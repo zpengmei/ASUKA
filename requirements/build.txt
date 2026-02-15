@@ -1,0 +1,6 @@
+cmake
+pybind11
+Cython
+
+# Build tool for the CUDA CMake projects (recommended)
+ninja

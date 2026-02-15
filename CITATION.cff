@@ -1,0 +1,10 @@
+cff-version: 1.2.0
+title: "ASUKA"
+message: "If you use ASUKA, please cite this software and the method references in docs/project/REFERENCES.md."
+type: software
+version: "0.1.0"
+date-released: 2026-02-14
+authors:
+  - family-names: "Pengmei"
+    given-names: "Zihan"
+    email: "zpengmei@uchicago.edu"

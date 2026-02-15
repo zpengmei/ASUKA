@@ -1,0 +1,23 @@
+include pyproject.toml
+include setup.py
+include README.md
+include LICENSE
+recursive-include requirements *.txt
+recursive-include docs/project *.md
+recursive-include .github *.md
+
+# Cython sources/includes (required to build from sdist)
+recursive-include asuka *.pyx *.pxi
+recursive-include asuka/include *.h
+
+# CUDA/CMake extension sources (required to build from sdist)
+recursive-include asuka/cuda/ext CMakeLists.txt
+recursive-include asuka/cuda/ext/src *.cu *.cuh *.cpp
+recursive-include asuka/cuda/linalg_ext CMakeLists.txt
+recursive-include asuka/cuda/linalg_ext/src *.cu *.cpp
+recursive-include asuka/cueri/cuda/ext CMakeLists.txt
+recursive-include asuka/cueri/cuda/ext/src *.cu *.cuh *.cpp *.h
+recursive-include asuka/cuguga/kernels/gpu *.cu *.cuh
+
+# Runtime data
+recursive-include asuka/cuguga/overlap *.json

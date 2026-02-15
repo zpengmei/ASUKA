@@ -1,0 +1,12 @@
+cupy-cuda12x
+
+# NVIDIA CUDA 12 user-space libraries (installed as pip wheels).
+# These avoid requiring a system-wide CUDA toolkit for runtime libraries.
+nvidia-cuda-runtime-cu12
+nvidia-cuda-nvrtc-cu12
+nvidia-cublas-cu12
+nvidia-curand-cu12
+nvidia-cusolver-cu12
+nvidia-cusparse-cu12
+nvidia-nvjitlink-cu12
+

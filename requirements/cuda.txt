@@ -1,0 +1,9 @@
+cupy-cuda13x
+
+# NVIDIA CUDA user-space libraries (needed for CuPy JIT + BLAS/LAPACK backends)
+# These are installed as pip wheels and avoid requiring a system-wide CUDA toolkit.
+nvidia-cuda-runtime
+nvidia-cuda-nvrtc
+nvidia-cublas
+nvidia-curand
+nvidia-cusolver

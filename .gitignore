@@ -1,0 +1,63 @@
+# Python bytecode and caches
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Compiled extension modules
+*.so
+*.pyd
+*.dylib
+
+# Packaging/build outputs
+/build/
+/dist/
+site/
+*.egg-info/
+.eggs/
+*.egg
+pip-wheel-metadata/
+cython_debug/
+
+# Test and coverage artifacts
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.hypothesis/
+
+# Type-checker/linter caches
+.mypy_cache/
+.ruff_cache/
+.pyre/
+.pytype/
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+.python-version
+
+# Notebook checkpoints
+.ipynb_checkpoints/
+
+# CMake/Ninja artifacts
+CMakeCache.txt
+CMakeFiles/
+cmake-build-*/
+compile_commands.json
+.ninja_deps
+.ninja_log
+
+# IDE/editor
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Project-specific generated CUDA/CMake build tree
+asuka/build/cueri_cuda_ext/

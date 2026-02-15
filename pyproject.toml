@@ -1,0 +1,93 @@
+[build-system]
+requires = ["setuptools>=68", "wheel", "Cython", "numpy", "cmake", "pybind11"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "asuka"
+version = "0.1.0"
+description = "GUGA/DRT-based electronic structure methods with CUDA acceleration"
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.10"
+authors = [
+  { name = "Zihan Pengmei", email = "zpengmei@uchicago.edu" },
+]
+keywords = ["quantum chemistry", "electronic structure", "guga", "ci", "cuda"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Intended Audience :: Science/Research",
+  "License :: OSI Approved :: GNU General Public License v3 (GPLv3)",
+  "Operating System :: POSIX :: Linux",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+  "Programming Language :: Python :: 3.10",
+  "Topic :: Scientific/Engineering :: Chemistry",
+  "Topic :: Scientific/Engineering :: Physics",
+]
+dependencies = [
+  "numpy",
+  "scipy",
+  "basis_set_exchange",
+]
+
+[project.urls]
+Homepage = "https://github.com/zpengmei/ASUKA"
+Repository = "https://github.com/zpengmei/ASUKA"
+Issues = "https://github.com/zpengmei/ASUKA/issues"
+
+[project.optional-dependencies]
+cuda = [
+  "cupy-cuda13x",
+  "nvidia-cuda-runtime",
+  "nvidia-cuda-nvrtc",
+  "nvidia-cublas",
+  "nvidia-curand",
+  "nvidia-cusolver",
+]
+cuda12 = [
+  "cupy-cuda12x",
+  "nvidia-cuda-runtime-cu12",
+  "nvidia-cuda-nvrtc-cu12",
+  "nvidia-cublas-cu12",
+  "nvidia-curand-cu12",
+  "nvidia-cusolver-cu12",
+  "nvidia-cusparse-cu12",
+  "nvidia-nvjitlink-cu12",
+]
+pyscf = [
+  "pyscf",
+  "h5py",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["asuka", "asuka.*"]
+exclude = [
+  # Development-only modules; may depend on optional third-party stacks (PySCF, etc.)
+  "asuka.bench*",
+  "asuka.test*",
+]
+
+
+[tool.setuptools.package-data]
+asuka = [
+  # Cython sources/includes
+  "*.pyx",
+  "*.pxi",
+  # CUDA extension sources (for building from source/sdist)
+  "cuda/ext/CMakeLists.txt",
+  "cuda/ext/src/*.cu",
+  "cuda/ext/src/*.cuh",
+  "cuda/ext/src/*.cpp",
+  "cuda/linalg_ext/CMakeLists.txt",
+  "cuda/linalg_ext/src/*.cu",
+  "cuda/linalg_ext/src/*.cpp",
+  # cuERI CUDA extension sources (vendored under asuka.cueri)
+  "cueri/cuda/ext/CMakeLists.txt",
+  "cueri/cuda/ext/src/*.cu",
+  "cueri/cuda/ext/src/*.cuh",
+  "cueri/cuda/ext/src/*.cpp",
+  "cueri/cuda/ext/src/*.h",
+  # Runtime data
+  "cuguga/overlap/*.json",
+]
