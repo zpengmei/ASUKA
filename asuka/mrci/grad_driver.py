@@ -294,7 +294,7 @@ def mrci_grad_states_from_mc(
                     # i.e. treat denom (c2 or w_ref) as constant w.r.t. nuclear displacements.
                     #
                     # Columbus can write similarly scaled "CI+DVx" density matrices (heuristic);
-                    # see `/home/zpengmei/columbus/Columbus/source/ciudg/ciudg_main.F90:6362`.
+                    # see ciudg_main.F90 (around line 6362) in the Columbus source tree.
                     if grad_ref is None or grad_corr is None:
                         raise RuntimeError(
                             "Heuristic +Q analytic gradients require an available reference gradient (grad_ref)."
