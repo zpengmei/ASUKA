@@ -1474,6 +1474,12 @@ def run_casscf_df(
         else:
             e_roots = np.asarray(casci_out.e_tot, dtype=np.float64).ravel()
         ci_list = ci_as_list(casci_out.ci, nroots=nroots)
+        if prev_ci_list is not None and nroots > 1:
+            perm = match_roots_by_overlap(prev_ci_list, ci_list)
+            e_roots = e_roots[perm]
+            ci_list = [ci_list[int(j)] for j in perm.tolist()]
+            fix_ci_phases(prev_ci_list, ci_list)
+        ci_out = ci_list if nroots > 1 else ci_list[0]
         e_last = float(np.dot(weights, e_roots))
 
     return CASSCFResult(

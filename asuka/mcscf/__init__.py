@@ -30,7 +30,7 @@ from .casscf import (
     run_casscf_df,
 )
 from .nuc_grad import NucGradResult, casci_nuc_grad, casscf_nuc_grad
-from .nuc_grad_df import DFNucGradResult, casscf_nuc_grad_df, casci_nuc_grad_df_relaxed, casci_nuc_grad_df_unrelaxed
+from .nuc_grad_df import DFNucGradResult, DFNucGradMultirootResult, casscf_nuc_grad_df, casscf_nuc_grad_df_per_root, casci_nuc_grad_df_relaxed, casci_nuc_grad_df_unrelaxed
 from .nac import (
     sacasscf_nonadiabatic_couplings_df,
     sacasscf_nonadiabatic_couplings_df_densez,
@@ -73,7 +73,9 @@ __all__ = [
     "sacasscf_nonadiabatic_couplings_df_densez",
     "sacasscf_nonadiabatic_couplings_dense",
     "DFNucGradResult",
+    "DFNucGradMultirootResult",
     "casscf_nuc_grad_df",
+    "casscf_nuc_grad_df_per_root",
     "casci_nuc_grad_df_relaxed",
     "casci_nuc_grad_df_unrelaxed",
     "allowed_rotation_mask",

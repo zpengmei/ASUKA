@@ -1069,9 +1069,367 @@ def casci_nuc_grad_df_relaxed(
     )
 
 
+@dataclass(frozen=True)
+class DFNucGradMultirootResult:
+    """Container for per-root DF-based nuclear gradients from SA-CASSCF.
+
+    Attributes
+    ----------
+    e_roots : np.ndarray
+        Per-root energies, shape ``(nroots,)``.
+    e_sa : float
+        State-averaged energy.
+    e_nuc : float
+        Nuclear repulsion energy.
+    grads : np.ndarray
+        Per-root gradients, shape ``(nroots, natm, 3)`` in Eh/Bohr.
+    grad_sa : np.ndarray
+        State-averaged gradient, shape ``(natm, 3)`` in Eh/Bohr.
+    root_weights : np.ndarray
+        SA weights, shape ``(nroots,)``.
+    """
+
+    e_roots: np.ndarray
+    e_sa: float
+    e_nuc: float
+    grads: np.ndarray
+    grad_sa: np.ndarray
+    root_weights: np.ndarray
+
+
+def casscf_nuc_grad_df_per_root(
+    scf_out: Any,
+    casscf: Any,
+    *,
+    fcisolver: GUGAFCISolver | None = None,
+    twos: int | None = None,
+    df_backend: Literal["cpu", "cuda"] = "cpu",
+    df_config: Any | None = None,
+    df_threads: int = 0,
+    delta_bohr: float = 1e-4,
+    solver_kwargs: dict[str, Any] | None = None,
+    z_tol: float = 1e-10,
+    z_maxiter: int = 200,
+) -> DFNucGradMultirootResult:
+    """Per-root DF-based nuclear gradients for SA-CASSCF with CP-MCSCF response.
+
+    For SA-CASSCF, individual root energies are *not* variational w.r.t.
+    orbitals, so the per-root gradient requires a CP-MCSCF (Z-vector) orbital
+    response correction.  This function computes exact per-root analytic
+    gradients using the same Lagrangian approach as PySCF's
+    ``sacasscf.Gradients``.
+
+    For single-state CASSCF (nroots=1) the response is zero and the result
+    matches :func:`casscf_nuc_grad_df` exactly.
+
+    Parameters
+    ----------
+    scf_out : Any
+        SCF result object (provides DF tensors).
+    casscf : Any
+        CASSCF result object (mo_coeff, ci, etc.).
+    fcisolver : GUGAFCISolver | None, optional
+        FCI solver for RDM / transition-RDM calculation.
+    twos : int | None, optional
+        Spin quantum number 2S.
+    df_backend : Literal["cpu", "cuda"], optional
+        Backend for DF derivative contraction.
+    df_config : Any | None, optional
+        Configuration for DF backend.
+    df_threads : int, optional
+        Number of threads for DF backend.
+    delta_bohr : float, optional
+        Step size for finite difference fallback (Bohr).
+    solver_kwargs : dict, optional
+        Arguments for FCI solver RDM calculation.
+    z_tol : float, optional
+        Convergence tolerance for the Z-vector solve.
+    z_maxiter : int, optional
+        Maximum iterations for the Z-vector solve.
+
+    Returns
+    -------
+    DFNucGradMultirootResult
+        Per-root energies and gradients.
+    """
+    from contextlib import contextmanager  # noqa: PLC0415
+    import os  # noqa: PLC0415
+
+    from .newton_df import DFNewtonCASSCFAdapter  # noqa: PLC0415
+    from . import newton_casscf as _newton_casscf  # noqa: PLC0415
+    from .zvector import build_mcscf_hessian_operator, solve_mcscf_zvector  # noqa: PLC0415
+    from .nac._df import (  # noqa: PLC0415
+        _FixedRDMFcisolver,
+        _grad_elec_active_df,
+        _Lorb_dot_dgorb_dx_df,
+    )
+
+    @contextmanager
+    def _force_internal_newton():
+        k_prefer = "CUGUGA_NEWTON_CASSCF"
+        k_impl = "CUGUGA_NEWTON_CASSCF_IMPL"
+        old_prefer = os.environ.get(k_prefer)
+        old_impl = os.environ.get(k_impl)
+        os.environ[k_prefer] = "internal"
+        os.environ[k_impl] = "internal"
+        try:
+            yield
+        finally:
+            if old_prefer is None:
+                os.environ.pop(k_prefer, None)
+            else:
+                os.environ[k_prefer] = old_prefer
+            if old_impl is None:
+                os.environ.pop(k_impl, None)
+            else:
+                os.environ[k_impl] = old_impl
+
+    # ------------------------------------------------------------------
+    # Setup (shared across all roots)
+    # ------------------------------------------------------------------
+    mol = getattr(scf_out, "mol", None)
+    if mol is None:
+        raise TypeError("scf_out must have a .mol attribute")
+    if not bool(getattr(mol, "cart", False)):
+        raise NotImplementedError("DF nuclear gradients currently require cart=True")
+
+    coords, charges = _mol_coords_charges_bohr(mol)
+    natm = int(coords.shape[0])
+
+    ncore = int(getattr(casscf, "ncore"))
+    ncas = int(getattr(casscf, "ncas"))
+    nelecas = getattr(casscf, "nelecas")
+    nroots = int(getattr(casscf, "nroots", 1))
+    weights = normalize_weights(getattr(casscf, "root_weights", None), nroots=nroots)
+    ci_list = ci_as_list(getattr(casscf, "ci"), nroots=nroots)
+    e_roots = np.asarray(getattr(casscf, "e_roots"), dtype=np.float64).ravel()
+
+    if fcisolver is None:
+        if twos is None:
+            twos = int(getattr(mol, "spin", 0))
+        fcisolver_use = GUGAFCISolver(twos=int(twos), nroots=int(nroots))
+    else:
+        fcisolver_use = fcisolver
+        if getattr(fcisolver_use, "nroots", None) != int(nroots):
+            try:
+                fcisolver_use.nroots = int(nroots)
+            except Exception:
+                pass
+
+    C = _asnumpy_f64(getattr(casscf, "mo_coeff"))
+    B_ao = _asnumpy_f64(getattr(scf_out, "df_B"))
+    h_ao = _asnumpy_f64(getattr(getattr(scf_out, "int1e"), "hcore"))
+
+    # Per-root RDMs
+    per_root_rdms: list[tuple[np.ndarray, np.ndarray]] = []
+    for K in range(nroots):
+        dm1_K, dm2_K = fcisolver_use.make_rdm12(ci_list[K], int(ncas), nelecas, **(solver_kwargs or {}))
+        per_root_rdms.append((np.asarray(dm1_K, dtype=np.float64), np.asarray(dm2_K, dtype=np.float64)))
+
+    # SA RDMs (needed for orbital response)
+    dm1_sa, dm2_sa = make_state_averaged_rdms(
+        fcisolver_use, ci_list, weights, ncas=int(ncas), nelecas=nelecas, solver_kwargs=solver_kwargs,
+    )
+
+    # Nuclear repulsion gradient (shared)
+    try:
+        de_nuc = np.asarray(mol.energy_nuc_grad(), dtype=np.float64)
+    except Exception:
+        de_nuc = np.zeros((natm, 3), dtype=np.float64)
+
+    # Build SA adapter and Hessian operator (shared across all roots)
+    mc_sa = DFNewtonCASSCFAdapter(
+        df_B=B_ao,
+        hcore_ao=h_ao,
+        ncore=int(ncore),
+        ncas=int(ncas),
+        nelecas=nelecas,
+        mo_coeff=C,
+        fcisolver=fcisolver_use,
+        weights=[float(w) for w in np.asarray(weights, dtype=np.float64).ravel().tolist()],
+        frozen=getattr(casscf, "frozen", None),
+        internal_rotation=bool(getattr(casscf, "internal_rotation", False)),
+        extrasym=getattr(casscf, "extrasym", None),
+    )
+    eris_sa = mc_sa.ao2mo(C)
+    with _force_internal_newton():
+        hess_op = build_mcscf_hessian_operator(
+            mc_sa, mo_coeff=C, ci=ci_list, eris=eris_sa, use_newton_hessian=True,
+        )
+
+    # Prepare DF gradient contraction context (reuse across roots)
+    from asuka.integrals.df_grad_context import DFGradContractionContext  # noqa: PLC0415
+
+    df_grad_ctx: DFGradContractionContext | None = None
+    try:
+        df_grad_ctx = DFGradContractionContext.build(
+            getattr(scf_out, "ao_basis"),
+            getattr(scf_out, "aux_basis"),
+            atom_coords_bohr=coords,
+            backend=str(df_backend),
+            df_threads=int(df_threads),
+        )
+    except (NotImplementedError, RuntimeError):
+        df_grad_ctx = None
+
+    # AO basis objects for 1e derivative contractions
+    ao_basis = getattr(scf_out, "ao_basis")
+    aux_basis = getattr(scf_out, "aux_basis")
+    from asuka.integrals.int1e_cart import shell_to_atom_map  # noqa: PLC0415
+
+    shell_atom = shell_to_atom_map(ao_basis, atom_coords_bohr=coords)
+
+    n_orb = int(hess_op.n_orb)
+    w_arr = np.asarray(weights, dtype=np.float64).ravel()
+
+    # ------------------------------------------------------------------
+    # Per-root gradient loop
+    # ------------------------------------------------------------------
+    grads_list: list[np.ndarray] = []
+
+    for K in range(nroots):
+        dm1_K, dm2_K = per_root_rdms[K]
+
+        # Step A: Bare (Hellmann-Feynman) gradient with root-K's RDMs
+        gfock_K, D_core, D_act_K, D_tot_K, C_act = _build_gfock_casscf_df(
+            B_ao, h_ao, C, ncore=int(ncore), ncas=int(ncas), dm1_act=dm1_K, dm2_act=dm2_K,
+        )
+        dme0_K = C @ ((gfock_K + gfock_K.T) * 0.5) @ C.T
+
+        de_h1_K = contract_dhcore_cart(
+            ao_basis, atom_coords_bohr=coords, atom_charges=charges, M=D_tot_K, shell_atom=shell_atom,
+        )
+        de_S_K = -contract_dS_cart(ao_basis, atom_coords_bohr=coords, M=dme0_K, shell_atom=shell_atom)
+
+        bar_L_K = _build_bar_L_casscf_df(
+            B_ao, D_core_ao=D_core, D_act_ao=D_act_K, C_act=C_act, dm2_act=dm2_K,
+        )
+        try:
+            if df_grad_ctx is not None:
+                de_df_K = df_grad_ctx.contract(B_ao=B_ao, bar_L_ao=bar_L_K)
+            else:
+                de_df_K = compute_df_gradient_contributions_analytic_packed_bases(
+                    ao_basis, aux_basis, atom_coords_bohr=coords, B_ao=B_ao, bar_L_ao=bar_L_K,
+                    backend=str(df_backend), df_threads=int(df_threads), profile=None,
+                )
+        except (NotImplementedError, RuntimeError):
+            de_df_K = compute_df_gradient_contributions_fd_packed_bases(
+                ao_basis, aux_basis, atom_coords_bohr=coords, bar_L_ao=bar_L_K,
+                backend=str(df_backend), df_config=df_config, df_threads=int(df_threads),
+                delta_bohr=float(delta_bohr), profile=None,
+            )
+
+        grad_bare_K = np.asarray(de_h1_K + de_S_K + de_df_K + de_nuc, dtype=np.float64)
+
+        # For single-state CASSCF, skip the response (gfock is symmetric → RHS ≈ 0)
+        if nroots == 1:
+            grads_list.append(grad_bare_K)
+            continue
+
+        # Step B: Z-vector RHS
+        fcisolver_fixed = _FixedRDMFcisolver(fcisolver_use, dm1=dm1_K, dm2=dm2_K)
+        mc_K = DFNewtonCASSCFAdapter(
+            df_B=B_ao,
+            hcore_ao=h_ao,
+            ncore=int(ncore),
+            ncas=int(ncas),
+            nelecas=nelecas,
+            mo_coeff=C,
+            fcisolver=fcisolver_fixed,
+            frozen=getattr(casscf, "frozen", None),
+            internal_rotation=bool(getattr(casscf, "internal_rotation", False)),
+            extrasym=getattr(casscf, "extrasym", None),
+        )
+
+        with _force_internal_newton():
+            g_K, _gupd, _hop, _hdiag = _newton_casscf.gen_g_hop(
+                mc_K, C, ci_list[K], eris_sa, verbose=0, implementation="internal",
+            )
+        g_K = np.asarray(g_K, dtype=np.float64).ravel()
+
+        rhs_orb = g_K[:n_orb]
+        rhs_ci_K = g_K[n_orb:]
+
+        rhs_ci: list[np.ndarray] = []
+        for r in range(nroots):
+            rhs_ci.append(np.zeros_like(np.asarray(ci_list[r], dtype=np.float64).ravel()))
+        ndet_K = int(np.asarray(ci_list[K]).size)
+        rhs_ci[K] = rhs_ci_K[:ndet_K]
+
+        # Step C: Z-vector solve
+        z_K = solve_mcscf_zvector(
+            mc_sa,
+            rhs_orb=np.asarray(rhs_orb, dtype=np.float64),
+            rhs_ci=rhs_ci,
+            hessian_op=hess_op,
+            tol=float(z_tol),
+            maxiter=int(z_maxiter),
+        )
+        Lvec = np.asarray(z_K.z_packed, dtype=np.float64).ravel()
+
+        # Step D: CI response
+        Lci_list = hess_op.ci_unflatten(Lvec[n_orb:])
+        dm1_lci = np.zeros((int(ncas), int(ncas)), dtype=np.float64)
+        dm2_lci = np.zeros((int(ncas), int(ncas), int(ncas), int(ncas)), dtype=np.float64)
+        for r in range(nroots):
+            wr = float(w_arr[r])
+            if abs(wr) < 1e-14:
+                continue
+            dm1_r, dm2_r = fcisolver_use.trans_rdm12(
+                np.asarray(Lci_list[r], dtype=np.float64).ravel(),
+                np.asarray(ci_list[r], dtype=np.float64).ravel(),
+                int(ncas), nelecas,
+            )
+            dm1_r = np.asarray(dm1_r, dtype=np.float64)
+            dm2_r = np.asarray(dm2_r, dtype=np.float64)
+            dm1_lci += wr * (dm1_r + dm1_r.T)
+            dm2_lci += wr * (dm2_r + dm2_r.transpose(1, 0, 3, 2))
+
+        de_lci_K = _grad_elec_active_df(
+            scf_out=scf_out, mo_coeff=C, dm1_act=dm1_lci, dm2_act=dm2_lci,
+            ncore=int(ncore), ncas=int(ncas),
+            df_backend=str(df_backend), df_config=df_config, df_threads=int(df_threads),
+            df_grad_ctx=df_grad_ctx,
+        )
+
+        # Step E: Orbital response
+        Lorb_mat = mc_sa.unpack_uniq_var(Lvec[:n_orb])
+        de_lorb_K = _Lorb_dot_dgorb_dx_df(
+            scf_out=scf_out, mo_coeff=C, dm1_act=dm1_sa, dm2_act=dm2_sa,
+            Lorb=np.asarray(Lorb_mat, dtype=np.float64),
+            ncore=int(ncore), ncas=int(ncas), eris=eris_sa,
+            df_backend=str(df_backend), df_config=df_config, df_threads=int(df_threads),
+            df_grad_ctx=df_grad_ctx,
+        )
+
+        # Step F: Combine
+        grad_K = grad_bare_K + np.asarray(de_lci_K, dtype=np.float64) + np.asarray(de_lorb_K, dtype=np.float64)
+        grads_list.append(grad_K)
+
+    # ------------------------------------------------------------------
+    # Assembly
+    # ------------------------------------------------------------------
+    grads = np.stack(grads_list, axis=0)  # (nroots, natm, 3)
+    grad_sa = np.einsum("r,rax->ax", w_arr, grads)
+
+    e_sa = float(np.dot(w_arr, e_roots))
+    e_nuc_val = float(mol.energy_nuc())
+
+    return DFNucGradMultirootResult(
+        e_roots=e_roots,
+        e_sa=e_sa,
+        e_nuc=e_nuc_val,
+        grads=grads,
+        grad_sa=grad_sa,
+        root_weights=np.asarray(weights, dtype=np.float64),
+    )
+
+
 __all__ = [
     "DFNucGradResult",
+    "DFNucGradMultirootResult",
     "casscf_nuc_grad_df",
+    "casscf_nuc_grad_df_per_root",
     "casci_nuc_grad_df_unrelaxed",
     "casci_nuc_grad_df_relaxed",
 ]

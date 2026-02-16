@@ -244,6 +244,122 @@ def make_df_casci_energy_grad(
     return energy_grad
 
 
+MultirootEnergyGradFn = Callable[[np.ndarray], tuple[np.ndarray, np.ndarray]]
+
+
+def make_df_casscf_multiroot_energy_grad(
+    mol: Molecule,
+    *,
+    hf_kwargs: Mapping[str, Any] | None = None,
+    casscf_kwargs: Mapping[str, Any] | None = None,
+    grad_kwargs: Mapping[str, Any] | None = None,
+    save_key: str = "method_eval_multiroot",
+    save_intermediates: bool = True,
+    warm_start: bool = True,
+    guess: Any | None = None,
+) -> MultirootEnergyGradFn:
+    """Build a ``(coords_bohr) -> (e_roots, grads)`` callback for per-root SA-CASSCF gradients.
+
+    This adapter re-runs SCF + CASSCF at the requested coordinates and returns
+    per-root energies and per-root analytic DF nuclear gradients (with CP-MCSCF
+    orbital response).
+
+    Returns
+    -------
+    MultirootEnergyGradFn
+        A callable ``(coords_bohr) -> (e_roots, grads)`` where ``e_roots`` has
+        shape ``(nroots,)`` and ``grads`` has shape ``(nroots, natm, 3)``.
+    """
+
+    hf_kwargs_use = dict(hf_kwargs or {})
+    casscf_kwargs_use = dict(casscf_kwargs or {})
+    grad_kwargs_use = dict(grad_kwargs or {})
+
+    if "method" not in hf_kwargs_use:
+        hf_kwargs_use["method"] = "rhf" if int(mol.spin) == 0 else "rohf"
+
+    prev_scf_mo_coeff: Any | None = None
+    prev_casscf_mo_coeff: Any | None = None
+    prev_ci: Any | None = None
+
+    if guess is not None:
+        g_scf = None
+        g_mc = None
+        if isinstance(guess, tuple) and len(guess) == 2:
+            g_scf, g_mc = guess
+        else:
+            g_scf = getattr(guess, "scf_out", None)
+            g_mc = getattr(guess, "mc", None)
+            if g_scf is None and hasattr(guess, "scf"):
+                g_scf = guess
+            if g_mc is None and hasattr(guess, "mo_coeff"):
+                g_mc = guess
+
+        if g_scf is not None:
+            scf_guess = getattr(g_scf, "scf", g_scf)
+            prev_scf_mo_coeff = getattr(scf_guess, "mo_coeff", None)
+        if g_mc is not None:
+            prev_casscf_mo_coeff = getattr(g_mc, "mo_coeff", None)
+            prev_ci = getattr(g_mc, "ci", None)
+            if prev_scf_mo_coeff is None and prev_casscf_mo_coeff is not None:
+                prev_scf_mo_coeff = prev_casscf_mo_coeff
+
+    def energy_grad(coords_bohr: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        from asuka.frontend import run_hf  # noqa: PLC0415
+        from asuka.mcscf import run_casscf  # noqa: PLC0415
+        from asuka.mcscf.nuc_grad_df import casscf_nuc_grad_df_per_root  # noqa: PLC0415
+
+        nonlocal prev_scf_mo_coeff, prev_casscf_mo_coeff, prev_ci
+
+        if bool(warm_start) and (prev_scf_mo_coeff is None and prev_casscf_mo_coeff is None and prev_ci is None):
+            prev = mol.results.get(str(save_key))
+            if isinstance(prev, DFMethodEvalArtifacts):
+                scf_prev = getattr(prev, "scf_out", None)
+                mc_prev = getattr(prev, "mc", None)
+                try:
+                    prev_scf_mo_coeff = getattr(getattr(scf_prev, "scf", None), "mo_coeff", None)
+                except Exception:
+                    prev_scf_mo_coeff = None
+                try:
+                    prev_casscf_mo_coeff = getattr(mc_prev, "mo_coeff", None)
+                    prev_ci = getattr(mc_prev, "ci", None)
+                except Exception:
+                    prev_casscf_mo_coeff = None
+                    prev_ci = None
+
+        mol_eval = _clone_molecule_with_coords(mol, coords_bohr)
+
+        hf_call = dict(hf_kwargs_use)
+        if bool(warm_start) and ("dm0" not in hf_call and "mo_coeff0" not in hf_call):
+            if prev_scf_mo_coeff is not None:
+                hf_call["mo_coeff0"] = prev_scf_mo_coeff
+
+        scf_out = run_hf(mol_eval, **hf_call)
+
+        casscf_call = dict(casscf_kwargs_use)
+        if bool(warm_start):
+            if "mo_coeff0" not in casscf_call and prev_casscf_mo_coeff is not None:
+                casscf_call["mo_coeff0"] = prev_casscf_mo_coeff
+            if "ci0" not in casscf_call and prev_ci is not None:
+                casscf_call["ci0"] = prev_ci
+
+        mc = run_casscf(scf_out, **casscf_call)
+        g = casscf_nuc_grad_df_per_root(scf_out, mc, **grad_kwargs_use)
+
+        if bool(save_intermediates):
+            mol.results[str(save_key)] = DFMethodEvalArtifacts(scf_out=scf_out, mc=mc, grad=g)
+
+        if bool(warm_start) and bool(getattr(getattr(scf_out, "scf", None), "converged", False)):
+            prev_scf_mo_coeff = getattr(getattr(scf_out, "scf", None), "mo_coeff", None)
+        if bool(warm_start) and bool(getattr(mc, "converged", False)):
+            prev_casscf_mo_coeff = getattr(mc, "mo_coeff", None)
+            prev_ci = getattr(mc, "ci", None)
+
+        return np.asarray(g.e_roots, dtype=np.float64), np.asarray(g.grads, dtype=np.float64)
+
+    return energy_grad
+
+
 def geomopt_molecule(
     mol: Molecule,
     energy_grad: EnergyGradFn,
