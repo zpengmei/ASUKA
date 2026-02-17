@@ -464,17 +464,18 @@ class DFNewtonCASSCFAdapter:
         Parameters
         ----------
         mat : Any
-            The full matrix.
+            The full matrix (numpy or CuPy).
 
         Returns
         -------
-        np.ndarray
-            Flattened vector of independent parameters.
+        numpy or CuPy array
+            Flattened vector of independent parameters (same backend as input).
         """
-        mat = _asnumpy_f64(mat)
+        xp, _on_gpu = _get_xp(mat)
+        mat = xp.asarray(mat, dtype=xp.float64)
         nmo = int(self.mo_coeff.shape[1])
         idx = self.uniq_var_indices(nmo, int(self.ncore), int(self.ncas), self.frozen)
-        return np.asarray(mat[idx], dtype=np.float64)
+        return xp.asarray(mat[idx], dtype=xp.float64)
 
     def unpack_uniq_var(self, v: Any) -> np.ndarray:
         """Unpack a flat independent-parameter vector into a full anti-symmetric matrix.
@@ -482,17 +483,18 @@ class DFNewtonCASSCFAdapter:
         Parameters
         ----------
         v : Any
-            The flattened vector.
+            The flattened vector (numpy or CuPy).
 
         Returns
         -------
-        np.ndarray
-            The full anti-symmetric matrix (nmo, nmo).
+        numpy or CuPy array
+            The full anti-symmetric matrix (nmo, nmo), same backend as input.
         """
-        v = _asnumpy_f64(v).ravel()
+        xp, _on_gpu = _get_xp(v)
+        v = xp.asarray(v, dtype=xp.float64).ravel()
         nmo = int(self.mo_coeff.shape[1])
         idx = self.uniq_var_indices(nmo, int(self.ncore), int(self.ncas), self.frozen)
-        mat = np.zeros((nmo, nmo), dtype=np.float64)
+        mat = xp.zeros((nmo, nmo), dtype=xp.float64)
         mat[idx] = v
         return mat - mat.T
 
@@ -521,6 +523,8 @@ class DFNewtonCASSCFAdapter:
         r: Any,
         casdm1: Any,
         eris: Any | None = None,
+        *,
+        return_gpu: bool = False,
     ) -> tuple[np.ndarray, np.ndarray]:
         """DF analogue of PySCF `mc1step.CASSCF.update_jk_in_ah`.
 
@@ -587,6 +591,10 @@ class DFNewtonCASSCFAdapter:
         va = casdm1 @ mo_act.T @ v0 @ mo
         vc = mo_core.T @ v1 @ mo[:, ncore:]
 
-        va_out = _asnumpy_f64(xp.ascontiguousarray(xp.asarray(va, dtype=xp.float64)))
-        vc_out = _asnumpy_f64(xp.ascontiguousarray(xp.asarray(vc, dtype=xp.float64)))
-        return va_out, vc_out
+        va_cont = xp.ascontiguousarray(xp.asarray(va, dtype=xp.float64))
+        vc_cont = xp.ascontiguousarray(xp.asarray(vc, dtype=xp.float64))
+
+        if return_gpu:
+            return va_cont, vc_cont
+
+        return _asnumpy_f64(va_cont), _asnumpy_f64(vc_cont)

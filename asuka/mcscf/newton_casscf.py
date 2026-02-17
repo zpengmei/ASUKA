@@ -386,15 +386,14 @@ def _maybe_set_attr(obj: Any, name: str, value: Any) -> Iterator[bool]:
     try:
         yield changed
     finally:
-        if not changed:
-            return
-        try:
-            if old is missing:
-                delattr(obj, name)
-            else:
-                setattr(obj, name, old)
-        except Exception:
-            pass
+        if changed:
+            try:
+                if old is missing:
+                    delattr(obj, name)
+                else:
+                    setattr(obj, name, old)
+            except Exception:
+                pass
 
 
 @contextmanager
@@ -1258,29 +1257,42 @@ def _weighted_trans_rdm12(
     ncas: int,
     nelecas: Any,
     link_index: Any | None,
+    return_cupy: bool = False,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Return SA-weighted (tdm1,tdm2) built from per-root transitions."""
+
+    if return_cupy:
+        try:
+            import cupy as _cp  # type: ignore[import-not-found]
+        except Exception:
+            _cp = None
+    else:
+        _cp = None
+    xp = _cp if _cp is not None and return_cupy else np
 
     nroots = int(len(ci0_list))
     if nroots != int(len(ci1_list)):
         raise ValueError("ci1_list length mismatch")
+    _rdm_kw: dict = dict(link_index=link_index, return_cupy=return_cupy)
+    if return_cupy:
+        _rdm_kw["rdm_backend"] = "cuda"
     if nroots == 1:
-        dm1, dm2 = fcisolver.trans_rdm12(ci1_list[0], ci0_list[0], int(ncas), nelecas, link_index=link_index)
-        return np.asarray(dm1, dtype=np.float64), np.asarray(dm2, dtype=np.float64)
+        dm1, dm2 = fcisolver.trans_rdm12(ci1_list[0], ci0_list[0], int(ncas), nelecas, **_rdm_kw)
+        return xp.asarray(dm1, dtype=xp.float64), xp.asarray(dm2, dtype=xp.float64)
 
     states_trans = getattr(fcisolver, "states_trans_rdm12", None)
-    tdm1 = np.zeros((ncas, ncas), dtype=np.float64)
-    tdm2 = np.zeros((ncas, ncas, ncas, ncas), dtype=np.float64)
-    if callable(states_trans):
+    tdm1 = xp.zeros((ncas, ncas), dtype=xp.float64)
+    tdm2 = xp.zeros((ncas, ncas, ncas, ncas), dtype=xp.float64)
+    if callable(states_trans) and not return_cupy:
         dm1s, dm2s = states_trans(ci1_list, ci0_list, int(ncas), nelecas, link_index=link_index)
         for w, dm1, dm2 in zip(weights, dm1s, dm2s):
-            tdm1 += float(w) * np.asarray(dm1, dtype=np.float64)
-            tdm2 += float(w) * np.asarray(dm2, dtype=np.float64)
+            tdm1 += float(w) * xp.asarray(dm1, dtype=xp.float64)
+            tdm2 += float(w) * xp.asarray(dm2, dtype=xp.float64)
     else:
         for w, c1, c0 in zip(weights, ci1_list, ci0_list):
-            dm1, dm2 = fcisolver.trans_rdm12(c1, c0, int(ncas), nelecas, link_index=link_index)
-            tdm1 += float(w) * np.asarray(dm1, dtype=np.float64)
-            tdm2 += float(w) * np.asarray(dm2, dtype=np.float64)
+            dm1, dm2 = fcisolver.trans_rdm12(c1, c0, int(ncas), nelecas, **_rdm_kw)
+            tdm1 += float(w) * xp.asarray(dm1, dtype=xp.float64)
+            tdm2 += float(w) * xp.asarray(dm2, dtype=xp.float64)
     return tdm1, tdm2
 
 
@@ -1868,135 +1880,234 @@ def gen_g_hop_internal(
             op_h0 = fcisolver.absorb_h1e(cache.h1cas_0, cache.eri_cas, cache.ncas, cache.nelecas, 0.5)
     linkstr = _maybe_gen_linkstr(fcisolver, cache.ncas, cache.nelecas, False)
 
-    def _h_op_raw(x: np.ndarray) -> np.ndarray:
-        x = np.asarray(x, dtype=np.float64).ravel()
-        x1 = casscf.unpack_uniq_var(x[:ngorb])
-        ci1_list = cache.ci.unpack(x[ngorb:])
+    # ── Closure-scope setup for _h_op_raw ──
+    _ppaa_hop = getattr(eris, "ppaa", None)
+    _papa_hop = getattr(eris, "papa", None)
+    if _ppaa_hop is None or _papa_hop is None:
+        raise ValueError("eris must provide 'ppaa' and 'papa'")
 
+    # Detect GPU mode from eris integral storage.
+    _hop_xp, _hop_on_gpu = _get_xp(_ppaa_hop, _papa_hop)
+    _supports_return_gpu = hasattr(casscf, "df_B")
+
+    # CPU copies (always needed for fallback / CPU-only callers).
+    ppaa_cpu = _to_np_f64(_ppaa_hop)
+    papa_cpu = _to_np_f64(_papa_hop)
+
+    # GPU copies of tensors used inside _h_op_raw (one-time upload).
+    if _hop_on_gpu:
+        ppaa_dev = _to_xp_f64(_ppaa_hop, _hop_xp)
+        papa_dev = _to_xp_f64(_papa_hop, _hop_xp)
+        ci0_list_dev = [_hop_xp.asarray(c, dtype=_hop_xp.float64).ravel() for c in ci0_list]
+        hci0_dev = [_hop_xp.asarray(h, dtype=_hop_xp.float64).ravel() for h in cache.hci0]
+        eci0_dev = _hop_xp.asarray(cache.eci0, dtype=_hop_xp.float64)
+        h1e_mo_dev = _hop_xp.asarray(cache.h1e_mo, dtype=_hop_xp.float64)
+        vhf_c_dev = _hop_xp.asarray(cache.vhf_c, dtype=_hop_xp.float64)
+        vhf_ca_dev = _hop_xp.asarray(cache.vhf_ca, dtype=_hop_xp.float64)
+        casdm1_dev = _hop_xp.asarray(cache.casdm1, dtype=_hop_xp.float64)
+        hdm2_dev = _hop_xp.asarray(cache.hdm2, dtype=_hop_xp.float64)
+        dm1_full_dev = _hop_xp.asarray(cache.dm1_full, dtype=_hop_xp.float64)
+        gpq_dev = _hop_xp.asarray(cache.gpq, dtype=_hop_xp.float64)
+        weights_dev = _hop_xp.asarray(cache.weights, dtype=_hop_xp.float64)
+        paaa_dev = cache.paaa_gpu if cache.paaa_gpu is not None else _hop_xp.asarray(cache.paaa, dtype=_hop_xp.float64)
+        # CI unpack offsets
+        _ci_sizes = [int(c.size) for c in ci0_list_dev]
+        _ci_offs: list[int] = [0]
+        for _s in _ci_sizes[:-1]:
+            _ci_offs.append(_ci_offs[-1] + _s)
+        # Rebuild op_h0 with GPU h1e *and* GPU eri_cas for zero-sync contract_2e.
+        h1cas_0_dev = _hop_xp.asarray(cache.h1cas_0, dtype=_hop_xp.float64)
+        eri_cas_dev = _hop_xp.asarray(cache.eri_cas, dtype=_hop_xp.float64)
+        with _absorb_ctx():
+            with _ah_mixed_precision_ctx(fcisolver, ah_mixed_precision):
+                op_h0_dev = fcisolver.absorb_h1e(h1cas_0_dev, eri_cas_dev, cache.ncas, cache.nelecas, 0.5)
+
+    def _h_op_raw(x):
+        xp, on_gpu = _get_xp(x)
+        x = xp.asarray(x, dtype=xp.float64).ravel()
+
+        # Select device-appropriate tensors.
+        if on_gpu:
+            ppaa, papa, paaa = ppaa_dev, papa_dev, paaa_dev
+            _ci0 = ci0_list_dev
+            _hci0 = hci0_dev
+            _eci0 = eci0_dev
+            _h1e_mo = h1e_mo_dev
+            _vhf_c = vhf_c_dev
+            _vhf_ca = vhf_ca_dev
+            _casdm1 = casdm1_dev
+            _hdm2 = hdm2_dev
+            _dm1_full = dm1_full_dev
+            _gpq = gpq_dev
+            _weights = weights_dev
+            _op_h0 = op_h0_dev
+        else:
+            ppaa, papa, paaa = ppaa_cpu, papa_cpu, cache.paaa
+            _ci0 = ci0_list
+            _hci0 = cache.hci0
+            _eci0 = cache.eci0
+            _h1e_mo = cache.h1e_mo
+            _vhf_c = cache.vhf_c
+            _vhf_ca = cache.vhf_ca
+            _casdm1 = cache.casdm1
+            _hdm2 = cache.hdm2
+            _dm1_full = cache.dm1_full
+            _gpq = cache.gpq
+            _weights = cache.weights
+            _op_h0 = op_h0
+
+        x1 = casscf.unpack_uniq_var(x[:ngorb])  # xp-aware (Step 5)
+
+        # CI unpack (xp-aware).
+        ci_flat = x[ngorb:]
+        if nroots == 1:
+            ci1_list = [ci_flat.copy()]
+        else:
+            ci1_list = [ci_flat[off:off + sz].copy() for off, sz in zip(_ci_offs, _ci_sizes)] if on_gpu else cache.ci.unpack(ci_flat)
+
+        # ── CI Hessian: H0|c1> ──
+        _c2e_kw: dict = dict(link_index=linkstrl, return_cupy=on_gpu)
+        if on_gpu:
+            _c2e_kw["contract_2e_backend"] = "cuda"
         with _ah_mixed_precision_ctx(fcisolver, ah_mixed_precision), _absorb_ctx():
             hci1 = [
-                np.asarray(
-                    fcisolver.contract_2e(op_h0, c1, cache.ncas, cache.nelecas, link_index=linkstrl),
-                    dtype=np.float64,
-                ).ravel()
+                fcisolver.contract_2e(_op_h0, c1, cache.ncas, cache.nelecas, **_c2e_kw).ravel()
                 for c1 in ci1_list
             ]
-        hci1 = [hc1 - c1 * float(ec0) for hc1, c1, ec0 in zip(hci1, ci1_list, cache.eci0)]
+        # Intermediate-normalisation correction (zero float() calls on GPU).
+        hci1 = [hc1 - c1 * ec0 for hc1, c1, ec0 in zip(hci1, ci1_list, _eci0)]
         hci1 = [
-            hc1 - (hc0 - c0 * float(ec0)) * float(np.dot(c0, c1))
-            for hc1, hc0, c0, ec0, c1 in zip(hci1, cache.hci0, ci0_list, cache.eci0, ci1_list)
+            hc1 - (hc0 - c0 * ec0) * xp.dot(c0, c1)
+            for hc1, hc0, c0, ec0, c1 in zip(hci1, _hci0, _ci0, _eci0, ci1_list)
         ]
         hci1 = [
-            hc1 - c0 * float(np.dot(hc0 - c0 * float(ec0), c1))
-            for hc1, hc0, c0, ec0, c1 in zip(hci1, cache.hci0, ci0_list, cache.eci0, ci1_list)
+            hc1 - c0 * xp.dot(hc0 - c0 * ec0, c1)
+            for hc1, hc0, c0, ec0, c1 in zip(hci1, _hci0, _ci0, _eci0, ci1_list)
         ]
 
-        rc = np.asarray(x1[:, : cache.ncore], dtype=np.float64, order="C") if cache.ncore else np.zeros((cache.nmo, 0))
-        ra = np.asarray(x1[:, cache.ncore : cache.nocc], dtype=np.float64, order="C")
-        ddm_c = np.zeros((cache.nmo, cache.nmo), dtype=np.float64)
+        # Orbital rotation sub-blocks.
+        rc = xp.asarray(x1[:, : cache.ncore], dtype=xp.float64) if cache.ncore else xp.zeros((cache.nmo, 0), dtype=xp.float64)
+        ra = xp.asarray(x1[:, cache.ncore : cache.nocc], dtype=xp.float64)
+        ddm_c = xp.zeros((cache.nmo, cache.nmo), dtype=xp.float64)
         if cache.ncore:
             ddm_c[:, : cache.ncore] = rc[:, : cache.ncore] * 2.0
             ddm_c[: cache.ncore, :] += rc[:, : cache.ncore].T * 2.0
 
+        # Transition RDMs.
         with _absorb_ctx():
             tdm1, tdm2 = _weighted_trans_rdm12(
                 fcisolver,
                 ci1_list=ci1_list,
-                ci0_list=ci0_list,
-                weights=cache.weights,
+                ci0_list=_ci0,
+                weights=_weights,
                 ncas=cache.ncas,
                 nelecas=cache.nelecas,
                 link_index=linkstr,
+                return_cupy=on_gpu,
             )
         tdm1 = tdm1 + tdm1.T
         tdm2 = tdm2 + tdm2.transpose(1, 0, 3, 2)
         tdm2 = (tdm2 + tdm2.transpose(2, 3, 0, 1)) * 0.5
 
-        ppaa = getattr(eris, "ppaa", None)
-        papa = getattr(eris, "papa", None)
-        if ppaa is None or papa is None:
-            raise ValueError("eris must provide 'ppaa' and 'papa'")
-
-        xp, _on_gpu = _get_xp(ppaa, papa)
-        ppaa_g = _to_xp_f64(ppaa, xp)  # (nmo,nmo,ncas,ncas)
-        papa_g = _to_xp_f64(papa, xp)  # (nmo,ncas,nmo,ncas)
-        paaa = cache.paaa  # numpy (nmo,ncas,ncas,ncas)
-
-        # Upload CPU quantities to GPU for contractions
-        tdm1_g = xp.asarray(tdm1, dtype=xp.float64)
-        tdm2_g = xp.asarray(tdm2, dtype=xp.float64)
-        ddm_c_g = xp.asarray(ddm_c, dtype=xp.float64)
-
+        # MO-basis contractions (on whichever device ppaa/papa reside).
         if cache.ncore:
-            vhf_a = _to_np_f64(
-                xp.einsum("pquv,uv->pq", ppaa_g[:, :cache.ncore], tdm1_g, optimize=True)
-                - 0.5 * xp.einsum("puqv,uv->pq", papa_g[:, :, :cache.ncore], tdm1_g, optimize=True)
+            vhf_a = (
+                xp.einsum("pquv,uv->pq", ppaa[:, : cache.ncore], tdm1, optimize=True)
+                - 0.5 * xp.einsum("puqv,uv->pq", papa[:, :, : cache.ncore], tdm1, optimize=True)
             )
         else:
-            vhf_a = np.empty((cache.nmo, 0), dtype=np.float64)
+            vhf_a = xp.empty((cache.nmo, 0), dtype=xp.float64)
 
-        jk = _to_np_f64(
-            xp.einsum("pquv,pq->uv", ppaa_g, ddm_c_g, optimize=True)
-            - 0.5 * xp.einsum("puqv,pq->uv", papa_g, ddm_c_g, optimize=True)
+        jk = (
+            xp.einsum("pquv,pq->uv", ppaa, ddm_c, optimize=True)
+            - 0.5 * xp.einsum("puqv,pq->uv", papa, ddm_c, optimize=True)
         )
 
-        # paaa contractions — use GPU copy when available
-        paaa_g = getattr(cache, "paaa_gpu", None)
-        if paaa_g is None:
-            paaa_g = xp.asarray(cache.paaa, dtype=xp.float64)
-        else:
-            paaa_g = _to_xp_f64(paaa_g, xp)
-        ra_g = xp.asarray(ra, dtype=xp.float64)
-        tdm2_g = xp.asarray(tdm2, dtype=xp.float64)
+        g_dm2 = xp.einsum("puwx,wxuv->pv", paaa, tdm2, optimize=True)
 
-        g_dm2 = _to_np_f64(xp.einsum("puwx,wxuv->pv", paaa_g, tdm2_g, optimize=True))
-        aaaa = _to_np_f64(
-            (ra_g.T @ paaa_g.reshape(cache.nmo, -1)).reshape((cache.ncas,) * 4)
-        )
+        aaaa = (ra.T @ paaa.reshape(cache.nmo, -1)).reshape((cache.ncas,) * 4)
         aaaa = aaaa + aaaa.transpose(1, 0, 2, 3)
         aaaa = aaaa + aaaa.transpose(2, 3, 0, 1)
 
-        vhf_c = cache.vhf_c
-        h1aa = (cache.h1e_mo[cache.ncore : cache.nocc] + vhf_c[cache.ncore : cache.nocc]) @ ra
+        # ── AO-basis DF-JK (GPU stays on GPU, CPU launches async) ──
+        if on_gpu:
+            if cache.ncore > 0:
+                if _supports_return_gpu:
+                    va, vc = casscf.update_jk_in_ah(mo, x1, _casdm1, eris, return_gpu=True)
+                else:
+                    _va_np, _vc_np = casscf.update_jk_in_ah(mo, x1, _casdm1, eris)
+                    va = xp.asarray(_va_np, dtype=xp.float64)
+                    vc = xp.asarray(_vc_np, dtype=xp.float64)
+        else:
+            _jk_on_gpu = False
+            if cache.ncore > 0:
+                if _supports_return_gpu:
+                    va_dev, vc_dev = casscf.update_jk_in_ah(mo, x1, _casdm1, eris, return_gpu=True)
+                    _jk_on_gpu = True
+                else:
+                    va_np, vc_np = casscf.update_jk_in_ah(mo, x1, _casdm1, eris)
+
+        # ── CI Hessian part 2: orbital-CI coupling ──
+        h1aa = (_h1e_mo[cache.ncore : cache.nocc] + _vhf_c[cache.ncore : cache.nocc]) @ ra
         h1aa = h1aa + h1aa.T + jk
 
         with _ah_mixed_precision_ctx(fcisolver, ah_mixed_precision), _absorb_ctx():
             op_k = fcisolver.absorb_h1e(h1aa, aaaa, cache.ncas, cache.nelecas, 0.5)
             kci0 = [
-                np.asarray(
-                    fcisolver.contract_2e(op_k, c0, cache.ncas, cache.nelecas, link_index=linkstrl),
-                    dtype=np.float64,
-                ).ravel()
-                for c0 in ci0_list
+                fcisolver.contract_2e(op_k, c0, cache.ncas, cache.nelecas, **_c2e_kw).ravel()
+                for c0 in _ci0
             ]
-        kci0 = [kc0 - float(np.dot(kc0, c0)) * c0 for kc0, c0 in zip(kci0, ci0_list)]
+        kci0 = [kc0 - xp.dot(kc0, c0) * c0 for kc0, c0 in zip(kci0, _ci0)]
         hci1 = [hc1 + kc0 for hc1, kc0 in zip(hci1, kci0)]
-        hci1 = [hc1 * float(wi) for hc1, wi in zip(hci1, cache.weights)]
+        hci1 = [hc1 * wi for hc1, wi in zip(hci1, _weights)]
 
-        # Orbital Hessian assembly (CPU — small matrices, GPU overhead not worthwhile)
-        x2 = (cache.h1e_mo @ x1) @ cache.dm1_full
-        g_orb_mat = np.einsum("r,rpq->pq", cache.weights, cache.gpq, optimize=True)
+        # ── Orbital Hessian assembly ──
+        x2 = (_h1e_mo @ x1) @ _dm1_full
+        g_orb_mat = xp.einsum("r,rpq->pq", _weights, _gpq, optimize=True)
         x2 -= (g_orb_mat + g_orb_mat.T) @ x1 * 0.5
         if cache.ncore:
-            x2[: cache.ncore] += (x1[: cache.ncore, cache.ncore :] @ cache.vhf_ca[cache.ncore :]) * 2.0
-        x2[cache.ncore : cache.nocc] += (cache.casdm1 @ x1[cache.ncore : cache.nocc]) @ vhf_c
-        x2[:, cache.ncore : cache.nocc] += np.einsum("purv,rv->pu", cache.hdm2, x1[:, cache.ncore : cache.nocc], optimize=True)
-        if cache.ncore > 0:
-            va, vc = casscf.update_jk_in_ah(mo, x1, cache.casdm1, eris)
-            x2[cache.ncore : cache.nocc] += va
-            x2[: cache.ncore, cache.ncore :] += vc
-        s10 = np.asarray(
-            [float(np.dot(c1, c0)) * 2.0 * float(wi) for c1, c0, wi in zip(ci1_list, ci0_list, cache.weights)],
-            dtype=np.float64,
+            x2[: cache.ncore] += (x1[: cache.ncore, cache.ncore :] @ _vhf_ca[cache.ncore :]) * 2.0
+        x2[cache.ncore : cache.nocc] += (_casdm1 @ x1[cache.ncore : cache.nocc]) @ _vhf_c
+        x2[:, cache.ncore : cache.nocc] += xp.einsum("purv,rv->pu", _hdm2, x1[:, cache.ncore : cache.nocc], optimize=True)
+
+        # ── JK sync ──
+        if on_gpu:
+            if cache.ncore > 0:
+                x2[cache.ncore : cache.nocc] += va
+                x2[: cache.ncore, cache.ncore :] += vc
+        else:
+            if cache.ncore > 0:
+                if _jk_on_gpu:
+                    va = _to_np_f64(va_dev)
+                    vc = _to_np_f64(vc_dev)
+                else:
+                    va, vc = va_np, vc_np
+                x2[cache.ncore : cache.nocc] += va
+                x2[: cache.ncore, cache.ncore :] += vc
+
+        # SA overlap contribution.
+        s10 = xp.asarray(
+            [xp.dot(c1, c0) * 2.0 * wi for c1, c0, wi in zip(ci1_list, _ci0, _weights)],
+            dtype=xp.float64,
         )
         if cache.ncore:
-            x2[:, : cache.ncore] += ((cache.h1e_mo[:, : cache.ncore] + vhf_c[:, : cache.ncore]) * float(np.sum(s10)) + vhf_a) * 2.0
-        x2[:, cache.ncore : cache.nocc] += (cache.h1e_mo[:, cache.ncore : cache.nocc] + vhf_c[:, cache.ncore : cache.nocc]) @ tdm1
+            x2[:, : cache.ncore] += ((_h1e_mo[:, : cache.ncore] + _vhf_c[:, : cache.ncore]) * xp.sum(s10) + vhf_a) * 2.0
+        x2[:, cache.ncore : cache.nocc] += (_h1e_mo[:, cache.ncore : cache.nocc] + _vhf_c[:, cache.ncore : cache.nocc]) @ tdm1
         x2[:, cache.ncore : cache.nocc] += g_dm2
-        x2 -= np.einsum("r,rpq->pq", s10, cache.gpq, optimize=True)
+        x2 -= xp.einsum("r,rpq->pq", s10, _gpq, optimize=True)
         x2 = x2 - x2.T
-        out = np.hstack((casscf.pack_uniq_var(x2) * 2.0, cache.ci.pack(hci1) * 2.0))
-        return np.asarray(out, dtype=np.float64).ravel()
+
+        # Pack output.
+        packed_orb = casscf.pack_uniq_var(x2) * 2.0  # xp-aware (Step 5)
+        if on_gpu:
+            if nroots == 1:
+                packed_ci = hci1[0].ravel() * 2.0
+            else:
+                packed_ci = xp.concatenate([v.ravel() for v in hci1]) * 2.0
+            out = xp.concatenate([packed_orb.ravel(), packed_ci])
+        else:
+            out = np.hstack((packed_orb, cache.ci.pack(hci1) * 2.0))
+        return xp.asarray(out, dtype=xp.float64).ravel()
 
     gauge_l = str(gauge).strip().lower()
     if gauge_l not in ("none", "project", "project_out"):

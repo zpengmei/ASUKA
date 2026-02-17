@@ -172,7 +172,7 @@ class H1E2EContractOp:
     determinant-style "absorb" trick and instead pass the explicit (h1e, eri) pair through.
     """
 
-    h1e: np.ndarray
+    h1e: Any  # np.ndarray or cp.ndarray
     eri: Any
     fac: float = 1.0
 
@@ -682,6 +682,13 @@ class GUGAFCISolver(_StreamObject):
         #
         # None means "auto" (see kernel()).
         self.kernel_blas_nthreads: int | None = getattr(self, "kernel_blas_nthreads", None)
+        # Safety net for pathological Davidson failures: for small CSF spaces we can
+        # deterministically recover roots by explicit full-space diagonalization.
+        self.unconverged_fallback_full_diag = getattr(self, "unconverged_fallback_full_diag", True)
+        self.unconverged_fallback_ncsf_max = int(getattr(self, "unconverged_fallback_ncsf_max", 512))
+        if self.unconverged_fallback_ncsf_max < 1:
+            self.unconverged_fallback_ncsf_max = 1
+        self.raise_on_unconverged = getattr(self, "raise_on_unconverged", False)
         self.rdm_backend = getattr(self, "rdm_backend", "auto")
         # `0` means "auto": use process-wide `lib.num_threads()`.
         self.rdm_nthreads = getattr(self, "rdm_nthreads", 0)
@@ -1517,6 +1524,23 @@ class GUGAFCISolver(_StreamObject):
         # the contract backend builds and caches operators lazily.
         precompute_epq = bool(kwargs.pop("precompute_epq", False))
         max_out = int(kwargs.pop("max_out", 200_000))
+        unconverged_fallback_full_diag = bool(
+            kwargs.pop(
+                "unconverged_fallback_full_diag",
+                getattr(self, "unconverged_fallback_full_diag", True),
+            )
+        )
+        unconverged_fallback_ncsf_max = int(
+            kwargs.pop(
+                "unconverged_fallback_ncsf_max",
+                getattr(self, "unconverged_fallback_ncsf_max", 512),
+            )
+        )
+        if unconverged_fallback_ncsf_max < 1:
+            unconverged_fallback_ncsf_max = 1
+        raise_on_unconverged = bool(
+            kwargs.pop("raise_on_unconverged", getattr(self, "raise_on_unconverged", False))
+        )
         contract_nthreads = int(kwargs.pop("contract_nthreads", int(getattr(self, "contract_nthreads", 0))))
         if contract_nthreads <= 0:
             contract_nthreads = _auto_num_threads()
@@ -3514,7 +3538,14 @@ class GUGAFCISolver(_StreamObject):
 
             raise ValueError(f"unsupported matvec_backend={matvec_backend!r}")
 
-        verbose = kwargs.pop("verbose", self.verbose)
+        verbose_in = kwargs.pop("verbose", self.verbose)
+        if hasattr(verbose_in, "verbose"):
+            verbose = int(getattr(verbose_in, "verbose", 0))
+        else:
+            try:
+                verbose = int(verbose_in)
+            except Exception:
+                verbose = 0
         if matvec_backend == "row_oracle_df" and not bool(getattr(self, "_warned_row_oracle_df", False)):
             warnings.warn(
                 "matvec_backend='row_oracle_df' is a single-threaded Python reference backend; "
@@ -3687,6 +3718,78 @@ class GUGAFCISolver(_StreamObject):
                 if contract_prof_tot is not None:
                     kprof["matvec_contract_profile"] = contract_prof_tot
 
+        conv_arr = np.asarray(self.converged, dtype=np.bool_).ravel()
+        if int(conv_arr.size) == 1 and int(nroots) > 1:
+            conv_arr = np.repeat(conv_arr, int(nroots))
+        if int(conv_arr.size) != int(nroots):
+            conv_arr = np.zeros((int(nroots),), dtype=np.bool_)
+        self.converged = conv_arr
+
+        if not bool(np.all(self.converged)):
+            fallback_used = False
+            if bool(unconverged_fallback_full_diag) and int(ncsf) <= int(unconverged_fallback_ncsf_max):
+                if verbose >= 1:
+                    print(
+                        "  Davidson did not converge; falling back to full-CSF diagonalization "
+                        f"(ncsf={int(ncsf)})."
+                    )
+                hdiag_ps = None if hdiag is None else np.asarray(hdiag, dtype=np.float64)
+                addr_full, h_full = self.pspace(
+                    h1e,
+                    eri,
+                    norb,
+                    nelec,
+                    npsp=int(ncsf),
+                    max_out=int(max_out),
+                    hdiag=hdiag_ps,
+                    orbsym=orbsym,
+                    wfnsym=wfnsym,
+                    ne_constraints=ne_constraints,
+                )
+                if int(np.asarray(addr_full).size) != int(ncsf):
+                    raise RuntimeError(
+                        "full-space fallback failed: pspace address size mismatch "
+                        f"(got {int(np.asarray(addr_full).size)}, expected {int(ncsf)})"
+                    )
+                h_full = np.asarray(h_full, dtype=np.float64)
+                if h_full.shape != (int(ncsf), int(ncsf)):
+                    raise RuntimeError(
+                        "full-space fallback failed: pspace matrix shape mismatch "
+                        f"(got {h_full.shape}, expected {(int(ncsf), int(ncsf))})"
+                    )
+                h_full = 0.5 * (h_full + h_full.T)
+                evals, evecs = np.linalg.eigh(h_full)
+                order = np.argsort(np.asarray(evals, dtype=np.float64))[: int(nroots)]
+                e = np.asarray(evals, dtype=np.float64)[order]
+                addr_idx = np.asarray(addr_full, dtype=np.int64).ravel()
+                ci_full: list[np.ndarray] = []
+                for col in order.tolist():
+                    v_sub = np.asarray(evecs[:, int(col)], dtype=np.float64).ravel()
+                    v_full = np.zeros((int(ncsf),), dtype=np.float64)
+                    v_full[addr_idx] = v_sub
+                    ci_full.append(np.ascontiguousarray(v_full))
+                ci = ci_full
+                self.converged = np.ones((int(nroots),), dtype=np.bool_)
+                fallback_used = True
+                if kprof is not None:
+                    kprof["unconverged_fallback_used"] = True
+                    kprof["unconverged_fallback_ncsf"] = int(ncsf)
+            if not fallback_used:
+                msg = (
+                    "GUGAFCISolver.kernel did not converge for all requested roots "
+                    f"(converged={self.converged.tolist()}, nroots={int(nroots)})."
+                )
+                if kprof is not None:
+                    kprof["unconverged_fallback_used"] = False
+                    kprof["unconverged_fallback_ncsf"] = int(ncsf)
+                if bool(raise_on_unconverged):
+                    raise RuntimeError(
+                        msg
+                        + " Increase max_cycle/max_space, or enable unconverged_fallback_full_diag "
+                        "for small CSF spaces."
+                    )
+                warnings.warn(msg)
+
         e = np.asarray(e, dtype=np.float64) + float(ecore)
         if warm_state_update:
             self._update_warm_state(
@@ -3771,7 +3874,7 @@ class GUGAFCISolver(_StreamObject):
                 raise
 
             # Use the last kernel DRT only if it matches the CI vector length.
-            ncsf_ci = int(np.asarray(civec).size)
+            ncsf_ci = int(civec.size) if hasattr(civec, 'size') else int(np.asarray(civec).size)
             drt_last = self._drt_cache.get(last)
             if drt_last is None:
                 # Rebuild (should be cheap for cached tables; required for external callers).
@@ -4584,8 +4687,19 @@ class GUGAFCISolver(_StreamObject):
         """
         backend = getattr(self, "contract_2e_backend", None) or getattr(self, "matvec_backend", "contract")
         absorb_h1e_mode = str(getattr(self, "absorb_h1e_mode", "tensor")).lower().strip()
-        if absorb_h1e_mode in ("direct", "op", "wrapper") or backend in ("cuda_eri_mat", "cuda"):
-            return H1E2EContractOp(h1e=np.asarray(h1e, dtype=np.float64), eri=eri, fac=float(fac))
+        try:
+            import cupy as _cp_absorb  # type: ignore[import-not-found]
+        except Exception:
+            _cp_absorb = None
+        # Force direct path when h1e is on GPU (tensor path requires numpy).
+        _h1e_is_cupy = _cp_absorb is not None and isinstance(h1e, _cp_absorb.ndarray)
+        if absorb_h1e_mode in ("direct", "op", "wrapper") or backend in ("cuda_eri_mat", "cuda") or _h1e_is_cupy:
+            # Keep h1e as-is (numpy or CuPy) — contract_2e CUDA path handles both.
+            if _h1e_is_cupy:
+                _h1e_stored = _cp_absorb.asarray(h1e, dtype=_cp_absorb.float64)
+            else:
+                _h1e_stored = np.asarray(h1e, dtype=np.float64)
+            return H1E2EContractOp(h1e=_h1e_stored, eri=eri, fac=float(fac))
         if isinstance(eri, (DFMOIntegrals, DeviceDFMOIntegrals)):
             raise NotImplementedError(
                 "absorb_h1e is not supported for DFMOIntegrals/DeviceDFMOIntegrals; pass h1e explicitly to "
@@ -4619,7 +4733,7 @@ class GUGAFCISolver(_StreamObject):
             eri4[:, :, k, k] += f1e
         return restore_eri4(eri4, int(norb)) * float(fac)
 
-    def contract_2e(self, eri, civec, norb: int, nelec: int | tuple[int, int], **kwargs):
+    def contract_2e(self, eri, civec, norb: int, nelec: int | tuple[int, int], *, return_cupy: bool = False, **kwargs):
         scale = 1.0
         if isinstance(eri, H1E2EContractOp):
             # Our CSF "absorbed-ERI" contraction backend (`contract_eri_epq_eqrs_multi`) implements
@@ -4740,7 +4854,15 @@ class GUGAFCISolver(_StreamObject):
                         raise ValueError("DeviceDFMOIntegrals requires eri_mat for CUDA contract_2e")
                     eri_mat_d = cp.ascontiguousarray(cp.asarray(eri.eri_mat, dtype=_ws_dtype))
                     j_ps_d = cp.ascontiguousarray(cp.asarray(eri.j_ps, dtype=_ws_dtype))
-                    h1e_d = cp.asarray(np.asarray(h1e, dtype=np.float64), dtype=_ws_dtype)
+                    # h1e may be numpy or CuPy — cp.asarray handles both.
+                    h1e_d = cp.asarray(h1e, dtype=_ws_dtype)
+                    h_eff_d = h1e_d - 0.5 * j_ps_d
+                elif isinstance(eri, cp.ndarray) and eri.ndim == 4:
+                    # CuPy 4D dense eri — stay on device, no host roundtrip.
+                    eri4_d = cp.ascontiguousarray(eri.astype(cp.float64, copy=False))
+                    eri_mat_d = cp.ascontiguousarray(eri4_d.reshape(nops, nops).astype(_ws_dtype, copy=False))
+                    j_ps_d = cp.einsum("pqqs->ps", eri4_d, optimize=True).astype(_ws_dtype, copy=False)
+                    h1e_d = cp.asarray(h1e, dtype=_ws_dtype)
                     h_eff_d = h1e_d - 0.5 * j_ps_d
                 else:
                     if isinstance(eri, DFMOIntegrals):
@@ -4833,8 +4955,17 @@ class GUGAFCISolver(_StreamObject):
 
                 cuda_ws._contract_2e_integral_key = integral_key
 
-            x_d = cp.ascontiguousarray(cp.asarray(np.asarray(civec, dtype=np.float64), dtype=_ws_dtype).ravel())
+            # Accept both numpy and CuPy civec — avoid roundtrip if already on device.
+            if isinstance(civec, cp.ndarray):
+                x_d = cp.ascontiguousarray(civec.astype(_ws_dtype, copy=False).ravel())
+            else:
+                x_d = cp.ascontiguousarray(cp.asarray(np.asarray(civec, dtype=np.float64), dtype=_ws_dtype).ravel())
             y_d = cuda_ws.hop(x_d, sync=True, check_overflow=True)
+            if return_cupy:
+                out_d = y_d.astype(cp.float64, copy=False)
+                if scale != 1.0:
+                    out_d = out_d * scale
+                return out_d
             out = cp.asnumpy(y_d)
             if scale != 1.0:
                 out = np.asarray(out, dtype=np.float64) * scale
@@ -5077,6 +5208,21 @@ class GUGAFCISolver(_StreamObject):
         )
         if isinstance(eri, DFMOIntegrals):
             from asuka.integrals.oracle_df import connected_row_df as connected_row
+        elif isinstance(eri, DeviceDFMOIntegrals):
+            # DeviceDFMOIntegrals lacks the CPU DF interface needed by connected_row_df.
+            # Materialize dense ERIs from eri_mat and use the standard connected_row.
+            try:
+                import cupy as _cp_ps  # type: ignore[import-not-found]
+            except Exception:
+                _cp_ps = None
+            if eri.eri_mat is not None:
+                _eri_mat = eri.eri_mat
+                if _cp_ps is not None and isinstance(_eri_mat, _cp_ps.ndarray):
+                    _eri_mat = _cp_ps.asnumpy(_eri_mat)
+                eri = np.asarray(_eri_mat, dtype=np.float64).reshape(norb, norb, norb, norb)
+            else:
+                raise ValueError("DeviceDFMOIntegrals requires eri_mat for pspace")
+            from asuka.cuguga.oracle import connected_row
         else:
             from asuka.cuguga.oracle import connected_row
 
@@ -5740,6 +5886,8 @@ class GUGAFCISolver(_StreamObject):
         ci_ket,
         norb: int,
         nelec: int | tuple[int, int],
+        *,
+        return_cupy: bool = False,
         **kwargs,
     ) -> tuple[np.ndarray, np.ndarray]:
         """Transition (dm1, dm2) between CI vectors in the active MO basis.
@@ -5846,10 +5994,23 @@ class GUGAFCISolver(_StreamObject):
                 )
                 self._rdm_cuda_ws_cache[ws_key] = ws
 
+            # Pass ci vectors as-is (numpy or CuPy); trans_rdm12_cuda handles both.
+            try:
+                import cupy as _cp_rdm  # type: ignore[import-not-found]
+            except Exception:
+                _cp_rdm = None
+            if _cp_rdm is not None and isinstance(ci_bra, _cp_rdm.ndarray):
+                _bra = ci_bra.astype(_cp_rdm.float64, copy=False)
+            else:
+                _bra = np.asarray(ci_bra, dtype=np.float64)
+            if _cp_rdm is not None and isinstance(ci_ket, _cp_rdm.ndarray):
+                _ket = ci_ket.astype(_cp_rdm.float64, copy=False)
+            else:
+                _ket = np.asarray(ci_ket, dtype=np.float64)
             return trans_rdm12_cuda(
                 drt,
-                np.asarray(ci_bra, dtype=np.float64),
-                np.asarray(ci_ket, dtype=np.float64),
+                _bra,
+                _ket,
                 workspace=ws,
                 block_nops=rdm_block_nops,
                 build_threads=build_threads,
@@ -5862,6 +6023,7 @@ class GUGAFCISolver(_StreamObject):
                 fixed_point_max_mantissa_bits=None if max_bits is None else int(max_bits),
                 fixed_point_mantissa_bit_offset=None if bit_offset is None else int(bit_offset),
                 streaming_ncsf_cutoff=int(streaming_ncsf_cutoff),
+                return_cupy=return_cupy,
             )
 
         # Keep behavior consistent with `make_rdm12`: ensure the E_pq cache exists.
@@ -5957,13 +6119,17 @@ def _normalize_ci0(ci0, *, nroots: int, ncsf: int) -> list[np.ndarray]:
 
 
 def _validate_civec_shape(civec, ncsf: int) -> None:
+    # Support both NumPy and CuPy arrays — use .ndim/.size/.shape directly
+    # rather than np.asarray() which fails for CuPy.
+    if hasattr(civec, 'ndim') and hasattr(civec, 'size'):
+        if civec.ndim == 1 and int(civec.size) == ncsf:
+            return
+        if civec.ndim == 2 and civec.shape == (1, ncsf):
+            return
+        raise ValueError(f"expected civec shape ({ncsf},) or (1,{ncsf}), got {civec.shape}")
     arr = np.asarray(civec)
     if arr.ndim == 1 and arr.size == ncsf:
         return
-    # Some PySCF code paths (notably SA-CASSCF gradients via newton_casscf)
-    # may wrap a single CI vector as a length-1 list, which NumPy views as
-    # shape (1, ncsf). Accept this and rely on downstream `.ravel()` to
-    # canonicalize.
     if arr.ndim == 2 and arr.shape == (1, ncsf):
         return
     raise ValueError(f"expected civec shape ({ncsf},) or (1,{ncsf}), got {arr.shape}")

@@ -27,7 +27,6 @@ from asuka.integrals.eri4c_deriv_contracted import (
 )
 from asuka.integrals.int1e_cart import (
     build_int1e_cart,
-    contract_dS_cart,
     contract_dS_ip_cart,
     contract_dhcore_cart,
 )
@@ -695,21 +694,12 @@ def _grad_elec_active_dense(
         threads=int(threads),
     )
 
-    C = _asnumpy_f64(mo_coeff)
-    dme0 = C @ ((gfock + gfock.T) * 0.5) @ C.T
-
     shell_atom = cache_cpu.shell_atom
     de_h1 = contract_dhcore_cart(
         ao_basis,
         atom_coords_bohr=atom_coords_bohr,
         atom_charges=atom_charges,
         M=D_tot_ao,
-        shell_atom=shell_atom,
-    )
-    de_S = -contract_dS_cart(
-        ao_basis,
-        atom_coords_bohr=atom_coords_bohr,
-        M=dme0,
         shell_atom=shell_atom,
     )
 
@@ -729,7 +719,7 @@ def _grad_elec_active_dense(
     )
 
     # Core-only RHF-like subtraction.
-    D_core_only, dme_core = _core_energy_weighted_density_dense(
+    D_core_only, _dme_core = _core_energy_weighted_density_dense(
         mo_coeff=mo_coeff,
         h_ao=h_ao_use,
         vhf_c_ao=vhf_c_ao,
@@ -740,12 +730,6 @@ def _grad_elec_active_dense(
         atom_coords_bohr=atom_coords_bohr,
         atom_charges=atom_charges,
         M=D_core_only,
-        shell_atom=shell_atom,
-    )
-    de_S_core = -contract_dS_cart(
-        ao_basis,
-        atom_coords_bohr=atom_coords_bohr,
-        M=dme_core,
         shell_atom=shell_atom,
     )
     zero_dm1 = np.zeros((int(ncas), int(ncas)), dtype=np.float64)
@@ -765,7 +749,7 @@ def _grad_elec_active_dense(
         threads=int(threads),
     )
 
-    return np.asarray(de_h1 + de_S + de_2e - de_h1_core - de_S_core - de_2e_core, dtype=np.float64)
+    return np.asarray(de_h1 + de_2e - de_h1_core - de_2e_core, dtype=np.float64)
 
 
 def _dense_ppaa_papa_from_eri_ao(
@@ -993,20 +977,12 @@ def _Lorb_dot_dgorb_dx_dense(
     gfock += (C @ np.asarray(t1, dtype=np.float64) @ C_act.T)
     gfock += (C @ np.asarray(t2, dtype=np.float64) @ C_L_act.T)
 
-    dme0 = 0.5 * (gfock + gfock.T)
-
     shell_atom = cache_cpu.shell_atom
     de_h1 = contract_dhcore_cart(
         ao_basis,
         atom_coords_bohr=atom_coords_bohr,
         atom_charges=atom_charges,
         M=D_L,
-        shell_atom=shell_atom,
-    )
-    de_S = -contract_dS_cart(
-        ao_basis,
-        atom_coords_bohr=atom_coords_bohr,
-        M=dme0,
         shell_atom=shell_atom,
     )
 
@@ -1026,7 +1002,7 @@ def _Lorb_dot_dgorb_dx_dense(
         threads=int(threads),
     )
 
-    return np.asarray(de_h1 + de_S + de_2e, dtype=np.float64)
+    return np.asarray(de_h1 + de_2e, dtype=np.float64)
 
 @dataclass(frozen=True)
 class DenseNACCPUCache:

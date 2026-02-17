@@ -591,6 +591,7 @@ def trans_rdm12_cuda(
     fixed_point_max_mantissa_bits: int | None = None,
     fixed_point_mantissa_bit_offset: int | None = None,
     streaming_ncsf_cutoff: int | None = None,
+    return_cupy: bool = False,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Compute transition (dm1, dm2) on GPU using (segment-walk -> T) then cuBLAS (dm1, cross-Gram).
 
@@ -614,8 +615,17 @@ def trans_rdm12_cuda(
     except Exception as e:  # pragma: no cover
         raise RuntimeError("CuPy is required for the CUDA RDM backend") from e
 
-    cbra = np.asarray(ci_bra, dtype=np.float64).ravel()
-    cket = np.asarray(ci_ket, dtype=np.float64).ravel()
+    # Accept both numpy and CuPy ci vectors.
+    if isinstance(ci_bra, cp.ndarray):
+        cbra = ci_bra.astype(cp.float64, copy=False).ravel()
+        _civec_on_device = True
+    else:
+        cbra = np.asarray(ci_bra, dtype=np.float64).ravel()
+        _civec_on_device = False
+    if isinstance(ci_ket, cp.ndarray):
+        cket = ci_ket.astype(cp.float64, copy=False).ravel()
+    else:
+        cket = np.asarray(ci_ket, dtype=np.float64).ravel()
     if cbra.size != ncsf or cket.size != ncsf:
         raise ValueError("ci_bra/ci_ket have wrong length")
 
@@ -649,6 +659,7 @@ def trans_rdm12_cuda(
             fixed_point_mantissa_bit_offset=fixed_point_mantissa_bit_offset,
         )
 
+    # cp.asarray is a no-op if already on device with matching dtype.
     cbra_gpu = cp.asarray(cbra, dtype=cp.float64)
     cket_gpu = cp.asarray(cket, dtype=cp.float64)
 
@@ -987,6 +998,17 @@ def trans_rdm12_cuda(
             dm1_out=dm1_pq_gpu,
             gram_out=gram0_gpu,
         )
+
+    if return_cupy:
+        # Keep everything on GPU — zero sync points.
+        dm1 = dm1_pq_gpu.reshape(norb, norb).T.copy()
+        swap = cp.arange(nops, dtype=cp.int32).reshape(norb, norb).T.ravel()
+        gram = gram0_gpu.T[swap]
+        dm2 = gram.reshape(norb, norb, norb, norb).copy()
+        for p in range(norb):
+            for q in range(norb):
+                dm2[p, q, q, :] -= dm1[:, p]
+        return cp.asarray(dm1, dtype=cp.float64), cp.asarray(dm2, dtype=cp.float64)
 
     dm1_pq = cp.asnumpy(dm1_pq_gpu)
     gram0 = cp.asnumpy(gram0_gpu).T.copy()

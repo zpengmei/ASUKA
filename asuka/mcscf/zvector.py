@@ -121,6 +121,7 @@ class MCSCFHessianOp:
     is_sa: bool
     ci_ref_list: list[np.ndarray] | None
     sa_gram_inv: np.ndarray | None = None
+    gpu_mode: bool = False  # True when h_op supports CuPy arrays natively
 
     @property
     def n_tot(self) -> int:
@@ -432,9 +433,28 @@ def _project_sa_ci_components(
     Notes
     -----
     This routine assumes all CI roots live in the same CI space (same flattened size).
+    Supports both numpy and CuPy arrays — dispatches based on input type.
     """
 
-    c_list = [np.asarray(c, dtype=np.float64).ravel() for c in ci0]
+    # Detect array backend from input vectors.
+    try:
+        import cupy as _cp_proj  # type: ignore[import-not-found]
+    except Exception:
+        _cp_proj = None
+    _on_gpu = False
+    if _cp_proj is not None:
+        for v in vecs:
+            if isinstance(v, _cp_proj.ndarray):
+                _on_gpu = True
+                break
+        if not _on_gpu:
+            for c in ci0:
+                if isinstance(c, _cp_proj.ndarray):
+                    _on_gpu = True
+                    break
+    xp = _cp_proj if _on_gpu else np
+
+    c_list = [xp.asarray(c, dtype=xp.float64).ravel() for c in ci0]
     sizes = {int(c.size) for c in c_list}
     if len(sizes) != 1:
         return vecs
@@ -443,42 +463,41 @@ def _project_sa_ci_components(
     if nroots <= 0:
         return vecs
 
-    gram_inv_use: np.ndarray
     if gram_inv is None:
-        gram = np.empty((nroots, nroots), dtype=np.float64)
+        gram = xp.empty((nroots, nroots), dtype=xp.float64)
         for i in range(nroots):
             ci = c_list[i]
-            gram[i, i] = float(np.dot(ci, ci))
+            gram[i, i] = xp.dot(ci, ci)
             for j in range(i + 1, nroots):
-                cij = float(np.dot(ci, c_list[j]))
+                cij = xp.dot(ci, c_list[j])
                 gram[i, j] = cij
                 gram[j, i] = cij
         try:
-            gram_inv_use = np.linalg.inv(gram)
-        except np.linalg.LinAlgError:  # pragma: no cover
-            gram_inv_use = np.linalg.pinv(gram)
+            gram_inv_use = xp.linalg.inv(gram)
+        except xp.linalg.LinAlgError:  # pragma: no cover
+            gram_inv_use = xp.linalg.pinv(gram)
     else:
-        gram_inv_use = np.asarray(gram_inv, dtype=np.float64)
+        gram_inv_use = xp.asarray(gram_inv, dtype=xp.float64)
         if gram_inv_use.shape != (nroots, nroots):
             raise ValueError("SA gram_inv shape mismatch in projection")
 
-    out: list[np.ndarray] = []
+    out: list = []
     for v in vecs:
-        v_arr = np.asarray(v, dtype=np.float64)
+        v_arr = xp.asarray(v, dtype=xp.float64)
         shape = v_arr.shape
         v_flat = v_arr.ravel()
         if int(v_flat.size) != nci:
             raise ValueError("SA CI vector size mismatch in projection")
 
-        coeff = np.empty(nroots, dtype=np.float64)
+        coeff = xp.empty(nroots, dtype=xp.float64)
         for i in range(nroots):
-            coeff[i] = float(np.dot(c_list[i], v_flat))
+            coeff[i] = xp.dot(c_list[i], v_flat)
         alpha = gram_inv_use @ coeff
 
-        v_proj = np.array(v_flat, dtype=np.float64, copy=True)
+        v_proj = v_flat.copy()
         for i in range(nroots):
-            v_proj -= float(alpha[i]) * c_list[i]
-        out.append(np.ascontiguousarray(v_proj.reshape(shape)))
+            v_proj -= alpha[i] * c_list[i]
+        out.append(xp.ascontiguousarray(v_proj.reshape(shape)))
 
     return out
 
@@ -518,6 +537,114 @@ def _extract_h_diag(h_diag: Any, n_orb: int, ci_template: Any) -> np.ndarray | N
     return None
 
 
+def _gmres_solve_gpu(
+    mv: Callable,
+    b: np.ndarray,
+    *,
+    diag_precond: np.ndarray | None = None,
+    precond: Callable | None = None,
+    tol: float = 1e-10,
+    maxiter: int = 200,
+    restart: int | None = None,
+    x0: np.ndarray | None = None,
+) -> tuple[np.ndarray, dict[str, Any]]:
+    """GPU-native GMRES solve using CuPy — zero GPU↔CPU sync during iteration."""
+
+    import cupy as cp  # type: ignore[import-not-found]
+    from cupyx.scipy.sparse.linalg import LinearOperator as CuLinearOperator
+    from cupyx.scipy.sparse.linalg import gmres as cu_gmres
+
+    b_np = np.asarray(b, dtype=np.float64).ravel()
+    n = int(b_np.size)
+    bnorm = float(np.linalg.norm(b_np))
+    if n == 0:
+        return b_np.copy(), {
+            "info": 0, "niter": 0, "matvec_calls": 0,
+            "matvec_time_total": 0.0, "matvec_time_avg": 0.0,
+            "solve_time_total": 0.0, "rhs_norm": 0.0,
+            "residual_norm": 0.0, "residual_rel": 0.0,
+            "solver": "gmres_gpu",
+        }
+
+    b_d = cp.asarray(b_np, dtype=cp.float64)
+
+    matvec_calls = 0
+    matvec_time = 0.0
+
+    def _mv_gpu(x_d):
+        nonlocal matvec_calls, matvec_time
+        matvec_calls += 1
+        t0 = time.perf_counter()
+        y_d = mv(x_d)
+        # Ensure result is CuPy float64.
+        y_d = cp.asarray(y_d, dtype=cp.float64).ravel()
+        matvec_time += time.perf_counter() - t0
+        return y_d
+
+    A = CuLinearOperator((n, n), matvec=_mv_gpu, dtype=cp.float64)
+
+    # Preconditioner on GPU.
+    M = None
+    if precond is not None:
+        # precond is CPU-based (e.g. SA Lagrange); roundtrip through numpy.
+        def _m_mv_gpu(x_d):
+            x_np = cp.asnumpy(x_d).astype(np.float64)
+            y_np = np.asarray(precond(x_np), dtype=np.float64).ravel()
+            return cp.asarray(y_np, dtype=cp.float64)
+        M = CuLinearOperator((n, n), matvec=_m_mv_gpu, dtype=cp.float64)
+    elif diag_precond is not None:
+        d = cp.asarray(diag_precond, dtype=cp.float64).ravel()
+        if d.size != n:
+            raise ValueError("diag_precond length mismatch")
+        d_safe = cp.where(cp.abs(d) > 1e-14, d, 1.0)
+        def _m_mv_gpu(x_d):
+            return x_d / d_safe
+        M = CuLinearOperator((n, n), matvec=_m_mv_gpu, dtype=cp.float64)
+
+    x0_d = None
+    if x0 is not None:
+        x0_d = cp.asarray(x0, dtype=cp.float64).ravel()
+        if x0_d.size != n:
+            raise ValueError("x0 length mismatch")
+
+    restart_val = restart if restart is not None else min(n, 30)
+
+    t_solve0 = time.perf_counter()
+    # CuPy GMRES: all iterations on GPU, zero sync.
+    x_d, info = cu_gmres(
+        A, b_d,
+        x0=x0_d,
+        tol=float(tol),
+        maxiter=int(maxiter),
+        restart=int(restart_val),
+        M=M,
+    )
+    solve_time = time.perf_counter() - t_solve0
+
+    # Single sync at end of entire solve.
+    x = cp.asnumpy(x_d)
+    x = np.asarray(x, dtype=np.float64).ravel()
+
+    # Compute residual on CPU.
+    r_d = mv(cp.asarray(x, dtype=cp.float64)) - b_d
+    resid = float(cp.linalg.norm(r_d))
+    rel = resid / bnorm if bnorm > 0.0 else resid
+
+    out: dict[str, Any] = {
+        "info": int(info),
+        "niter": int(matvec_calls),  # CuPy doesn't expose iteration count separately
+        "matvec_calls": int(matvec_calls),
+        "matvec_time_total": float(matvec_time),
+        "matvec_time_avg": float(matvec_time) / float(matvec_calls) if matvec_calls else 0.0,
+        "solve_time_total": float(solve_time),
+        "rhs_norm": float(bnorm),
+        "residual_norm": resid,
+        "residual_rel": float(rel),
+        "solver": "gmres_gpu",
+    }
+    return x, out
+
+
 def _gmres_solve(
     mv: Callable[[np.ndarray], np.ndarray],
     b: np.ndarray,
@@ -528,6 +655,7 @@ def _gmres_solve(
     maxiter: int = 200,
     restart: int | None = None,
     x0: np.ndarray | None = None,
+    use_gpu: bool = False,
 ) -> tuple[np.ndarray, dict[str, Any]]:
     """Solve A x = b with restarted GMRES.
 
@@ -563,6 +691,12 @@ def _gmres_solve(
       indefinite and the effective operator returned by PySCF is not guaranteed
       to be SPD.
     """
+
+    if use_gpu:
+        return _gmres_solve_gpu(
+            mv, b, diag_precond=diag_precond, precond=precond,
+            tol=tol, maxiter=maxiter, restart=restart, x0=x0,
+        )
 
     from scipy.sparse.linalg import LinearOperator, gmres
 
@@ -1040,36 +1174,67 @@ def build_mcscf_hessian_operator(
                     f"n_tot={n_tot} < n_ci={n_ci}"
                 )
 
-            def _mv(x: np.ndarray) -> np.ndarray:
-                x = np.asarray(x, dtype=np.float64).ravel()
+            # Detect GPU mode from h_op's closure (eris on GPU → full GPU matvec).
+            _mv_gpu_mode = False
+            try:
+                import cupy as _cp_mv  # type: ignore[import-not-found]
+                # Check if eris are on GPU by inspecting the integral object.
+                _eris_ppaa = getattr(_eris, "ppaa", None) if _eris is not None else None
+                if _cp_mv is not None and _eris_ppaa is not None and isinstance(_eris_ppaa, _cp_mv.ndarray):
+                    _mv_gpu_mode = True
+                    # Pre-upload SA reference CI vectors and gram_inv for GPU projection.
+                    if is_sa and ci_ref_list is not None:
+                        _ci_ref_dev = [_cp_mv.asarray(c, dtype=_cp_mv.float64).ravel() for c in ci_ref_list]
+                        _sa_gram_inv_dev = _cp_mv.asarray(sa_gram_inv, dtype=_cp_mv.float64) if sa_gram_inv is not None else None
+                        _ci_sizes_mv = [int(c.size) for c in _ci_ref_dev]
+                        _ci_offs_mv: list[int] = [0]
+                        for _ss in _ci_sizes_mv[:-1]:
+                            _ci_offs_mv.append(_ci_offs_mv[-1] + _ss)
+            except Exception:
+                _cp_mv = None
+
+            def _ci_unflatten_xp(xp_mod, flat):
+                """Unflatten CI vector using xp — works for both numpy and CuPy."""
+                if not is_sa or ci_ref_list is None:
+                    return [flat.copy()]
+                parts = []
+                off = 0
+                for c in (ci_ref_list if xp_mod is np else _ci_ref_dev):
+                    s = int(c.size)
+                    parts.append(flat[off:off + s].copy())
+                    off += s
+                return parts
+
+            def _mv(x):
+                # Detect xp from input — CuPy GMRES passes CuPy arrays.
+                _is_gpu = _cp_mv is not None and isinstance(x, _cp_mv.ndarray)
+                xp = _cp_mv if _is_gpu else np
+                x = xp.asarray(x, dtype=xp.float64).ravel()
                 if x.size != n_tot:
                     raise ValueError("h_op input length mismatch")
 
                 if is_sa:
-                    # Enforce the SA gauge on the *input* as well. The SA super-Hessian is
-                    # singular in the CI root-span directions; projecting the input keeps the
-                    # Krylov iterates from accumulating uncontrolled components in this nullspace.
                     x_orb = x[:n_orb]
-                    x_ci_list = ci_unflatten(x[n_orb:])
-                    if not isinstance(x_ci_list, list) or ci_ref_list is None:
-                        raise RuntimeError("internal error: expected list CI unpacking for SA-CASSCF")
-                    x_ci_list = _project_sa_ci_components(ci_ref_list, x_ci_list, gram_inv=sa_gram_inv)
-                    x = np.concatenate([x_orb, np.concatenate([np.asarray(v).ravel() for v in x_ci_list])])
+                    x_ci_list = _ci_unflatten_xp(xp, x[n_orb:])
+                    if ci_ref_list is None:
+                        raise RuntimeError("internal error: expected ci_ref_list for SA-CASSCF")
+                    _refs = _ci_ref_dev if _is_gpu else ci_ref_list
+                    _ginv = _sa_gram_inv_dev if (_is_gpu and _mv_gpu_mode) else sa_gram_inv
+                    x_ci_list = _project_sa_ci_components(_refs, x_ci_list, gram_inv=_ginv)
+                    x = xp.concatenate([x_orb, xp.concatenate([xp.asarray(v, dtype=xp.float64).ravel() for v in x_ci_list])])
 
                 y = h_op(x)
-                y = np.asarray(y, dtype=np.float64).ravel()
+                y = xp.asarray(y, dtype=xp.float64).ravel()
                 if y.size != n_tot:
                     raise ValueError("h_op output length mismatch")
 
                 if is_sa:
-                    # Match PySCF's `sacasscf.Gradients.project_Aop`: project the *output*
-                    # CI block to remove redundant root-span components.
                     y_orb = y[:n_orb]
-                    y_ci_list = ci_unflatten(y[n_orb:])
-                    if not isinstance(y_ci_list, list) or ci_ref_list is None:
-                        raise RuntimeError("internal error: expected list CI unpacking for SA-CASSCF")
-                    y_ci_list = _project_sa_ci_components(ci_ref_list, y_ci_list, gram_inv=sa_gram_inv)
-                    y = np.concatenate([y_orb, np.concatenate([np.asarray(v).ravel() for v in y_ci_list])])
+                    y_ci_list = _ci_unflatten_xp(xp, y[n_orb:])
+                    if ci_ref_list is None:
+                        raise RuntimeError("internal error: expected ci_ref_list for SA-CASSCF")
+                    y_ci_list = _project_sa_ci_components(_refs, y_ci_list, gram_inv=_ginv)
+                    y = xp.concatenate([y_orb, xp.concatenate([xp.asarray(v, dtype=xp.float64).ravel() for v in y_ci_list])])
 
                 return y
 
@@ -1092,6 +1257,7 @@ def build_mcscf_hessian_operator(
                 is_sa=bool(is_sa),
                 ci_ref_list=ci_ref_list,
                 sa_gram_inv=sa_gram_inv,
+                gpu_mode=bool(_mv_gpu_mode),
             )
         except Exception:
             if use_newton_hessian:
@@ -1413,7 +1579,7 @@ def solve_mcscf_zvector(
                     if x0_orb is not None:
                         gmres_kwargs["x0"] = np.asarray(x0_orb, dtype=np.float64).ravel()
                     with ctx_rdm:
-                        z_orb, info = _gmres_solve(op.mv, b_orb, **gmres_kwargs)
+                        z_orb, info = _gmres_solve(op.mv, b_orb, **gmres_kwargs, use_gpu=False)
 
                 z_orb = np.asarray(z_orb, dtype=np.float64).ravel()
                 z = np.concatenate([z_orb, np.zeros(int(op.n_ci), dtype=np.float64)])
@@ -1463,7 +1629,7 @@ def solve_mcscf_zvector(
                 if x0_use is not None:
                     gmres_kwargs["x0"] = np.asarray(x0_use, dtype=np.float64).ravel()
                 with ctx_rdm:
-                    z, info = _gmres_solve(op.mv, b, **gmres_kwargs)
+                    z, info = _gmres_solve(op.mv, b, **gmres_kwargs, use_gpu=bool(op.gpu_mode))
 
             z = np.asarray(z, dtype=np.float64).ravel()
             z_orb = z[: int(op.n_orb)].copy()

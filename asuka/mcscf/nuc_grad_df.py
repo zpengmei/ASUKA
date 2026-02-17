@@ -35,11 +35,36 @@ from asuka.integrals.grad import (
     compute_df_gradient_contributions_analytic_packed_bases,
     compute_df_gradient_contributions_fd_packed_bases,
 )
-from asuka.integrals.int1e_cart import contract_dS_cart, contract_dhcore_cart, shell_to_atom_map
+from asuka.integrals.int1e_cart import contract_dhcore_cart, shell_to_atom_map
 from asuka.solver import GUGAFCISolver
 
 from .state_average import ci_as_list, make_state_averaged_rdms, normalize_weights
 from .cphf_df import solve_rhf_cphf_df
+
+# ---------------------------------------------------------------------------
+# xp (numpy / cupy) dispatch utilities
+# ---------------------------------------------------------------------------
+from asuka.hf.df_scf import _get_xp as _get_xp_arrays  # noqa: E402
+
+
+def _resolve_xp(df_backend: str):
+    """Return ``(xp, is_gpu)`` based on *df_backend* string."""
+    if str(df_backend).strip().lower() == "cuda":
+        try:
+            import cupy as cp  # type: ignore[import-not-found]
+
+            return cp, True
+        except ImportError:
+            raise RuntimeError("df_backend='cuda' requires CuPy")
+    return np, False
+
+
+def _as_xp_f64(xp, a):
+    """Convert any array-like to *xp* float64."""
+    # When target is numpy but input is a CuPy array, pull to CPU first.
+    if xp is np and hasattr(a, "get"):
+        a = a.get()
+    return xp.asarray(a, dtype=xp.float64)
 
 
 def _asnumpy_f64(a: Any) -> np.ndarray:
@@ -153,9 +178,10 @@ def _build_gfock_casscf_df(
     if ncore < 0 or ncas <= 0:
         raise ValueError("invalid ncore/ncas")
 
-    B_ao = np.asarray(B_ao, dtype=np.float64)
-    h_ao = np.asarray(h_ao, dtype=np.float64)
-    C = np.asarray(C, dtype=np.float64)
+    xp, _ = _get_xp_arrays(B_ao, C)
+    B_ao = xp.asarray(B_ao, dtype=xp.float64)
+    h_ao = xp.asarray(h_ao, dtype=xp.float64)
+    C = xp.asarray(C, dtype=xp.float64)
     if B_ao.ndim != 3:
         raise ValueError("B_ao must have shape (nao, nao, naux)")
     if h_ao.ndim != 2 or h_ao.shape[0] != h_ao.shape[1]:
@@ -172,11 +198,11 @@ def _build_gfock_casscf_df(
     if nocc > nmo:
         raise ValueError("ncore+ncas exceeds nmo")
 
-    dm1_act = np.asarray(dm1_act, dtype=np.float64)
+    dm1_act = xp.asarray(dm1_act, dtype=xp.float64)
     if dm1_act.shape != (ncas, ncas):
         raise ValueError("dm1_act shape mismatch")
 
-    dm2_arr = np.asarray(dm2_act, dtype=np.float64)
+    dm2_arr = xp.asarray(dm2_act, dtype=xp.float64)
     if dm2_arr.shape != (ncas, ncas, ncas, ncas):
         raise ValueError("dm2_act must have shape (ncas,ncas,ncas,ncas)")
 
@@ -186,7 +212,7 @@ def _build_gfock_casscf_df(
     if ncore:
         D_core_ao = 2.0 * (C_core @ C_core.T)
     else:
-        D_core_ao = np.zeros((nao, nao), dtype=np.float64)
+        D_core_ao = xp.zeros((nao, nao), dtype=xp.float64)
     D_act_ao = C_act @ dm1_act @ C_act.T
     D_tot_ao = D_core_ao + D_act_ao
 
@@ -202,8 +228,8 @@ def _build_gfock_casscf_df(
     vhf_ca_mo = C.T @ vhf_ca_ao @ C
 
     # DF MO factors for dm2 contraction (same construction as orbital_grad_df)
-    X = np.einsum("mnQ,nv->mvQ", B_ao, C_act, optimize=True)
-    L_pact = np.einsum("mp,mvQ->pvQ", C, X, optimize=True)  # (nmo,ncas,naux)
+    X = xp.einsum("mnQ,nv->mvQ", B_ao, C_act, optimize=True)
+    L_pact = xp.einsum("mp,mvQ->pvQ", C, X, optimize=True)  # (nmo,ncas,naux)
     L_act = L_pact[ncore:nocc]  # (ncas,ncas,naux)
 
     dm2_flat = dm2_arr.reshape(ncas * ncas, ncas * ncas)
@@ -213,10 +239,10 @@ def _build_gfock_casscf_df(
     # T[Q,u,v] = sum_{w,x} L[w,x,Q] * dm2[w,x,u,v]
     T_flat = L2.T @ dm2_flat  # (naux,ncas^2)
     T = T_flat.reshape(L2.shape[1], ncas, ncas)
-    g_dm2 = np.einsum("puQ,Quv->pv", L_pact, T, optimize=True)  # (nmo,ncas)
+    g_dm2 = xp.einsum("puQ,Quv->pv", L_pact, T, optimize=True)  # (nmo,ncas)
 
     # Generalized Fock (g) matrix: only core+active columns are defined.
-    gfock = np.zeros((nmo, nmo), dtype=np.float64)
+    gfock = xp.zeros((nmo, nmo), dtype=xp.float64)
     if ncore:
         gfock[:, :ncore] = 2.0 * (h_mo + vhf_ca_mo)[:, :ncore]
     gfock[:, ncore:nocc] = (h_mo + vhf_c_mo)[:, ncore:nocc] @ dm1_act + g_dm2
@@ -253,15 +279,16 @@ def _build_bar_L_casscf_df(
         The partial derivative of energy w.r.t B tensor elements.
     """
 
-    B_ao = np.asarray(B_ao, dtype=np.float64)
+    xp, _ = _get_xp_arrays(B_ao)
+    B_ao = xp.asarray(B_ao, dtype=xp.float64)
     if B_ao.ndim != 3:
         raise ValueError("B_ao must have shape (nao, nao, naux)")
     nao, nao1, naux = map(int, B_ao.shape)
     if nao != nao1:
         raise ValueError("B_ao must have shape (nao, nao, naux)")
 
-    D_core_ao = np.asarray(D_core_ao, dtype=np.float64)
-    D_act_ao = np.asarray(D_act_ao, dtype=np.float64)
+    D_core_ao = xp.asarray(D_core_ao, dtype=xp.float64)
+    D_act_ao = xp.asarray(D_act_ao, dtype=xp.float64)
     if D_core_ao.shape != (nao, nao) or D_act_ao.shape != (nao, nao):
         raise ValueError("AO density shape mismatch")
 
@@ -275,9 +302,9 @@ def _build_bar_L_casscf_df(
 
     bar_J = sigma[:, None, None] * D_core_ao[None, :, :] + rho[:, None, None] * D_w[None, :, :]
 
-    BQ = np.transpose(B_ao, (2, 0, 1))  # (naux,nao,nao)
-    t1 = np.matmul(np.matmul(D_core_ao[None, :, :], BQ), D_w)  # D_core * B_Q * D_w
-    t2 = np.matmul(np.matmul(D_w[None, :, :], BQ), D_core_ao)  # D_w * B_Q * D_core
+    BQ = xp.transpose(B_ao, (2, 0, 1))  # (naux,nao,nao)
+    t1 = xp.matmul(xp.matmul(D_core_ao[None, :, :], BQ), D_w)  # D_core * B_Q * D_w
+    t2 = xp.matmul(xp.matmul(D_w[None, :, :], BQ), D_core_ao)  # D_w * B_Q * D_core
     bar_K = -0.5 * (t1 + t2)
 
     bar_mean = bar_J + bar_K
@@ -285,20 +312,20 @@ def _build_bar_L_casscf_df(
     # Active-active 2-RDM term:
     #   E_aa = 0.5 Σ_{uvwx} dm2_uvwx (uv|wx)
     # with (uv|wx) ≈ Σ_Q L_uv,Q L_wx,Q and L_uv,Q = C^T B_Q C in active MO space.
-    C_act = np.asarray(C_act, dtype=np.float64)
+    C_act = xp.asarray(C_act, dtype=xp.float64)
     if C_act.ndim != 2 or int(C_act.shape[0]) != int(nao):
         raise ValueError("C_act shape mismatch")
     ncas = int(C_act.shape[1])
     if ncas <= 0:
         raise ValueError("empty active space")
 
-    dm2_arr = np.asarray(dm2_act, dtype=np.float64)
+    dm2_arr = xp.asarray(dm2_act, dtype=xp.float64)
     if dm2_arr.shape != (ncas, ncas, ncas, ncas):
         raise ValueError("dm2_act shape mismatch")
 
     # L_uv,Q in active MO indices
-    X = np.einsum("mnQ,nv->mvQ", B_ao, C_act, optimize=True)
-    L_act = np.einsum("mu,mvQ->uvQ", C_act, X, optimize=True)  # (ncas,ncas,naux)
+    X = xp.einsum("mnQ,nv->mvQ", B_ao, C_act, optimize=True)
+    L_act = xp.einsum("mu,mvQ->uvQ", C_act, X, optimize=True)  # (ncas,ncas,naux)
 
     L2 = L_act.reshape(ncas * ncas, naux)
     dm2_flat = dm2_arr.reshape(ncas * ncas, ncas * ncas)
@@ -306,12 +333,12 @@ def _build_bar_L_casscf_df(
     M = dm2_flat @ L2  # (ncas^2,naux), M_uv,Q = sum_{wx} dm2_uvwx L_wx,Q
     M_uvQ = M.reshape(ncas, ncas, naux)
 
-    tmp = np.einsum("mu,uvQ->mvQ", C_act, M_uvQ, optimize=True)  # (nao,ncas,naux)
-    bar_act = np.einsum("mvQ,nv->Qmn", tmp, C_act, optimize=True)  # (naux,nao,nao)
+    tmp = xp.einsum("mu,uvQ->mvQ", C_act, M_uvQ, optimize=True)  # (nao,ncas,naux)
+    bar_act = xp.einsum("mvQ,nv->Qmn", tmp, C_act, optimize=True)  # (naux,nao,nao)
 
     bar_L = bar_mean + bar_act
-    bar_L = 0.5 * (bar_L + np.transpose(bar_L, (0, 2, 1)))
-    return np.asarray(bar_L, dtype=np.float64, order="C")
+    bar_L = 0.5 * (bar_L + xp.transpose(bar_L, (0, 2, 1)))
+    return xp.asarray(bar_L, dtype=xp.float64)
 
 
 def _build_bar_L_df_cross(
@@ -346,15 +373,16 @@ def _build_bar_L_df_cross(
         Contribution to bar_L.
     """
 
-    B_ao = np.asarray(B_ao, dtype=np.float64)
+    xp, _ = _get_xp_arrays(B_ao)
+    B_ao = xp.asarray(B_ao, dtype=xp.float64)
     if B_ao.ndim != 3:
         raise ValueError("B_ao must have shape (nao, nao, naux)")
     nao, nao1, naux = map(int, B_ao.shape)
     if nao != nao1:
         raise ValueError("B_ao must have shape (nao, nao, naux)")
 
-    D_left = np.asarray(D_left, dtype=np.float64)
-    D_right = np.asarray(D_right, dtype=np.float64)
+    D_left = xp.asarray(D_left, dtype=xp.float64)
+    D_right = xp.asarray(D_right, dtype=xp.float64)
     if D_left.shape != (nao, nao) or D_right.shape != (nao, nao):
         raise ValueError("D_left/D_right shape mismatch")
 
@@ -363,7 +391,7 @@ def _build_bar_L_df_cross(
     rho = B2.T @ D_right.reshape(nao * nao)  # (naux,)
     sigma = B2.T @ D_left.reshape(nao * nao)  # (naux,)
 
-    bar = np.zeros((naux, nao, nao), dtype=np.float64)
+    bar = xp.zeros((naux, nao, nao), dtype=xp.float64)
 
     cJ = float(coeff_J)
     if cJ:
@@ -372,13 +400,13 @@ def _build_bar_L_df_cross(
     # Exchange-like part: Tr(D_left K(D_right)) = Σ_Q Tr(D_left B_Q D_right B_Q)
     cK = float(coeff_K)
     if cK:
-        BQ = np.transpose(B_ao, (2, 0, 1))  # (naux,nao,nao)
-        t1 = np.matmul(np.matmul(D_left[None, :, :], BQ), D_right)  # D_left * B_Q * D_right
-        t2 = np.matmul(np.matmul(D_right[None, :, :], BQ), D_left)  # D_right * B_Q * D_left
+        BQ = xp.transpose(B_ao, (2, 0, 1))  # (naux,nao,nao)
+        t1 = xp.matmul(xp.matmul(D_left[None, :, :], BQ), D_right)  # D_left * B_Q * D_right
+        t2 = xp.matmul(xp.matmul(D_right[None, :, :], BQ), D_left)  # D_right * B_Q * D_left
         bar += cK * (t1 + t2)
 
-    bar = 0.5 * (bar + np.transpose(bar, (0, 2, 1)))
-    return np.asarray(bar, dtype=np.float64, order="C")
+    bar = 0.5 * (bar + xp.transpose(bar, (0, 2, 1)))
+    return xp.asarray(bar, dtype=xp.float64)
 
 
 def casscf_nuc_grad_df(
@@ -480,9 +508,10 @@ def casscf_nuc_grad_df(
     )
     t_rdms = time.perf_counter() if profile is not None else 0.0
 
-    C = _asnumpy_f64(getattr(casscf, "mo_coeff"))
-    B_ao = _asnumpy_f64(getattr(scf_out, "df_B"))
-    h_ao = _asnumpy_f64(getattr(getattr(scf_out, "int1e"), "hcore"))
+    xp, _is_gpu = _resolve_xp(df_backend)
+    C = _as_xp_f64(xp, getattr(casscf, "mo_coeff"))
+    B_ao = _as_xp_f64(xp, getattr(scf_out, "df_B"))
+    h_ao = _as_xp_f64(xp, getattr(getattr(scf_out, "int1e"), "hcore"))
 
     gfock, D_core_ao, D_act_ao, D_tot_ao, C_act = _build_gfock_casscf_df(
         B_ao,
@@ -495,29 +524,7 @@ def casscf_nuc_grad_df(
     )
     t_gfock = time.perf_counter() if profile is not None else 0.0
 
-    # Energy-weighted density for the overlap (Pulay) term.
-    dme0 = C @ ((gfock + gfock.T) * 0.5) @ C.T
-
-    # 1e AO derivatives (analytic), contracted on the fly to avoid allocating
-    # (natm,3,nao,nao) tensors.
-    ao_basis = getattr(scf_out, "ao_basis")
-    shell_atom = shell_to_atom_map(ao_basis, atom_coords_bohr=coords)
-    de_h1 = contract_dhcore_cart(
-        ao_basis,
-        atom_coords_bohr=coords,
-        atom_charges=charges,
-        M=D_tot_ao,
-        shell_atom=shell_atom,
-    )
-    de_S = -contract_dS_cart(
-        ao_basis,
-        atom_coords_bohr=coords,
-        M=dme0,
-        shell_atom=shell_atom,
-    )
-    t_1e = time.perf_counter() if profile is not None else 0.0
-
-    # 2e DF derivative contraction (FD on B)
+    # ── GPU phase: bar_L build + DF 2e contraction (before 1e to keep GPU busy) ──
     bar_L_ao = _build_bar_L_casscf_df(
         B_ao,
         D_core_ao=D_core_ao,
@@ -556,13 +563,27 @@ def casscf_nuc_grad_df(
         )
     t_df = time.perf_counter() if profile is not None else 0.0
 
+    # ── CPU phase: 1e AO derivative contractions (Numba-only) ──
+    # Device already synced by contract() above; _asnumpy_f64 is a pure memcpy.
+    ao_basis = getattr(scf_out, "ao_basis")
+    shell_atom = shell_to_atom_map(ao_basis, atom_coords_bohr=coords)
+    de_h1 = contract_dhcore_cart(
+        ao_basis,
+        atom_coords_bohr=coords,
+        atom_charges=charges,
+        M=_asnumpy_f64(D_tot_ao),
+        shell_atom=shell_atom,
+    )
+    t_1e = time.perf_counter() if profile is not None else 0.0
+
     try:
         de_nuc = np.asarray(mol.energy_nuc_grad(), dtype=np.float64)
     except Exception:
         de_nuc = np.zeros((natm, 3), dtype=np.float64)
     t_nuc = time.perf_counter() if profile is not None else 0.0
 
-    grad = np.asarray(de_h1 + de_S + de_df + de_nuc, dtype=np.float64)
+    # de_df already on CPU (contract() returns numpy).
+    grad = np.asarray(de_h1 + _asnumpy_f64(de_df) + de_nuc, dtype=np.float64)
     if atmlst is not None:
         idx = np.asarray(list(atmlst), dtype=np.int32).ravel()
         grad = grad[idx]
@@ -570,10 +591,10 @@ def casscf_nuc_grad_df(
     if profile is not None:
         profile["t_rdms_s"] = float(t_rdms - t0_total)
         profile["t_gfock_s"] = float(t_gfock - t_rdms)
-        profile["t_1e_s"] = float(t_1e - t_gfock)
-        profile["t_barL_s"] = float(t_barL - t_1e)
+        profile["t_barL_s"] = float(t_barL - t_gfock)
         profile["t_df_s"] = float(t_df - t0_df)
-        profile["t_nuc_s"] = float(t_nuc - t_df)
+        profile["t_1e_s"] = float(t_1e - t_df)
+        profile["t_nuc_s"] = float(t_nuc - t_1e)
         profile["t_total_s"] = float(t_nuc - t0_total)
 
     return DFNucGradResult(
@@ -694,8 +715,6 @@ def casci_nuc_grad_df_unrelaxed(
         dm2_act=dm2_act,
     )
 
-    dme0 = C @ ((gfock + gfock.T) * 0.5) @ C.T
-
     ao_basis = getattr(scf_out, "ao_basis")
     shell_atom = shell_to_atom_map(ao_basis, atom_coords_bohr=coords)
     de_h1 = contract_dhcore_cart(
@@ -703,12 +722,6 @@ def casci_nuc_grad_df_unrelaxed(
         atom_coords_bohr=coords,
         atom_charges=charges,
         M=D_tot_ao,
-        shell_atom=shell_atom,
-    )
-    de_S = -contract_dS_cart(
-        ao_basis,
-        atom_coords_bohr=coords,
-        M=dme0,
         shell_atom=shell_atom,
     )
 
@@ -750,7 +763,7 @@ def casci_nuc_grad_df_unrelaxed(
     except Exception:
         de_nuc = np.zeros((natm, 3), dtype=np.float64)
 
-    grad = np.asarray(de_h1 + de_S + de_df + de_nuc, dtype=np.float64)
+    grad = np.asarray(de_h1 + de_df + de_nuc, dtype=np.float64)
     if atmlst is not None:
         idx = np.asarray(list(atmlst), dtype=np.int32).ravel()
         grad = grad[idx]
@@ -990,14 +1003,6 @@ def casci_nuc_grad_df_relaxed(
         shell_atom=shell_atom,
     )
 
-    mS = 0.5 * (im1 + im1.T) + 2.0 * (0.5 * (zeta + zeta.T)) + 2.0 * (0.5 * (vhf_s1occ + vhf_s1occ.T))
-    de_S = -contract_dS_cart(
-        ao_basis,
-        atom_coords_bohr=coords,
-        M=np.asarray(mS, dtype=np.float64),
-        shell_atom=shell_atom,
-    )
-
     bar_L_ao = _build_bar_L_casscf_df(
         B_ao,
         D_core_ao=D_core_ao,
@@ -1047,7 +1052,7 @@ def casci_nuc_grad_df_relaxed(
     except Exception:
         de_nuc = np.zeros((natm, 3), dtype=np.float64)
 
-    grad = np.asarray(de_h1 + de_S + de_df + de_nuc, dtype=np.float64)
+    grad = np.asarray(de_h1 + de_df + de_nuc, dtype=np.float64)
     if atmlst is not None:
         idx = np.asarray(list(atmlst), dtype=np.int32).ravel()
         grad = grad[idx]
@@ -1217,9 +1222,10 @@ def casscf_nuc_grad_df_per_root(
             except Exception:
                 pass
 
-    C = _asnumpy_f64(getattr(casscf, "mo_coeff"))
-    B_ao = _asnumpy_f64(getattr(scf_out, "df_B"))
-    h_ao = _asnumpy_f64(getattr(getattr(scf_out, "int1e"), "hcore"))
+    xp, _is_gpu = _resolve_xp(df_backend)
+    C = _as_xp_f64(xp, getattr(casscf, "mo_coeff"))
+    B_ao = _as_xp_f64(xp, getattr(scf_out, "df_B"))
+    h_ao = _as_xp_f64(xp, getattr(getattr(scf_out, "int1e"), "hcore"))
 
     # Per-root RDMs
     per_root_rdms: list[tuple[np.ndarray, np.ndarray]] = []
@@ -1285,6 +1291,36 @@ def casscf_nuc_grad_df_per_root(
     warned_df_fd = False
 
     # ------------------------------------------------------------------
+    # Precompute shared quantities for lightweight Z-vector RHS
+    # ------------------------------------------------------------------
+    nmo = int(C.shape[1])
+    nocc = ncore + ncas
+    ppaa_sa = _asnumpy_f64(getattr(eris_sa, "ppaa"))  # (nmo,nmo,ncas,ncas)
+    papa_sa = _asnumpy_f64(getattr(eris_sa, "papa"))  # (nmo,ncas,nmo,ncas)
+    vhf_c_sa = _asnumpy_f64(getattr(eris_sa, "vhf_c"))  # (nmo,nmo)
+    h1e_mo_sa = _asnumpy_f64(C).T @ _asnumpy_f64(h_ao) @ _asnumpy_f64(C)
+    h1cas_0 = h1e_mo_sa[ncore:nocc, ncore:nocc] + vhf_c_sa[ncore:nocc, ncore:nocc]
+    eri_cas_sa = ppaa_sa[ncore:nocc, ncore:nocc]
+
+    # Precompute hci0, eci0 (root-independent: H_act |ci_r> for each root)
+    _linkstrl_rhs = _newton_casscf._maybe_gen_linkstr(fcisolver_use, ncas, nelecas, True)
+    _hci0_all = _newton_casscf._ci_h_op(
+        fcisolver_use,
+        h1cas=h1cas_0,
+        eri_cas=eri_cas_sa,
+        ncas=ncas,
+        nelecas=nelecas,
+        ci_list=ci_list,
+        link_index=_linkstrl_rhs,
+    )
+    _eci0_all = np.array(
+        [float(np.dot(np.asarray(c).ravel(), np.asarray(hc).ravel())) for c, hc in zip(ci_list, _hci0_all)],
+        dtype=np.float64,
+    )
+    # Pre-reshape ppaa for GEMM in orbital gradient
+    _ppaa_2d = ppaa_sa.reshape(nmo * nmo, ncas * ncas)
+
+    # ------------------------------------------------------------------
     # Per-root gradient loop
     # ------------------------------------------------------------------
     grads_list: list[np.ndarray] = []
@@ -1296,13 +1332,7 @@ def casscf_nuc_grad_df_per_root(
         gfock_K, D_core, D_act_K, D_tot_K, C_act = _build_gfock_casscf_df(
             B_ao, h_ao, C, ncore=int(ncore), ncas=int(ncas), dm1_act=dm1_K, dm2_act=dm2_K,
         )
-        dme0_K = C @ ((gfock_K + gfock_K.T) * 0.5) @ C.T
-
-        de_h1_K = contract_dhcore_cart(
-            ao_basis, atom_coords_bohr=coords, atom_charges=charges, M=D_tot_K, shell_atom=shell_atom,
-        )
-        de_S_K = -contract_dS_cart(ao_basis, atom_coords_bohr=coords, M=dme0_K, shell_atom=shell_atom)
-
+        # ── GPU phase: bar_L + DF 2e contraction (before 1e to keep GPU busy) ──
         bar_L_K = _build_bar_L_casscf_df(
             B_ao, D_core_ao=D_core, D_act_ao=D_act_K, C_act=C_act, dm2_act=dm2_K,
         )
@@ -1330,7 +1360,12 @@ def casscf_nuc_grad_df_per_root(
                 delta_bohr=float(delta_bohr), profile=None,
             )
 
-        grad_bare_K = np.asarray(de_h1_K + de_S_K + de_df_K + de_nuc, dtype=np.float64)
+        # ── CPU phase: 1e derivative contractions (device synced by contract()) ──
+        de_h1_K = contract_dhcore_cart(
+            ao_basis, atom_coords_bohr=coords, atom_charges=charges, M=_asnumpy_f64(D_tot_K), shell_atom=shell_atom,
+        )
+        # de_df_K already on CPU (contract() returns numpy).
+        grad_bare_K = np.asarray(_asnumpy_f64(de_df_K) + de_h1_K + de_nuc, dtype=np.float64)
 
         # For single-state CASSCF, skip the response (gfock is symmetric → RHS ≈ 0)
         if nroots == 1:
@@ -1356,7 +1391,7 @@ def casscf_nuc_grad_df_per_root(
             g_K, _gupd, _hop, _hdiag = _newton_casscf.gen_g_hop(
                 mc_K, C, ci_list[K], eris_sa, verbose=0, implementation="internal",
             )
-        g_K = np.asarray(g_K, dtype=np.float64).ravel()
+        g_K = _asnumpy_f64(g_K).ravel()
 
         rhs_orb = g_K[:n_orb]
         rhs_ci_K = g_K[n_orb:]
@@ -1380,16 +1415,21 @@ def casscf_nuc_grad_df_per_root(
 
         # Step D: CI response
         Lci_list = hess_op.ci_unflatten(Lvec[n_orb:])
+        _use_cuda_rdm = getattr(hess_op, "gpu_mode", False)
         dm1_lci = np.zeros((int(ncas), int(ncas)), dtype=np.float64)
         dm2_lci = np.zeros((int(ncas), int(ncas), int(ncas), int(ncas)), dtype=np.float64)
         for r in range(nroots):
             wr = float(w_arr[r])
             if abs(wr) < 1e-14:
                 continue
+            _rdm_kw: dict = {}
+            if _use_cuda_rdm:
+                _rdm_kw["rdm_backend"] = "cuda"
             dm1_r, dm2_r = fcisolver_use.trans_rdm12(
                 np.asarray(Lci_list[r], dtype=np.float64).ravel(),
                 np.asarray(ci_list[r], dtype=np.float64).ravel(),
                 int(ncas), nelecas,
+                **_rdm_kw,
             )
             dm1_r = np.asarray(dm1_r, dtype=np.float64)
             dm2_r = np.asarray(dm2_r, dtype=np.float64)
@@ -1414,7 +1454,7 @@ def casscf_nuc_grad_df_per_root(
         )
 
         # Step F: Combine
-        grad_K = grad_bare_K + np.asarray(de_lci_K, dtype=np.float64) + np.asarray(de_lorb_K, dtype=np.float64)
+        grad_K = grad_bare_K + _asnumpy_f64(de_lci_K) + _asnumpy_f64(de_lorb_K)
         grads_list.append(grad_K)
 
     # ------------------------------------------------------------------

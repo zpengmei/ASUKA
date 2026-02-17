@@ -362,6 +362,8 @@ class DenseNewtonCASSCFAdapter:
         r: Any,
         casdm1: Any,
         eris: Any | None = None,
+        *,
+        return_gpu: bool = False,
     ) -> tuple[np.ndarray, np.ndarray]:
         """Dense analogue of PySCF `mc1step.CASSCF.update_jk_in_ah`.
 

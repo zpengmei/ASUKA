@@ -29,12 +29,18 @@ from asuka.integrals.grad import (
 )
 from asuka.integrals.int1e_cart import (
     build_int1e_cart,
-    contract_dS_cart,
     contract_dS_ip_cart,
     contract_dhcore_cart,
     shell_to_atom_map,
 )
-from asuka.mcscf.nuc_grad_df import _build_bar_L_casscf_df, _build_bar_L_df_cross, _build_gfock_casscf_df
+from asuka.hf.df_scf import _get_xp as _get_xp_arrays
+from asuka.mcscf.nuc_grad_df import (
+    _build_bar_L_casscf_df,
+    _build_bar_L_df_cross,
+    _build_gfock_casscf_df,
+    _resolve_xp,
+    _as_xp_f64,
+)
 from asuka.mcscf.newton_df import DFNewtonCASSCFAdapter, DFNewtonERIs
 from asuka.mcscf import newton_casscf as _newton_casscf
 from asuka.mcscf.state_average import ci_as_list, make_state_averaged_rdms, normalize_weights
@@ -196,7 +202,8 @@ def _core_energy_weighted_density(
 ) -> tuple[np.ndarray, np.ndarray]:
     """Return (D_core_ao, dme_sf_core) for the core-only RHF-like term."""
 
-    mo = np.asarray(mo_coeff, dtype=np.float64)
+    xp, _ = _get_xp_arrays(B_ao, mo_coeff)
+    mo = xp.asarray(mo_coeff, dtype=xp.float64)
     nao, nmo = map(int, mo.shape)
     ncore = int(ncore)
     if ncore < 0 or ncore > nmo:
@@ -206,21 +213,21 @@ def _core_energy_weighted_density(
         mo_core = mo[:, :ncore]
         D_core_ao = 2.0 * (mo_core @ mo_core.T)
         Jc, Kc = _df_scf._df_JK(B_ao, D_core_ao, want_J=True, want_K=True)  # noqa: SLF001
-        v_ao = np.asarray(Jc - 0.5 * Kc, dtype=np.float64)
+        v_ao = xp.asarray(Jc - 0.5 * Kc, dtype=xp.float64)
     else:
-        D_core_ao = np.zeros((nao, nao), dtype=np.float64)
-        v_ao = np.zeros((nao, nao), dtype=np.float64)
+        D_core_ao = xp.zeros((nao, nao), dtype=xp.float64)
+        v_ao = xp.zeros((nao, nao), dtype=xp.float64)
 
-    f0 = mo.T @ np.asarray(hcore_ao, dtype=np.float64) @ mo
-    f0 = np.asarray(f0, dtype=np.float64)
+    f0 = mo.T @ xp.asarray(hcore_ao, dtype=xp.float64) @ mo
+    f0 = xp.asarray(f0, dtype=xp.float64)
     if ncore:
         f0 = f0 + (mo.T @ v_ao @ mo)
 
-    mo_occ = np.zeros((nmo,), dtype=np.float64)
+    mo_occ = xp.zeros((nmo,), dtype=xp.float64)
     mo_occ[:ncore] = 2.0
     f0_occ = f0 * mo_occ[None, :]
     dme_sf = mo @ ((f0_occ + f0_occ.T) * 0.5) @ mo.T
-    return np.asarray(D_core_ao, dtype=np.float64), np.asarray(dme_sf, dtype=np.float64)
+    return xp.asarray(D_core_ao, dtype=xp.float64), xp.asarray(dme_sf, dtype=xp.float64)
 
 
 def _grad_elec_active_df(
@@ -239,16 +246,18 @@ def _grad_elec_active_df(
 ) -> np.ndarray | tuple[np.ndarray, dict[str, np.ndarray]]:
     """Return active-electron part of <dH/dR> using DF integrals (no nuclear term)."""
 
+    xp, _ = _resolve_xp(df_backend)
+
     mol = getattr(scf_out, "mol")
     coords, charges = _mol_coords_charges_bohr(mol)
 
-    B_ao = _asnumpy_f64(getattr(scf_out, "df_B"))
+    B_ao = _as_xp_f64(xp, getattr(scf_out, "df_B"))
     ao_basis = getattr(scf_out, "ao_basis")
     aux_basis = getattr(scf_out, "aux_basis")
-    h_ao = _asnumpy_f64(getattr(getattr(scf_out, "int1e"), "hcore"))
+    h_ao = _as_xp_f64(xp, getattr(getattr(scf_out, "int1e"), "hcore"))
     shell_atom = shell_to_atom_map(ao_basis, atom_coords_bohr=coords)
 
-    C = np.asarray(mo_coeff, dtype=np.float64)
+    C = _as_xp_f64(xp, mo_coeff)
 
     gfock, D_core_ao, D_act_ao, D_tot_ao, C_act = _build_gfock_casscf_df(
         B_ao,
@@ -256,34 +265,18 @@ def _grad_elec_active_df(
         C,
         ncore=int(ncore),
         ncas=int(ncas),
-        dm1_act=np.asarray(dm1_act, dtype=np.float64),
-        dm2_act=np.asarray(dm2_act, dtype=np.float64),
+        dm1_act=xp.asarray(dm1_act, dtype=xp.float64),
+        dm2_act=xp.asarray(dm2_act, dtype=xp.float64),
     )
 
-    dme0 = C @ ((gfock + gfock.T) * 0.5) @ C.T
-
-    de_h1 = contract_dhcore_cart(
-        ao_basis,
-        atom_coords_bohr=coords,
-        atom_charges=charges,
-        M=D_tot_ao,
-        shell_atom=shell_atom,
-    )
-    de_S = -contract_dS_cart(
-        ao_basis,
-        atom_coords_bohr=coords,
-        M=dme0,
-        shell_atom=shell_atom,
-    )
-
+    # ── Phase 1: ALL GPU work (bar_L + DF contract for total and core) ──
     bar_L_ao = _build_bar_L_casscf_df(
         B_ao,
         D_core_ao=D_core_ao,
         D_act_ao=D_act_ao,
         C_act=C_act,
-        dm2_act=np.asarray(dm2_act, dtype=np.float64),
+        dm2_act=xp.asarray(dm2_act, dtype=xp.float64),
     )
-
     try:
         if df_grad_ctx is not None:
             de_df = df_grad_ctx.contract(B_ao=B_ao, bar_L_ao=bar_L_ao)
@@ -311,21 +304,8 @@ def _grad_elec_active_df(
             profile=None,
         )
 
-    # Subtract the core-only RHF-like contribution.
+    # Core-only RHF-like contribution (GPU).
     D_core_only, dme_core = _core_energy_weighted_density(mo_coeff=C, hcore_ao=h_ao, B_ao=B_ao, ncore=int(ncore))
-    de_h1_core = contract_dhcore_cart(
-        ao_basis,
-        atom_coords_bohr=coords,
-        atom_charges=charges,
-        M=D_core_only,
-        shell_atom=shell_atom,
-    )
-    de_S_core = -contract_dS_cart(
-        ao_basis,
-        atom_coords_bohr=coords,
-        M=dme_core,
-        shell_atom=shell_atom,
-    )
     bar_L_core = _build_bar_L_df_cross(
         B_ao,
         D_left=D_core_only,
@@ -360,17 +340,30 @@ def _grad_elec_active_df(
             profile=None,
         )
 
-    total = np.asarray(de_h1 + de_S + de_df - de_h1_core - de_S_core - de_df_core, dtype=np.float64)
+    # ── Phase 2: Batch transfer (device already synced by contract()) ──
+    D_tot_cpu = _asnumpy_f64(D_tot_ao)
+    D_core_cpu = _asnumpy_f64(D_core_only)
+
+    # ── Phase 3: ALL CPU 1e work ──
+    de_h1 = contract_dhcore_cart(
+        ao_basis, atom_coords_bohr=coords, atom_charges=charges,
+        M=D_tot_cpu, shell_atom=shell_atom,
+    )
+    de_h1_core = contract_dhcore_cart(
+        ao_basis, atom_coords_bohr=coords, atom_charges=charges,
+        M=D_core_cpu, shell_atom=shell_atom,
+    )
+
+    # ── Phase 4: Accumulate (de_df, de_df_core already CPU from contract()) ──
+    total = np.asarray(de_h1 + _asnumpy_f64(de_df) - de_h1_core - _asnumpy_f64(de_df_core), dtype=np.float64)
     if not bool(return_terms):
         return total
 
     terms = {
         "dhcore": np.asarray(de_h1, dtype=np.float64),
-        "dS": np.asarray(de_S, dtype=np.float64),
         "df2e": np.asarray(de_df, dtype=np.float64),
         # Core-only RHF-like subtraction pieces (returned as the *contribution to total*).
         "dhcore_core_sub": np.asarray(-de_h1_core, dtype=np.float64),
-        "dS_core_sub": np.asarray(-de_S_core, dtype=np.float64),
         "df2e_core_sub": np.asarray(-de_df_core, dtype=np.float64),
     }
     return total, terms
@@ -391,16 +384,18 @@ def _grad_elec_casscf_df(
 ) -> np.ndarray:
     """Return electronic SA-CASSCF/CASSCF gradient (no nuclear term), DF-only."""
 
+    xp, _ = _resolve_xp(df_backend)
+
     mol = getattr(scf_out, "mol")
     coords, charges = _mol_coords_charges_bohr(mol)
 
-    B_ao = _asnumpy_f64(getattr(scf_out, "df_B"))
+    B_ao = _as_xp_f64(xp, getattr(scf_out, "df_B"))
     ao_basis = getattr(scf_out, "ao_basis")
     aux_basis = getattr(scf_out, "aux_basis")
-    h_ao = _asnumpy_f64(getattr(getattr(scf_out, "int1e"), "hcore"))
+    h_ao = _as_xp_f64(xp, getattr(getattr(scf_out, "int1e"), "hcore"))
     shell_atom = shell_to_atom_map(ao_basis, atom_coords_bohr=coords)
 
-    C = np.asarray(mo_coeff, dtype=np.float64)
+    C = _as_xp_f64(xp, mo_coeff)
 
     gfock, D_core_ao, D_act_ao, D_tot_ao, C_act = _build_gfock_casscf_df(
         B_ao,
@@ -408,31 +403,16 @@ def _grad_elec_casscf_df(
         C,
         ncore=int(ncore),
         ncas=int(ncas),
-        dm1_act=np.asarray(dm1_act, dtype=np.float64),
-        dm2_act=np.asarray(dm2_act, dtype=np.float64),
+        dm1_act=xp.asarray(dm1_act, dtype=xp.float64),
+        dm2_act=xp.asarray(dm2_act, dtype=xp.float64),
     )
-    dme0 = C @ ((gfock + gfock.T) * 0.5) @ C.T
-
-    de_h1 = contract_dhcore_cart(
-        ao_basis,
-        atom_coords_bohr=coords,
-        atom_charges=charges,
-        M=D_tot_ao,
-        shell_atom=shell_atom,
-    )
-    de_S = -contract_dS_cart(
-        ao_basis,
-        atom_coords_bohr=coords,
-        M=dme0,
-        shell_atom=shell_atom,
-    )
-
+    # ── GPU phase: bar_L + DF 2e contraction (before 1e to keep GPU busy) ──
     bar_L_ao = _build_bar_L_casscf_df(
         B_ao,
         D_core_ao=D_core_ao,
         D_act_ao=D_act_ao,
         C_act=C_act,
-        dm2_act=np.asarray(dm2_act, dtype=np.float64),
+        dm2_act=xp.asarray(dm2_act, dtype=xp.float64),
     )
     try:
         if df_grad_ctx is not None:
@@ -461,7 +441,16 @@ def _grad_elec_casscf_df(
             profile=None,
         )
 
-    return np.asarray(de_h1 + de_S + de_df, dtype=np.float64)
+    # ── CPU phase: 1e contractions (device synced by contract()) ──
+    de_h1 = contract_dhcore_cart(
+        ao_basis,
+        atom_coords_bohr=coords,
+        atom_charges=charges,
+        M=_asnumpy_f64(D_tot_ao),
+        shell_atom=shell_atom,
+    )
+
+    return np.asarray(de_h1 + _asnumpy_f64(de_df), dtype=np.float64)
 
 
 def _Lorb_dot_dgorb_dx_df(
@@ -493,16 +482,18 @@ def _Lorb_dot_dgorb_dx_df(
     - The active-space RDMs are treated as fixed inputs (state-averaged).
     """
 
+    xp, _ = _resolve_xp(df_backend)
+
     mol = getattr(scf_out, "mol")
     coords, charges = _mol_coords_charges_bohr(mol)
 
-    B_ao = _asnumpy_f64(getattr(scf_out, "df_B"))
+    B_ao = _as_xp_f64(xp, getattr(scf_out, "df_B"))
     ao_basis = getattr(scf_out, "ao_basis")
     aux_basis = getattr(scf_out, "aux_basis")
-    h_ao = _asnumpy_f64(getattr(getattr(scf_out, "int1e"), "hcore"))
+    h_ao = _as_xp_f64(xp, getattr(getattr(scf_out, "int1e"), "hcore"))
 
-    C = np.asarray(mo_coeff, dtype=np.float64)
-    L = np.asarray(Lorb, dtype=np.float64)
+    C = _as_xp_f64(xp, mo_coeff)
+    L = _as_xp_f64(xp, Lorb)
     if C.ndim != 2 or L.ndim != 2:
         raise ValueError("mo_coeff and Lorb must be 2D arrays")
     nao, nmo = map(int, C.shape)
@@ -515,8 +506,8 @@ def _Lorb_dot_dgorb_dx_df(
     if ncore < 0 or ncas <= 0 or nocc > nmo:
         raise ValueError("invalid ncore/ncas for Lorb response")
 
-    dm1_act = np.asarray(dm1_act, dtype=np.float64)
-    dm2_act = np.asarray(dm2_act, dtype=np.float64)
+    dm1_act = xp.asarray(dm1_act, dtype=xp.float64)
+    dm2_act = xp.asarray(dm2_act, dtype=xp.float64)
     if dm1_act.shape != (ncas, ncas):
         raise ValueError("dm1_act shape mismatch")
     if dm2_act.shape != (ncas, ncas, ncas, ncas):
@@ -535,8 +526,8 @@ def _Lorb_dot_dgorb_dx_df(
         D_L_core = 2.0 * (C_L_core @ C_core.T)
         D_L_core = D_L_core + D_L_core.T
     else:
-        D_core = np.zeros((nao, nao), dtype=np.float64)
-        D_L_core = np.zeros((nao, nao), dtype=np.float64)
+        D_core = xp.zeros((nao, nao), dtype=xp.float64)
+        D_L_core = xp.zeros((nao, nao), dtype=xp.float64)
 
     D_act = C_act @ dm1_act @ C_act.T
     D_L_act = C_L_act @ dm1_act @ C_act.T
@@ -545,111 +536,95 @@ def _Lorb_dot_dgorb_dx_df(
     D_tot = D_core + D_act
     D_L = D_L_core + D_L_act
 
-    # Build the overlap/renormalization matrix dme0 from the L-effective generalized Fock.
+    # Build the L-effective generalized Fock matrix for the orbital Lagrange term.
     # This mirrors PySCF's construction in Lorb_dot_dgorb_dx, but uses DF J/K.
     if ncore:
         Jc, Kc = _df_scf._df_JK(B_ao, D_core, want_J=True, want_K=True)  # noqa: SLF001
     else:
-        Jc = np.zeros((nao, nao), dtype=np.float64)
-        Kc = np.zeros((nao, nao), dtype=np.float64)
+        Jc = xp.zeros((nao, nao), dtype=xp.float64)
+        Kc = xp.zeros((nao, nao), dtype=xp.float64)
     Ja, Ka = _df_scf._df_JK(B_ao, D_act, want_J=True, want_K=True)  # noqa: SLF001
     if ncore:
         JcL, KcL = _df_scf._df_JK(B_ao, D_L_core, want_J=True, want_K=True)  # noqa: SLF001
     else:
-        JcL = np.zeros((nao, nao), dtype=np.float64)
-        KcL = np.zeros((nao, nao), dtype=np.float64)
+        JcL = xp.zeros((nao, nao), dtype=xp.float64)
+        KcL = xp.zeros((nao, nao), dtype=xp.float64)
     JaL, KaL = _df_scf._df_JK(B_ao, D_L_act, want_J=True, want_K=True)  # noqa: SLF001
 
-    vhf_c = np.asarray(Jc - 0.5 * Kc, dtype=np.float64)
-    vhf_a = np.asarray(Ja - 0.5 * Ka, dtype=np.float64)
-    vhfL_c = np.asarray(JcL - 0.5 * KcL, dtype=np.float64)
-    vhfL_a = np.asarray(JaL - 0.5 * KaL, dtype=np.float64)
+    vhf_c = Jc - 0.5 * Kc
+    vhf_a = Ja - 0.5 * Ka
+    vhfL_c = JcL - 0.5 * KcL
+    vhfL_a = JaL - 0.5 * KaL
 
-    gfock = np.asarray(h_ao @ D_L, dtype=np.float64)
-    gfock += np.asarray((vhf_c + vhf_a) @ D_L_core, dtype=np.float64)
-    gfock += np.asarray((vhfL_c + vhfL_a) @ D_core, dtype=np.float64)
-    gfock += np.asarray(vhfL_c @ D_act, dtype=np.float64)
-    gfock += np.asarray(vhf_c @ D_L_act, dtype=np.float64)
+    gfock = h_ao @ D_L
+    gfock = gfock + (vhf_c + vhf_a) @ D_L_core
+    gfock = gfock + (vhfL_c + vhfL_a) @ D_core
+    gfock = gfock + vhfL_c @ D_act
+    gfock = gfock + vhf_c @ D_L_act
 
     # Convert AO->(MO definition) by left-multiplying S^{-1} ≈ C C^T (PySCF convention).
     s0_inv = C @ C.T
-    gfock = np.asarray(s0_inv @ gfock, dtype=np.float64)
+    gfock = s0_inv @ gfock
 
     # Two-electron (active-active) part: reproduce PySCF's aapa/aapaL contraction using DF ERIs.
     # This contraction is validation-oriented and can be costly for large ncas.
-    ppaa = np.asarray(getattr(eris, "ppaa"), dtype=np.float64)
-    papa = np.asarray(getattr(eris, "papa"), dtype=np.float64)
+    ppaa = xp.asarray(getattr(eris, "ppaa"), dtype=xp.float64)
+    papa = xp.asarray(getattr(eris, "papa"), dtype=xp.float64)
     if ppaa.ndim != 4 or papa.ndim != 4:
         raise ValueError("unexpected ERI tensor ndim for Lorb response")
 
-    aapa = np.zeros((ncas, ncas, nmo, ncas), dtype=np.float64)
-    aapaL = np.zeros_like(aapa)
+    aapa = xp.zeros((ncas, ncas, nmo, ncas), dtype=xp.float64)
+    aapaL = xp.zeros_like(aapa)
+    L_act_slice = L[:, ncore:nocc]
     for i in range(nmo):
         jbuf = ppaa[i]  # (nmo,ncas,ncas)
         kbuf = papa[i]  # (ncas,nmo,ncas)
-        aapa[:, :, i, :] = np.asarray(jbuf[ncore:nocc, :, :], dtype=np.float64).transpose(1, 2, 0)
-        aapaL[:, :, i, :] += np.tensordot(jbuf, L[:, ncore:nocc], axes=((0), (0)))
-        kk = np.tensordot(kbuf, L[:, ncore:nocc], axes=((1), (0))).transpose(1, 2, 0)
+        aapa[:, :, i, :] = xp.asarray(jbuf[ncore:nocc, :, :], dtype=xp.float64).transpose(1, 2, 0)
+        aapaL[:, :, i, :] += xp.tensordot(jbuf, L_act_slice, axes=((0,), (0,)))
+        kk = xp.tensordot(kbuf, L_act_slice, axes=((1,), (0,))).transpose(1, 2, 0)
         aapaL[:, :, i, :] += kk + kk.transpose(1, 0, 2)
 
-    dm2 = np.asarray(dm2_act, dtype=np.float64)
-    t1 = np.einsum("uviw,uvtw->it", aapaL, dm2, optimize=True)
-    t2 = np.einsum("uviw,vuwt->it", aapa, dm2, optimize=True)
-    gfock += (C @ np.asarray(t1, dtype=np.float64) @ C_act.T)
-    gfock += (C @ np.asarray(t2, dtype=np.float64) @ C_L_act.T)
+    dm2 = xp.asarray(dm2_act, dtype=xp.float64)
+    t1 = xp.einsum("uviw,uvtw->it", aapaL, dm2, optimize=True)
+    t2 = xp.einsum("uviw,vuwt->it", aapa, dm2, optimize=True)
+    gfock = gfock + (C @ t1 @ C_act.T)
+    gfock = gfock + (C @ t2 @ C_L_act.T)
 
-    dme0 = 0.5 * (gfock + gfock.T)
-
-    # One-electron derivative terms: dh/dR · D_L and -dS/dR · dme0
-    shell_atom = shell_to_atom_map(ao_basis, atom_coords_bohr=coords)
-    de_h1 = contract_dhcore_cart(
-        ao_basis,
-        atom_coords_bohr=coords,
-        atom_charges=charges,
-        M=D_L,
-        shell_atom=shell_atom,
-    )
-    de_S = -contract_dS_cart(
-        ao_basis,
-        atom_coords_bohr=coords,
-        M=dme0,
-        shell_atom=shell_atom,
-    )
-
+    # ── GPU phase: bar_L build + DF 2e contraction (before 1e to keep GPU busy) ──
     # Two-electron DF derivative term: build bar_L for the L-effective contraction.
     D_w = D_act + 0.5 * D_core
     D_wL = D_L_act + 0.5 * D_L_core
     bar_mean = _build_bar_L_df_cross(B_ao, D_left=D_wL, D_right=D_core, coeff_J=1.0, coeff_K=-0.5)
-    bar_mean += _build_bar_L_df_cross(B_ao, D_left=D_w, D_right=D_L_core, coeff_J=1.0, coeff_K=-0.5)
+    bar_mean = bar_mean + _build_bar_L_df_cross(B_ao, D_left=D_w, D_right=D_L_core, coeff_J=1.0, coeff_K=-0.5)
 
     # Active-active DF term: linearize _build_bar_L_casscf_df active block w.r.t C_act along C_L_act.
-    X = np.einsum("mnQ,nv->mvQ", B_ao, C_act, optimize=True)  # (nao,ncas,naux)
-    L_act = np.einsum("mu,mvQ->uvQ", C_act, X, optimize=True)  # (ncas,ncas,naux)
-    L2 = L_act.reshape(ncas * ncas, -1)
+    X = xp.einsum("mnQ,nv->mvQ", B_ao, C_act, optimize=True)  # (nao,ncas,naux)
+    L_act_mo = xp.einsum("mu,mvQ->uvQ", C_act, X, optimize=True)  # (ncas,ncas,naux)
+    L2 = L_act_mo.reshape(ncas * ncas, -1)
 
     dm2_flat = dm2.reshape(ncas * ncas, ncas * ncas)
     dm2_flat = 0.5 * (dm2_flat + dm2_flat.T)
 
-    M = dm2_flat @ L2  # (ncas^2,naux)
-    M_uvQ = M.reshape(ncas, ncas, -1)
+    M_mat = dm2_flat @ L2  # (ncas^2,naux)
+    M_uvQ = M_mat.reshape(ncas, ncas, -1)
 
-    tmp = np.einsum("mu,uvQ->mvQ", C_act, M_uvQ, optimize=True)  # (nao,ncas,naux)
-    tmp_L = np.einsum("mu,uvQ->mvQ", C_L_act, M_uvQ, optimize=True)
+    tmp = xp.einsum("mu,uvQ->mvQ", C_act, M_uvQ, optimize=True)  # (nao,ncas,naux)
+    tmp_L = xp.einsum("mu,uvQ->mvQ", C_L_act, M_uvQ, optimize=True)
 
     # δM from δL_act induced by δC_act = C_L_act
-    X_L = np.einsum("mnQ,nv->mvQ", B_ao, C_L_act, optimize=True)
-    dL_act = np.einsum("mu,mvQ->uvQ", C_L_act, X, optimize=True) + np.einsum("mu,mvQ->uvQ", C_act, X_L, optimize=True)
+    X_L = xp.einsum("mnQ,nv->mvQ", B_ao, C_L_act, optimize=True)
+    dL_act = xp.einsum("mu,mvQ->uvQ", C_L_act, X, optimize=True) + xp.einsum("mu,mvQ->uvQ", C_act, X_L, optimize=True)
     dL2 = dL_act.reshape(ncas * ncas, -1)
     dM = dm2_flat @ dL2
     dM_uvQ = dM.reshape(ncas, ncas, -1)
-    tmp_M = np.einsum("mu,uvQ->mvQ", C_act, dM_uvQ, optimize=True)
+    tmp_M = xp.einsum("mu,uvQ->mvQ", C_act, dM_uvQ, optimize=True)
 
-    bar_act = np.einsum("mvQ,nv->Qmn", tmp_L, C_act, optimize=True)
-    bar_act += np.einsum("mvQ,nv->Qmn", tmp, C_L_act, optimize=True)
-    bar_act += np.einsum("mvQ,nv->Qmn", tmp_M, C_act, optimize=True)
+    bar_act = xp.einsum("mvQ,nv->Qmn", tmp_L, C_act, optimize=True)
+    bar_act = bar_act + xp.einsum("mvQ,nv->Qmn", tmp, C_L_act, optimize=True)
+    bar_act = bar_act + xp.einsum("mvQ,nv->Qmn", tmp_M, C_act, optimize=True)
 
-    bar_L_ao = np.asarray(bar_mean + bar_act, dtype=np.float64)
-    bar_L_ao = 0.5 * (bar_L_ao + np.transpose(bar_L_ao, (0, 2, 1)))
+    bar_L_ao = bar_mean + bar_act
+    bar_L_ao = 0.5 * (bar_L_ao + xp.transpose(bar_L_ao, (0, 2, 1)))
 
     try:
         if df_grad_ctx is not None:
@@ -678,13 +653,22 @@ def _Lorb_dot_dgorb_dx_df(
             profile=None,
         )
 
-    total = np.asarray(de_h1 + de_S + de_df, dtype=np.float64)
+    # ── CPU phase: 1e derivative contractions (device synced by contract()) ──
+    shell_atom = shell_to_atom_map(ao_basis, atom_coords_bohr=coords)
+    de_h1 = contract_dhcore_cart(
+        ao_basis,
+        atom_coords_bohr=coords,
+        atom_charges=charges,
+        M=_asnumpy_f64(D_L),
+        shell_atom=shell_atom,
+    )
+    # de_df already on CPU (contract() returns numpy).
+    total = np.asarray(de_h1 + _asnumpy_f64(de_df), dtype=np.float64)
     if not bool(return_terms):
         return total
     terms = {
         "dhcore": np.asarray(de_h1, dtype=np.float64),
-        "dS": np.asarray(de_S, dtype=np.float64),
-        "df2e": np.asarray(de_df, dtype=np.float64),
+        "df2e": _asnumpy_f64(de_df),
     }
     return total, terms
 
