@@ -21,3 +21,5 @@ recursive-include asuka/cuguga/kernels/gpu *.cu *.cuh
 
 # Runtime data
 recursive-include asuka/cuguga/overlap *.json
+recursive-include asuka/semiempirical/data *.json
+recursive-include asuka/semiempirical/gpu/cuda *.cu *.cuh

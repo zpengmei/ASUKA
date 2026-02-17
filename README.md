@@ -54,6 +54,48 @@ Verify:
 python -c "import asuka; print(asuka.__version__)"
 ```
 
+## AM1 semiempirical CUDA
+
+ASUKA includes an AM1 semiempirical CUDA path in `asuka/semiempirical`.
+
+- Supported method: `AM1` (PM7 remains scaffold-only)
+- Supported elements in this cycle: `H`, `C`, `N`, `O`
+- Public control: `fock_mode="ri"` (default), `fock_mode="w"`, or `fock_mode="auto"`
+- Cartesian gradients available via:
+  - `am1_gradient(...)`
+  - `am1_energy_gradient(...)`
+  - `SemiempiricalCalculator.gradient(...)`
+  - `SemiempiricalCalculator.energy_gradient(...)`
+- Gradient units are always `Hartree/Bohr`
+- Gradient backend control: `gradient_backend="auto"` (default),
+  `"cuda_analytic"`, or `"cpu_frozen"`
+- For `device="cuda"`, `gradient_backend="auto"` uses the CUDA analytical
+  pair-gradient kernels and falls back to CPU frozen-density gradients if CUDA
+  gradient compilation/runtime fails.
+
+Example:
+
+```python
+import numpy as np
+from asuka.semiempirical import am1_energy_gradient
+
+symbols = ["O", "H", "H"]
+coords_ang = np.array([[0.0, 0.0, 0.0], [0.0, 0.757, 0.586], [0.0, -0.757, 0.586]])
+energy_ha, grad_ha_bohr = am1_energy_gradient(
+    symbols,
+    coords_ang,
+    coords_unit="angstrom",
+    device="cuda",
+    fock_mode="w",
+    gradient_backend="auto",
+)
+```
+
+Detailed usage, validation gates, and known limits:
+
+- `docs/project/AM1_CUDA.md`
+- `docs/project/RELEASE_NOTES.md`
+
 ## Quick start
 
 ```python

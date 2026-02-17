@@ -90,4 +90,7 @@ asuka = [
   "cueri/cuda/ext/src/*.h",
   # Runtime data
   "cuguga/overlap/*.json",
+  "semiempirical/data/*.json",
+  "semiempirical/gpu/cuda/*.cu",
+  "semiempirical/gpu/cuda/*.cuh",
 ]

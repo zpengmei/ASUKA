@@ -1,0 +1,20 @@
+{
+  "created_at_utc": "2026-02-17T08:28:22.929390+00:00",
+  "metric": "gradient_time_s_mean",
+  "baseline_locked": {
+    "water_16": 2.205,
+    "water_24": 5.342,
+    "water_32": 9.256
+  },
+  "current_cuda_auto": {
+    "water_16": 0.05480179166625021,
+    "water_24": 0.07693116933417816,
+    "water_32": 0.09312617066461826
+  },
+  "speedup_vs_locked": {
+    "water_16": 40.235910778770275,
+    "water_24": 69.43869495594308,
+    "water_32": 99.3920391436933
+  },
+  "geomean_speedup_vs_locked": 65.24125836689305
+}
