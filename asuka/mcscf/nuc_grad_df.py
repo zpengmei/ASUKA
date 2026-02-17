@@ -26,6 +26,7 @@ from dataclasses import dataclass
 from typing import Any, Literal, Sequence
 
 import time
+import warnings
 import numpy as np
 
 from asuka.frontend.periodic_table import atomic_number
@@ -1281,6 +1282,7 @@ def casscf_nuc_grad_df_per_root(
 
     n_orb = int(hess_op.n_orb)
     w_arr = np.asarray(weights, dtype=np.float64).ravel()
+    warned_df_fd = False
 
     # ------------------------------------------------------------------
     # Per-root gradient loop
@@ -1312,7 +1314,16 @@ def casscf_nuc_grad_df_per_root(
                     ao_basis, aux_basis, atom_coords_bohr=coords, B_ao=B_ao, bar_L_ao=bar_L_K,
                     backend=str(df_backend), df_threads=int(df_threads), profile=None,
                 )
-        except (NotImplementedError, RuntimeError):
+        except (NotImplementedError, RuntimeError) as e:
+            if not warned_df_fd:
+                warnings.warn(
+                    f"DF 2e gradient contraction fell back to finite-difference on B (backend={df_backend!s}); "
+                    "expect noisy/non-conservative forces in MD. "
+                    f"Reason: {type(e).__name__}: {e}",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+                warned_df_fd = True
             de_df_K = compute_df_gradient_contributions_fd_packed_bases(
                 ao_basis, aux_basis, atom_coords_bohr=coords, bar_L_ao=bar_L_K,
                 backend=str(df_backend), df_config=df_config, df_threads=int(df_threads),

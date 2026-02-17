@@ -1484,15 +1484,11 @@ def solve_mcscf_zvector(
         info_out = dict(info)
         info_out["absorb_h1e_direct"] = bool(absorb_direct_changed)
         if bool(op.orb_only):
-            # `mc1step.gen_g_hop` convention (no global factor-2 scaling).
+            # `mc1step.gen_g_hop` convention.
             info_out.setdefault("hessian_backend", "mc1step")
-            info_out.setdefault("lagrange_orb_scale", 0.5)
-            info_out.setdefault("lagrange_ci_scale", 1.0)
         else:
-            # `newton_casscf.gen_g_hop` convention (global factor-2 scaling like PySCF).
+            # `newton_casscf.gen_g_hop` convention (PySCF-style packed vector).
             info_out.setdefault("hessian_backend", "newton")
-            info_out.setdefault("lagrange_orb_scale", 0.25)
-            info_out.setdefault("lagrange_ci_scale", 0.5)
 
         return MCSCFZVectorResult(
             converged=converged,
