@@ -20,6 +20,7 @@ authors:
     given-names: Zihan
 
 preferred-citation:
+  type: unpublished
   title: "cuGUGA: Operator-Direct Graphical Unitary Group Approach Accelerated with CUDA"
   authors:
     - family-names: Pengmei
