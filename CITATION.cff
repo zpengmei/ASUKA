@@ -4,7 +4,8 @@ type: software
 title: "ASUKA"
 abstract: "CUDA-accelerated multireference methods built on a native GUGA/DRT engine."
 version: 0.1.0
-date-released: 2026-02-15
+license-url: "https://github.com/zpengmei/ASUKA/blob/main/LICENSE"
+date-released: "2026-02-15"
 url: "https://github.com/zpengmei/ASUKA"
 repository-code: "https://github.com/zpengmei/ASUKA"
 keywords:
@@ -19,11 +20,12 @@ authors:
     given-names: Zihan
 
 preferred-citation:
-  type: unpublished
+  type: article
   title: "cuGUGA: Operator-Direct Graphical Unitary Group Approach Accelerated with CUDA"
   authors:
     - family-names: Pengmei
       given-names: Zihan
   year: 2026
+  journal: "arXiv preprint"
+  doi: "10.48550/arXiv.2601.17729"
   url: "https://arxiv.org/abs/2601.17729"
-  notes: "arXiv:2601.17729 [physics.chem-ph]"
