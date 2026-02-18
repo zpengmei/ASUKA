@@ -429,9 +429,26 @@ def compute_df_gradient_contributions_analytic_packed_bases(
         bar_V_dev = cp.ascontiguousarray(cp.asarray(bar_V.reshape(-1), dtype=cp.float64))
 
         spCD_by_l_dev = {int(lq): cp.ascontiguousarray(cp.asarray(spCD_batch, dtype=cp.int32)) for lq, spCD_batch in spCD_by_l.items()}
-        atomC_by_l_dev = {
-            int(lq): cp.ascontiguousarray(cp.asarray(aux_shell_atom[np.asarray(shells_by_l[int(lq)], dtype=np.int32)], dtype=cp.int32))
-            for lq in spCD_by_l_dev
+
+        # Combined AO+aux shell→atom map for batched atomicAdd kernel.
+        shell_atom_all = np.concatenate([
+            np.asarray(ao_shell_atom, dtype=np.int32),
+            np.asarray(aux_shell_atom, dtype=np.int32),
+        ])
+        shell_atom_dev = cp.ascontiguousarray(cp.asarray(shell_atom_all, dtype=cp.int32))
+
+        # Group AO shell pairs by (la, lb) angular momentum class.
+        spAB_by_lab: dict[tuple[int, int], list[int]] = {}
+        for spAB_i in range(int(nsp_ao)):
+            shA = int(sp_A_all[int(spAB_i)])
+            shB = int(sp_B_all[int(spAB_i)])
+            key = (int(shell_l_host[shA]), int(shell_l_host[shB]))
+            if key not in spAB_by_lab:
+                spAB_by_lab[key] = []
+            spAB_by_lab[key].append(spAB_i)
+        spAB_by_lab_dev = {
+            lab: cp.ascontiguousarray(cp.asarray(indices, dtype=cp.int32))
+            for lab, indices in spAB_by_lab.items()
         }
 
         grad_dev = cp.zeros((natm, 3), dtype=cp.float64)
@@ -439,25 +456,16 @@ def compute_df_gradient_contributions_analytic_packed_bases(
         threads = 256
         stream_ptr = int(cp.cuda.get_current_stream().ptr)
 
-        # 3c2e derivative contraction.
-        for spAB in range(int(nsp_ao)):
-            shA = int(sp_A_all[int(spAB)])
-            shB = int(sp_B_all[int(spAB)])
-            fac = 2.0 if shA != shB else 1.0
-            atomA = int(ao_shell_atom[int(shA)])
-            atomB = int(ao_shell_atom[int(shB)])
-
-            la = int(shell_l_host[int(shA)])
-            lb = int(shell_l_host[int(shB)])
-
+        # 3c2e derivative contraction — batched: one kernel per (la,lb,lq) class.
+        grad_dev_flat = grad_dev.reshape(-1)  # (natm*3,) view for atomicAdd kernel
+        for (la_, lb_), spAB_class_dev in spAB_by_lab_dev.items():
+            n_spAB = int(spAB_class_dev.shape[0])
             for lq, spCD_dev in spCD_by_l_dev.items():
-                q_shells = shells_by_l[int(lq)]
                 nt = int(spCD_dev.shape[0])
-                if nt == 0:
+                if nt == 0 or n_spAB == 0:
                     continue
-                out_dev = cp.zeros((nt * 9,), dtype=cp.float64)
-                _ext_cuda.df_int3c2e_deriv_contracted_cart_sp_batch_inplace_device(
-                    int(spAB),
+                _ext_cuda.df_int3c2e_deriv_contracted_cart_allsp_atomgrad_inplace_device(
+                    spAB_class_dev,
                     spCD_dev,
                     sp_A_dev,
                     sp_B_dev,
@@ -477,31 +485,19 @@ def compute_df_gradient_contributions_analytic_packed_bases(
                     pair_cK_dev,
                     int(nao0),
                     int(naux),
-                    int(la),
-                    int(lb),
+                    int(la_),
+                    int(lb_),
                     int(lq),
                     bar_X_dev,
-                    out_dev,
+                    shell_atom_dev,
+                    grad_dev_flat,
                     int(threads),
                     int(stream_ptr),
-                    True,
+                    False,
                 )
-                out_batch_dev = out_dev.reshape((nt, 3, 3))
 
-                # Centers A/B are fixed for this AO shell pair, so reduce on-GPU
-                # and add once.
-                grad_dev[atomA] += fac * cp.sum(out_batch_dev[:, 0, :], axis=0)
-                grad_dev[atomB] += fac * cp.sum(out_batch_dev[:, 1, :], axis=0)
-
-                # Center C varies per aux shell; scatter-add to atoms.
-                atomC_dev = atomC_by_l_dev[int(lq)]
-                valsC = fac * out_batch_dev[:, 2, :]
-                cp.add.at(grad_dev[:, 0], atomC_dev, valsC[:, 0])
-                cp.add.at(grad_dev[:, 1], atomC_dev, valsC[:, 1])
-                cp.add.at(grad_dev[:, 2], atomC_dev, valsC[:, 2])
-
-    if profile is not None and backend_s == "cuda":
-        # Synchronize so the wall-clock profile reflects actual kernel work.
+    if backend_s == "cuda":
+        # Synchronize so that async 3c2e kernels complete before 2c2e metric section.
         import cupy as cp  # noqa: PLC0415
 
         cp.cuda.get_current_stream().synchronize()
