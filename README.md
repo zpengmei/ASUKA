@@ -4,6 +4,8 @@
   <img src="resources/asuka.jpg" alt="ASUKA" width="100%">
 </p>
 
+[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.XXXXXXX.svg)](https://doi.org/10.5281/zenodo.XXXXXXX)
+
 CUDA-accelerated multireference methods built on a native GUGA/DRT engine.
 
 Status: experimental — APIs and performance characteristics are evolving.
@@ -157,7 +159,7 @@ done
 
 ## Citation
 
-If you use ASUKA in your research, please cite:
+If you use ASUKA in your research, please cite the following paper:
 
 ```bibtex
 @misc{pengmei2026cugugaoperatordirectgraphicalunitary,
@@ -171,7 +173,20 @@ If you use ASUKA in your research, please cite:
 }
 ```
 
-See also `CITATION.cff` for additional references.
+If you wish to cite the software itself directly, please use the Zenodo record:
+
+```bibtex
+@software{pengmei2026asuka,
+      author={Zihan Pengmei},
+      title={ASUKA},
+      year={2026},
+      publisher={Zenodo},
+      doi={10.5281/zenodo.XXXXXXX},
+      url={https://doi.org/10.5281/zenodo.XXXXXXX},
+}
+```
+
+See also `CITATION.cff` for additional citation formats.
 
 ## Acknowledgments
 
@@ -183,4 +198,4 @@ ASUKA builds on ideas, algorithms, and validation references from several open-s
 
 ## License
 
-ASUKA is licensed under the [GNU General Public License v3.0](LICENSE). You are free to use, modify, and distribute this software, provided that any derivative work is also released under GPLv3 with full source code. See the LICENSE file for details.
+ASUKA is licensed under the [ASUKA Noncommercial License 1.0](LICENSE). Free for academic and non-commercial research use. Commercial use or redistribution as a standalone package requires explicit written permission from the author. See the LICENSE file for full details.
