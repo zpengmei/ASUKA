@@ -5,7 +5,6 @@ title: "ASUKA"
 abstract: "CUDA-accelerated multireference methods built on a native GUGA/DRT engine."
 version: 0.1.0
 date-released: 2026-02-15
-license: "LicenseRef-ASUKA-Noncommercial-1.0"
 url: "https://github.com/zpengmei/ASUKA"
 repository-code: "https://github.com/zpengmei/ASUKA"
 keywords:
