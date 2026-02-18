@@ -28,6 +28,7 @@ dependencies = [
   "numpy",
   "scipy",
   "basis_set_exchange",
+  "numba",
 ]
 
 [project.urls]

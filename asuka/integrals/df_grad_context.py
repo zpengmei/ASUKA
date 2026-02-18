@@ -281,6 +281,32 @@ class DFGradContractionContext:
                 )
             )
 
+        # Combined AO+aux shell→atom map (AO shells first, then aux shells).
+        # shellA/B from sp_A/sp_B for AO pairs index into [0, n_ao_shells).
+        # shellC from sp_A for aux pairs indexes into [n_ao_shells, n_ao_shells+n_aux_shells).
+        shell_atom_all = np.concatenate([
+            np.asarray(self.ao_shell_atom, dtype=np.int32),
+            np.asarray(self.aux_shell_atom, dtype=np.int32),
+        ])
+        shell_atom_dev = cp.ascontiguousarray(cp.asarray(shell_atom_all, dtype=cp.int32))
+
+        # Pre-group AO shell pairs by (la, lb) angular momentum class for batched kernel.
+        shell_l_np = np.asarray(self.shell_l_all, dtype=np.int32).ravel()
+        sp_A_np = np.asarray(self.sp_A_all, dtype=np.int32).ravel()
+        sp_B_np = np.asarray(self.sp_B_all, dtype=np.int32).ravel()
+        spAB_by_lab: dict[tuple[int, int], list[int]] = {}
+        for spAB_i in range(int(self.nsp_ao)):
+            shA = int(sp_A_np[spAB_i])
+            shB = int(sp_B_np[spAB_i])
+            key = (int(shell_l_np[shA]), int(shell_l_np[shB]))
+            if key not in spAB_by_lab:
+                spAB_by_lab[key] = []
+            spAB_by_lab[key].append(spAB_i)
+        spAB_by_lab_dev = {
+            lab: cp.ascontiguousarray(cp.asarray(indices, dtype=cp.int32))
+            for lab, indices in spAB_by_lab.items()
+        }
+
         self.cuda = {
             "_ext": _ext_cuda,
             "shell_cx": cp.ascontiguousarray(cp.asarray(self.shell_cxyz_all[:, 0], dtype=cp.float64)),
@@ -302,7 +328,9 @@ class DFGradContractionContext:
             "spCD_by_l": spCD_by_l_dev,
             "atomC_by_l": atomC_by_l_dev,
             "metric_batches": metric_batches_dev,
-            "shell_l_host": np.asarray(self.shell_l_all, dtype=np.int32).ravel(),
+            "shell_l_host": shell_l_np,
+            "shell_atom": shell_atom_dev,
+            "spAB_by_lab": spAB_by_lab_dev,
         }
 
     def contract(self, *, B_ao: Any, bar_L_ao: Any) -> np.ndarray:
@@ -425,26 +453,16 @@ class DFGradContractionContext:
         threads = 256
         stream_ptr = int(cp.cuda.get_current_stream().ptr)
 
-        work_3c: dict[int, Any] = {}
-        for spAB in range(int(self.nsp_ao)):
-            shA = int(self.sp_A_all[int(spAB)])
-            shB = int(self.sp_B_all[int(spAB)])
-            fac = 2.0 if shA != shB else 1.0
-            atomA = int(self.ao_shell_atom[int(shA)])
-            atomB = int(self.ao_shell_atom[int(shB)])
-            la = int(cuda["shell_l_host"][int(shA)])
-            lb = int(cuda["shell_l_host"][int(shB)])
-
+        # Batched 3c2e gradient: one kernel launch per (la,lb,lq) class instead of nsp_ao×nlq loops.
+        grad_dev_flat = grad_dev.reshape(-1)  # view as (natm*3,) for atomicAdd kernel
+        for (la_, lb_), spAB_class_dev in cuda["spAB_by_lab"].items():
+            n_spAB = int(spAB_class_dev.shape[0])
             for lq, spCD_dev in cuda["spCD_by_l"].items():
                 nt = int(spCD_dev.shape[0])
-                if nt == 0:
+                if nt == 0 or n_spAB == 0:
                     continue
-                out_dev = work_3c.get(nt)
-                if out_dev is None:
-                    out_dev = cp.empty((nt * 9,), dtype=cp.float64)
-                    work_3c[nt] = out_dev
-                _ext.df_int3c2e_deriv_contracted_cart_sp_batch_inplace_device(
-                    int(spAB),
+                _ext.df_int3c2e_deriv_contracted_cart_allsp_atomgrad_inplace_device(
+                    spAB_class_dev,
                     spCD_dev,
                     cuda["sp_A"],
                     cuda["sp_B"],
@@ -464,23 +482,16 @@ class DFGradContractionContext:
                     cuda["pair_cK"],
                     int(self.nao),
                     int(self.naux),
-                    int(la),
-                    int(lb),
+                    int(la_),
+                    int(lb_),
                     int(lq),
                     bar_X_dev,
-                    out_dev,
+                    cuda["shell_atom"],
+                    grad_dev_flat,
                     int(threads),
                     int(stream_ptr),
                     False,
                 )
-                out_batch_dev = out_dev.reshape((nt, 3, 3))
-                grad_dev[atomA] += fac * cp.sum(out_batch_dev[:, 0, :], axis=0)
-                grad_dev[atomB] += fac * cp.sum(out_batch_dev[:, 1, :], axis=0)
-                atomC_dev = cuda["atomC_by_l"][int(lq)]
-                valsC = fac * out_batch_dev[:, 2, :]
-                cp.add.at(grad_dev[:, 0], atomC_dev, valsC[:, 0])
-                cp.add.at(grad_dev[:, 1], atomC_dev, valsC[:, 1])
-                cp.add.at(grad_dev[:, 2], atomC_dev, valsC[:, 2])
 
         work_2c: dict[int, Any] = {}
         for spAB, lp, atomP, lq, spCD_dev, atomQ_dev, fac_dev in cuda["metric_batches"]:

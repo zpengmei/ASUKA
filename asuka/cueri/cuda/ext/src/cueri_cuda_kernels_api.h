@@ -799,6 +799,46 @@ extern "C" cudaError_t cueri_df_int3c2e_deriv_contracted_cart_launch_stream(
     cudaStream_t stream,
     int threads);
 
+// Batched DF int3c2e derivative contraction — processes all AO shell pairs in one (la,lb) class
+// × all aux shell pairs in one lq class with a single 2D kernel launch.
+// Accumulates gradient contributions directly into grad_dev via atomicAdd (no output buffer).
+//
+// Grid: dim3(ntasks_cd, n_spAB).  Each block handles one (spAB, spCD) pair.
+// spAB_arr[n_spAB]: GPU array of AO shell-pair indices, all sharing the same (la, lb).
+// shell_atom[nShellTotal]: combined AO+aux shell-to-atom map (AO shells first, then aux).
+// grad_dev[natm*3]: pre-zeroed gradient accumulator; results atomicAdd'd into it.
+extern "C" cudaError_t cueri_df_int3c2e_deriv_contracted_cart_allsp_atomgrad_launch_stream(
+    const int32_t* spAB_arr,   // [n_spAB]
+    int n_spAB,
+    const int32_t* spCD,       // [ntasks]
+    int ntasks,
+    const int32_t* sp_A,
+    const int32_t* sp_B,
+    const int32_t* sp_pair_start,
+    const int32_t* sp_npair,
+    const double* shell_cx,
+    const double* shell_cy,
+    const double* shell_cz,
+    const int32_t* shell_prim_start,
+    const int32_t* shell_nprim,
+    const int32_t* shell_ao_start,
+    const double* prim_exp,
+    const double* pair_eta,
+    const double* pair_Px,
+    const double* pair_Py,
+    const double* pair_Pz,
+    const double* pair_cK,
+    int nao,
+    int naux,
+    int la,
+    int lb,
+    int lc,
+    const double* bar_X_flat,  // size (nao*nao*naux)
+    const int32_t* shell_atom, // size (nAOshells+nAuxShells)
+    double* grad_dev,          // size (natm*3) — atomicAdd target
+    cudaStream_t stream,
+    int threads);
+
 // DF metric 2c2e derivative contraction (analytic) for expanded (nctr==1) aux bases.
 //
 // Contracts dV/dR against `bar_V` for a fixed aux spAB and a batch of aux spCD tasks:

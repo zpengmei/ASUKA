@@ -230,6 +230,141 @@ def _core_energy_weighted_density(
     return xp.asarray(D_core_ao, dtype=xp.float64), xp.asarray(dme_sf, dtype=xp.float64)
 
 
+def _build_bar_L_net_active_df(
+    B_ao: Any,
+    C: Any,
+    dm1_act: Any,
+    dm2_act: Any,
+    *,
+    ncore: int,
+    ncas: int,
+    xp: Any,
+) -> tuple[Any, Any]:
+    """Return (bar_L_net, D_act_ao) for the active DF gradient contribution.
+
+    bar_L_net = bar_L_casscf - bar_L_core_sub (fused, ready for a single contract() call).
+    D_act_ao  = active-space AO density matrix; use as M in contract_dhcore_cart for
+                the net 1e contribution (de_h1_active - de_h1_core_sub).
+
+    This extracts the bar_L construction from _grad_elec_active_df without calling
+    contract(), so the caller can accumulate multiple bar_L tensors before contracting.
+    Unlike _grad_elec_active_df it skips _build_gfock_casscf_df and
+    _core_energy_weighted_density (both only needed for the Fock/overlap terms).
+    """
+    ncore = int(ncore)
+    ncas = int(ncas)
+    nocc = ncore + ncas
+    nao = int(C.shape[0])
+
+    C_core = C[:, :ncore]
+    C_act = C[:, ncore:nocc]
+    D_core_ao = 2.0 * (C_core @ C_core.T) if ncore else xp.zeros((nao, nao), dtype=xp.float64)
+    D_act_ao = C_act @ xp.asarray(dm1_act, dtype=xp.float64) @ C_act.T
+
+    bar_L_ao = _build_bar_L_casscf_df(
+        B_ao,
+        D_core_ao=D_core_ao,
+        D_act_ao=D_act_ao,
+        C_act=C_act,
+        dm2_act=xp.asarray(dm2_act, dtype=xp.float64),
+    )
+    # Core-only RHF subtraction (same D_core_only as in _grad_elec_active_df).
+    bar_L_core = _build_bar_L_df_cross(
+        B_ao,
+        D_left=D_core_ao,
+        D_right=D_core_ao,
+        coeff_J=0.5,
+        coeff_K=-0.25,
+    )
+    return bar_L_ao - bar_L_core, D_act_ao
+
+
+def _build_bar_L_lorb_df(
+    B_ao: Any,
+    C: Any,
+    Lorb: Any,
+    dm1_act: Any,
+    dm2_act: Any,
+    *,
+    ncore: int,
+    ncas: int,
+    xp: Any,
+) -> tuple[Any, Any]:
+    """Return (bar_L_lorb, D_L_ao) for the orbital Lagrange DF gradient contribution.
+
+    bar_L_lorb is the bar_L tensor from _Lorb_dot_dgorb_dx_df, extracted without
+    the gfock/JK construction and without calling contract().
+    D_L_ao is the L-effective density for the 1e term (contract_dhcore_cart M=D_L_ao).
+
+    The caller can sum bar_L_lorb with other bar_L tensors and issue a single
+    contract() call, replacing the separate contract() inside _Lorb_dot_dgorb_dx_df.
+    """
+    ncore = int(ncore)
+    ncas = int(ncas)
+    nocc = ncore + ncas
+    nao = int(C.shape[0])
+
+    L = xp.asarray(Lorb, dtype=xp.float64)
+    dm1 = xp.asarray(dm1_act, dtype=xp.float64)
+    dm2 = xp.asarray(dm2_act, dtype=xp.float64)
+
+    C_core = C[:, :ncore]
+    C_act = C[:, ncore:nocc]
+    C_L = C @ L
+    C_L_core = C_L[:, :ncore]
+    C_L_act = C_L[:, ncore:nocc]
+
+    if ncore:
+        D_core = 2.0 * (C_core @ C_core.T)
+        D_L_core = 2.0 * (C_L_core @ C_core.T)
+        D_L_core = D_L_core + D_L_core.T
+    else:
+        D_core = xp.zeros((nao, nao), dtype=xp.float64)
+        D_L_core = xp.zeros((nao, nao), dtype=xp.float64)
+
+    D_act = C_act @ dm1 @ C_act.T
+    D_L_act = C_L_act @ dm1 @ C_act.T
+    D_L_act = D_L_act + D_L_act.T
+    D_L = D_L_core + D_L_act
+
+    # Mean-field bar_L (two _build_bar_L_df_cross calls, no _df_JK needed).
+    D_w = D_act + 0.5 * D_core
+    D_wL = D_L_act + 0.5 * D_L_core
+    bar_mean = _build_bar_L_df_cross(B_ao, D_left=D_wL, D_right=D_core, coeff_J=1.0, coeff_K=-0.5)
+    bar_mean = bar_mean + _build_bar_L_df_cross(B_ao, D_left=D_w, D_right=D_L_core, coeff_J=1.0, coeff_K=-0.5)
+
+    # Active-active DF term: linearize bar_L_casscf active block w.r.t C_act along C_L_act.
+    dm2_flat = dm2.reshape(ncas * ncas, ncas * ncas)
+    dm2_flat = 0.5 * (dm2_flat + dm2_flat.T)
+
+    X = xp.einsum("mnQ,nv->mvQ", B_ao, C_act, optimize=True)
+    L_act_mo = xp.einsum("mu,mvQ->uvQ", C_act, X, optimize=True)
+    L2 = L_act_mo.reshape(ncas * ncas, -1)
+    M_mat = dm2_flat @ L2
+    M_uvQ = M_mat.reshape(ncas, ncas, -1)
+
+    tmp = xp.einsum("mu,uvQ->mvQ", C_act, M_uvQ, optimize=True)
+    tmp_L = xp.einsum("mu,uvQ->mvQ", C_L_act, M_uvQ, optimize=True)
+
+    X_L = xp.einsum("mnQ,nv->mvQ", B_ao, C_L_act, optimize=True)
+    dL_act = (
+        xp.einsum("mu,mvQ->uvQ", C_L_act, X, optimize=True)
+        + xp.einsum("mu,mvQ->uvQ", C_act, X_L, optimize=True)
+    )
+    dL2 = dL_act.reshape(ncas * ncas, -1)
+    dM = dm2_flat @ dL2
+    dM_uvQ = dM.reshape(ncas, ncas, -1)
+    tmp_M = xp.einsum("mu,uvQ->mvQ", C_act, dM_uvQ, optimize=True)
+
+    bar_act = xp.einsum("mvQ,nv->Qmn", tmp_L, C_act, optimize=True)
+    bar_act = bar_act + xp.einsum("mvQ,nv->Qmn", tmp, C_L_act, optimize=True)
+    bar_act = bar_act + xp.einsum("mvQ,nv->Qmn", tmp_M, C_act, optimize=True)
+
+    bar_L_lorb = bar_mean + bar_act
+    bar_L_lorb = 0.5 * (bar_L_lorb + xp.transpose(bar_L_lorb, (0, 2, 1)))
+    return bar_L_lorb, D_L
+
+
 def _grad_elec_active_df(
     *,
     scf_out: Any,
@@ -269,7 +404,7 @@ def _grad_elec_active_df(
         dm2_act=xp.asarray(dm2_act, dtype=xp.float64),
     )
 
-    # ── Phase 1: ALL GPU work (bar_L + DF contract for total and core) ──
+    # ── Phase 1: Build both bar_L tensors on GPU (cheap, before any contract call) ──
     bar_L_ao = _build_bar_L_casscf_df(
         B_ao,
         D_core_ao=D_core_ao,
@@ -277,6 +412,58 @@ def _grad_elec_active_df(
         C_act=C_act,
         dm2_act=xp.asarray(dm2_act, dtype=xp.float64),
     )
+    # Core-only RHF-like contribution (GPU).
+    D_core_only, dme_core = _core_energy_weighted_density(mo_coeff=C, hcore_ao=h_ao, B_ao=B_ao, ncore=int(ncore))
+    bar_L_core = _build_bar_L_df_cross(
+        B_ao,
+        D_left=D_core_only,
+        D_right=D_core_only,
+        coeff_J=0.5,
+        coeff_K=-0.25,
+    )
+
+    if not bool(return_terms):
+        # ── Fast path: single fused contract() call (bar_L_ao - bar_L_core) ──
+        bar_L_net = bar_L_ao - bar_L_core
+        try:
+            if df_grad_ctx is not None:
+                de_df_net = df_grad_ctx.contract(B_ao=B_ao, bar_L_ao=bar_L_net)
+            else:
+                de_df_net = compute_df_gradient_contributions_analytic_packed_bases(
+                    ao_basis,
+                    aux_basis,
+                    atom_coords_bohr=coords,
+                    B_ao=B_ao,
+                    bar_L_ao=bar_L_net,
+                    backend=str(df_backend),
+                    df_threads=int(df_threads),
+                    profile=None,
+                )
+        except (NotImplementedError, RuntimeError):
+            de_df_net = compute_df_gradient_contributions_fd_packed_bases(
+                ao_basis,
+                aux_basis,
+                atom_coords_bohr=coords,
+                bar_L_ao=bar_L_net,
+                backend=str(df_backend),
+                df_config=df_config,
+                df_threads=int(df_threads),
+                delta_bohr=1e-4,
+                profile=None,
+            )
+        D_tot_cpu = _asnumpy_f64(D_tot_ao)
+        D_core_cpu = _asnumpy_f64(D_core_only)
+        de_h1 = contract_dhcore_cart(
+            ao_basis, atom_coords_bohr=coords, atom_charges=charges,
+            M=D_tot_cpu, shell_atom=shell_atom,
+        )
+        de_h1_core = contract_dhcore_cart(
+            ao_basis, atom_coords_bohr=coords, atom_charges=charges,
+            M=D_core_cpu, shell_atom=shell_atom,
+        )
+        return np.asarray(de_h1 + _asnumpy_f64(de_df_net) - de_h1_core, dtype=np.float64)
+
+    # ── Debug path (return_terms=True): keep 2 separate contract() calls for breakdown ──
     try:
         if df_grad_ctx is not None:
             de_df = df_grad_ctx.contract(B_ao=B_ao, bar_L_ao=bar_L_ao)
@@ -304,15 +491,6 @@ def _grad_elec_active_df(
             profile=None,
         )
 
-    # Core-only RHF-like contribution (GPU).
-    D_core_only, dme_core = _core_energy_weighted_density(mo_coeff=C, hcore_ao=h_ao, B_ao=B_ao, ncore=int(ncore))
-    bar_L_core = _build_bar_L_df_cross(
-        B_ao,
-        D_left=D_core_only,
-        D_right=D_core_only,
-        coeff_J=0.5,
-        coeff_K=-0.25,
-    )
     try:
         if df_grad_ctx is not None:
             de_df_core = df_grad_ctx.contract(B_ao=B_ao, bar_L_ao=bar_L_core)
@@ -340,11 +518,8 @@ def _grad_elec_active_df(
             profile=None,
         )
 
-    # ── Phase 2: Batch transfer (device already synced by contract()) ──
     D_tot_cpu = _asnumpy_f64(D_tot_ao)
     D_core_cpu = _asnumpy_f64(D_core_only)
-
-    # ── Phase 3: ALL CPU 1e work ──
     de_h1 = contract_dhcore_cart(
         ao_basis, atom_coords_bohr=coords, atom_charges=charges,
         M=D_tot_cpu, shell_atom=shell_atom,
@@ -353,12 +528,7 @@ def _grad_elec_active_df(
         ao_basis, atom_coords_bohr=coords, atom_charges=charges,
         M=D_core_cpu, shell_atom=shell_atom,
     )
-
-    # ── Phase 4: Accumulate (de_df, de_df_core already CPU from contract()) ──
     total = np.asarray(de_h1 + _asnumpy_f64(de_df) - de_h1_core - _asnumpy_f64(de_df_core), dtype=np.float64)
-    if not bool(return_terms):
-        return total
-
     terms = {
         "dhcore": np.asarray(de_h1, dtype=np.float64),
         "df2e": np.asarray(de_df, dtype=np.float64),

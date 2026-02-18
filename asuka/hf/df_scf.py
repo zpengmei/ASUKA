@@ -201,28 +201,25 @@ def _df_JK(B, D, *, want_J: bool = True, want_K: bool = True, B2=None, BQ=None, 
         except Exception:
             pass
 
-    # For larger systems, forming the full KQ tensor can be very memory-heavy.
-    # Use a chunked contraction path on GPU to reduce peak memory.
     naux = int(BQ.shape[0])
-    use_chunked = (xp is not np) and (int(naux) * int(nao) * int(nao) >= 10_000_000)
-    chunk = 128
+
     if profile is not None:
         jk_prof = profile.setdefault("jk", {})
-        jk_prof["k_impl"] = "chunked_einsum" if use_chunked else "batched_matmul"
-        if use_chunked:
-            jk_prof["k_chunk_naux"] = int(chunk)
+        jk_prof["k_impl"] = "gemm_gpu" if xp is not np else "batched_matmul"
 
     tK = _time_ms_start(xp) if profile is not None else None
-    if use_chunked:
-        K = xp.zeros((nao, nao), dtype=xp.float64)
-        for q0 in range(0, naux, int(chunk)):
-            q1 = min(int(naux), int(q0) + int(chunk))
-            BQc = BQ[int(q0) : int(q1)]
-            BDc = xp.matmul(BQc, D)  # (q, nao, nao)
-            # K += Σ_q BDc[q] @ BQc[q].T
-            K += xp.einsum("qik,qjk->ij", BDc, BQc)
-        BD = None
-        KQ = None
+    BD = None
+    KQ = None
+    if xp is not np:
+        # GPU path: single GEMM  K = M1 @ B2d.T
+        #   B2d[k, n*naux+Q] = B[k,n,Q]  (free reshape, C-contiguous)
+        #   BQD[m,Q,n]       = Σ_p B[m,p,Q]*D[p,n]  via tensordot
+        #   M1[m, n*naux+Q]  = BQD[m,Q,n]  (contiguous copy of BQD.T021)
+        #   K[m,k]           = Σ_{n,Q} M1[m,n*naux+Q] * B2d[k,n*naux+Q]
+        B2d = B.reshape(nao, nao * naux)          # view, no copy
+        BQD = xp.tensordot(B, D, axes=([1], [0]))  # (nao, naux, nao)
+        M1 = xp.ascontiguousarray(BQD.transpose(0, 2, 1)).reshape(nao, nao * naux)
+        K = M1 @ B2d.T
     else:
         BD = xp.matmul(BQ, D)  # (naux, nao, nao)
         KQ = xp.matmul(BD, BQ.transpose((0, 2, 1)))  # (naux, nao, nao)

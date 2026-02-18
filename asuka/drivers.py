@@ -224,7 +224,7 @@ def _can_use_cueri_cpu(mc: Any) -> bool:
     if mol is None or not bool(getattr(mol, "cart", False)):
         return False
     try:
-        from asuka.cueri import CuERIActiveSpaceDenseCPUBuilder  # noqa: F401
+        from asuka.cueri.active_space_dense_cpu import CuERIActiveSpaceDenseCPUBuilder  # noqa: F401
     except Exception:
         return False
     return True
@@ -283,7 +283,7 @@ def _get_cueri_builder(mc: Any, *, cueri_opts: dict[str, Any], cache_size: int) 
     builder = _CUERI_BUILDER_CACHE.get(key)
     if builder is not None:
         return builder
-    from asuka.cueri import CuERIActiveSpaceDenseCPUBuilder
+    from asuka.cueri.active_space_dense_cpu import CuERIActiveSpaceDenseCPUBuilder
     from asuka.cueri.mol_basis import get_cached_or_pack_cart_ao_basis
 
     ao_basis = get_cached_or_pack_cart_ao_basis(cache_owner=mc, mol=mol, cache_attr="_asuka_ao_basis")
@@ -1002,7 +1002,9 @@ def fciqmc(
     nspawn_two: int = 100,
     seed: int = 12345,
     target_population: float = 10000.0,
-    shift_damping: float = 0.1,
+    shift_damping: float = 0.0,
+    shift_stride: int = 1,
+    shift_start: int = 0,
     verbose: int = 0,
     eri_backend: Literal["auto", "mc_get_h2eff", "cueri_cpu"] | None = None,
     config: DriverConfig | None = None,
@@ -1035,7 +1037,11 @@ def fciqmc(
     target_population
         Target walker population.
     shift_damping
-        Damping factor for shift update.
+        Damping factor for shift update. Use 0.0 to disable shift control.
+    shift_stride
+        Update shift every `shift_stride` iterations.
+    shift_start
+        Start shift updates at iteration `shift_start`.
     verbose
         Verbosity level.
 
@@ -1084,7 +1090,7 @@ def fciqmc(
         if twos is None:
             twos = 0
 
-    drt = build_drt(norb, nelec, twos=twos)
+    drt = build_drt(norb, nelec, twos_target=twos)
 
     # Start from HF-like initial guess (first CSF)
     x_idx = np.array([0], dtype=np.int32)
@@ -1103,6 +1109,8 @@ def fciqmc(
         seed=seed,
         target_population=target_population,
         shift_damping=shift_damping,
+        shift_stride=shift_stride,
+        shift_start=shift_start,
     )
 
 
@@ -1115,13 +1123,14 @@ def fcifri(
     mc: Any | None = None,
     twos: int | None = None,
     m: int = 1000,
-    eps: float = 0.01,
-    niter: int = 100,
-    nspawn_one: int = 100,
-    nspawn_two: int = 100,
+    eps: float = 0.05,
+    niter: int = 500,
+    nspawn_one: int = 256,
+    nspawn_two: int = 256,
     seed: int = 12345,
     nroots: int = 1,
     backend: str = "stochastic",
+    energy_estimator: Literal["projected", "rayleigh"] = "projected",
     verbose: int = 0,
     eri_backend: Literal["auto", "mc_get_h2eff", "cueri_cpu"] | None = None,
     config: DriverConfig | None = None,
@@ -1158,6 +1167,9 @@ def fcifri(
     backend
         Projector backend: "stochastic" (CPU) or "cuda" (GPU). For multi-root
         subspace iteration, "exact" is also available for validation on tiny spaces.
+    energy_estimator
+        Ground-state energy estimator for ``nroots=1``:
+        ``"projected"`` or ``"rayleigh"``.
     verbose
         Verbosity level.
 
@@ -1206,7 +1218,11 @@ def fcifri(
         if twos is None:
             twos = 0
 
-    drt = build_drt(norb, nelec, twos=twos)
+    energy_estimator = str(energy_estimator).lower()
+    if energy_estimator not in ("projected", "rayleigh"):
+        raise ValueError("energy_estimator must be 'projected' or 'rayleigh'")
+
+    drt = build_drt(norb, nelec, twos_target=twos)
 
     # Start from HF-like initial guess
     x_idx = np.array([0], dtype=np.int32)
@@ -1226,6 +1242,7 @@ def fcifri(
             nspawn_two=nspawn_two,
             seed=seed,
             backend=backend,
+            energy_estimator=energy_estimator,
         )
     else:
         # Multi-root subspace method

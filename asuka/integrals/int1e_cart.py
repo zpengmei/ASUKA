@@ -1634,68 +1634,54 @@ def contract_dhcore_cart(
     if shell_atom.shape != (int(basis.shell_l.shape[0]),):
         raise ValueError("shell_atom must have shape (nShell,)")
 
-    backend = _int1e_backend()
-    if backend in ("numba", "cython"):
-        from asuka.integrals import _int1e_cart_numba as _nb  # noqa: PLC0415
+    from asuka.integrals import _int1e_cart_numba as _nb  # noqa: PLC0415
 
-        if bool(getattr(_nb, "HAS_NUMBA", False)):
-            lmax = int(np.max(basis.shell_l)) if int(basis.shell_l.size) else 0
-            comp_start, comp_lx, comp_ly, comp_lz = _comp_tables_cached(lmax)
-            pairA, pairB = _shell_pairs_lower(int(basis.shell_l.shape[0]))
+    lmax = int(np.max(basis.shell_l)) if int(basis.shell_l.size) else 0
+    comp_start, comp_lx, comp_ly, comp_lz = _comp_tables_cached(lmax)
+    pairA, pairB = _shell_pairs_lower(int(basis.shell_l.shape[0]))
 
-            gT = _nb.contract_dT_cart_numba(
-                basis.shell_cxyz,
-                basis.shell_prim_start,
-                basis.shell_nprim,
-                basis.shell_l,
-                basis.shell_ao_start,
-                basis.prim_exp,
-                basis.prim_coef,
-                shell_atom,
-                int(natm),
-                comp_start,
-                comp_lx,
-                comp_ly,
-                comp_lz,
-                pairA,
-                pairB,
-                int(nao),
-                M,
-            )
-            gV = _nb.contract_dV_cart_numba(
-                basis.shell_cxyz,
-                basis.shell_prim_start,
-                basis.shell_nprim,
-                basis.shell_l,
-                basis.shell_ao_start,
-                basis.prim_exp,
-                basis.prim_coef,
-                atom_coords_bohr,
-                atom_charges,
-                shell_atom,
-                int(natm),
-                comp_start,
-                comp_lx,
-                comp_ly,
-                comp_lz,
-                pairA,
-                pairB,
-                int(nao),
-                bool(include_operator_deriv),
-                M,
-            )
-            return np.asarray(gT + gV, dtype=np.float64)
-
-    # Fallback: build full derivative tensors and contract (memory-heavy).
-    dT = build_dT_cart(basis, atom_coords_bohr=atom_coords_bohr, shell_atom=shell_atom)
-    dV = build_dV_cart(
-        basis,
-        atom_coords_bohr=atom_coords_bohr,
-        atom_charges=atom_charges,
-        shell_atom=shell_atom,
-        include_operator_deriv=bool(include_operator_deriv),
+    gT = _nb.contract_dT_cart_numba(
+        basis.shell_cxyz,
+        basis.shell_prim_start,
+        basis.shell_nprim,
+        basis.shell_l,
+        basis.shell_ao_start,
+        basis.prim_exp,
+        basis.prim_coef,
+        shell_atom,
+        int(natm),
+        comp_start,
+        comp_lx,
+        comp_ly,
+        comp_lz,
+        pairA,
+        pairB,
+        int(nao),
+        M,
     )
-    return np.einsum("axij,ij->ax", dT + dV, M, optimize=True)
+    gV = _nb.contract_dV_cart_numba(
+        basis.shell_cxyz,
+        basis.shell_prim_start,
+        basis.shell_nprim,
+        basis.shell_l,
+        basis.shell_ao_start,
+        basis.prim_exp,
+        basis.prim_coef,
+        atom_coords_bohr,
+        atom_charges,
+        shell_atom,
+        int(natm),
+        comp_start,
+        comp_lx,
+        comp_ly,
+        comp_lz,
+        pairA,
+        pairB,
+        int(nao),
+        bool(include_operator_deriv),
+        M,
+    )
+    return np.asarray(gT + gV, dtype=np.float64)
 
 
 __all__ = [
