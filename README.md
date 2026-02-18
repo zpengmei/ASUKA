@@ -4,7 +4,7 @@
   <img src="resources/asuka.jpg" alt="ASUKA" width="100%">
 </p>
 
-[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.XXXXXXX.svg)](https://doi.org/10.5281/zenodo.XXXXXXX)
+[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.18676228.svg)](https://doi.org/10.5281/zenodo.18676228)
 
 CUDA-accelerated multireference methods built on a native GUGA/DRT engine.
 
@@ -181,8 +181,8 @@ If you wish to cite the software itself directly, please use the Zenodo record:
       title={ASUKA},
       year={2026},
       publisher={Zenodo},
-      doi={10.5281/zenodo.XXXXXXX},
-      url={https://doi.org/10.5281/zenodo.XXXXXXX},
+      doi={10.5281/zenodo.18676228},
+      url={https://doi.org/10.5281/zenodo.18676228},
 }
 ```
 
