@@ -1,30 +1,33 @@
 cff-version: 1.2.0
 message: "If you use this software, please cite it as below."
-type: software
 title: "ASUKA"
+type: software
 abstract: "CUDA-accelerated multireference methods built on a native GUGA/DRT engine."
-version: 0.1.0
-license-url: "https://github.com/zpengmei/ASUKA/blob/main/LICENSE"
+version: "0.1.0"
 date-released: "2026-02-15"
 url: "https://github.com/zpengmei/ASUKA"
 repository-code: "https://github.com/zpengmei/ASUKA"
+
+license-url: "https://github.com/zpengmei/ASUKA/blob/main/LICENSE"
+
 keywords:
-  - quantum chemistry
-  - multireference methods
-  - GUGA
-  - DRT
-  - CUDA
-  - GPU acceleration
+  - "quantum chemistry"
+  - "multireference methods"
+  - "GUGA"
+  - "DRT"
+  - "CUDA"
+  - "GPU acceleration"
+
 authors:
-  - family-names: Pengmei
-    given-names: Zihan
+  - family-names: "Pengmei"
+    given-names: "Zihan"
 
 preferred-citation:
   type: article
   title: "cuGUGA: Operator-Direct Graphical Unitary Group Approach Accelerated with CUDA"
   authors:
-    - family-names: Pengmei
-      given-names: Zihan
+    - family-names: "Pengmei"
+      given-names: "Zihan"
   year: 2026
   journal: "arXiv preprint"
   doi: "10.48550/arXiv.2601.17729"
