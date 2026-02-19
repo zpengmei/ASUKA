@@ -586,12 +586,28 @@ def _gmres_solve_gpu(
     # Preconditioner on GPU.
     M = None
     if precond is not None:
-        # precond is CPU-based (e.g. SA Lagrange); roundtrip through numpy.
-        def _m_mv_gpu(x_d):
-            x_np = cp.asnumpy(x_d).astype(np.float64)
-            y_np = np.asarray(precond(x_np), dtype=np.float64).ravel()
-            return cp.asarray(y_np, dtype=cp.float64)
-        M = CuLinearOperator((n, n), matvec=_m_mv_gpu, dtype=cp.float64)
+        # Prefer a GPU-native preconditioner to avoid CPU roundtrips.
+        _gpu_precond_ok = False
+        try:
+            _probe = precond(cp.zeros_like(b_d))
+            _gpu_precond_ok = isinstance(_probe, cp.ndarray)
+        except Exception:
+            _gpu_precond_ok = False
+
+        if _gpu_precond_ok:
+            def _m_mv_gpu(x_d):
+                y_d = precond(x_d)
+                return cp.asarray(y_d, dtype=cp.float64).ravel()
+
+            M = CuLinearOperator((n, n), matvec=_m_mv_gpu, dtype=cp.float64)
+        else:
+            # Fall back to CPU preconditioner with a roundtrip through NumPy.
+            def _m_mv_gpu(x_d):
+                x_np = cp.asnumpy(x_d).astype(np.float64)
+                y_np = np.asarray(precond(x_np), dtype=np.float64).ravel()
+                return cp.asarray(y_np, dtype=cp.float64)
+
+            M = CuLinearOperator((n, n), matvec=_m_mv_gpu, dtype=cp.float64)
     elif diag_precond is not None:
         d = cp.asarray(diag_precond, dtype=cp.float64).ravel()
         if d.size != n:
@@ -960,13 +976,14 @@ def _build_sa_lagrange_precond(
     n_orb: int,
     diag: np.ndarray,
     ci_ref_list: list[np.ndarray],
-    ci_unflatten: Callable[[np.ndarray], Any],
     level_shift: float = 1e-8,
-) -> Callable[[np.ndarray], np.ndarray]:
+) -> Callable[[Any], Any]:
     """Build a CSF-compatible SA-CASSCF Lagrange preconditioner.
 
     This mirrors the logic of PySCF's `pyscf.grad.sacasscf.SACASLagPrec` but operates
     on flattened CI vectors (e.g. CSF/GUGA) rather than determinant-shaped (na,nb) CI arrays.
+    The returned callable is xp-aware: it accepts a NumPy *or* CuPy vector and returns an
+    array on the same backend.
 
     Parameters
     ----------
@@ -976,14 +993,12 @@ def _build_sa_lagrange_precond(
         Diagonal approximation of the Hessian.
     ci_ref_list : list[np.ndarray]
         Reference CI vectors.
-    ci_unflatten : Callable
-        Unflatten function for CI vectors.
     level_shift : float, optional
         Level shift for stability.
 
     Returns
     -------
-    Callable[[np.ndarray], np.ndarray]
+    Callable[[Any], Any]
         Preconditioner function.
     """
 
@@ -1001,62 +1016,96 @@ def _build_sa_lagrange_precond(
     if nroots <= 0:
         raise ValueError("empty ci_ref_list for SA preconditioner")
 
+    n_tot = int(n_orb + nci * nroots)
+    if int(diag.size) != n_tot:
+        raise ValueError("SA preconditioner expected full diagonal of length n_orb + nci*nroots")
+
     d_orb = diag[:n_orb].copy()
     d_orb = d_orb + float(level_shift)
     d_orb[np.abs(d_orb) < 1e-8] = 1e-8
     r_orb = 1.0 / d_orb if d_orb.size else d_orb
 
-    d_ci_list = ci_unflatten(diag[n_orb:])
-    if not isinstance(d_ci_list, list) or len(d_ci_list) != nroots:
-        raise ValueError("SA preconditioner expected list CI diag matching nroots")
-    d_ci_flat = [np.asarray(v, dtype=np.float64).ravel() for v in d_ci_list]
-    if any(int(v.size) != nci for v in d_ci_flat):
-        raise ValueError("SA preconditioner CI diag size mismatch")
+    # CI diagonal is packed root-by-root; reshape to (nci,nroots) in Fortran order.
+    d_ci_mat = np.asarray(diag[n_orb:], dtype=np.float64).reshape((nci, nroots), order="F")
 
     cmat = np.stack(ci_ref_flat, axis=1)  # (nci, nroots)
 
-    r_ci: list[np.ndarray] = []
-    r_ci_sa: list[np.ndarray] = []
-    for i in range(nroots):
-        d_i = np.asarray(d_ci_flat[i], dtype=np.float64).copy()
-        d_i = d_i + float(level_shift)
-        d_i[np.abs(d_i) < 1e-8] = 1e-8
-        r_i = 1.0 / d_i
-        r_ci.append(r_i)
+    # r_ci_mat[:,i] = elementwise inverse (diag_ci_i + shift)
+    d_ci_mat = d_ci_mat + float(level_shift)
+    d_ci_mat[np.abs(d_ci_mat) < 1e-8] = 1e-8
+    r_ci_mat = 1.0 / d_ci_mat
 
+    # For each root i, precompute sci_inv_i where sci_i = C^T (diag^{-1}_i * C).
+    # Store as (nroots,nroots,nroots): sci_inv_stack[i,:,:].
+    sci_inv_stack = np.empty((nroots, nroots, nroots), dtype=np.float64)
+    for i in range(nroots):
+        r_i = np.asarray(r_ci_mat[:, i], dtype=np.float64)
         rci_c = r_i[:, None] * cmat  # (nci,nroots)
         sci = cmat.T @ rci_c  # (nroots,nroots)
         try:
             sci_inv = np.linalg.inv(sci)
         except np.linalg.LinAlgError:  # pragma: no cover
             sci_inv = np.linalg.pinv(sci)
-        r_ci_sa.append(rci_c @ sci_inv)  # (nci,nroots)
+        sci_inv_stack[i] = np.asarray(sci_inv, dtype=np.float64)
 
-    def _precond(x: np.ndarray) -> np.ndarray:
-        xx = np.asarray(x, dtype=np.float64).ravel()
+    # Lazy GPU cache (allocated on first CuPy call).
+    try:
+        import cupy as _cp_mod  # type: ignore[import-not-found]  # noqa: PLC0415
+    except Exception:  # pragma: no cover
+        _cp_mod = None
+
+    _cp = None
+    _r_orb_dev = None
+    _cmat_dev = None
+    _r_ci_mat_dev = None
+    _sci_inv_stack_dev = None
+
+    def _get_gpu_cache():
+        nonlocal _cp, _r_orb_dev, _cmat_dev, _r_ci_mat_dev, _sci_inv_stack_dev
+        if _r_orb_dev is not None:
+            return _cp, _r_orb_dev, _cmat_dev, _r_ci_mat_dev, _sci_inv_stack_dev
+        if _cp_mod is None:  # pragma: no cover
+            return None, None, None, None, None
+        _cp = _cp_mod
+        _r_orb_dev = _cp_mod.asarray(r_orb, dtype=_cp_mod.float64) if int(r_orb.size) else _cp_mod.zeros((0,), dtype=_cp_mod.float64)
+        _cmat_dev = _cp_mod.asarray(cmat, dtype=_cp_mod.float64)
+        _r_ci_mat_dev = _cp_mod.asarray(r_ci_mat, dtype=_cp_mod.float64)
+        _sci_inv_stack_dev = _cp_mod.asarray(sci_inv_stack, dtype=_cp_mod.float64)
+        return _cp, _r_orb_dev, _cmat_dev, _r_ci_mat_dev, _sci_inv_stack_dev
+
+    def _precond(x: Any) -> Any:
+        # Detect xp based on input type.
+        cp = _cp_mod
+        if cp is not None and isinstance(x, cp.ndarray):
+            xp = cp
+            cp2, r_orb_xp, cmat_xp, r_ci_mat_xp, sci_inv_stack_xp = _get_gpu_cache()
+            if cp2 is None:  # pragma: no cover
+                raise RuntimeError("CuPy preconditioner requested but CuPy is unavailable")
+        else:
+            xp = np
+            r_orb_xp = r_orb
+            cmat_xp = cmat
+            r_ci_mat_xp = r_ci_mat
+            sci_inv_stack_xp = sci_inv_stack
+
+        xx = xp.asarray(x, dtype=xp.float64).ravel()
         if int(xx.size) != int(diag.size):
             raise ValueError("SA preconditioner input length mismatch")
 
         x_orb = xx[:n_orb]
         x_ci = xx[n_orb:]
 
-        out_orb = x_orb * r_orb if int(r_orb.size) else x_orb
+        out_orb = x_orb * r_orb_xp if int(n_orb) else x_orb
 
-        x_ci_list = ci_unflatten(x_ci)
-        if not isinstance(x_ci_list, list) or len(x_ci_list) != nroots:
-            raise ValueError("SA preconditioner expected list CI input")
+        x_ci_mat = x_ci.reshape((nci, nroots), order="F")
+        rx_mat = x_ci_mat * r_ci_mat_xp
 
-        rx_mat = np.empty((nci, nroots), dtype=np.float64)
-        for i in range(nroots):
-            rx_mat[:, i] = r_ci[i] * np.asarray(x_ci_list[i], dtype=np.float64).ravel()
+        sa_ovlp = cmat_xp.T @ rx_mat  # (nroots,nroots)
+        v_mat = xp.einsum("iab,bi->ai", sci_inv_stack_xp, sa_ovlp, optimize=True)  # (nroots,nroots)
+        corr = (cmat_xp @ v_mat) * r_ci_mat_xp  # (nci,nroots)
+        out_ci = rx_mat - corr
 
-        sa_ovlp = cmat.T @ rx_mat  # (nroots,nroots)
-
-        out_ci = np.empty_like(rx_mat)
-        for i in range(nroots):
-            out_ci[:, i] = rx_mat[:, i] - r_ci_sa[i] @ sa_ovlp[:, i]
-
-        return np.concatenate([out_orb, out_ci.ravel(order="F")])
+        return xp.concatenate([out_orb, out_ci.ravel(order="F")])
 
     return _precond
 
@@ -1516,7 +1565,6 @@ def solve_mcscf_zvector(
                     n_orb=int(op.n_orb),
                     diag=np.asarray(op.diag, dtype=np.float64),
                     ci_ref_list=op.ci_ref_list,
-                    ci_unflatten=op.ci_unflatten,
                 )
                 diag_use = None
             except Exception:

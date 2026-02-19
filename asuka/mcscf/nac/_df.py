@@ -239,6 +239,8 @@ def _build_bar_L_net_active_df(
     ncore: int,
     ncas: int,
     xp: Any,
+    L_act: Any | None = None,
+    rho_core: Any | None = None,
 ) -> tuple[Any, Any]:
     """Return (bar_L_net, D_act_ao) for the active DF gradient contribution.
 
@@ -267,6 +269,8 @@ def _build_bar_L_net_active_df(
         D_act_ao=D_act_ao,
         C_act=C_act,
         dm2_act=xp.asarray(dm2_act, dtype=xp.float64),
+        L_act=L_act,
+        rho_core=rho_core,
     )
     # Core-only RHF subtraction (same D_core_only as in _grad_elec_active_df).
     bar_L_core = _build_bar_L_df_cross(

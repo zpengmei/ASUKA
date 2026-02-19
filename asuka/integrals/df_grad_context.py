@@ -334,14 +334,14 @@ class DFGradContractionContext:
         }
 
     def contract(self, *, B_ao: Any, bar_L_ao: Any) -> np.ndarray:
-        if self.backend == "cpu":
-            B = np.asarray(B_ao, dtype=np.float64, order="C")
-            bar_L = np.asarray(bar_L_ao, dtype=np.float64, order="C")
-        else:
+        if self.backend == "cuda":
             import cupy as cp  # noqa: PLC0415
 
-            B = cp.ascontiguousarray(cp.asarray(B_ao, dtype=cp.float64))
-            bar_L = cp.ascontiguousarray(cp.asarray(bar_L_ao, dtype=cp.float64))
+            grad_dev = self.contract_device(B_ao=B_ao, bar_L_ao=bar_L_ao)
+            return np.asarray(cp.asnumpy(grad_dev), dtype=np.float64)
+
+        B = np.asarray(B_ao, dtype=np.float64, order="C")
+        bar_L = np.asarray(bar_L_ao, dtype=np.float64, order="C")
 
         if B.ndim != 3:
             raise ValueError("B_ao must have shape (nao, nao, naux)")
@@ -354,60 +354,30 @@ class DFGradContractionContext:
         if tuple(map(int, bar_L.shape)) != (int(self.naux), int(self.nao), int(self.nao)):
             raise ValueError("bar_L_ao must have shape (naux, nao, nao)")
 
-        if self.backend == "cpu":
-            bar_B = np.transpose(bar_L, (1, 2, 0))
-            bar_X, bar_Lchol = df_whiten_adjoint(B, np.asarray(bar_B, dtype=np.float64, order="C"), self.L_metric)
-            bar_V = chol_lower_adjoint(self.L_metric, bar_Lchol)
-            bar_X = 0.5 * (bar_X + bar_X.transpose((1, 0, 2)))
-            bar_X = np.asarray(bar_X, dtype=np.float64, order="C")
-            bar_V = np.asarray(bar_V, dtype=np.float64, order="C")
-            bar_X_flat = bar_X.reshape((self.nao * self.nao, self.naux))
+        bar_B = np.transpose(bar_L, (1, 2, 0))
+        bar_X, bar_Lchol = df_whiten_adjoint(B, np.asarray(bar_B, dtype=np.float64, order="C"), self.L_metric)
+        bar_V = chol_lower_adjoint(self.L_metric, bar_Lchol)
+        bar_X = 0.5 * (bar_X + bar_X.transpose((1, 0, 2)))
+        bar_X = np.asarray(bar_X, dtype=np.float64, order="C")
+        bar_V = np.asarray(bar_V, dtype=np.float64, order="C")
+        bar_X_flat = bar_X.reshape((self.nao * self.nao, self.naux))
 
-            grad = np.zeros((self.natm, 3), dtype=np.float64)
-            if self.cpu is None:  # pragma: no cover
-                raise RuntimeError("internal error: CPU function table missing")
-            fn_3c = self.cpu["fn_3c"]
-            fn_2c = self.cpu["fn_2c"]
+        grad = np.zeros((self.natm, 3), dtype=np.float64)
+        if self.cpu is None:  # pragma: no cover
+            raise RuntimeError("internal error: CPU function table missing")
+        fn_3c = self.cpu["fn_3c"]
+        fn_2c = self.cpu["fn_2c"]
 
-            for spAB in range(int(self.nsp_ao)):
-                shA = int(self.sp_A_all[int(spAB)])
-                shB = int(self.sp_B_all[int(spAB)])
-                fac = 2.0 if shA != shB else 1.0
-                atomA = int(self.ao_shell_atom[int(shA)])
-                atomB = int(self.ao_shell_atom[int(shB)])
+        for spAB in range(int(self.nsp_ao)):
+            shA = int(self.sp_A_all[int(spAB)])
+            shB = int(self.sp_B_all[int(spAB)])
+            fac = 2.0 if shA != shB else 1.0
+            atomA = int(self.ao_shell_atom[int(shA)])
+            atomB = int(self.ao_shell_atom[int(shB)])
 
-                for lq, spCD_batch in self.spCD_by_l.items():
-                    q_shells = self.shells_by_l[int(lq)]
-                    out_batch = fn_3c(
-                        self.shell_cxyz_all,
-                        self.shell_prim_start_all,
-                        self.shell_nprim_all,
-                        self.shell_l_all,
-                        self.shell_ao_start_all,
-                        self.prim_exp_all,
-                        self.sp_A_all,
-                        self.sp_B_all,
-                        self.sp_pair_start_all,
-                        self.sp_npair_all,
-                        self.pair_eta_all,
-                        self.pair_Px_all,
-                        self.pair_Py_all,
-                        self.pair_Pz_all,
-                        self.pair_cK_all,
-                        int(spAB),
-                        spCD_batch,
-                        int(self.nao),
-                        bar_X_flat,
-                    )
-                    out_batch = np.asarray(out_batch, dtype=np.float64)
-                    for t, qsh in enumerate(q_shells.tolist()):
-                        atomC = int(self.aux_shell_atom[int(qsh)])
-                        grad[atomA] += fac * out_batch[int(t), 0, :]
-                        grad[atomB] += fac * out_batch[int(t), 1, :]
-                        grad[atomC] += fac * out_batch[int(t), 2, :]
-
-            for spAB, lp, atomP, lq, spCD_batch, atomQ, fac in self.metric_batches:
-                out_batch = fn_2c(
+            for lq, spCD_batch in self.spCD_by_l.items():
+                q_shells = self.shells_by_l[int(lq)]
+                out_batch = fn_3c(
                     self.shell_cxyz_all,
                     self.shell_prim_start_all,
                     self.shell_nprim_all,
@@ -426,15 +396,69 @@ class DFGradContractionContext:
                     int(spAB),
                     spCD_batch,
                     int(self.nao),
-                    bar_V,
+                    bar_X_flat,
                 )
                 out_batch = np.asarray(out_batch, dtype=np.float64)
-                grad[int(atomP)] += np.sum(out_batch[:, 0, :] * fac[:, None], axis=0)
-                np.add.at(grad, atomQ, out_batch[:, 1, :] * fac[:, None])
+                for t, qsh in enumerate(q_shells.tolist()):
+                    atomC = int(self.aux_shell_atom[int(qsh)])
+                    grad[atomA] += fac * out_batch[int(t), 0, :]
+                    grad[atomB] += fac * out_batch[int(t), 1, :]
+                    grad[atomC] += fac * out_batch[int(t), 2, :]
 
-            return np.asarray(grad, dtype=np.float64)
+        for spAB, lp, atomP, lq, spCD_batch, atomQ, fac in self.metric_batches:
+            out_batch = fn_2c(
+                self.shell_cxyz_all,
+                self.shell_prim_start_all,
+                self.shell_nprim_all,
+                self.shell_l_all,
+                self.shell_ao_start_all,
+                self.prim_exp_all,
+                self.sp_A_all,
+                self.sp_B_all,
+                self.sp_pair_start_all,
+                self.sp_npair_all,
+                self.pair_eta_all,
+                self.pair_Px_all,
+                self.pair_Py_all,
+                self.pair_Pz_all,
+                self.pair_cK_all,
+                int(spAB),
+                spCD_batch,
+                int(self.nao),
+                bar_V,
+            )
+            out_batch = np.asarray(out_batch, dtype=np.float64)
+            grad[int(atomP)] += np.sum(out_batch[:, 0, :] * fac[:, None], axis=0)
+            np.add.at(grad, atomQ, out_batch[:, 1, :] * fac[:, None])
+
+        return np.asarray(grad, dtype=np.float64)
+
+    def contract_device(self, *, B_ao: Any, bar_L_ao: Any) -> Any:
+        """CUDA-only version of :meth:`contract` that returns the gradient on device.
+
+        Returns
+        -------
+        cupy.ndarray
+            Gradient array on device with shape (natm, 3) and dtype float64.
+        """
+        if self.backend != "cuda":
+            raise NotImplementedError("contract_device is only available for backend='cuda'")
 
         import cupy as cp  # noqa: PLC0415
+
+        B = cp.ascontiguousarray(cp.asarray(B_ao, dtype=cp.float64))
+        bar_L = cp.ascontiguousarray(cp.asarray(bar_L_ao, dtype=cp.float64))
+
+        if B.ndim != 3:
+            raise ValueError("B_ao must have shape (nao, nao, naux)")
+        nao0, nao1, naux = map(int, B.shape)
+        if nao0 != nao1:
+            raise ValueError("B_ao must have shape (nao, nao, naux)")
+        if nao0 != int(self.nao) or naux != int(self.naux):
+            raise ValueError("B_ao shape mismatch with context")
+
+        if tuple(map(int, bar_L.shape)) != (int(self.naux), int(self.nao), int(self.nao)):
+            raise ValueError("bar_L_ao must have shape (naux, nao, nao)")
 
         if self.cuda is None:
             raise RuntimeError("CUDA static context is not initialized")
@@ -538,4 +562,4 @@ class DFGradContractionContext:
             cp.add.at(grad_dev[:, 1], atomQ_dev, valsQ[:, 1])
             cp.add.at(grad_dev[:, 2], atomQ_dev, valsQ[:, 2])
 
-        return np.asarray(cp.asnumpy(grad_dev), dtype=np.float64)
+        return grad_dev
