@@ -35,7 +35,7 @@ from asuka.integrals.grad import (
     compute_df_gradient_contributions_analytic_packed_bases,
     compute_df_gradient_contributions_fd_packed_bases,
 )
-from asuka.integrals.int1e_cart import contract_dhcore_cart, shell_to_atom_map
+from asuka.integrals.int1e_cart import contract_dhcore_cart, contract_dS_ip_cart, shell_to_atom_map
 from asuka.solver import GUGAFCISolver
 
 from .state_average import ci_as_list, make_state_averaged_rdms, normalize_weights
@@ -574,6 +574,7 @@ def casscf_nuc_grad_df(
         M=_asnumpy_f64(D_tot_ao),
         shell_atom=shell_atom,
     )
+
     t_1e = time.perf_counter() if profile is not None else 0.0
 
     try:
@@ -1323,6 +1324,48 @@ def casscf_nuc_grad_df_per_root(
     _ppaa_2d = ppaa_sa.reshape(nmo * nmo, ncas * ncas)
 
     # ------------------------------------------------------------------
+    # SA base gradient (shared across all roots, includes Pulay term)
+    # This is the correct SA-CASSCF gradient (variational w.r.t. SA energy).
+    # Per-root gradients are expressed as: grad_K = grad_sa_base + delta_K
+    # ------------------------------------------------------------------
+    C_np = _asnumpy_f64(C)
+    gfock_sa, D_core_sa, D_act_sa, D_tot_sa, C_act_sa = _build_gfock_casscf_df(
+        B_ao, h_ao, C, ncore=int(ncore), ncas=int(ncas), dm1_act=dm1_sa, dm2_act=dm2_sa,
+    )
+    bar_L_sa = _build_bar_L_casscf_df(
+        B_ao, D_core_ao=D_core_sa, D_act_ao=D_act_sa, C_act=C_act_sa, dm2_act=dm2_sa,
+    )
+    try:
+        if df_grad_ctx is not None:
+            de_df_sa = df_grad_ctx.contract(B_ao=B_ao, bar_L_ao=bar_L_sa)
+        else:
+            de_df_sa = compute_df_gradient_contributions_analytic_packed_bases(
+                ao_basis, aux_basis, atom_coords_bohr=coords, B_ao=B_ao, bar_L_ao=bar_L_sa,
+                backend=str(df_backend), df_threads=int(df_threads), profile=None,
+            )
+    except (NotImplementedError, RuntimeError) as e:
+        warnings.warn(
+            f"DF 2e gradient contraction fell back to finite-difference on B (backend={df_backend!s}); "
+            "expect noisy/non-conservative forces in MD. "
+            f"Reason: {type(e).__name__}: {e}",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+        warned_df_fd = True
+        de_df_sa = compute_df_gradient_contributions_fd_packed_bases(
+            ao_basis, aux_basis, atom_coords_bohr=coords, bar_L_ao=bar_L_sa,
+            backend=str(df_backend), df_config=df_config, df_threads=int(df_threads),
+            delta_bohr=float(delta_bohr), profile=None,
+        )
+    de_h1_sa = contract_dhcore_cart(
+        ao_basis, atom_coords_bohr=coords, atom_charges=charges,
+        M=_asnumpy_f64(D_tot_sa), shell_atom=shell_atom,
+    )
+    grad_sa_base = np.asarray(
+        de_h1_sa + _asnumpy_f64(de_df_sa) + de_nuc, dtype=np.float64,
+    )
+
+    # ------------------------------------------------------------------
     # Per-root gradient loop
     # ------------------------------------------------------------------
     grads_list: list[np.ndarray] = []
@@ -1330,45 +1373,18 @@ def casscf_nuc_grad_df_per_root(
     for K in range(nroots):
         dm1_K, dm2_K = per_root_rdms[K]
 
-        # Step A: Build densities and bar_L for the Hellmann-Feynman term (GPU).
+        # For single-state CASSCF: no response — SA base gradient IS the exact per-root gradient.
+        if nroots == 1:
+            grads_list.append(np.asarray(grad_sa_base, dtype=np.float64))
+            continue
+
+        # Step A: Build per-root densities and bar_L for the Hellmann-Feynman term (GPU).
         gfock_K, D_core_K, D_act_K, D_tot_K, C_act_K = _build_gfock_casscf_df(
             B_ao, h_ao, C, ncore=int(ncore), ncas=int(ncas), dm1_act=dm1_K, dm2_act=dm2_K,
         )
         bar_L_K = _build_bar_L_casscf_df(
             B_ao, D_core_ao=D_core_K, D_act_ao=D_act_K, C_act=C_act_K, dm2_act=dm2_K,
         )
-
-        # For single-state CASSCF: no lci/lorb response — contract immediately and continue.
-        if nroots == 1:
-            try:
-                if df_grad_ctx is not None:
-                    de_df_K = df_grad_ctx.contract(B_ao=B_ao, bar_L_ao=bar_L_K)
-                else:
-                    de_df_K = compute_df_gradient_contributions_analytic_packed_bases(
-                        ao_basis, aux_basis, atom_coords_bohr=coords, B_ao=B_ao, bar_L_ao=bar_L_K,
-                        backend=str(df_backend), df_threads=int(df_threads), profile=None,
-                    )
-            except (NotImplementedError, RuntimeError) as e:
-                if not warned_df_fd:
-                    warnings.warn(
-                        f"DF 2e gradient contraction fell back to finite-difference on B (backend={df_backend!s}); "
-                        "expect noisy/non-conservative forces in MD. "
-                        f"Reason: {type(e).__name__}: {e}",
-                        RuntimeWarning,
-                        stacklevel=2,
-                    )
-                    warned_df_fd = True
-                de_df_K = compute_df_gradient_contributions_fd_packed_bases(
-                    ao_basis, aux_basis, atom_coords_bohr=coords, bar_L_ao=bar_L_K,
-                    backend=str(df_backend), df_config=df_config, df_threads=int(df_threads),
-                    delta_bohr=float(delta_bohr), profile=None,
-                )
-            de_h1_K = contract_dhcore_cart(
-                ao_basis, atom_coords_bohr=coords, atom_charges=charges,
-                M=_asnumpy_f64(D_tot_K), shell_atom=shell_atom,
-            )
-            grads_list.append(np.asarray(_asnumpy_f64(de_df_K) + de_h1_K + de_nuc, dtype=np.float64))
-            continue
 
         # Step B: Z-vector RHS
         fcisolver_fixed = _FixedRDMFcisolver(fcisolver_use, dm1=dm1_K, dm2=dm2_K)
@@ -1446,14 +1462,15 @@ def casscf_nuc_grad_df_per_root(
             ncore=int(ncore), ncas=int(ncas), xp=xp,
         )
 
-        # ── Single fused contract() call: bar_L_K + bar_L_lci_net + bar_L_lorb ──
-        bar_L_total = bar_L_K + bar_L_lci_net + bar_L_lorb
+        # ── Single fused contract(): delta from SA + lci response + lorb response ──
+        # grad_K = grad_sa_base + delta_2e + delta_1e + delta_Pulay
+        bar_L_delta_total = (bar_L_K - bar_L_sa) + bar_L_lci_net + bar_L_lorb
         try:
             if df_grad_ctx is not None:
-                de_df_total = df_grad_ctx.contract(B_ao=B_ao, bar_L_ao=bar_L_total)
+                de_df_delta = df_grad_ctx.contract(B_ao=B_ao, bar_L_ao=bar_L_delta_total)
             else:
-                de_df_total = compute_df_gradient_contributions_analytic_packed_bases(
-                    ao_basis, aux_basis, atom_coords_bohr=coords, B_ao=B_ao, bar_L_ao=bar_L_total,
+                de_df_delta = compute_df_gradient_contributions_analytic_packed_bases(
+                    ao_basis, aux_basis, atom_coords_bohr=coords, B_ao=B_ao, bar_L_ao=bar_L_delta_total,
                     backend=str(df_backend), df_threads=int(df_threads), profile=None,
                 )
         except (NotImplementedError, RuntimeError) as e:
@@ -1466,28 +1483,31 @@ def casscf_nuc_grad_df_per_root(
                     stacklevel=2,
                 )
                 warned_df_fd = True
-            de_df_total = compute_df_gradient_contributions_fd_packed_bases(
-                ao_basis, aux_basis, atom_coords_bohr=coords, bar_L_ao=bar_L_total,
+            de_df_delta = compute_df_gradient_contributions_fd_packed_bases(
+                ao_basis, aux_basis, atom_coords_bohr=coords, bar_L_ao=bar_L_delta_total,
                 backend=str(df_backend), df_config=df_config, df_threads=int(df_threads),
                 delta_bohr=float(delta_bohr), profile=None,
             )
 
-        # ── Single fused 1e call: D_tot_K (HF) + D_act_lci (lci net) + D_L_lorb (lorb) ──
-        D_1e_total = _asnumpy_f64(D_tot_K + D_act_lci + D_L_lorb)
-        de_h1_total = contract_dhcore_cart(
+        # ── Single fused 1e call: delta from SA + lci + lorb ──
+        D_1e_delta = _asnumpy_f64(D_tot_K - D_tot_sa + D_act_lci + D_L_lorb)
+        de_h1_delta = contract_dhcore_cart(
             ao_basis, atom_coords_bohr=coords, atom_charges=charges,
-            M=D_1e_total, shell_atom=shell_atom,
+            M=D_1e_delta, shell_atom=shell_atom,
         )
 
-        # Step F: Combine
-        grad_K = np.asarray(_asnumpy_f64(de_df_total) + de_h1_total + de_nuc, dtype=np.float64)
+        # Step F: Combine — grad_sa_base + delta 2e + delta 1e
+        grad_K = np.asarray(
+            grad_sa_base + _asnumpy_f64(de_df_delta) + de_h1_delta,
+            dtype=np.float64,
+        )
         grads_list.append(grad_K)
 
     # ------------------------------------------------------------------
     # Assembly
     # ------------------------------------------------------------------
     grads = np.stack(grads_list, axis=0)  # (nroots, natm, 3)
-    grad_sa = np.einsum("r,rax->ax", w_arr, grads)
+    grad_sa = np.asarray(grad_sa_base, dtype=np.float64)  # directly from SA (not weighted sum)
 
     e_sa = float(np.dot(w_arr, e_roots))
     e_nuc_val = float(mol.energy_nuc())
