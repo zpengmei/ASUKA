@@ -887,6 +887,7 @@ def _gcrotmk_solve(
             "residual_norm": 0.0,
             "residual_rel": 0.0,
             "solver": "gcrotmk",
+            "backend": "cpu",
         }
 
     matvec_calls = 0
@@ -967,6 +968,159 @@ def _gcrotmk_solve(
         "residual_norm": resid,
         "residual_rel": float(rel),
         "solver": "gcrotmk",
+        "backend": "cpu",
+    }
+    return x, out
+
+
+def _gcrotmk_solve_gpu(
+    mv: Callable[[Any], Any],
+    b: np.ndarray,
+    *,
+    diag_precond: np.ndarray | None = None,
+    precond: Callable[[Any], Any] | None = None,
+    tol: float = 1e-10,
+    maxiter: int = 50,
+    m: int | None = None,
+    k: int | None = None,
+    x0: np.ndarray | None = None,
+    recycle_space: list[tuple[np.ndarray | None, np.ndarray]] | None = None,
+) -> tuple[np.ndarray, dict[str, Any]]:
+    """Solve A x = b with GPU GCROT(m,k) using CuPy vectors."""
+
+    try:
+        import cupy as cp  # type: ignore[import-not-found]
+    except Exception as e:
+        raise RuntimeError("GCROTMK GPU path requires CuPy") from e
+
+    from asuka.cuda.krylov_gcrotmk import gcrotmk_xp  # noqa: PLC0415
+
+    b = np.asarray(b, dtype=np.float64).ravel()
+    n = int(b.size)
+    bnorm = float(np.linalg.norm(b))
+    if n == 0:
+        return b.copy(), {
+            "info": 0,
+            "niter": 0,
+            "matvec_calls": 0,
+            "matvec_time_total": 0.0,
+            "matvec_time_avg": 0.0,
+            "solve_time_total": 0.0,
+            "rhs_norm": 0.0,
+            "residual_norm": 0.0,
+            "residual_rel": 0.0,
+            "solver": "gcrotmk_gpu",
+            "backend": "cuda",
+        }
+
+    b_d = cp.asarray(b, dtype=cp.float64)
+    x0_d = None
+    if x0 is not None:
+        x0_d = cp.asarray(np.asarray(x0, dtype=np.float64).ravel(), dtype=cp.float64)
+        if int(x0_d.size) != n:
+            raise ValueError("x0 length mismatch")
+
+    m_use = 20 if m is None else int(m)
+    if m_use <= 0:
+        raise ValueError("m must be positive")
+    k_use = None if k is None else int(k)
+    if k_use is not None and k_use <= 0:
+        raise ValueError("k must be positive when provided")
+
+    matvec_calls = 0
+    matvec_time = 0.0
+    niter = 0
+
+    def _mv_counted(x: Any) -> Any:
+        nonlocal matvec_calls
+        nonlocal matvec_time
+        matvec_calls += 1
+        t0 = time.perf_counter()
+        y = mv(x)
+        matvec_time += time.perf_counter() - t0
+        return cp.asarray(y, dtype=cp.float64).ravel()
+
+    M = None
+    if precond is not None:
+        def _m_mv(x: Any) -> Any:
+            y = precond(x)
+            if isinstance(y, cp.ndarray):
+                return cp.asarray(y, dtype=cp.float64).ravel()
+            y_np = np.asarray(y, dtype=np.float64).ravel()
+            return cp.asarray(y_np, dtype=cp.float64)
+
+        M = _m_mv
+    elif diag_precond is not None:
+        d = cp.asarray(np.asarray(diag_precond, dtype=np.float64).ravel(), dtype=cp.float64)
+        if int(d.size) != n:
+            raise ValueError("diag_precond length mismatch")
+        d_safe = cp.where(cp.abs(d) > 1e-14, d, 1.0)
+
+        def _m_mv(x: Any) -> Any:
+            xx = cp.asarray(x, dtype=cp.float64).ravel()
+            return xx / d_safe
+
+        M = _m_mv
+
+    def _cb(_xk: Any) -> None:
+        nonlocal niter
+        niter += 1
+
+    cu: list[tuple[Any, Any]]
+    if recycle_space is None:
+        cu = []
+    else:
+        cu = recycle_space  # type: ignore[assignment]
+        for i, (c, u) in enumerate(list(cu)):
+            if c is None:
+                c_d = None
+            elif isinstance(c, cp.ndarray):
+                c_d = cp.asarray(c, dtype=cp.float64).ravel()
+            else:
+                c_d = cp.asarray(np.asarray(c, dtype=np.float64).ravel(), dtype=cp.float64)
+
+            if isinstance(u, cp.ndarray):
+                u_d = cp.asarray(u, dtype=cp.float64).ravel()
+            else:
+                u_d = cp.asarray(np.asarray(u, dtype=np.float64).ravel(), dtype=cp.float64)
+            cu[i] = (c_d, u_d)
+
+    t_solve0 = time.perf_counter()
+    x_d, info = gcrotmk_xp(
+        _mv_counted,
+        b_d,
+        x0=x0_d,
+        rtol=float(tol),
+        atol=0.0,
+        maxiter=int(maxiter),
+        M=M,
+        callback=_cb,
+        m=m_use,
+        k=k_use,
+        CU=cu,
+        discard_C=False,
+        truncate="oldest",
+        xp=cp,
+    )
+    solve_time = time.perf_counter() - t_solve0
+
+    x = np.asarray(cp.asnumpy(x_d), dtype=np.float64).ravel()
+    r_d = cp.asarray(mv(x_d), dtype=cp.float64).ravel() - b_d
+    resid = float(cp.linalg.norm(r_d))
+    rel = resid / bnorm if bnorm > 0.0 else resid
+
+    out: dict[str, Any] = {
+        "info": int(info),
+        "niter": int(niter),
+        "matvec_calls": int(matvec_calls),
+        "matvec_time_total": float(matvec_time),
+        "matvec_time_avg": float(matvec_time) / float(matvec_calls) if matvec_calls else 0.0,
+        "solve_time_total": float(solve_time),
+        "rhs_norm": float(bnorm),
+        "residual_norm": resid,
+        "residual_rel": float(rel),
+        "solver": "gcrotmk_gpu",
+        "backend": "cuda",
     }
     return x, out
 
@@ -1404,7 +1558,7 @@ def solve_mcscf_zvector(
     use_newton_hessian: bool | None = True,
     restart: int | None = None,
     x0: np.ndarray | None = None,
-    method: str = "gmres",
+    method: str = "gcrotmk",
     gcrotmk_k: int | None = None,
     recycle_space: list[tuple[np.ndarray | None, np.ndarray]] | None = None,
     hessian_op: MCSCFHessianOp | None = None,
@@ -1440,7 +1594,7 @@ def solve_mcscf_zvector(
     use_newton_hessian : bool | None, optional
         Use exact Newton Hessian (default True).
     restart : int | None, optional
-        Restart size (GMRES).
+        Restart size (GMRES restart / GCROTMK inner iteration count m).
     x0 : np.ndarray | None, optional
         Initial guess.
     method : str, optional
@@ -1571,6 +1725,53 @@ def solve_mcscf_zvector(
                 precond_use = None
                 diag_use = op.diag
 
+        def _solve_gcrotmk_dispatch(b_vec: np.ndarray, x0_vec: np.ndarray | None):
+            if not bool(op.gpu_mode):
+                return _gcrotmk_solve(
+                    op.mv,
+                    b_vec,
+                    diag_precond=diag_use,
+                    precond=precond_use,
+                    tol=float(tol),
+                    maxiter=int(maxiter),
+                    m=restart,
+                    k=gcrotmk_k,
+                    x0=x0_vec,
+                    recycle_space=recycle_space,
+                )
+            try:
+                return _gcrotmk_solve_gpu(
+                    op.mv,
+                    b_vec,
+                    diag_precond=diag_use,
+                    precond=precond_use,
+                    tol=float(tol),
+                    maxiter=int(maxiter),
+                    m=restart,
+                    k=gcrotmk_k,
+                    x0=x0_vec,
+                    recycle_space=recycle_space,
+                )
+            except RuntimeError as e:
+                if "requires CuPy" not in str(e):
+                    raise
+                x_cpu, info_cpu = _gcrotmk_solve(
+                    op.mv,
+                    b_vec,
+                    diag_precond=diag_use,
+                    precond=precond_use,
+                    tol=float(tol),
+                    maxiter=int(maxiter),
+                    m=restart,
+                    k=gcrotmk_k,
+                    x0=x0_vec,
+                    recycle_space=recycle_space,
+                )
+                info_cpu = dict(info_cpu)
+                info_cpu["fallback_reason"] = "cupy_unavailable"
+                info_cpu["backend"] = "cpu"
+                return x_cpu, info_cpu
+
         info: dict[str, Any]
         z: np.ndarray
         z_orb: np.ndarray
@@ -1603,18 +1804,7 @@ def solve_mcscf_zvector(
                 b_orb = -rhs_orb_flat
                 if method_l == "gcrotmk":
                     with ctx_rdm:
-                        z_orb, info = _gcrotmk_solve(
-                            op.mv,
-                            b_orb,
-                            diag_precond=diag_use,
-                            precond=precond_use,
-                            tol=float(tol),
-                            maxiter=int(maxiter),
-                            m=restart,
-                            k=gcrotmk_k,
-                            x0=x0_orb,
-                            recycle_space=recycle_space,
-                        )
+                        z_orb, info = _solve_gcrotmk_dispatch(b_orb, x0_orb)
                 else:
                     gmres_kwargs: dict[str, Any] = {
                         "diag_precond": diag_use,
@@ -1653,18 +1843,7 @@ def solve_mcscf_zvector(
             b = -rhs
             if method_l == "gcrotmk":
                 with ctx_rdm:
-                    z, info = _gcrotmk_solve(
-                        op.mv,
-                        b,
-                        diag_precond=diag_use,
-                        precond=precond_use,
-                        tol=float(tol),
-                        maxiter=int(maxiter),
-                        m=restart,
-                        k=gcrotmk_k,
-                        x0=x0_use,
-                        recycle_space=recycle_space,
-                    )
+                    z, info = _solve_gcrotmk_dispatch(b, x0_use)
             else:
                 gmres_kwargs = {
                     "diag_precond": diag_use,

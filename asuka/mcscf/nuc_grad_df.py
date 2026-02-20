@@ -1468,14 +1468,11 @@ def casscf_nuc_grad_df_per_root(
     _z_use_x0_env = str(os.environ.get("ASUKA_ZVECTOR_USE_X0", "1")).strip().lower()
     _z_use_x0 = _z_use_x0_env not in ("0", "false", "no", "off", "disable", "disabled")
 
-    # No GPU GCROT: if Hessian matvec is GPU-native, keep GMRES on GPU.
-    _hess_gpu_mode = bool(getattr(hess_op, "gpu_mode", False))
+    # Default to GCROTMK unless explicitly overridden.
     if _z_method_env in ("gmres", "gcrotmk"):
         _z_method = _z_method_env
     else:
-        _z_method = "gmres" if _hess_gpu_mode else "gcrotmk"
-    if _hess_gpu_mode and _z_method == "gcrotmk":
-        _z_method = "gmres"
+        _z_method = "gcrotmk"
     _z_recycle_space: list[tuple[np.ndarray | None, np.ndarray]] | None = [] if _z_method == "gcrotmk" else None
     _z_prev_x0: np.ndarray | None = None
 

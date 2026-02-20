@@ -809,9 +809,8 @@ def mrcisd_energy_and_grad_states_from_mc(
     )
     weights = getattr(mc, "weights", np.asarray([1.0], dtype=np.float64))
     atmlst_eff = list(range(mc.mol.natm)) if atmlst is None else list(atmlst)
-    nsolve = int(len(mrci_states.states))
     if z_method is None:
-        method_z = "gcrotmk" if nsolve > 1 else "gmres"
+        method_z = "gcrotmk"
     else:
         method_z = str(z_method).strip().lower()
     if method_z not in ("gmres", "gcrotmk"):
@@ -1057,9 +1056,8 @@ def ic_mrcisd_energy_and_grad_states_from_mc(
         eris=eris,
         use_newton_hessian=True,
     )
-    nsolve = int(len(states))
     if z_method is None:
-        method_z = "gcrotmk" if nsolve > 1 else "gmres"
+        method_z = "gcrotmk"
     else:
         method_z = str(z_method).strip().lower()
     if method_z not in ("gmres", "gcrotmk"):
