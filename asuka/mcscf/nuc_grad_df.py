@@ -1795,7 +1795,7 @@ def casscf_nuc_grad_df_per_root(
 
         # Multi-stream CUDA path: launch contract_device() asynchronously and
         # overlap CPU work while kernels run on independent streams.
-        if _use_multistream_contract and df_grad_ctx is not None and _cp is not None:
+        if _use_multistream_contract and df_grad_ctx is not None and _cp is not None and hasattr(df_grad_ctx, "contract_device"):
             cp = _cp
             evt_ready = cp.cuda.Event()
             with _main_stream_cm:
