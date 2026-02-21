@@ -71,7 +71,33 @@ def build_bmat(
     *,
     ci_context: CASPT2CIContext | None = None,
 ) -> np.ndarray:
-    """Build zeroth-order Hamiltonian matrix B for a given IC case."""
+    """Build zeroth-order Hamiltonian matrix B for a given IC case.
+
+    The B matrix is the active-superindex representation of Dyall's H0 in the
+    IC basis.  For most cases (B±, D–H±) it involves only the Fock-weighted
+    RDM intermediates (EASUM, FD, FP) and the 1-/2-RDMs.  Cases A and C
+    additionally require F3 (DELTA3) contractions and therefore need a valid
+    ``ci_context``.
+
+    Parameters
+    ----------
+    case : int
+        IC case number (1–13).
+    smap : SuperindexMap
+        Precomputed index tables.
+    fock : CASPT2Fock
+        MO-basis Fock matrices (provides ``epsa`` and ``fifa``).
+    dm1, dm2, dm3 : np.ndarray
+        Active-space RDMs in E-operator convention.
+    ci_context : CASPT2CIContext | None
+        Required for cases 1 (A) and 4 (C) to compute F3 contributions
+        without an explicit 4-RDM.  Ignored for other cases.
+
+    Returns
+    -------
+    bmat : (nasup, nasup) array
+        Zeroth-order Hamiltonian matrix in the active superindex basis.
+    """
     builders = {
         1: _bmat_a,
         2: _bmat_bp,

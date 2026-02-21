@@ -893,10 +893,32 @@ def _mltr1(imltop: int, lst1: np.ndarray, x: np.ndarray, f: np.ndarray, y: np.nd
 
 @dataclass(frozen=True)
 class SigmaC1CaseCoupling:
-    """Molcas SIGMA_CASPT2 case coupling operator (C1).
+    """Full Molcas SIGMA_CASPT2 inter-case coupling operator (C1 symmetry).
 
-    Extends `SigmaC1ActiveVirtualCoupling` to include *all* IFCOUP couplings
-    required for `nish>0` parity (KOD 1-24 in `OpenMolcas/src/caspt2/sgm.f`).
+    Extends ``SigmaC1ActiveVirtualCoupling`` to include *all* 24 IFCOUP coupling
+    channels required for systems with inactive orbitals (``nish > 0``).
+    Ports KOD 1–24 from ``OpenMolcas/src/caspt2/sgm.f``.
+
+    The algorithm operates in two passes:
+
+    **IMLTOP=0** (forward): For each "low" case, accumulates off-diagonal
+    sigma contributions from all coupled "high" cases into the low case's
+    covariant sigma vector.  Uses ``_mltsca``/``_mltmv``/``_mltdxp``/``_mltr1``
+    tensor contraction primitives and precomputed MKLIST coupling lists (1–17).
+
+    **IMLTOP=1** (reverse): For each (low, high) coupling pair, propagates
+    the covariant density ``D = S·X(low)`` into the high case's sigma vector
+    using the same kernel types in reverse mode.
+
+    Special 1-electron folding (``spec1a``/``spec1c``/``spec1d``) handles the
+    extra Fock/nactel corrections for cases A, C, and D.
+
+    The full coupling table (from ``eqsolv.F90`` IFCOUP):
+      KOD 1–2:   A ↔ B±    KOD 9–10:  C ↔ F±    KOD 17–18: E± ↔ H±
+      KOD 3:     A ↔ D     KOD 11–12: C ↔ G±    KOD 19–20: F± ↔ G±
+      KOD 4–5:   A ↔ E±    KOD 13–14: D ↔ E±    KOD 21–22: G± ↔ H±
+      KOD 6–7:   B± ↔ E±   KOD 15–16: D ↔ G±    KOD 23–24: D ↔ H±
+      KOD 8:     C ↔ D
     """
 
     smap: SuperindexMap

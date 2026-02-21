@@ -59,32 +59,58 @@ def caspt2_energy_ss(
     threshold_s: float = 1e-8,
     verbose: int = 0,
 ) -> CASPT2EnergyResult:
-    """Compute SS-CASPT2 energy.
+    """Compute SS-CASPT2 energy for a single reference state.
+
+    Orchestrates the full per-case workflow: S/B matrix construction,
+    joint diagonalization with linear-dependence removal, RHS vector
+    transformation, optional level shifts, and amplitude solution via
+    direct divide or iterative PCG.
+
+    When ``pt2_backend="cuda"``, dispatches to ``caspt2_energy_ss_cuda()``
+    which uses DF-based RHS construction and a GPU sigma operator.
 
     Parameters
     ----------
     smap : SuperindexMap
-        Precomputed superindex mappings.
+        Precomputed superindex mappings (from ``build_superindex``).
     fock : CASPT2Fock
-        Fock matrices.
+        MO-basis Fock matrices.
     eri_mo : (nmo, nmo, nmo, nmo)
-        Full MO ERIs in chemists' notation.
+        Full MO ERIs in chemists' notation.  Unused when ``pt2_backend="cuda"``
+        (DF blocks are used instead).
     dm1, dm2, dm3 : np.ndarray
-        Active RDMs (Molcas normal-ordered convention).
+        Active-space RDMs in E-operator convention.
     e_ref : float
-        Reference (CASSCF) energy.
+        Reference (CASSCF) energy for this state.
+    ci_context : CASPT2CIContext | None
+        DRT + CI vector needed for F3 contractions (cases A/C).
+    df_blocks : CASPT2DFBlocks | None
+        DF pair blocks for CUDA backend.
+    store_rhs : bool
+        If True, store raw RHS vectors in the result breakdown dict.
+    store_row_dots : bool
+        If True, store per-case row_dots matrices (needed for MS Heff).
+        Only supported for ``pt2_backend="cuda"``.
     ipea_shift, imag_shift, real_shift : float
-        Shift parameters.
+        Level-shift parameters for intruder-state removal.
     tol : float
         Solver convergence tolerance.
     maxiter : int
-        Maximum solver iterations.
+        Maximum number of PCG iterations.
     threshold : float
         Diagonal-norm threshold (Molcas THRSHN) for S-metric pre-scaling.
     threshold_s : float
-        Scaled-S eigenvalue threshold (Molcas THRSHS).
+        Scaled-S eigenvalue threshold (Molcas THRSHS) for linear-dependence
+        removal.
     verbose : int
-        Verbosity level.
+        Verbosity level (0=silent, 1=summary, 2=per-case detail).
+
+    Returns
+    -------
+    CASPT2EnergyResult
+        Contains ``e_ref``, ``e_pt2``, ``e_tot``, ``amplitudes`` (list of 13
+        per-case amplitude vectors in the SR basis), and ``breakdown`` dict
+        with per-case E2 contributions and shift corrections.
     """
     pt2_backend_norm = str(pt2_backend).strip().lower()
     if pt2_backend_norm in ("cuda", "cupy", "gpu"):

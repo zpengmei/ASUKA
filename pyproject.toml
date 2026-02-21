@@ -55,11 +55,6 @@ cuda12 = [
   "nvidia-cusparse-cu12",
   "nvidia-nvjitlink-cu12",
 ]
-pyscf = [
-  "pyscf",
-  "h5py",
-]
-
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["asuka", "asuka.*"]

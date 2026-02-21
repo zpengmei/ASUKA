@@ -46,7 +46,23 @@ except Exception:  # pragma: no cover
 
 @dataclass(frozen=True)
 class CASPT2CIContext:
-    """Context needed to build F3 contributions in cases A/C."""
+    """Context needed to build F3 contributions in IC-CASPT2 cases A and C.
+
+    Carries the active-space DRT (Distinct Row Table) and the CI coefficient
+    vector in the CSF basis, which are used by ``F3ContractionEngine`` to
+    compute Fock-weighted 4-body quantities without an explicit 4-RDM.
+
+    Attributes
+    ----------
+    drt : DRT
+        Active-space GUGA Distinct Row Table (defines norb, nelec, ncsf).
+    ci_csf : np.ndarray
+        CI coefficient vector in the CSF basis, shape ``(ncsf,)``.
+    max_memory_mb : float
+        Memory cap for intermediate buffers.
+    block_nops : int
+        Block size for batched E_pq applications.
+    """
 
     drt: DRT
     ci_csf: np.ndarray
@@ -55,7 +71,28 @@ class CASPT2CIContext:
 
 
 class F3ContractionEngine:
-    """On-demand F3 contraction engine for one CASPT2 reference state."""
+    """On-demand F3 contraction engine for one CASPT2 reference state.
+
+    Computes Fock-weighted 4-body quantities (OpenMolcas DELTA3) needed by
+    cases A and C of the IC-CASPT2 B matrix, *without* building an explicit
+    4-RDM.  The key identity used is:
+
+        F3_raw(t,u,v,x,y,z) = <c| E_tu (H_diag - epsa[v]) E_vx E_yz |c>
+
+    where ``H_diag`` is the diagonal one-electron Fock operator in the CSF
+    basis and ``|c>`` is the reference CI vector.  OpenMolcas applies
+    additional delta-function correction terms (from ``mkfg3.f``) to convert
+    this raw contraction into the irreducible-generator DELTA3 quantity.
+
+    The engine precomputes:
+      - ``|fc> = (sum_w epsa[w] E_ww)|c>``  (Fock-weighted ket)
+      - ``T1[pq] = E_pq|c>``  (all nops first-order intermediates)
+      - ``bra[pq] = E_qp|c>``  (for bra contractions)
+
+    F3 elements are evaluated lazily and cached per (y,z) pair.  Two backends
+    are available for E_pq applications: sparse CSC matrices (via SciPy/Cython)
+    or the oracle-based ``_fill_epq_vec`` fallback.
+    """
 
     def __init__(self, context: CASPT2CIContext, epsa: np.ndarray):
         self.drt = context.drt

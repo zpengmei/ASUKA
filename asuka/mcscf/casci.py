@@ -23,6 +23,7 @@ from asuka.cuda.active_space_df.active_space_integrals import (
     build_device_dfmo_integrals_cueri_df,
 )
 from asuka.hf import df_scf as _df_scf
+from asuka.hf import df_jk
 from asuka.solver import GUGAFCISolver
 
 from asuka.frontend.molecule import Molecule
@@ -240,6 +241,8 @@ class CASCIResult:
         Active space two-electron integrals.
     scf : Any
         The underlying SCF result object from the frontend calculation.
+    scf_out : Any | None
+        The full frontend run result object (includes DF factors, hcore, etc).
     profile : dict | None
         Performance profiling data, if collected.
     """
@@ -258,6 +261,7 @@ class CASCIResult:
     eri: Any
     scf: Any
     profile: dict | None = None
+    scf_out: Any | None = None
 
 
 @dataclass(frozen=True)
@@ -365,12 +369,37 @@ def _build_casci_df_integrals(
     xp, _is_gpu = _df_scf._get_xp(B, C_cas)  # noqa: SLF001
     h_ao = xp.asarray(scf_out.int1e.hcore, dtype=xp.float64)
 
+    cached_b_whitened_use = cached_b_whitened
+    if cached_b_whitened_use is None and bool(_is_gpu) and B is not None:
+        # Reuse SCF's whitened DF factors for active-space DF when available.
+        # This avoids rebuilding metric/int3c2e/whitening inside the CAS pipeline.
+        try:
+            import cupy as cp  # type: ignore
+        except Exception:  # pragma: no cover
+            cp = None  # type: ignore
+        if cp is not None and isinstance(B, cp.ndarray):  # type: ignore[attr-defined]
+            if B.dtype == cp.float64 and B.ndim == 3 and int(B.shape[0]) == int(nao) and int(B.shape[1]) == int(nao):
+                if hasattr(B, "flags") and not bool(B.flags.c_contiguous):
+                    B = cp.ascontiguousarray(B)
+                cached_b_whitened_use = B
+
     if ncore == 0:
         vhf_core = xp.zeros((nao, nao), dtype=xp.float64)
         ecore = float(scf_out.mol.energy_nuc())
     else:
         D_core = 2.0 * (C_core @ C_core.T)
-        Jc, Kc = _df_scf._df_JK(B, D_core, want_J=True, want_K=True)  # noqa: SLF001
+        if bool(_is_gpu):
+            import cupy as cp  # type: ignore
+
+            B_mnQ = cp.asarray(B, dtype=cp.float64)
+            BQ = cp.ascontiguousarray(B_mnQ.transpose((2, 0, 1)))
+            Jc = df_jk.df_J_from_BQ_D(BQ, D_core)
+            Jc = 0.5 * (Jc + Jc.T)
+            Cc = cp.ascontiguousarray(C_core)
+            occ_vals = cp.full((int(ncore),), 2.0, dtype=cp.float64)
+            Kc = df_jk.df_K_from_BQ_Cocc(BQ, Cc, occ_vals, q_block=128)
+        else:
+            Jc, Kc = _df_scf._df_JK(B, D_core, want_J=True, want_K=True)  # noqa: SLF001
         vhf_core = Jc - 0.5 * Kc
         e_one = xp.sum(D_core * h_ao)
         e_two = 0.5 * xp.sum(D_core * vhf_core)
@@ -394,7 +423,7 @@ def _build_casci_df_integrals(
         want_eri_mat=bool(want_eri_mat),
         want_pair_norm=False,
         profile=eri_prof,
-        cached_b_whitened=cached_b_whitened,
+        cached_b_whitened=cached_b_whitened_use,
         cache_out=cache_out,
     )
 
@@ -474,6 +503,7 @@ def eval_casci_energy_df(
         h1eff=h1eff,
         eri=eri,
         scf=scf_out.scf,
+        scf_out=scf_out,
     )
 
 
@@ -639,6 +669,7 @@ def run_casci_df(
         eri=eri,
         scf=scf_out.scf,
         profile=profile,
+        scf_out=scf_out,
     )
 
 
@@ -961,6 +992,7 @@ def run_casci_df_cpu(
         eri=eri,
         scf=scf_out.scf,
         profile=profile,
+        scf_out=scf_out,
     )
 
 
@@ -1173,6 +1205,7 @@ def run_casci_dense_cpu(
         eri=eri,
         scf=scf_out.scf,
         profile=profile,
+        scf_out=scf_out,
     )
 
 
@@ -1436,6 +1469,7 @@ def run_casci_dense_gpu(
         eri=eri,
         scf=scf_out.scf,
         profile=profile,
+        scf_out=scf_out,
     )
 
 def run_casci(

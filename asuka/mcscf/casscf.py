@@ -299,6 +299,7 @@ class CASSCFResult:
     grad_norm: float
     casci: CASCIResult
     profile: dict | None = None
+    scf_out: Any | None = None
 
 
 def casscf_orbital_gradient_df(
@@ -776,6 +777,25 @@ def run_casscf_df(
     e_roots = np.zeros((nroots,), dtype=np.float64)
     ci_out: Any = None
     cached_b_whitened = None
+    if b_cache_enabled:
+        # Seed the active-space DF cache from the SCF DF factors when possible.
+        # This avoids rebuilding metric/int3c2e/whitening inside DF-CASCI/CASSCF.
+        B_seed = getattr(scf_out, "df_B", None)
+        if B_seed is not None:
+            try:
+                import cupy as cp  # type: ignore
+            except Exception:  # pragma: no cover
+                cp = None  # type: ignore
+            if cp is not None and isinstance(B_seed, cp.ndarray):  # type: ignore[attr-defined]
+                if B_seed.dtype == cp.float64 and B_seed.ndim == 3:  # type: ignore[attr-defined]
+                    nao_b, nao_b1, _naux_b = map(int, B_seed.shape)
+                    if nao_b == nao_b1 and nao_b == int(C.shape[0]) and int(B_seed.nbytes) <= int(max_b_cache_bytes):
+                        if hasattr(B_seed, "flags") and not bool(B_seed.flags.c_contiguous):
+                            B_seed = cp.ascontiguousarray(B_seed)
+                        cached_b_whitened = B_seed
+                        if profile is not None:
+                            profile["cueri_b_cache_seed_source"] = "scf_out.df_B"
+                            profile["cueri_b_cache_resident"] = True
     b_cache_disabled_reason: str | None = None
     if use_cueri_b_cache and not b_cache_enabled:
         if max_b_cache_bytes <= 0:
@@ -1513,6 +1533,7 @@ def run_casscf_df(
         grad_norm=float(grad_norm),
         casci=casci_out,
         profile=profile,
+        scf_out=scf_out,
     )
 
 

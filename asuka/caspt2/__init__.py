@@ -1,10 +1,15 @@
-"""Internally contracted CASPT2 (SS/MS/XMS) with analytic gradients.
+"""Internally contracted CASPT2 (SS/MS/XMS) on GPU (DF, C1, FP64).
 
 This module implements the 13-case OpenMolcas formalism for IC-CASPT2
-using conventional ERIs on CPU/NumPy.
+with support for both CPU (NumPy + full ERIs) and GPU (CuPy + DF) backends.
+Primary entry points for end-to-end ASUKA workflows are:
+  - :func:`run_caspt2` (ASUKA CASCIResult/CASSCFResult)
+
+See ``asuka/caspt2/README.md`` for a detailed description of the
+computational workflow, module structure, and conventions.
 """
 
-from asuka.caspt2.driver import caspt2_from_mc
+from asuka.caspt2.driver_asuka import run_caspt2
 from asuka.caspt2.energy import caspt2_energy_ss
 from asuka.caspt2.fock import CASPT2Fock, build_caspt2_fock
 from asuka.caspt2.multistate import build_heff, diagonalize_heff
@@ -13,17 +18,8 @@ from asuka.caspt2.result import CASPT2EnergyResult, CASPT2GradResult, CASPT2Resu
 from asuka.caspt2.superindex import CASOrbitals, SuperindexMap, build_superindex
 from asuka.caspt2.xms import xms_rotate_states
 
-# Gradient support depends on optional subpackages (e.g. SOC tools). Keep CASPT2
-# energies importable even when those extras are unavailable.
-try:  # pragma: no cover
-    from asuka.caspt2.gradient.driver import caspt2_gradient_from_mc  # type: ignore[import-not-found]
-    from asuka.caspt2.gradient.types import CASPT2LagSnapshot  # type: ignore[import-not-found]
-except Exception:  # pragma: no cover
-    caspt2_gradient_from_mc = None  # type: ignore[assignment]
-    CASPT2LagSnapshot = None  # type: ignore[assignment]
-
 __all__ = [
-    "caspt2_from_mc",
+    "run_caspt2",
     "caspt2_energy_ss",
     "CASPT2Fock",
     "build_caspt2_fock",
@@ -39,8 +35,3 @@ __all__ = [
     "build_superindex",
     "xms_rotate_states",
 ]
-
-if caspt2_gradient_from_mc is not None:
-    __all__.append("caspt2_gradient_from_mc")
-if CASPT2LagSnapshot is not None:
-    __all__.append("CASPT2LagSnapshot")

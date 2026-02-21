@@ -20,12 +20,23 @@ from asuka.caspt2.superindex import SuperindexMap
 
 @dataclass(frozen=True)
 class SBDecomposition:
-    """Result of S-B joint diagonalization for one IC case."""
+    """Result of S-B joint diagonalization for one IC case.
 
-    s_eigvals: np.ndarray      # S eigenvalues before truncation
+    After joint diagonalization, the active superindex basis is compressed
+    to ``nindep`` orthonormal functions.  The ``transform`` matrix maps from
+    the original basis to this compressed basis:
+
+        T^T S T = I          (orthonormality)
+        T^T B T = diag(b_diag)  (diagonal H0 in the compressed basis)
+
+    Amplitudes in the SR (diagonalized) basis are related to the original
+    (contravariant) basis by: ``x_orig = T @ x_SR``.
+    """
+
+    s_eigvals: np.ndarray      # (nasup,) S eigenvalues before truncation
     transform: np.ndarray      # (nasup, nindep) transformation to orthonormal basis
-    nindep: int                # number of independent basis functions
-    b_diag: np.ndarray         # (nindep,) diagonal B in orthonormal basis
+    nindep: int                # number of independent basis functions after lin-dep removal
+    b_diag: np.ndarray         # (nindep,) diagonal of H0 in the orthonormal basis
 
 
 def sbdiag(

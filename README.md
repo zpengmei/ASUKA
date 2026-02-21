@@ -93,6 +93,35 @@ out = run_casscf(
 print("SA-CASSCF e_roots =", out.e_roots)
 ```
 
+## GPU CASPT2 (ASUKA)
+
+CASPT2 runs directly from ASUKA `run_casscf` (or `run_casci*`) outputs:
+
+```python
+from asuka.frontend import Molecule
+from asuka.frontend.scf import run_hf_df
+from asuka.mcscf import run_casscf
+from asuka.caspt2 import run_caspt2
+
+mol = Molecule.from_atoms("N 0 0 0; N 0 0 1.0977", unit="Angstrom", basis="cc-pvdz", cart=True, spin=0)
+scf_out = run_hf_df(mol, method="rhf", backend="cuda", df=True, auxbasis="autoaux")
+
+# Reference (1 root for SS, >1 roots for MS/XMS)
+casscf = run_casscf(scf_out, ncore=2, ncas=8, nelecas=8, nroots=2, root_weights=(0.5, 0.5), backend="cuda", df=True)
+
+# SS / MS / XMS
+ss  = run_caspt2(casscf, method="SS",  nstates=1, device=0)
+ms  = run_caspt2(casscf, method="MS",  nstates=2, device=0)
+xms = run_caspt2(casscf, method="XMS", nstates=2, device=0)
+print("SS E_tot:", ss.e_tot)
+print("MS E_tot:", ms.e_tot)
+print("XMS E_tot:", xms.e_tot)
+```
+
+Notes:
+- Current CUDA CASPT2 path targets C1 symmetry and FP64.
+- If you hit CuPy library errors (or warnings about multiple CuPy installs), run with `PYTHONNOUSERSITE=1` (or `python -s`) to avoid picking up `~/.local` packages.
+
 ## Warm-starting across geometries
 
 Pass the previous result as `guess=` to reuse MO coefficients and CI vectors — useful for PES scans, geometry optimization, and finite-difference Hessians.

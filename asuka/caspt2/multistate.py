@@ -3,6 +3,24 @@
 Ports OpenMolcas ``hcoup.f``, ``hefval.F90``, ``mltctl.f``.
 Constructs the effective Hamiltonian Heff from SS-CASPT2 results
 for multiple states, then diagonalizes to get MS-CASPT2 energies.
+
+The effective Hamiltonian is defined as:
+
+    Heff[I,J] = δ(I,J) · E_CASPT2(I)  +  (1 - δ(I,J)) · ⟨I|H|Ω_J⟩
+
+where |Ω_J⟩ is the first-order wavefunction for state J.  The off-diagonal
+couplings ⟨I|H|Ω_J⟩ are evaluated by contracting the ket-state J's RHS and
+solution vectors (in the raw active superindex basis) against transition
+densities (TG1/TG2/TG3) between states I and J, using per-case HCOUP kernels.
+
+The workflow is:
+  1. Run SS-CASPT2 for each state → amplitudes + per-case decompositions
+  2. Back-transform amplitudes to the raw (un-diagonalized) active superindex
+     basis: T_raw = transform @ T_SR
+  3. Precompute row_dots[ias,jas] = V1[ias,:] · V2[jas,:] (RHS × solution)
+  4. For each off-diagonal (I,J) pair, compute transition dm1/dm2/dm3 and
+     contract with row_dots via hcoup_case_contribution()
+  5. Diagonalize Heff to obtain MS-CASPT2 energies
 """
 
 from __future__ import annotations

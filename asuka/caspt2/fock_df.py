@@ -1,10 +1,24 @@
 """DF/Cholesky-vector Fock matrix construction for CASPT2.
 
-This backend avoids building the full 4-index MO ERI tensor (`ao2mo.full`) by
+This backend avoids building the full 4-index MO ERI tensor (``ao2mo.full``) by
 contracting density-fitting / Cholesky 3-index factors in MO pair space.
+The key idea is to express two-electron integrals as:
 
-The resulting Fock object matches the semantics of :func:`asuka.caspt2.fock.build_caspt2_fock`
-when the DF factors reproduce the same (pq|rs) integrals.
+    (pq|rs) ≈ Σ_Q L_{pq}^Q · L_{rs}^Q
+
+so that J and K contractions become ``L^T @ L`` products in the auxiliary
+basis, scaling as O(naux · n²) instead of O(n⁴).
+
+The resulting ``CASPT2Fock`` object is semantically identical to the one
+produced by :func:`asuka.caspt2.fock.build_caspt2_fock` (full-ERI version).
+
+The DF pair blocks are organized by orbital partition:
+  - ``l_ii``: (i,i) — inactive–inactive, needed for inactive Fock J/K
+  - ``l_it``: (i,t) — inactive–active
+  - ``l_ia``: (i,a) — inactive–virtual
+  - ``l_tu``: (t,u) — active–active, needed for active Fock J/K
+  - ``l_at``: (a,t) — virtual–active
+  - ``l_ab``: (a,b) — virtual–virtual, needed for inactive Fock K on virt block
 """
 
 from __future__ import annotations
