@@ -54,10 +54,10 @@ def build_heff_cuda(
             raise ValueError(f"state {j}: row_dots_by_case_cuda must be a length-13 list")
         row_dots_by_state.append(list(rd))
 
-    # Diagonal: SS energies.
-    heff = np.zeros((nstates, nstates), dtype=np.float64)
+    # Build on device and copy once at the end to avoid per-pair synchronizations.
+    heff_d = cp.zeros((nstates, nstates), dtype=cp.float64)
     for i in range(nstates):
-        heff[i, i] = float(ss_results[i].e_tot)
+        heff_d[i, i] = float(ss_results[i].e_tot)
 
     # Overlaps (host; small).
     ovl = np.zeros((nstates, nstates), dtype=np.float64)
@@ -70,13 +70,23 @@ def build_heff_cuda(
     from asuka.cuda.rdm123_gpu import make_trans_rdm123_raw_cuda, reorder_dm123_molcas_trans_cuda  # noqa: PLC0415
     from asuka.caspt2.cuda.hcoup_cuda import hcoup_case_contribution_cuda  # noqa: PLC0415
 
-    # Off-diagonal: build transition TG tensors once for i<j, derive j,i by raw transpose mapping.
+    stream = cp.cuda.get_current_stream()
+
+    # Off-diagonal: build transition TG tensors once for i<j.
     for i in range(nstates):
         for j in range(i + 1, nstates):
             if verbose >= 1:
                 print(f"  Heff CUDA: building transition TG for pair ({i},{j})...")
 
             prof_ij: dict[str, Any] | None = {} if profile is not None else None
+
+            ev0 = ev1 = ev2 = None
+            if prof_ij is not None:
+                ev0 = cp.cuda.Event()
+                ev1 = cp.cuda.Event()
+                ev2 = cp.cuda.Event()
+                ev0.record(stream)
+
             dm1_raw, dm2_raw, dm3_raw = make_trans_rdm123_raw_cuda(
                 drt,
                 ci_vectors[i],
@@ -88,17 +98,15 @@ def build_heff_cuda(
                 dm1_raw, dm2_raw, dm3_raw, inplace=False, profile=prof_ij
             )
 
-            # Reverse direction raw tensors via Hermitian adjoint mapping:
+            # Reverse direction mapping for transition TG tensors:
             #   <j|E_pq|i> = <i|E_qp|j>
-            #   <j|E_pq E_rs|i> = <i|E_sr E_qp|j>
-            #   <j|E_pq E_rs E_tu|i> = <i|E_ut E_sr E_qp|j>
-            tg1_ji, tg2_ji, tg3_ji = reorder_dm123_molcas_trans_cuda(
-                dm1_raw.T,
-                dm2_raw.transpose(3, 2, 1, 0),
-                dm3_raw.transpose(5, 4, 3, 2, 1, 0),
-                inplace=False,
-                profile=None,
-            )
+            # and similarly for higher-order TG tensors.
+            tg1_ji = tg1_ij.T
+            tg2_ji = tg2_ij.transpose(3, 2, 1, 0)
+            tg3_ji = tg3_ij.transpose(5, 4, 3, 2, 1, 0)
+
+            if prof_ij is not None and ev1 is not None:
+                ev1.record(stream)
 
             coup_ij = cp.float64(0.0)
             coup_ji = cp.float64(0.0)
@@ -115,11 +123,19 @@ def build_heff_cuda(
                         case, smap, rd_ket_i, tg1_ji, tg2_ji, tg3_ji, ovl=float(ovl[j, i])
                     )
 
-            heff[i, j] = float(coup_ij.get())
-            heff[j, i] = float(coup_ji.get())
+            heff_d[i, j] = coup_ij
+            heff_d[j, i] = coup_ji
+
+            if prof_ij is not None and ev2 is not None and ev0 is not None and ev1 is not None:
+                ev2.record(stream)
+                try:
+                    stream.synchronize()
+                except Exception:
+                    pass
+                prof_ij["heff_tg_s"] = float(cp.cuda.get_elapsed_time(ev0, ev1) * 1e-3)
+                prof_ij["heff_hcoup_s"] = float(cp.cuda.get_elapsed_time(ev1, ev2) * 1e-3)
 
             if profile is not None and prof_ij is not None:
                 profile[f"tg_pair_{i}_{j}"] = prof_ij
 
-    return heff
-
+    return np.asarray(cp.asnumpy(heff_d), dtype=np.float64, order="C")

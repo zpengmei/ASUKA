@@ -72,7 +72,8 @@ class RDM123CudaWorkspace:
     # Reusable buffers
     occ: Any | None = None  # (ncsf, norb)
     x_csf: Any | None = None  # (ncsf, nops)
-    x2_csf: Any | None = None  # (ncsf, nops) second buffer (transition bra/ket)
+    x2_csf: Any | None = None  # (ncsf, nops) optional legacy transition buffer (full bra-side X)
+    x_bra_tile: Any | None = None  # (tile_csf, nops) streamed bra-side tile buffer
     x_blk: Any | None = None  # (ncsf, nvec<=32)
     y_blk: Any | None = None  # (ncsf, nvec<=32)
 
@@ -179,10 +180,17 @@ def _ensure_buffers(cp, ws: RDM123CudaWorkspace) -> None:
         ws.x_csf = cp.empty((ncsf, nops), dtype=cp.float64)
 
 
-def _ensure_buffers_trans(cp, ws: RDM123CudaWorkspace) -> None:
-    """Ensure buffers needed for transition (bra/ket) RDM builds."""
+def _ensure_buffers_trans(cp, ws: RDM123CudaWorkspace, *, full: bool) -> None:
+    """Ensure buffers needed for transition (bra/ket) RDM builds.
+
+    By default, the transition builders stream bra-side tiles and do not allocate
+    the second full `(ncsf,nops)` buffer. The legacy full-buffer path can be
+    forced via `full=True`.
+    """
 
     _ensure_buffers(cp, ws)
+    if not bool(full):
+        return
     ncsf = int(ws.ncsf)
     nops = int(ws.nops)
     if ws.x2_csf is None or tuple(getattr(ws.x2_csf, "shape", ())) != (ncsf, nops):
@@ -629,7 +637,8 @@ def make_trans_rdm123_raw_cuda(
         raise RuntimeError("CUDA extension not available; build with python -m asuka.build.guga_cuda_ext")
     if not bool(use_epq_table):
         raise NotImplementedError("use_epq_table=False not implemented for transition RDM123 CUDA path")
-    if str(streaming_policy).strip().lower() not in ("auto", "full"):
+    streaming_policy_norm = str(streaming_policy).strip().lower()
+    if streaming_policy_norm not in ("auto", "full"):
         raise ValueError("streaming_policy must be 'auto' or 'full'")
 
     try:
@@ -641,7 +650,7 @@ def make_trans_rdm123_raw_cuda(
         cp.cuda.Device(int(device)).use()
 
     ws = _get_or_make_workspace(drt)
-    _ensure_buffers_trans(cp, ws)
+    _ensure_buffers(cp, ws)
     qp_perm = _ensure_qp_perm(cp, ws)
 
     norb = int(ws.norb)
@@ -703,33 +712,44 @@ def make_trans_rdm123_raw_cuda(
         return out
 
     x_ket = _build_x(ws.x_csf, cket, key="rdm_trans_build_x_ket_s")
-    x_bra = _build_x(ws.x2_csf, cbra, key="rdm_trans_build_x_bra_s")
 
     # dm1_raw[pq] = <bra|E_pq|ket> = X_ket[:,pq]^T cbra
-    t0 = time.perf_counter()
+    t0_dm1 = time.perf_counter()
     dm1_pq = x_ket.T @ cbra
     dm1_raw = dm1_pq.reshape(norb, norb)
-
-    # dm2_raw: dm2_flat[pq,rs] = <E_pq E_rs> with bra block E_qp|bra>
-    gram_bk = x_bra.T @ x_ket  # rows: pq (bra), cols: rs (ket)
-    dm2_flat = gram_bk[qp_perm, :]
-    dm2_raw = dm2_flat.reshape(norb, norb, norb, norb)
-
     if profile is not None:
-        profile["rdm_trans_dm1_dm2_s"] = float(time.perf_counter() - t0)
+        profile["rdm_trans_dm1_s"] = float(time.perf_counter() - t0_dm1)
 
-    # dm3_raw: prefer yz-batched mm EPQ apply-all (fast path), else fall back to legacy gather.
-    dm3_flat = cp.empty((nops, nops, nops), dtype=cp.float64)
-    t0 = time.perf_counter()
-    dm3_apply_ms = 0.0
-    dm3_gemm_ms = 0.0
-
+    # dm3 implementation selection (shared with diagonal dm3).
     impl = str(os.getenv("ASUKA_RDM123_DM3_IMPL", "auto")).strip().lower() or "auto"
     if impl not in ("auto", "legacy", "yz_mm"):
         raise ValueError("ASUKA_RDM123_DM3_IMPL must be one of: auto, legacy, yz_mm")
     use_yz_mm = bool(impl in ("auto", "yz_mm") and has_build_w_from_epq_transpose_range_mm())
     if impl == "yz_mm" and not use_yz_mm and profile is not None:
         profile["rdm_trans_dm3_yz_mm_unavailable_s"] = float("nan")
+
+    # Bra-side buffering policy: stream bra-side X tiles by default to avoid allocating `x2_csf`.
+    full_bra = bool(streaming_policy_norm == "full" or not use_yz_mm)
+    if profile is not None:
+        profile["rdm_trans_bra_full_buffer"] = float(1.0 if full_bra else 0.0)
+
+    x_bra = None
+    dm2_raw = None
+    if full_bra:
+        _ensure_buffers_trans(cp, ws, full=True)
+        x_bra = _build_x(ws.x2_csf, cbra, key="rdm_trans_build_x_bra_s")
+        t0_dm2 = time.perf_counter()
+        gram_bk = x_bra.T @ x_ket  # rows: pq (bra), cols: rs (ket)
+        dm2_flat = gram_bk[qp_perm, :]
+        dm2_raw = dm2_flat.reshape(norb, norb, norb, norb)
+        if profile is not None:
+            profile["rdm_trans_dm2_s"] = float(time.perf_counter() - t0_dm2)
+
+    # dm3_raw: prefer yz-batched mm EPQ apply-all (fast path), else fall back to legacy gather.
+    dm3_flat = cp.empty((nops, nops, nops), dtype=cp.float64)
+    t0 = time.perf_counter()
+    dm3_apply_ms = 0.0
+    dm3_gemm_ms = 0.0
 
     stream_dm3 = cp.cuda.get_current_stream()
     check_ov = bool(int(os.getenv("ASUKA_RDM123_DM3_CHECK_OVERFLOW", "0").strip() or "0"))
@@ -747,40 +767,51 @@ def make_trans_rdm123_raw_cuda(
         if ws.w_tile_mm is None:
             ws.w_tile_mm = {}
 
-        for yz0 in range(0, nops, yz_batch):
-            yz1 = min(nops, int(yz0) + int(yz_batch))
-            nvec = int(yz1 - yz0)
-            out_cols = int(nops) * int(nvec)
+        if not bool(full_bra):
+            # Stream bra-side X tiles instead of materializing a full `(ncsf,nops)` buffer.
+            # This reduces peak memory for transition TG builds (MS/XMS Heff).
+            x_bra_tile_full = getattr(ws, "x_bra_tile", None)
+            if x_bra_tile_full is None or tuple(getattr(x_bra_tile_full, "shape", ())) != (tile_csf, nops):
+                x_bra_tile_full = cp.empty((tile_csf, nops), dtype=cp.float64)
+                try:
+                    ws.x_bra_tile = x_bra_tile_full
+                except Exception:
+                    pass
 
-            x_batch = x_ket[:, int(yz0) : int(yz1)]
-            mat_batch_raw = cp.zeros((nops, out_cols), dtype=cp.float64)
-
-            w_tile_full = ws.w_tile_mm.get(out_cols)
-            if w_tile_full is None or tuple(getattr(w_tile_full, "shape", ())) != (tile_csf, out_cols):
-                w_tile_full = cp.empty((tile_csf, out_cols), dtype=cp.float64)
-                ws.w_tile_mm[out_cols] = w_tile_full
-
+            gram_bk_raw = cp.zeros((nops, nops), dtype=cp.float64)
+            dm3_flat = cp.zeros((nops, nops, nops), dtype=cp.float64)
             ev_triples: list[tuple[Any, Any, Any]] = []
+
             for k_start in range(0, ncsf, tile_csf):
                 k_count = min(tile_csf, ncsf - int(k_start))
-                w_tile = w_tile_full[: int(k_count)]
+                x_bra_tile = x_bra_tile_full[: int(k_count)]
 
+                # Build x_bra_tile[k_local, pq] = (E_pq|bra>)[k] for this CSF destination range.
+                cp.cuda.runtime.memsetAsync(
+                    int(x_bra_tile.data.ptr),
+                    0,
+                    int(x_bra_tile.size) * int(x_bra_tile.itemsize),
+                    int(stream_dm3.ptr),
+                )
+                build_w_diag_from_steps_inplace_device(
+                    ws.state_dev,
+                    j_start=int(k_start),
+                    j_count=int(k_count),
+                    x=cbra,
+                    w_out=x_bra_tile,
+                    threads=256,
+                    stream=stream_dm3,
+                    sync=False,
+                    relative_w=True,
+                )
                 if check_ov:
                     ws.overflow.fill(0)
-
-                ev0 = ev1 = ev2 = None
-                if profile is not None:
-                    ev0 = cp.cuda.Event()
-                    ev1 = cp.cuda.Event()
-                    ev2 = cp.cuda.Event()
-                    ev0.record(stream_dm3)
-
-                build_w_from_epq_transpose_range_mm_inplace_device(
+                build_w_from_epq_transpose_range_inplace_device(
                     drt,
                     ws.state_dev,
                     epq_table_t,
-                    x_batch,
-                    w_out=w_tile,
+                    cbra,
+                    w_out=x_bra_tile,
                     overflow=ws.overflow,
                     threads=int(build_threads),
                     stream=stream_dm3,
@@ -789,20 +820,82 @@ def make_trans_rdm123_raw_cuda(
                     k_start=int(k_start),
                     k_count=int(k_count),
                 )
+                if check_ov:
+                    try:
+                        stream_dm3.synchronize()
+                    except Exception:
+                        pass
+                    ov = int(cp.asnumpy(ws.overflow[0]))
+                    if ov != 0:
+                        raise RuntimeError(
+                            f"EPQ apply overflow on GPU (overflow={ov}); reduce problem size or rebuild EPQ tables"
+                        )
 
-                if profile is not None and ev1 is not None:
-                    ev1.record(stream_dm3)
+                # dm2_raw: accumulate gram_bk = X_bra^T X_ket, then apply qp_perm.
+                x_ket_blk = x_ket[int(k_start) : int(k_start) + int(k_count), :]
+                gram_bk_raw += x_bra_tile.T @ x_ket_blk
 
-                x_bra_blk = x_bra[int(k_start) : int(k_start) + int(k_count), :]
-                mat_batch_raw += x_bra_blk.T @ w_tile
+                # dm3_raw: for each yz batch, apply-all (mm) into w_tile for this destination range,
+                # then contract with X_bra tile.
+                for yz0 in range(0, nops, yz_batch):
+                    yz1 = min(nops, int(yz0) + int(yz_batch))
+                    nvec = int(yz1 - yz0)
+                    out_cols = int(nops) * int(nvec)
 
-                if profile is not None and ev2 is not None and ev0 is not None and ev1 is not None:
-                    ev2.record(stream_dm3)
-                    ev_triples.append((ev0, ev1, ev2))
+                    x_batch = x_ket[:, int(yz0) : int(yz1)]
 
-            mat_batch = mat_batch_raw[qp_perm, :]
-            mat_batch_3 = mat_batch.reshape(nops, nops, nvec, order="C")
-            dm3_flat[:, :, int(yz0) : int(yz1)] = mat_batch_3
+                    w_tile_full = ws.w_tile_mm.get(out_cols)
+                    if w_tile_full is None or tuple(getattr(w_tile_full, "shape", ())) != (tile_csf, out_cols):
+                        w_tile_full = cp.empty((tile_csf, out_cols), dtype=cp.float64)
+                        ws.w_tile_mm[out_cols] = w_tile_full
+                    w_tile = w_tile_full[: int(k_count)]
+
+                    if check_ov:
+                        ws.overflow.fill(0)
+
+                    ev0 = ev1 = ev2 = None
+                    if profile is not None:
+                        ev0 = cp.cuda.Event()
+                        ev1 = cp.cuda.Event()
+                        ev2 = cp.cuda.Event()
+                        ev0.record(stream_dm3)
+
+                    build_w_from_epq_transpose_range_mm_inplace_device(
+                        drt,
+                        ws.state_dev,
+                        epq_table_t,
+                        x_batch,
+                        w_out=w_tile,
+                        overflow=ws.overflow,
+                        threads=int(build_threads),
+                        stream=stream_dm3,
+                        sync=False,
+                        check_overflow=False,
+                        k_start=int(k_start),
+                        k_count=int(k_count),
+                    )
+
+                    if profile is not None and ev1 is not None:
+                        ev1.record(stream_dm3)
+
+                    contrib_raw = x_bra_tile.T @ w_tile  # (pq, rs*nvec)
+                    contrib = contrib_raw[qp_perm, :]  # rows -> qp
+                    dm3_flat[:, :, int(yz0) : int(yz1)] += contrib.reshape(nops, nops, nvec, order="C")
+
+                    if profile is not None and ev2 is not None and ev0 is not None and ev1 is not None:
+                        ev2.record(stream_dm3)
+                        ev_triples.append((ev0, ev1, ev2))
+
+                    if check_ov:
+                        try:
+                            stream_dm3.synchronize()
+                        except Exception:
+                            pass
+                        ov = int(cp.asnumpy(ws.overflow[0]))
+                        if ov != 0:
+                            raise RuntimeError(
+                                f"EPQ apply overflow on GPU (overflow={ov}); reduce problem size or rebuild EPQ tables"
+                            )
 
             if profile is not None and ev_triples:
                 try:
@@ -813,16 +906,89 @@ def make_trans_rdm123_raw_cuda(
                     dm3_apply_ms += float(cp.cuda.get_elapsed_time(ev0, ev1))
                     dm3_gemm_ms += float(cp.cuda.get_elapsed_time(ev1, ev2))
 
-            if check_ov:
-                try:
-                    stream_dm3.synchronize()
-                except Exception:
-                    pass
-                ov = int(cp.asnumpy(ws.overflow[0]))
-                if ov != 0:
-                    raise RuntimeError(
-                        f"EPQ apply overflow on GPU (overflow={ov}); reduce problem size or rebuild EPQ tables"
+            dm2_flat = gram_bk_raw[qp_perm, :]
+            dm2_raw = dm2_flat.reshape(norb, norb, norb, norb)
+        else:
+            # Full bra-buffer path (legacy): requires x_bra.
+            if x_bra is None:
+                raise RuntimeError("internal error: full_bra=True but x_bra is None")
+
+            for yz0 in range(0, nops, yz_batch):
+                yz1 = min(nops, int(yz0) + int(yz_batch))
+                nvec = int(yz1 - yz0)
+                out_cols = int(nops) * int(nvec)
+
+                x_batch = x_ket[:, int(yz0) : int(yz1)]
+                mat_batch_raw = cp.zeros((nops, out_cols), dtype=cp.float64)
+
+                w_tile_full = ws.w_tile_mm.get(out_cols)
+                if w_tile_full is None or tuple(getattr(w_tile_full, "shape", ())) != (tile_csf, out_cols):
+                    w_tile_full = cp.empty((tile_csf, out_cols), dtype=cp.float64)
+                    ws.w_tile_mm[out_cols] = w_tile_full
+
+                ev_triples: list[tuple[Any, Any, Any]] = []
+                for k_start in range(0, ncsf, tile_csf):
+                    k_count = min(tile_csf, ncsf - int(k_start))
+                    w_tile = w_tile_full[: int(k_count)]
+
+                    if check_ov:
+                        ws.overflow.fill(0)
+
+                    ev0 = ev1 = ev2 = None
+                    if profile is not None:
+                        ev0 = cp.cuda.Event()
+                        ev1 = cp.cuda.Event()
+                        ev2 = cp.cuda.Event()
+                        ev0.record(stream_dm3)
+
+                    build_w_from_epq_transpose_range_mm_inplace_device(
+                        drt,
+                        ws.state_dev,
+                        epq_table_t,
+                        x_batch,
+                        w_out=w_tile,
+                        overflow=ws.overflow,
+                        threads=int(build_threads),
+                        stream=stream_dm3,
+                        sync=False,
+                        check_overflow=False,
+                        k_start=int(k_start),
+                        k_count=int(k_count),
                     )
+
+                    if profile is not None and ev1 is not None:
+                        ev1.record(stream_dm3)
+
+                    x_bra_blk = x_bra[int(k_start) : int(k_start) + int(k_count), :]
+                    mat_batch_raw += x_bra_blk.T @ w_tile
+
+                    if profile is not None and ev2 is not None and ev0 is not None and ev1 is not None:
+                        ev2.record(stream_dm3)
+                        ev_triples.append((ev0, ev1, ev2))
+
+                mat_batch = mat_batch_raw[qp_perm, :]
+                mat_batch_3 = mat_batch.reshape(nops, nops, nvec, order="C")
+                dm3_flat[:, :, int(yz0) : int(yz1)] = mat_batch_3
+
+                if profile is not None and ev_triples:
+                    try:
+                        stream_dm3.synchronize()
+                    except Exception:
+                        pass
+                    for ev0, ev1, ev2 in ev_triples:
+                        dm3_apply_ms += float(cp.cuda.get_elapsed_time(ev0, ev1))
+                        dm3_gemm_ms += float(cp.cuda.get_elapsed_time(ev1, ev2))
+
+                if check_ov:
+                    try:
+                        stream_dm3.synchronize()
+                    except Exception:
+                        pass
+                    ov = int(cp.asnumpy(ws.overflow[0]))
+                    if ov != 0:
+                        raise RuntimeError(
+                            f"EPQ apply overflow on GPU (overflow={ov}); reduce problem size or rebuild EPQ tables"
+                        )
     else:
         # Legacy path: loop over rs, apply E_rs to blocks of X_ket columns using gather-kernels.
         # (Kept for fallback parity if mm builder is unavailable.)

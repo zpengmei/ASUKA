@@ -1799,17 +1799,38 @@ def _run_xms(
         raise ValueError("rdm_backend must be 'cpu' or 'cuda'")
 
     # XMS rotation of reference states
-    dm1_for_xms = dm1_list
     if rdm_backend_norm == "cuda":
+        xms_profile: dict[str, float] | None = {} if bool(kwargs.get("cuda_profile", False)) else None
         try:
-            import cupy as cp  # noqa: PLC0415
-        except Exception as e:  # pragma: no cover
-            raise RuntimeError("rdm_backend='cuda' requires CuPy") from e
-        # xms_rotate_states is CPU-only; convert diagonal dm1 blocks (small) once.
-        dm1_for_xms = [np.asarray(cp.asnumpy(d), dtype=np.float64, order="C") for d in dm1_list]
-    rotated_ci, u0, h0_model = xms_rotate_states(
-        drt, ci_vectors, dm1_for_xms, fock, nish, nash, nstates, verbose=verbose,
-    )
+            from asuka.caspt2.cuda.xms_cuda import xms_rotate_states_cuda  # noqa: PLC0415
+
+            rotated_ci, u0, h0_model = xms_rotate_states_cuda(
+                drt,
+                ci_vectors,
+                dm1_list,
+                fock,
+                nish,
+                nash,
+                nstates,
+                device=kwargs.get("cuda_device", None),
+                verbose=int(verbose),
+                profile=xms_profile,
+            )
+        except Exception:
+            # Fallback: CPU rotation (requires host dm1 blocks).
+            try:
+                import cupy as cp  # noqa: PLC0415
+            except Exception as e:  # pragma: no cover
+                raise RuntimeError("rdm_backend='cuda' requires CuPy") from e
+            dm1_for_xms = [np.asarray(cp.asnumpy(d), dtype=np.float64, order="C") for d in dm1_list]
+            rotated_ci, u0, h0_model = xms_rotate_states(
+                drt, ci_vectors, dm1_for_xms, fock, nish, nash, nstates, verbose=verbose,
+            )
+    else:
+        xms_profile = None
+        rotated_ci, u0, h0_model = xms_rotate_states(
+            drt, ci_vectors, dm1_list, fock, nish, nash, nstates, verbose=verbose,
+        )
 
     # Recompute RDMs for rotated states (Molcas conventions).
     rot_dm1_list, rot_dm2_list, rot_dm3_list = [], [], []
@@ -1866,6 +1887,8 @@ def _run_xms(
             "reference_rotation_applied": True,
         }
     )
+    if rdm_backend_norm == "cuda" and xms_profile is not None:
+        breakdown["xms_cuda_profile"] = dict(xms_profile)
 
     return CASPT2Result(
         e_ref=e_ref_list,
