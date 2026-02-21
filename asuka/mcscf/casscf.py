@@ -663,8 +663,9 @@ def run_casscf_df(
             raise ValueError("UHF mo_coeff=(Ca,Cb) requires scf_out.scf.mo_occ=(occ_a,occ_b)")
         C, _occ_no = spatialize_uhf_mo_coeff(S_ao=scf_out.int1e.S, mo_coeff=C, mo_occ=mo_occ)
 
-    # Determine array backend from the DF factors (cupy vs numpy).
-    xp, _is_gpu = _df_scf._get_xp(scf_out.df_B, C)  # noqa: SLF001
+    # Determine array backend (cupy vs numpy).  df_B may be None for dense HF.
+    _xp_probe = scf_out.df_B if scf_out.df_B is not None else getattr(scf_out, "ao_eri", C)
+    xp, _is_gpu = _df_scf._get_xp(_xp_probe, C)  # noqa: SLF001
     C = _as_xp_f64(xp, C)
 
     if casci_backend_s == "df":
@@ -1056,7 +1057,12 @@ def run_casscf_df(
                 _cp_ah = None
 
             if ah_df_B_np is None:
-                ah_df_B_np = getattr(scf_out, "df_B")
+                _raw_df_B = getattr(scf_out, "df_B", None)
+                if _raw_df_B is not None:
+                    if _cp_ah is not None and isinstance(_raw_df_B, _cp_ah.ndarray):
+                        ah_df_B_np = _cp_ah.asnumpy(_raw_df_B)
+                    else:
+                        ah_df_B_np = np.asarray(_raw_df_B, dtype=np.float64)
             if ah_hcore_np is None:
                 H0 = getattr(scf_out.int1e, "hcore")
                 if _cp_ah is not None and isinstance(H0, _cp_ah.ndarray):
@@ -1085,8 +1091,14 @@ def run_casscf_df(
                 # requires FP64 dtype, and gemmex_tf32 is only valid for FP32.
                 # trans_rdm12 is a smaller cost and stays FP64.
 
+            # Resolve ao_eri for dense-mode AH (when df_B is None).
+            _ah_ao_eri = None
+            if ah_df_B_np is None and casci_backend_s in ("dense_gpu", "dense_cpu"):
+                _ah_ao_eri = getattr(scf_out, "ao_eri", None)
+
             mc_ah = DFNewtonCASSCFAdapter(
                 df_B=ah_df_B_np,
+                ao_eri=_ah_ao_eri,
                 hcore_ao=ah_hcore_np,
                 ncore=int(ncore),
                 ncas=int(ncas),
@@ -1582,9 +1594,10 @@ def run_casscf(
     df_b = bool(df)
 
     C0 = getattr(scf_out.scf, "mo_coeff", None)
-    _, is_gpu = _df_scf._get_xp(scf_out.df_B, C0)  # noqa: SLF001
+    _xp_probe = scf_out.df_B if scf_out.df_B is not None else getattr(scf_out, "ao_eri", C0)
+    _, is_gpu = _df_scf._get_xp(_xp_probe, C0)  # noqa: SLF001
     if backend_s == "cuda" and not bool(is_gpu):
-        raise ValueError("backend='cuda' requires scf_out with GPU arrays (use frontend.run_*_df)")
+        raise ValueError("backend='cuda' requires scf_out with GPU arrays (use frontend.run_*_df or run_*_dense with backend='cuda')")
 
     if matvec_backend is None:
         matvec_backend = "cuda_eri_mat" if backend_s == "cuda" else "contract"

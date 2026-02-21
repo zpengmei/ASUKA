@@ -972,8 +972,9 @@ def orbital_gradient_dense(
         raise ValueError("ncas must be > 0")
 
     B = getattr(scf_out, "df_B", None)
-    if B is None:
-        raise ValueError("scf_out.df_B is missing")
+    ao_eri = getattr(scf_out, "ao_eri", None)
+    if B is None and ao_eri is None:
+        raise ValueError("scf_out requires either df_B or ao_eri for J/K computation")
     int1e = getattr(scf_out, "int1e", None)
     if int1e is None:
         raise ValueError("scf_out.int1e is missing")
@@ -985,9 +986,13 @@ def orbital_gradient_dense(
     if ao_basis is None:
         raise ValueError("scf_out.ao_basis is missing (required for dense orbital gradients)")
 
-    xp, _is_gpu = _df_scf._get_xp(B, C)  # noqa: SLF001
+    _xp_probe = B if B is not None else ao_eri
+    xp, _is_gpu = _df_scf._get_xp(_xp_probe, C)  # noqa: SLF001
     C = _as_xp_f64(xp, C)
-    B = _as_xp_f64(xp, B)
+    if B is not None:
+        B = _as_xp_f64(xp, B)
+    if ao_eri is not None:
+        ao_eri = _as_xp_f64(xp, ao_eri)
     h_ao = _as_xp_f64(xp, hcore)
 
     if C.ndim != 2:
@@ -1030,7 +1035,13 @@ def orbital_gradient_dense(
 
     # AO potentials: core and active JK (for generalized Fock pieces and preconditioner).
     dense_exact_jk = bool(dense_exact_jk)
-    if dense_exact_jk:
+    if B is None and ao_eri is not None:
+        # Dense J/K from materialized AO ERIs (works on GPU via CuPy).
+        from asuka.hf.dense_jk import dense_JK_from_eri_mat_D  # noqa: PLC0415
+
+        Jc, Kc = dense_JK_from_eri_mat_D(ao_eri, D_core_ao, want_J=True, want_K=True)
+        Ja, Ka = dense_JK_from_eri_mat_D(ao_eri, D_act_ao, want_J=True, want_K=True)
+    elif dense_exact_jk:
         mol_exact = getattr(scf_out, "mol", None)
         scf_exact = getattr(scf_out, "scf", None)
         get_jk = getattr(scf_exact, "get_jk", None)

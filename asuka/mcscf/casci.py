@@ -1078,9 +1078,12 @@ def run_casci_dense_cpu(
     C_core = C[:, :ncore]
     C_cas = C[:, ncore : ncore + ncas]
 
-    # Core density and core Fock potential (AO basis) still use DF JK from the SCF backend.
+    # Core density and core Fock potential (AO basis).
+    # Use DF JK when available, otherwise fall back to dense AO ERIs.
     B = scf_out.df_B
-    xp, _is_gpu = _df_scf._get_xp(B, C_cas)  # noqa: SLF001
+    ao_eri = getattr(scf_out, "ao_eri", None)
+    _xp_probe = B if B is not None else (ao_eri if ao_eri is not None else C_cas)
+    xp, _is_gpu = _df_scf._get_xp(_xp_probe, C_cas)  # noqa: SLF001
     h_ao = xp.asarray(scf_out.int1e.hcore, dtype=xp.float64)
 
     if ncore == 0:
@@ -1089,7 +1092,11 @@ def run_casci_dense_cpu(
         ecore = float(scf_out.mol.energy_nuc())
     else:
         D_core = 2.0 * (xp.asarray(C_core) @ xp.asarray(C_core).T)
-        Jc, Kc = _df_scf._df_JK(B, D_core, want_J=True, want_K=True)  # noqa: SLF001
+        from asuka.mcscf.jk_util import jk_from_2e_source  # noqa: PLC0415
+
+        _B_xp = xp.asarray(B, dtype=xp.float64) if B is not None else None
+        _ao_eri_xp = xp.asarray(ao_eri, dtype=xp.float64) if ao_eri is not None else None
+        Jc, Kc = jk_from_2e_source(_B_xp, _ao_eri_xp, D_core, want_J=True, want_K=True)
         vhf_core = Jc - 0.5 * Kc
         e_one = xp.sum(D_core * h_ao)
         e_two = 0.5 * xp.sum(D_core * vhf_core)
@@ -1286,27 +1293,37 @@ def run_casci_dense_gpu(
     C_core = C[:, :ncore]
     C_cas = C[:, ncore : ncore + ncas]
 
-    # Core density and core Fock potential (AO basis) still use DF JK from the SCF backend.
+    # Core density and core Fock potential (AO basis).
+    # Use DF JK when available, otherwise fall back to dense AO ERIs.
     B = scf_out.df_B
-    xp, _is_gpu = _df_scf._get_xp(B, C_cas)  # noqa: SLF001
+    ao_eri = getattr(scf_out, "ao_eri", None)
+    _xp_probe = B if B is not None else (ao_eri if ao_eri is not None else C_cas)
+    xp, _is_gpu = _df_scf._get_xp(_xp_probe, C_cas)  # noqa: SLF001
     h_ao = xp.asarray(scf_out.int1e.hcore, dtype=xp.float64)
 
     dense_exact_jk = bool(dense_exact_jk)
 
     def _jk_for_density(D_in):
-        if not dense_exact_jk:
+        if dense_exact_jk:
+            mol_exact = getattr(scf_out, "mol", None)
+            scf_exact = getattr(scf_out, "scf", None)
+            get_jk = getattr(scf_exact, "get_jk", None)
+            if mol_exact is None or not callable(get_jk):
+                raise ValueError("dense_exact_jk=True requires scf_out.scf.get_jk")
+            d_h = np.asarray(_asnumpy_f64(D_in), dtype=np.float64, order="C")
+            try:
+                J_h, K_h = get_jk(mol_exact, d_h, hermi=1)
+            except TypeError:
+                J_h, K_h = get_jk(d_h, hermi=1)
+            return xp.asarray(J_h, dtype=xp.float64), xp.asarray(K_h, dtype=xp.float64)
+        if B is not None:
             return _df_scf._df_JK(B, D_in, want_J=True, want_K=True)  # noqa: SLF001
-        mol_exact = getattr(scf_out, "mol", None)
-        scf_exact = getattr(scf_out, "scf", None)
-        get_jk = getattr(scf_exact, "get_jk", None)
-        if mol_exact is None or not callable(get_jk):
-            raise ValueError("dense_exact_jk=True requires scf_out.scf.get_jk")
-        d_h = np.asarray(_asnumpy_f64(D_in), dtype=np.float64, order="C")
-        try:
-            J_h, K_h = get_jk(mol_exact, d_h, hermi=1)
-        except TypeError:
-            J_h, K_h = get_jk(d_h, hermi=1)
-        return xp.asarray(J_h, dtype=xp.float64), xp.asarray(K_h, dtype=xp.float64)
+        if ao_eri is not None:
+            from asuka.hf.dense_jk import dense_JK_from_eri_mat_D  # noqa: PLC0415
+
+            _ao_eri_xp = xp.asarray(ao_eri, dtype=xp.float64)
+            return dense_JK_from_eri_mat_D(_ao_eri_xp, D_in, want_J=True, want_K=True)
+        raise ValueError("No 2e integral source available (need df_B or ao_eri)")
 
     _t_core_start = time.perf_counter() if profile is not None else 0.0
     if ncore == 0:
@@ -1476,9 +1493,10 @@ def run_casci(
     )
 
     C = getattr(scf_out.scf, "mo_coeff", None)
-    _xp, is_gpu = _df_scf._get_xp(scf_out.df_B, C)  # noqa: SLF001
+    _xp_probe = scf_out.df_B if scf_out.df_B is not None else getattr(scf_out, "ao_eri", C)
+    _xp, is_gpu = _df_scf._get_xp(_xp_probe, C)  # noqa: SLF001
     if backend_s == "cuda" and not bool(is_gpu):
-        raise ValueError("backend='cuda' requires scf_out with GPU arrays (use frontend.run_*_df)")
+        raise ValueError("backend='cuda' requires scf_out with GPU arrays")
 
     if backend_s == "cuda" and df_b:
         return run_casci_df(scf_out, ncore=int(ncore), ncas=int(ncas), nelecas=nelecas, mo_coeff=mo_coeff, **kwargs)

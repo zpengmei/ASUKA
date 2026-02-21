@@ -218,6 +218,7 @@ def build_dense_newton_eris(
     ncore: int,
     ncas: int,
     B_ao_for_vhf: Any | None = None,
+    ao_eri_for_vhf: Any | None = None,
 ) -> DFNewtonERIs:
     """Build Newton ERI intermediates from exact (dense) ERIs via GPU builder.
 
@@ -235,7 +236,10 @@ def build_dense_newton_eris(
     ncas : int
         Number of active orbitals.
     B_ao_for_vhf : Any | None, optional
-        DF B-tensor for building vhf_c. If None, vhf_c is set to zero.
+        DF B-tensor for building vhf_c. If None, falls back to ao_eri_for_vhf.
+    ao_eri_for_vhf : Any | None, optional
+        Materialized AO ERI tensor (nao*nao, nao*nao) for building vhf_c
+        when B_ao_for_vhf is None (dense, no-DF mode).
 
     Returns
     -------
@@ -294,7 +298,7 @@ def build_dense_newton_eris(
     # papa[p,u,q,v] ≈ sum_Q L[p,u,Q] L[q,v,Q]
     # This is only used when B_ao_for_vhf is provided.
     if B_ao_for_vhf is not None:
-        # Build papa from DF for now (consistent with vhf_c from DF)
+        # Build papa from DF: L[p,q,Q] -> papa[p,u,q,v] = sum_Q L[p,u,Q] L[q,v,Q]
         B = cp.asarray(B_ao_for_vhf, dtype=cp.float64)
         tmp = cp.tensordot(B, mo, axes=([1], [0]))
         X = cp.transpose(tmp, (0, 2, 1))
@@ -303,28 +307,95 @@ def build_dense_newton_eris(
         L_pu = cp.ascontiguousarray(L[:, ncore:nocc])
         papa = cp.einsum("puQ,qvQ->puqv", L_pu, L_pu, optimize=True)
         papa = cp.ascontiguousarray(cp.asarray(papa, dtype=cp.float64))
+    elif ao_eri_for_vhf is not None:
+        # Dense path: 4-index transform from AO ERIs for papa
+        # papa[p,u,q,v] = (pu|qv) = sum_{μνλσ} C_μp C_νu eri[μνλσ] C_λq C_σv
+        _ao_eri_4d = cp.asarray(ao_eri_for_vhf, dtype=cp.float64).reshape(nao, nao, nao, nao)
+        # σ -> v
+        _T1 = cp.tensordot(_ao_eri_4d, C_act, axes=([3], [0]))  # (nao,nao,nao,ncas)
+        del _ao_eri_4d
+        # λ -> q : result (nao,nao,ncas,nmo) with indices (μ,ν,v,q)
+        _T2 = cp.tensordot(_T1, mo, axes=([2], [0]))
+        del _T1
+        # ν -> u : contract axis 1 of _T2 with C_act
+        # _T2 shape (nao_μ, nao_ν, ncas_v, nmo_q)
+        _T3 = cp.tensordot(_T2, C_act, axes=([1], [0]))  # (nao_μ, ncas_v, nmo_q, ncas_u)
+        del _T2
+        # Reorder to (μ, u, q, v)
+        _T3 = _T3.transpose(0, 3, 2, 1)  # (nao, ncas, nmo, ncas)
+        # μ -> p
+        papa = cp.tensordot(mo.T, _T3, axes=([1], [0]))  # (nmo, ncas, nmo, ncas)
+        del _T3
+        papa = cp.ascontiguousarray(cp.asarray(papa, dtype=cp.float64))
     else:
-        # Transpose ppaa as approximation — NOT exact but usable for testing
-        papa = ppaa.transpose(0, 2, 1, 3).copy()
+        # No 2e source — zero papa (should not happen in practice)
+        papa = cp.zeros((nmo, ncas, nmo, ncas), dtype=cp.float64)
 
-    # j_pc and k_pc from ppaa diagonal
-    ppaa_diag = ppaa[cp.arange(nmo), cp.arange(nmo)]  # (nmo, ncas, ncas)
+    # j_pc[p,i] = (pp|ii), k_pc[p,i] = (pi|pi)  where i is a CORE orbital
     if ncore:
-        j_pc = cp.zeros((nmo, ncore), dtype=cp.float64)
-        k_pc = cp.zeros((nmo, ncore), dtype=cp.float64)
-        for i in range(ncore):
-            j_pc[:, i] = ppaa[cp.arange(nmo), cp.arange(nmo), i, i] if i < ncas else 0.0
-            k_pc[:, i] = papa[cp.arange(nmo), i, cp.arange(nmo), i] if i < ncas else 0.0
+        if B_ao_for_vhf is not None:
+            # DF path: compute from L[p,q,Q]
+            L_pp = cp.ascontiguousarray(L[cp.arange(nmo), cp.arange(nmo)])  # (nmo,naux)
+            L_ii = cp.ascontiguousarray(L_pp[:ncore])  # (ncore,naux)
+            j_pc = cp.ascontiguousarray(L_pp @ L_ii.T)  # (nmo,ncore)
+            k_pc = cp.ascontiguousarray(
+                cp.einsum("piQ,piQ->pi", L[:, :ncore], L[:, :ncore], optimize=True)
+            )
+        elif ao_eri_for_vhf is not None:
+            # Dense path: compute from AO ERIs
+            # j_pc[p,i] = D_p^T @ eri_2d @ D_i  where D_x[μν] = C[μ,x]*C[ν,x]
+            _ao_eri_2d = cp.asarray(ao_eri_for_vhf, dtype=cp.float64)
+            if _ao_eri_2d.ndim == 4:
+                _ao_eri_2d = _ao_eri_2d.reshape(nao * nao, nao * nao)
+            # D_diag[x, μν] = C[μ,x] * C[ν,x]
+            _D_all = (mo[:, :, None] * mo[:, None, :])  # (nao, nao, nmo) — outer products
+            _D_all = _D_all.transpose(2, 0, 1).reshape(nmo, nao * nao)  # (nmo, nao^2)
+            _D_core = _D_all[:ncore]  # (ncore, nao^2)
+            _T = _ao_eri_2d @ _D_core.T  # (nao^2, ncore)
+            j_pc = cp.ascontiguousarray(_D_all @ _T)  # (nmo, ncore)
+            # k_pc[p,i] = K_pi^T @ eri_2d @ K_pi  where K_pi[μν] = C[μ,p]*C[ν,i]
+            mo_core = mo[:, :ncore]  # (nao, ncore)
+            # K_pi[μ,ν] = C[μ,p]*C[ν,i] → K[p,i,μ,ν] = C[μ,p]*C[ν,i]
+            # Vectorized: K_flat[p*ncore+i, μ*nao+ν] = C[μ,p]*C[ν,i]
+            # = (C ⊗ C_core)[μν, pi]
+            # Reshape for batch matmul: for each i,
+            # k_pc[p,i] = sum_{μλ} C[μ,p] * W_i[μ,λ] * C[λ,p]
+            # where W_i[μ,λ] = sum_{νσ} C[ν,i] * eri[μν,λσ] * C[σ,i]
+            k_pc = cp.zeros((nmo, ncore), dtype=cp.float64)
+            _eri_4d = _ao_eri_2d.reshape(nao, nao, nao, nao)
+            for i in range(ncore):
+                _ci = mo_core[:, i]  # (nao,)
+                # W_i[μ,λ] = sum_{νσ} C[ν,i] * eri[μ,ν,λ,σ] * C[σ,i]
+                _W = cp.einsum("n,mnls,s->ml", _ci, _eri_4d, _ci, optimize=True)
+                # k_pc[p,i] = C[:,p]^T @ W @ C[:,p] for all p
+                _CW = mo.T @ _W  # (nmo, nao)
+                k_pc[:, i] = cp.einsum("pn,pn->p", _CW, mo.T)
+            del _eri_4d, _ao_eri_2d
+            k_pc = cp.ascontiguousarray(k_pc)
+        else:
+            j_pc = cp.zeros((nmo, ncore), dtype=cp.float64)
+            k_pc = cp.zeros((nmo, ncore), dtype=cp.float64)
     else:
         j_pc = cp.zeros((nmo, 0), dtype=cp.float64)
         k_pc = cp.zeros((nmo, 0), dtype=cp.float64)
 
-    # vhf_c from DF B-tensor (or zero if not provided)
+    # vhf_c: core Fock potential in MO basis
     if B_ao_for_vhf is not None and ncore:
+        # DF path
         B = cp.asarray(B_ao_for_vhf, dtype=cp.float64)
         mo_core = mo[:, :ncore]
         D_core = 2.0 * (mo_core @ mo_core.T)
-        Jc, Kc = _df_scf._df_JK(B, D_core, want_J=True, want_K=True)
+        Jc, Kc = _df_scf._df_JK(B, D_core, want_J=True, want_K=True)  # noqa: SLF001
+        v_ao = cp.asarray(Jc - 0.5 * Kc, dtype=cp.float64)
+        vhf_c = cp.ascontiguousarray(mo.T @ v_ao @ mo)
+    elif ao_eri_for_vhf is not None and ncore:
+        # Dense path: use materialized AO ERIs for J/K
+        from asuka.hf.dense_jk import dense_JK_from_eri_mat_D  # noqa: PLC0415
+
+        _ao_eri = cp.asarray(ao_eri_for_vhf, dtype=cp.float64)
+        mo_core = mo[:, :ncore]
+        D_core = 2.0 * (mo_core @ mo_core.T)
+        Jc, Kc = dense_JK_from_eri_mat_D(_ao_eri, D_core, want_J=True, want_K=True)
         v_ao = cp.asarray(Jc - 0.5 * Kc, dtype=cp.float64)
         vhf_c = cp.ascontiguousarray(mo.T @ v_ao @ mo)
     else:
@@ -371,9 +442,12 @@ class DFNewtonCASSCFAdapter:
     -----
     df_B may be a CuPy array for GPU-accelerated AH. All downstream operations
     (ao2mo, update_jk_in_ah) will auto-detect and stay on GPU.
+
+    When df_B is None, ao_eri (materialized AO ERI tensor) is used for J/K
+    computation instead. This enables fully dense (no-DF) CASSCF with CUDA.
     """
 
-    df_B: Any  # (nao,nao,naux) — numpy or cupy
+    df_B: Any  # (nao,nao,naux) — numpy or cupy, can be None for dense mode
     hcore_ao: Any
     ncore: int
     ncas: int
@@ -381,6 +455,7 @@ class DFNewtonCASSCFAdapter:
     mo_coeff: Any
     fcisolver: Any
     dense_gpu_builder: Any = None  # CuERIActiveSpaceDenseGPUBuilder, optional
+    ao_eri: Any = None  # (nao*nao, nao*nao) — for dense J/K when df_B is None
 
     # Optional knobs (PySCF-compatible names)
     weights: list[float] | None = None
@@ -388,9 +463,17 @@ class DFNewtonCASSCFAdapter:
     internal_rotation: bool = False
     extrasym: Any | None = None
 
+    def _get_2e_probe(self) -> Any:
+        """Return the first non-None 2e integral source for xp detection."""
+        if self.df_B is not None:
+            return self.df_B
+        if self.ao_eri is not None:
+            return self.ao_eri
+        return self.hcore_ao
+
     def get_hcore(self) -> Any:
         """Return the core Hamiltonian in AO basis (on correct device)."""
-        xp, _is_gpu = _get_xp(self.df_B, self.hcore_ao)
+        xp, _is_gpu = _get_xp(self._get_2e_probe(), self.hcore_ao)
         return _as_xp_f64(xp, self.hcore_ao)
 
     def ao2mo(self, mo_coeff: Any) -> DFNewtonERIs:
@@ -413,7 +496,10 @@ class DFNewtonCASSCFAdapter:
                 ncore=int(self.ncore),
                 ncas=int(self.ncas),
                 B_ao_for_vhf=self.df_B,
+                ao_eri_for_vhf=self.ao_eri,
             )
+        if self.df_B is None:
+            raise ValueError("ao2mo requires df_B or dense_gpu_builder")
         return build_df_newton_eris(self.df_B, mo_coeff, ncore=int(self.ncore), ncas=int(self.ncas))
 
     def uniq_var_indices(self, nmo: int, ncore: int, ncas: int, frozen: Any | None) -> np.ndarray:
@@ -546,7 +632,7 @@ class DFNewtonCASSCFAdapter:
 
         Notes
         -----
-        GPU-aware: uses the same array backend as self.df_B.
+        GPU-aware: uses the same array backend as self.df_B (or self.ao_eri).
         """
 
         _ = eris  # unused (kept for PySCF signature compatibility)
@@ -555,7 +641,7 @@ class DFNewtonCASSCFAdapter:
         ncas = int(self.ncas)
         nocc = ncore + ncas
 
-        xp, _is_gpu = _get_xp(self.df_B)
+        xp, _is_gpu = _get_xp(self._get_2e_probe())
         mo = _as_xp_f64(xp, mo)
         r = _as_xp_f64(xp, r)
         casdm1 = _as_xp_f64(xp, casdm1)
@@ -578,9 +664,12 @@ class DFNewtonCASSCFAdapter:
         dm4 = mo[:, ncore:nocc] @ casdm1 @ r[ncore:nocc] @ mo.T
         dm4 = dm4 + dm4.T
 
-        B = _as_xp_f64(xp, self.df_B)
-        J0, K0 = _df_scf._df_JK(B, dm3, want_J=True, want_K=True)  # noqa: SLF001
-        J1, K1 = _df_scf._df_JK(B, dm3 * 2.0 + dm4, want_J=True, want_K=True)  # noqa: SLF001
+        from asuka.mcscf.jk_util import jk_from_2e_source  # noqa: PLC0415
+
+        _df_B_xp = _as_xp_f64(xp, self.df_B) if self.df_B is not None else None
+        _ao_eri_xp = _as_xp_f64(xp, self.ao_eri) if self.ao_eri is not None else None
+        J0, K0 = jk_from_2e_source(_df_B_xp, _ao_eri_xp, dm3, want_J=True, want_K=True)
+        J1, K1 = jk_from_2e_source(_df_B_xp, _ao_eri_xp, dm3 * 2.0 + dm4, want_J=True, want_K=True)
 
         v0 = xp.asarray(J0 * 2.0 - K0, dtype=xp.float64)
         v1 = xp.asarray(J1 * 2.0 - K1, dtype=xp.float64)
