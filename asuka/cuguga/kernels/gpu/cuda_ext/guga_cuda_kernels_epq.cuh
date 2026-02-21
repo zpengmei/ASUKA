@@ -4067,10 +4067,12 @@ __global__ void epq_apply_gather_inplace_kernel_t(
     int norb,
     int p,  // apply E_pq via gather enumeration of E_qp
     int q,
-    const double* __restrict__ x,  // [ncsf,nvec] row-major
+    const double* __restrict__ x,  // [ncsf,ldx] row-major
+    int ldx,
     int nvec,
     double alpha,
-    double* __restrict__ y,  // [ncsf,nvec] row-major
+    double* __restrict__ y,  // [ncsf,ldy] row-major
+    int ldy,
     bool add,
     int* __restrict__ overflow_flag) {
   constexpr int MAX_WARPS_PER_BLOCK = 8;  // requires threads<=256
@@ -4253,11 +4255,11 @@ __global__ void epq_apply_gather_inplace_kernel_t(
   for (int t = 0; t < cnt; t++) {
     int j = out_idx[warp_in_block][t];
     double c = out_coeff[warp_in_block][t];
-    acc += c * x[(int64_t)j * (int64_t)nvec + (int64_t)lane];
+    acc += c * x[(int64_t)j * (int64_t)ldx + (int64_t)lane];
   }
 
   double contrib = alpha * acc;
-  int64_t y_off = (int64_t)csf_i * (int64_t)nvec + (int64_t)lane;
+  int64_t y_off = (int64_t)csf_i * (int64_t)ldy + (int64_t)lane;
   if (add) {
     y[y_off] += contrib;
   } else {
@@ -4276,9 +4278,11 @@ extern "C" void guga_epq_apply_gather_inplace_launch_stream(
     int p,
     int q,
     const double* x,
+    int ldx,
     int nvec,
     double alpha,
     double* y,
+    int ldy,
     int add,
     int* overflow_flag,
     cudaStream_t stream,
@@ -4295,12 +4299,12 @@ extern "C" void guga_epq_apply_gather_inplace_launch_stream(
   int blocks = (ncsf + warps_per_block - 1) / warps_per_block;
   if (norb <= 32) {
     epq_apply_gather_inplace_kernel_t<32><<<blocks, threads, 0, stream>>>(
-        child, node_twos, child_prefix, steps_table, nodes_table, ncsf, norb, p, q, x, nvec, alpha, y, (bool)add,
-        overflow_flag);
+        child, node_twos, child_prefix, steps_table, nodes_table, ncsf, norb, p, q, x, ldx, nvec, alpha, y, ldy,
+        (bool)add, overflow_flag);
   } else {
     epq_apply_gather_inplace_kernel_t<64><<<blocks, threads, 0, stream>>>(
-        child, node_twos, child_prefix, steps_table, nodes_table, ncsf, norb, p, q, x, nvec, alpha, y, (bool)add,
-        overflow_flag);
+        child, node_twos, child_prefix, steps_table, nodes_table, ncsf, norb, p, q, x, ldx, nvec, alpha, y, ldy,
+        (bool)add, overflow_flag);
   }
 }
 

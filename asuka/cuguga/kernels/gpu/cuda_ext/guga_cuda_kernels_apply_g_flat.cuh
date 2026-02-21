@@ -1328,6 +1328,199 @@ __global__ void guga_build_w_from_epq_transpose_range_kernel_t(
   }
 }
 
+template <typename INDPTR_T, typename OUT_T, typename COEF_T, typename PQ_T>
+__global__ void guga_build_w_from_epq_transpose_range_mm_kernel_t(
+    const int8_t* __restrict__ steps_table,     // [ncsf,norb]
+    int ncsf,
+    int norb,
+    const INDPTR_T* __restrict__ epq_t_indptr,  // [ncsf+1], rows by destination k
+    const int32_t* __restrict__ epq_t_source,   // [nnz], source j
+    const PQ_T* __restrict__ epq_t_pq,          // [nnz]
+    const COEF_T* __restrict__ epq_t_data,      // [nnz]
+    const OUT_T* __restrict__ x,                // [ncsf,x_stride]
+    int64_t x_stride,
+    int nvec,
+    OUT_T* __restrict__ w_out,                  // [k_count,w_stride]
+    int64_t w_stride,
+    int* __restrict__ overflow_flag,
+    int k_start,
+    int k_count) {
+  int k_local = (int)blockIdx.x;
+  if (k_local < 0 || k_local >= k_count) return;
+  int csf_k = k_start + k_local;
+  if ((unsigned)csf_k >= (unsigned)ncsf) {
+    if ((int)threadIdx.x == 0) atomicExch(overflow_flag, 1);
+    return;
+  }
+  if (nvec <= 0) return;
+  int nops = norb * norb;
+  int64_t nout = (int64_t)nops * (int64_t)nvec;
+
+  extern __shared__ unsigned char smem[];
+  OUT_T* w_s = reinterpret_cast<OUT_T*>(smem);
+  for (int64_t idx = (int64_t)threadIdx.x; idx < nout; idx += (int64_t)blockDim.x) {
+    w_s[idx] = (OUT_T)0;
+  }
+  __syncthreads();
+
+  const int8_t* steps_k = steps_table + (int64_t)csf_k * (int64_t)norb;
+  const OUT_T* xk = x + (int64_t)csf_k * x_stride;
+
+  // Diagonal E_pp contributions: (E_pp|x>)[k] += occ(k,p) * x[k].
+  for (int p = (int)threadIdx.x; p < norb; p += (int)blockDim.x) {
+    int occ_p = step_to_occ(steps_k[p]);
+    if (!occ_p) continue;
+    OUT_T mult = (OUT_T)occ_p;
+    int pq = p * norb + p;
+    int64_t base = (int64_t)pq * (int64_t)nvec;
+    #pragma unroll
+    for (int v = 0; v < 32; v++) {
+      if (v >= nvec) break;
+      w_s[base + (int64_t)v] = xk[v] * mult;
+    }
+  }
+  __syncthreads();
+
+  int64_t start = epq_t_indptr[(int64_t)csf_k];
+  int64_t end = epq_t_indptr[(int64_t)csf_k + 1];
+  if (start < 0 || end < start) {
+    if ((int)threadIdx.x == 0) atomicExch(overflow_flag, 1);
+    return;
+  }
+
+  // Off-diagonal EPQ contributions from the destination-major transpose table.
+  for (int64_t t = start + (int64_t)threadIdx.x; t < end; t += (int64_t)blockDim.x) {
+    int32_t csf_j = epq_t_source[t];
+    if ((unsigned)csf_j >= (unsigned)ncsf) {
+      atomicExch(overflow_flag, 1);
+      continue;
+    }
+    int pq = (int)epq_t_pq[t];
+    if ((unsigned)pq >= (unsigned)nops) {
+      atomicExch(overflow_flag, 1);
+      continue;
+    }
+    OUT_T coef = (OUT_T)epq_t_data[t];
+    if (coef == (OUT_T)0) continue;
+    const OUT_T* xj = x + (int64_t)csf_j * x_stride;
+    int64_t base = (int64_t)pq * (int64_t)nvec;
+    #pragma unroll
+    for (int v = 0; v < 32; v++) {
+      if (v >= nvec) break;
+      OUT_T xjv = xj[v];
+      if (xjv == (OUT_T)0) continue;
+      atomicAdd(&w_s[base + (int64_t)v], xjv * coef);
+    }
+  }
+  __syncthreads();
+
+  OUT_T* w_row = w_out + (int64_t)k_local * w_stride;
+  for (int64_t idx = (int64_t)threadIdx.x; idx < nout; idx += (int64_t)blockDim.x) {
+    w_row[idx] = w_s[idx];
+  }
+}
+
+template <typename INDPTR_T, typename OUT_T, typename COEF_T, typename PQ_T>
+__global__ void guga_build_w_from_epq_transpose_range_mm_scaled_kernel_t(
+    const int8_t* __restrict__ steps_table,     // [ncsf,norb]
+    int ncsf,
+    int norb,
+    const INDPTR_T* __restrict__ epq_t_indptr,  // [ncsf+1], rows by destination k
+    const int32_t* __restrict__ epq_t_source,   // [nnz], source j
+    const PQ_T* __restrict__ epq_t_pq,          // [nnz]
+    const COEF_T* __restrict__ epq_t_data,      // [nnz]
+    const OUT_T* __restrict__ x,                // [ncsf,x_stride]
+    int64_t x_stride,
+    int nvec,
+    const OUT_T* __restrict__ hdiag,            // [ncsf]
+    const OUT_T* __restrict__ epsa,             // [norb]
+    OUT_T* __restrict__ w_out,                  // [k_count,w_stride]
+    int64_t w_stride,
+    int* __restrict__ overflow_flag,
+    int k_start,
+    int k_count) {
+  int k_local = (int)blockIdx.x;
+  if (k_local < 0 || k_local >= k_count) return;
+  int csf_k = k_start + k_local;
+  if ((unsigned)csf_k >= (unsigned)ncsf) {
+    if ((int)threadIdx.x == 0) atomicExch(overflow_flag, 1);
+    return;
+  }
+  if (nvec <= 0) return;
+  int nops = norb * norb;
+  int64_t nout = (int64_t)nops * (int64_t)nvec;
+
+  extern __shared__ unsigned char smem[];
+  OUT_T* w_s = reinterpret_cast<OUT_T*>(smem);
+  for (int64_t idx = (int64_t)threadIdx.x; idx < nout; idx += (int64_t)blockDim.x) {
+    w_s[idx] = (OUT_T)0;
+  }
+  __syncthreads();
+
+  const int8_t* steps_k = steps_table + (int64_t)csf_k * (int64_t)norb;
+  OUT_T hk = hdiag[csf_k];
+  const OUT_T* xk = x + (int64_t)csf_k * x_stride;
+
+  // Diagonal E_pp contributions: (E_pp|x>)[k] += occ(k,p) * x[k].
+  // Also apply the fused scale: (hdiag[k] - epsa[p]) for row index p.
+  for (int p = (int)threadIdx.x; p < norb; p += (int)blockDim.x) {
+    int occ_p = step_to_occ(steps_k[p]);
+    if (!occ_p) continue;
+    OUT_T scale = hk - epsa[p];
+    OUT_T mult = (OUT_T)occ_p * scale;
+    int pq = p * norb + p;
+    int64_t base = (int64_t)pq * (int64_t)nvec;
+    #pragma unroll
+    for (int v = 0; v < 32; v++) {
+      if (v >= nvec) break;
+      w_s[base + (int64_t)v] = xk[v] * mult;
+    }
+  }
+  __syncthreads();
+
+  int64_t start = epq_t_indptr[(int64_t)csf_k];
+  int64_t end = epq_t_indptr[(int64_t)csf_k + 1];
+  if (start < 0 || end < start) {
+    if ((int)threadIdx.x == 0) atomicExch(overflow_flag, 1);
+    return;
+  }
+
+  // Off-diagonal EPQ contributions from the destination-major transpose table.
+  for (int64_t t = start + (int64_t)threadIdx.x; t < end; t += (int64_t)blockDim.x) {
+    int32_t csf_j = epq_t_source[t];
+    if ((unsigned)csf_j >= (unsigned)ncsf) {
+      atomicExch(overflow_flag, 1);
+      continue;
+    }
+    int pq = (int)epq_t_pq[t];
+    if ((unsigned)pq >= (unsigned)nops) {
+      atomicExch(overflow_flag, 1);
+      continue;
+    }
+    OUT_T coef = (OUT_T)epq_t_data[t];
+    if (coef == (OUT_T)0) continue;
+    const OUT_T* xj = x + (int64_t)csf_j * x_stride;
+    // Fused scale depends on p (row index in pq = p*norb + q).
+    int p = pq / norb;
+    OUT_T mult = coef * (hk - epsa[p]);
+    if (mult == (OUT_T)0) continue;
+    int64_t base = (int64_t)pq * (int64_t)nvec;
+    #pragma unroll
+    for (int v = 0; v < 32; v++) {
+      if (v >= nvec) break;
+      OUT_T xjv = xj[v];
+      if (xjv == (OUT_T)0) continue;
+      atomicAdd(&w_s[base + (int64_t)v], xjv * mult);
+    }
+  }
+  __syncthreads();
+
+  OUT_T* w_row = w_out + (int64_t)k_local * w_stride;
+  for (int64_t idx = (int64_t)threadIdx.x; idx < nout; idx += (int64_t)blockDim.x) {
+    w_row[idx] = w_s[idx];
+  }
+}
+
 template <typename INDPTR_T, typename OUT_T, typename COEF_T, typename PQ_T, bool USE_KAHAN = false>
 __global__ void guga_apply_g_flat_gather_epq_transpose_range_kernel_t(
     const int8_t* __restrict__ steps_table,     // [ncsf,norb]
@@ -4381,6 +4574,302 @@ extern "C" void guga_build_w_from_epq_transpose_range_launch_stream(
           overflow_flag,
           k_start,
           k_count);
+    }
+  }
+}
+
+extern "C" void guga_build_w_from_epq_transpose_range_mm_launch_stream(
+    const int8_t* steps_table,
+    int ncsf,
+    int norb,
+    const void* epq_t_indptr,
+    int epq_t_indptr_type,
+    const int32_t* epq_t_source,
+    const void* epq_t_pq,
+    int epq_t_pq_type,
+    const double* epq_t_data,
+    const double* x,
+    int64_t x_stride,
+    int nvec,
+    double* w_out,
+    int64_t w_stride,
+    int* overflow_flag,
+    cudaStream_t stream,
+    int threads,
+    int k_start,
+    int k_count) {
+  if (epq_t_indptr_type != 4 && epq_t_indptr_type != 8) return;
+  if (k_count <= 0 || ncsf <= 0 || norb <= 0) return;
+  if (nvec <= 0) return;
+  if (epq_t_pq_type != 1 && epq_t_pq_type != 2 && epq_t_pq_type != 4) return;
+  int nops = norb * norb;
+  if (nops <= 0) return;
+  int blocks = k_count;
+  size_t smem_bytes = (size_t)nops * (size_t)nvec * sizeof(double);
+  if (epq_t_indptr_type == 4) {
+    const int32_t* epq_t_indptr_i32 = reinterpret_cast<const int32_t*>(epq_t_indptr);
+    if (epq_t_pq_type == 1) {
+      guga_build_w_from_epq_transpose_range_mm_kernel_t<int32_t, double, double, uint8_t>
+          <<<blocks, threads, smem_bytes, stream>>>(
+              steps_table, ncsf, norb, epq_t_indptr_i32, epq_t_source,
+              reinterpret_cast<const uint8_t*>(epq_t_pq), epq_t_data,
+              x, x_stride, nvec, w_out, w_stride, overflow_flag, k_start, k_count);
+    } else if (epq_t_pq_type == 2) {
+      guga_build_w_from_epq_transpose_range_mm_kernel_t<int32_t, double, double, uint16_t>
+          <<<blocks, threads, smem_bytes, stream>>>(
+              steps_table, ncsf, norb, epq_t_indptr_i32, epq_t_source,
+              reinterpret_cast<const uint16_t*>(epq_t_pq), epq_t_data,
+              x, x_stride, nvec, w_out, w_stride, overflow_flag, k_start, k_count);
+    } else {
+      guga_build_w_from_epq_transpose_range_mm_kernel_t<int32_t, double, double, int32_t>
+          <<<blocks, threads, smem_bytes, stream>>>(
+              steps_table, ncsf, norb, epq_t_indptr_i32, epq_t_source,
+              reinterpret_cast<const int32_t*>(epq_t_pq), epq_t_data,
+              x, x_stride, nvec, w_out, w_stride, overflow_flag, k_start, k_count);
+    }
+  } else {
+    const int64_t* epq_t_indptr_i64 = reinterpret_cast<const int64_t*>(epq_t_indptr);
+    if (epq_t_pq_type == 1) {
+      guga_build_w_from_epq_transpose_range_mm_kernel_t<int64_t, double, double, uint8_t>
+          <<<blocks, threads, smem_bytes, stream>>>(
+              steps_table, ncsf, norb, epq_t_indptr_i64, epq_t_source,
+              reinterpret_cast<const uint8_t*>(epq_t_pq), epq_t_data,
+              x, x_stride, nvec, w_out, w_stride, overflow_flag, k_start, k_count);
+    } else if (epq_t_pq_type == 2) {
+      guga_build_w_from_epq_transpose_range_mm_kernel_t<int64_t, double, double, uint16_t>
+          <<<blocks, threads, smem_bytes, stream>>>(
+              steps_table, ncsf, norb, epq_t_indptr_i64, epq_t_source,
+              reinterpret_cast<const uint16_t*>(epq_t_pq), epq_t_data,
+              x, x_stride, nvec, w_out, w_stride, overflow_flag, k_start, k_count);
+    } else {
+      guga_build_w_from_epq_transpose_range_mm_kernel_t<int64_t, double, double, int32_t>
+          <<<blocks, threads, smem_bytes, stream>>>(
+              steps_table, ncsf, norb, epq_t_indptr_i64, epq_t_source,
+              reinterpret_cast<const int32_t*>(epq_t_pq), epq_t_data,
+              x, x_stride, nvec, w_out, w_stride, overflow_flag, k_start, k_count);
+    }
+  }
+}
+
+extern "C" void guga_build_w_from_epq_transpose_range_mm_f64_out_f32_coeff_launch_stream(
+    const int8_t* steps_table,
+    int ncsf,
+    int norb,
+    const void* epq_t_indptr,
+    int epq_t_indptr_type,
+    const int32_t* epq_t_source,
+    const void* epq_t_pq,
+    int epq_t_pq_type,
+    const float* epq_t_data,
+    const double* x,
+    int64_t x_stride,
+    int nvec,
+    double* w_out,
+    int64_t w_stride,
+    int* overflow_flag,
+    cudaStream_t stream,
+    int threads,
+    int k_start,
+    int k_count) {
+  if (epq_t_indptr_type != 4 && epq_t_indptr_type != 8) return;
+  if (k_count <= 0 || ncsf <= 0 || norb <= 0) return;
+  if (nvec <= 0) return;
+  if (epq_t_pq_type != 1 && epq_t_pq_type != 2 && epq_t_pq_type != 4) return;
+  int nops = norb * norb;
+  if (nops <= 0) return;
+  int blocks = k_count;
+  size_t smem_bytes = (size_t)nops * (size_t)nvec * sizeof(double);
+  if (epq_t_indptr_type == 4) {
+    const int32_t* epq_t_indptr_i32 = reinterpret_cast<const int32_t*>(epq_t_indptr);
+    if (epq_t_pq_type == 1) {
+      guga_build_w_from_epq_transpose_range_mm_kernel_t<int32_t, double, float, uint8_t>
+          <<<blocks, threads, smem_bytes, stream>>>(
+              steps_table, ncsf, norb, epq_t_indptr_i32, epq_t_source,
+              reinterpret_cast<const uint8_t*>(epq_t_pq), epq_t_data,
+              x, x_stride, nvec, w_out, w_stride, overflow_flag, k_start, k_count);
+    } else if (epq_t_pq_type == 2) {
+      guga_build_w_from_epq_transpose_range_mm_kernel_t<int32_t, double, float, uint16_t>
+          <<<blocks, threads, smem_bytes, stream>>>(
+              steps_table, ncsf, norb, epq_t_indptr_i32, epq_t_source,
+              reinterpret_cast<const uint16_t*>(epq_t_pq), epq_t_data,
+              x, x_stride, nvec, w_out, w_stride, overflow_flag, k_start, k_count);
+    } else {
+      guga_build_w_from_epq_transpose_range_mm_kernel_t<int32_t, double, float, int32_t>
+          <<<blocks, threads, smem_bytes, stream>>>(
+              steps_table, ncsf, norb, epq_t_indptr_i32, epq_t_source,
+              reinterpret_cast<const int32_t*>(epq_t_pq), epq_t_data,
+              x, x_stride, nvec, w_out, w_stride, overflow_flag, k_start, k_count);
+    }
+  } else {
+    const int64_t* epq_t_indptr_i64 = reinterpret_cast<const int64_t*>(epq_t_indptr);
+    if (epq_t_pq_type == 1) {
+      guga_build_w_from_epq_transpose_range_mm_kernel_t<int64_t, double, float, uint8_t>
+          <<<blocks, threads, smem_bytes, stream>>>(
+              steps_table, ncsf, norb, epq_t_indptr_i64, epq_t_source,
+              reinterpret_cast<const uint8_t*>(epq_t_pq), epq_t_data,
+              x, x_stride, nvec, w_out, w_stride, overflow_flag, k_start, k_count);
+    } else if (epq_t_pq_type == 2) {
+      guga_build_w_from_epq_transpose_range_mm_kernel_t<int64_t, double, float, uint16_t>
+          <<<blocks, threads, smem_bytes, stream>>>(
+              steps_table, ncsf, norb, epq_t_indptr_i64, epq_t_source,
+              reinterpret_cast<const uint16_t*>(epq_t_pq), epq_t_data,
+              x, x_stride, nvec, w_out, w_stride, overflow_flag, k_start, k_count);
+    } else {
+      guga_build_w_from_epq_transpose_range_mm_kernel_t<int64_t, double, float, int32_t>
+          <<<blocks, threads, smem_bytes, stream>>>(
+              steps_table, ncsf, norb, epq_t_indptr_i64, epq_t_source,
+              reinterpret_cast<const int32_t*>(epq_t_pq), epq_t_data,
+              x, x_stride, nvec, w_out, w_stride, overflow_flag, k_start, k_count);
+    }
+  }
+}
+
+extern "C" void guga_build_w_from_epq_transpose_range_mm_scaled_launch_stream(
+    const int8_t* steps_table,
+    int ncsf,
+    int norb,
+    const void* epq_t_indptr,
+    int epq_t_indptr_type,
+    const int32_t* epq_t_source,
+    const void* epq_t_pq,
+    int epq_t_pq_type,
+    const double* epq_t_data,
+    const double* x,
+    int64_t x_stride,
+    int nvec,
+    const double* hdiag,
+    const double* epsa,
+    double* w_out,
+    int64_t w_stride,
+    int* overflow_flag,
+    cudaStream_t stream,
+    int threads,
+    int k_start,
+    int k_count) {
+  if (epq_t_indptr_type != 4 && epq_t_indptr_type != 8) return;
+  if (k_count <= 0 || ncsf <= 0 || norb <= 0) return;
+  if (nvec <= 0) return;
+  if (epq_t_pq_type != 1 && epq_t_pq_type != 2 && epq_t_pq_type != 4) return;
+  int nops = norb * norb;
+  if (nops <= 0) return;
+  int blocks = k_count;
+  size_t smem_bytes = (size_t)nops * (size_t)nvec * sizeof(double);
+  if (epq_t_indptr_type == 4) {
+    const int32_t* epq_t_indptr_i32 = reinterpret_cast<const int32_t*>(epq_t_indptr);
+    if (epq_t_pq_type == 1) {
+      guga_build_w_from_epq_transpose_range_mm_scaled_kernel_t<int32_t, double, double, uint8_t>
+          <<<blocks, threads, smem_bytes, stream>>>(
+              steps_table, ncsf, norb, epq_t_indptr_i32, epq_t_source,
+              reinterpret_cast<const uint8_t*>(epq_t_pq), epq_t_data,
+              x, x_stride, nvec, hdiag, epsa, w_out, w_stride, overflow_flag, k_start, k_count);
+    } else if (epq_t_pq_type == 2) {
+      guga_build_w_from_epq_transpose_range_mm_scaled_kernel_t<int32_t, double, double, uint16_t>
+          <<<blocks, threads, smem_bytes, stream>>>(
+              steps_table, ncsf, norb, epq_t_indptr_i32, epq_t_source,
+              reinterpret_cast<const uint16_t*>(epq_t_pq), epq_t_data,
+              x, x_stride, nvec, hdiag, epsa, w_out, w_stride, overflow_flag, k_start, k_count);
+    } else {
+      guga_build_w_from_epq_transpose_range_mm_scaled_kernel_t<int32_t, double, double, int32_t>
+          <<<blocks, threads, smem_bytes, stream>>>(
+              steps_table, ncsf, norb, epq_t_indptr_i32, epq_t_source,
+              reinterpret_cast<const int32_t*>(epq_t_pq), epq_t_data,
+              x, x_stride, nvec, hdiag, epsa, w_out, w_stride, overflow_flag, k_start, k_count);
+    }
+  } else {
+    const int64_t* epq_t_indptr_i64 = reinterpret_cast<const int64_t*>(epq_t_indptr);
+    if (epq_t_pq_type == 1) {
+      guga_build_w_from_epq_transpose_range_mm_scaled_kernel_t<int64_t, double, double, uint8_t>
+          <<<blocks, threads, smem_bytes, stream>>>(
+              steps_table, ncsf, norb, epq_t_indptr_i64, epq_t_source,
+              reinterpret_cast<const uint8_t*>(epq_t_pq), epq_t_data,
+              x, x_stride, nvec, hdiag, epsa, w_out, w_stride, overflow_flag, k_start, k_count);
+    } else if (epq_t_pq_type == 2) {
+      guga_build_w_from_epq_transpose_range_mm_scaled_kernel_t<int64_t, double, double, uint16_t>
+          <<<blocks, threads, smem_bytes, stream>>>(
+              steps_table, ncsf, norb, epq_t_indptr_i64, epq_t_source,
+              reinterpret_cast<const uint16_t*>(epq_t_pq), epq_t_data,
+              x, x_stride, nvec, hdiag, epsa, w_out, w_stride, overflow_flag, k_start, k_count);
+    } else {
+      guga_build_w_from_epq_transpose_range_mm_scaled_kernel_t<int64_t, double, double, int32_t>
+          <<<blocks, threads, smem_bytes, stream>>>(
+              steps_table, ncsf, norb, epq_t_indptr_i64, epq_t_source,
+              reinterpret_cast<const int32_t*>(epq_t_pq), epq_t_data,
+              x, x_stride, nvec, hdiag, epsa, w_out, w_stride, overflow_flag, k_start, k_count);
+    }
+  }
+}
+
+extern "C" void guga_build_w_from_epq_transpose_range_mm_scaled_f64_out_f32_coeff_launch_stream(
+    const int8_t* steps_table,
+    int ncsf,
+    int norb,
+    const void* epq_t_indptr,
+    int epq_t_indptr_type,
+    const int32_t* epq_t_source,
+    const void* epq_t_pq,
+    int epq_t_pq_type,
+    const float* epq_t_data,
+    const double* x,
+    int64_t x_stride,
+    int nvec,
+    const double* hdiag,
+    const double* epsa,
+    double* w_out,
+    int64_t w_stride,
+    int* overflow_flag,
+    cudaStream_t stream,
+    int threads,
+    int k_start,
+    int k_count) {
+  if (epq_t_indptr_type != 4 && epq_t_indptr_type != 8) return;
+  if (k_count <= 0 || ncsf <= 0 || norb <= 0) return;
+  if (nvec <= 0) return;
+  if (epq_t_pq_type != 1 && epq_t_pq_type != 2 && epq_t_pq_type != 4) return;
+  int nops = norb * norb;
+  if (nops <= 0) return;
+  int blocks = k_count;
+  size_t smem_bytes = (size_t)nops * (size_t)nvec * sizeof(double);
+  if (epq_t_indptr_type == 4) {
+    const int32_t* epq_t_indptr_i32 = reinterpret_cast<const int32_t*>(epq_t_indptr);
+    if (epq_t_pq_type == 1) {
+      guga_build_w_from_epq_transpose_range_mm_scaled_kernel_t<int32_t, double, float, uint8_t>
+          <<<blocks, threads, smem_bytes, stream>>>(
+              steps_table, ncsf, norb, epq_t_indptr_i32, epq_t_source,
+              reinterpret_cast<const uint8_t*>(epq_t_pq), epq_t_data,
+              x, x_stride, nvec, hdiag, epsa, w_out, w_stride, overflow_flag, k_start, k_count);
+    } else if (epq_t_pq_type == 2) {
+      guga_build_w_from_epq_transpose_range_mm_scaled_kernel_t<int32_t, double, float, uint16_t>
+          <<<blocks, threads, smem_bytes, stream>>>(
+              steps_table, ncsf, norb, epq_t_indptr_i32, epq_t_source,
+              reinterpret_cast<const uint16_t*>(epq_t_pq), epq_t_data,
+              x, x_stride, nvec, hdiag, epsa, w_out, w_stride, overflow_flag, k_start, k_count);
+    } else {
+      guga_build_w_from_epq_transpose_range_mm_scaled_kernel_t<int32_t, double, float, int32_t>
+          <<<blocks, threads, smem_bytes, stream>>>(
+              steps_table, ncsf, norb, epq_t_indptr_i32, epq_t_source,
+              reinterpret_cast<const int32_t*>(epq_t_pq), epq_t_data,
+              x, x_stride, nvec, hdiag, epsa, w_out, w_stride, overflow_flag, k_start, k_count);
+    }
+  } else {
+    const int64_t* epq_t_indptr_i64 = reinterpret_cast<const int64_t*>(epq_t_indptr);
+    if (epq_t_pq_type == 1) {
+      guga_build_w_from_epq_transpose_range_mm_scaled_kernel_t<int64_t, double, float, uint8_t>
+          <<<blocks, threads, smem_bytes, stream>>>(
+              steps_table, ncsf, norb, epq_t_indptr_i64, epq_t_source,
+              reinterpret_cast<const uint8_t*>(epq_t_pq), epq_t_data,
+              x, x_stride, nvec, hdiag, epsa, w_out, w_stride, overflow_flag, k_start, k_count);
+    } else if (epq_t_pq_type == 2) {
+      guga_build_w_from_epq_transpose_range_mm_scaled_kernel_t<int64_t, double, float, uint16_t>
+          <<<blocks, threads, smem_bytes, stream>>>(
+              steps_table, ncsf, norb, epq_t_indptr_i64, epq_t_source,
+              reinterpret_cast<const uint16_t*>(epq_t_pq), epq_t_data,
+              x, x_stride, nvec, hdiag, epsa, w_out, w_stride, overflow_flag, k_start, k_count);
+    } else {
+      guga_build_w_from_epq_transpose_range_mm_scaled_kernel_t<int64_t, double, float, int32_t>
+          <<<blocks, threads, smem_bytes, stream>>>(
+              steps_table, ncsf, norb, epq_t_indptr_i64, epq_t_source,
+              reinterpret_cast<const int32_t*>(epq_t_pq), epq_t_data,
+              x, x_stride, nvec, hdiag, epsa, w_out, w_stride, overflow_flag, k_start, k_count);
     }
   }
 }

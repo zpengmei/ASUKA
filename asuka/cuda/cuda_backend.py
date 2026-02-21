@@ -45,6 +45,18 @@ def has_epq_table_gather_apply_device() -> bool:
     return _ext is not None and hasattr(_ext, "apply_g_flat_gather_epq_table_inplace_device")
 
 
+def has_build_w_from_epq_transpose_range_mm_scaled() -> bool:
+    """Return True if the CUDA extension exposes the mm-scaled EPQ transpose-range W builder."""
+
+    return _ext is not None and hasattr(_ext, "build_w_from_epq_transpose_range_mm_scaled_inplace_device")
+
+
+def has_build_w_from_epq_transpose_range_mm() -> bool:
+    """Return True if the CUDA extension exposes the mm EPQ transpose-range W builder."""
+
+    return _ext is not None and hasattr(_ext, "build_w_from_epq_transpose_range_mm_inplace_device")
+
+
 def device_info() -> dict[str, object]:
     if _ext is None:
         raise RuntimeError("CUDA extension not available; build with python -m asuka.build.guga_cuda_ext")
@@ -1681,12 +1693,21 @@ def epq_apply_gather_inplace_device(
         raise ValueError("orbital indices out of range")
 
     x = cp.asarray(x, dtype=cp.float64)
-    x = cp.ascontiguousarray(x)
     if x.ndim != 2 or x.shape[0] != int(drt.ncsf):
         raise ValueError("x must have shape (ncsf,nvec)")
     nvec = int(x.shape[1])
     if nvec <= 0 or nvec > 32:
         raise ValueError("epq_apply_gather_inplace_device requires 1 <= nvec <= 32")
+
+    # Allow pitched 2D arrays: stride1=itemsize, stride0>=nvec*itemsize.
+    if (
+        x.strides[1] != x.itemsize
+        or x.strides[0] < nvec * x.itemsize
+        or (x.strides[0] % x.itemsize) != 0
+        or x.strides[0] <= 0
+        or x.strides[1] <= 0
+    ):
+        x = cp.ascontiguousarray(x)
 
     if y is None:
         y = cp.empty((int(drt.ncsf), nvec), dtype=cp.float64)
@@ -1694,9 +1715,16 @@ def epq_apply_gather_inplace_device(
             y.fill(0.0)
     else:
         y = cp.asarray(y, dtype=cp.float64)
-        y = cp.ascontiguousarray(y)
         if y.shape != (int(drt.ncsf), nvec):
             raise ValueError("y must have the same shape as x")
+        if (
+            y.strides[1] != y.itemsize
+            or y.strides[0] < nvec * y.itemsize
+            or (y.strides[0] % y.itemsize) != 0
+            or y.strides[0] <= 0
+            or y.strides[1] <= 0
+        ):
+            y = cp.ascontiguousarray(y)
 
     if overflow is None:
         overflow = cp.empty((1,), dtype=cp.int32)
@@ -2125,6 +2153,262 @@ def build_w_from_epq_transpose_range_inplace_device(
         t_pq,
         t_data,
         x,
+        w_out,
+        overflow,
+        int(threads),
+        int(stream_ptr),
+        bool(sync),
+        bool(check_overflow),
+        int(k_start),
+        int(k_count),
+    )
+    return w_out, overflow
+
+
+def build_w_from_epq_transpose_range_mm_inplace_device(
+    drt: DRT,
+    state_dev,
+    epq_table_t,
+    x,
+    *,
+    w_out=None,
+    overflow=None,
+    threads: int = 256,
+    stream=None,
+    sync: bool = True,
+    check_overflow: bool = True,
+    k_start: int = 0,
+    k_count: int = 0,
+):
+    """Build a W_block from a destination-major EPQ transpose table for multiple vectors.
+
+    Computes, for k in [k_start, k_start+k_count) and for each vector lane v:
+      W[k_local, pq*nvec+v] = (E_pq |x[:,v]>)[k]
+
+    The diagonal E_pp contributions are included internally using the device steps table.
+    """
+    if _ext is None:
+        raise RuntimeError("CUDA extension not available; build with python -m asuka.build.guga_cuda_ext")
+
+    try:
+        import cupy as cp
+    except Exception as e:  # pragma: no cover
+        raise RuntimeError("CuPy is required for the device-array path") from e
+
+    if check_overflow and not sync:
+        raise ValueError("check_overflow=True requires sync=True")
+
+    if epq_table_t is None or len(epq_table_t) != 4:
+        raise ValueError("epq_table_t must be a (t_indptr, t_source, t_pq, t_data) tuple")
+    t_indptr, t_source, t_pq, t_data = epq_table_t
+    t_indptr = _as_epq_indptr_array(cp, t_indptr, ncsf=int(drt.ncsf), name="t_indptr")
+    t_source = cp.ascontiguousarray(cp.asarray(t_source, dtype=cp.int32).ravel())
+    t_pq = _as_epq_pq_array(cp, t_pq, name="t_pq")
+    _validate_epq_pq_capacity(cp, t_pq, norb=int(drt.norb), name="t_pq")
+    t_data = cp.asarray(t_data).ravel()
+    t_dt = cp.dtype(t_data.dtype)
+    if t_dt not in (cp.float32, cp.float64):
+        t_data = cp.asarray(t_data, dtype=cp.float64).ravel()
+        t_dt = cp.dtype(t_data.dtype)
+    t_data = cp.ascontiguousarray(t_data)
+
+    if t_indptr.shape != (int(drt.ncsf) + 1,):
+        raise ValueError("t_indptr must have shape (ncsf+1,)")
+    if t_source.shape != t_pq.shape or t_source.shape != t_data.shape:
+        raise ValueError("t_source,t_pq,t_data must have the same shape (nnz,)")
+
+    x = cp.asarray(x, dtype=cp.float64)
+    if x.ndim != 2 or x.shape[0] != int(drt.ncsf):
+        raise ValueError("x must have shape (ncsf,nvec)")
+    nvec = int(x.shape[1])
+    if nvec <= 0 or nvec > 32:
+        raise ValueError("x must satisfy 1 <= nvec <= 32")
+
+    # Require dense row-major layout: stride1==itemsize and stride0>=nvec*itemsize.
+    if x.strides[1] != x.itemsize or x.strides[0] < nvec * x.itemsize or (x.strides[0] % x.itemsize) != 0:
+        x = cp.ascontiguousarray(x)
+
+    nops = int(drt.norb) * int(drt.norb)
+    out_cols = int(nops) * int(nvec)
+
+    k_start = int(k_start)
+    if k_start < 0 or k_start >= int(drt.ncsf):
+        raise ValueError("k_start out of range")
+    if int(k_count) <= 0:
+        k_count = int(drt.ncsf) - int(k_start)
+    else:
+        k_count = int(k_count)
+    if k_count <= 0 or k_start + k_count > int(drt.ncsf):
+        raise ValueError("k_count out of range")
+
+    if w_out is None:
+        w_out = cp.empty((int(k_count), int(out_cols)), dtype=cp.float64)
+    else:
+        w_out = cp.asarray(w_out, dtype=cp.float64)
+        if not getattr(w_out, "flags", None) or not w_out.flags.c_contiguous:
+            raise ValueError("w_out must be C-contiguous")
+        if w_out.ndim == 1:
+            if w_out.shape != (int(k_count) * int(out_cols),):
+                raise ValueError("w_out (1D) must have shape (k_count*nops*nvec,)")
+        elif w_out.ndim == 2:
+            if w_out.shape[0] != int(k_count) or w_out.shape[1] < int(out_cols):
+                raise ValueError("w_out (2D) must have shape (k_count, nops*nvec_or_more)")
+        else:
+            raise ValueError("w_out must be 1D or 2D")
+
+    if overflow is None:
+        overflow = cp.empty((1,), dtype=cp.int32)
+    else:
+        overflow = cp.ascontiguousarray(cp.asarray(overflow, dtype=cp.int32).ravel())
+        if overflow.shape != (1,):
+            raise ValueError("overflow must have shape (1,)")
+
+    if stream is None:
+        stream_ptr = int(cp.cuda.get_current_stream().ptr)
+    else:
+        stream_ptr = int(getattr(stream, "ptr", stream))
+
+    _ext.build_w_from_epq_transpose_range_mm_inplace_device(
+        state_dev,
+        t_indptr,
+        t_source,
+        t_pq,
+        t_data,
+        x,
+        w_out,
+        overflow,
+        int(threads),
+        int(stream_ptr),
+        bool(sync),
+        bool(check_overflow),
+        int(k_start),
+        int(k_count),
+    )
+    return w_out, overflow
+
+
+def build_w_from_epq_transpose_range_mm_scaled_inplace_device(
+    drt: DRT,
+    state_dev,
+    epq_table_t,
+    x,
+    hdiag,
+    epsa,
+    *,
+    w_out=None,
+    overflow=None,
+    threads: int = 256,
+    stream=None,
+    sync: bool = True,
+    check_overflow: bool = True,
+    k_start: int = 0,
+    k_count: int = 0,
+):
+    """Build a (scaled) W_block from a destination-major EPQ transpose table for multiple vectors.
+
+    Computes, for k in [k_start, k_start+k_count) and for each vector lane v:
+      W_scaled[k_local, pq*nvec+v] = (E_pq |x[:,v]>)[k] * (hdiag[k] - epsa[p])
+
+    The diagonal E_pp contributions are included internally using the device steps table.
+    """
+    if _ext is None:
+        raise RuntimeError("CUDA extension not available; build with python -m asuka.build.guga_cuda_ext")
+
+    try:
+        import cupy as cp
+    except Exception as e:  # pragma: no cover
+        raise RuntimeError("CuPy is required for the device-array path") from e
+
+    if check_overflow and not sync:
+        raise ValueError("check_overflow=True requires sync=True")
+
+    if epq_table_t is None or len(epq_table_t) != 4:
+        raise ValueError("epq_table_t must be a (t_indptr, t_source, t_pq, t_data) tuple")
+    t_indptr, t_source, t_pq, t_data = epq_table_t
+    t_indptr = _as_epq_indptr_array(cp, t_indptr, ncsf=int(drt.ncsf), name="t_indptr")
+    t_source = cp.ascontiguousarray(cp.asarray(t_source, dtype=cp.int32).ravel())
+    t_pq = _as_epq_pq_array(cp, t_pq, name="t_pq")
+    _validate_epq_pq_capacity(cp, t_pq, norb=int(drt.norb), name="t_pq")
+    t_data = cp.asarray(t_data).ravel()
+    t_dt = cp.dtype(t_data.dtype)
+    if t_dt not in (cp.float32, cp.float64):
+        t_data = cp.asarray(t_data, dtype=cp.float64).ravel()
+        t_dt = cp.dtype(t_data.dtype)
+    t_data = cp.ascontiguousarray(t_data)
+
+    if t_indptr.shape != (int(drt.ncsf) + 1,):
+        raise ValueError("t_indptr must have shape (ncsf+1,)")
+    if t_source.shape != t_pq.shape or t_source.shape != t_data.shape:
+        raise ValueError("t_source,t_pq,t_data must have the same shape (nnz,)")
+
+    x = cp.asarray(x, dtype=cp.float64)
+    if x.ndim != 2 or x.shape[0] != int(drt.ncsf):
+        raise ValueError("x must have shape (ncsf,nvec)")
+    nvec = int(x.shape[1])
+    if nvec <= 0 or nvec > 32:
+        raise ValueError("x must satisfy 1 <= nvec <= 32")
+
+    # Require dense row-major layout: stride1==itemsize and stride0>=nvec*itemsize.
+    if x.strides[1] != x.itemsize or x.strides[0] < nvec * x.itemsize or (x.strides[0] % x.itemsize) != 0:
+        x = cp.ascontiguousarray(x)
+
+    hdiag = cp.ascontiguousarray(cp.asarray(hdiag, dtype=cp.float64).ravel())
+    if hdiag.shape != (int(drt.ncsf),):
+        raise ValueError("hdiag must have shape (ncsf,)")
+
+    epsa = cp.ascontiguousarray(cp.asarray(epsa, dtype=cp.float64).ravel())
+    if epsa.shape != (int(drt.norb),):
+        raise ValueError("epsa must have shape (norb,)")
+
+    nops = int(drt.norb) * int(drt.norb)
+    out_cols = int(nops) * int(nvec)
+
+    k_start = int(k_start)
+    if k_start < 0 or k_start >= int(drt.ncsf):
+        raise ValueError("k_start out of range")
+    if int(k_count) <= 0:
+        k_count = int(drt.ncsf) - int(k_start)
+    else:
+        k_count = int(k_count)
+    if k_count <= 0 or k_start + k_count > int(drt.ncsf):
+        raise ValueError("k_count out of range")
+
+    if w_out is None:
+        w_out = cp.empty((int(k_count), int(out_cols)), dtype=cp.float64)
+    else:
+        w_out = cp.asarray(w_out, dtype=cp.float64)
+        if not getattr(w_out, "flags", None) or not w_out.flags.c_contiguous:
+            raise ValueError("w_out must be C-contiguous")
+        if w_out.ndim == 1:
+            if w_out.shape != (int(k_count) * int(out_cols),):
+                raise ValueError("w_out (1D) must have shape (k_count*nops*nvec,)")
+        elif w_out.ndim == 2:
+            if w_out.shape[0] != int(k_count) or w_out.shape[1] < int(out_cols):
+                raise ValueError("w_out (2D) must have shape (k_count, nops*nvec_or_more)")
+        else:
+            raise ValueError("w_out must be 1D or 2D")
+
+    if overflow is None:
+        overflow = cp.empty((1,), dtype=cp.int32)
+    else:
+        overflow = cp.ascontiguousarray(cp.asarray(overflow, dtype=cp.int32).ravel())
+        if overflow.shape != (1,):
+            raise ValueError("overflow must have shape (1,)")
+
+    if stream is None:
+        stream_ptr = int(cp.cuda.get_current_stream().ptr)
+    else:
+        stream_ptr = int(getattr(stream, "ptr", stream))
+
+    _ext.build_w_from_epq_transpose_range_mm_scaled_inplace_device(
+        state_dev,
+        t_indptr,
+        t_source,
+        t_pq,
+        t_data,
+        x,
+        hdiag,
+        epsa,
         w_out,
         overflow,
         int(threads),

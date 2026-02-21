@@ -14,6 +14,134 @@ def _as_f64_2d(a: Any) -> np.ndarray:
     return arr
 
 
+def _is_cart_basis(mol: Any) -> bool:
+    """Return True if `mol` uses Cartesian basis functions.
+
+    ASUKA's cuERI-backed DF context currently only supports Cartesian AO bases.
+    PySCF's default is spherical (`cart=False`). For spherical bases, we fall
+    back to PySCF's DF/Cholesky builder (see `_build_df_pair_blocks_pyscf`).
+    """
+
+    # PySCF Mole: `mol.cart` exists.
+    cart = getattr(mol, "cart", None)
+    if cart is None:
+        # asuka.frontend.molecule.Molecule path: treat as Cartesian by default.
+        return True
+    return bool(cart)
+
+
+def _transform_cderi_s1_to_mo_pairs(
+    cderi_s1: np.ndarray,
+    mo_x: np.ndarray,
+    mo_y: np.ndarray,
+    *,
+    max_memory: int,
+) -> np.ndarray:
+    """Transform AO DF/Cholesky vectors (aosym='s1') to an MO pair block.
+
+    Parameters
+    ----------
+    cderi_s1:
+        AO factors as shape (naux, nao*nao), where the last dimension is the
+        ordered AO pair index μ*nao+ν (PySCF aosym='s1' convention).
+    mo_x, mo_y:
+        AO->MO coefficient blocks with shapes (nao, nx) and (nao, ny).
+
+    Returns
+    -------
+    mo_cderi : np.ndarray
+        Shape (naux, nx*ny) in PySCF outcore.general style.
+    """
+
+    cderi_s1 = np.asarray(cderi_s1, dtype=np.float64, order="C")
+    mo_x = np.asarray(mo_x, dtype=np.float64, order="C")
+    mo_y = np.asarray(mo_y, dtype=np.float64, order="C")
+
+    naux = int(cderi_s1.shape[0])
+    nao = int(mo_x.shape[0])
+    if cderi_s1.shape[1] != nao * nao:
+        raise ValueError("cderi_s1 shape mismatch with mo_x/mo_y")
+
+    nx = int(mo_x.shape[1])
+    ny = int(mo_y.shape[1])
+    out = np.empty((naux, nx * ny), dtype=np.float64, order="C")
+
+    # Chunk over aux to control peak intermediate memory (tmp/res).
+    mem_mb = int(max_memory)
+    if mem_mb <= 0:
+        mem_mb = 256
+    mem_bytes = int(mem_mb) * (1024**2)
+    per_aux = int(8 * (nao * ny + nx * ny))
+    if per_aux <= 0:
+        per_aux = 1
+    block_naux = max(1, min(naux, mem_bytes // per_aux))
+    block_naux = int(min(block_naux, 1024))
+
+    for q0 in range(0, naux, block_naux):
+        q1 = min(naux, q0 + block_naux)
+        qb = int(q1 - q0)
+        # (qb, nao, nao)
+        b_blk = cderi_s1[q0:q1, :].reshape(qb, nao, nao)
+
+        # tmp[Q, μ, y] = Σ_ν B[Q,μ,ν] C_y[ν,y]
+        tmp = np.tensordot(b_blk, mo_y, axes=([2], [0]))  # (qb, nao, ny)
+        tmp = np.transpose(tmp, (1, 2, 0))  # (nao, ny, qb)
+        # res[x, y, Q] = Σ_μ C_x[μ,x] tmp[μ,y,Q]
+        res = np.tensordot(mo_x.T, tmp, axes=([1], [0]))  # (nx, ny, qb)
+        out[q0:q1, :] = np.asarray(res.reshape(nx * ny, qb).T, dtype=np.float64, order="C")
+
+    return out
+
+
+def _build_df_pair_blocks_pyscf(
+    mol: Any,
+    blocks: list[tuple[np.ndarray, np.ndarray]],
+    *,
+    auxbasis: Any,
+    max_memory: int,
+    verbose: int,
+    compute_pair_norm: bool,
+) -> list["DFPairBlock"]:
+    """PySCF fallback builder for spherical AO bases (mol.cart=False)."""
+
+    try:
+        from pyscf.df import incore  # noqa: PLC0415
+    except Exception as e:  # pragma: no cover
+        raise RuntimeError(
+            "PySCF is required to build DF pair blocks for spherical AO bases (mol.cart=False). "
+            "Either install PySCF or run with a cartesian basis (mol.cart=True)."
+        ) from e
+
+    # Use aosym='s1' (full ordered AO pairs) to match DFPairBlock conventions.
+    cderi = incore.cholesky_eri(
+        mol,
+        auxbasis=auxbasis,
+        aosym="s1",
+        max_memory=int(max_memory),
+        verbose=int(verbose),
+    )
+    cderi = np.asarray(cderi, dtype=np.float64, order="C")  # (naux, nao*nao)
+
+    out: list[DFPairBlock] = []
+    for mo_x, mo_y in blocks:
+        mo_x = _as_f64_2d(mo_x)
+        mo_y = _as_f64_2d(mo_y)
+        if mo_x.shape[0] != mo_y.shape[0]:
+            raise ValueError("mo_x and mo_y must have the same number of AO rows")
+        nx = int(mo_x.shape[1])
+        ny = int(mo_y.shape[1])
+        if nx <= 0 or ny <= 0:
+            raise ValueError("empty orbital block")
+
+        mo_cderi = _transform_cderi_s1_to_mo_pairs(cderi, mo_x, mo_y, max_memory=int(max_memory))
+        l_full = np.asarray(mo_cderi.T, dtype=np.float64, order="C")
+        pair_norm = None
+        if compute_pair_norm:
+            pair_norm = np.asarray(np.linalg.norm(l_full, axis=1), dtype=np.float64, order="C")
+        out.append(DFPairBlock(nx=nx, ny=ny, l_full=l_full, pair_norm=pair_norm))
+    return out
+
+
 @dataclass(frozen=True)
 class DFPairBlock:
     """Rectangular DF/Cholesky vectors for a fixed MO orbital block (X,Y).
@@ -143,6 +271,30 @@ def build_df_pair_block(
     if nx <= 0 or ny <= 0:
         raise ValueError("empty orbital block")
 
+    if not _is_cart_basis(mol):
+        # Spherical AO basis (PySCF default): use PySCF DF/Cholesky integrals.
+        blocks = _build_df_pair_blocks_pyscf(
+            mol,
+            [(mo_x, mo_y)],
+            auxbasis=auxbasis,
+            max_memory=int(max_memory),
+            verbose=int(verbose),
+            compute_pair_norm=bool(compute_pair_norm),
+        )
+        block = blocks[0]
+        if filename is not None:
+            try:
+                import h5py  # noqa: PLC0415
+            except Exception as e:  # pragma: no cover
+                raise RuntimeError("filename output requires `h5py` to be installed") from e
+
+            filename = str(filename)
+            Path(filename).parent.mkdir(parents=True, exist_ok=True)
+            with h5py.File(str(filename), "w") as f:
+                # PySCF outcore layout: (naux, ncol)
+                f.create_dataset(str(dataname), data=np.asarray(block.l_full.T, dtype=np.float64, order="C"))
+        return block
+
     from asuka.integrals.df_context import get_df_cholesky_context  # noqa: PLC0415
 
     ctx = get_df_cholesky_context(
@@ -196,6 +348,17 @@ def build_df_pair_blocks(
     if not blocks:
         return []
 
+    if not _is_cart_basis(mol):
+        # Spherical AO basis (PySCF default): use PySCF DF/Cholesky integrals.
+        return _build_df_pair_blocks_pyscf(
+            mol,
+            blocks,
+            auxbasis=auxbasis,
+            max_memory=int(max_memory),
+            verbose=int(verbose),
+            compute_pair_norm=bool(compute_pair_norm),
+        )
+
     from asuka.integrals.df_context import get_df_cholesky_context  # noqa: PLC0415
 
     ctx = get_df_cholesky_context(
@@ -236,4 +399,105 @@ def build_df_pair_blocks(
         if compute_pair_norm:
             pair_norm = np.asarray(np.linalg.norm(l_full_c, axis=1), order="C")
         out.append(DFPairBlock(nx=int(nx), ny=int(ny), l_full=l_full_c, pair_norm=pair_norm))
+    return out
+
+
+def build_df_pair_blocks_from_df_B(
+    B_ao: Any,
+    blocks: list[tuple[np.ndarray, np.ndarray]],
+    *,
+    max_memory: int = 2000,
+    compute_pair_norm: bool = False,
+) -> list[DFPairBlock]:
+    """Build DFPairBlock objects from whitened AO DF factors ``B[μ,ν,Q]``.
+
+    This is a bridge for the ASUKA frontend (cuERI) pipeline where SCF produces
+    the whitened 3-center factors on GPU:
+
+      (μν|λσ) ≈ Σ_Q B[μ,ν,Q] B[λ,σ,Q]
+
+    Parameters
+    ----------
+    B_ao
+        Whitened AO DF factors with shape (nao, nao, naux). Can be a NumPy or
+        CuPy array. The returned DFPairBlocks will live on the same backend.
+    blocks
+        List of (mo_x, mo_y) coefficient blocks with shapes (nao, nx) and
+        (nao, ny). These may be NumPy arrays even when B_ao is on GPU; they
+        will be converted as needed.
+    max_memory
+        Chunking hint (in MB) for the aux dimension.
+    compute_pair_norm
+        If True, compute and store per-pair norms (used rarely in this repo).
+    """
+
+    if not blocks:
+        return []
+
+    # Select backend based on B_ao type.
+    xp = np
+    try:
+        import cupy as cp  # noqa: PLC0415
+
+        if hasattr(B_ao, "__cuda_array_interface__") or isinstance(B_ao, cp.ndarray):
+            xp = cp
+    except Exception:
+        cp = None  # type: ignore[assignment]
+
+    B = xp.asarray(B_ao, dtype=xp.float64)
+    if B.ndim != 3:
+        raise ValueError("B_ao must have shape (nao,nao,naux)")
+    nao, nao2, naux = map(int, B.shape)
+    if nao <= 0 or nao2 != nao or naux <= 0:
+        raise ValueError("B_ao must have shape (nao,nao,naux) with positive sizes")
+
+    # Chunk over aux to control intermediate memory (tmp/res).
+    mem_mb = int(max_memory)
+    if mem_mb <= 0:
+        mem_mb = 256
+    mem_bytes = int(mem_mb) * (1024**2)
+
+    out: list[DFPairBlock] = []
+    for mo_x, mo_y in blocks:
+        Cx_in = xp.asarray(mo_x, dtype=xp.float64)
+        Cy_in = xp.asarray(mo_y, dtype=xp.float64)
+        if Cx_in.ndim != 2 or Cy_in.ndim != 2:
+            raise ValueError("mo_x and mo_y must be 2D arrays")
+        if int(Cx_in.shape[0]) != nao or int(Cy_in.shape[0]) != nao:
+            raise ValueError("mo_x/mo_y AO dimension mismatch with B_ao")
+        nx = int(Cx_in.shape[1])
+        ny = int(Cy_in.shape[1])
+        if nx <= 0 or ny <= 0:
+            raise ValueError("empty orbital block")
+
+        Cx = xp.ascontiguousarray(Cx_in)
+        Cy = xp.ascontiguousarray(Cy_in)
+
+        # Estimate per-aux temporary footprint: tmp(nao,ny) + res(nx,ny).
+        per_aux = int(8 * (nao * ny + nx * ny))
+        if per_aux <= 0:
+            per_aux = 1
+        block_naux = max(1, min(naux, mem_bytes // per_aux))
+        block_naux = int(min(block_naux, 1024))
+
+        mo_cderi = xp.empty((naux, nx * ny), dtype=xp.float64)
+        for q0 in range(0, naux, block_naux):
+            q1 = min(naux, q0 + block_naux)
+            qb = int(q1 - q0)
+            b_blk = B[:, :, q0:q1]  # (nao,nao,qb)
+
+            # tmp[μ,y,Q] = Σ_ν B[μ,ν,Q] Cy[ν,y]
+            tmp = xp.tensordot(b_blk, Cy, axes=([1], [0]))  # (nao,qb,ny)
+            tmp = xp.transpose(tmp, (0, 2, 1))  # (nao,ny,qb)
+            # res[x,y,Q] = Σ_μ Cx[μ,x] tmp[μ,y,Q]
+            res = xp.tensordot(Cx.T, tmp, axes=([1], [0]))  # (nx,ny,qb)
+            mo_cderi[q0:q1, :] = xp.asarray(res.reshape(nx * ny, qb).T, dtype=xp.float64)
+
+        l_full = xp.ascontiguousarray(mo_cderi.T)  # (nx*ny,naux)
+        pair_norm = None
+        if compute_pair_norm:
+            pair_norm = xp.asarray(xp.linalg.norm(l_full, axis=1), dtype=xp.float64)
+
+        out.append(DFPairBlock(nx=nx, ny=ny, l_full=l_full, pair_norm=pair_norm))
+
     return out
