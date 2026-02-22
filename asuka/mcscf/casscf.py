@@ -849,7 +849,7 @@ def run_casscf_df(
     qune_prev_fp = None
     qune_nls = 0
     ah_x0_guess = None
-    ah_df_B_np = None
+    ah_df_B = None
     ah_hcore_np = None
     ah_conv_tol_grad_eff = max(float(conv_tol_grad), float(ah_conv_tol_grad))
     ah_conv_tol_energy_eff = max(float(tol), float(ah_conv_tol_energy))
@@ -1076,13 +1076,22 @@ def run_casscf_df(
             except Exception:
                 _cp_ah = None
 
-            if ah_df_B_np is None:
+            if ah_df_B is None:
                 _raw_df_B = getattr(scf_out, "df_B", None)
                 if _raw_df_B is not None:
+                    # Keep DF factors on the current device when possible.
+                    #
+                    # The AH/Newton micro-iterations are NumPy-based (see
+                    # `newton_casscf.update_orb_ci`), but the internal operator
+                    # (`gen_g_hop_internal`) can offload the expensive DF J/K
+                    # updates and contractions to CuPy when `df_B` is a CuPy
+                    # array. Pulling `df_B` to CPU here forces the entire AH
+                    # path to run CPU-only and also introduces a large device→host
+                    # copy for big bases.
                     if _cp_ah is not None and isinstance(_raw_df_B, _cp_ah.ndarray):
-                        ah_df_B_np = _cp_ah.asnumpy(_raw_df_B)
+                        ah_df_B = _cp_ah.ascontiguousarray(_cp_ah.asarray(_raw_df_B, dtype=_cp_ah.float64))
                     else:
-                        ah_df_B_np = np.asarray(_raw_df_B, dtype=np.float64)
+                        ah_df_B = np.asarray(_raw_df_B, dtype=np.float64, order="C")
             if ah_hcore_np is None:
                 H0 = getattr(scf_out.int1e, "hcore")
                 if _cp_ah is not None and isinstance(H0, _cp_ah.ndarray):
@@ -1113,11 +1122,11 @@ def run_casscf_df(
 
             # Resolve ao_eri for dense-mode AH (when df_B is None).
             _ah_ao_eri = None
-            if ah_df_B_np is None and casci_backend_s in ("dense_gpu", "dense_cpu"):
+            if ah_df_B is None and casci_backend_s in ("dense_gpu", "dense_cpu"):
                 _ah_ao_eri = getattr(scf_out, "ao_eri", None)
 
             mc_ah = DFNewtonCASSCFAdapter(
-                df_B=ah_df_B_np,
+                df_B=ah_df_B,
                 ao_eri=_ah_ao_eri,
                 hcore_ao=ah_hcore_np,
                 ncore=int(ncore),
