@@ -41,34 +41,34 @@ def _normalize_soc_cuda_gm_strategy(strategy: str) -> Literal["auto", "apply_gem
     return mode  # type: ignore[return-value]
 
 
-def spinfree_states_from_mc(
-    mc: Any,
+def spinfree_states_from_ref(
+    ref: Any,
     *,
     ci: Any | None = None,
     energies: Sequence[float] | None = None,
     twos: int | None = None,
 ) -> list[SpinFreeState]:
-    """Build `SpinFreeState` objects from a PySCF-like CASSCF/CASCI object.
+    """Build `SpinFreeState` objects from a CASSCF/CASCI-like reference object.
 
     Notes
     -----
     This helper is intended for developer workflows where the active-space CI
-    vectors in `mc.ci` are in the same CSF basis as cuGUGA's DRT builder.
+    vectors in `ref.ci` are in the same CSF basis as cuGUGA's DRT builder.
     """
 
     if ci is None:
-        ci = getattr(mc, "ci", None)
+        ci = getattr(ref, "ci", None)
     if ci is None:
-        raise ValueError("ci must be provided or present on mc")
+        raise ValueError("ci must be provided or present on ref")
 
     if twos is None:
-        twos = getattr(getattr(mc, "fcisolver", None), "twos", None)
+        twos = getattr(getattr(ref, "fcisolver", None), "twos", None)
     if twos is None:
-        raise ValueError("twos must be provided (or available as mc.fcisolver.twos)")
+        raise ValueError("twos must be provided (or available as ref.fcisolver.twos)")
     twos = int(twos)
 
-    norb = int(getattr(mc, "ncas"))
-    nelec = _nelec_total(getattr(mc, "nelecas"))
+    norb = int(getattr(ref, "ncas"))
+    nelec = _nelec_total(getattr(ref, "nelecas"))
     drt = build_drt(norb=norb, nelec=nelec, twos_target=twos)
 
     if isinstance(ci, (list, tuple)):
@@ -77,13 +77,13 @@ def spinfree_states_from_mc(
         ci_list = [np.asarray(ci, dtype=np.float64).ravel()]
 
     if energies is None:
-        e_states = getattr(mc, "e_states", None)
+        e_states = getattr(ref, "e_states", None)
         if e_states is not None:
             e_arr = np.asarray(e_states, dtype=np.float64).ravel()
             if int(e_arr.size) == len(ci_list):
                 energies = [float(x) for x in e_arr]
         if energies is None:
-            energies = [float(getattr(mc, "e_tot", 0.0)) for _ in range(len(ci_list))]
+            energies = [float(getattr(ref, "e_tot", 0.0)) for _ in range(len(ci_list))]
     if len(energies) != len(ci_list):
         raise ValueError("energies length mismatch")
 
@@ -222,136 +222,26 @@ def soc_lagrange_response_nuc_grad(
 ) -> np.ndarray | tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Compute the Z-vector Lagrange contribution ``z · d(g_ref)/dR`` to nuclear gradients.
 
-    This is a thin wrapper around PySCF's SA-CASSCF Lagrange kernels, which are generic enough
-    to work with the CSF-based `GUGAFCISolver` interface as long as `mc.gen_g_hop` is available.
-
     Notes
     -----
     - This term depends only on the *reference* MCSCF stationarity conditions and the solved
       multipliers `z`; it is agnostic to how `z` was constructed (SOC, MRPT2, etc.).
     - The returned gradient is *electronic only*; add nuclear repulsion separately if needed.
     """
-
-    try:
-        from pyscf.grad import sacasscf as _sacasscf  # type: ignore[import-not-found]
-    except Exception as err:  # pragma: no cover
-        raise ImportError("soc_lagrange_response_nuc_grad requires PySCF to be installed") from err
-
-    if mo_coeff is None:
-        mo_coeff = getattr(mc, "mo_coeff", None)
-    if ci is None:
-        ci = getattr(mc, "ci", None)
-    if mo_coeff is None or ci is None:
-        raise ValueError("mo_coeff/ci must be provided or present on mc")
-
-    mol = getattr(mc, "mol", None)
-    if mol is None:
-        raise ValueError("mc.mol must be available")
-
-    if atmlst is None:
-        atmlst = list(range(int(mol.natm)))
-    else:
-        atmlst = [int(x) for x in atmlst]
-
-    if verbose is None:
-        verbose = int(getattr(mc, "verbose", 0))
-
-    # Reference SA weights (if any). For state-specific, default to [1.0].
-    weights = getattr(mc, "weights", None)
-    if weights is None:
-        if isinstance(ci, (list, tuple)):
-            weights = np.ones(len(ci), dtype=np.float64) / float(len(ci))
-        else:
-            weights = np.ones(1, dtype=np.float64)
-    weights = np.asarray(weights, dtype=np.float64).ravel()
-    if np.any(weights < 0.0) or float(np.sum(weights)) <= 0.0:
-        raise ValueError("SA weights must be non-negative and sum to a positive number")
-    weights_norm = weights / float(np.sum(weights))
-
-    @contextmanager
-    def _maybe_set_attr(obj: Any, name: str, value: Any):
-        missing = object()
-        if obj is None:
-            yield False
-            return
-        try:
-            old = getattr(obj, name, missing)
-        except Exception:
-            yield False
-            return
-        try:
-            setattr(obj, name, value)
-        except Exception:
-            yield False
-            return
-        try:
-            yield True
-        finally:
-            try:
-                if old is missing:
-                    delattr(obj, name)
-                else:
-                    setattr(obj, name, old)
-            except Exception:
-                pass
-
-    z_info = getattr(z, "info", None)
-    if not isinstance(z_info, dict):
-        z_info = {}
-
-    # `solve_mcscf_zvector` works in the packed-variable convention of the underlying
-    # Hessian operator. PySCF's `sacasscf` Lagrange-gradient kernels expect the
-    # *matrix-form* multipliers in the unscaled convention, so convert here.
-    orb_scale = float(z_info.get("lagrange_orb_scale", 1.0))
-    ci_scale = float(z_info.get("lagrange_ci_scale", 1.0))
-
-    Lorb = mc.unpack_uniq_var(np.asarray(z.z_orb, dtype=np.float64).ravel() * orb_scale)
-    Lci = z.z_ci
-    if isinstance(Lci, list):
-        Lci = [np.asarray(v, dtype=np.float64) * ci_scale for v in Lci]
-    elif Lci is not None:
-        Lci = np.asarray(Lci, dtype=np.float64) * ci_scale
-
-    # Build ERIs cache if not provided (needed by the Lagrange kernels).
-    if eris is None:
-        if not hasattr(mc, "ao2mo"):
-            raise AttributeError("mc object does not provide ao2mo required for Lagrange terms")
-        eris = mc.ao2mo(mo_coeff)
-
-    # CI and orbital Lagrange contributions.
+    # Keep the public name, but route to ASUKA-internal DF kernels so `asuka/` stays
+    # free of hard dependencies on PySCF gradient modules.
     #
-    # IMPORTANT: In PySCF, `sacasscf.Lci_dot_dgci_dx` uses `mc.fcisolver.trans_rdm12`, which
-    # typically pulls SA weights from `mc.fcisolver.weights` (the explicit `weights` argument
-    # is not used in some versions). To avoid convention mismatches, enforce a single source
-    # of truth by temporarily normalizing and syncing both `mc.weights` and `mc.fcisolver.weights`.
-    fs = getattr(mc, "fcisolver", None)
-    w_list = [float(x) for x in weights_norm.tolist()]
-    with _maybe_set_attr(mc, "weights", w_list), _maybe_set_attr(fs, "weights", w_list):
-        de_Lci = _sacasscf.Lci_dot_dgci_dx(
-            Lci,
-            weights_norm,
-            mc,
-            mo_coeff=mo_coeff,
-            ci=ci,
-            atmlst=atmlst,
-            mf_grad=mf_grad,
-            eris=eris,
-            verbose=int(verbose),
-        )
-        de_Lorb = _sacasscf.Lorb_dot_dgorb_dx(
-            Lorb,
-            mc,
-            mo_coeff=mo_coeff,
-            ci=ci,
-            atmlst=atmlst,
-            mf_grad=mf_grad,
-            eris=eris,
-            verbose=int(verbose),
-        )
-        total = np.asarray(de_Lci + de_Lorb, dtype=np.float64)
-        if bool(return_parts):
-            return total, np.asarray(de_Lorb, dtype=np.float64), np.asarray(de_Lci, dtype=np.float64)
-        return total
+    # NOTE: `soc_lagrange_response_nuc_grad_df` returns the electronic-only gradient, matching
+    # the convention of the legacy PySCF backend.
+    return soc_lagrange_response_nuc_grad_df(
+        mc,
+        z,
+        mo_coeff=mo_coeff,
+        ci=ci,
+        atmlst=atmlst,
+        verbose=verbose,
+        return_parts=return_parts,
+    )
 
 
 def soc_lagrange_response_nuc_grad_df(
@@ -376,7 +266,7 @@ def soc_lagrange_response_nuc_grad_df(
     | tuple[np.ndarray, np.ndarray, np.ndarray]
     | tuple[np.ndarray, np.ndarray, np.ndarray, dict[str, np.ndarray], dict[str, np.ndarray]]
 ):
-    """ASUKA-internal DF analogue of `soc_lagrange_response_nuc_grad` (no PySCF gradients).
+    """ASUKA-internal DF analogue of `soc_lagrange_response_nuc_grad`.
 
     This contracts the Z-vector multipliers with nuclear derivatives of the SA-CASSCF
     stationarity conditions using:
@@ -384,7 +274,7 @@ def soc_lagrange_response_nuc_grad_df(
       - ASUKA 1e integrals (analytic cart)
       - ASUKA DF 2e derivative backends (analytic when available; else FD fallback)
 
-    The returned gradient is *electronic only* (same convention as the PySCF backend).
+    The returned gradient is *electronic only* (same convention as the external-driver backend).
     """
 
     from types import SimpleNamespace  # noqa: PLC0415
@@ -635,12 +525,6 @@ def _spinfree_state_nuc_grads(mc: Any) -> list[np.ndarray]:
     in the CSF parameterization.
     """
 
-    try:
-        from pyscf.grad import lagrange as _lagrange  # type: ignore[import-not-found]
-        from pyscf.grad import sacasscf as _sacasscf  # type: ignore[import-not-found]
-    except Exception as err:  # pragma: no cover
-        raise ImportError("_spinfree_state_nuc_grads requires PySCF to be installed") from err
-
     ci = getattr(mc, "ci", None)
     if ci is None:
         raise ValueError("mc.ci must be available")
@@ -655,7 +539,23 @@ def _spinfree_state_nuc_grads(mc: Any) -> list[np.ndarray]:
         raise ValueError("mc.ci is empty")
 
     # CSF-compatible SA-CASSCF gradients: override CI block sizes to match CSF vector lengths.
-    class _CSFSACASSCFGradients(_sacasscf.Gradients):  # type: ignore[misc]
+    #
+    # Avoid importing `pyscf.grad.*` in core; instead, introspect the gradient object's class
+    # hierarchy and reuse the already-constructed PySCF objects if the caller is using PySCF.
+    grad0 = mc.nuc_grad_method()
+    grad_cls = grad0.__class__
+
+    lagrange_base = None
+    for cls in grad_cls.__mro__:
+        if cls is object:
+            continue
+        if cls.__name__ == "Gradients" and "pyscf.grad.lagrange" in str(getattr(cls, "__module__", "")):
+            lagrange_base = cls
+            break
+    if lagrange_base is None:  # pragma: no cover
+        raise RuntimeError("Could not locate pyscf.grad.lagrange.Gradients base class for SA gradient patching")
+
+    class _CSFSACASSCFGradients(grad_cls):  # type: ignore[misc]
         def __init__(self, mc_in: Any, state: int | None = None):
             super().__init__(mc_in, state=state)
             sizes = [int(np.asarray(c).size) for c in getattr(mc_in, "ci")]
@@ -665,7 +565,7 @@ def _spinfree_state_nuc_grads(mc: Any) -> list[np.ndarray]:
             self.nb_states = [1] * len(sizes)
             self.nci = int(sum(sizes))
             # Re-initialize the Lagrange base class with the corrected total variable count.
-            _lagrange.Gradients.__init__(self, mc_in, int(self.ngorb + self.nci))
+            lagrange_base.__init__(self, mc_in, int(self.ngorb + self.nci))  # type: ignore[misc]
 
         def pack_uniq_var(self, xorb, xci):
             xorb = self.base.pack_uniq_var(xorb)
@@ -718,286 +618,11 @@ def _compute_spinfree_state_derivative_couplings(
 ) -> np.ndarray:
     """Compute SA-CASSCF nonadiabatic couplings between spin-free roots (CSF-friendly).
 
-    Returns
-    -------
-    nac
-        Array with shape (nroots, nroots, natm, 3) where nac[bra, ket] = <bra| d(ket)/dR>.
-        Diagonal blocks are zero.
-
-    Notes
-    -----
-    This is a CSF-compatible adaptation of `pyscf.nac.sacasscf.NonAdiabaticCouplings` for use with
-    `GUGAFCISolver`-based SA-CASSCF wavefunctions.
+    This functionality is not implemented in core yet. Use parity utilities under
+    `tools/parity/` if needed.
     """
 
-    try:
-        from pyscf import lib  # type: ignore[import-not-found]
-        from pyscf.grad import casscf as _casscf_grad  # type: ignore[import-not-found]
-        from pyscf.grad import lagrange as _lagrange  # type: ignore[import-not-found]
-        from pyscf.grad import sacasscf as _sacasscf_grad  # type: ignore[import-not-found]
-        from asuka.mcscf import newton_casscf as _newton_casscf  # noqa: PLC0415
-    except Exception as err:  # pragma: no cover
-        raise ImportError("_compute_spinfree_state_derivative_couplings requires PySCF to be installed") from err
-
-    ci = getattr(mc, "ci", None)
-    if not isinstance(ci, (list, tuple)) or len(ci) < 2:
-        raise ValueError("mc.ci must be a list/tuple with >= 2 roots to compute derivative couplings")
-
-    mol = getattr(mc, "mol", None)
-    if mol is None:
-        raise ValueError("mc.mol must be available")
-
-    if verbose is None:
-        verbose = int(getattr(mc, "verbose", 0))
-
-    if atmlst is None:
-        atmlst = list(range(int(mol.natm)))
-    else:
-        atmlst = [int(x) for x in atmlst]
-
-    nroots = int(len(ci))
-    nac = np.zeros((nroots, nroots, len(atmlst), 3), dtype=np.float64)
-
-    def _unpack_state(state):
-        ket, bra = state
-        ket = int(ket)
-        bra = int(bra)
-        if ket < 0 or bra < 0 or ket >= nroots or bra >= nroots:
-            raise ValueError("state indices out of range")
-        return ket, bra
-
-    def _gen_g_hop_active(casscf, mo, ci0, eris, *, verbose_local=0):
-        moH = mo.conj().T
-        ncore = int(casscf.ncore)
-        vnocore = np.asarray(eris.vhf_c).copy()
-        vnocore[:, :ncore] = -moH @ casscf.get_hcore() @ mo[:, :ncore]
-        with lib.temporary_env(eris, vhf_c=vnocore):
-            return _newton_casscf.gen_g_hop(casscf, mo, ci0, eris, verbose=verbose_local)
-
-    def _grad_elec_core(mc_grad, mo_coeff=None, atmlst_local=None, eris=None, mf_grad=None):
-        mc_local = mc_grad.base
-        if mo_coeff is None:
-            mo_coeff = mc_local.mo_coeff
-        if eris is None:
-            eris = mc_local.ao2mo(mo_coeff)
-        if mf_grad is None:
-            mf_grad = mc_local._scf.nuc_grad_method()
-
-        ncore = int(mc_local.ncore)
-        moH = mo_coeff.conj().T
-        f0 = (moH @ mc_local.get_hcore() @ mo_coeff) + eris.vhf_c
-        mo_energy = np.asarray(f0.diagonal()).copy()
-        mo_occ = np.zeros_like(mo_energy)
-        mo_occ[:ncore] = 2.0
-
-        # Patch the energy-weighted density matrix for the doubly-occupied core.
-        f0_occ = f0 * mo_occ[None, :]
-        dme_sf = mo_coeff @ ((f0_occ + f0_occ.T) * 0.5) @ moH
-
-        uhf_like = str(getattr(getattr(mf_grad, "grad_elec", None), "__module__", "")).endswith(".uhf")
-
-        def _make_rdm1e(_mo_energy=None, _mo_coeff=None, _mo_occ=None):
-            if uhf_like:
-                half = 0.5 * np.asarray(dme_sf)
-                return np.asarray((half, half))
-            return np.asarray(dme_sf)
-
-        with lib.temporary_env(mf_grad, make_rdm1e=_make_rdm1e, verbose=0):
-            with lib.temporary_env(mf_grad.base, mo_coeff=mo_coeff, mo_occ=mo_occ):
-                return mf_grad.grad_elec(
-                    mo_coeff=mo_coeff, mo_energy=mo_energy, mo_occ=mo_occ, atmlst=atmlst_local
-                )
-
-    def _grad_elec_active(mc_grad, mo_coeff=None, ci_local=None, atmlst_local=None, eris=None, mf_grad=None):
-        de = mc_grad.grad_elec(mo_coeff=mo_coeff, ci=ci_local, atmlst=atmlst_local, verbose=0)
-        de -= _grad_elec_core(mc_grad, mo_coeff=mo_coeff, atmlst_local=atmlst_local, eris=eris, mf_grad=mf_grad)
-        return de
-
-    def _nac_csf_from_tm1(mol_local, mf_grad, tm1, atmlst_local):
-        aoslices = mol_local.aoslice_by_atom()
-        s1 = mf_grad.get_ovlp(mol_local)
-        out = np.zeros((len(atmlst_local), 3), dtype=np.float64)
-        for k, ia in enumerate(atmlst_local):
-            _shl0, _shl1, p0, p1 = aoslices[int(ia)]
-            out[k] += 0.5 * np.einsum("xij,ij->x", s1[:, p0:p1], tm1[p0:p1])
-        return out
-
-    def _nac_csf(mc_grad, mo_coeff, ci_all, state, mf_grad, atmlst_local):
-        ket, bra = _unpack_state(state)
-        mc_local = mc_grad.base
-        ncore = int(mc_local.ncore)
-        ncas = int(mc_local.ncas)
-        nocc = ncore + ncas
-        nelecas = mc_local.nelecas
-
-        trans_rdm1 = _base_fcisolver_method(mc_local, "trans_rdm1")
-        dm1 = trans_rdm1(mc_local.fcisolver, ci_all[bra], ci_all[ket], ncas, nelecas)
-        # dm1[p,q] = <bra|E_{q p}|ket> => dm1.T - dm1 gives <bra|E_{p q} - E_{q p}|ket>
-        castm1 = np.asarray(dm1).conj().T - np.asarray(dm1)
-        mo_cas = np.asarray(mo_coeff)[:, ncore:nocc]
-        tm1 = mo_cas @ castm1 @ mo_cas.conj().T
-        nac_csf_val = _nac_csf_from_tm1(mc_local.mol, mf_grad, tm1, atmlst_local)
-
-        # Multiply by energy difference to return the numerator; division (if requested) happens in kernel().
-        e_bra = float(np.asarray(getattr(mc_local, "e_states"))[bra])
-        e_ket = float(np.asarray(getattr(mc_local, "e_states"))[ket])
-        return nac_csf_val * (e_bra - e_ket)
-
-    class _CSFNonAdiabaticCouplings(_sacasscf_grad.Gradients):  # type: ignore[misc]
-        def __init__(self, mc_in: Any, *, state: tuple[int, int], mult_ediff: bool, use_etfs: bool):
-            self.mult_ediff = bool(mult_ediff)
-            self.use_etfs = bool(use_etfs)
-            super().__init__(mc_in, state=state)
-
-            sizes = [int(np.asarray(c).size) for c in getattr(mc_in, "ci")]
-            if any(s <= 0 for s in sizes):
-                raise ValueError("Encountered empty CI root in derivative coupling setup")
-            self.na_states = sizes
-            self.nb_states = [1] * len(sizes)
-            self.nci = int(sum(sizes))
-            _lagrange.Gradients.__init__(self, mc_in, int(self.ngorb + self.nci))
-
-        def pack_uniq_var(self, xorb, xci):
-            xorb = self.base.pack_uniq_var(xorb)
-            xci = np.concatenate([np.asarray(x).ravel() for x in xci])
-            return np.append(xorb, xci)
-
-        def unpack_uniq_var(self, x):
-            x = np.asarray(x).ravel()
-            xorb = self.base.unpack_uniq_var(x[: int(self.ngorb)])
-            x = x[int(self.ngorb) :]
-            xci = []
-            for sz in self.na_states:
-                xci.append(x[: int(sz)].copy())
-                x = x[int(sz) :]
-            return xorb, xci
-
-        def make_fcasscf_nacs(self, state=None, casscf_attr=None, fcisolver_attr=None):
-            if state is None:
-                state = self.state
-            ket, bra = _unpack_state(state)
-            if casscf_attr is None:
-                casscf_attr = {}
-            if fcisolver_attr is None:
-                fcisolver_attr = {}
-
-            ci_all = self.base.ci
-            ncas = int(self.base.ncas)
-            nelecas = self.base.nelecas
-
-            trans_rdm12 = _base_fcisolver_method(self.base, "trans_rdm12")
-            tdm1, tdm2 = trans_rdm12(self.base.fcisolver, ci_all[bra], ci_all[ket], ncas, nelecas)
-            tdm1 = 0.5 * (np.asarray(tdm1) + np.asarray(tdm1).T)
-            tdm2 = 0.5 * (np.asarray(tdm2) + np.asarray(tdm2).transpose(1, 0, 3, 2))
-
-            fcisolver_attr["make_rdm12"] = lambda *_a, **_k: (tdm1, tdm2)
-            fcisolver_attr["make_rdm1"] = lambda *_a, **_k: tdm1
-            fcisolver_attr["make_rdm2"] = lambda *_a, **_k: tdm2
-
-            return _sacasscf_grad.Gradients.make_fcasscf(  # type: ignore[misc]
-                self, state=ket, casscf_attr=casscf_attr, fcisolver_attr=fcisolver_attr
-            )
-
-        def get_wfn_response(self, atmlst=None, state=None, verbose=None, mo=None, ci=None, **kwargs):
-            if state is None:
-                state = self.state
-            if atmlst is None:
-                atmlst = self.atmlst
-            if verbose is None:
-                verbose = self.verbose
-            if mo is None:
-                mo = self.base.mo_coeff
-            if ci is None:
-                ci = self.base.ci
-            ket, bra = _unpack_state(state)
-
-            fcasscf = self.make_fcasscf_nacs(state)
-            fcasscf.mo_coeff = mo
-            fcasscf.ci = ci[ket]
-            eris = fcasscf.ao2mo(mo)
-
-            g_all_ket = _gen_g_hop_active(fcasscf, mo, ci[ket], eris, verbose_local=0)[0]
-            g_all = np.zeros(self.nlag, dtype=np.float64)
-            g_all[: self.ngorb] = g_all_ket[: self.ngorb]
-
-            g_ci_bra = 0.5 * np.asarray(g_all_ket[self.ngorb :], dtype=np.float64).ravel()
-            g_all_bra = _gen_g_hop_active(fcasscf, mo, ci[bra], eris, verbose_local=0)[0]
-            g_ci_ket = 0.5 * np.asarray(g_all_bra[self.ngorb :], dtype=np.float64).ravel()
-
-            ndet_ket = int(self.na_states[ket] * self.nb_states[ket])
-            ndet_bra = int(self.na_states[bra] * self.nb_states[bra])
-            if ndet_ket == ndet_bra:
-                ket2bra = float(np.dot(np.asarray(ci[bra], dtype=np.float64).ravel(), g_ci_ket))
-                bra2ket = float(np.dot(np.asarray(ci[ket], dtype=np.float64).ravel(), g_ci_bra))
-                g_ci_ket = g_ci_ket - ket2bra * np.asarray(ci[bra], dtype=np.float64).ravel()
-                g_ci_bra = g_ci_bra - bra2ket * np.asarray(ci[ket], dtype=np.float64).ravel()
-
-            offs_ket = int(sum(self.na_states[:ket])) if ket > 0 else 0
-            offs_bra = int(sum(self.na_states[:bra])) if bra > 0 else 0
-            g_all[self.ngorb :][offs_ket:][:ndet_ket] = g_ci_ket[:ndet_ket]
-            g_all[self.ngorb :][offs_bra:][:ndet_bra] = g_ci_bra[:ndet_bra]
-            return g_all
-
-        def get_ham_response(self, state=None, atmlst=None, verbose=None, mo=None, ci=None, eris=None, mf_grad=None, **kwargs):
-            if state is None:
-                state = self.state
-            if atmlst is None:
-                atmlst = self.atmlst
-            if verbose is None:
-                verbose = self.verbose
-            if mo is None:
-                mo = self.base.mo_coeff
-            if ci is None:
-                ci = self.base.ci
-            if mf_grad is None:
-                mf_grad = self.base._scf.nuc_grad_method()
-            if eris is None and self.eris is None:
-                eris = self.eris = self.base.ao2mo(mo)
-            elif eris is None:
-                eris = self.eris
-
-            ket, _bra = _unpack_state(state)
-            fcasscf_grad = _casscf_grad.Gradients(self.make_fcasscf_nacs(state))
-            fcasscf_grad._finalize = lambda: None
-
-            nac_num = _grad_elec_active(
-                fcasscf_grad,
-                mo_coeff=mo,
-                ci_local=ci[ket],
-                eris=eris,
-                mf_grad=mf_grad,
-                atmlst_local=atmlst,
-            )
-            if not bool(kwargs.get("use_etfs", self.use_etfs)):
-                nac_num = nac_num + _nac_csf(self, mo_coeff=mo, ci_all=ci, state=state, mf_grad=mf_grad, atmlst_local=atmlst)
-            return np.asarray(nac_num, dtype=np.float64)
-
-        def kernel(self, *args, **kwargs):
-            mult_ediff_local = kwargs.get("mult_ediff", self.mult_ediff)
-            state = kwargs.get("state", self.state)
-            ket, bra = _unpack_state(state)
-            if ket == bra:
-                mol_local = kwargs.get("mol", self.mol)
-                atmlst_local = kwargs.get("atmlst", range(int(mol_local.natm)))
-                return np.zeros((len(list(atmlst_local)), 3), dtype=np.float64)
-
-            nac_val = _sacasscf_grad.Gradients.kernel(self, *args, **kwargs)
-            if not bool(mult_ediff_local):
-                e_bra = float(np.asarray(getattr(self.base, "e_states"))[bra])
-                e_ket = float(np.asarray(getattr(self.base, "e_states"))[ket])
-                nac_val = np.asarray(nac_val, dtype=np.float64) / (e_bra - e_ket)
-            return np.asarray(nac_val, dtype=np.float64)
-
-    for ket in range(nroots):
-        for bra in range(nroots):
-            if ket == bra:
-                continue
-            nac_pair = _CSFNonAdiabaticCouplings(
-                mc, state=(ket, bra), mult_ediff=bool(mult_ediff), use_etfs=bool(use_etfs)
-            ).kernel(state=(ket, bra), atmlst=atmlst, verbose=verbose)
-            nac[bra, ket] = np.asarray(nac_pair, dtype=np.float64)
-
-    return nac
+    raise NotImplementedError("Spin-free SA-CASSCF derivative couplings are not implemented in core yet.")
 
 
 def _compute_Gm_from_states_and_soc_integrals(
@@ -1200,7 +825,7 @@ def _soc_state_rotation_nuc_grad_correction_single(
         raise ValueError("mc.ci must be a list matching the number of SA roots")
 
     # OpenMolcas-like state-rotation multipliers -> CI-space Lagrange component.
-    # For PySCF's equal-weight SA objective, the effective scaling matches using
+    # For equal-weight SA objectives, the effective scaling matches using
     # `scale = 0.5` for the antisymmetric numerator/(E_j-E_i) (see msgrad.f where
     # SLag is built with 0.25 and later used with a factor 2 in the pseudo-density).
     energies = [float(s.energy) for s in states]
@@ -1212,10 +837,10 @@ def _soc_state_rotation_nuc_grad_correction_single(
     )
 
     # Contract against the reference SA-CASSCF dgci/dR kernel (CI Lagrange term only).
-    try:
-        from pyscf.grad import sacasscf as _sacasscf  # type: ignore[import-not-found]
-    except Exception as err:  # pragma: no cover
-        raise ImportError("SOC state-rotation correction requires PySCF to be installed") from err
+    #
+    # Use ASUKA-internal DF kernels (same as `soc_lagrange_response_nuc_grad_df`) to keep
+    # this module self-contained. This builds a synthetic Z-vector object with CI-only
+    # multipliers in the SA root-rotation subspace.
 
     if mo_coeff is None:
         mo_coeff = getattr(mc, "mo_coeff", None)
@@ -1227,24 +852,29 @@ def _soc_state_rotation_nuc_grad_correction_single(
         weights = np.ones(nstates, dtype=np.float64) / float(nstates)
     weights = np.asarray(weights, dtype=np.float64).ravel()
 
-    if eris is None:
-        eris = mc.ao2mo(np.asarray(mo_coeff))
-    if mf_grad is None:
-        mf_grad = mc._scf.nuc_grad_method()
-    return np.asarray(
-        _sacasscf.Lci_dot_dgci_dx(
-            lci_rot,
-            weights,
-            mc,
-            mo_coeff=np.asarray(mo_coeff),
-            ci=ci0,
-            atmlst=list(range(natm)),
-            mf_grad=mf_grad,
-            eris=eris,
-            verbose=0,
-        ),
-        dtype=np.float64,
+    nmo = int(np.asarray(mo_coeff).shape[1])
+    z_orb0 = np.asarray(mc.pack_uniq_var(np.zeros((nmo, nmo), dtype=np.float64)), dtype=np.float64).ravel()
+    z_ci0 = [np.asarray(v, dtype=np.float64) for v in lci_rot]
+    z_rot = MCSCFZVectorResult(
+        converged=True,
+        niter=0,
+        residual_norm=0.0,
+        z_orb=z_orb0,
+        z_ci=z_ci0,
+        z_packed=z_orb0,
+        info={"lagrange_orb_scale": 1.0, "lagrange_ci_scale": 1.0},
     )
+
+    _total, _de_Lorb, de_Lci = soc_lagrange_response_nuc_grad_df(
+        mc,
+        z_rot,
+        mo_coeff=np.asarray(mo_coeff),
+        ci=ci0,
+        atmlst=list(range(natm)),
+        verbose=0,
+        return_parts=True,
+    )
+    return np.asarray(de_Lci, dtype=np.float64)
 
 
 def _soc_state_rotation_nuc_grad_correction(
@@ -1456,7 +1086,7 @@ def soc_si_nuclear_gradients_all_roots(
         use_newton_hessian=use_newton_hessian,
     )
 
-    states = spinfree_states_from_mc(mc)
+    states = spinfree_states_from_ref(mc)
 
     e_si, c_si, basis = soc_state_interaction(
         states,
@@ -1719,7 +1349,7 @@ def soc_si_nuclear_gradient(
     if gm_direct_max < 1:
         raise ValueError("soc_cuda_gm_direct_max_nb_nk must be >= 1")
 
-    states = spinfree_states_from_mc(mc)
+    states = spinfree_states_from_ref(mc)
 
     # SI diagonalization and adjoint weights.
     e_si, c_si, basis = soc_state_interaction(
@@ -2240,7 +1870,7 @@ def solve_soc_ci_zvector_response_multi_spin(
     manifold_state_ids: list[list[int]] = []
     for mc in mcs:
         start = len(states)
-        st = spinfree_states_from_mc(mc)
+        st = spinfree_states_from_ref(mc)
         states.extend(st)
         manifold_state_ids.append(list(range(start, start + len(st))))
 

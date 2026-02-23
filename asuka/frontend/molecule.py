@@ -44,7 +44,7 @@ def _parse_atoms(atoms: Any) -> list[tuple[str, np.ndarray]]:
         if not out:
             raise ValueError("no atoms parsed")
         return out
-    raise TypeError("atoms must be a PySCF-like atom string or a list of (sym, (x,y,z))")
+    raise TypeError("atoms must be an atom string ('El x y z; ...') or a list of (sym, (x,y,z))")
 
 
 @dataclass(frozen=True)

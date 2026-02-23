@@ -2,7 +2,7 @@ from __future__ import annotations
 
 """Cached DF/Cholesky AO factors and AO->MO transforms.
 
-This module replaces the historical PySCF-outcore-backed DF "context" with a
+This module replaces the historical outcore-backed DF "context" with a
 cuERI-based implementation:
 
 - AO DF factors are built via cuERI (CPU) as whitened 3-index tensors
@@ -17,9 +17,9 @@ The public API exposes:
 
 Notes
 -----
-- This module intentionally contains **no PySCF imports**. It can accept a
-  PySCF `mol` object as input (if the caller has PySCF installed) without
-  importing PySCF internally by only using mol-like introspection methods.
+- This module intentionally contains no external runtime dependencies. It can
+  accept a Mole-like object from other libraries without importing them, by
+  relying only on mol-like introspection methods.
 - For large AO bases, storing `B[μ,ν,Q]` in memory can be expensive. This
   implementation prioritizes compatibility and clarity over peak throughput.
 """
@@ -71,7 +71,7 @@ def _env_int(name: str, default: int) -> int:
 
 
 def _atoms_bohr_from_mol_like(mol: Any) -> list[tuple[str, np.ndarray]]:
-    """Extract [(sym, xyz_bohr), ...] from a Mole-like object without PySCF imports."""
+    """Extract [(sym, xyz_bohr), ...] from a Mole-like object without external imports."""
 
     try:
         from asuka.frontend.molecule import Molecule  # noqa: PLC0415
@@ -86,8 +86,8 @@ def _atoms_bohr_from_mol_like(mol: Any) -> list[tuple[str, np.ndarray]]:
     atom_coord = getattr(mol, "atom_coord", None)
     if natm is None or not callable(atom_symbol) or not callable(atom_coord):
         raise TypeError(
-            "mol must be an asuka.frontend.molecule.Molecule or a PySCF-like Mole object "
-            "with natm/atom_symbol(i)/atom_coord(i)"
+            "mol must be an asuka.frontend.molecule.Molecule or a Mole-like object with "
+            "natm/atom_symbol(i)/atom_coord(i)"
         )
 
     atoms: list[tuple[str, np.ndarray]] = []

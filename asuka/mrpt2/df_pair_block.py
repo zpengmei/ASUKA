@@ -18,8 +18,7 @@ def _is_cart_basis(mol: Any) -> bool:
     """Return True if `mol` uses Cartesian basis functions.
 
     ASUKA's cuERI-backed DF context currently only supports Cartesian AO bases.
-    PySCF's default is spherical (`cart=False`). For spherical bases, we fall
-    back to PySCF's DF/Cholesky builder (see `_build_df_pair_blocks_pyscf`).
+    Spherical AO bases are not supported in core ASUKA; use `cart=True`.
     """
 
     # PySCF Mole: `mol.cart` exists.
@@ -90,55 +89,6 @@ def _transform_cderi_s1_to_mo_pairs(
         res = np.tensordot(mo_x.T, tmp, axes=([1], [0]))  # (nx, ny, qb)
         out[q0:q1, :] = np.asarray(res.reshape(nx * ny, qb).T, dtype=np.float64, order="C")
 
-    return out
-
-
-def _build_df_pair_blocks_pyscf(
-    mol: Any,
-    blocks: list[tuple[np.ndarray, np.ndarray]],
-    *,
-    auxbasis: Any,
-    max_memory: int,
-    verbose: int,
-    compute_pair_norm: bool,
-) -> list["DFPairBlock"]:
-    """PySCF fallback builder for spherical AO bases (mol.cart=False)."""
-
-    try:
-        from pyscf.df import incore  # noqa: PLC0415
-    except Exception as e:  # pragma: no cover
-        raise RuntimeError(
-            "PySCF is required to build DF pair blocks for spherical AO bases (mol.cart=False). "
-            "Either install PySCF or run with a cartesian basis (mol.cart=True)."
-        ) from e
-
-    # Use aosym='s1' (full ordered AO pairs) to match DFPairBlock conventions.
-    cderi = incore.cholesky_eri(
-        mol,
-        auxbasis=auxbasis,
-        aosym="s1",
-        max_memory=int(max_memory),
-        verbose=int(verbose),
-    )
-    cderi = np.asarray(cderi, dtype=np.float64, order="C")  # (naux, nao*nao)
-
-    out: list[DFPairBlock] = []
-    for mo_x, mo_y in blocks:
-        mo_x = _as_f64_2d(mo_x)
-        mo_y = _as_f64_2d(mo_y)
-        if mo_x.shape[0] != mo_y.shape[0]:
-            raise ValueError("mo_x and mo_y must have the same number of AO rows")
-        nx = int(mo_x.shape[1])
-        ny = int(mo_y.shape[1])
-        if nx <= 0 or ny <= 0:
-            raise ValueError("empty orbital block")
-
-        mo_cderi = _transform_cderi_s1_to_mo_pairs(cderi, mo_x, mo_y, max_memory=int(max_memory))
-        l_full = np.asarray(mo_cderi.T, dtype=np.float64, order="C")
-        pair_norm = None
-        if compute_pair_norm:
-            pair_norm = np.asarray(np.linalg.norm(l_full, axis=1), dtype=np.float64, order="C")
-        out.append(DFPairBlock(nx=nx, ny=ny, l_full=l_full, pair_norm=pair_norm))
     return out
 
 
@@ -272,28 +222,7 @@ def build_df_pair_block(
         raise ValueError("empty orbital block")
 
     if not _is_cart_basis(mol):
-        # Spherical AO basis (PySCF default): use PySCF DF/Cholesky integrals.
-        blocks = _build_df_pair_blocks_pyscf(
-            mol,
-            [(mo_x, mo_y)],
-            auxbasis=auxbasis,
-            max_memory=int(max_memory),
-            verbose=int(verbose),
-            compute_pair_norm=bool(compute_pair_norm),
-        )
-        block = blocks[0]
-        if filename is not None:
-            try:
-                import h5py  # noqa: PLC0415
-            except Exception as e:  # pragma: no cover
-                raise RuntimeError("filename output requires `h5py` to be installed") from e
-
-            filename = str(filename)
-            Path(filename).parent.mkdir(parents=True, exist_ok=True)
-            with h5py.File(str(filename), "w") as f:
-                # PySCF outcore layout: (naux, ncol)
-                f.create_dataset(str(dataname), data=np.asarray(block.l_full.T, dtype=np.float64, order="C"))
-        return block
+        raise ValueError("spherical AO bases are not supported; use cart=True")
 
     from asuka.integrals.df_context import get_df_cholesky_context  # noqa: PLC0415
 
@@ -349,15 +278,7 @@ def build_df_pair_blocks(
         return []
 
     if not _is_cart_basis(mol):
-        # Spherical AO basis (PySCF default): use PySCF DF/Cholesky integrals.
-        return _build_df_pair_blocks_pyscf(
-            mol,
-            blocks,
-            auxbasis=auxbasis,
-            max_memory=int(max_memory),
-            verbose=int(verbose),
-            compute_pair_norm=bool(compute_pair_norm),
-        )
+        raise ValueError("spherical AO bases are not supported; use cart=True")
 
     from asuka.integrals.df_context import get_df_cholesky_context  # noqa: PLC0415
 

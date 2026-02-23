@@ -73,5 +73,5 @@ print(e, g.shape)
   (GPU or CPU DF builder paths).
 - `run_hf(..., df=False)` / `run_*_dense(...)` builds full AO dense ERIs and
   stores them in `scf_out.ao_eri` (`scf_out.df_B` is `None`).
-- The module is structured to avoid importing PySCF directly at package import
-  time; method-level integrations are loaded lazily.
+- The module is structured to avoid importing optional external stacks at package
+  import time; method-level integrations are loaded lazily.

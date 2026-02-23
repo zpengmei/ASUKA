@@ -11,9 +11,6 @@ from asuka.cuguga.blas_threads import asuka_thread_limit
 from asuka.solver import GUGAFCISolver
 from asuka.mcscf.casci import autotune_casci_df as autotune
 
-# High-level drivers module (import as `from asuka import drivers`)
-from asuka import drivers
-
 try:
     __version__ = _dist_version("asuka")
 except PackageNotFoundError:  # pragma: no cover
@@ -31,8 +28,6 @@ __all__ = [
     "gas_ne_constraints",
     "merge_ne_constraints",
     "ras_ne_constraints",
-    # High-level drivers
-    "drivers",
     "asuka_thread_limit",
     "autotune",
 ]

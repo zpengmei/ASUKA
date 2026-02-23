@@ -7,13 +7,12 @@ from typing import Any
 import numpy as np
 
 from asuka.cuguga import build_drt
-from asuka.mrpt2.df_pair_block import build_df_pair_blocks
+from asuka.mrpt2.df_pair_block import build_df_pair_blocks_from_df_B
 from asuka.mrpt2.nevpt2_sc import nevpt2_sc_total_energy_df
 from asuka.mrpt2.nevpt2_sc_df_tiled import sr_h1e_v_correction_df_tiled
-from asuka.mrpt2.semicanonical import semicanonicalize_core_virt_from_generalized_fock
+from asuka.mrpt2.semicanonical import build_vhf_df, semicanonicalize_core_virt_from_fock_ao
 from asuka.rdm.contract4pdm import _make_f3ca_f3ac_pyscf
 from asuka.rdm.rdm123 import _make_rdm123_pyscf
-from asuka.solver import GUGAFCISolver
 
 
 @dataclass(frozen=True)
@@ -38,39 +37,46 @@ def _as_f64_1d(a: Any) -> np.ndarray:
     return arr
 
 
-def nevpt2_sc_df_from_mc(
-    mc,
+def nevpt2_sc_df_from_ref(
+    ref,
     *,
-    auxbasis: Any = "weigend+etb",
-    twos: int = 0,
+    scf_out: Any | None = None,
+    state: int = 0,
+    auxbasis: Any | None = None,
+    twos: int | None = None,
     semicanonicalize: bool = True,
     pt2_backend: str = "cpu",
     cuda_device: int | None = None,
     max_memory_mb: float = 4000.0,
-    guga_tol: float = 1e-14,
-    guga_max_cycle: int = 400,
-    guga_max_space: int = 30,
-    guga_pspace_size: int = 0,
     verbose: int = 0,
 ) -> NEVPT2SCDFResult:
-    """Compute SC-NEVPT2(DF) from a PySCF CASCI/CASSCF object using a CSF reference.
+    """Compute SC-NEVPT2(DF) from an ASUKA CAS reference (CASSCF/CASCI result).
 
     Notes
     -----
-    - This driver is **reference-oriented**: it solves the CAS problem in the CSF
-      basis (via :class:`asuka.solver.GUGAFCISolver`) even if `mc.ci` is already
-      available in determinant form.
     - By default, core/virtual orbitals are semicanonicalized by diagonalizing
       the generalized Fock in the core-core and virtual-virtual blocks.
     """
 
-    mol = mc.mol
-    ncore = int(mc.ncore)
-    ncas = int(mc.ncas)
-    nelecas = mc.nelecas
+    if scf_out is None:
+        scf_out = getattr(ref, "scf_out", None)
+    if scf_out is None:
+        casci = getattr(ref, "casci", None)
+        if casci is not None:
+            scf_out = getattr(casci, "scf_out", None)
+    if scf_out is None:
+        raise ValueError("scf_out must be provided (or available as ref.scf_out/ref.casci.scf_out)")
+
+    mol = getattr(ref, "mol", None)
+    if mol is None:
+        raise ValueError("ref.mol must be available")
+
+    ncore = int(getattr(ref, "ncore"))
+    ncas = int(getattr(ref, "ncas"))
+    nelecas = getattr(ref, "nelecas")
     nocc = ncore + ncas
 
-    mo = _as_f64_2d(mc.mo_coeff)
+    mo = _as_f64_2d(getattr(ref, "mo_coeff"))
     if mo.shape[1] < nocc:
         raise ValueError("mo_coeff has too few orbitals for (ncore+ncas)")
     mo_core = mo[:, :ncore]
@@ -79,78 +85,96 @@ def nevpt2_sc_df_from_mc(
     if mo_core.size == 0 or mo_virt.size == 0:
         raise ValueError("need at least 1 core and 1 virtual orbital for SC-NEVPT2")
 
-    eps = _as_f64_1d(getattr(mc, "mo_energy", getattr(mc._scf, "mo_energy")))
-    if eps.size < mo.shape[1]:
-        raise ValueError("mo_energy has too few entries")
-    eps_core = eps[:ncore]
-    eps_virt = eps[nocc : nocc + mo_virt.shape[1]]
+    if twos is None:
+        twos = getattr(mol, "spin", None)
+    if twos is None:
+        raise ValueError("twos must be provided (or available as ref.mol.spin)")
+    twos = int(twos)
+
+    ci = getattr(ref, "ci", None)
+    if ci is None:
+        raise ValueError("ref.ci must be available")
+    if isinstance(ci, (list, tuple)):
+        st = int(state)
+        if st < 0 or st >= len(ci):
+            raise IndexError("state out of range for ref.ci")
+        ci_csf = np.asarray(ci[st], dtype=np.float64).ravel()
+    else:
+        if int(state) != 0:
+            raise ValueError("state must be 0 for a single-root ref.ci")
+        ci_csf = np.asarray(ci, dtype=np.float64).ravel()
 
     # Active-space integrals:
     # - eri_chem matches the Hamiltonian convention expected by the FCI/CSF solvers (chemist notation).
     # - h2e_nevpt matches the einsum conventions in `asuka.mrpt2.nevpt2_sc` (Physicist-like transpose).
-    h1e = np.asarray(mc.h1e_for_cas()[0], dtype=np.float64, order="C")
-    if not bool(getattr(mol, "cart", False)):
-        raise NotImplementedError("SC-NEVPT2 active-space integrals currently require mol.cart=True (cuERI dense CPU)")
+    if auxbasis is not None:
+        # The ASUKA-native DF path uses `scf_out.df_B`. Ensure the user's auxbasis
+        # selection is consistent with the SCF/CASSCF preparation.
+        if isinstance(auxbasis, str) and isinstance(getattr(scf_out, "auxbasis_name", None), str):
+            if str(auxbasis) != str(getattr(scf_out, "auxbasis_name")):
+                raise ValueError("auxbasis must match scf_out.auxbasis_name; rebuild scf_out with the desired auxbasis")
+        else:
+            raise NotImplementedError("auxbasis override is not supported in the ASUKA-native NEVPT2 driver")
+
+    hcore = np.asarray(getattr(scf_out, "int1e").hcore, dtype=np.float64)
+    df_B = getattr(scf_out, "df_B", None)
+    if df_B is None:
+        raise ValueError("scf_out.df_B is required for SC-NEVPT2(DF)")
+    B_ao = np.asarray(df_B, dtype=np.float64)
+
+    core_dm = np.dot(mo_core, mo_core.T) * 2.0
+    core_vhf = build_vhf_df(core_dm, b_ao=B_ao)
+    h1e = np.asarray(mo_act.T @ (hcore + core_vhf) @ mo_act, dtype=np.float64, order="C")
+
+    if not bool(getattr(mol, "cart", True)):
+        raise NotImplementedError("SC-NEVPT2 active-space integrals currently require cart=True (dense cuERI CPU)")
 
     from asuka.cueri.active_space_dense_cpu import CuERIActiveSpaceDenseCPUBuilder  # noqa: PLC0415
-    from asuka.cueri.mol_basis import pack_cart_shells_from_mol  # noqa: PLC0415
 
     # cuERI returns an ordered-pair matrix with row pair ij=i*ncas+j and col pair kl=k*ncas+l.
-    # Reshape it to a 4-index tensor matching PySCF AO2MO `restore(1, ..., ncas)` conventions.
-    ao_basis = None
-    try:
-        ao_basis = pack_cart_shells_from_mol(mol, expand_contractions=True)
-    except Exception:
-        ao_basis = None
-
+    # Reshape it to a 4-index tensor matching the standard AO2MO `restore(1, ..., ncas)` layout.
+    ao_basis = getattr(scf_out, "ao_basis", None)
     if ao_basis is None:
-        raise NotImplementedError(
-            "SC-NEVPT2 cuERI CPU path requires a packable cartesian ao_basis from mol."
-        )
+        raise ValueError("scf_out.ao_basis is required for SC-NEVPT2 active-space ERIs")
     builder = CuERIActiveSpaceDenseCPUBuilder(ao_basis=ao_basis)
 
     eri_mat = builder.build_eri_mat(mo_act, eps_ao=0.0, eps_mo=0.0)
     eri_chem = np.asarray(eri_mat.reshape(ncas, ncas, ncas, ncas), dtype=np.float64, order="C")
     h2e_nevpt = np.asarray(eri_chem.transpose(0, 2, 1, 3), dtype=np.float64, order="C")
 
-    # CSF reference solve.
-    solver = GUGAFCISolver(twos=int(twos))
-    _e_act, ci_csf = solver.kernel(
-        h1e,
-        eri_chem,
-        ncas,
-        nelecas,
-        tol=float(guga_tol),
-        max_cycle=int(guga_max_cycle),
-        max_space=int(guga_max_space),
-        pspace_size=int(guga_pspace_size),
-    )
     drt = build_drt(norb=ncas, nelec=int(np.sum(nelecas)), twos_target=int(twos))
+    if int(ci_csf.size) != int(drt.ncsf):
+        raise ValueError("ref.ci has wrong length for the constructed DRT")
 
-    # Active density tensors and contracted-4PDM intermediates in PySCF NEVPT2 conventions.
-    #
-    # Important: PySCF SC-NEVPT2 uses the *raw* spin-traced dm2/dm3 returned by
-    # `pyscf.fci.rdm.make_dm123('FCI3pdm_kern_sf', ...)` (i.e. no `reorder_dm123`).
-    # See `pyscf.mrpt.nevpt2.NEVPT.kernel()`.
+    # Active density tensors and contracted-4PDM intermediates in NEVPT2 conventions.
+    # Important: use the raw spin-traced dm2/dm3 without `reorder_dm123`.
     dm1, dm2, dm3 = _make_rdm123_pyscf(drt, ci_csf, max_memory_mb=float(max_memory_mb), reorder=False)
     f3ca, f3ac = _make_f3ca_f3ac_pyscf(drt, ci_csf, eri_chem, max_memory_mb=float(max_memory_mb))
 
     if bool(semicanonicalize):
-        sc = semicanonicalize_core_virt_from_generalized_fock(
-            mc,
-            mo_core=mo_core,
-            mo_act=mo_act,
-            mo_virt=mo_virt,
-            dm1_act=dm1,
-        )
+        nao = int(mo.shape[0])
+        dm_act = mo_act @ dm1 @ mo_act.T
+        dm_tot = core_dm + dm_act
+        vhf_tot = build_vhf_df(dm_tot, b_ao=B_ao)
+        f_ao = hcore + vhf_tot
+        sc = semicanonicalize_core_virt_from_fock_ao(f_ao, mo_core=mo_core, mo_virt=mo_virt)
         mo_core = sc.mo_core
         mo_virt = sc.mo_virt
         eps_core = sc.eps_core
         eps_virt = sc.eps_virt
+    else:
+        dm_act = mo_act @ dm1 @ mo_act.T
+        dm_tot = core_dm + dm_act
+        vhf_tot = build_vhf_df(dm_tot, b_ao=B_ao)
+        f_ao = hcore + vhf_tot
+        f_cc = 0.5 * (mo_core.T @ f_ao @ mo_core + (mo_core.T @ f_ao @ mo_core).T)
+        f_vv = 0.5 * (mo_virt.T @ f_ao @ mo_virt + (mo_virt.T @ f_ao @ mo_virt).T)
+        eps_core = np.diag(f_cc).copy()
+        eps_virt = np.diag(f_vv).copy()
 
     # DF pair blocks for mixed integrals.
-    l_cv, l_vc, l_va, l_ac, l_aa = build_df_pair_blocks(
-        mol,
+    l_cv, l_vc, l_va, l_ac, l_aa = build_df_pair_blocks_from_df_B(
+        df_B,
         [
             (mo_core, mo_virt),
             (mo_virt, mo_core),
@@ -158,22 +182,11 @@ def nevpt2_sc_df_from_mc(
             (mo_act, mo_core),
             (mo_act, mo_act),
         ],
-        auxbasis=auxbasis,
         max_memory=int(max_memory_mb),
-        verbose=int(verbose),
         compute_pair_norm=False,
     )
 
     # One-electron blocks coupling inactive/virtual with active space.
-    core_dm = np.dot(mo_core, mo_core.T) * 2.0
-    from asuka.mrpt2.semicanonical import build_hcore_ao, build_vhf_df  # noqa: PLC0415
-
-    _vhf_ctx = get_df_cholesky_context(
-        mol, auxbasis=auxbasis, max_memory=int(max_memory_mb), verbose=int(verbose),
-    )
-    _b_ao = np.asarray(_vhf_ctx.B_ao, dtype=np.float64)
-    core_vhf = build_vhf_df(core_dm, b_ao=_b_ao)
-    hcore = build_hcore_ao(mol)
     h1e_v_sir = reduce(np.dot, (mo_virt.T, hcore + core_vhf, mo_core))  # (virt, core)
     h1e_v_si = reduce(np.dot, (mo_act.T, hcore + core_vhf, mo_core))  # (act, core)
 
@@ -230,8 +243,19 @@ def nevpt2_sc_df_from_mc(
         raise ValueError("pt2_backend must be one of: 'cpu', 'cuda'")
 
     e_corr = float(breakdown["e_total"])
-    e_cas = getattr(mc, "e_cas", None)
-    e_tot = None
-    if e_cas is not None:
-        e_tot = float(e_cas) + e_corr
+    e_cas = None
+    if hasattr(ref, "e_roots"):
+        e_roots = np.asarray(getattr(ref, "e_roots"), dtype=np.float64).ravel()
+        if int(state) < int(e_roots.size):
+            e_cas = float(e_roots[int(state)])
+    if e_cas is None:
+        e_tot_ref = getattr(ref, "e_tot", None)
+        if e_tot_ref is not None:
+            e_arr = np.asarray(e_tot_ref, dtype=np.float64).ravel()
+            if int(e_arr.size) == 1:
+                e_cas = float(e_arr[0])
+            elif int(state) < int(e_arr.size):
+                e_cas = float(e_arr[int(state)])
+
+    e_tot = None if e_cas is None else float(e_cas) + e_corr
     return NEVPT2SCDFResult(e_corr=e_corr, breakdown=breakdown, e_cas=e_cas, e_tot=e_tot)

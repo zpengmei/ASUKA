@@ -12,12 +12,17 @@ Top-level `asuka.mrci` exports include:
 - Contracted solver APIs: `ic_mrcisd_kernel`, `ICMRCISDResult`
 - Frozen-core helpers: `frozen_core_from_eri4`, `FrozenCoreMOIntegrals`
 - Generalized Davidson: `generalized_davidson1`, `GeneralizedDavidsonResult`
+- High-level drivers:
+  - ASUKA-native: `mrci_from_ref`, `mrci_states_from_ref`, `mrci_states_from_ref_soc`
+- Nuclear gradients (ASUKA-native): `run_mrci_grad`, `mrci_grad_states_from_ref`
 - IC basis / overlap / sigma helpers re-exported from `ic_basis`, `ic_overlap`,
   `ic_sigma_rdm`, and `ic_sigma_semidirect`
 
-Driver helpers (`mrci_from_mc`, gradients, multi-state utilities) remain in
-submodules (`driver.py`, `grad_driver.py`) and are intentionally not re-exported
-at package root.
+For ASUKA-native workflows, prefer the entry points in
+`asuka.mrci.driver_asuka` (also re-exported at the package root).
+
+Parity utilities live under `tools/parity/` and are intentionally not part of
+the installed ASUKA package.
 
 ## Quick Usage
 
@@ -32,8 +37,8 @@ from asuka.mrci import mrcisd_kernel
 | Module | Purpose |
 | --- | --- |
 | `__init__.py` | Package-level re-export hub |
-| `driver.py` | Driver helpers (`mrci_from_mc`, multi-state variants) |
-| `grad_driver.py` | Gradient drivers (FD + analytic paths, state/root handling) |
+| `driver_asuka.py` | ASUKA-native driver helpers (end-to-end, DF integrals) |
+| `result.py` | Core driver result dataclasses |
 | `mrcisd.py` | Uncontracted MRCISD kernels and +Q utilities |
 | `ic_mrcisd.py` | Internally contracted MRCISD solver |
 | `frozen_core.py` | Frozen-core effective integrals and shifts |
@@ -41,15 +46,11 @@ from asuka.mrci import mrcisd_kernel
 | `ic_basis.py` | IC basis enumeration/filtering helpers |
 | `ic_overlap.py` | Overlap application in contracted bases |
 | `ic_sigma_rdm.py` / `ic_sigma_semidirect.py` | Contracted sigma builders (RDM/semi-direct backends) |
-| `grad_analytic.py` | Analytic MRCISD gradient implementation details |
+| `grad_analytic.py` | Analytic MRCISD gradient implementation details (ASUKA-native) |
 
 ## Notes
 
 - Correlated orbital ordering for kernels is `[internal/active][external]`.
-- `integrals_backend="cueri_df"` in `driver.py::mrci_from_mc` currently supports only
-  uncontracted `method="mrcisd"` and requires `hop_backend="cuda"`.
-- `integrals_backend="pyscf_eri4"` is maintained mainly for parity/benchmark
-  workflows.
 - `+Q` correction support is currently tied to uncontracted `mrcisd`.
 
 ## Related Docs

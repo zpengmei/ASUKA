@@ -15,10 +15,14 @@ RDM builders, MRCI CUDA hops, and active-space DF integration helpers.
 ### Run CI with CUDA matvec backend
 
 ```python
-from asuka import drivers
+from asuka.frontend import Molecule
+from asuka.frontend.scf import run_hf_df
+from asuka.mcscf import run_casscf
 
-res = drivers.fci(mc=mc, matvec_backend="cuda")
-print(res.e_tot)
+mol = Molecule.from_atoms("N 0 0 0; N 0 0 1.0977", unit="Angstrom", basis="cc-pvdz", cart=True, spin=0)
+scf_out = run_hf_df(mol, method="rhf", backend="cuda", df=True, auxbasis="autoaux")
+casscf = run_casscf(scf_out, ncore=2, ncas=6, nelecas=6, nroots=1, backend="cuda", df=True)
+print(casscf.e_tot)
 ```
 
 ### Use active-space DF helpers

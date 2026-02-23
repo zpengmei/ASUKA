@@ -697,7 +697,8 @@ def compute_df_gradient_contributions_tiled(
             profile=profile,
         )
 
-    # Mol-like path (e.g. a PySCF Mole object): pack AO/aux bases without importing PySCF.
+    # Mol-like path (e.g. an external Mole object): pack AO/aux bases without importing
+    # external dependencies.
     from asuka.cueri.mol_basis import pack_cart_shells_from_mol  # noqa: PLC0415
     from asuka.integrals.int1e_cart import nao_cart_from_basis  # noqa: PLC0415
     from asuka.frontend.basis_bse import load_autoaux_shells, load_basis_shells  # noqa: PLC0415
@@ -706,7 +707,7 @@ def compute_df_gradient_contributions_tiled(
     if not bool(getattr(mol, "cart", False)):
         raise NotImplementedError("DF gradient FD path currently requires cart=True")
 
-    # Atom list in Bohr (no PySCF imports; rely on mol-like methods).
+    # Atom list in Bohr (rely on mol-like methods).
     natm = int(getattr(mol, "natm"))
     if natm <= 0:
         return np.zeros((0, 3), dtype=np.float64)
@@ -716,8 +717,8 @@ def compute_df_gradient_contributions_tiled(
     def _clean_element_symbol(sym_raw: str) -> str:
         """Return a best-effort element symbol from a mol-like `atom_symbol` string.
 
-        Some `mol` implementations (notably PySCF molecules reconstructed from Molden
-        files) return labels like ``'Li1'`` / ``'H2'`` from `atom_symbol(i)`. Basis Set
+        Some `mol` implementations (notably from Molden imports) return labels like
+        ``'Li1'`` / ``'H2'`` from `atom_symbol(i)`. Basis Set
         Exchange expects plain element symbols (``'Li'``, ``'H'``), so strip common
         numeric suffixes and normalize capitalization.
         """

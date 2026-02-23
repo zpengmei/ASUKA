@@ -35,7 +35,7 @@ from asuka.soc.grad import (
     soc_ao_to_mo,
     solve_soc_ci_zvector_response,
     solve_soc_ci_zvector_response_multi_spin,
-    spinfree_states_from_mc,
+    spinfree_states_from_ref,
 )
 from asuka.soc.triplet_op import apply_triplet_pq, rme_triplet_single_excitation, triplet_contribs_one
 from asuka.soc.triplet_factors import (
@@ -94,7 +94,7 @@ __all__ = [
     "SOCCIZVectorResponse",
     "SOCSpinManifoldZVectorResponse",
     "SOCMultiSpinZVectorResponse",
-    "spinfree_states_from_mc",
+    "spinfree_states_from_ref",
     "triplet_contribs_one",
     "A_factor",
     "Atilde_factor",

@@ -1792,7 +1792,7 @@ def gen_g_hop_internal(
     enforce_absorb_h1e_direct: bool = True,
     ah_mixed_precision: bool = False,
 ) -> tuple[np.ndarray, Callable[..., Any], Callable[[np.ndarray], np.ndarray], Any]:
-    """cuGUGA-owned `gen_g_hop` implementation (no PySCF newton proxy).
+    """cuGUGA-owned `gen_g_hop` implementation.
 
     Parameters
     ----------
@@ -1890,14 +1890,34 @@ def gen_g_hop_internal(
     _hop_xp, _hop_on_gpu = _get_xp(_ppaa_hop, _papa_hop)
     _supports_return_gpu = hasattr(casscf, "df_B")
 
-    # CPU copies (always needed for fallback / CPU-only callers).
-    ppaa_cpu = _to_np_f64(_ppaa_hop)
-    papa_cpu = _to_np_f64(_papa_hop)
+    # DF factors for memory-efficient per-iteration contractions.
+    _L_pu_hop = getattr(eris, "L_pu", None)
+    _L_pi_hop = getattr(eris, "L_pi", None)
+    _use_df_factors = _L_pu_hop is not None
+
+    if _use_df_factors:
+        # Store smaller DF factors; skip ppaa/papa for per-iteration work.
+        if _hop_on_gpu:
+            L_pu_dev = _to_xp_f64(_L_pu_hop, _hop_xp)
+            L_pi_dev = _to_xp_f64(_L_pi_hop, _hop_xp) if _L_pi_hop is not None else None
+        L_pu_cpu = _to_np_f64(_L_pu_hop)
+        L_pi_cpu = _to_np_f64(_L_pi_hop) if _L_pi_hop is not None else None
+        # ppaa/papa are NOT captured for the closure.
+        ppaa_cpu = None
+        papa_cpu = None
+    else:
+        # CPU copies (always needed for fallback / CPU-only callers).
+        ppaa_cpu = _to_np_f64(_ppaa_hop)
+        papa_cpu = _to_np_f64(_papa_hop)
 
     # GPU copies of tensors used inside _h_op_raw (one-time upload).
     if _hop_on_gpu:
-        ppaa_dev = _to_xp_f64(_ppaa_hop, _hop_xp)
-        papa_dev = _to_xp_f64(_papa_hop, _hop_xp)
+        if not _use_df_factors:
+            ppaa_dev = _to_xp_f64(_ppaa_hop, _hop_xp)
+            papa_dev = _to_xp_f64(_papa_hop, _hop_xp)
+        else:
+            ppaa_dev = None
+            papa_dev = None
         ci0_list_dev = [_hop_xp.asarray(c, dtype=_hop_xp.float64).ravel() for c in ci0_list]
         hci0_dev = [_hop_xp.asarray(h, dtype=_hop_xp.float64).ravel() for h in cache.hci0]
         eci0_dev = _hop_xp.asarray(cache.eci0, dtype=_hop_xp.float64)
@@ -1927,8 +1947,13 @@ def gen_g_hop_internal(
         x = xp.asarray(x, dtype=xp.float64).ravel()
 
         # Select device-appropriate tensors.
+        ppaa = papa = None  # may stay None when using DF factors
         if on_gpu:
-            ppaa, papa, paaa = ppaa_dev, papa_dev, paaa_dev
+            paaa = paaa_dev
+            if _use_df_factors:
+                _L_pu, _L_pi = L_pu_dev, L_pi_dev
+            else:
+                ppaa, papa = ppaa_dev, papa_dev
             _ci0 = ci0_list_dev
             _hci0 = hci0_dev
             _eci0 = eci0_dev
@@ -1942,7 +1967,11 @@ def gen_g_hop_internal(
             _weights = weights_dev
             _op_h0 = op_h0_dev
         else:
-            ppaa, papa, paaa = ppaa_cpu, papa_cpu, cache.paaa
+            paaa = cache.paaa
+            if _use_df_factors:
+                _L_pu, _L_pi = L_pu_cpu, L_pi_cpu
+            else:
+                ppaa, papa = ppaa_cpu, papa_cpu
             _ci0 = ci0_list
             _hci0 = cache.hci0
             _eci0 = cache.eci0
@@ -2011,17 +2040,49 @@ def gen_g_hop_internal(
 
         # MO-basis contractions (on whichever device ppaa/papa reside).
         if cache.ncore:
-            vhf_a = (
-                xp.einsum("pquv,uv->pq", ppaa[:, : cache.ncore], tdm1, optimize=True)
-                - 0.5 * xp.einsum("puqv,uv->pq", papa[:, :, : cache.ncore], tdm1, optimize=True)
-            )
+            if _use_df_factors:
+                _naux = int(_L_pu.shape[2])
+                _ncas = cache.ncas
+                _nmo = cache.nmo
+                _ncore = cache.ncore
+                _L_uv = _L_pu[_ncore : cache.nocc]  # (ncas, ncas, naux)
+                # J: g_Q = sum_{u,v} L_uv[u,v,Q] * tdm1[u,v]
+                g_Q = xp.einsum("uvQ,uv->Q", _L_uv, tdm1)
+                vhf_a = xp.einsum("piQ,Q->pi", _L_pi, g_Q)
+                # K: M[i,u,Q] = sum_v tdm1[u,v] * L_pu[i,v,Q]
+                M_iu = xp.einsum("uv,ivQ->iuQ", tdm1, _L_pu[:_ncore])  # (ncore, ncas, naux)
+                vhf_a = vhf_a - 0.5 * (
+                    _L_pu.reshape(_nmo, _ncas * _naux) @ M_iu.reshape(_ncore, _ncas * _naux).T
+                )
+            else:
+                vhf_a = (
+                    xp.einsum("pquv,uv->pq", ppaa[:, : cache.ncore], tdm1, optimize=True)
+                    - 0.5 * xp.einsum("puqv,uv->pq", papa[:, :, : cache.ncore], tdm1, optimize=True)
+                )
         else:
             vhf_a = xp.empty((cache.nmo, 0), dtype=xp.float64)
 
-        jk = (
-            xp.einsum("pquv,pq->uv", ppaa, ddm_c, optimize=True)
-            - 0.5 * xp.einsum("puqv,pq->uv", papa, ddm_c, optimize=True)
-        )
+        if _use_df_factors:
+            _naux = int(_L_pu.shape[2])
+            _ncas = cache.ncas
+            _nmo = cache.nmo
+            _L_uv = _L_pu[cache.ncore : cache.nocc]  # (ncas, ncas, naux)
+            # J: g_Q = 2 * sum_{p,i} L_pi[p,i,Q] * ddm_c[p,i]
+            if cache.ncore:
+                g_Q = 2.0 * xp.einsum("piQ,pi->Q", _L_pi, ddm_c[:, : cache.ncore])
+            else:
+                g_Q = xp.zeros(_naux, dtype=xp.float64)
+            jk = xp.einsum("uvQ,Q->uv", _L_uv, g_Q)
+            # K: DL[p,v,Q] = sum_q ddm_c[p,q] * L_pu[q,v,Q]
+            DL = (ddm_c @ _L_pu.reshape(_nmo, _ncas * _naux)).reshape(_nmo, _ncas, _naux)
+            DL_flat = DL.transpose(1, 0, 2).reshape(_ncas, _nmo * _naux)
+            L_pu_flat = _L_pu.transpose(1, 0, 2).reshape(_ncas, _nmo * _naux)
+            jk = jk - 0.5 * (L_pu_flat @ DL_flat.T)
+        else:
+            jk = (
+                xp.einsum("pquv,pq->uv", ppaa, ddm_c, optimize=True)
+                - 0.5 * xp.einsum("puqv,pq->uv", papa, ddm_c, optimize=True)
+            )
 
         g_dm2 = xp.einsum("puwx,wxuv->pv", paaa, tdm2, optimize=True)
 

@@ -92,6 +92,14 @@ class DFNewtonERIs:
         Core Coulomb potential (nmo,ncore).
     k_pc : Any
         Core Exchange potential (nmo,ncore).
+    L_pu : Any or None
+        DF factors (nmo,ncas,naux).  When provided, ``_h_op_raw`` can
+        release ``ppaa``/``papa`` after the one-time cache build and
+        use these smaller factors for the per-iteration contractions.
+    L_pi : Any or None
+        DF factors (nmo,ncore,naux).
+    L_uv : Any or None
+        DF factors (ncas,ncas,naux).
 
     Notes
     -----
@@ -110,6 +118,9 @@ class DFNewtonERIs:
     vhf_c: Any
     j_pc: Any
     k_pc: Any
+    L_pu: Any = None
+    L_pi: Any = None
+    L_uv: Any = None
 
 
 def build_df_newton_eris(
@@ -177,6 +188,7 @@ def build_df_newton_eris(
     act = slice(ncore, nocc)
     L_act = xp.ascontiguousarray(xp.asarray(L[act, act], dtype=xp.float64))
     L_pu = xp.ascontiguousarray(xp.asarray(L[:, act], dtype=xp.float64))
+    L_pi = xp.ascontiguousarray(xp.asarray(L[:, :ncore], dtype=xp.float64)) if ncore else None
 
     # (p q|u v) = sum_Q L[p,q,Q] L[u,v,Q]
     ppaa = xp.einsum("pqQ,uvQ->pquv", L, L_act, optimize=True)
@@ -208,7 +220,10 @@ def build_df_newton_eris(
     else:
         vhf_c = xp.zeros((nmo, nmo), dtype=xp.float64)
 
-    return DFNewtonERIs(ppaa=ppaa, papa=papa, vhf_c=vhf_c, j_pc=j_pc, k_pc=k_pc)
+    return DFNewtonERIs(
+        ppaa=ppaa, papa=papa, vhf_c=vhf_c, j_pc=j_pc, k_pc=k_pc,
+        L_pu=L_pu, L_pi=L_pi, L_uv=L_act,
+    )
 
 
 def build_dense_newton_eris(

@@ -5,8 +5,8 @@ This subpackage hosts cuGUGA-owned interfaces for integral generation.
 Policy
 ------
 - cuERI is the production integral backend.
-- PySCF-backed helpers (where present) are intended for parity tests / benchmarks
-  and should not be relied on for production workflows.
+- External interoperability helpers (where present) are intended for parity tests /
+  benchmarks and should not be relied on for production workflows.
 """
 
 from __future__ import annotations

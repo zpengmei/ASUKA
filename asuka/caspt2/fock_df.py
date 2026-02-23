@@ -1,24 +1,16 @@
 """DF/Cholesky-vector Fock matrix construction for CASPT2.
 
-This backend avoids building the full 4-index MO ERI tensor (``ao2mo.full``) by
-contracting density-fitting / Cholesky 3-index factors in MO pair space.
-The key idea is to express two-electron integrals as:
+This module provides two backends for constructing CASPT2 Fock matrices:
 
-    (pq|rs) ≈ Σ_Q L_{pq}^Q · L_{rs}^Q
+1. ``build_caspt2_fock_ao`` (preferred): builds J/K in AO basis via the SCF
+   ``_df_JK`` routine and transforms to MO.  This never materialises MO pair
+   blocks and avoids the expensive virtual–virtual DF allocation entirely.
 
-so that J and K contractions become ``L^T @ L`` products in the auxiliary
-basis, scaling as O(naux · n²) instead of O(n⁴).
+2. ``build_caspt2_fock_df`` (legacy): contracts MO-basis DF pair blocks
+   (``CASPT2DFBlocks``).  Requires all six pair blocks including ``l_ab``.
 
-The resulting ``CASPT2Fock`` object is semantically identical to the one
-produced by :func:`asuka.caspt2.fock.build_caspt2_fock` (full-ERI version).
-
-The DF pair blocks are organized by orbital partition:
-  - ``l_ii``: (i,i) — inactive–inactive, needed for inactive Fock J/K
-  - ``l_it``: (i,t) — inactive–active
-  - ``l_ia``: (i,a) — inactive–virtual
-  - ``l_tu``: (t,u) — active–active, needed for active Fock J/K
-  - ``l_at``: (a,t) — virtual–active
-  - ``l_ab``: (a,b) — virtual–virtual, needed for inactive Fock K on virt block
+Both produce a ``CASPT2Fock`` that is semantically identical to the full-ERI
+version in :func:`asuka.caspt2.fock.build_caspt2_fock`.
 """
 
 from __future__ import annotations
@@ -102,8 +94,8 @@ def build_caspt2_fock_df(
     # - Virtual blocks are optional when nssh==0.
     if nish > 0 and df_blocks.l_ii is None:
         raise ValueError("DF Fock build requires df_blocks.l_ii when nish > 0")
-    if nssh > 0 and df_blocks.l_ab is None:
-        raise ValueError("DF Fock build requires df_blocks.l_ab when nssh > 0")
+    # l_ab is no longer required — use build_caspt2_fock_ao() instead for
+    # the preferred path that avoids the O(nvirt^2 * naux) allocation.
 
     l_it = _as_contig(xp_mod, df_blocks.l_it.l_full, dtype=f64)
     l_ia = _as_contig(xp_mod, df_blocks.l_ia.l_full, dtype=f64)
@@ -159,7 +151,8 @@ def build_caspt2_fock_df(
             j_at = (l_at @ g_core).reshape(nssh, nash)
             j_core[nish + nash :, nish : nish + nash] = j_at
             j_core[nish : nish + nash, nish + nash :] = j_at.T
-            j_core[nish + nash :, nish + nash :] = (l_ab @ g_core).reshape(nssh, nssh)
+            if l_ab is not None:
+                j_core[nish + nash :, nish + nash :] = (l_ab @ g_core).reshape(nssh, nssh)
 
         # K_core(p,q) = sum_i (p i| q i) ~= sum_{i,P} L_{p i}(P) L_{q i}(P)
         # Build L_{p i}(P) for all p in MO and i in core.
@@ -194,7 +187,8 @@ def build_caspt2_fock_df(
             j_at_act = (l_at @ g_act).reshape(nssh, nash)
             j_act[nish + nash :, nish : nish + nash] = j_at_act
             j_act[nish : nish + nash, nish + nash :] = j_at_act.T
-            j_act[nish + nash :, nish + nash :] = (l_ab @ g_act).reshape(nssh, nssh)
+            if l_ab is not None:
+                j_act[nish + nash :, nish + nash :] = (l_ab @ g_act).reshape(nssh, nssh)
 
         # K_act(p,q) = sum_{t,u} dm1[t,u] (p t| q u)
         # Use eigen-decomposition of symmetric dm1: dm1 = U diag(w) U^T
@@ -275,5 +269,142 @@ def build_caspt2_fock_df(
         famo=np.asarray(cp.asnumpy(famo), dtype=np.float64, order="C"),
         fifa=np.asarray(cp.asnumpy(fifa), dtype=np.float64, order="C"),
         epsa=np.asarray(cp.asnumpy(epsa), dtype=np.float64),
+        e_core=float(e_core),
+    )
+
+
+# ---------------------------------------------------------------------------
+# AO-based Fock builder (preferred — avoids all MO pair block allocations)
+# ---------------------------------------------------------------------------
+
+
+def build_caspt2_fock_ao(
+    h1e_ao: np.ndarray,
+    B_ao,
+    C,
+    dm1_act: np.ndarray,
+    nish: int,
+    nash: int,
+    nssh: int,
+    *,
+    e_nuc: float = 0.0,
+) -> CASPT2Fock:
+    """Build CASPT2 Fock matrices from AO-basis DF factors.
+
+    Instead of constructing MO-basis DF pair blocks (including the expensive
+    virtual–virtual block ``l_ab``), this function builds J and K directly
+    in AO basis using :func:`asuka.hf.df_scf._df_JK` and transforms the
+    result to the MO basis.
+
+    The split Fock ``F = h + 2J_core - K_core + J_act - 0.5 K_act`` is
+    equivalent to two standard J/K builds with AO densities:
+
+    - ``fimo = h + J[D_core] - 0.5 K[D_core]``  where ``D_core = 2 C_i C_i^T``
+    - ``famo = J[D_act] - 0.5 K[D_act]``         where ``D_act  = C_t γ C_t^T``
+
+    Parameters
+    ----------
+    h1e_ao : (nao, nao)
+        Core Hamiltonian in AO basis.
+    B_ao
+        DF factors ``(nao, nao, naux)``.  May be NumPy or CuPy.
+    C
+        MO coefficients ``(nao, nmo)``.  May be NumPy or CuPy.
+    dm1_act : (nash, nash)
+        Active-space 1-RDM.
+    nish, nash, nssh : int
+        Number of inactive, active, and secondary orbitals.
+    e_nuc : float
+        Nuclear repulsion energy.
+    """
+    from asuka.hf.df_scf import _df_JK  # noqa: PLC0415
+
+    nish = int(nish)
+    nash = int(nash)
+    nssh = int(nssh)
+    nmo = nish + nash + nssh
+    if nmo <= 0:
+        raise ValueError("invalid orbital partition: nmo <= 0")
+
+    # Detect backend (NumPy vs CuPy) from B_ao.
+    xp = np
+    _is_cupy = False
+    if hasattr(B_ao, "__cuda_array_interface__") or (
+        hasattr(B_ao, "__class__") and "cupy" in type(B_ao).__module__
+    ):
+        import cupy as cp  # noqa: PLC0415
+
+        xp = cp
+        _is_cupy = True
+
+    f64 = xp.float64
+    B = xp.asarray(B_ao, dtype=f64)
+    C_full = xp.asarray(C, dtype=f64)
+    h_ao = xp.asarray(h1e_ao, dtype=f64)
+    dm1 = xp.asarray(dm1_act, dtype=f64)
+
+    if B.ndim != 3:
+        raise ValueError("B_ao must have shape (nao, nao, naux)")
+    if C_full.ndim != 2:
+        raise ValueError("C must have shape (nao, nmo)")
+    nao = int(C_full.shape[0])
+    if int(C_full.shape[1]) != nmo:
+        raise ValueError(f"C has {int(C_full.shape[1])} MOs, expected {nmo}")
+    if h_ao.shape != (nao, nao):
+        raise ValueError(f"h1e_ao shape {tuple(h_ao.shape)} != ({nao}, {nao})")
+    if dm1.shape != (nash, nash):
+        raise ValueError(f"dm1_act shape {tuple(dm1.shape)} != ({nash}, {nash})")
+
+    C_core = C_full[:, :nish]
+    C_act = C_full[:, nish : nish + nash]
+
+    # -- AO densities --
+    if nish > 0:
+        D_core = 2.0 * (C_core @ C_core.T)  # (nao, nao)
+    else:
+        D_core = xp.zeros((nao, nao), dtype=f64)
+
+    if nash > 0:
+        D_act = C_act @ dm1 @ C_act.T  # (nao, nao)
+    else:
+        D_act = xp.zeros((nao, nao), dtype=f64)
+
+    # -- J/K via existing SCF DF routine --
+    J_core, K_core = _df_JK(B, D_core, want_J=True, want_K=True)
+    J_act, K_act = _df_JK(B, D_act, want_J=True, want_K=True)
+
+    # -- AO Fock matrices --
+    F_imo_ao = h_ao + J_core - 0.5 * K_core
+    F_amo_ao = J_act - 0.5 * K_act
+
+    # -- Transform to MO --
+    fimo = C_full.T @ F_imo_ao @ C_full
+    famo = C_full.T @ F_amo_ao @ C_full
+    fifa = fimo + famo
+
+    act = slice(nish, nish + nash)
+    epsa = xp.diag(fifa[act, act]).copy() if nash > 0 else xp.zeros((0,), dtype=f64)
+
+    # -- Core energy: E_core = sum_i [h_ii + fimo_ii] + E_nuc --
+    h_mo = C_full.T @ h_ao @ C_full
+    e_core = float(e_nuc)
+    if nish > 0:
+        diag_h = xp.diag(h_mo[:nish, :nish])
+        diag_f = xp.diag(fimo[:nish, :nish])
+        e_core += float(xp.sum(diag_h + diag_f))
+
+    # -- Return NumPy arrays --
+    def _to_np(a):
+        if _is_cupy:
+            import cupy as cp  # noqa: PLC0415
+
+            return np.asarray(cp.asnumpy(a), dtype=np.float64, order="C")
+        return np.asarray(a, dtype=np.float64, order="C")
+
+    return CASPT2Fock(
+        fimo=_to_np(fimo),
+        famo=_to_np(famo),
+        fifa=_to_np(fifa),
+        epsa=np.asarray(_to_np(epsa), dtype=np.float64),
         e_core=float(e_core),
     )

@@ -14,6 +14,52 @@ def _as_f64(a: Any) -> np.ndarray:
     return np.asarray(a, dtype=np.float64)
 
 
+def _df_gram_gather(L3, pairs_act, pairs_orb, sign=1):
+    """Compute gathered gram-matrix elements without forming the full gram.
+
+    Given a 3-D DF block ``L3`` of shape ``(n_orb, n_act, naux)``, the full
+    gram matrix in 4-D is ``g4[i, t, j, u] = Σ_P L3[i, t, P] · L3[j, u, P]``.
+
+    This function computes, for each active pair ``(t_k, u_k)`` from
+    *pairs_act* and each orbital pair ``(i_m, j_m)`` from *pairs_orb*::
+
+        result[k, m] = g4[i_m, t_k, j_m, u_k] + sign · g4[j_m, t_k, i_m, u_k]
+
+    via batched GEMM through the auxiliary dimension, avoiding the
+    O((n_orb · n_act)²) gram matrix.
+
+    Parameters
+    ----------
+    L3 : cupy.ndarray, shape ``(n_orb, n_act, naux)``
+        DF block reshaped to 3-D.
+    pairs_act : cupy.ndarray, shape ``(n_act_pairs, 2)``
+        Indices into axis 1 of *L3*.
+    pairs_orb : cupy.ndarray, shape ``(n_orb_pairs, 2)``
+        Indices into axis 0 of *L3*.
+    sign : {+1, -1, 0}
+        ``+1`` symmetrises (add transposed), ``-1`` antisymmetrises,
+        ``0`` returns only the direct term.
+
+    Returns
+    -------
+    cupy.ndarray, shape ``(n_act_pairs, n_orb_pairs)``
+    """
+    t = pairs_act[:, 0]
+    u = pairs_act[:, 1]
+    i = pairs_orb[:, 0]
+    j = pairs_orb[:, 1]
+
+    # Batched GEMM: M[k, a, b] = Σ_P L3[a, t[k], P] · L3[b, u[k], P]
+    L_t = L3[:, t, :].transpose(1, 0, 2)  # (n_act_pairs, n_orb, naux)
+    L_u = L3[:, u, :].transpose(1, 0, 2)
+    M = L_t @ L_u.transpose(0, 2, 1)       # (n_act_pairs, n_orb, n_orb)
+
+    result = M[:, i, j]                     # (n_act_pairs, n_orb_pairs)
+    if sign != 0:
+        result = result + sign * M[:, j, i]
+    return result
+
+
 @dataclass(frozen=True)
 class CASPT2DFBlocks:
     """Minimal DF blocks for C1 CASPT2 RHS construction."""
@@ -117,31 +163,23 @@ def build_rhs_df_cuda(
         return cp.ascontiguousarray(rhs)
 
     if case in (2, 3):
-        g = l_it @ l_it.T  # (i*t, j*u)
-        g4 = g.reshape(nish, nash, nish, nash)  # (i,t,j,u)
+        naux = l_it.shape[1]
+        L3_it = l_it.reshape(nish, nash, naux)
 
         if case == 2:
-            mtgeu = np.asarray(smap.mtgeu, dtype=np.int64)
-            migej = np.asarray(smap.migej, dtype=np.int64)
-            t = cp.asarray(mtgeu[:, 0], dtype=cp.int64)
-            u = cp.asarray(mtgeu[:, 1], dtype=cp.int64)
-            i = cp.asarray(migej[:, 0], dtype=cp.int64)
-            j = cp.asarray(migej[:, 1], dtype=cp.int64)
-
-            val = g4[i[:, None], t[None, :], j[:, None], u[None, :]] + g4[j[:, None], t[None, :], i[:, None], u[None, :]]
+            p_act = cp.asarray(np.asarray(smap.mtgeu, dtype=np.int64))
+            p_orb = cp.asarray(np.asarray(smap.migej, dtype=np.int64))
+            val = _df_gram_gather(L3_it, p_act, p_orb, sign=+1)  # (ntgeu, nigej)
+            t = p_act[:, 0]; u = p_act[:, 1]
+            i = p_orb[:, 0]; j = p_orb[:, 1]
             fac_tu = cp.where(t != u, 0.5, 0.25).astype(cp.float64)
             fac_ij = (1.0 / cp.sqrt(1.0 + (i == j).astype(cp.float64))).astype(cp.float64)
-            rhs = (val.T * fac_tu[:, None]) * fac_ij[None, :]
+            rhs = (val * fac_tu[:, None]) * fac_ij[None, :]
             return cp.ascontiguousarray(rhs)
 
-        mtgtu = np.asarray(smap.mtgtu, dtype=np.int64)
-        migtj = np.asarray(smap.migtj, dtype=np.int64)
-        t = cp.asarray(mtgtu[:, 0], dtype=cp.int64)
-        u = cp.asarray(mtgtu[:, 1], dtype=cp.int64)
-        i = cp.asarray(migtj[:, 0], dtype=cp.int64)
-        j = cp.asarray(migtj[:, 1], dtype=cp.int64)
-        val = g4[i[:, None], t[None, :], j[:, None], u[None, :]] - g4[j[:, None], t[None, :], i[:, None], u[None, :]]
-        rhs = 0.5 * val.T
+        p_act = cp.asarray(np.asarray(smap.mtgtu, dtype=np.int64))
+        p_orb = cp.asarray(np.asarray(smap.migtj, dtype=np.int64))
+        rhs = 0.5 * _df_gram_gather(L3_it, p_act, p_orb, sign=-1)
         return cp.ascontiguousarray(rhs)
 
     if case == 4:
@@ -214,35 +252,23 @@ def build_rhs_df_cuda(
         return cp.ascontiguousarray(rhs)
 
     if case in (8, 9):
-        g = l_at @ l_at.T  # (a*t, b*u) -> (at|bu)
-        g4 = g.reshape(nssh, nash, nssh, nash)  # (a,t,b,u)
+        naux = l_at.shape[1]
+        L3_at = l_at.reshape(nssh, nash, naux)
 
         if case == 8:
-            mtgeu = np.asarray(smap.mtgeu, dtype=np.int64)
-            mageb = np.asarray(smap.mageb, dtype=np.int64)
-            t = cp.asarray(mtgeu[:, 0], dtype=cp.int64)
-            u = cp.asarray(mtgeu[:, 1], dtype=cp.int64)
-            a = cp.asarray(mageb[:, 0], dtype=cp.int64)
-            b = cp.asarray(mageb[:, 1], dtype=cp.int64)
-
-            term1 = g4[a[None, :], u[:, None], b[None, :], t[:, None]]  # (tu,ab)
-            term2 = g4[a[None, :], t[:, None], b[None, :], u[:, None]]
-            val = term1 + term2
+            p_act = cp.asarray(np.asarray(smap.mtgeu, dtype=np.int64))
+            p_orb = cp.asarray(np.asarray(smap.mageb, dtype=np.int64))
+            val = _df_gram_gather(L3_at, p_act, p_orb, sign=+1)  # (ntgeu, nageb)
+            t = p_act[:, 0]; u = p_act[:, 1]
+            a = p_orb[:, 0]; b = p_orb[:, 1]
             fac_tu = cp.where(t != u, 0.5, 0.25).astype(cp.float64)
             fac_ab = (1.0 / cp.sqrt(1.0 + (a == b).astype(cp.float64))).astype(cp.float64)
             rhs = (val * fac_tu[:, None]) * fac_ab[None, :]
             return cp.ascontiguousarray(rhs)
 
-        mtgtu = np.asarray(smap.mtgtu, dtype=np.int64)
-        magtb = np.asarray(smap.magtb, dtype=np.int64)
-        t = cp.asarray(mtgtu[:, 0], dtype=cp.int64)
-        u = cp.asarray(mtgtu[:, 1], dtype=cp.int64)
-        a = cp.asarray(magtb[:, 0], dtype=cp.int64)
-        b = cp.asarray(magtb[:, 1], dtype=cp.int64)
-
-        term1 = g4[a[None, :], u[:, None], b[None, :], t[:, None]]
-        term2 = g4[a[None, :], t[:, None], b[None, :], u[:, None]]
-        rhs = 0.5 * (term1 - term2)
+        p_act = cp.asarray(np.asarray(smap.mtgtu, dtype=np.int64))
+        p_orb = cp.asarray(np.asarray(smap.magtb, dtype=np.int64))
+        rhs = -0.5 * _df_gram_gather(L3_at, p_act, p_orb, sign=-1)
         return cp.ascontiguousarray(rhs)
 
     if case in (10, 11):
@@ -276,35 +302,24 @@ def build_rhs_df_cuda(
         return cp.ascontiguousarray(rhs)
 
     if case in (12, 13):
-        g = l_ia @ l_ia.T  # (i*a, j*b) -> (ia|jb) == (ai|bj)
-        g4 = g.reshape(nish, nssh, nish, nssh)  # (i,a,j,b)
+        naux = l_ia.shape[1]
+        L3_ia = l_ia.reshape(nish, nssh, naux)
 
         if case == 12:
-            mageb = np.asarray(smap.mageb, dtype=np.int64)
-            migej = np.asarray(smap.migej, dtype=np.int64)
-            a = cp.asarray(mageb[:, 0], dtype=cp.int64)
-            b = cp.asarray(mageb[:, 1], dtype=cp.int64)
-            i = cp.asarray(migej[:, 0], dtype=cp.int64)
-            j = cp.asarray(migej[:, 1], dtype=cp.int64)
-
-            term1 = g4[i[None, :], a[:, None], j[None, :], b[:, None]]
-            term2 = g4[j[None, :], a[:, None], i[None, :], b[:, None]]
-            val = term1 + term2
+            p_act = cp.asarray(np.asarray(smap.mageb, dtype=np.int64))
+            p_orb = cp.asarray(np.asarray(smap.migej, dtype=np.int64))
+            val = _df_gram_gather(L3_ia, p_act, p_orb, sign=+1)  # (nageb, nigej)
+            a = p_act[:, 0]; b = p_act[:, 1]
+            i = p_orb[:, 0]; j = p_orb[:, 1]
             fac_ab = (1.0 / cp.sqrt(1.0 + (a == b).astype(cp.float64))).astype(cp.float64)
             fac_ij = (1.0 / cp.sqrt(1.0 + (i == j).astype(cp.float64))).astype(cp.float64)
             rhs = (val * fac_ab[:, None]) * fac_ij[None, :]
             return cp.ascontiguousarray(rhs)
 
-        magtb = np.asarray(smap.magtb, dtype=np.int64)
-        migtj = np.asarray(smap.migtj, dtype=np.int64)
-        a = cp.asarray(magtb[:, 0], dtype=cp.int64)
-        b = cp.asarray(magtb[:, 1], dtype=cp.int64)
-        i = cp.asarray(migtj[:, 0], dtype=cp.int64)
-        j = cp.asarray(migtj[:, 1], dtype=cp.int64)
-
-        term1 = g4[i[None, :], a[:, None], j[None, :], b[:, None]]
-        term2 = g4[j[None, :], a[:, None], i[None, :], b[:, None]]
-        rhs = (np.sqrt(3.0) * (term1 - term2)).astype(cp.float64, copy=False)
+        p_act = cp.asarray(np.asarray(smap.magtb, dtype=np.int64))
+        p_orb = cp.asarray(np.asarray(smap.migtj, dtype=np.int64))
+        val = _df_gram_gather(L3_ia, p_act, p_orb, sign=-1)
+        rhs = (np.sqrt(3.0) * val).astype(cp.float64, copy=False)
         return cp.ascontiguousarray(rhs)
 
     raise NotImplementedError(f"DF RHS case {case} not implemented")

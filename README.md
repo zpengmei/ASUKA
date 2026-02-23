@@ -122,6 +122,97 @@ Notes:
 - Current CUDA CASPT2 path targets C1 symmetry and FP64.
 - If you hit CuPy library errors (or warnings about multiple CuPy installs), run with `PYTHONNOUSERSITE=1` (or `python -s`) to avoid picking up `~/.local` packages.
 
+## SOC-(on-top) CASPT2 (SOC-SI)
+
+Run spin–orbit coupling (RASSI-SO style) on top of SS/MS/XMS-CASPT2:
+
+```python
+from asuka.frontend import Molecule
+from asuka.frontend.scf import run_hf_df
+from asuka.mcscf import run_casscf
+from asuka.caspt2 import run_caspt2_soc
+
+mol = Molecule.from_atoms("O 0 0 0; H 0 0 0.97", unit="Angstrom", basis="sto-3g", cart=True, charge=0, spin=1)
+scf_out = run_hf_df(mol, method="rohf", backend="cuda", df=True, auxbasis="autoaux")
+ncore, ncas, nelecas, nroots = 3, 2, 3, 2
+casscf = run_casscf(
+    scf_out,
+    ncore=ncore, ncas=ncas, nelecas=nelecas, nroots=nroots, root_weights=(0.5, 0.5),
+    backend="cuda", df=True,
+)
+
+# Default: build one-center OpenMolcas-style AMFI internally.
+res = run_caspt2_soc(
+    casscf,
+    scf_out=scf_out,
+    method="MS",
+    nstates=nroots,
+    soc_backend="cuda",  # GPU GM build; SI diagonalization is small
+)
+
+print("Spin-free MS-CASPT2 energies:", res.caspt2.e_tot)
+print("Spin–orbit energies:", res.so_energies)
+```
+
+Singlet–triplet SOC mixing (common-orbital workflow):
+
+```python
+from dataclasses import replace
+
+from asuka.frontend import Molecule
+from asuka.frontend.scf import run_hf_df
+from asuka.mcscf import run_casscf, run_casci
+from asuka.caspt2 import run_caspt2_soc_multispin
+
+# Build one common orbital set (usually from a singlet reference).
+mol_s = Molecule.from_atoms(
+    "C 0 0 0; H 0 0 1.12; H 0 1.095360 -0.232848",
+    unit="Angstrom",
+    basis="sto-3g",
+    cart=True,
+    charge=0,
+    spin=0,
+)
+scf_out_s = run_hf_df(mol_s, method="rhf", backend="cuda", df=True, auxbasis="autoaux")
+
+ncore, ncas, nelecas = 3, 2, 2
+casscf_s = run_casscf(
+    scf_out_s,
+    ncore=ncore,
+    ncas=ncas,
+    nelecas=nelecas,
+    nroots=2,
+    root_weights=(0.5, 0.5),
+    backend="cuda",
+    df=True,
+)
+
+# Triplet CI-only on the *same* orbitals (2 roots for MS-CASPT2).
+mol_t = replace(mol_s, spin=2)
+scf_out_t = replace(scf_out_s, mol=mol_t)
+casci_t = run_casci(
+    scf_out_t,
+    ncore=ncore,
+    ncas=ncas,
+    nelecas=nelecas,
+    nroots=2,
+    backend="cuda",
+    df=True,
+    mo_coeff=casscf_s.mo_coeff,
+    twos=2,
+)
+
+res_st = run_caspt2_soc_multispin(
+    [casscf_s, casci_t],
+    scf_outs=[scf_out_s, scf_out_t],
+    method="MS",
+    nstates=[2, 2],
+    soc_backend="cuda",
+)
+
+print("Spin–orbit energies:", res_st.so_energies)
+```
+
 ## Warm-starting across geometries
 
 Pass the previous result as `guess=` to reuse MO coefficients and CI vectors — useful for PES scans, geometry optimization, and finite-difference Hessians.

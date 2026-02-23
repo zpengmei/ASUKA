@@ -31,8 +31,9 @@ from asuka.mrci.ic_sigma_semidirect import (
 )
 from asuka.mrci.ic_sigma_rdm import ICRefSinglesRDM
 from asuka.mrci.ic_mrcisd import ICMRCISDResult, ic_mrcisd_kernel
-from asuka.mrci.driver import mrci_from_mc as run_mrci
-from asuka.mrci.grad_driver import mrci_grad_from_mc as run_mrci_grad
+from asuka.mrci.driver_asuka import mrci_from_ref, mrci_states_from_ref, mrci_states_from_ref_soc
+from asuka.mrci.grad_driver import mrci_grad_from_ref as run_mrci_grad
+from asuka.mrci.grad_driver import mrci_grad_states_from_ref
 from asuka.mrci.mrcisd import (
     MRCISDResult,
     build_drt_mrcisd,
@@ -41,6 +42,7 @@ from asuka.mrci.mrcisd import (
     mrcisd_plus_q,
     mrcisd_virtual_weights,
 )
+from asuka.mrci.result import MRCIResult, MRCIStatesResult, MRCISOCResult
 
 __all__ = [
     "FrozenCoreMOIntegrals",
@@ -54,6 +56,9 @@ __all__ = [
     "ICStronglyContractedSemiDirect",
     "ICStronglyContractedSemiDirectOTF",
     "MRCISDResult",
+    "MRCIResult",
+    "MRCIStatesResult",
+    "MRCISOCResult",
     "OrbitalSpaces",
     "SCDoubles",
     "SCSingles",
@@ -68,8 +73,11 @@ __all__ = [
     "filter_ic_doubles_by_norm",
     "filter_ic_singles_by_norm",
     "ic_mrcisd_kernel",
-    "run_mrci",
     "run_mrci_grad",
+    "mrci_states_from_ref",
+    "mrci_states_from_ref_soc",
+    "mrci_from_ref",
+    "mrci_grad_states_from_ref",
     "embed_cas_ci_into_mrcisd",
     "frozen_core_from_eri4",
     "generalized_davidson1",

@@ -1,8 +1,8 @@
 """MRPT2 utilities on top of a GUGA/CSF CAS reference."""
 
 from asuka.mrpt2.df_pair_block import DFPairBlock, build_df_pair_block
-from asuka.mrpt2.nevpt2_sc_df_driver import NEVPT2SCDFResult, nevpt2_sc_df_from_mc
-from asuka.mrpt2.nevpt2_sc_df_grad_driver import NEVPT2SCDFGradResult, nevpt2_sc_df_grad_from_mc
+from asuka.mrpt2.nevpt2_sc_df_driver import NEVPT2SCDFResult, nevpt2_sc_df_from_ref
+from asuka.mrpt2.nevpt2_sc_df_grad_driver import NEVPT2SCDFGradResult, nevpt2_sc_df_grad_from_ref
 from asuka.mrpt2.nevpt2_sc_df_sens import NEVPT2SCDFAdjointTotalResult, nevpt2_sc_total_energy_df_adjoint
 from asuka.mrpt2.nevpt2_sc import (
     sijrs0_energy_df,
@@ -33,8 +33,8 @@ __all__ = [
     "NEVPT2SCDFGradResult",
     "NEVPT2SCDFResult",
     "build_df_pair_block",
-    "nevpt2_sc_df_grad_from_mc",
-    "nevpt2_sc_df_from_mc",
+    "nevpt2_sc_df_grad_from_ref",
+    "nevpt2_sc_df_from_ref",
     "nevpt2_sc_total_energy_df_adjoint",
     "sijrs0_energy_df",
     "sijr_p1_energy_df",

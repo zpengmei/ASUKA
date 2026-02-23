@@ -23,7 +23,7 @@ res = selected_ci(drt, h1e, eri, nroots=1, init_ncsf=256, max_ncsf=20_000)
 print(res.e_var[0], res.e_pt2[0], res.e_tot[0])
 ```
 
-### Solver-style API (PySCF-like kernel signature)
+### Solver-style API (kernel-style signature)
 
 ```python
 from asuka.sci import GUGASelectedCISolver
