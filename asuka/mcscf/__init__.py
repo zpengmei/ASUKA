@@ -37,6 +37,12 @@ from .nac import (
     sacasscf_nonadiabatic_couplings_dense,
 )
 from .orbital_grad import allowed_rotation_mask, orbital_gradient_dense, orbital_gradient_df
+from .orbital_tracking import (
+    align_orbital_phases,
+    assign_active_orbitals_by_overlap,
+    compute_mo_overlap,
+    reorder_mo_to_active_space,
+)
 from .zvector import (
     MCSCFZVectorResult,
     build_ci_gradient_from_effective_integrals,
@@ -49,6 +55,7 @@ from .zvector import (
     solve_mcscf_zvector,
 )
 from .ras_gas_mcscf import attach_gas_orbital_rotation_mask, attach_ras_orbital_rotation_mask
+from .sort_mo import sort_mo, sort_mo_by_irrep
 
 __all__ = [
     "CASCIResult",
@@ -81,6 +88,10 @@ __all__ = [
     "allowed_rotation_mask",
     "orbital_gradient_df",
     "orbital_gradient_dense",
+    "align_orbital_phases",
+    "assign_active_orbitals_by_overlap",
+    "compute_mo_overlap",
+    "reorder_mo_to_active_space",
     "solve_mcscf_zvector",
     "build_ci_gradient_from_effective_integrals",
     "build_orbital_gradient_from_effective_densities",
@@ -91,4 +102,6 @@ __all__ = [
     "project_ci_rhs_normalized",
     "attach_gas_orbital_rotation_mask",
     "attach_ras_orbital_rotation_mask",
+    "sort_mo",
+    "sort_mo_by_irrep",
 ]

@@ -11,6 +11,7 @@ Policy
 
 from __future__ import annotations
 
+from .cross_geometry import build_S_cross_cart
 from .cueri_df import CuERIDFConfig, build_df_B_from_cueri_packed_bases
 from .int1e_cart import (
     Int1eDerivResult,
@@ -33,6 +34,7 @@ __all__ = [
     "Int1eResult",
     "build_df_B_from_cueri_packed_bases",
     "build_S_cart",
+    "build_S_cross_cart",
     "build_T_cart",
     "build_V_cart",
     "build_dS_cart",
