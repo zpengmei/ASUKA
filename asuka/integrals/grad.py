@@ -549,22 +549,41 @@ def compute_df_gradient_contributions_analytic_packed_bases(
         threads = 256
         stream_ptr = int(cp.cuda.get_current_stream().ptr)
 
-        # 2c2e metric derivative contraction.
-        for psh in range(int(n_shell_aux)):
-            lp = int(aux_shell_l[int(psh)])
-            spAB = int(aux_sp0 + psh)
-            atomP = int(aux_shell_atom[int(psh)])
-            for lq, q_shells in shells_by_l.items():
-                q_list = [int(q) for q in q_shells if int(q) <= int(psh)]
-                if not q_list:
+        # 2c2e metric derivative contraction — one kernel per (la, lc) class.
+        #
+        # Uses the allsp_atomgrad kernel which takes arrays of spAB and spCD,
+        # uses a 2D grid (ntasks, n_spAB), and accumulates via atomicAdd
+        # directly into grad_dev.  Processing the full (P,Q) matrix (not just
+        # the upper triangle) is correct because each off-diagonal pair
+        # (P,Q) and (Q,P) together contribute the same as fac=2 on the upper
+        # triangle.
+        #
+        # For C10H12 / cc-pVDZ this reduces ~2100 kernel launches to ~16.
+
+        # Reuse the combined (AO + aux) shell→atom map already on device.
+        # sp_A[spAB] returns a global shell index, so the atom lookup must
+        # cover both AO and aux shells — using shell_atom_dev (built above).
+
+        # Group aux shell-pair indices by angular momentum.
+        _spAB_by_l: dict[int, Any] = {}
+        _spCD_by_l: dict[int, Any] = {}
+        for lval in sorted(shells_by_l.keys()):
+            q_arr = np.asarray(shells_by_l[int(lval)], dtype=np.int32)
+            sp_arr = (aux_sp0 + q_arr).astype(np.int32, copy=False)
+            _spAB_by_l[int(lval)] = cp.ascontiguousarray(cp.asarray(sp_arr, dtype=cp.int32))
+            _spCD_by_l[int(lval)] = _spAB_by_l[int(lval)]  # same arrays
+
+        grad_dev_flat = grad_dev.reshape(-1)
+
+        for lp, spAB_class_dev in _spAB_by_l.items():
+            n_spAB = int(spAB_class_dev.shape[0])
+            for lq, spCD_class_dev in _spCD_by_l.items():
+                ntasks_lq = int(spCD_class_dev.shape[0])
+                if n_spAB == 0 or ntasks_lq == 0:
                     continue
-                spCD_batch = (aux_sp0 + np.asarray(q_list, dtype=np.int32)).astype(np.int32, copy=False)
-                spCD_dev = cp.ascontiguousarray(cp.asarray(spCD_batch, dtype=cp.int32))
-                nt = int(spCD_dev.shape[0])
-                out_dev = cp.zeros((nt * 6,), dtype=cp.float64)
-                _ext_cuda.df_metric_2c2e_deriv_contracted_cart_sp_batch_inplace_device(
-                    int(spAB),
-                    spCD_dev,
+                _ext_cuda.df_metric_2c2e_deriv_contracted_cart_allsp_atomgrad_inplace_device(
+                    spAB_class_dev,
+                    spCD_class_dev,
                     sp_A_dev,
                     sp_B_dev,
                     sp_pair_start_dev,
@@ -586,27 +605,12 @@ def compute_df_gradient_contributions_analytic_packed_bases(
                     int(lp),
                     int(lq),
                     bar_V_dev,
-                    out_dev,
+                    shell_atom_dev,
+                    grad_dev_flat,
                     int(threads),
                     int(stream_ptr),
-                    True,
+                    False,
                 )
-                out_batch_dev = out_dev.reshape((nt, 2, 3))
-
-                q_arr = np.asarray(q_list, dtype=np.int32)
-                atomQ_dev = cp.ascontiguousarray(cp.asarray(aux_shell_atom[q_arr], dtype=cp.int32))
-
-                # Symmetry factor: off-diagonal (P,Q) appears twice.
-                fac_host = np.full((nt,), 2.0, dtype=np.float64)
-                fac_host[q_arr == np.int32(int(psh))] = 1.0
-                fac_dev = cp.ascontiguousarray(cp.asarray(fac_host, dtype=cp.float64))
-
-                grad_dev[atomP] += cp.sum(out_batch_dev[:, 0, :] * fac_dev[:, None], axis=0)
-
-                valsQ = out_batch_dev[:, 1, :] * fac_dev[:, None]
-                cp.add.at(grad_dev[:, 0], atomQ_dev, valsQ[:, 0])
-                cp.add.at(grad_dev[:, 1], atomQ_dev, valsQ[:, 1])
-                cp.add.at(grad_dev[:, 2], atomQ_dev, valsQ[:, 2])
 
     t_2c_deriv = time.perf_counter() if profile is not None else 0.0
 

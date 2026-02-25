@@ -5783,6 +5783,175 @@ m.def(
       py::arg("stream") = 0,
       py::arg("sync") = true);
 
+  // ── 2c2e metric allsp atomgrad ──
+  m.def(
+      "df_metric_2c2e_deriv_contracted_cart_allsp_atomgrad_inplace_device",
+      [](py::object spAB_arr,
+         py::object spCD,
+         py::object sp_A,
+         py::object sp_B,
+         py::object sp_pair_start,
+         py::object sp_npair,
+         py::object shell_cx,
+         py::object shell_cy,
+         py::object shell_cz,
+         py::object shell_prim_start,
+         py::object shell_nprim,
+         py::object shell_ao_start,
+         py::object prim_exp,
+         py::object pair_eta,
+         py::object pair_Px,
+         py::object pair_Py,
+         py::object pair_Pz,
+         py::object pair_cK,
+         int nao,
+         int naux,
+         int la,
+         int lc,
+         py::object bar_V,
+         py::object shell_atom,
+         py::object grad_dev,
+         int threads,
+         uint64_t stream_ptr,
+         bool sync) {
+        require_threads_multiple_of_32(threads, "df_metric_2c2e_deriv_contracted_cart_allsp_atomgrad_inplace_device");
+        if (threads > 256) {
+          throw std::invalid_argument("df_metric_2c2e_deriv_contracted_cart_allsp_atomgrad_inplace_device requires threads <= 256");
+        }
+        if (nao < 0 || naux <= 0) throw std::invalid_argument("nao must be >=0 and naux must be >0");
+        if (la < 0 || lc < 0) throw std::invalid_argument("la/lc must be >= 0");
+        if (la > 5 || lc > 5) throw std::invalid_argument("df_metric_2c2e_deriv_contracted_cart_allsp_atomgrad_inplace_device supports only l<=5");
+
+        auto ab = cuda_array_view_from_object(spAB_arr, "spAB_arr");
+        auto cd = cuda_array_view_from_object(spCD, "spCD");
+        auto a_sp = cuda_array_view_from_object(sp_A, "sp_A");
+        auto b_sp = cuda_array_view_from_object(sp_B, "sp_B");
+        auto sp_start = cuda_array_view_from_object(sp_pair_start, "sp_pair_start");
+        auto sp_npair_v = cuda_array_view_from_object(sp_npair, "sp_npair");
+
+        auto cx = cuda_array_view_from_object(shell_cx, "shell_cx");
+        auto cy = cuda_array_view_from_object(shell_cy, "shell_cy");
+        auto cz = cuda_array_view_from_object(shell_cz, "shell_cz");
+        auto s_prim_start = cuda_array_view_from_object(shell_prim_start, "shell_prim_start");
+        auto s_nprim = cuda_array_view_from_object(shell_nprim, "shell_nprim");
+        auto s_a0 = cuda_array_view_from_object(shell_ao_start, "shell_ao_start");
+        auto p_exp = cuda_array_view_from_object(prim_exp, "prim_exp");
+
+        auto eta = cuda_array_view_from_object(pair_eta, "pair_eta");
+        auto px = cuda_array_view_from_object(pair_Px, "pair_Px");
+        auto pyv = cuda_array_view_from_object(pair_Py, "pair_Py");
+        auto pz = cuda_array_view_from_object(pair_Pz, "pair_Pz");
+        auto ck = cuda_array_view_from_object(pair_cK, "pair_cK");
+
+        auto bar = cuda_array_view_from_object(bar_V, "bar_V");
+        auto s_atom = cuda_array_view_from_object(shell_atom, "shell_atom");
+        auto g_dev = cuda_array_view_from_object(grad_dev, "grad_dev");
+
+        require_typestr(ab, "spAB_arr", "<i4");
+        require_typestr(cd, "spCD", "<i4");
+        require_typestr(a_sp, "sp_A", "<i4");
+        require_typestr(b_sp, "sp_B", "<i4");
+        require_typestr(sp_start, "sp_pair_start", "<i4");
+        require_typestr(sp_npair_v, "sp_npair", "<i4");
+
+        require_typestr(cx, "shell_cx", "<f8");
+        require_typestr(cy, "shell_cy", "<f8");
+        require_typestr(cz, "shell_cz", "<f8");
+        require_typestr(s_prim_start, "shell_prim_start", "<i4");
+        require_typestr(s_nprim, "shell_nprim", "<i4");
+        require_typestr(s_a0, "shell_ao_start", "<i4");
+        require_typestr(p_exp, "prim_exp", "<f8");
+
+        require_typestr(eta, "pair_eta", "<f8");
+        require_typestr(px, "pair_Px", "<f8");
+        require_typestr(pyv, "pair_Py", "<f8");
+        require_typestr(pz, "pair_Pz", "<f8");
+        require_typestr(ck, "pair_cK", "<f8");
+
+        require_typestr(bar, "bar_V", "<f8");
+        require_typestr(s_atom, "shell_atom", "<i4");
+        require_typestr(g_dev, "grad_dev", "<f8");
+
+        const int64_t n_spAB = require_1d(ab, "spAB_arr");
+        const int64_t ntasks = require_1d(cd, "spCD");
+        if (n_spAB <= 0 || ntasks <= 0) return;
+
+        const int64_t nsp = require_1d(a_sp, "sp_A");
+        if (require_1d(b_sp, "sp_B") != nsp || require_1d(sp_npair_v, "sp_npair") != nsp) {
+          throw std::invalid_argument("sp_A/sp_B/sp_npair must have identical shape (nSP,)");
+        }
+        if (require_1d(sp_start, "sp_pair_start") != (nsp + 1)) {
+          throw std::invalid_argument("sp_pair_start must have shape (nSP+1,)");
+        }
+
+        const int64_t bar_len = require_1d(bar, "bar_V");
+        const int64_t expected_bar = static_cast<int64_t>(naux) * static_cast<int64_t>(naux);
+        if (bar_len != expected_bar) throw std::invalid_argument("bar_V must have shape (naux*naux,)");
+
+        cudaStream_t stream = stream_from_uint(stream_ptr);
+        throw_on_cuda_error(
+            cueri_df_metric_2c2e_deriv_contracted_cart_allsp_atomgrad_launch_stream(
+                static_cast<const int32_t*>(ab.ptr),
+                static_cast<int>(n_spAB),
+                static_cast<const int32_t*>(cd.ptr),
+                static_cast<int>(ntasks),
+                static_cast<const int32_t*>(a_sp.ptr),
+                static_cast<const int32_t*>(b_sp.ptr),
+                static_cast<const int32_t*>(sp_start.ptr),
+                static_cast<const int32_t*>(sp_npair_v.ptr),
+                static_cast<const double*>(cx.ptr),
+                static_cast<const double*>(cy.ptr),
+                static_cast<const double*>(cz.ptr),
+                static_cast<const int32_t*>(s_prim_start.ptr),
+                static_cast<const int32_t*>(s_nprim.ptr),
+                static_cast<const int32_t*>(s_a0.ptr),
+                static_cast<const double*>(p_exp.ptr),
+                static_cast<const double*>(eta.ptr),
+                static_cast<const double*>(px.ptr),
+                static_cast<const double*>(pyv.ptr),
+                static_cast<const double*>(pz.ptr),
+                static_cast<const double*>(ck.ptr),
+                static_cast<int>(nao),
+                static_cast<int>(naux),
+                static_cast<int>(la),
+                static_cast<int>(lc),
+                static_cast<const double*>(bar.ptr),
+                static_cast<const int32_t*>(s_atom.ptr),
+                static_cast<double*>(g_dev.ptr),
+                stream,
+                threads),
+            "cueri_df_metric_2c2e_deriv_contracted_cart_allsp_atomgrad_launch_stream");
+        if (sync) throw_on_cuda_error(cudaStreamSynchronize(stream), "cudaStreamSynchronize");
+      },
+      py::arg("spAB_arr"),
+      py::arg("spCD"),
+      py::arg("sp_A"),
+      py::arg("sp_B"),
+      py::arg("sp_pair_start"),
+      py::arg("sp_npair"),
+      py::arg("shell_cx"),
+      py::arg("shell_cy"),
+      py::arg("shell_cz"),
+      py::arg("shell_prim_start"),
+      py::arg("shell_nprim"),
+      py::arg("shell_ao_start"),
+      py::arg("prim_exp"),
+      py::arg("pair_eta"),
+      py::arg("pair_Px"),
+      py::arg("pair_Py"),
+      py::arg("pair_Pz"),
+      py::arg("pair_cK"),
+      py::arg("nao"),
+      py::arg("naux"),
+      py::arg("la"),
+      py::arg("lc"),
+      py::arg("bar_V"),
+      py::arg("shell_atom"),
+      py::arg("grad_dev"),
+      py::arg("threads") = 256,
+      py::arg("stream") = 0,
+      py::arg("sync") = false);
+
   m.def(
       "rys_roots_weights_inplace_device",
       [](py::object T, py::object roots_out, py::object weights_out, int nroots, int threads, uint64_t stream_ptr, bool sync) {

@@ -876,6 +876,44 @@ extern "C" cudaError_t cueri_df_metric_2c2e_deriv_contracted_cart_launch_stream(
     cudaStream_t stream,
     int threads);
 
+// DF metric 2c2e derivative contraction — allsp + atomicAdd variant.
+//
+// Like cueri_df_metric_2c2e_deriv_contracted_cart_launch_stream but:
+//   • takes an array spAB_arr[n_spAB] instead of a single spAB
+//   • uses a 2D grid: (ntasks, n_spAB) blocks
+//   • accumulates results directly into grad_dev[natm*3] via atomicAdd
+//   • processes the full (P,Q) matrix (no upper-triangle restriction)
+extern "C" cudaError_t cueri_df_metric_2c2e_deriv_contracted_cart_allsp_atomgrad_launch_stream(
+    const int32_t* spAB_arr,   // [n_spAB]
+    int n_spAB,
+    const int32_t* spCD,       // [ntasks]
+    int ntasks,
+    const int32_t* sp_A,
+    const int32_t* sp_B,
+    const int32_t* sp_pair_start,
+    const int32_t* sp_npair,
+    const double* shell_cx,
+    const double* shell_cy,
+    const double* shell_cz,
+    const int32_t* shell_prim_start,
+    const int32_t* shell_nprim,
+    const int32_t* shell_ao_start,
+    const double* prim_exp,
+    const double* pair_eta,
+    const double* pair_Px,
+    const double* pair_Py,
+    const double* pair_Pz,
+    const double* pair_cK,
+    int nao,
+    int naux,
+    int la,
+    int lc,
+    const double* bar_V,       // size (naux*naux)
+    const int32_t* shell_atom, // size (nAuxShells) — aux shell -> atom map
+    double* grad_dev,          // size (natm*3) — atomicAdd target
+    cudaStream_t stream,
+    int threads);
+
 // 4c ERI derivative contraction (analytic) for expanded (nctr==1) cartesian bases.
 //
 // Contracts d(μν|λσ)/dR against a per-task adjoint tile `bar_eri` (stacked) and outputs

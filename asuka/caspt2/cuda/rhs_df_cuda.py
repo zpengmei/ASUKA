@@ -109,10 +109,13 @@ def build_rhs_df_cuda(
     *,
     nactel: int | None = None,
     device: int | None = None,
+    mixed_precision: bool = False,
 ):
     """Build RHS block (nasup, nisup) on GPU from DF pair blocks.
 
     Returns a CuPy array with dtype float64, C-order.
+    When *mixed_precision* is True, DF block loads and intermediate GEMMs
+    use FP32 for speed, with the final result cast to FP64.
     """
     try:
         import cupy as cp
@@ -121,6 +124,8 @@ def build_rhs_df_cuda(
 
     if device is not None:
         cp.cuda.Device(int(device)).use()
+
+    _cdtype = cp.float32 if mixed_precision else cp.float64
 
     nish = int(smap.orbs.nish)
     nash = int(smap.orbs.nash)
@@ -131,11 +136,11 @@ def build_rhs_df_cuda(
     if case < 1 or case > 13:
         raise ValueError("case must be 1..13")
 
-    # Device DF blocks (ensure CuPy).
-    l_it = cp.asarray(df.l_it.l_full, dtype=cp.float64)
-    l_ia = cp.asarray(df.l_ia.l_full, dtype=cp.float64)
-    l_at = cp.asarray(df.l_at.l_full, dtype=cp.float64)
-    l_tu = cp.asarray(df.l_tu.l_full, dtype=cp.float64)
+    # Device DF blocks (ensure CuPy).  Use _cdtype for mixed-precision GEMMs.
+    l_it = cp.asarray(df.l_it.l_full, dtype=_cdtype)
+    l_ia = cp.asarray(df.l_ia.l_full, dtype=_cdtype)
+    l_at = cp.asarray(df.l_at.l_full, dtype=_cdtype)
+    l_tu = cp.asarray(df.l_tu.l_full, dtype=_cdtype)
 
     # Fast-exit empty shapes.
     nasup = int(smap.nasup[case - 1])
@@ -160,7 +165,7 @@ def build_rhs_df_cuda(
         for u in range(nash):
             rows = t_idx * (nash * nash) + u * nash + u
             rhs[rows, :] += fimo_ti
-        return cp.ascontiguousarray(rhs)
+        return cp.ascontiguousarray(cp.asarray(rhs, dtype=cp.float64))
 
     if case in (2, 3):
         naux = l_it.shape[1]
@@ -175,12 +180,12 @@ def build_rhs_df_cuda(
             fac_tu = cp.where(t != u, 0.5, 0.25).astype(cp.float64)
             fac_ij = (1.0 / cp.sqrt(1.0 + (i == j).astype(cp.float64))).astype(cp.float64)
             rhs = (val * fac_tu[:, None]) * fac_ij[None, :]
-            return cp.ascontiguousarray(rhs)
+            return cp.ascontiguousarray(cp.asarray(rhs, dtype=cp.float64))
 
         p_act = cp.asarray(np.asarray(smap.mtgtu, dtype=np.int64))
         p_orb = cp.asarray(np.asarray(smap.migtj, dtype=np.int64))
         rhs = 0.5 * _df_gram_gather(L3_it, p_act, p_orb, sign=-1)
-        return cp.ascontiguousarray(rhs)
+        return cp.ascontiguousarray(cp.asarray(rhs, dtype=cp.float64))
 
     if case == 4:
         m = l_at @ l_tu.T  # (a*t, u*v) -> (at|uv)
@@ -200,7 +205,7 @@ def build_rhs_df_cuda(
         for u in range(nash):
             rows = t_idx * (nash * nash) + u * nash + u
             rhs[rows, :] += oneadd_ta
-        return cp.ascontiguousarray(rhs)
+        return cp.ascontiguousarray(cp.asarray(rhs, dtype=cp.float64))
 
     if case == 5:
         # W1[tu, a*i] = (ai|tu) == (tu|ia)
@@ -219,7 +224,7 @@ def build_rhs_df_cuda(
         w2 = m24.transpose(1, 3, 2, 0).reshape(ntu, nssh * nish)  # (t,u,a,i)
 
         rhs = cp.concatenate([w1, w2], axis=0)
-        return cp.ascontiguousarray(rhs)
+        return cp.ascontiguousarray(cp.asarray(rhs, dtype=cp.float64))
 
     if case in (6, 7):
         m = l_ia @ l_it.T  # (i*a, j*t) -> (ia|jt) == (ai|tj)
@@ -237,7 +242,7 @@ def build_rhs_df_cuda(
             )  # (igej,a,t)
             fac = (1.0 / cp.sqrt(2.0 + 2.0 * (i == j).astype(cp.float64))).astype(cp.float64)  # (igej,)
             rhs = (val * fac[:, None, None]).transpose(2, 0, 1).reshape(nash, int(smap.nigej) * nssh)
-            return cp.ascontiguousarray(rhs)
+            return cp.ascontiguousarray(cp.asarray(rhs, dtype=cp.float64))
 
         migtj = np.asarray(smap.migtj, dtype=np.int64)
         i = cp.asarray(migtj[:, 0], dtype=cp.int64)
@@ -249,7 +254,7 @@ def build_rhs_df_cuda(
             - m4[j[:, None, None], a[None, :, None], i[:, None, None], t[None, None, :]]
         )
         rhs = (np.sqrt(1.5) * val).transpose(2, 0, 1).reshape(nash, int(smap.nigtj) * nssh)
-        return cp.ascontiguousarray(rhs)
+        return cp.ascontiguousarray(cp.asarray(rhs, dtype=cp.float64))
 
     if case in (8, 9):
         naux = l_at.shape[1]
@@ -264,12 +269,12 @@ def build_rhs_df_cuda(
             fac_tu = cp.where(t != u, 0.5, 0.25).astype(cp.float64)
             fac_ab = (1.0 / cp.sqrt(1.0 + (a == b).astype(cp.float64))).astype(cp.float64)
             rhs = (val * fac_tu[:, None]) * fac_ab[None, :]
-            return cp.ascontiguousarray(rhs)
+            return cp.ascontiguousarray(cp.asarray(rhs, dtype=cp.float64))
 
         p_act = cp.asarray(np.asarray(smap.mtgtu, dtype=np.int64))
         p_orb = cp.asarray(np.asarray(smap.magtb, dtype=np.int64))
         rhs = -0.5 * _df_gram_gather(L3_at, p_act, p_orb, sign=-1)
-        return cp.ascontiguousarray(rhs)
+        return cp.ascontiguousarray(cp.asarray(rhs, dtype=cp.float64))
 
     if case in (10, 11):
         m = l_at @ l_ia.T  # (a*t, i*b) -> (at|ib) == (at|bi)
@@ -287,7 +292,7 @@ def build_rhs_df_cuda(
             val = term1 + term2
             fac = (1.0 / cp.sqrt(2.0 + 2.0 * (a == b).astype(cp.float64))).astype(cp.float64)
             rhs = (val * fac[:, None, None]).transpose(2, 0, 1).reshape(nash, int(smap.nageb) * nish)
-            return cp.ascontiguousarray(rhs)
+            return cp.ascontiguousarray(cp.asarray(rhs, dtype=cp.float64))
 
         magtb = np.asarray(smap.magtb, dtype=np.int64)
         a = cp.asarray(magtb[:, 0], dtype=cp.int64)
@@ -299,7 +304,7 @@ def build_rhs_df_cuda(
         term2 = m4[b[:, None, None], t[None, None, :], i[None, :, None], a[:, None, None]]
         val = term1 - term2
         rhs = (np.sqrt(1.5) * val).transpose(2, 0, 1).reshape(nash, int(smap.nagtb) * nish)
-        return cp.ascontiguousarray(rhs)
+        return cp.ascontiguousarray(cp.asarray(rhs, dtype=cp.float64))
 
     if case in (12, 13):
         naux = l_ia.shape[1]
@@ -314,13 +319,13 @@ def build_rhs_df_cuda(
             fac_ab = (1.0 / cp.sqrt(1.0 + (a == b).astype(cp.float64))).astype(cp.float64)
             fac_ij = (1.0 / cp.sqrt(1.0 + (i == j).astype(cp.float64))).astype(cp.float64)
             rhs = (val * fac_ab[:, None]) * fac_ij[None, :]
-            return cp.ascontiguousarray(rhs)
+            return cp.ascontiguousarray(cp.asarray(rhs, dtype=cp.float64))
 
         p_act = cp.asarray(np.asarray(smap.magtb, dtype=np.int64))
         p_orb = cp.asarray(np.asarray(smap.migtj, dtype=np.int64))
         val = _df_gram_gather(L3_ia, p_act, p_orb, sign=-1)
         rhs = (np.sqrt(3.0) * val).astype(cp.float64, copy=False)
-        return cp.ascontiguousarray(rhs)
+        return cp.ascontiguousarray(cp.asarray(rhs, dtype=cp.float64))
 
     raise NotImplementedError(f"DF RHS case {case} not implemented")
 
@@ -334,6 +339,7 @@ def build_all_rhs_df_cuda(
     *,
     nactel: int | None = None,
     device: int | None = None,
+    mixed_precision: bool = False,
 ):
     """Build all 13 RHS blocks on GPU from DF pair blocks."""
     out = []
@@ -348,6 +354,7 @@ def build_all_rhs_df_cuda(
                 dm2,
                 nactel=nactel,
                 device=device,
+                mixed_precision=mixed_precision,
             )
         )
     return out

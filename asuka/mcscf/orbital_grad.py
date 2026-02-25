@@ -27,6 +27,7 @@ import time
 import numpy as np
 
 from asuka.hf import df_scf as _df_scf
+from asuka.utils.einsum_cache import cached_einsum
 
 
 def _as_xp_f64(xp: Any, a: Any) -> Any:
@@ -254,7 +255,7 @@ def _g_dm2_df_blocked(
                 prod = xp.matmul(Lp_q, T)  # (qb,pb,ncas)
                 g_dm2[int(p0) : int(p1)] += xp.sum(prod, axis=0)
             else:
-                g_dm2[int(p0) : int(p1)] += xp.einsum("puQ,Quv->pv", Lp, T, optimize=True)
+                g_dm2[int(p0) : int(p1)] += cached_einsum("puQ,Quv->pv", Lp, T, xp=xp)
         if profile is not None:
             t_mo += time.perf_counter() - tt_mo
 
@@ -485,14 +486,14 @@ def orbital_gradient_df(
     use_blocked = bool(force_blocked) or (bytes_l_pact >= 128 * 1024 * 1024) or (bytes_x >= 128 * 1024 * 1024)
 
     if not use_blocked:
-        X = xp.einsum("mnQ,nv->mvQ", B, C_act, optimize=True)
-        L_pact = xp.einsum("mp,mvQ->pvQ", C, X, optimize=True)  # (nmo,ncas,naux)
+        X = cached_einsum("mnQ,nv->mvQ", B, C_act, xp=xp)
+        L_pact = cached_einsum("mp,mvQ->pvQ", C, X, xp=xp)  # (nmo,ncas,naux)
         L_act = L_pact[ncore:nocc]  # (ncas,ncas,naux)
 
         L2 = L_act.reshape(ncas * ncas, naux)  # (ncas^2,naux)
         T_flat = L2.T @ dm2_act_xp  # (naux,ncas^2)
         T = T_flat.reshape(naux, ncas, ncas)  # (Q,u,v)
-        g_dm2 = xp.einsum("puQ,Quv->pv", L_pact, T, optimize=True)  # (nmo,ncas)
+        g_dm2 = cached_einsum("puQ,Quv->pv", L_pact, T, xp=xp)  # (nmo,ncas)
     else:
         gdm2_prof = profile.setdefault("g_dm2_blocked", {}) if profile is not None else None
         g_dm2 = _g_dm2_df_blocked(
@@ -870,7 +871,7 @@ def _g_dm2_dense_cpu(
                 K_mixed = build_pair_coeff_ordered_mixed(CA_p, CB_p, CA_u, CB_u, same_shell=(A == B))  # (nAB,pb*ncas)
                 pu_wx = K_mixed.T @ B_sum  # (pb*ncas, ncas^2)
                 pu_wx = pu_wx.reshape(pb, ncas, ncas * ncas)  # (pb,u,wx)
-                g_dm2[int(p0) : int(p1)] += np.einsum("puw,wuv->pv", pu_wx, dm2_wxuv, optimize=True)
+                g_dm2[int(p0) : int(p1)] += cached_einsum("puw,wuv->pv", pu_wx, dm2_wxuv, xp=np)
 
     if profile is not None:
         profile["t_total_s"] = float(perf_counter() - float(t0_total))
@@ -1120,7 +1121,7 @@ def orbital_gradient_dense(
         pu_wx = cp.ascontiguousarray(pu_wx, dtype=cp.float64)
         pu_wx = pu_wx.reshape(nmo, ncas, ncas, ncas)  # (p,u,w,x)
         dm2_wxuv = dm2_wxuv_xp.reshape(ncas, ncas, ncas, ncas)  # (w,x,u,v)
-        g_dm2_xp = cp.einsum("puwx,wxuv->pv", pu_wx, dm2_wxuv, optimize=True)
+        g_dm2_xp = cached_einsum("puwx,wxuv->pv", pu_wx, dm2_wxuv, xp=cp)
     t_gdm2 = time.perf_counter() if profile is not None else 0.0
 
     # gpq columns for core + active only (virtual columns are 0)

@@ -51,6 +51,7 @@ def caspt2_energy_ss_cuda(
     device: int | None = None,
     store_rhs: bool = False,
     store_row_dots: bool = False,
+    mixed_precision_rhs: bool = False,
 ) -> CASPT2EnergyResult:
     """SS-CASPT2 energy on GPU (C1, FP64) using DF RHS and CUDA sigma kernels."""
 
@@ -156,7 +157,7 @@ def caspt2_energy_ss_cuda(
         dm1_rhs = dm1_cpu
         dm2_rhs = dm2_cpu
     t0 = time.perf_counter()
-    rhs_c_list = build_all_rhs_df_cuda(smap, fock, df_d, dm1_rhs, dm2_rhs, nactel=nactel, device=device)
+    rhs_c_list = build_all_rhs_df_cuda(smap, fock, df_d, dm1_rhs, dm2_rhs, nactel=nactel, device=device, mixed_precision=bool(mixed_precision_rhs))
     _sync()
     if profile is not None:
         profile["rhs_df_build_s"] = float(time.perf_counter() - t0)
@@ -181,6 +182,7 @@ def caspt2_energy_ss_cuda(
         if profile is not None:
             profile["f3_engine_init_s"] = float(time.perf_counter() - t0)
 
+    _t_rhs_sr_total = 0.0
     for case in range(1, 14):
         nasup = int(smap.nasup[case - 1])
         nisup = int(smap.nisup[case - 1])
@@ -380,14 +382,20 @@ def caspt2_energy_ss_cuda(
             raise RuntimeError(f"DF RHS shape mismatch for case {case}: {rhs_c.shape} vs {(nasup, nisup)}")
 
         # PTRTOSR for RHS uses ITYPE=1: rhs_SR = T^T * S * rhs_C
+        _t_rhs_sr0 = time.perf_counter()
         t_d = cp.asarray(decomp.transform, dtype=cp.float64)
         s_d = cp.asarray(smat, dtype=cp.float64)
         tmp = s_d @ rhs_c
         rhs_sr = t_d.T @ tmp
         rhs_sr_list.append(rhs_sr.ravel())
+        _sync()
+        _t_rhs_sr_total += time.perf_counter() - _t_rhs_sr0
 
         if verbose >= 2:
             print(f"  Case {case}: nasup={nasup}, nisup={nisup}, nindep={decomp.nindep}")
+
+    if profile is not None:
+        profile["rhs_sr_transform_s"] = float(_t_rhs_sr_total)
 
     # Decide whether to include Molcas off-diagonal Fock couplings (sigma operator).
     use_sigma = False
@@ -515,6 +523,7 @@ def caspt2_energy_ss_cuda(
             amps_sr_list = _views(x)
 
     # Energy: E2 = <RHS|T> in SR basis (per-case + total).
+    _t_energy0 = time.perf_counter()
     e_pt2 = 0.0
     breakdown: dict[str, Any] = {}
     if profile is not None:
@@ -549,6 +558,10 @@ def caspt2_energy_ss_cuda(
         breakdown["e_shift_correction"] = -float(corr)
         if verbose >= 1:
             print(f"  Shift correction: {-float(corr):.10f}")
+
+    _sync()
+    if profile is not None:
+        profile["energy_eval_s"] = float(time.perf_counter() - _t_energy0)
 
     e_tot = float(e_ref) + float(e_pt2)
     breakdown["e_ref"] = float(e_ref)

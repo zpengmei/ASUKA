@@ -167,6 +167,136 @@ def contract_dS_cart_numba(
 
     return out
 
+
+@nb.njit(cache=True)
+def contract_dS_ip_cart_numba(
+    shell_cxyz: np.ndarray,
+    shell_prim_start: np.ndarray,
+    shell_nprim: np.ndarray,
+    shell_l: np.ndarray,
+    shell_ao_start: np.ndarray,
+    prim_exp: np.ndarray,
+    prim_coef: np.ndarray,
+    shell_atom: np.ndarray,
+    natm: int,
+    comp_start: np.ndarray,
+    comp_lx: np.ndarray,
+    comp_ly: np.ndarray,
+    comp_lz: np.ndarray,
+    pairA: np.ndarray,
+    pairB: np.ndarray,
+    nao: int,
+    M: np.ndarray,
+) -> np.ndarray:
+    """Bra-side overlap derivative contracted with M (PySCF int1e_ipovlp convention).
+
+    g[A,x] = sum_{mu in A} sum_nu (d/dR_A S[mu,nu]) * M[mu,nu]
+
+    Only the derivative w.r.t. the bra (mu) center is accumulated.
+    """
+    out = np.zeros((natm, 3), dtype=np.float64)
+    npair = int(pairA.shape[0])
+    for idx in range(npair):
+        shA = int(pairA[idx])
+        shB = int(pairB[idx])
+        la = int(shell_l[shA])
+        lb = int(shell_l[shB])
+        aoA = int(shell_ao_start[shA])
+        aoB = int(shell_ao_start[shB])
+        nA = _ncart(la)
+        nB = _ncart(lb)
+
+        atomA = int(shell_atom[shA])
+        atomB = int(shell_atom[shB])
+
+        sA = int(shell_prim_start[shA])
+        nprimA = int(shell_nprim[shA])
+        expA = prim_exp[sA : sA + nprimA]
+        coefA = prim_coef[sA : sA + nprimA]
+
+        sB = int(shell_prim_start[shB])
+        nprimB = int(shell_nprim[shB])
+        expB = prim_exp[sB : sB + nprimB]
+        coefB = prim_coef[sB : sB + nprimB]
+
+        offA = int(comp_start[la])
+        offB = int(comp_start[lb])
+
+        Ax = float(shell_cxyz[shA, 0])
+        Ay = float(shell_cxyz[shA, 1])
+        Az = float(shell_cxyz[shA, 2])
+        Bx = float(shell_cxyz[shB, 0])
+        By = float(shell_cxyz[shB, 1])
+        Bz = float(shell_cxyz[shB, 2])
+
+        for ia in range(expA.shape[0]):
+            a = float(expA[ia])
+            ca = float(coefA[ia])
+            for ib in range(expB.shape[0]):
+                b = float(expB[ib])
+                cb = float(coefB[ib])
+                Sx = _overlap_1d_table(la + 1, lb + 1, a, b, Ax, Bx)
+                Sy = _overlap_1d_table(la + 1, lb + 1, a, b, Ay, By)
+                Sz = _overlap_1d_table(la + 1, lb + 1, a, b, Az, Bz)
+                c = ca * cb
+
+                for i in range(nA):
+                    lax = int(comp_lx[offA + i])
+                    lay = int(comp_ly[offA + i])
+                    laz = int(comp_lz[offA + i])
+                    for j in range(nB):
+                        lbx = int(comp_lx[offB + j])
+                        lby = int(comp_ly[offB + j])
+                        lbz = int(comp_lz[offB + j])
+
+                        S_yz = Sy[lay, lby] * Sz[laz, lbz]
+                        S_xz = Sx[lax, lbx] * Sz[laz, lbz]
+                        S_xy = Sx[lax, lbx] * Sy[lay, lby]
+
+                        # d/dR_A (bra-center derivative)
+                        dAx = 2.0 * a * Sx[lax + 1, lbx]
+                        if lax:
+                            dAx -= float(lax) * Sx[lax - 1, lbx]
+                        dAy = 2.0 * a * Sy[lay + 1, lby]
+                        if lay:
+                            dAy -= float(lay) * Sy[lay - 1, lby]
+                        dAz = 2.0 * a * Sz[laz + 1, lbz]
+                        if laz:
+                            dAz -= float(laz) * Sz[laz - 1, lbz]
+
+                        i0 = aoA + i
+                        j0 = aoB + j
+                        if i0 >= nao or j0 >= nao:
+                            continue
+
+                        # Bra mu=i0 ∈ atomA, ket nu=j0: accumulate to atomA
+                        m_ij = M[i0, j0]
+                        out[atomA, 0] += c * dAx * S_yz * m_ij
+                        out[atomA, 1] += c * dAy * S_xz * m_ij
+                        out[atomA, 2] += c * dAz * S_xy * m_ij
+
+                        if shA != shB:
+                            # d/dR_B (ket-center derivative of (mu,nu))
+                            # = bra-center derivative of the transposed pair (nu,mu)
+                            dBx = 2.0 * b * Sx[lax, lbx + 1]
+                            if lbx:
+                                dBx -= float(lbx) * Sx[lax, lbx - 1]
+                            dBy = 2.0 * b * Sy[lay, lby + 1]
+                            if lby:
+                                dBy -= float(lby) * Sy[lay, lby - 1]
+                            dBz = 2.0 * b * Sz[laz, lbz + 1]
+                            if lbz:
+                                dBz -= float(lbz) * Sz[laz, lbz - 1]
+
+                            # Bra nu=j0 ∈ atomB, ket mu=i0: accumulate to atomB
+                            m_ji = M[j0, i0]
+                            out[atomB, 0] += c * dBx * S_yz * m_ji
+                            out[atomB, 1] += c * dBy * S_xz * m_ji
+                            out[atomB, 2] += c * dBz * S_xy * m_ji
+
+    return out
+
+
 @nb.njit(cache=True)
 def contract_dT_cart_numba(
     shell_cxyz: np.ndarray,
@@ -1421,6 +1551,7 @@ __all__ += [
     "build_dT_cart_numba",
     "build_dV_cart_numba",
     "contract_dS_cart_numba",
+    "contract_dS_ip_cart_numba",
     "contract_dT_cart_numba",
     "contract_dV_cart_numba",
 ]

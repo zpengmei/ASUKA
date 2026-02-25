@@ -145,22 +145,147 @@ def _regular_step(
     heff: np.ndarray,
     ovlp: np.ndarray,
     xs: Sequence[np.ndarray],
+    ax: Sequence[np.ndarray] | None,
     lindep: float,
     log: _SimpleLogger,
+    *,
+    v_prev: np.ndarray | None = None,
+    root_v0_min: float = 0.1,
+    root_homing: bool = False,
+    root_pred_decrease: bool = False,
+    root_pred_decrease_tol_rel: float = 1e-3,
+    trust_maxabs_orb: float | None = None,
+    trust_maxabs_ci: float | None = None,
+    ngorb: int | None = None,
+    mu_orb: float = 0.0,
+    mu_ci: float = 0.0,
+    ovlp_orb: np.ndarray | None = None,
+    ovlp_ci: np.ndarray | None = None,
 ) -> tuple[np.ndarray, float, np.ndarray, int, np.ndarray]:
     w, v, seig = _safe_eigh(heff, ovlp, lindep)
     if w.size == 0 or v.shape[1] == 0:
         return np.zeros_like(xs[0]), 0.0, np.zeros((0,), dtype=np.float64), 0, seig
 
-    idx = np.where(np.abs(v[0]) > 0.1)[0]
-    sel = int(idx[0]) if idx.size else int(np.argmax(np.abs(v[0])))
+    nvec = int(v.shape[0])
+    nbasis = nvec - 1
+    v0_all = np.asarray(v[0], dtype=np.float64).ravel()
+    cand = np.where(np.abs(v0_all) >= float(root_v0_min))[0]
+    if cand.size == 0:
+        cand = np.asarray([int(np.argmax(np.abs(v0_all)))], dtype=np.int64)
+
+    # Candidate filtering by step caps is optional (requires ngorb + xs).
+    trust_enabled = (
+        (trust_maxabs_orb is not None or trust_maxabs_ci is not None)
+        and (ngorb is not None)
+        and (int(ngorb) >= 0)
+        and ax is not None
+    )
+
+    # Root homing overlap in the generalized eigenvector space (S-metric).
+    v_prev_use: np.ndarray | None = None
+    if v_prev is not None and root_homing:
+        vp = np.asarray(v_prev, dtype=np.float64).ravel()
+        if vp.size < nvec:
+            vp = np.pad(vp, (0, nvec - vp.size))
+        elif vp.size > nvec:
+            vp = vp[:nvec]
+        v_prev_use = vp
+
+    # Predicted quadratic decrease in the AH model: g·x + 0.5 x·H x
+    # computed in the small subspace using heff/ovlp blocks.
+    dE: np.ndarray | None = None
+    if root_pred_decrease and nbasis > 0:
+        heff_b = np.asarray(heff[1:nvec, 1:nvec], dtype=np.float64)
+        b = np.asarray(heff[1:nvec, 0], dtype=np.float64).ravel()
+        s_full = np.asarray(ovlp[1:nvec, 1:nvec], dtype=np.float64)
+        dE = np.full((int(v.shape[1]),), np.inf, dtype=np.float64)
+
+        use_block = abs(float(mu_orb) - float(mu_ci)) > 0.0
+        s_orb = s_ci = None
+        if use_block:
+            if ovlp_orb is not None and ovlp_ci is not None:
+                s_orb = np.asarray(ovlp_orb[1:nvec, 1:nvec], dtype=np.float64)
+                s_ci = np.asarray(ovlp_ci[1:nvec, 1:nvec], dtype=np.float64)
+            else:
+                use_block = False  # fallback to scalar-style correction
+
+        for k in cand.tolist():
+            v0k = float(v0_all[k])
+            if abs(v0k) < 1e-14:
+                continue
+            ck = np.asarray(v[1:nvec, k], dtype=np.float64).ravel() * (1.0 / v0k)
+            g_dot_x = float(np.dot(ck, b))
+            xHx_tilde = float(ck @ (heff_b @ ck))
+
+            # Convert from shifted operator (H+mu) back to the true AH quadratic model.
+            if use_block and s_orb is not None and s_ci is not None:
+                x2_orb = float(ck @ (s_orb @ ck))
+                x2_ci = float(ck @ (s_ci @ ck))
+                xHx = xHx_tilde - float(mu_orb) * x2_orb - float(mu_ci) * x2_ci
+            else:
+                x2 = float(ck @ (s_full @ ck))
+                # If mu_orb != mu_ci but block overlaps are unavailable, apply the smaller
+                # shift to avoid over-correcting (still monotone in mu).
+                mu_eff = float(mu_orb) if abs(float(mu_orb) - float(mu_ci)) < 1e-15 else float(min(mu_orb, mu_ci))
+                xHx = xHx_tilde - mu_eff * x2
+
+            dE[k] = g_dot_x + 0.5 * xHx
+
+    # Choose the root.
+    sel = int(cand[0])
+    if dE is not None:
+        # Prefer candidates that satisfy the trust caps (check only a few best).
+        order = cand[np.argsort(dE[cand], kind="stable")]
+        cand_ok: list[int] = []
+        if trust_enabled and ngorb is not None:
+            ncheck = int(min(int(order.size), 5))
+            for k in order[:ncheck].tolist():
+                v0k = float(v0_all[k])
+                if abs(v0k) < 1e-14:
+                    continue
+                xk = _dgemv(np.asarray(v[1:, k], dtype=np.float64).ravel() * (1.0 / v0k), xs)
+                max_orb = float(np.max(np.abs(xk[: int(ngorb)]))) if int(ngorb) > 0 else 0.0
+                max_ci = float(np.max(np.abs(xk[int(ngorb) :]))) if int(ngorb) < int(xk.size) else 0.0
+                ok_orb = True if trust_maxabs_orb is None else (max_orb <= float(trust_maxabs_orb))
+                ok_ci = True if trust_maxabs_ci is None else (max_ci <= float(trust_maxabs_ci))
+                if ok_orb and ok_ci:
+                    cand_ok.append(int(k))
+            if cand_ok:
+                order = np.asarray(cand_ok, dtype=np.int64)
+
+        # Root homing as a tie-breaker among near-equivalent predicted decreases.
+        if v_prev_use is not None and root_homing and order.size > 1:
+            best = float(np.min(dE[order]))
+            tol = max(1e-12, abs(best) * float(root_pred_decrease_tol_rel))
+            near = [int(k) for k in order.tolist() if float(dE[k]) <= best + tol]
+            if len(near) > 1:
+                overlaps = []
+                for k in near:
+                    vk = np.asarray(v[:, k], dtype=np.float64).ravel()
+                    overlaps.append(abs(float(v_prev_use.conj() @ (ovlp @ vk))))
+                sel = int(near[int(np.argmax(overlaps))])
+            else:
+                sel = int(order[0])
+        else:
+            sel = int(order[0])
+    elif v_prev_use is not None and root_homing:
+        # Homing-only selection among candidates.
+        overlaps = []
+        for k in cand.tolist():
+            vk = np.asarray(v[:, k], dtype=np.float64).ravel()
+            overlaps.append(abs(float(v_prev_use.conj() @ (ovlp @ vk))))
+        sel = int(cand[int(np.argmax(overlaps))])
+    else:
+        # Legacy: pick the first eigenvector with sufficient v0 component.
+        sel = int(cand[0])
+
     log.debug1("CIAH eigen-sel %d", sel)
     w_t = float(w[sel])
 
     v0 = float(v[0, sel])
     if abs(v0) < 1e-14:
         return np.zeros_like(xs[0]), w_t, v[:, sel], sel, seig
-    xtrial = _dgemv(v[1:, sel] / v0, xs)
+    xtrial = _dgemv(np.asarray(v[1:, sel], dtype=np.float64).ravel() * (1.0 / v0), xs)
     return np.asarray(xtrial, dtype=np.float64), w_t, np.asarray(v[:, sel], dtype=np.float64), sel, seig
 
 
@@ -176,6 +301,20 @@ def davidson_cc(
     lindep: float = 1e-14,
     dot: Callable[[np.ndarray, np.ndarray], np.ndarray] = np.dot,
     verbose: Any | None = None,
+    *,
+    root_v0_min: float = 0.1,
+    root_homing: bool = False,
+    root_pred_decrease: bool = False,
+    root_pred_decrease_tol_rel: float = 1e-3,
+    trust_maxabs_orb: float | None = None,
+    trust_maxabs_ci: float | None = None,
+    ngorb: int | None = None,
+    mu_orb: float = 0.0,
+    mu_ci: float = 0.0,
+    mgs: bool = False,
+    mgs_eps: float = 1e-12,
+    restart: bool = False,
+    restart_stagnant: int = 3,
 ) -> Iterator[tuple[bool, int, float, np.ndarray, np.ndarray, np.ndarray, float]]:
     """Internal AH-Davidson iterator (PySCF `ciah.davidson_cc` equivalent).
 
@@ -222,6 +361,12 @@ def davidson_cc(
 
     heff = np.zeros((max_cycle + nx + 1, max_cycle + nx + 1), dtype=np.float64)
     ovlp = np.eye(max_cycle + nx + 1, dtype=np.float64)
+    ovlp_orb = None
+    ovlp_ci = None
+    if root_pred_decrease and (abs(float(mu_orb) - float(mu_ci)) > 0.0) and ngorb is not None:
+        # Block overlaps are only needed when mu differs across blocks.
+        ovlp_orb = np.zeros_like(ovlp)
+        ovlp_ci = np.zeros_like(ovlp)
     if nx == 0:
         xs_l.append(x0)
         ax_l.append(np.asarray(h_op(x0), dtype=np.float64).ravel())
@@ -229,11 +374,22 @@ def davidson_cc(
         for i in range(1, nx + 1):
             for j in range(1, i + 1):
                 heff[i, j] = float(dot(xs_l[i - 1].conj(), ax_l[j - 1]).real)
-                ovlp[i, j] = float(dot(xs_l[i - 1].conj(), xs_l[j - 1]).real)
+            ovlp[i, j] = float(dot(xs_l[i - 1].conj(), xs_l[j - 1]).real)
             heff[1:i, i] = heff[i, 1:i]
             ovlp[1:i, i] = ovlp[i, 1:i]
+        if ovlp_orb is not None and ovlp_ci is not None and ngorb is not None:
+            ng = int(ngorb)
+            for i in range(1, nx + 1):
+                for j in range(1, i + 1):
+                    ovlp_orb[i, j] = float(dot(xs_l[i - 1][:ng].conj(), xs_l[j - 1][:ng]).real) if ng > 0 else 0.0
+                    ovlp_ci[i, j] = float(dot(xs_l[i - 1][ng:].conj(), xs_l[j - 1][ng:]).real)
+                ovlp_orb[1:i, i] = ovlp_orb[i, 1:i]
+                ovlp_ci[1:i, i] = ovlp_ci[i, 1:i]
 
     w_t = 0.0
+    v_prev: np.ndarray | None = None
+    best_dx = float("inf")
+    n_stagnant = 0
     for istep in range(max_cycle):
         g = np.asarray(g_op(), dtype=np.float64).ravel()
         nx = len(xs_l)
@@ -241,18 +397,45 @@ def davidson_cc(
             heff[i + 1, 0] = float(dot(xs_l[i].conj(), g).real)
             heff[nx, i + 1] = float(dot(xs_l[nx - 1].conj(), ax_l[i]).real)
             ovlp[nx, i + 1] = float(dot(xs_l[nx - 1].conj(), xs_l[i]).real)
+            if ovlp_orb is not None and ovlp_ci is not None and ngorb is not None:
+                ng = int(ngorb)
+                ovlp_orb[nx, i + 1] = float(dot(xs_l[nx - 1][:ng].conj(), xs_l[i][:ng]).real) if ng > 0 else 0.0
+                ovlp_ci[nx, i + 1] = float(dot(xs_l[nx - 1][ng:].conj(), xs_l[i][ng:]).real)
         heff[0, : nx + 1] = heff[: nx + 1, 0].conj()
         heff[1:nx, nx] = heff[nx, 1:nx].conj()
         ovlp[1:nx, nx] = ovlp[nx, 1:nx].conj()
+        if ovlp_orb is not None and ovlp_ci is not None:
+            ovlp_orb[1:nx, nx] = ovlp_orb[nx, 1:nx].conj()
+            ovlp_ci[1:nx, nx] = ovlp_ci[nx, 1:nx].conj()
 
         nvec = nx + 1
         wlast = w_t
-        xtrial, w_t, v_t, index, seig = _regular_step(heff[:nvec, :nvec], ovlp[:nvec, :nvec], xs_l, lindep, log)
+        xtrial, w_t, v_t, index, seig = _regular_step(
+            heff[:nvec, :nvec],
+            ovlp[:nvec, :nvec],
+            xs_l,
+            ax_l if ax_l else None,
+            lindep,
+            log,
+            v_prev=v_prev,
+            root_v0_min=root_v0_min,
+            root_homing=bool(root_homing),
+            root_pred_decrease=bool(root_pred_decrease),
+            root_pred_decrease_tol_rel=float(root_pred_decrease_tol_rel),
+            trust_maxabs_orb=trust_maxabs_orb,
+            trust_maxabs_ci=trust_maxabs_ci,
+            ngorb=ngorb,
+            mu_orb=float(mu_orb),
+            mu_ci=float(mu_ci),
+            ovlp_orb=ovlp_orb[:nvec, :nvec] if ovlp_orb is not None else None,
+            ovlp_ci=ovlp_ci[:nvec, :nvec] if ovlp_ci is not None else None,
+        )
         s0 = float(seig[0]) if seig.size else 0.0
         if v_t.size == 0:
             z = np.zeros_like(x0)
             yield True, istep + 1, w_t, z, z, z, s0
             break
+        v_prev = np.asarray(v_t, dtype=np.float64).ravel()
 
         hx = _dgemv(v_t[1:], ax_l)
         dx = hx + g * float(v_t[0]) - w_t * float(v_t[0]) * xtrial
@@ -272,6 +455,32 @@ def davidson_cc(
         else:
             hx = np.zeros_like(hx)
 
+        if restart and norm_dx < best_dx * 0.999:
+            best_dx = norm_dx
+            n_stagnant = 0
+        elif restart:
+            n_stagnant += 1
+            if n_stagnant >= int(restart_stagnant) and istep + 1 < max_cycle:
+                # Restart the subspace with the current best direction (xtrial).
+                log.debug1("AH Davidson restart at step %d (stagnation)", istep + 1)
+                n_stagnant = 0
+                best_dx = norm_dx
+                v_prev = None
+                x_reset = np.asarray(xtrial, dtype=np.float64).ravel()
+                nrm = float(np.linalg.norm(x_reset))
+                if nrm > 0.0:
+                    x_reset *= 1.0 / nrm
+                xs_l = [x_reset]
+                ax_l = [np.asarray(h_op(x_reset), dtype=np.float64).ravel()]
+                heff.fill(0.0)
+                ovlp.fill(0.0)
+                np.fill_diagonal(ovlp, 1.0)
+                if ovlp_orb is not None:
+                    ovlp_orb.fill(0.0)
+                if ovlp_ci is not None:
+                    ovlp_ci.fill(0.0)
+                continue
+
         converged = (
             (abs(w_t - wlast) < float(tol) and norm_dx < toloose)
             or s0 < float(lindep)
@@ -284,6 +493,16 @@ def davidson_cc(
         else:
             yield False, istep + 1, w_t, xtrial, hx, dx, s0
             x1 = np.asarray(precond(dx, w_t), dtype=np.float64).ravel()
+            if mgs and xs_l:
+                x1_orig = x1.copy()
+                for vj in xs_l:
+                    x1 = x1 - float(dot(vj.conj(), x1).real) * vj
+                nrm = float(np.linalg.norm(x1))
+                if nrm < float(mgs_eps):
+                    x1 = x1_orig
+                    nrm = float(np.linalg.norm(x1))
+                if nrm > 0.0:
+                    x1 *= 1.0 / nrm
             xs_l.append(x1)
             ax_l.append(np.asarray(h_op(x1), dtype=np.float64).ravel())
 
@@ -1207,7 +1426,8 @@ def _build_gpq_per_root(
     vhf_ca = _to_np_f64(vhf_a) + vhf_c_np[None, :, :]
 
     hcore = casscf.get_hcore()
-    h1e_mo = _to_np_f64((mo.T @ hcore) @ mo)
+    # Ensure mo and hcore are on the same device before matmul.
+    h1e_mo = _to_np_f64((_to_xp_f64(mo, xp).T @ _to_xp_f64(hcore, xp)) @ _to_xp_f64(mo, xp))
 
     gpq = np.zeros((nroots, nmo, nmo), dtype=np.float64)
     if ncore:
@@ -1852,14 +2072,14 @@ def gen_g_hop_internal(
     ci0_list = cache.ci.ci0_list
     nroots = int(cache.nroots)
 
-    def g_update(u: np.ndarray, fcivec: Any) -> np.ndarray:
+    def g_update(u: np.ndarray, fcivec: Any) -> tuple[np.ndarray, Callable[[np.ndarray], np.ndarray], Any]:
         u = np.asarray(u, dtype=np.float64)
         if u.ndim != 2 or u.shape[0] != cache.nmo or u.shape[1] != cache.nmo:
             raise ValueError("u must be (nmo,nmo)")
         xp_mo, _ = _get_xp(mo)
         mo1 = _to_xp_f64(mo, xp_mo) @ xp_mo.asarray(u, dtype=xp_mo.float64)
         eris1 = casscf.ao2mo(mo1)
-        g1, _gup, _hop, _diag = gen_g_hop_internal(
+        g1, _gup, hop1, diag1 = gen_g_hop_internal(
             casscf,
             mo1,
             fcivec,
@@ -1872,7 +2092,7 @@ def gen_g_hop_internal(
             enforce_absorb_h1e_direct=bool(enforce_absorb_h1e_direct),
             ah_mixed_precision=bool(ah_mixed_precision),
         )
-        return np.asarray(g1, dtype=np.float64).ravel()
+        return np.asarray(g1, dtype=np.float64).ravel(), hop1, diag1
 
     with _absorb_ctx():
         linkstrl = _maybe_gen_linkstr(fcisolver, cache.ncas, cache.nelecas, True)
@@ -1942,9 +2162,53 @@ def gen_g_hop_internal(
             with _ah_mixed_precision_ctx(fcisolver, ah_mixed_precision):
                 op_h0_dev = fcisolver.absorb_h1e(h1cas_0_dev, eri_cas_dev, cache.ncas, cache.nelecas, 0.5)
 
+    import os as _os_hop
+    _HOP_PROFILE = _os_hop.environ.get("ASUKA_HOP_PROFILE", "0") == "1"
+
+    # ── Precompute MO-basis 3-index DF integrals L_pq^Q for fast JK in h_op ──
+    # L[p,q,Q] = sum_mn C[m,p] * B[m,n,Q] * C[n,q]
+    # This replaces AO-basis _df_JK calls (nao^3 * naux) with MO-basis (nmo^3 * naux).
+    _L_pq_dev = None
+    _L_t_dev = None  # (nmo, naux, nmo) contiguous — avoids transpose+copy in h_op
+    _use_mo_jk = False
+    _disable_mo_jk = _os_hop.environ.get("ASUKA_DISABLE_MO_JK", "0") == "1"
+    if not _disable_mo_jk and _hop_on_gpu and _supports_return_gpu and cache.ncore > 0:
+        _df_B_raw = getattr(casscf, "df_B", None)
+        if _df_B_raw is not None:
+            _xp = _hop_xp
+            _B = _xp.asarray(_df_B_raw, dtype=_xp.float64)
+            _C = _xp.asarray(mo, dtype=_xp.float64)
+            _nao_B = int(_B.shape[0])
+            _nmo_C = int(_C.shape[1])
+            _naux_B = int(_B.shape[2])
+            # Half-transform: H[p,n,Q] = C.T @ B[:,:,Q] for all Q
+            _H = (_C.T @ _B.reshape(_nao_B, _nao_B * _naux_B)).reshape(_nmo_C, _nao_B, _naux_B)
+            # Full transform: L_t[p,Q,q] = sum_n H[p,n,Q] * C[n,q]
+            # Transpose H to (nmo, naux, nao) so reshape to (nmo*naux, nao) preserves
+            # the grouping: row p*naux+Q contains H[p, :, Q].
+            _H_t = _xp.ascontiguousarray(_H.transpose(0, 2, 1))  # (nmo, naux, nao)
+            _L_t_dev = (_H_t.reshape(_nmo_C * _naux_B, _nao_B) @ _C).reshape(_nmo_C, _naux_B, _nmo_C)
+            _L_t_dev = _xp.ascontiguousarray(_L_t_dev)  # ensure contiguous
+            # Also store (nmo, nmo, naux) layout for J einsum
+            _L_pq_dev = _xp.ascontiguousarray(_L_t_dev.transpose(0, 2, 1))
+            del _H, _B
+            _use_mo_jk = True
+
     def _h_op_raw(x):
-        xp, on_gpu = _get_xp(x)
-        x = xp.asarray(x, dtype=xp.float64).ravel()
+        # Use GPU path when GPU tensors exist in closure, regardless of
+        # input vector type.  davidson_cc passes NumPy vectors, but the
+        # expensive operations (sigma vectors, trans-RDMs, einsums over
+        # ppaa/papa) benefit hugely from running on GPU.  The parameter
+        # vector upload (~25K doubles) is negligible.
+        if _HOP_PROFILE:
+            _t0_hop = time.perf_counter()
+        if _hop_on_gpu:
+            xp = _hop_xp
+            on_gpu = True
+            x = xp.asarray(x, dtype=xp.float64).ravel()
+        else:
+            xp, on_gpu = _get_xp(x)
+            x = xp.asarray(x, dtype=xp.float64).ravel()
 
         # Select device-appropriate tensors.
         ppaa = papa = None  # may stay None when using DF factors
@@ -1995,6 +2259,9 @@ def gen_g_hop_internal(
             ci1_list = [ci_flat[off:off + sz].copy() for off, sz in zip(_ci_offs, _ci_sizes)] if on_gpu else cache.ci.unpack(ci_flat)
 
         # ── CI Hessian: H0|c1> ──
+        if _HOP_PROFILE:
+            if on_gpu: xp.cuda.Stream.null.synchronize()
+            _t1_hop = time.perf_counter()
         _c2e_kw: dict = dict(link_index=linkstrl, return_cupy=on_gpu)
         if on_gpu:
             _c2e_kw["contract_2e_backend"] = "cuda"
@@ -2023,6 +2290,9 @@ def gen_g_hop_internal(
             ddm_c[: cache.ncore, :] += rc[:, : cache.ncore].T * 2.0
 
         # Transition RDMs.
+        if _HOP_PROFILE:
+            if on_gpu: xp.cuda.Stream.null.synchronize()
+            _t2_hop = time.perf_counter()
         with _absorb_ctx():
             tdm1, tdm2 = _weighted_trans_rdm12(
                 fcisolver,
@@ -2039,6 +2309,9 @@ def gen_g_hop_internal(
         tdm2 = (tdm2 + tdm2.transpose(2, 3, 0, 1)) * 0.5
 
         # MO-basis contractions (on whichever device ppaa/papa reside).
+        if _HOP_PROFILE:
+            if on_gpu: xp.cuda.Stream.null.synchronize()
+            _t3_hop = time.perf_counter()
         if cache.ncore:
             if _use_df_factors:
                 _naux = int(_L_pu.shape[2])
@@ -2090,8 +2363,51 @@ def gen_g_hop_internal(
         aaaa = aaaa + aaaa.transpose(1, 0, 2, 3)
         aaaa = aaaa + aaaa.transpose(2, 3, 0, 1)
 
-        # ── AO-basis DF-JK (GPU stays on GPU, CPU launches async) ──
-        if on_gpu:
+        # ── JK for orbital Hessian: MO-basis (fast) or AO-basis (fallback) ──
+        if _HOP_PROFILE:
+            if on_gpu: xp.cuda.Stream.null.synchronize()
+            _t4_hop = time.perf_counter()
+        if _use_mo_jk and on_gpu and cache.ncore > 0:
+            # MO-basis JK using precomputed L_pq^Q — avoids nao^3 contractions.
+            _nmo_L = cache.nmo
+            _ncore_L = cache.ncore
+            _nocc_L = cache.nocc
+
+            # dm3_MO: core-rest block of x1 (symmetric)
+            _dm3 = xp.zeros((_nmo_L, _nmo_L), dtype=xp.float64)
+            _dm3[:_ncore_L, _ncore_L:] = x1[:_ncore_L, _ncore_L:]
+            _dm3[_ncore_L:, :_ncore_L] = x1[:_ncore_L, _ncore_L:].T
+            # dm4_MO: active-all block weighted by casdm1 (symmetric)
+            _dm4_h = xp.zeros((_nmo_L, _nmo_L), dtype=xp.float64)
+            _dm4_h[_ncore_L:_nocc_L, :] = _casdm1 @ x1[_ncore_L:_nocc_L, :]
+            _dm4 = _dm4_h + _dm4_h.T
+            _dm_total = _dm3 * 2.0 + _dm4
+
+            _naux_L = int(_L_pq_dev.shape[2])
+            # Precomputed views (no copy):
+            _L_t_2d = _L_t_dev.reshape(_nmo_L, _naux_L * _nmo_L)  # (nmo, naux*nmo)
+            _L_flat = _L_pq_dev.reshape(_nmo_L * _nmo_L, _naux_L)  # (nmo*nmo, naux)
+            _L_t_flat = _L_t_2d.reshape(_nmo_L * _naux_L, _nmo_L)  # (nmo*naux, nmo)
+            # J0 via GEMV: rho_Q = L_flat^T @ vec(dm3), J0 = reshape(L_flat @ rho)
+            _dm3_v = _dm3.ravel()
+            _rho0 = _L_flat.T @ _dm3_v
+            _J0 = (_L_flat @ _rho0).reshape(_nmo_L, _nmo_L)
+            # K0 via two GEMMs (no intermediate copies):
+            _LDM0 = (_L_t_flat @ _dm3).reshape(_nmo_L, _naux_L * _nmo_L)
+            _K0 = _LDM0 @ _L_t_2d.T
+            _v0 = _J0 * 2.0 - _K0
+            # J1, K1 for dm_total
+            _dmt_v = _dm_total.ravel()
+            _rho1 = _L_flat.T @ _dmt_v
+            _J1 = (_L_flat @ _rho1).reshape(_nmo_L, _nmo_L)
+            _LDM1 = (_L_t_flat @ _dm_total).reshape(_nmo_L, _naux_L * _nmo_L)
+            _K1 = _LDM1 @ _L_t_2d.T
+            _v1 = _J1 * 2.0 - _K1
+            # va = casdm1 @ v0[act, :], vc = v1[:core, rest]
+            va = _casdm1 @ _v0[_ncore_L:_nocc_L, :]
+            vc = _v1[:_ncore_L, _ncore_L:]
+            # Verification removed after confirming machine-precision match.
+        elif on_gpu:
             if cache.ncore > 0:
                 if _supports_return_gpu:
                     va, vc = casscf.update_jk_in_ah(mo, x1, _casdm1, eris, return_gpu=True)
@@ -2109,6 +2425,9 @@ def gen_g_hop_internal(
                     va_np, vc_np = casscf.update_jk_in_ah(mo, x1, _casdm1, eris)
 
         # ── CI Hessian part 2: orbital-CI coupling ──
+        if _HOP_PROFILE:
+            if on_gpu: xp.cuda.Stream.null.synchronize()
+            _t5_hop = time.perf_counter()
         h1aa = (_h1e_mo[cache.ncore : cache.nocc] + _vhf_c[cache.ncore : cache.nocc]) @ ra
         h1aa = h1aa + h1aa.T + jk
 
@@ -2123,6 +2442,9 @@ def gen_g_hop_internal(
         hci1 = [hc1 * wi for hc1, wi in zip(hci1, _weights)]
 
         # ── Orbital Hessian assembly ──
+        if _HOP_PROFILE:
+            if on_gpu: xp.cuda.Stream.null.synchronize()
+            _t6_hop = time.perf_counter()
         x2 = (_h1e_mo @ x1) @ _dm1_full
         g_orb_mat = xp.einsum("r,rpq->pq", _weights, _gpq, optimize=True)
         x2 -= (g_orb_mat + g_orb_mat.T) @ x1 * 0.5
@@ -2168,7 +2490,25 @@ def gen_g_hop_internal(
             out = xp.concatenate([packed_orb.ravel(), packed_ci])
         else:
             out = np.hstack((packed_orb, cache.ci.pack(hci1) * 2.0))
-        return xp.asarray(out, dtype=xp.float64).ravel()
+        out = xp.asarray(out, dtype=xp.float64).ravel()
+        # Davidson solver operates in NumPy — convert GPU result back.
+        if on_gpu and _hop_on_gpu:
+            out = out.get()
+        if _HOP_PROFILE:
+            _t7_hop = time.perf_counter()
+            print(
+                f"  h_op profile: "
+                f"unpack={(_t1_hop-_t0_hop)*1e3:.1f}ms  "
+                f"sigma={(_t2_hop-_t1_hop)*1e3:.1f}ms  "
+                f"trdm={(_t3_hop-_t2_hop)*1e3:.1f}ms  "
+                f"mo_contr={(_t4_hop-_t3_hop)*1e3:.1f}ms  "
+                f"jk={'MO' if _use_mo_jk else 'AO'}={(_t5_hop-_t4_hop)*1e3:.1f}ms  "
+                f"ci_coup={(_t6_hop-_t5_hop)*1e3:.1f}ms  "
+                f"orb_hess={(_t7_hop-_t6_hop)*1e3:.1f}ms  "
+                f"total={(_t7_hop-_t0_hop)*1e3:.1f}ms",
+                flush=True,
+            )
+        return out
 
     gauge_l = str(gauge).strip().lower()
     if gauge_l not in ("none", "project", "project_out"):
@@ -2266,6 +2606,20 @@ class NewtonMicroStats:
     imic: int = 0
     tot_hop: int = 0
     tot_kf: int = 0
+
+    # Diagnostics / instrumentation (best-effort; not used in core control flow).
+    n_trust_fail_grad: int = 0
+    n_trust_fail_kf: int = 0
+    n_retry: int = 0
+    n_mu_increase: int = 0
+    n_step_scaled: int = 0
+    n_step_scaled_orb: int = 0
+    n_step_scaled_ci: int = 0
+    last_level_shift: float = 0.0
+    last_mu_orb: float = 0.0
+    last_mu_ci: float = 0.0
+    last_kf_trust: float = 0.0
+    g_orb: np.ndarray | None = None  # orbital gradient at keyframe entry
 
 
 def _orthonormalize_ci_columns(
@@ -2487,33 +2841,141 @@ def update_orb_ci(
         float(np.linalg.norm(g_all[ngorb:])),
     )
 
-    def precond(x: np.ndarray, e: float) -> np.ndarray:
-        x = np.asarray(x, dtype=np.float64).ravel()
-        if callable(h_diag):
-            x = np.asarray(h_diag(x, e - casscf.ah_level_shift), dtype=np.float64).ravel()
-        else:
-            hdiagd = np.asarray(h_diag, dtype=np.float64).ravel() - (e - casscf.ah_level_shift)
-            hdiagd[np.abs(hdiagd) < 1e-8] = 1e-8
-            x = x / hdiagd
-        nrm = float(np.linalg.norm(x))
-        if nrm > 0.0:
-            x *= 1.0 / nrm
-        return x
+    # ── Local knobs (AH inner-loop only) ─────────────────────────────────────
+    # These attributes are intentionally read via getattr so callers can
+    # override them on the adapter object without changing public APIs.
+    root_v0_min = float(getattr(casscf, "ah_root_v0_min", 0.1))
+    root_homing = bool(getattr(casscf, "ah_root_homing_enabled", True))
+    root_pred = bool(getattr(casscf, "ah_root_pred_decrease_enabled", True))
+    root_pred_tol = float(getattr(casscf, "ah_root_pred_decrease_tol_rel", 1e-3))
 
-    def scale_down_step(dxi: np.ndarray, hdxi: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-        dxmax = float(np.max(np.abs(dxi)))
-        if dxmax > float(max_stepsize):
-            scale = float(max_stepsize) / dxmax
-            log.debug1("Scale rotation by %g", scale)
+    start_tol_base = float(getattr(casscf, "ah_start_tol", 2.5))
+    start_tol_dynamic = bool(getattr(casscf, "ah_start_tol_dynamic", True))
+
+    retry_enabled = bool(getattr(casscf, "ah_retry_enabled", True))
+    retry_max = int(getattr(casscf, "ah_retry_max", 6))
+    level_shift_growth = float(getattr(casscf, "ah_level_shift_growth", 5.0))
+    stepsize_shrink = float(getattr(casscf, "ah_stepsize_shrink", 0.5))
+
+    mu_enabled = bool(getattr(casscf, "ah_mu_enabled", True))
+    mu_init = float(getattr(casscf, "ah_mu_init", 0.0))
+    mu_growth = float(getattr(casscf, "ah_mu_growth", 5.0))
+    mu_max = float(getattr(casscf, "ah_mu_max", 1e6))
+    mu_blockwise = bool(getattr(casscf, "ah_mu_blockwise", True))
+    mu_ci_scale = float(getattr(casscf, "ah_mu_ci_scale", 1.0))
+    scale_fallback = bool(getattr(casscf, "ah_scale_fallback", True))
+
+    mgs = bool(getattr(casscf, "ah_davidson_mgs_enabled", True))
+    d_restart = bool(getattr(casscf, "ah_davidson_restart_enabled", True))
+    d_restart_stagnant = int(getattr(casscf, "ah_davidson_restart_stagnant", 3))
+
+    kf_min_ikf = int(getattr(casscf, "ah_keyframe_min_ikf", 2))
+    kf_trust_dynamic = bool(getattr(casscf, "ah_kf_trust_dynamic", True))
+    kf_trust_min = float(getattr(casscf, "ah_kf_trust_min", 1.2))
+    kf_trust_max = float(getattr(casscf, "ah_kf_trust_max", 10.0))
+
+    # Separate caps for orbital and CI blocks (same vector scaling factor).
+    max_stepsize_orb = float(getattr(casscf, "ah_max_stepsize_orb", max_stepsize))
+    max_stepsize_ci = float(
+        getattr(
+            casscf,
+            "ah_max_stepsize_ci",
+            max(0.1, min(0.5, max_stepsize_orb * 10.0)),
+        )
+    )
+
+    level_shift_local = float(getattr(casscf, "ah_level_shift_local_init", casscf.ah_level_shift))
+    mu_orb = float(mu_init)
+    mu_ci = float(mu_init * mu_ci_scale) if mu_blockwise else float(mu_init)
+
+    def _step_maxabs(x: np.ndarray) -> tuple[float, float, float]:
+        x = np.asarray(x, dtype=np.float64).ravel()
+        max_all = float(np.max(np.abs(x))) if x.size else 0.0
+        max_orb = float(np.max(np.abs(x[:ngorb]))) if ngorb > 0 else 0.0
+        max_ci = float(np.max(np.abs(x[ngorb:]))) if ngorb < int(x.size) else 0.0
+        return max_orb, max_ci, max_all
+
+    def _scale_to_caps(dxi: np.ndarray, hdxi: np.ndarray, cap_orb: float, cap_ci: float) -> tuple[np.ndarray, np.ndarray]:
+        max_orb, max_ci, _ = _step_maxabs(dxi)
+        scale = 1.0
+        if max_orb > cap_orb:
+            scale = min(scale, cap_orb / max_orb)
+        if max_ci > cap_ci:
+            scale = min(scale, cap_ci / max_ci)
+        if scale < 1.0:
+            stat.n_step_scaled += 1
+            if max_orb > cap_orb:
+                stat.n_step_scaled_orb += 1
+            if max_ci > cap_ci:
+                stat.n_step_scaled_ci += 1
+            log.debug1("Scale AH step by %g (caps orb=%g ci=%g)", scale, cap_orb, cap_ci)
             dxi = np.asarray(dxi, dtype=np.float64) * scale
             hdxi = np.asarray(hdxi, dtype=np.float64) * scale
         return dxi, hdxi
 
+    def _mu_correct_hdxi(hdxi: np.ndarray, dxi: np.ndarray, muo: float, muc: float) -> np.ndarray:
+        """Convert (H+mu)x to Hx without extra h_op calls."""
+        hdxi = np.asarray(hdxi, dtype=np.float64).ravel().copy()
+        dxi = np.asarray(dxi, dtype=np.float64).ravel()
+        if muo != 0.0 and ngorb > 0:
+            hdxi[:ngorb] -= float(muo) * dxi[:ngorb]
+        if muc != 0.0 and ngorb < int(dxi.size):
+            hdxi[ngorb:] -= float(muc) * dxi[ngorb:]
+        return hdxi
+
+    def _make_precond(hdiag: Any, level_shift: float, muo: float, muc: float) -> Callable[[np.ndarray, float], np.ndarray]:
+        def _p(x: np.ndarray, e: float) -> np.ndarray:
+            x = np.asarray(x, dtype=np.float64).ravel()
+            if callable(hdiag):
+                # Callable preconditioners are assumed to already handle sign/shift robustly.
+                out = np.asarray(hdiag(x, e - float(level_shift)), dtype=np.float64).ravel()
+                nrm = float(np.linalg.norm(out))
+                if nrm > 0.0:
+                    out *= 1.0 / nrm
+                return out
+
+            hdiagd = np.asarray(hdiag, dtype=np.float64).ravel() - (float(e) - float(level_shift))
+            if muo != 0.0 and ngorb > 0:
+                hdiagd[:ngorb] += float(muo)
+            if muc != 0.0 and ngorb < int(hdiagd.size):
+                hdiagd[ngorb:] += float(muc)
+
+            # Sign-preserving floor for near-singular denominators.
+            eps = 1e-8
+            mask = np.abs(hdiagd) < eps
+            if np.any(mask):
+                hdiagd = hdiagd.copy()
+                hdiagd[mask] = np.copysign(eps, hdiagd[mask])
+            out = x / hdiagd
+            nrm = float(np.linalg.norm(out))
+            if nrm > 0.0:
+                out *= 1.0 / nrm
+            return out
+
+        return _p
+
+    def _make_h_op_mu(hop: Callable[[np.ndarray], np.ndarray], muo: float, muc: float) -> Callable[[np.ndarray], np.ndarray]:
+        if muo == 0.0 and muc == 0.0:
+            return hop
+
+        def _hop_mu(x: np.ndarray) -> np.ndarray:
+            x = np.asarray(x, dtype=np.float64).ravel()
+            y = np.asarray(hop(x), dtype=np.float64).ravel()
+            if muo != 0.0 and ngorb > 0:
+                y[:ngorb] += float(muo) * x[:ngorb]
+            if muc != 0.0 and ngorb < int(x.size):
+                y[ngorb:] += float(muc) * x[ngorb:]
+            return y
+
+        return _hop_mu
+
     stat = NewtonMicroStats(imic=0, tot_hop=0, tot_kf=1)
+    stat.g_orb = g_all[:ngorb].copy() if ngorb > 0 else None
     dr = np.zeros_like(g_all)
     ikf = 0
     u = np.eye(nmo, dtype=np.float64)
     ci_kf: Any = ci0_use
+    kf_trust_local = float(getattr(casscf, "kf_trust_region", 3.0))
 
     if x0_guess is None:
         x0_guess = g_all
@@ -2523,78 +2985,168 @@ def update_orb_ci(
     if norm_gall < float(conv_tol_grad) * 0.3:
         return u, ci_kf, norm_gall, stat, x0_guess
 
-    last_dxi = x0_guess
-    for ah_conv, ihop, w, dxi, hdxi, residual, seig in davidson_cc(
-        h_op,
-        g_op,
-        precond,
-        x0_guess,
-        tol=casscf.ah_conv_tol,
-        max_cycle=casscf.ah_max_cycle,
-        lindep=casscf.ah_lindep,
-        verbose=log,
-    ):
-        stat.tot_hop = int(ihop)
-        norm_residual = float(np.linalg.norm(residual))
-        if (
-            bool(ah_conv)
-            or int(ihop) == int(casscf.ah_max_cycle)
-            or ((norm_residual < float(casscf.ah_start_tol)) and (int(ihop) >= int(casscf.ah_start_cycle)))
-            or (float(seig) < float(casscf.ah_lindep))
-        ):
-            stat.imic += 1
-            last_dxi = np.asarray(dxi, dtype=np.float64).ravel()
-            dxi_s, hdxi_s = scale_down_step(last_dxi, np.asarray(hdxi, dtype=np.float64).ravel())
+    last_dxi = np.asarray(x0_guess, dtype=np.float64).ravel()
+    last_hdxi_true = np.zeros_like(last_dxi)
 
-            dr += dxi_s
-            g_all = g_all + hdxi_s
+    hop_total = 0
+    n_retry = 0
+    max_cycle_cur = int(casscf.max_cycle_micro)
+    while True:
+        precond = _make_precond(h_diag, level_shift_local, mu_orb, mu_ci)
+        h_op_use = _make_h_op_mu(h_op, mu_orb, mu_ci)
+
+        stat.last_level_shift = float(level_shift_local)
+        stat.last_mu_orb = float(mu_orb)
+        stat.last_mu_ci = float(mu_ci)
+        stat.last_kf_trust = float(kf_trust_local)
+
+        x0_use = np.asarray(g_all, dtype=np.float64).ravel() if n_retry > 0 else np.asarray(last_dxi, dtype=np.float64).ravel()
+        hop_before = hop_total
+        restart = False
+        terminate = False
+
+        for ah_conv, ihop, w, dxi, hdxi, residual, seig in davidson_cc(
+            h_op_use,
+            g_op,
+            precond,
+            x0_use,
+            tol=casscf.ah_conv_tol,
+            max_cycle=casscf.ah_max_cycle,
+            lindep=casscf.ah_lindep,
+            verbose=log,
+            root_v0_min=root_v0_min,
+            root_homing=root_homing,
+            root_pred_decrease=root_pred,
+            root_pred_decrease_tol_rel=root_pred_tol,
+            trust_maxabs_orb=max_stepsize_orb,
+            trust_maxabs_ci=max_stepsize_ci,
+            ngorb=ngorb,
+            mu_orb=mu_orb,
+            mu_ci=mu_ci,
+            mgs=mgs,
+            restart=d_restart,
+            restart_stagnant=d_restart_stagnant,
+        ):
+            hop_total = hop_before + int(ihop)
+            stat.tot_hop = int(hop_total)
+
+            norm_residual = float(np.linalg.norm(residual))
+            start_tol_eff = float(start_tol_base)
+            if start_tol_dynamic:
+                start_tol_eff = min(5.0 * float(norm_gall), float(start_tol_base))
+
+            accept_step = (
+                bool(ah_conv)
+                or int(ihop) == int(casscf.ah_max_cycle)
+                or ((norm_residual < float(start_tol_eff)) and (int(ihop) >= int(casscf.ah_start_cycle)))
+                or (float(seig) < float(casscf.ah_lindep))
+            )
+            if not accept_step:
+                continue
+
+            dxi = np.asarray(dxi, dtype=np.float64).ravel()
+            hdxi = np.asarray(hdxi, dtype=np.float64).ravel()
+            hdxi_true = _mu_correct_hdxi(hdxi, dxi, mu_orb, mu_ci)
+
+            # Enforce step caps by adjusting mu (preferred) or scaling (fallback).
+            max_orb, max_ci, max_all = _step_maxabs(dxi)
+            if (max_orb > max_stepsize_orb) or (max_ci > max_stepsize_ci):
+                if mu_enabled and (mu_orb < mu_max or mu_ci < mu_max) and n_retry < retry_max:
+                    if not mu_blockwise:
+                        mu_orb = min(float(mu_max), max(float(mu_orb), 1e-12) * float(mu_growth))
+                        mu_ci = mu_orb
+                    else:
+                        if max_orb > max_stepsize_orb:
+                            mu_orb = min(float(mu_max), max(float(mu_orb), 1e-12) * float(mu_growth))
+                        if max_ci > max_stepsize_ci:
+                            mu_ci = min(float(mu_max), max(float(mu_ci), 1e-12) * float(mu_growth))
+                    stat.n_mu_increase += 1
+                    stat.n_retry += 1
+                    n_retry += 1
+                    restart = True
+                    log.debug("AH step exceeds caps (orb=%g ci=%g); increase mu and retry", max_orb, max_ci)
+                    break
+                if scale_fallback:
+                    dxi, hdxi_true = _scale_to_caps(dxi, hdxi_true, max_stepsize_orb, max_stepsize_ci)
+                    max_orb, max_ci, max_all = _step_maxabs(dxi)
+
+            # Predict gradient after the step; reject early on trust-region violation.
+            g_trial = np.asarray(g_all, dtype=np.float64).ravel() + np.asarray(hdxi_true, dtype=np.float64).ravel()
+            norm_g_trial = float(np.linalg.norm(g_trial))
+            if stat.imic >= 3 and norm_g_trial > norm_gkf * float(casscf.ah_grad_trust_region):
+                stat.n_trust_fail_grad += 1
+                stat.n_retry += 1
+                n_retry += 1
+                if retry_enabled and n_retry <= retry_max:
+                    level_shift_local = max(float(level_shift_local), 1e-16) * float(level_shift_growth)
+                    max_stepsize_orb = max(float(max_stepsize_orb) * float(stepsize_shrink), 1e-6)
+                    max_stepsize_ci = max(float(max_stepsize_ci) * float(stepsize_shrink), 1e-6)
+                    if mu_enabled and (mu_orb < mu_max or mu_ci < mu_max):
+                        mu_orb = min(float(mu_max), max(float(mu_orb), 1e-12) * float(mu_growth))
+                        mu_ci = min(float(mu_max), max(float(mu_ci), 1e-12) * float(mu_growth)) if mu_blockwise else mu_orb
+                        stat.n_mu_increase += 1
+                    restart = True
+                    log.debug("|g| >> keyframe (trial). Damp+retry (level_shift=%g)", level_shift_local)
+                    break
+                log.debug("|g| >> keyframe (trial). Stop inner iterations (retry disabled/exhausted)")
+                terminate = True
+                break
+
+            # Commit the micro step.
+            stat.imic += 1
+            last_dxi = dxi
+            last_hdxi_true = hdxi_true
+            dr += dxi
+            g_all = g_trial
+            n_retry = 0
             norm_dr = float(np.linalg.norm(dr))
             norm_gall = float(np.linalg.norm(g_all))
             norm_gorb = float(np.linalg.norm(g_all[:ngorb]))
             norm_gci = float(np.linalg.norm(g_all[ngorb:]))
             log.debug(
-                "    imic %d(%d)  |g|=%3.2e (%2.1e %2.1e)  |dxi|=%3.2e max(x)=%3.2e |dr|=%3.2e  eig=%2.1e seig=%2.1e",
+                "    imic %d(%d)  |g|=%3.2e (%2.1e %2.1e)  |dxi|=%3.2e max(o,c,a)=(%3.2e %3.2e %3.2e) |dr|=%3.2e  eig=%2.1e seig=%2.1e",
                 stat.imic,
-                ihop,
+                hop_total,
                 norm_gall,
                 norm_gorb,
                 norm_gci,
-                float(np.linalg.norm(dxi_s)),
-                float(np.max(np.abs(dxi_s))),
+                float(np.linalg.norm(dxi)),
+                max_orb,
+                max_ci,
+                max_all,
                 norm_dr,
                 float(w),
                 float(seig),
             )
 
-            max_cycle = max(
+            max_cycle_cur = max(
                 int(casscf.max_cycle_micro),
                 int(casscf.max_cycle_micro) - int(np.log(norm_gkf + 1e-7) * 2),
             )
             max_cycle_cap = getattr(casscf, "ah_max_cycle_micro_cap", None)
             if max_cycle_cap is not None:
-                max_cycle = min(max_cycle, max(int(casscf.max_cycle_micro), int(max_cycle_cap)))
-            log.debug1("Set max_cycle %d", max_cycle)
+                max_cycle_cur = min(max_cycle_cur, max(int(casscf.max_cycle_micro), int(max_cycle_cap)))
+            log.debug1("Set max_cycle %d", max_cycle_cur)
             ikf += 1
 
-            if stat.imic > 3 and norm_gall > norm_gkf * float(casscf.ah_grad_trust_region):
-                g_all = g_all - hdxi_s
-                dr -= dxi_s
-                norm_gall = float(np.linalg.norm(g_all))
-                log.debug("|g| >> keyframe, Restore previous step")
+            if stat.imic >= int(max_cycle_cur) or norm_gall < float(conv_tol_grad) * 0.3:
                 break
 
-            if stat.imic >= max_cycle or norm_gall < float(conv_tol_grad) * 0.3:
-                break
-
-            if ikf >= max(
-                int(casscf.kf_interval),
-                int(casscf.kf_interval) - int(np.log(norm_dr + 1e-7)),
-            ) or (norm_gall < norm_gkf / float(casscf.kf_trust_region)):
-                ikf = 0
-                u, ci_kf = extract_rotation(casscf, dr, u, ci_kf, ci_update=ci_update)
-                dr[:] = 0.0
-                g_kf1 = np.asarray(g_update(u, ci_kf), dtype=np.float64).ravel()
+            # Keyframe update: recompute gradient (and refresh h_op/h_diag) in a trial state,
+            # then accept/reject without mutating the current keyframe unless accepted.
+            kf_trigger = (
+                ikf >= max(
+                    int(casscf.kf_interval),
+                    int(casscf.kf_interval) - int(np.log(norm_dr + 1e-7)),
+                )
+                or (norm_gall < norm_gkf / float(kf_trust_local))
+            )
+            if kf_trigger and ikf > int(kf_min_ikf):
+                u_trial, ci_trial = extract_rotation(casscf, dr, u, ci_kf, ci_update=ci_update)
+                g_kf1, h_op_kf1, h_diag_kf1 = g_update(u_trial, ci_trial)
+                g_kf1 = np.asarray(g_kf1, dtype=np.float64).ravel()
                 stat.tot_kf += 1
+
                 norm_gkf1 = float(np.linalg.norm(g_kf1))
                 norm_gorb = float(np.linalg.norm(g_kf1[:ngorb]))
                 norm_gci = float(np.linalg.norm(g_kf1[ngorb:]))
@@ -2607,18 +3159,64 @@ def update_orb_ci(
                     norm_dg,
                 )
 
+                # Dynamic keyframe trust region (CIAH-style).
+                if kf_trust_dynamic:
+                    ratio = float(norm_gall) / (float(norm_dg) + 1e-12)
+                    kf_trust_local = float(np.clip(ratio, float(kf_trust_min), float(kf_trust_max)))
+                    stat.last_kf_trust = float(kf_trust_local)
+
                 if (
                     norm_dg < norm_gall * float(casscf.ah_grad_trust_region)
                     or norm_gkf1 < float(conv_tol_grad) * float(casscf.ah_grad_trust_region)
                 ):
+                    u, ci_kf = u_trial, ci_trial
+                    dr[:] = 0.0
                     g_all = g_kf1
+                    h_op = h_op_kf1
+                    h_diag = h_diag_kf1
                     norm_gall = norm_gkf = norm_gkf1
-                else:
-                    g_all = g_all - hdxi_s
-                    dr -= dxi_s
-                    norm_gall = norm_gkf = float(np.linalg.norm(g_all))
-                    log.debug("Out of trust region. Restore previous step")
+                    ikf = 0
+                    n_retry = 0
+                    # Restart Davidson at the new keyframe/operator.
+                    restart = True
                     break
+
+                # Out of trust region: undo the last micro step and damp+retry.
+                stat.n_trust_fail_kf += 1
+                stat.n_retry += 1
+                n_retry += 1
+                dr -= last_dxi
+                g_all = g_all - last_hdxi_true
+                stat.imic = max(int(stat.imic) - 1, 0)
+                ikf = max(int(ikf) - 1, 0)
+                norm_gall = float(np.linalg.norm(g_all))
+                norm_gkf = float(norm_gkf)
+                log.debug("Out of trust region. Undo last step and damp+retry")
+
+                if retry_enabled and n_retry <= retry_max:
+                    level_shift_local = max(float(level_shift_local), 1e-16) * float(level_shift_growth)
+                    max_stepsize_orb = max(float(max_stepsize_orb) * float(stepsize_shrink), 1e-6)
+                    max_stepsize_ci = max(float(max_stepsize_ci) * float(stepsize_shrink), 1e-6)
+                    if mu_enabled and (mu_orb < mu_max or mu_ci < mu_max):
+                        mu_orb = min(float(mu_max), max(float(mu_orb), 1e-12) * float(mu_growth))
+                        mu_ci = min(float(mu_max), max(float(mu_ci), 1e-12) * float(mu_growth)) if mu_blockwise else mu_orb
+                        stat.n_mu_increase += 1
+                    restart = True
+                    break
+
+                # Give up if retry is disabled or exhausted.
+                restart = False
+                break
+
+        # End davidson loop
+        if terminate:
+            break
+        if restart:
+            # Restart inner AH solve with updated (mu, level_shift, caps, operator).
+            if n_retry > retry_max:
+                break
+            continue
+        break
 
     u, ci_kf = extract_rotation(casscf, dr, u, ci_kf, ci_update=ci_update)
     try:
@@ -2943,13 +3541,389 @@ def kernel_newton_inplace(
     return float(e_tot), e_cas, ci, mo, mo_energy
 
 
+@dataclass
+class OrbitalMicroStats:
+    """Micro-iteration stats returned by `rotate_orb_ah`."""
+
+    imic: int = 0
+    tot_hop: int = 0
+    tot_kf: int = 0
+    norm_gorb: float = 0.0
+
+
+def gen_g_hop_orbital(
+    casscf: Any,
+    mo: np.ndarray,
+    ci0: Any,
+    eris: Any,
+    *,
+    weights: Sequence[float] | None = None,
+    strict_weights: bool = False,
+) -> tuple[np.ndarray, Callable[[np.ndarray], np.ndarray], np.ndarray, Callable[..., tuple[np.ndarray, Callable, np.ndarray]]]:
+    """Orbital-only gradient, Hessian-vector product, and diagonal for mc1step-style AH.
+
+    Returns
+    -------
+    g_orb : np.ndarray
+        Packed orbital gradient (scaled by 2).
+    h_op_orb : Callable
+        Orbital-only Hessian-vector product.
+    h_diag_orb : np.ndarray
+        Orbital diagonal Hessian (scaled by 2).
+    gorb_update : Callable
+        Recompute (g_orb, h_op_orb, h_diag_orb) at a new rotation.
+    """
+
+    ci0_list = _as_ci_list(ci0)
+    nroots = int(len(ci0_list))
+    w_info = _resolve_weights(casscf, nroots=nroots, weights=weights, strict=bool(strict_weights))
+    w = np.asarray(w_info.weights, dtype=np.float64)
+
+    ncas = int(getattr(casscf, "ncas"))
+    ncore = int(getattr(casscf, "ncore"))
+    nocc = ncore + ncas
+    nmo = int(mo.shape[1])
+
+    fcisolver = getattr(casscf, "fcisolver", None)
+    if fcisolver is None:
+        raise ValueError("casscf must provide fcisolver")
+
+    # Build per-root RDMs.
+    linkstr = _maybe_gen_linkstr(fcisolver, ncas, getattr(casscf, "nelecas"), False)
+    try:
+        casdm1_r, casdm2_r = fcisolver.states_make_rdm12(ci0_list, ncas, getattr(casscf, "nelecas"), link_index=linkstr)
+        casdm1_r = np.asarray(casdm1_r, dtype=np.float64)
+        casdm2_r = np.asarray(casdm2_r, dtype=np.float64)
+    except AttributeError:
+        dm1s_l: list[np.ndarray] = []
+        dm2s_l: list[np.ndarray] = []
+        for c in ci0_list:
+            dm1, dm2 = fcisolver.make_rdm12(c, ncas, getattr(casscf, "nelecas"), link_index=linkstr)
+            dm1s_l.append(np.asarray(dm1, dtype=np.float64))
+            dm2s_l.append(np.asarray(dm2, dtype=np.float64))
+        casdm1_r = np.asarray(dm1s_l, dtype=np.float64)
+        casdm2_r = np.asarray(dm2s_l, dtype=np.float64)
+
+    # State-averaged RDMs.
+    casdm1 = np.einsum("r,rpq->pq", w, casdm1_r, optimize=True)
+
+    # Build per-root gpq and SA average.
+    gpq = _build_gpq_per_root(casscf, mo, ci0_list, eris, strict_weights=bool(strict_weights))
+    g_orb_mat = np.einsum("r,rpq->pq", w, gpq, optimize=True)
+    g_orb = casscf.pack_uniq_var(g_orb_mat - g_orb_mat.T)
+    g_orb = np.asarray(g_orb, dtype=np.float64).ravel() * 2.0
+
+    # Build cache intermediates needed for the orbital Hessian.
+    ppaa = getattr(eris, "ppaa", None)
+    papa = getattr(eris, "papa", None)
+    vhf_c = getattr(eris, "vhf_c", None)
+    xp, _on_gpu = _get_xp(ppaa, papa)
+
+    ppaa_arr = _to_xp_f64(ppaa, xp)
+    papa_arr = _to_xp_f64(papa, xp)
+
+    casdm1_g = xp.asarray(casdm1, dtype=xp.float64)
+    casdm2_g = xp.asarray(np.einsum("r,ruvwx->uvwx", w, casdm2_r, optimize=True), dtype=xp.float64)
+
+    # vhf_a (SA-weighted), vhf_ca, jkcaa, hdm2
+    vhf_a = xp.einsum("pquv,uv->pq", ppaa_arr, casdm1_g, optimize=True)
+    vhf_a -= 0.5 * xp.einsum("puqv,uv->pq", papa_arr, casdm1_g, optimize=True)
+    vhf_c_xp = _to_xp_f64(vhf_c, xp)
+    vhf_ca = _to_np_f64(vhf_a) + _to_np_f64(vhf_c_xp)
+
+    # hdm2 (SA-weighted)
+    dm2tmp = casdm2_g.transpose(1, 2, 0, 3) + casdm2_g.transpose(0, 2, 1, 3)
+    _ppaa_2d = ppaa_arr.reshape(nmo * nmo, ncas * ncas)
+    _dm2_2d = casdm2_g.reshape(ncas * ncas, ncas * ncas)
+    jtmp_full = (_ppaa_2d @ _dm2_2d).reshape(nmo, nmo, ncas, ncas)
+    papa_t = papa_arr.transpose(0, 2, 1, 3)
+    _papa_t_2d = papa_t.reshape(nmo * nmo, ncas * ncas)
+    _dm2tmp_2d = dm2tmp.reshape(ncas * ncas, ncas * ncas)
+    ktmp_full = (_papa_t_2d @ _dm2tmp_2d).reshape(nmo, nmo, ncas, ncas)
+    hdm2 = _to_np_f64((jtmp_full + ktmp_full).transpose(0, 2, 1, 3))
+
+    # jkcaa (SA-weighted)
+    arange_nocc = xp.arange(nocc)
+    ppaa_diag = ppaa_arr[arange_nocc, arange_nocc]
+    papa_diag = papa_arr[arange_nocc, :, arange_nocc]
+    jkcaa_kernel = 6.0 * papa_diag - 2.0 * ppaa_diag
+    jkcaa = _to_np_f64(xp.einsum("pik,ik->pi", jkcaa_kernel, casdm1_g, optimize=True))
+
+    hcore = casscf.get_hcore()
+    h1e_mo = _to_np_f64((_to_xp_f64(mo, xp).T @ _to_xp_f64(hcore, xp)) @ _to_xp_f64(mo, xp))
+    vhf_c_np = _to_np_f64(vhf_c_xp)
+
+    # dm1_full
+    dm1_full = np.zeros((nmo, nmo), dtype=np.float64)
+    if ncore:
+        idx_c = np.arange(ncore)
+        dm1_full[idx_c, idx_c] = 2.0
+    dm1_full[ncore:nocc, ncore:nocc] = casdm1
+
+    # paaa
+    paaa = ppaa_arr[:, ncore:nocc, :, :]
+
+    # Orbital diagonal Hessian (PySCF Parts 7-6).
+    h_diag = np.einsum("ii,jj->ij", h1e_mo, dm1_full) - h1e_mo * dm1_full
+    h_diag = h_diag + h_diag.T
+    g_diag = np.einsum("r,rpp->p", w, gpq, optimize=True)
+    h_diag -= g_diag + g_diag.reshape(-1, 1)
+    idx = np.arange(nmo)
+    h_diag[idx, idx] += g_diag * 2.0
+    v_diag = np.diag(vhf_ca)
+    h_diag[:, :ncore] += v_diag.reshape(-1, 1) * 2.0
+    h_diag[:ncore] += v_diag * 2.0
+    if ncore:
+        idxc = np.arange(ncore)
+        h_diag[idxc, idxc] -= v_diag[:ncore] * 4.0
+    tmp_d = np.einsum("ii,jj->ij", vhf_c_np, casdm1, optimize=True)
+    h_diag[:, ncore:nocc] += tmp_d
+    h_diag[ncore:nocc, :] += tmp_d.T
+    tmp2_d = -vhf_c_np[ncore:nocc, ncore:nocc] * casdm1
+    h_diag[ncore:nocc, ncore:nocc] += tmp2_d + tmp2_d.T
+    tmp3_d = 6.0 * _to_np_f64(getattr(eris, "k_pc")) - 2.0 * _to_np_f64(getattr(eris, "j_pc"))
+    h_diag[ncore:, :ncore] += tmp3_d[ncore:]
+    h_diag[:ncore, ncore:] += tmp3_d[ncore:].T
+    h_diag[:nocc, ncore:nocc] -= jkcaa
+    h_diag[ncore:nocc, :nocc] -= jkcaa.T
+    v_diag2 = np.einsum("ijij->ij", hdm2, optimize=True)
+    h_diag[ncore:nocc, :] += v_diag2.T
+    h_diag[:, ncore:nocc] += v_diag2
+    h_diag_orb = casscf.pack_uniq_var(h_diag)
+    h_diag_orb = np.asarray(h_diag_orb, dtype=np.float64).ravel() * 2.0
+
+    # Orbital-only Hessian-vector product.
+    def _h_op_orb(x_packed: np.ndarray) -> np.ndarray:
+        x_packed = np.asarray(x_packed, dtype=np.float64).ravel()
+        x1 = casscf.unpack_uniq_var(x_packed)
+
+        # Orbital Hessian assembly (lines 2443-2480 of _h_op_raw, orbital-only).
+        x2 = (h1e_mo @ x1) @ dm1_full
+        x2 -= (g_orb_mat + g_orb_mat.T) @ x1 * 0.5
+        if ncore:
+            x2[:ncore] += (x1[:ncore, ncore:] @ vhf_ca[ncore:]) * 2.0
+        x2[ncore:nocc] += (casdm1 @ x1[ncore:nocc]) @ vhf_c_np
+        x2[:, ncore:nocc] += np.einsum("purv,rv->pu", hdm2, x1[:, ncore:nocc], optimize=True)
+
+        # JK for orbital Hessian (AO-basis fallback through adapter).
+        if ncore > 0:
+            va, vc = casscf.update_jk_in_ah(mo, x1, casdm1, eris)
+            va = _to_np_f64(va)
+            vc = _to_np_f64(vc)
+            x2[ncore:nocc] += va
+            x2[:ncore, ncore:] += vc
+
+        x2 = x2 - x2.T
+        return np.asarray(casscf.pack_uniq_var(x2), dtype=np.float64).ravel() * 2.0
+
+    def _gorb_update(u_rot: np.ndarray, ci_new: Any) -> tuple[np.ndarray, Callable, np.ndarray]:
+        mo_new = np.asarray(mo, dtype=np.float64) @ np.asarray(u_rot, dtype=np.float64)
+        return gen_g_hop_orbital(casscf, mo_new, ci_new, eris, weights=weights, strict_weights=strict_weights)[:3]
+
+    return g_orb, _h_op_orb, h_diag_orb, _gorb_update
+
+
+def rotate_orb_ah(
+    casscf: Any,
+    mo: np.ndarray,
+    casdm1: np.ndarray,
+    casdm2: np.ndarray,
+    eris: Any,
+    ci0: Any,
+    *,
+    weights: Sequence[float] | None = None,
+    strict_weights: bool = False,
+    verbose: int = 0,
+) -> tuple[np.ndarray, float, OrbitalMicroStats]:
+    """Orbital-only AH micro-iterations for mc1step-style optimization.
+
+    Parameters
+    ----------
+    casscf : DFNewtonCASSCFAdapter
+        CASSCF adapter object.
+    mo : np.ndarray
+        Current MO coefficients.
+    casdm1, casdm2 : np.ndarray
+        State-averaged 1- and 2-RDMs from the macro CASCI step.
+    eris : DFNewtonERIs
+        Integral object.
+    ci0 : Any
+        Current CI vector(s), needed for gen_g_hop_orbital.
+    weights : Sequence[float] | None
+        State-average weights.
+    strict_weights : bool
+        Whether to enforce weight consistency.
+    verbose : int
+        Verbosity level.
+
+    Returns
+    -------
+    u : np.ndarray
+        Accumulated orbital rotation matrix.
+    norm_gorb : float
+        Orbital gradient norm at the last keyframe.
+    stat : OrbitalMicroStats
+        Micro-iteration statistics.
+    """
+
+    log = _new_logger(verbose=verbose)
+    nmo = int(mo.shape[1])
+
+    max_stepsize = float(getattr(casscf, "max_stepsize", 0.02))
+    max_cycle_micro = int(getattr(casscf, "max_cycle_micro", 4))
+    kf_interval = int(getattr(casscf, "kf_interval", 4))
+    ah_start_tol = float(getattr(casscf, "ah_start_tol", 2.5))
+    ah_start_cycle = int(getattr(casscf, "ah_start_cycle", 3))
+    ah_conv_tol = float(getattr(casscf, "ah_conv_tol", 1e-12))
+    ah_max_cycle = int(getattr(casscf, "ah_max_cycle", 30))
+    ah_lindep = float(getattr(casscf, "ah_lindep", 1e-14))
+    ah_level_shift = float(getattr(casscf, "ah_level_shift", 1e-8))
+    ah_grad_trust_region = float(getattr(casscf, "ah_grad_trust_region", 3.0))
+    scale_restoration = float(getattr(casscf, "ah_scale_restoration", 0.5))
+
+    g_orb, h_op_orb, h_diag_orb, gorb_update = gen_g_hop_orbital(
+        casscf, mo, ci0, eris, weights=weights, strict_weights=strict_weights,
+    )
+
+    norm_gorb = float(np.linalg.norm(g_orb))
+    norm_gkf = norm_gorb
+
+    stat = OrbitalMicroStats(imic=0, tot_hop=0, tot_kf=1, norm_gorb=norm_gorb)
+
+    if norm_gorb < 1e-8:
+        return np.eye(nmo, dtype=np.float64), norm_gorb, stat
+
+    u = np.eye(nmo, dtype=np.float64)
+    dr = np.zeros_like(g_orb)
+    x0_guess = g_orb.copy()
+
+    def _make_precond(hdiag: np.ndarray, ls: float) -> Callable[[np.ndarray, float], np.ndarray]:
+        def _p(x: np.ndarray, e: float) -> np.ndarray:
+            x = np.asarray(x, dtype=np.float64).ravel()
+            hd = np.asarray(hdiag, dtype=np.float64).ravel() - (float(e) - float(ls))
+            eps = 1e-8
+            mask = np.abs(hd) < eps
+            if np.any(mask):
+                hd = hd.copy()
+                hd[mask] = np.copysign(eps, hd[mask])
+            out = x / hd
+            nrm = float(np.linalg.norm(out))
+            if nrm > 0.0:
+                out *= 1.0 / nrm
+            return out
+        return _p
+
+    ikf = 0
+    for imic_outer in range(max_cycle_micro):
+        precond = _make_precond(h_diag_orb, ah_level_shift)
+        g_op = lambda: g_orb  # noqa: E731
+
+        for ah_conv, ihop, w_eig, dxi, hdxi, residual, seig in davidson_cc(
+            h_op_orb,
+            g_op,
+            precond,
+            x0_guess,
+            tol=ah_conv_tol,
+            max_cycle=ah_max_cycle,
+            lindep=ah_lindep,
+            verbose=log,
+        ):
+            stat.tot_hop = stat.tot_hop + 1
+
+            norm_residual = float(np.linalg.norm(residual))
+            accept_step = (
+                bool(ah_conv)
+                or int(ihop) == int(ah_max_cycle)
+                or ((norm_residual < ah_start_tol) and (int(ihop) >= ah_start_cycle))
+                or (float(seig) < ah_lindep)
+            )
+            if not accept_step:
+                continue
+
+            dxi = np.asarray(dxi, dtype=np.float64).ravel()
+            hdxi = np.asarray(hdxi, dtype=np.float64).ravel()
+
+            # Clip step to max_stepsize.
+            max_abs = float(np.max(np.abs(dxi))) if dxi.size > 0 else 0.0
+            if max_abs > max_stepsize:
+                scale = max_stepsize / max_abs
+                dxi = dxi * scale
+                hdxi = hdxi * scale
+                log.debug1("Scale orbital AH step by %g", scale)
+
+            # Predict gradient and trust-region check.
+            g_trial = np.asarray(g_orb, dtype=np.float64) + np.asarray(hdxi, dtype=np.float64)
+            norm_g_trial = float(np.linalg.norm(g_trial))
+            if stat.imic >= 2 and norm_g_trial > norm_gkf * ah_grad_trust_region:
+                log.debug("Orbital |g| trust fail; stop micro-iterations.")
+                break
+
+            # Commit.
+            stat.imic += 1
+            dr += dxi
+            g_orb = g_trial
+            norm_gorb = float(np.linalg.norm(g_orb))
+            ikf += 1
+            x0_guess = dxi.copy()
+            log.debug(
+                "    orb imic %d  |g|=%3.2e  |dxi|=%3.2e  max=%3.2e",
+                stat.imic, norm_gorb, float(np.linalg.norm(dxi)), max_abs,
+            )
+
+            if stat.imic >= max_cycle_micro:
+                break
+
+            # Keyframe refresh.
+            if ikf >= kf_interval or norm_gorb < norm_gkf / ah_grad_trust_region:
+                # Apply current rotation and recompute gradient.
+                x1_mat = casscf.unpack_uniq_var(dr)
+                u_trial = u @ casscf.update_rotate_matrix(
+                    casscf.pack_uniq_var(x1_mat)
+                )
+                g_kf, h_op_kf, h_diag_kf = gorb_update(u_trial, ci0)
+                stat.tot_kf += 1
+                norm_gkf_new = float(np.linalg.norm(g_kf))
+
+                norm_dg = float(np.linalg.norm(g_kf - g_orb))
+                if norm_dg < norm_gorb * ah_grad_trust_region:
+                    u = u_trial
+                    dr[:] = 0.0
+                    g_orb = g_kf
+                    h_op_orb = h_op_kf
+                    h_diag_orb = h_diag_kf
+                    norm_gorb = norm_gkf = norm_gkf_new
+                    ikf = 0
+                    # Restart Davidson with new operator.
+                    break
+                else:
+                    log.debug("Keyframe trust fail; stop micro-iterations.")
+                    break
+            break
+        else:
+            # davidson_cc exhausted without break
+            break
+
+        if stat.imic >= max_cycle_micro:
+            break
+
+    # Apply final accumulated rotation.
+    if float(np.linalg.norm(dr)) > 1e-15:
+        u = u @ casscf.update_rotate_matrix(dr)
+
+    stat.norm_gorb = norm_gorb
+    return u, norm_gorb, stat
+
+
 __all__ = [
     "WeightsInfo",
     "NewtonMicroStats",
+    "OrbitalMicroStats",
     "compute_ci_gram_inv",
     "extract_rotation",
     "gen_g_hop_internal",
     "gen_g_hop",
+    "gen_g_hop_orbital",
+    "rotate_orb_ah",
     "kernel_newton",
     "kernel_newton_inplace",
     "update_orb_ci",

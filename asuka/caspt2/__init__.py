@@ -12,6 +12,7 @@ computational workflow, module structure, and conventions.
 from asuka.caspt2.driver_asuka import run_caspt2, run_caspt2_soc, run_caspt2_soc_multispin
 from asuka.caspt2.energy import caspt2_energy_ss
 from asuka.caspt2.fock import CASPT2Fock, build_caspt2_fock
+from asuka.caspt2.gradient.driver import caspt2_gradient_from_casscf
 from asuka.caspt2.multistate import build_heff, diagonalize_heff
 from asuka.caspt2.overlap import SBDecomposition, sbdiag
 from asuka.caspt2.result import (
@@ -28,6 +29,7 @@ __all__ = [
     "run_caspt2",
     "run_caspt2_soc",
     "run_caspt2_soc_multispin",
+    "caspt2_gradient_from_casscf",
     "caspt2_energy_ss",
     "CASPT2Fock",
     "build_caspt2_fock",

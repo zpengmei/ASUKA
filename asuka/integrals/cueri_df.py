@@ -59,6 +59,13 @@ def build_df_B_from_cueri_packed_bases(
         mode=str(cfg.mode),
         threads=int(cfg.threads),
     )
+    # Regularize near-singular auxiliary basis metrics.
+    # AutoAux bases can have near-linear dependencies that produce tiny
+    # negative eigenvalues (e.g. -1e-14), causing Cholesky to fail or
+    # silently produce NaN on GPU.  A small diagonal shift fixes this.
+    _v_diag = cp.diag(V)
+    _v_shift = max(float(cp.max(cp.abs(_v_diag))) * 1e-14, 1e-12)
+    V[cp.diag_indices_from(V)] += _v_shift
     L = cp.linalg.cholesky(V)
     X = cueri_df.int3c2e_basis(
         ao_basis,

@@ -528,6 +528,51 @@ class _DRTKey:
     ne_constraints_key: tuple[tuple[int, int, int], ...] | None
 
 
+_DETECTED_GPU_MEM_CAP_GIB: float | None = None
+
+
+def _auto_gpu_mem_hard_cap() -> float:
+    """Return a safe VRAM hard cap based on the current CUDA device.
+
+    Uses the same formula as ``autotune._gpu_autofill_overrides``:
+    reserve 1.5 GiB for >=20 GiB GPUs, 1.0 for >=12, 0.75 otherwise;
+    cap = min(90% of total, total - reserve), at least 2.0 GiB.
+
+    Checks ``ASUKA_CUDA_MEM_HARD_CAP_GIB`` env var first, then auto-detects
+    via CuPy. Falls back to 11.5 GiB (legacy default) on failure.
+    """
+    global _DETECTED_GPU_MEM_CAP_GIB
+    if _DETECTED_GPU_MEM_CAP_GIB is not None:
+        return _DETECTED_GPU_MEM_CAP_GIB
+
+    env_val = os.environ.get("ASUKA_CUDA_MEM_HARD_CAP_GIB")
+    if env_val is not None:
+        try:
+            cap = float(env_val)
+            if cap > 0.0:
+                _DETECTED_GPU_MEM_CAP_GIB = cap
+                return cap
+        except (ValueError, TypeError):
+            pass
+
+    try:
+        from asuka.cuguga.autotune import detect_cuda_device_info
+
+        info = detect_cuda_device_info()
+        if info is not None and isinstance(info.get("total_mem_gib"), (int, float)):
+            total = float(info["total_mem_gib"])
+            if total > 0.0:
+                reserve = 1.5 if total >= 20.0 else (1.0 if total >= 12.0 else 0.75)
+                cap = max(2.0, min(total * 0.90, total - reserve))
+                _DETECTED_GPU_MEM_CAP_GIB = round(cap, 3)
+                return _DETECTED_GPU_MEM_CAP_GIB
+    except Exception:
+        pass
+
+    _DETECTED_GPU_MEM_CAP_GIB = 11.5
+    return 11.5
+
+
 class GUGAFCISolver(_StreamObject):
     """FCI-like solver interface for a native GUGA/CSF engine.
     """
@@ -684,6 +729,7 @@ class GUGAFCISolver(_StreamObject):
         self.kernel_blas_nthreads: int | None = getattr(self, "kernel_blas_nthreads", None)
         # Safety net for pathological Davidson failures: for small CSF spaces we can
         # deterministically recover roots by explicit full-space diagonalization.
+        self.dense_eigh_ncsf_threshold = int(getattr(self, "dense_eigh_ncsf_threshold", 0))
         self.unconverged_fallback_full_diag = getattr(self, "unconverged_fallback_full_diag", True)
         self.unconverged_fallback_ncsf_max = int(getattr(self, "unconverged_fallback_ncsf_max", 512))
         if self.unconverged_fallback_ncsf_max < 1:
@@ -789,7 +835,7 @@ class GUGAFCISolver(_StreamObject):
         # Hard cap for CUDA private-memory budgeting (<=0 disables cap).
         # Auto policies (EPQ enable, max_g sizing) use this budget to avoid OOM on
         # constrained private-GPU environments.
-        self.matvec_cuda_mem_hard_cap_gib = getattr(self, "matvec_cuda_mem_hard_cap_gib", 11.5)
+        self.matvec_cuda_mem_hard_cap_gib = getattr(self, "matvec_cuda_mem_hard_cap_gib", _auto_gpu_mem_hard_cap())
         self.matvec_cuda_coalesce = getattr(self, "matvec_cuda_coalesce", True)
         self.matvec_cuda_include_diagonal_rs = getattr(self, "matvec_cuda_include_diagonal_rs", True)
         self.matvec_cuda_fuse_count_write = getattr(self, "matvec_cuda_fuse_count_write", True)
@@ -1701,6 +1747,76 @@ class GUGAFCISolver(_StreamObject):
             raise ValueError("nroots must be >= 1")
         if ncsf < nroots:
             raise ValueError(f"nroots={nroots} > ncsf={ncsf}")
+
+        # --- Dense CPU eigh fast-path for tiny CI spaces ---
+        # For small ncsf the CUDA Davidson setup overhead dominates; a direct
+        # np.linalg.eigh on the full H matrix is orders of magnitude faster.
+        _dense_thresh = int(getattr(self, "dense_eigh_ncsf_threshold", 0))
+        if _dense_thresh > 0 and int(ncsf) <= _dense_thresh:
+            _t_dense0 = time.perf_counter()
+            hdiag_ps = None
+            addr_full, h_full = self.pspace(
+                h1e,
+                eri,
+                norb,
+                nelec,
+                npsp=int(ncsf),
+                max_out=int(max_out),
+                hdiag=hdiag_ps,
+                orbsym=orbsym,
+                wfnsym=wfnsym,
+                ne_constraints=ne_constraints,
+            )
+            addr_full = np.asarray(addr_full, dtype=np.int64).ravel()
+            if int(addr_full.size) != int(ncsf):
+                raise RuntimeError(
+                    "dense_eigh fast-path: pspace address size mismatch "
+                    f"(got {int(addr_full.size)}, expected {int(ncsf)})"
+                )
+            h_full = np.asarray(h_full, dtype=np.float64)
+            h_full = 0.5 * (h_full + h_full.T)
+            evals, evecs = np.linalg.eigh(h_full)
+            order = np.argsort(np.asarray(evals, dtype=np.float64))[:int(nroots)]
+            e = np.asarray(evals, dtype=np.float64)[order] + float(ecore)
+            ci: list[np.ndarray] = []
+            for col in order.tolist():
+                v_sub = np.asarray(evecs[:, int(col)], dtype=np.float64).ravel()
+                v_full = np.zeros((int(ncsf),), dtype=np.float64)
+                v_full[addr_full] = v_sub
+                ci.append(np.ascontiguousarray(v_full))
+            self.converged = np.ones((int(nroots),), dtype=np.bool_)
+            _t_dense1 = time.perf_counter()
+            # Update warm state
+            if warm_state_update:
+                self._update_warm_state(
+                    ci=ci,
+                    norb=int(norb),
+                    nelec_total=int(nelec_total),
+                    twos=int(twos),
+                    nroots=int(nroots),
+                    ncsf=int(ncsf),
+                    orbsym=orbsym,
+                    wfnsym=wfnsym,
+                    ne_constraints=ne_constraints,
+                    cas_metadata=warm_cas_metadata,
+                    mo_coeff=warm_state_mo_coeff,
+                    mo_occ=warm_state_mo_occ,
+                )
+            if kprof is not None:
+                kprof["dense_eigh_used"] = True
+                kprof["dense_eigh_ncsf"] = int(ncsf)
+                kprof["dense_eigh_s"] = _t_dense1 - _t_dense0
+                kprof["total_s"] = _t_dense1 - t_kernel0
+                self._last_kernel_profile = kprof
+            if nroots == 1:
+                self.converged = bool(self.converged[0])
+                self.eci, self.ci = float(e[0]), np.ascontiguousarray(ci[0])
+                self._last_drt_key = drt_key
+                return self.eci, self.ci
+            self.eci, self.ci = e, [np.ascontiguousarray(v) for v in ci]
+            self._last_drt_key = drt_key
+            return self.eci, self.ci
+        # --- end dense eigh fast-path ---
 
         warm_applied = False
         warm_reason = "warm_start_disabled" if not warm_state_enable else "ci0_provided"

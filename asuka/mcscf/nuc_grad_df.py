@@ -35,7 +35,7 @@ from asuka.integrals.grad import (
     compute_df_gradient_contributions_analytic_packed_bases,
     compute_df_gradient_contributions_fd_packed_bases,
 )
-from asuka.integrals.int1e_cart import contract_dhcore_cart, contract_dS_ip_cart, shell_to_atom_map
+from asuka.integrals.int1e_cart import contract_dS_cart, contract_dhcore_cart, contract_dS_ip_cart, shell_to_atom_map
 from asuka.solver import GUGAFCISolver
 
 from .state_average import ci_as_list, make_state_averaged_rdms, normalize_weights
@@ -516,6 +516,7 @@ def casscf_nuc_grad_df(
     twos: int | None = None,
     atmlst: Sequence[int] | None = None,
     df_backend: Literal["cpu", "cuda"] = "cpu",
+    int1e_contract_backend: Literal["auto", "cpu", "cuda"] = "cpu",
     df_config: Any | None = None,
     df_threads: int = 0,
     delta_bohr: float = 1e-4,
@@ -541,6 +542,8 @@ def casscf_nuc_grad_df(
         List of atoms to compute gradient for.
     df_backend : Literal["cpu", "cuda"], optional
         Backend for DF derivative contraction.
+    int1e_contract_backend : Literal["auto", "cpu", "cuda"], optional
+        Backend for AO 1e derivative contractions used in ``contract_dhcore_cart``.
     df_config : Any | None, optional
         Configuration for DF backend.
     df_threads : int, optional
@@ -558,10 +561,16 @@ def casscf_nuc_grad_df(
         The computed nuclear gradient.
     """
 
+    # When df_backend='cuda', auto-promote the 1e contraction backend so the
+    # full gradient pipeline stays GPU-resident (avoids CPU↔GPU ping-pong).
+    if str(int1e_contract_backend).strip().lower() == "cpu" and str(df_backend).strip().lower() == "cuda":
+        int1e_contract_backend = "cuda"
+
     t0_total = time.perf_counter() if profile is not None else 0.0
     if profile is not None:
         profile.clear()
         profile["df_backend"] = str(df_backend).strip().lower()
+        profile["int1e_contract_backend"] = str(int1e_contract_backend).strip().lower()
         profile["df_threads"] = int(df_threads)
 
     mol = getattr(scf_out, "mol", None)
@@ -672,6 +681,7 @@ def casscf_nuc_grad_df(
         atom_charges=charges,
         M=_asnumpy_f64(D_tot_ao),
         shell_atom=shell_atom,
+        contract_backend=str(int1e_contract_backend),
     )
 
     t_1e = time.perf_counter() if profile is not None else 0.0
@@ -691,9 +701,14 @@ def casscf_nuc_grad_df(
     _C_occ = _C_np[:, :_nocc]
     _tmp_w = _C_np @ _gfock_np[:, :_nocc]  # (nao, nocc)
     W = 0.5 * (_tmp_w @ _C_occ.T + _C_occ @ _tmp_w.T)
-    # contract_dS_ip_cart corresponds to the one-sided overlap derivative (ip).
-    # For symmetric W, -Tr(W·dS) = -2·Tr(W·dS_ip).
-    de_pulay = -2.0 * contract_dS_ip_cart(ao_basis, atom_coords_bohr=coords, M=W, shell_atom=shell_atom)
+    # contract_dS_cart returns the full symmetric nuclear derivative (both bra
+    # and ket centres), so -Tr(W dS) = -1 * contract_dS_cart(M=W).  This path
+    # uses the backend selected by int1e_contract_backend.
+    de_pulay = -1.0 * contract_dS_cart(
+        ao_basis, atom_coords_bohr=coords, M=W, shell_atom=shell_atom,
+        contract_backend=str(int1e_contract_backend),
+    )
+    t_pulay = time.perf_counter() if profile is not None else 0.0
 
     _de_h1_np = np.asarray(de_h1, dtype=np.float64)
     _de_df_np = _asnumpy_f64(de_df)
@@ -718,7 +733,8 @@ def casscf_nuc_grad_df(
         profile["t_df_s"] = float(t_df - t0_df)
         profile["t_1e_s"] = float(t_1e - t_df)
         profile["t_nuc_s"] = float(t_nuc - t_1e)
-        profile["t_total_s"] = float(t_nuc - t0_total)
+        profile["t_pulay_s"] = float(t_pulay - t_nuc)
+        profile["t_total_s"] = float(t_pulay - t0_total)
 
     return DFNucGradResult(
         e_tot=float(getattr(casscf, "e_tot", 0.0)),
@@ -1233,6 +1249,7 @@ def casscf_nuc_grad_df_per_root(
     fcisolver: GUGAFCISolver | None = None,
     twos: int | None = None,
     df_backend: Literal["cpu", "cuda"] = "cpu",
+    int1e_contract_backend: Literal["auto", "cpu", "cuda"] = "cpu",
     df_config: Any | None = None,
     df_threads: int = 0,
     delta_bohr: float = 1e-4,
@@ -1263,6 +1280,8 @@ def casscf_nuc_grad_df_per_root(
         Spin quantum number 2S.
     df_backend : Literal["cpu", "cuda"], optional
         Backend for DF derivative contraction.
+    int1e_contract_backend : Literal["auto", "cpu", "cuda"], optional
+        Backend for AO 1e derivative contractions used in ``contract_dhcore_cart``.
     df_config : Any | None, optional
         Configuration for DF backend.
     df_threads : int, optional
@@ -1608,14 +1627,20 @@ def casscf_nuc_grad_df_per_root(
             )
     de_h1_sa = contract_dhcore_cart(
         ao_basis, atom_coords_bohr=coords, atom_charges=charges,
-        M=_asnumpy_f64(D_tot_sa), shell_atom=shell_atom,
+        M=_asnumpy_f64(D_tot_sa), shell_atom=shell_atom, contract_backend=str(int1e_contract_backend),
     )
     # SA Pulay term: -Tr(W_sa · dS/dR).
     gfock_sa_np = _asnumpy_f64(gfock_sa)
     C_occ_np = C_np[:, :nocc]
     _tmp_sa = C_np @ gfock_sa_np[:, :nocc]  # (nao, nocc)
     W_sa = 0.5 * (_tmp_sa @ C_occ_np.T + C_occ_np @ _tmp_sa.T)
-    de_pulay_sa = -2.0 * contract_dS_ip_cart(ao_basis, atom_coords_bohr=coords, M=W_sa, shell_atom=shell_atom)
+    de_pulay_sa = -2.0 * contract_dS_ip_cart(
+        ao_basis,
+        atom_coords_bohr=coords,
+        M=W_sa,
+        shell_atom=shell_atom,
+        contract_backend=str(int1e_contract_backend),
+    )
 
     # SA base gradient: de_h1_sa + de_df_sa + de_nuc + de_pulay_sa.
     grad_sa_base = np.asarray(
@@ -1811,7 +1836,7 @@ def casscf_nuc_grad_df_per_root(
                     D_1e_delta = _asnumpy_f64(D_tot_K - D_tot_sa + D_act_lci + D_L_lorb)
                 de_h1_delta = contract_dhcore_cart(
                     ao_basis, atom_coords_bohr=coords, atom_charges=charges,
-                    M=D_1e_delta, shell_atom=shell_atom,
+                    M=D_1e_delta, shell_atom=shell_atom, contract_backend=str(int1e_contract_backend),
                 )
 
                 # ── Per-root Pulay delta: -Tr((W_K - W_sa) · dS/dR) ──
@@ -1820,7 +1845,11 @@ def casscf_nuc_grad_df_per_root(
                 _tmp_K = C_np @ gfock_K_np[:, :nocc]  # (nao, nocc)
                 W_K = 0.5 * (_tmp_K @ C_occ_np.T + C_occ_np @ _tmp_K.T)
                 de_pulay_delta = -2.0 * contract_dS_ip_cart(
-                    ao_basis, atom_coords_bohr=coords, M=W_K - W_sa, shell_atom=shell_atom,
+                    ao_basis,
+                    atom_coords_bohr=coords,
+                    M=W_K - W_sa,
+                    shell_atom=shell_atom,
+                    contract_backend=str(int1e_contract_backend),
                 )
 
                 _in_flight.append(
@@ -1904,7 +1933,7 @@ def casscf_nuc_grad_df_per_root(
             D_1e_delta = _asnumpy_f64(D_tot_K - D_tot_sa + D_act_lci + D_L_lorb)
         de_h1_delta = contract_dhcore_cart(
             ao_basis, atom_coords_bohr=coords, atom_charges=charges,
-            M=D_1e_delta, shell_atom=shell_atom,
+            M=D_1e_delta, shell_atom=shell_atom, contract_backend=str(int1e_contract_backend),
         )
 
         # ── Per-root Pulay delta: -Tr((W_K - W_sa) · dS/dR) ──
@@ -1913,7 +1942,11 @@ def casscf_nuc_grad_df_per_root(
         _tmp_K = C_np @ gfock_K_np[:, :nocc]  # (nao, nocc)
         W_K = 0.5 * (_tmp_K @ C_occ_np.T + C_occ_np @ _tmp_K.T)
         de_pulay_delta = -2.0 * contract_dS_ip_cart(
-            ao_basis, atom_coords_bohr=coords, M=W_K - W_sa, shell_atom=shell_atom,
+            ao_basis,
+            atom_coords_bohr=coords,
+            M=W_K - W_sa,
+            shell_atom=shell_atom,
+            contract_backend=str(int1e_contract_backend),
         )
 
         # Step F: Combine — grad_sa_base + delta 2e + delta 1e + delta Pulay

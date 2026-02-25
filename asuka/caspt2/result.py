@@ -73,6 +73,7 @@ class CASPT2GradResult:
     # Target-state metadata
     method: str = "SS"
     iroot: int = 0
+    nstates: int | None = None
     # PT2 lagrangian objects
     clag: np.ndarray | None = None
     olag: np.ndarray | None = None
@@ -80,4 +81,10 @@ class CASPT2GradResult:
     wlag: np.ndarray | None = None
     dpt2_1rdm: np.ndarray | None = None
     dpt2_2rdm: np.ndarray | None = None
+    # Validation/diagnostic metadata
+    fd_error_abs: float | None = None
+    fd_error_rel: float | None = None
+    molcas_delta_abs: float | None = None
+    molcas_delta_rel: float | None = None
+    convergence_flags: dict[str, Any] = field(default_factory=dict)
     breakdown: dict[str, Any] = field(default_factory=dict)

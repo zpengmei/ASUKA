@@ -121,18 +121,7 @@ def _caspt2_spinfree_states_for_soc(
     return states
 
 
-def _apply_xms_reference_rotation(*, heff: np.ndarray, e_ref_list: list[float], u0: np.ndarray) -> np.ndarray:
-    h = np.asarray(heff, dtype=np.float64)
-    u = np.asarray(u0, dtype=np.float64)
-    e_ref = np.asarray(e_ref_list, dtype=np.float64).ravel()
-    nstates = int(e_ref.size)
-    if h.shape != (nstates, nstates):
-        raise ValueError("heff shape mismatch with e_ref_list")
-    if u.shape != (nstates, nstates):
-        raise ValueError("u0 shape mismatch with e_ref_list")
-    d_ref = np.diag(e_ref)
-    h_ref_rot = np.asarray(u.T @ d_ref @ u, dtype=np.float64)
-    return np.asarray(h - d_ref + h_ref_rot, dtype=np.float64, order="C")
+from asuka.caspt2.xms_utils import _apply_xms_reference_rotation  # noqa: F401
 
 
 def _build_df_blocks_from_scf_out(
@@ -256,7 +245,8 @@ def _caspt2_from_asuka_ref(
     threshold_s: float,
     cuda_f3_cache_bytes: int,
     cuda_profile: bool,
-    verbose: int,
+    mixed_precision_rhs: bool = False,
+    verbose: int = 0,
 ) -> CASPT2Result:
     method_u = str(method).upper().strip()
     if method_u not in ("SS", "MS", "XMS"):
@@ -397,41 +387,22 @@ def _caspt2_from_asuka_ref(
 
     # ── SST backend early return ──
     pt2_backend_norm = str(pt2_backend).strip().lower()
-    if pt2_backend_norm == "sst":
-        if method_u != "SS":
-            raise NotImplementedError("SST backend supports SS-CASPT2 only")
+    if pt2_backend_norm in ("sst", "sst-ic", "sst-full"):
         from asuka.caspt2.sst import sst_caspt2_energy_ss  # noqa: PLC0415
         from asuka.caspt2.sst.types import SSTConfig, SSTInput  # noqa: PLC0415
 
-        fock_ss: CASPT2Fock = fock  # type: ignore[assignment]
+        # Determine SST mode: "sst" and "sst-full" use full SST, "sst-ic" uses IC split
+        sst_mode = "ic" if pt2_backend_norm == "sst-ic" else "full"
+
         C_np = np.asarray(cp.asnumpy(C) if hasattr(C, "get") else C, dtype=np.float64)
-
-        # Convert RDMs from CuPy to NumPy if needed
         _to_np = lambda x: np.asarray(cp.asnumpy(x) if hasattr(x, "get") else x, dtype=np.float64)
+        B_ao_np = _to_np(B_ao) if B_ao is not None else None
+        if B_ao_np is None:
+            raise ValueError(
+                "SST backend requires DF factors (scf_out.df_B). "
+                "Run SCF with df=True or provide DF integrals."
+            )
 
-        # Build CI context for the reduced system (cases A/C need F3)
-        ci_ctx = CASPT2CIContext(
-            drt=drt,
-            ci_csf=np.asarray(ci_vectors[iroot], dtype=np.float64),
-            max_memory_mb=float(max_memory_mb),
-        )
-
-        sst_inp = SSTInput(
-            ncore=int(ncore),
-            ncas=int(ncas),
-            nvirt=int(nvirt),
-            mo_coeff=C_np,
-            dm1_act=_to_np(dm1_list[iroot]),
-            dm2_act=_to_np(dm2_list[iroot]),
-            fock=fock_ss,
-            semicanonical=None,
-            e_ref=float(e_ref_list[iroot]),
-            e_nuc=float(e_nuc),
-            dm3_act=_to_np(dm3_list[iroot]),
-            ci_context=ci_ctx,
-            smap=smap,
-            B_ao=_to_np(B_ao) if B_ao is not None else None,
-        )
         sst_cfg = SSTConfig(
             imag_shift=float(imag_shift),
             real_shift=float(real_shift),
@@ -441,14 +412,210 @@ def _caspt2_from_asuka_ref(
             threshold_s=float(threshold_s),
             verbose=int(verbose),
         )
-        sst_res = sst_caspt2_energy_ss(sst_inp, sst_cfg)
-        return CASPT2Result(
-            e_ref=float(sst_res.e_tot - sst_res.e_pt2),
-            e_pt2=float(sst_res.e_pt2),
-            e_tot=float(sst_res.e_tot),
-            amplitudes=sst_res.amplitudes_active if sst_res.amplitudes_active is not None else None,
-            method="SS",
-            breakdown=sst_res.breakdown,
+
+        def _build_sst_input(state: int, fock_i: CASPT2Fock) -> SSTInput:
+            ci_ctx = CASPT2CIContext(
+                drt=drt,
+                ci_csf=np.asarray(ci_vectors[state], dtype=np.float64),
+                max_memory_mb=float(max_memory_mb),
+            )
+            return SSTInput(
+                ncore=int(ncore),
+                ncas=int(ncas),
+                nvirt=int(nvirt),
+                mo_coeff=C_np,
+                dm1_act=_to_np(dm1_list[state]),
+                dm2_act=_to_np(dm2_list[state]),
+                fock=fock_i,
+                semicanonical=None,
+                e_ref=float(e_ref_list[state]),
+                e_nuc=float(e_nuc),
+                dm3_act=_to_np(dm3_list[state]),
+                ci_context=ci_ctx,
+                smap=smap,
+                B_ao=B_ao_np,
+            )
+
+        if method_u == "SS":
+            fock_ss: CASPT2Fock = fock  # type: ignore[assignment]
+            sst_inp = _build_sst_input(int(iroot), fock_ss)
+            sst_res = sst_caspt2_energy_ss(sst_inp, sst_cfg, sst_mode=sst_mode)
+            return CASPT2Result(
+                e_ref=float(sst_res.e_tot - sst_res.e_pt2),
+                e_pt2=float(sst_res.e_pt2),
+                e_tot=float(sst_res.e_tot),
+                amplitudes=sst_res.amplitudes_active if sst_res.amplitudes_active is not None else None,
+                method="SS",
+                breakdown=sst_res.breakdown,
+            )
+
+        # MS/XMS via SST — use CUDA path when build_heff_cuda is available
+        from asuka.caspt2.sst.multistate import sst_caspt2_energy_ms  # noqa: PLC0415
+
+        _sst_cuda_ok = False
+        try:
+            from asuka.caspt2.sst.multistate import sst_caspt2_energy_ms_cuda  # noqa: PLC0415
+            from asuka.caspt2.cuda.multistate_cuda import build_heff_cuda  # noqa: PLC0415,F811
+            _sst_cuda_ok = True
+        except ImportError:
+            if int(verbose) >= 1:
+                print("SST CUDA modules unavailable; using CPU path")
+
+        if method_u == "MS":
+            sst_inputs = [
+                _build_sst_input(i, fock[i] if isinstance(fock, (list, tuple)) else fock)
+                for i in range(nstates)
+            ]
+            if _sst_cuda_ok:
+                return sst_caspt2_energy_ms_cuda(
+                    nstates=nstates,
+                    sst_inputs=sst_inputs,
+                    ci_vectors=[np.asarray(c, dtype=np.float64) for c in ci_vectors],
+                    drt=drt,
+                    smap=smap,
+                    fock_list=fock,
+                    df_blocks=df_blocks,
+                    dm1_list=[_to_np(d) for d in dm1_list],
+                    dm2_list=[_to_np(d) for d in dm2_list],
+                    dm3_list=[_to_np(d) for d in dm3_list],
+                    e_ref_list=e_ref_list,
+                    cfg=sst_cfg,
+                    device=int(cuda_device),
+                    verbose=int(verbose),
+                )
+            return sst_caspt2_energy_ms(
+                nstates=nstates,
+                sst_inputs=sst_inputs,
+                ci_vectors=[np.asarray(c, dtype=np.float64) for c in ci_vectors],
+                drt=drt,
+                smap=smap,
+                fock_list=fock,
+                eri_mo=None,
+                dm1_list=[_to_np(d) for d in dm1_list],
+                dm2_list=[_to_np(d) for d in dm2_list],
+                dm3_list=[_to_np(d) for d in dm3_list],
+                e_ref_list=e_ref_list,
+                cfg=sst_cfg,
+                verbose=int(verbose),
+            )
+
+        # XMS
+        if _sst_cuda_ok:
+            # Use CUDA XMS rotation when available
+            try:
+                from asuka.caspt2.cuda.xms_cuda import xms_rotate_states_cuda  # noqa: PLC0415
+                rotated_ci, u0, h0_model = xms_rotate_states_cuda(
+                    drt,
+                    [np.asarray(c, dtype=np.float64) for c in ci_vectors],
+                    [_to_np(d) for d in dm1_list],
+                    fock_sa,
+                    int(ncore),
+                    int(ncas),
+                    nstates,
+                    device=int(cuda_device),
+                    verbose=int(verbose),
+                )
+            except ImportError:
+                from asuka.caspt2.xms import xms_rotate_states  # noqa: PLC0415
+                rotated_ci, u0, h0_model = xms_rotate_states(
+                    drt,
+                    [np.asarray(c, dtype=np.float64) for c in ci_vectors],
+                    [_to_np(d) for d in dm1_list],
+                    fock_sa,
+                    int(ncore),
+                    int(ncas),
+                    nstates,
+                    verbose=int(verbose),
+                )
+        else:
+            from asuka.caspt2.xms import xms_rotate_states  # noqa: PLC0415
+            rotated_ci, u0, h0_model = xms_rotate_states(
+                drt,
+                [np.asarray(c, dtype=np.float64) for c in ci_vectors],
+                [_to_np(d) for d in dm1_list],
+                fock_sa,
+                int(ncore),
+                int(ncas),
+                nstates,
+                verbose=int(verbose),
+            )
+
+        # Recompute RDMs from rotated CI vectors
+        rot_dm1_list: list[Any] = []
+        rot_dm2_list: list[Any] = []
+        rot_dm3_list: list[Any] = []
+        for i, c in enumerate(rotated_ci):
+            ci_i = np.asarray(c, dtype=np.float64)
+            if make_rdm123_molcas_cuda is not None:
+                dm1_i, dm2_i, dm3_i = make_rdm123_molcas_cuda(drt, ci_i, device=int(cuda_device))
+            else:
+                dm1_raw, dm2_raw, dm3_raw = _make_rdm123_raw(drt, ci_i, reorder=False)
+                dm1_i, dm2_i, dm3_i = _reorder_dm123_molcas(dm1_raw, dm2_raw, dm3_raw, inplace=True)
+            rot_dm1_list.append(_to_np(dm1_i))
+            rot_dm2_list.append(_to_np(dm2_i))
+            rot_dm3_list.append(_to_np(dm3_i))
+
+        # Build per-state SST inputs using rotated densities and SA Fock
+        xms_sst_inputs = []
+        for i in range(nstates):
+            ci_ctx = CASPT2CIContext(
+                drt=drt,
+                ci_csf=np.asarray(rotated_ci[i], dtype=np.float64),
+                max_memory_mb=float(max_memory_mb),
+            )
+            xms_sst_inputs.append(SSTInput(
+                ncore=int(ncore),
+                ncas=int(ncas),
+                nvirt=int(nvirt),
+                mo_coeff=C_np,
+                dm1_act=rot_dm1_list[i],
+                dm2_act=rot_dm2_list[i],
+                fock=fock_sa,
+                semicanonical=None,
+                e_ref=float(e_ref_list[i]),
+                e_nuc=float(e_nuc),
+                dm3_act=rot_dm3_list[i],
+                ci_context=ci_ctx,
+                smap=smap,
+                B_ao=B_ao_np,
+            ))
+
+        if _sst_cuda_ok:
+            return sst_caspt2_energy_ms_cuda(
+                nstates=nstates,
+                sst_inputs=xms_sst_inputs,
+                ci_vectors=[np.asarray(c, dtype=np.float64) for c in rotated_ci],
+                drt=drt,
+                smap=smap,
+                fock_list=fock_sa,
+                df_blocks=df_blocks,
+                dm1_list=rot_dm1_list,
+                dm2_list=rot_dm2_list,
+                dm3_list=rot_dm3_list,
+                e_ref_list=e_ref_list,
+                cfg=sst_cfg,
+                xms_mode=True,
+                u0=np.asarray(u0, dtype=np.float64),
+                device=int(cuda_device),
+                verbose=int(verbose),
+            )
+
+        return sst_caspt2_energy_ms(
+            nstates=nstates,
+            sst_inputs=xms_sst_inputs,
+            ci_vectors=[np.asarray(c, dtype=np.float64) for c in rotated_ci],
+            drt=drt,
+            smap=smap,
+            fock_list=fock_sa,
+            eri_mo=None,
+            dm1_list=rot_dm1_list,
+            dm2_list=rot_dm2_list,
+            dm3_list=rot_dm3_list,
+            e_ref_list=e_ref_list,
+            cfg=sst_cfg,
+            xms_mode=True,
+            u0=np.asarray(u0, dtype=np.float64),
+            verbose=int(verbose),
         )
 
     # Placeholder for full ERIs: DF path does not use eri_mo.
@@ -479,6 +646,7 @@ def _caspt2_from_asuka_ref(
             threshold_s=float(threshold_s),
             verbose=int(verbose),
             store_row_dots=bool(store_row_dots),
+            mixed_precision_rhs=bool(mixed_precision_rhs),
         )
 
     if method_u == "SS":
@@ -758,6 +926,7 @@ def run_caspt2(
     threshold_s: float = 1e-8,
     cuda_f3_cache_bytes: int = 512 * 1024 * 1024,
     cuda_profile: bool = False,
+    mixed_precision_rhs: bool = False,
     verbose: int = 0,
 ) -> CASPT2Result:
     """Run SS/MS/XMS CASPT2 from an ASUKA CASCI/CASSCF result.
@@ -796,6 +965,7 @@ def run_caspt2(
         threshold_s=float(threshold_s),
         cuda_f3_cache_bytes=int(cuda_f3_cache_bytes),
         cuda_profile=bool(cuda_profile),
+        mixed_precision_rhs=bool(mixed_precision_rhs),
         verbose=int(verbose),
     )
 

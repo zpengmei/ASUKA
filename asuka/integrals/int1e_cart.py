@@ -20,6 +20,7 @@ from math import pi, sqrt
 import functools
 import numpy as np
 import os
+from typing import Any, Literal
 
 from asuka.cueri.basis_cart import BasisCartSoA
 from asuka.cueri.boys import boys_fm_list
@@ -282,6 +283,72 @@ def _int1e_backend() -> str:
     raise ValueError("ASUKA_INT1E_BACKEND must be one of: auto|python|numba|cython")
 
 
+def _load_numba_backend():
+    try:
+        from asuka.integrals import _int1e_cart_numba as _nb  # noqa: PLC0415
+    except Exception:
+        return None
+    if bool(getattr(_nb, "HAS_NUMBA", False)):
+        return _nb
+    return None
+
+
+def _maybe_import_cupy():
+    try:
+        import cupy as cp  # noqa: PLC0415
+
+        return cp
+    except Exception:
+        return None
+
+
+def _resolve_contract_backend(contract_backend: Literal["auto", "cpu", "cuda"], M: Any) -> str:
+    v = str(contract_backend).strip().lower()
+    if v not in {"auto", "cpu", "cuda"}:
+        raise ValueError("contract_backend must be one of: auto|cpu|cuda")
+    if v == "auto":
+        cp = _maybe_import_cupy()
+        if cp is not None and isinstance(M, cp.ndarray):  # type: ignore[attr-defined]
+            return "cuda"
+        return "cpu"
+    if v == "cuda":
+        cp = _maybe_import_cupy()
+        if cp is None:
+            raise RuntimeError("contract_backend='cuda' requires CuPy")
+    return v
+
+
+def _build_comp_tables_py(lmax: int) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Build flattened (lx,ly,lz) tables for all l<=lmax in PySCF cart order."""
+
+    lmax = int(lmax)
+    if lmax < 0:
+        raise ValueError("lmax must be >= 0")
+
+    start = np.zeros((lmax + 2,), dtype=np.int32)
+    total = 0
+    for l in range(lmax + 1):
+        start[l] = total
+        total += (l + 1) * (l + 2) // 2
+    start[lmax + 1] = total
+
+    lx = np.empty((total,), dtype=np.int16)
+    ly = np.empty((total,), dtype=np.int16)
+    lz = np.empty((total,), dtype=np.int16)
+
+    off = 0
+    for l in range(lmax + 1):
+        for lxi in range(l, -1, -1):
+            for lyi in range(l - lxi, -1, -1):
+                lzi = l - lxi - lyi
+                lx[off] = lxi
+                ly[off] = lyi
+                lz[off] = lzi
+                off += 1
+
+    return start, lx, ly, lz
+
+
 @functools.lru_cache(maxsize=64)
 def _shell_pairs_lower(nshell: int) -> tuple[np.ndarray, np.ndarray]:
     nshell = int(nshell)
@@ -300,10 +367,8 @@ def _shell_pairs_lower(nshell: int) -> tuple[np.ndarray, np.ndarray]:
 
 @functools.lru_cache(maxsize=64)
 def _comp_tables_cached(lmax: int) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    from asuka.integrals import _int1e_cart_numba as _nb  # noqa: PLC0415
-
     lmax = int(lmax)
-    comp_start, comp_lx, comp_ly, comp_lz = _nb.build_comp_tables(lmax)
+    comp_start, comp_lx, comp_ly, comp_lz = _build_comp_tables_py(lmax)
     comp_start.setflags(write=False)
     comp_lx.setflags(write=False)
     comp_ly.setflags(write=False)
@@ -1388,8 +1453,9 @@ def contract_dS_cart(
     basis: BasisCartSoA,
     *,
     atom_coords_bohr: np.ndarray,
-    M: np.ndarray,
+    M: Any,
     shell_atom: np.ndarray | None = None,
+    contract_backend: Literal["auto", "cpu", "cuda"] = "auto",
 ) -> np.ndarray:
     """Return gS[natm,3] = sum_{mu,nu} dS[A,x,mu,nu] * M[mu,nu] without building dS.
 
@@ -1410,13 +1476,7 @@ def contract_dS_cart(
         raise ValueError("atom_coords_bohr must have shape (natm, 3)")
     natm = int(atom_coords_bohr.shape[0])
 
-    M = np.asarray(M, dtype=np.float64)
-    if M.ndim != 2 or M.shape[0] != M.shape[1]:
-        raise ValueError("M must be a square 2D array")
     nao = int(nao_cart_from_basis(basis))
-    if tuple(M.shape) != (nao, nao):
-        raise ValueError("M shape mismatch with basis nao")
-    M = np.asarray(M, dtype=np.float64, order="C")
 
     if shell_atom is None:
         shell_atom = shell_to_atom_map(basis, atom_coords_bohr=atom_coords_bohr)
@@ -1424,45 +1484,71 @@ def contract_dS_cart(
     if shell_atom.shape != (int(basis.shell_l.shape[0]),):
         raise ValueError("shell_atom must have shape (nShell,)")
 
-    backend = _int1e_backend()
-    if backend in ("numba", "cython"):
-        from asuka.integrals import _int1e_cart_numba as _nb  # noqa: PLC0415
+    contract_backend_s = _resolve_contract_backend(contract_backend, M)
 
-        if bool(getattr(_nb, "HAS_NUMBA", False)):
-            lmax = int(np.max(basis.shell_l)) if int(basis.shell_l.size) else 0
-            comp_start, comp_lx, comp_ly, comp_lz = _comp_tables_cached(lmax)
-            pairA, pairB = _shell_pairs_lower(int(basis.shell_l.shape[0]))
-            return _nb.contract_dS_cart_numba(
-                basis.shell_cxyz,
-                basis.shell_prim_start,
-                basis.shell_nprim,
-                basis.shell_l,
-                basis.shell_ao_start,
-                basis.prim_exp,
-                basis.prim_coef,
-                shell_atom,
-                int(natm),
-                comp_start,
-                comp_lx,
-                comp_ly,
-                comp_lz,
-                pairA,
-                pairB,
-                int(nao),
-                M,
-            )
+    if contract_backend_s == "cpu":
+        M_np = np.asarray(M, dtype=np.float64)
+        if M_np.ndim != 2 or M_np.shape[0] != M_np.shape[1]:
+            raise ValueError("M must be a square 2D array")
+        if tuple(M_np.shape) != (nao, nao):
+            raise ValueError("M shape mismatch with basis nao")
+        M_np = np.asarray(M_np, dtype=np.float64, order="C")
 
-    # Fallback: build full dS tensor and contract (memory-heavy).
+        backend = _int1e_backend()
+        if backend in ("numba", "cython"):
+            _nb = _load_numba_backend()
+            if _nb is not None:
+                lmax = int(np.max(basis.shell_l)) if int(basis.shell_l.size) else 0
+                comp_start, comp_lx, comp_ly, comp_lz = _comp_tables_cached(lmax)
+                pairA, pairB = _shell_pairs_lower(int(basis.shell_l.shape[0]))
+                return _nb.contract_dS_cart_numba(
+                    basis.shell_cxyz,
+                    basis.shell_prim_start,
+                    basis.shell_nprim,
+                    basis.shell_l,
+                    basis.shell_ao_start,
+                    basis.prim_exp,
+                    basis.prim_coef,
+                    shell_atom,
+                    int(natm),
+                    comp_start,
+                    comp_lx,
+                    comp_ly,
+                    comp_lz,
+                    pairA,
+                    pairB,
+                    int(nao),
+                    M_np,
+                )
+
+        # Fallback: build full dS tensor and contract (memory-heavy).
+        dS = build_dS_cart(basis, atom_coords_bohr=atom_coords_bohr, shell_atom=shell_atom)
+        return np.asarray(np.einsum("axij,ij->ax", dS, M_np, optimize=True), dtype=np.float64)
+
+    cp = _maybe_import_cupy()
+    if cp is None:  # pragma: no cover
+        raise RuntimeError("contract_backend='cuda' requires CuPy")
+    M_dev = cp.asarray(M, dtype=cp.float64)
+    if M_dev.ndim != 2 or int(M_dev.shape[0]) != int(M_dev.shape[1]):
+        raise ValueError("M must be a square 2D array")
+    if tuple(map(int, M_dev.shape)) != (nao, nao):
+        raise ValueError("M shape mismatch with basis nao")
+    M_dev = cp.ascontiguousarray(M_dev)
+
+    # CUDA contraction path: build derivative tensor on host, contract on device.
     dS = build_dS_cart(basis, atom_coords_bohr=atom_coords_bohr, shell_atom=shell_atom)
-    return np.einsum("axij,ij->ax", dS, M, optimize=True)
+    dS_dev = cp.asarray(dS, dtype=cp.float64)
+    out_dev = cp.einsum("axij,ij->ax", dS_dev, M_dev, optimize=True)
+    return np.asarray(cp.asnumpy(out_dev), dtype=np.float64)
 
 
 def contract_dS_ip_cart(
     basis: BasisCartSoA,
     *,
     atom_coords_bohr: np.ndarray,
-    M: np.ndarray,
+    M: Any,
     shell_atom: np.ndarray | None = None,
+    contract_backend: Literal["auto", "cpu", "cuda"] = "auto",
 ) -> np.ndarray:
     """Contract the bra-side overlap derivative (PySCF ``get_ovlp`` convention) with a matrix.
 
@@ -1487,21 +1573,64 @@ def contract_dS_ip_cart(
         raise ValueError("atom_coords_bohr must have shape (natm, 3)")
     natm = int(atom_coords_bohr.shape[0])
 
-    M = np.asarray(M, dtype=np.float64)
-    if M.ndim != 2 or M.shape[0] != M.shape[1]:
-        raise ValueError("M must be a square 2D array")
-    nao = int(nao_cart_from_basis(basis))
-    if tuple(M.shape) != (nao, nao):
-        raise ValueError("M shape mismatch with basis nao")
-    M = np.asarray(M, dtype=np.float64, order="C")
-
     if shell_atom is None:
         shell_atom = shell_to_atom_map(basis, atom_coords_bohr=atom_coords_bohr)
     shell_atom = np.asarray(shell_atom, dtype=np.int32).ravel()
     if shell_atom.shape != (int(basis.shell_l.shape[0]),):
         raise ValueError("shell_atom must have shape (nShell,)")
 
-    out = np.zeros((natm, 3), dtype=np.float64)
+    contract_backend_s = _resolve_contract_backend(contract_backend, M)
+    nao = int(nao_cart_from_basis(basis))
+
+    # Fast path: numba-compiled kernel (CPU)
+    if contract_backend_s == "cpu":
+        M = np.asarray(M, dtype=np.float64)
+        if M.ndim != 2 or M.shape[0] != M.shape[1]:
+            raise ValueError("M must be a square 2D array")
+        if tuple(M.shape) != (nao, nao):
+            raise ValueError("M shape mismatch with basis nao")
+        M = np.asarray(M, dtype=np.float64, order="C")
+
+        backend = _int1e_backend()
+        if backend in ("numba", "cython"):
+            _nb = _load_numba_backend()
+            if _nb is not None:
+                lmax = int(np.max(basis.shell_l)) if int(basis.shell_l.size) else 0
+                comp_start, comp_lx, comp_ly, comp_lz = _comp_tables_cached(lmax)
+                pairA, pairB = _shell_pairs_lower(int(basis.shell_l.shape[0]))
+                return _nb.contract_dS_ip_cart_numba(
+                    basis.shell_cxyz,
+                    basis.shell_prim_start,
+                    basis.shell_nprim,
+                    basis.shell_l,
+                    basis.shell_ao_start,
+                    basis.prim_exp,
+                    basis.prim_coef,
+                    shell_atom,
+                    int(natm),
+                    comp_start,
+                    comp_lx,
+                    comp_ly,
+                    comp_lz,
+                    pairA,
+                    pairB,
+                    int(nao),
+                    M,
+                )
+
+        out = np.zeros((natm, 3), dtype=np.float64)
+        cp = None
+    else:
+        cp = _maybe_import_cupy()
+        if cp is None:  # pragma: no cover
+            raise RuntimeError("contract_backend='cuda' requires CuPy")
+        M = cp.asarray(M, dtype=cp.float64)
+        if M.ndim != 2 or int(M.shape[0]) != int(M.shape[1]):
+            raise ValueError("M must be a square 2D array")
+        if tuple(map(int, M.shape)) != (nao, nao):
+            raise ValueError("M shape mismatch with basis nao")
+        M = cp.ascontiguousarray(M)
+        out_dev = cp.zeros((natm, 3), dtype=cp.float64)
 
     nshell = int(basis.shell_l.shape[0])
     for shA in range(nshell):
@@ -1584,14 +1713,26 @@ def contract_dS_ip_cart(
                                 dBz -= float(lbz) * Sz[laz, lbz - 1]
                             tileB[2, i, j] += c * dBz * S_xy
 
-            Mab = M[aoA : aoA + nA, aoB : aoB + nB]
-            out[atomA] += np.einsum("xij,ij->x", tileA, Mab, optimize=True)
+            if contract_backend_s == "cpu":
+                Mab = M[aoA : aoA + nA, aoB : aoB + nB]
+                out[atomA] += np.einsum("xij,ij->x", tileA, Mab, optimize=True)
+            else:
+                Mab_dev = M[aoA : aoA + nA, aoB : aoB + nB]
+                tileA_dev = cp.asarray(tileA, dtype=cp.float64)
+                out_dev[atomA] += cp.einsum("xij,ij->x", tileA_dev, Mab_dev, optimize=True)
 
             if shA != shB:
-                Mba = M[aoB : aoB + nB, aoA : aoA + nA]
-                out[atomB] += np.einsum("xij,ij->x", tileB.transpose(0, 2, 1), Mba, optimize=True)
+                if contract_backend_s == "cpu":
+                    Mba = M[aoB : aoB + nB, aoA : aoA + nA]
+                    out[atomB] += np.einsum("xij,ij->x", tileB.transpose(0, 2, 1), Mba, optimize=True)
+                else:
+                    Mba_dev = M[aoB : aoB + nB, aoA : aoA + nA]
+                    tileBt_dev = cp.asarray(tileB.transpose(0, 2, 1), dtype=cp.float64)
+                    out_dev[atomB] += cp.einsum("xij,ij->x", tileBt_dev, Mba_dev, optimize=True)
 
-    return np.asarray(out, dtype=np.float64)
+    if contract_backend_s == "cpu":
+        return np.asarray(out, dtype=np.float64)
+    return np.asarray(cp.asnumpy(out_dev), dtype=np.float64)
 
 
 def contract_dhcore_cart(
@@ -1599,9 +1740,10 @@ def contract_dhcore_cart(
     *,
     atom_coords_bohr: np.ndarray,
     atom_charges: np.ndarray,
-    M: np.ndarray,
+    M: Any,
     shell_atom: np.ndarray | None = None,
     include_operator_deriv: bool = True,
+    contract_backend: Literal["auto", "cpu", "cuda"] = "auto",
 ) -> np.ndarray:
     """Return gh1[natm,3] = sum_{mu,nu} d(hcore)[A,x,mu,nu] * M[mu,nu] without building dhcore.
 
@@ -1620,13 +1762,7 @@ def contract_dhcore_cart(
     if atom_charges.shape != (natm,):
         raise ValueError("atom_charges must have shape (natm,)")
 
-    M = np.asarray(M, dtype=np.float64)
-    if M.ndim != 2 or M.shape[0] != M.shape[1]:
-        raise ValueError("M must be a square 2D array")
     nao = int(nao_cart_from_basis(basis))
-    if tuple(M.shape) != (nao, nao):
-        raise ValueError("M shape mismatch with basis nao")
-    M = np.asarray(M, dtype=np.float64, order="C")
 
     if shell_atom is None:
         shell_atom = shell_to_atom_map(basis, atom_coords_bohr=atom_coords_bohr)
@@ -1634,54 +1770,101 @@ def contract_dhcore_cart(
     if shell_atom.shape != (int(basis.shell_l.shape[0]),):
         raise ValueError("shell_atom must have shape (nShell,)")
 
-    from asuka.integrals import _int1e_cart_numba as _nb  # noqa: PLC0415
-
+    contract_backend_s = _resolve_contract_backend(contract_backend, M)
     lmax = int(np.max(basis.shell_l)) if int(basis.shell_l.size) else 0
     comp_start, comp_lx, comp_ly, comp_lz = _comp_tables_cached(lmax)
     pairA, pairB = _shell_pairs_lower(int(basis.shell_l.shape[0]))
 
-    gT = _nb.contract_dT_cart_numba(
-        basis.shell_cxyz,
-        basis.shell_prim_start,
-        basis.shell_nprim,
-        basis.shell_l,
-        basis.shell_ao_start,
-        basis.prim_exp,
-        basis.prim_coef,
-        shell_atom,
-        int(natm),
-        comp_start,
-        comp_lx,
-        comp_ly,
-        comp_lz,
-        pairA,
-        pairB,
-        int(nao),
-        M,
+    if contract_backend_s == "cpu":
+        M_np = np.asarray(M, dtype=np.float64)
+        if M_np.ndim != 2 or M_np.shape[0] != M_np.shape[1]:
+            raise ValueError("M must be a square 2D array")
+        if tuple(M_np.shape) != (nao, nao):
+            raise ValueError("M shape mismatch with basis nao")
+        M_np = np.asarray(M_np, dtype=np.float64, order="C")
+
+        backend = _int1e_backend()
+        if backend in ("numba", "cython"):
+            _nb = _load_numba_backend()
+            if _nb is not None:
+                gT = _nb.contract_dT_cart_numba(
+                    basis.shell_cxyz,
+                    basis.shell_prim_start,
+                    basis.shell_nprim,
+                    basis.shell_l,
+                    basis.shell_ao_start,
+                    basis.prim_exp,
+                    basis.prim_coef,
+                    shell_atom,
+                    int(natm),
+                    comp_start,
+                    comp_lx,
+                    comp_ly,
+                    comp_lz,
+                    pairA,
+                    pairB,
+                    int(nao),
+                    M_np,
+                )
+                gV = _nb.contract_dV_cart_numba(
+                    basis.shell_cxyz,
+                    basis.shell_prim_start,
+                    basis.shell_nprim,
+                    basis.shell_l,
+                    basis.shell_ao_start,
+                    basis.prim_exp,
+                    basis.prim_coef,
+                    atom_coords_bohr,
+                    atom_charges,
+                    shell_atom,
+                    int(natm),
+                    comp_start,
+                    comp_lx,
+                    comp_ly,
+                    comp_lz,
+                    pairA,
+                    pairB,
+                    int(nao),
+                    bool(include_operator_deriv),
+                    M_np,
+                )
+                return np.asarray(gT + gV, dtype=np.float64)
+
+        dT = build_dT_cart(basis, atom_coords_bohr=atom_coords_bohr, shell_atom=shell_atom)
+        dV = build_dV_cart(
+            basis,
+            atom_coords_bohr=atom_coords_bohr,
+            atom_charges=atom_charges,
+            shell_atom=shell_atom,
+            include_operator_deriv=bool(include_operator_deriv),
+        )
+        gT = np.einsum("axij,ij->ax", dT, M_np, optimize=True)
+        gV = np.einsum("axij,ij->ax", dV, M_np, optimize=True)
+        return np.asarray(gT + gV, dtype=np.float64)
+
+    cp = _maybe_import_cupy()
+    if cp is None:  # pragma: no cover
+        raise RuntimeError("contract_backend='cuda' requires CuPy")
+    M_dev = cp.asarray(M, dtype=cp.float64)
+    if M_dev.ndim != 2 or int(M_dev.shape[0]) != int(M_dev.shape[1]):
+        raise ValueError("M must be a square 2D array")
+    if tuple(map(int, M_dev.shape)) != (nao, nao):
+        raise ValueError("M shape mismatch with basis nao")
+    M_dev = cp.ascontiguousarray(M_dev)
+
+    dT = build_dT_cart(basis, atom_coords_bohr=atom_coords_bohr, shell_atom=shell_atom)
+    dV = build_dV_cart(
+        basis,
+        atom_coords_bohr=atom_coords_bohr,
+        atom_charges=atom_charges,
+        shell_atom=shell_atom,
+        include_operator_deriv=bool(include_operator_deriv),
     )
-    gV = _nb.contract_dV_cart_numba(
-        basis.shell_cxyz,
-        basis.shell_prim_start,
-        basis.shell_nprim,
-        basis.shell_l,
-        basis.shell_ao_start,
-        basis.prim_exp,
-        basis.prim_coef,
-        atom_coords_bohr,
-        atom_charges,
-        shell_atom,
-        int(natm),
-        comp_start,
-        comp_lx,
-        comp_ly,
-        comp_lz,
-        pairA,
-        pairB,
-        int(nao),
-        bool(include_operator_deriv),
-        M,
-    )
-    return np.asarray(gT + gV, dtype=np.float64)
+    dT_dev = cp.asarray(dT, dtype=cp.float64)
+    dV_dev = cp.asarray(dV, dtype=cp.float64)
+    gT_dev = cp.einsum("axij,ij->ax", dT_dev, M_dev, optimize=True)
+    gV_dev = cp.einsum("axij,ij->ax", dV_dev, M_dev, optimize=True)
+    return np.asarray(cp.asnumpy(gT_dev + gV_dev), dtype=np.float64)
 
 
 __all__ = [

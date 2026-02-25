@@ -670,13 +670,18 @@ def whiten_3c2e(X, L):
         raise ValueError(f"L has shape {L.shape}, but X implies naux={naux}")
 
     X_flat = X.reshape((nao0 * nao0, naux))
-    # B^T = L^{-1} X^T  (L is lower)
-    BT = cpx_linalg.solve_triangular(L, X_flat.T, lower=True, trans="N", unit_diagonal=False, overwrite_b=False)
+    # B^T = L^{-1} X^T  (L is lower).
+    # Make an explicit C-contiguous copy of X_flat.T so solve_triangular can
+    # overwrite it in-place, avoiding an internal allocation.
+    X_flat_T = cp.ascontiguousarray(X_flat.T)       # (naux, nao²)
+    del X_flat
+    BT = cpx_linalg.solve_triangular(L, X_flat_T, lower=True, trans="N", unit_diagonal=False, overwrite_b=True)
+    del X_flat_T
     # Normalize layout to C-contiguous so downstream (J/K, transforms) have
     # stable performance regardless of the input X memory order/strides.
     B_flat = cp.ascontiguousarray(BT.T)
-    B = B_flat.reshape((nao0, nao0, naux))
-    return cp.ascontiguousarray(B)
+    del BT
+    return B_flat.reshape((nao0, nao0, naux))
 
 
 def active_Lfull_from_B(B, C_active):

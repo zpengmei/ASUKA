@@ -57,6 +57,7 @@ def caspt2_energy_ss(
     maxiter: int = 200,
     threshold: float = 1e-10,
     threshold_s: float = 1e-8,
+    mixed_precision_rhs: bool = False,
     verbose: int = 0,
 ) -> CASPT2EnergyResult:
     """Compute SS-CASPT2 energy for a single reference state.
@@ -142,6 +143,7 @@ def caspt2_energy_ss(
             device=cuda_device,
             store_rhs=store_rhs,
             store_row_dots=store_row_dots,
+            mixed_precision_rhs=bool(mixed_precision_rhs),
         )
 
     if bool(store_row_dots):

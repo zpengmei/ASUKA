@@ -298,6 +298,7 @@ class CASSCFResult:
     mo_coeff: Any
     grad_norm: float
     casci: CASCIResult
+    mo_energy: Any | None = None
     profile: dict | None = None
     scf_out: Any | None = None
 
@@ -435,12 +436,14 @@ def run_casscf_df(
     dense_gpu_ao_rep: str = "auto",
     dense_gpu_builder_mol: Any | None = None,
     dense_exact_jk: bool | str = "auto",
-    max_cycle_macro: int = 30,
+    scramble_virtuals: bool | int = False,
+    scramble_nfrontier: int = 20,
+    max_cycle_macro: int = 50,
     tol: float = 1e-8,
     conv_tol_grad: float | None = None,
-    max_stepsize: float = 0.02,
+    max_stepsize: float = 0.10,
     damp: float = 1.0,
-    orbital_optimizer: str = "ah",
+    orbital_optimizer: str = "1step",
     lbfgs_history: int = 10,
     lbfgs_descent_guard: bool = False,
     lbfgs_descent_guard_clear_history: bool = True,
@@ -451,7 +454,7 @@ def run_casscf_df(
     step_rejection_tol: float = 1e-6,
     step_rejection_factor: float = 0.7,
     step_rejection_min_stepsize: float = 1e-4,
-    step_recovery_enabled: bool = False,
+    step_recovery_enabled: bool = True,
     step_recovery_factor: float = 1.2,
     step_recovery_interval: int = 5,
     step_norm_scale_alpha: float = 0.0,
@@ -465,11 +468,11 @@ def run_casscf_df(
     ah_lindep: float = 1e-14,
     ah_start_tol: float = 2.5,
     ah_start_cycle: int = 3,
-    ah_max_cycle_micro: int = 4,
+    ah_max_cycle_micro: int = 6,
     ah_grad_trust_region: float = 3.0,
-    ah_kf_interval: int = 4,
+    ah_kf_interval: int = 6,
     ah_kf_trust_region: float = 3.0,
-    ah_max_cycle_micro_cap: int | None = 4,
+    ah_max_cycle_micro_cap: int | None = 6,
     ah_conv_tol_grad: float = 1e-4,
     ah_conv_tol_energy: float = 1e-7,
     ah_ci_update: str = "orthonormalize",
@@ -478,6 +481,16 @@ def run_casscf_df(
     dense_cpu_eps_mo: float = 0.0,
     dense_cpu_threads: int = 0,
     dense_cpu_blas_nthreads: int | None = None,
+    newton_mixed_precision: bool = False,
+    newton_aux_block_naux: int = 0,
+    dense_eigh_ncsf_threshold: int = 500,
+    adaptive_stepsize: bool = True,
+    adaptive_growth_factor: float = 1.5,
+    adaptive_shrink_factor: float = 0.7,
+    adaptive_max_stepsize: float | None = None,
+    ah_auto_scale: bool = True,
+    ah_options: dict[str, Any] | None = None,
+    sort_mo: bool = True,
     profile: dict | None = None,
     **solver_kwargs,
 ) -> CASSCFResult:
@@ -539,8 +552,8 @@ def run_casscf_df(
         raise ValueError("max_b_cache_bytes must be >= 0")
 
     orbital_optimizer = str(orbital_optimizer).strip().lower()
-    if orbital_optimizer not in {"jacobi", "lbfgs", "ah"}:
-        raise ValueError("orbital_optimizer must be one of: 'jacobi', 'lbfgs', 'ah'")
+    if orbital_optimizer not in {"jacobi", "lbfgs", "ah", "1step"}:
+        raise ValueError("orbital_optimizer must be one of: 'jacobi', 'lbfgs', 'ah', '1step'")
     lbfgs_history = int(lbfgs_history)
     if lbfgs_history < 0:
         raise ValueError("lbfgs_history must be >= 0")
@@ -624,6 +637,20 @@ def run_casscf_df(
     if ah_ci_update not in {"pyscf", "orthonormalize"}:
         raise ValueError("ah_ci_update must be one of: 'pyscf', 'orthonormalize'")
 
+    ah_auto_scale = bool(ah_auto_scale)
+
+    adaptive_stepsize = bool(adaptive_stepsize)
+    adaptive_growth_factor = float(adaptive_growth_factor)
+    if adaptive_growth_factor <= 1.0:
+        raise ValueError("adaptive_growth_factor must be > 1.0")
+    adaptive_shrink_factor = float(adaptive_shrink_factor)
+    if not (0.0 < adaptive_shrink_factor < 1.0):
+        raise ValueError("adaptive_shrink_factor must satisfy 0 < factor < 1")
+    if adaptive_max_stepsize is not None:
+        adaptive_max_stepsize = float(adaptive_max_stepsize)
+        if adaptive_max_stepsize <= 0.0:
+            raise ValueError("adaptive_max_stepsize must be > 0")
+
     casci_backend_s = str(casci_backend).strip().lower()
     if casci_backend_s not in {"df", "dense_cpu", "dense_gpu"}:
         raise ValueError("casci_backend must be one of: 'df', 'dense_cpu', 'dense_gpu'")
@@ -668,6 +695,21 @@ def run_casscf_df(
     _xp_probe = scf_out.df_B if scf_out.df_B is not None else getattr(scf_out, "ao_eri", C)
     xp, _is_gpu = _df_scf._get_xp(_xp_probe, C)  # noqa: SLF001
     C = _as_xp_f64(xp, C)
+
+    # Optionally scramble frontier virtual orbitals to avoid local minima.
+    # With diffuse basis sets (aug-/jun-cc-pVXZ), the lowest HF virtuals are
+    # often Rydberg-type.  Scrambling forces the CASSCF optimizer to explore.
+    if scramble_virtuals is not False:
+        _nocc_s = ncore + ncas
+        _nmo_s = int(C.shape[1])
+        _n_s = min(int(scramble_nfrontier), _nmo_s - _nocc_s)
+        if _n_s > 1:
+            _seed = 42 if scramble_virtuals is True else int(scramble_virtuals)
+            _perm = np.random.RandomState(_seed).permutation(_n_s)
+            _C_np = C if xp is np else xp.asnumpy(C)
+            _C_np = np.array(_C_np, dtype=np.float64, copy=True)
+            _C_np[:, _nocc_s:_nocc_s + _n_s] = _C_np[:, _nocc_s:_nocc_s + _n_s][:, _perm]
+            C = xp.asarray(_C_np, dtype=xp.float64) if xp is not np else _C_np
 
     if casci_backend_s == "df":
         # DF CASCI can run on CPU (DFMOIntegrals + contract/row_oracle_df) or on CUDA
@@ -733,6 +775,9 @@ def run_casscf_df(
         fcisolver_use.kernel_profile = True
         fcisolver_use.kernel_profile_cuda_sync = True
 
+    # Dense CPU eigh fast-path for tiny CI spaces (avoids CUDA Davidson overhead)
+    fcisolver_use.dense_eigh_ncsf_threshold = int(dense_eigh_ncsf_threshold)
+
     # Propagate GPU backends to the solver so that trans_rdm12 / contract_2e
     # (called directly by the AH orbital optimizer) also run on GPU.
     if matvec_backend_s in {"cuda_eri_mat", "cuda"}:
@@ -741,7 +786,6 @@ def run_casscf_df(
         # with "cuda".  Force it explicitly for clarity.
         if str(getattr(fcisolver_use, "rdm_backend", "auto")).strip().lower() == "auto":
             fcisolver_use.rdm_backend = "cuda"
-
     dense_cpu_builder = None
     dense_gpu_builder = None
     if casci_backend_s == "dense_cpu":
@@ -839,11 +883,21 @@ def run_casscf_df(
         profile["dense_exact_jk"] = bool(dense_exact_jk)
         if b_cache_disabled_reason is not None:
             profile["cueri_b_cache_disabled_reason"] = str(b_cache_disabled_reason)
+        profile["adaptive_stepsize"] = bool(adaptive_stepsize)
+        profile["adaptive_growth_factor"] = float(adaptive_growth_factor)
+        profile["adaptive_shrink_factor"] = float(adaptive_shrink_factor)
+        profile["adaptive_max_stepsize"] = float(adaptive_max_stepsize) if adaptive_max_stepsize is not None else 2.0 * float(max_stepsize)
+        profile["ah_auto_scale"] = bool(ah_auto_scale)
     max_stepsize_cur = float(max_stepsize)
+    if ah_auto_scale and ncas > 6 and orbital_optimizer == "ah":
+        # Match PySCF newton_casscf default (0.03).
+        max_stepsize_cur = min(float(max_stepsize), 0.03)
     n_step_rejected = 0
     n_consecutive_rejected = 0
     accepted_since_reject = 0
     _n_e_stall = 0
+    _n_e_stall_loose = 0
+    prev_grad_norm: float = float("inf")
     qune_prev_step = None
     qune_prev_energy = None
     qune_prev_fp = None
@@ -999,9 +1053,14 @@ def run_casscf_df(
             n_consecutive_rejected += 1
             accepted_since_reject = 0
             if n_consecutive_rejected >= 5:
-                # Cascade cap: accept the step and reset step size
+                # Cascade cap: revert to best orbitals and update e_ref to the
+                # current CASCI energy.  After AH updates, C_ref may correspond
+                # to a slightly different CASCI energy than the stored e_ref
+                # (which was set pre-update).  Accepting e_avg as the new
+                # baseline prevents an infinite rejection loop.
+                C = C_ref.copy()
                 e_ref = float(e_avg)
-                max_stepsize_cur = float(max_stepsize)
+                max_stepsize_cur = max(float(step_rejection_min_stepsize), float(max_stepsize) * 0.5)
                 n_consecutive_rejected = 0
             else:
                 max_stepsize_cur = max(float(step_rejection_min_stepsize), float(max_stepsize_cur) * float(step_rejection_factor))
@@ -1049,21 +1108,40 @@ def run_casscf_df(
                             "step_rejected": True,
                             "max_stepsize_cur": float(max_stepsize_cur),
                             "qune_step_mode": "reject",
+                            "adaptive_stepsize_action": "reject",
                         }
                     )
+                    if hasattr(fcisolver_use, '_last_kernel_profile') and fcisolver_use._last_kernel_profile:
+                        hist[-1]["solver_kernel_profile"] = dict(fcisolver_use._last_kernel_profile)
                     profile["step_rejection_count"] = int(n_step_rejected)
             continue
         n_consecutive_rejected = 0
-        if (
-            step_recovery_enabled
-            and e_ref is not None
-            and float(max_stepsize_cur) < float(max_stepsize)
-            and float(step_recovery_factor) > 1.0
-        ):
-            accepted_since_reject += 1
-            if accepted_since_reject >= int(step_recovery_interval):
-                max_stepsize_cur = min(float(max_stepsize), float(max_stepsize_cur) * float(step_recovery_factor))
-                accepted_since_reject = 0
+        _adaptive_action = "hold"
+        if adaptive_stepsize and e_ref is not None:
+            _adaptive_max = float(adaptive_max_stepsize) if adaptive_max_stepsize is not None else 2.0 * float(max_stepsize)
+            # Note: grad_norm is computed later in this iteration for non-AH paths,
+            # but for the AH path it comes from the previous iteration's profile
+            # history. Use prev_grad_norm which tracks accepted-step gradient norms.
+            # The adaptive logic runs *after* the step is accepted (energy check
+            # above passed), so we compare the current energy to e_ref and use the
+            # gradient ratio from the *previous* accepted step.
+            if float(e_avg) < float(e_ref):
+                # Energy decreased — gradient ratio check deferred until grad_norm computed
+                _adaptive_action = "pending_grad"
+            elif float(e_avg) >= float(e_ref) - float(step_rejection_tol):
+                # Energy stalled — may proactively shrink (resolved after grad)
+                _adaptive_action = "pending_grad_stall"
+        elif not adaptive_stepsize:
+            if (
+                step_recovery_enabled
+                and e_ref is not None
+                and float(max_stepsize_cur) < float(max_stepsize)
+                and float(step_recovery_factor) > 1.0
+            ):
+                accepted_since_reject += 1
+                if accepted_since_reject >= int(step_recovery_interval):
+                    max_stepsize_cur = min(float(max_stepsize), float(max_stepsize_cur) * float(step_recovery_factor))
+                    accepted_since_reject = 0
 
         if orbital_optimizer == "ah":
             try:
@@ -1139,6 +1217,8 @@ def run_casscf_df(
                 frozen=None,
                 internal_rotation=False,
                 extrasym=None,
+                mixed_precision=bool(newton_mixed_precision),
+                aux_block_naux=int(newton_aux_block_naux),
             )
             mc_ah.max_stepsize = float(max_stepsize_cur)
             mc_ah.ah_level_shift = float(ah_level_shift)
@@ -1152,10 +1232,26 @@ def run_casscf_df(
             mc_ah.kf_interval = int(ah_kf_interval)
             mc_ah.kf_trust_region = float(ah_kf_trust_region)
             mc_ah.ah_max_cycle_micro_cap = None if ah_max_cycle_micro_cap_i is None else int(ah_max_cycle_micro_cap_i)
+            # Match PySCF newton_casscf.py defaults (lines 732-756).
+            if ah_auto_scale and ncas > 6:
+                mc_ah.max_cycle_micro = 10
+                mc_ah.ah_max_cycle_micro_cap = None
+                mc_ah.kf_interval = 5
+                mc_ah.ah_start_tol = 500.0
+                mc_ah.ah_start_tol_dynamic = False
+                mc_ah.ah_retry_enabled = False
+                mc_ah.ah_mu_enabled = False
+                mc_ah.ah_scale_fallback = True
             mc_ah.verbose = 0
+            if ah_options:
+                # Advanced inner-loop AH knobs (instrumentation/ablation).  Kept as
+                # a dict to avoid exploding the public driver signature further.
+                for k, v in dict(ah_options).items():
+                    setattr(mc_ah, str(k), v)
 
             _t_pre_ah = time.perf_counter() if profile is not None else 0.0
             eris_ah = mc_ah.ao2mo(C_np)
+            _t_post_ao2mo = time.perf_counter() if profile is not None else 0.0
             ci_ah_in = ci_list if nroots > 1 else ci_list[0]
             U_ah, ci_ah_out, grad_norm_ah, ah_stat, ah_x0_guess = _update_orb_ci(
                 mc_ah,
@@ -1174,17 +1270,60 @@ def run_casscf_df(
                 implementation="internal",
                 ci_update=str(ah_ci_update),
             )
+            _t_post_ah_micro = time.perf_counter() if profile is not None else 0.0
             grad_norm = float(grad_norm_ah)
+            ah_diis_used = False  # set to True later if DIIS extrapolation succeeds
+            # Resolve deferred adaptive step-size action now that grad_norm is known.
+            if _adaptive_action.startswith("pending"):
+                # Near stall-detection window: freeze adaptive to let the
+                # stall counter accumulate instead of perturbing the energy.
+                _stall_grad_thr = ah_conv_tol_grad_eff * 10.0
+                if grad_norm < _stall_grad_thr and prev_grad_norm < _stall_grad_thr:
+                    _adaptive_action = "hold"
+                else:
+                    _a_max = float(adaptive_max_stepsize) if adaptive_max_stepsize is not None else 2.0 * float(max_stepsize)
+                    _grad_ratio = grad_norm / prev_grad_norm if prev_grad_norm > 1e-15 else 1.0
+                    if _adaptive_action == "pending_grad":
+                        if _grad_ratio > 2.0:
+                            # Energy decreased but gradient grew rapidly — heading toward
+                            # a cliff.  Proactively shrink to avoid a rejection cascade.
+                            max_stepsize_cur = max(float(step_rejection_min_stepsize), max_stepsize_cur * adaptive_shrink_factor)
+                            _adaptive_action = "shrink"
+                        elif _grad_ratio < 0.7:
+                            max_stepsize_cur = min(_a_max, max_stepsize_cur * adaptive_growth_factor)
+                            _adaptive_action = "grow"
+                        elif _grad_ratio < 1.0:
+                            max_stepsize_cur = min(_a_max, max_stepsize_cur * 1.1)
+                            _adaptive_action = "mild_grow"
+                        else:
+                            _adaptive_action = "hold"
+                    elif _adaptive_action == "pending_grad_stall":
+                        if _grad_ratio > 1.5:
+                            max_stepsize_cur = max(float(step_rejection_min_stepsize), max_stepsize_cur * adaptive_shrink_factor)
+                            _adaptive_action = "shrink"
+                        else:
+                            _adaptive_action = "hold"
+                prev_grad_norm = grad_norm
             de = float("inf") if e_last is None else abs(float(e_avg) - float(e_last))
             if e_last is not None and de < ah_conv_tol_energy_eff and grad_norm < ah_conv_tol_grad_eff:
                 converged = True
-            # Stall detection: energy converged for 3+ iters but grad slightly above threshold
+            # Stall detection: energy converged but grad slightly above threshold.
+            # Tier 1 (tight): grad < 10× tol, stalled for 3 iters
+            # Tier 2 (loose): grad < 50× tol, stalled for 8 iters — catches
+            #   DF-approximation noise floors for large active spaces.
             if not converged and e_last is not None:
                 if de < max(tol * 100, ah_conv_tol_energy_eff * 10) and grad_norm < ah_conv_tol_grad_eff * 10:
                     _n_e_stall += 1
                 else:
                     _n_e_stall = 0
                 if _n_e_stall >= 3:
+                    converged = True
+            if not converged and e_last is not None:
+                if de < max(tol * 1000, ah_conv_tol_energy_eff * 100) and grad_norm < ah_conv_tol_grad_eff * 50:
+                    _n_e_stall_loose += 1
+                else:
+                    _n_e_stall_loose = 0
+                if _n_e_stall_loose >= 8:
                     converged = True
             if converged:
                 e_last = e_avg
@@ -1204,17 +1343,54 @@ def run_casscf_df(
                                 "t_rdm_s": 0.0,
                                 "t_orbgrad_s": 0.0,
                                 "t_conv_check_s": 0.0,
+                                "t_ao2mo_s": float(_t_post_ao2mo - _t_pre_ah),
+                                "t_ah_micros_s": float(_t_post_ah_micro - _t_post_ao2mo),
                                 "t_orb_update_s": float(_t_iter_end - _t_pre_ah),
                                 "t_iter_total_s": float(_t_iter_end - _t_iter_start),
-                                "orbital_diis_used": False,
+                                "orbital_diis_used": bool(ah_diis_used),
                                 "lbfgs_fallback_used": False,
                                 "qune_step_mode": "AH",
                                 "ah_micro_iters": int(getattr(ah_stat, "imic", 0)),
                                 "ah_hop_iters": int(getattr(ah_stat, "tot_hop", 0)),
                                 "ah_keyframes": int(getattr(ah_stat, "tot_kf", 0)),
+                                "ah_trust_fail_grad": int(getattr(ah_stat, "n_trust_fail_grad", 0)),
+                                "ah_trust_fail_kf": int(getattr(ah_stat, "n_trust_fail_kf", 0)),
+                                "ah_retries": int(getattr(ah_stat, "n_retry", 0)),
+                                "ah_mu_increase": int(getattr(ah_stat, "n_mu_increase", 0)),
+                                "ah_step_scaled": int(getattr(ah_stat, "n_step_scaled", 0)),
+                                "ah_step_scaled_orb": int(getattr(ah_stat, "n_step_scaled_orb", 0)),
+                                "ah_step_scaled_ci": int(getattr(ah_stat, "n_step_scaled_ci", 0)),
+                                "ah_level_shift_last": float(getattr(ah_stat, "last_level_shift", 0.0)),
+                                "ah_mu_orb_last": float(getattr(ah_stat, "last_mu_orb", 0.0)),
+                                "ah_mu_ci_last": float(getattr(ah_stat, "last_mu_ci", 0.0)),
+                                "ah_kf_trust_last": float(getattr(ah_stat, "last_kf_trust", 0.0)),
+                                "adaptive_stepsize_action": str(_adaptive_action),
+                                "max_stepsize_cur": float(max_stepsize_cur),
                             }
                         )
+                        if hasattr(fcisolver_use, '_last_kernel_profile') and fcisolver_use._last_kernel_profile:
+                            hist[-1]["solver_kernel_profile"] = dict(fcisolver_use._last_kernel_profile)
                 break
+
+            # Enhancement D: DIIS extrapolation on AH orbital rotations.
+            # Disabled for large CAS with ah_auto_scale (PySCF doesn't use
+            # DIIS in Newton CASSCF; empirically it causes energy spikes).
+            ah_diis_used = False
+            _diis_ok = not (ah_auto_scale and ncas > 6)
+            if _diis_ok and diis is not None and diis.enabled and it >= diis_start_cycle and allowed_nvar > 0:
+                _X = np.asarray(U_ah, dtype=np.float64) - np.asarray(U_ah, dtype=np.float64).T
+                _step_packed = _X[allowed]
+                _g_orb = getattr(ah_stat, 'g_orb', None)
+                if _g_orb is not None and _g_orb.size == _step_packed.size:
+                    diis.push(_step_packed, _g_orb)
+                    _diis_step = diis.extrapolate()
+                    if _diis_step is not None:
+                        _X_d = np.zeros((nmo, nmo), dtype=np.float64)
+                        _X_d[allowed] = _diis_step
+                        _X_d = _X_d - _X_d.T
+                        _I = np.eye(nmo, dtype=np.float64)
+                        U_ah = np.linalg.solve(_I - 0.5 * _X_d, _I + 0.5 * _X_d)
+                        ah_diis_used = True
 
             C_np = np.asarray(C_np, dtype=np.float64) @ np.asarray(U_ah, dtype=np.float64)
             if _cp_ah is not None and isinstance(C, _cp_ah.ndarray):
@@ -1244,14 +1420,212 @@ def run_casscf_df(
                             "t_rdm_s": 0.0,
                             "t_orbgrad_s": 0.0,
                             "t_conv_check_s": 0.0,
+                            "t_ao2mo_s": float(_t_post_ao2mo - _t_pre_ah),
+                            "t_ah_micros_s": float(_t_post_ah_micro - _t_post_ao2mo),
                             "t_orb_update_s": float(_t_iter_end - _t_pre_ah),
                             "t_iter_total_s": float(_t_iter_end - _t_iter_start),
-                            "orbital_diis_used": False,
+                            "orbital_diis_used": bool(ah_diis_used),
                             "lbfgs_fallback_used": False,
                             "qune_step_mode": "AH",
                             "ah_micro_iters": int(getattr(ah_stat, "imic", 0)),
                             "ah_hop_iters": int(getattr(ah_stat, "tot_hop", 0)),
                             "ah_keyframes": int(getattr(ah_stat, "tot_kf", 0)),
+                            "ah_trust_fail_grad": int(getattr(ah_stat, "n_trust_fail_grad", 0)),
+                            "ah_trust_fail_kf": int(getattr(ah_stat, "n_trust_fail_kf", 0)),
+                            "ah_retries": int(getattr(ah_stat, "n_retry", 0)),
+                            "ah_mu_increase": int(getattr(ah_stat, "n_mu_increase", 0)),
+                            "ah_step_scaled": int(getattr(ah_stat, "n_step_scaled", 0)),
+                            "ah_step_scaled_orb": int(getattr(ah_stat, "n_step_scaled_orb", 0)),
+                            "ah_step_scaled_ci": int(getattr(ah_stat, "n_step_scaled_ci", 0)),
+                            "ah_level_shift_last": float(getattr(ah_stat, "last_level_shift", 0.0)),
+                            "ah_mu_orb_last": float(getattr(ah_stat, "last_mu_orb", 0.0)),
+                            "ah_mu_ci_last": float(getattr(ah_stat, "last_mu_ci", 0.0)),
+                            "ah_kf_trust_last": float(getattr(ah_stat, "last_kf_trust", 0.0)),
+                            "adaptive_stepsize_action": str(_adaptive_action),
+                            "max_stepsize_cur": float(max_stepsize_cur),
+                        }
+                    )
+                    if hasattr(fcisolver_use, '_last_kernel_profile') and fcisolver_use._last_kernel_profile:
+                        hist[-1]["solver_kernel_profile"] = dict(fcisolver_use._last_kernel_profile)
+            continue
+
+        elif orbital_optimizer == "1step":
+            try:
+                from asuka.mcscf.newton_df import DFNewtonCASSCFAdapter  # noqa: PLC0415
+                from asuka.mcscf.newton_casscf import rotate_orb_ah as _rotate_orb_ah  # noqa: PLC0415
+            except Exception as exc:  # pragma: no cover
+                raise RuntimeError("orbital_optimizer='1step' requires asuka.mcscf.newton_casscf support") from exc
+            try:
+                import cupy as _cp_1s  # type: ignore
+            except Exception:
+                _cp_1s = None
+
+            if ah_df_B is None:
+                _raw_df_B = getattr(scf_out, "df_B", None)
+                if _raw_df_B is not None:
+                    if _cp_1s is not None and isinstance(_raw_df_B, _cp_1s.ndarray):
+                        ah_df_B = _cp_1s.ascontiguousarray(_cp_1s.asarray(_raw_df_B, dtype=_cp_1s.float64))
+                    else:
+                        ah_df_B = np.asarray(_raw_df_B, dtype=np.float64, order="C")
+            if ah_hcore_np is None:
+                H0 = getattr(scf_out.int1e, "hcore")
+                if _cp_1s is not None and isinstance(H0, _cp_1s.ndarray):
+                    H0 = _cp_1s.asnumpy(H0)
+                ah_hcore_np = np.asarray(H0, dtype=np.float64)
+
+            C_np = C
+            if _cp_1s is not None and isinstance(C_np, _cp_1s.ndarray):
+                C_np = _cp_1s.asnumpy(C_np)
+            C_np = np.asarray(C_np, dtype=np.float64)
+
+            # Build RDMs for the orbital optimizer.
+            dm1_act, dm2_act = make_state_averaged_rdms(
+                fcisolver_use,
+                ci_list,
+                weights,
+                ncas=int(ncas),
+                nelecas=nelecas,
+                solver_kwargs=solver_kwargs,
+            )
+
+            import copy as _copy_1s
+            ah_fcisolver_1s = _copy_1s.copy(fcisolver_use)
+            if matvec_backend_s in {"cuda_eri_mat", "cuda"}:
+                ah_fcisolver_1s._matvec_cuda_ws_cache = {}
+                ah_fcisolver_1s._matvec_cuda_state_cache = {}
+                ah_fcisolver_1s._rdm_cuda_ws_cache = {}
+
+            mc_1s = DFNewtonCASSCFAdapter(
+                df_B=ah_df_B,
+                ao_eri=None,
+                hcore_ao=ah_hcore_np,
+                ncore=int(ncore),
+                ncas=int(ncas),
+                nelecas=nelecas,
+                mo_coeff=C_np,
+                fcisolver=ah_fcisolver_1s,
+                dense_gpu_builder=None,
+                weights=[float(w) for w in np.asarray(weights, dtype=np.float64).ravel().tolist()],
+                frozen=None,
+                internal_rotation=False,
+                extrasym=None,
+                mixed_precision=bool(newton_mixed_precision),
+                aux_block_naux=int(newton_aux_block_naux),
+            )
+            # PySCF mc1step defaults.
+            mc_1s.max_stepsize = min(float(max_stepsize), 0.02)
+            mc_1s.ah_start_tol = 2.5
+            mc_1s.ah_start_cycle = 3
+            mc_1s.max_cycle_micro = 4
+            mc_1s.kf_interval = 4
+            mc_1s.ah_grad_trust_region = 3.0
+            mc_1s.ah_level_shift = float(ah_level_shift)
+            mc_1s.ah_conv_tol = float(ah_conv_tol)
+            mc_1s.ah_max_cycle = int(ah_max_cycle)
+            mc_1s.ah_lindep = float(ah_lindep)
+            mc_1s.verbose = 0
+            if ah_options:
+                for k, v in dict(ah_options).items():
+                    setattr(mc_1s, str(k), v)
+
+            _t_pre_1s = time.perf_counter() if profile is not None else 0.0
+            eris_1s = mc_1s.ao2mo(C_np)
+            _t_post_ao2mo_1s = time.perf_counter() if profile is not None else 0.0
+            ci_1s_in = ci_list if nroots > 1 else ci_list[0]
+            U_1s, norm_gorb_1s, stat_1s = _rotate_orb_ah(
+                mc_1s,
+                C_np,
+                dm1_act,
+                dm2_act,
+                eris_1s,
+                ci_1s_in,
+                weights=[float(w) for w in np.asarray(weights, dtype=np.float64).ravel().tolist()],
+                strict_weights=False,
+                verbose=0,
+            )
+            _t_post_1s = time.perf_counter() if profile is not None else 0.0
+            grad_norm = float(norm_gorb_1s)
+
+            de = float("inf") if e_last is None else abs(float(e_avg) - float(e_last))
+            if e_last is not None and de < tol and grad_norm < conv_tol_grad:
+                converged = True
+            # Stall detection (same as AH path).
+            if not converged and e_last is not None:
+                if de < max(tol * 100, tol * 10) and grad_norm < conv_tol_grad * 10:
+                    _n_e_stall += 1
+                else:
+                    _n_e_stall = 0
+                if _n_e_stall >= 3:
+                    converged = True
+            if not converged and e_last is not None:
+                if de < max(tol * 1000, tol * 100) and grad_norm < conv_tol_grad * 50:
+                    _n_e_stall_loose += 1
+                else:
+                    _n_e_stall_loose = 0
+                if _n_e_stall_loose >= 8:
+                    converged = True
+
+            if converged:
+                e_last = e_avg
+                if profile is not None:
+                    _t_iter_end = time.perf_counter()
+                    hist = profile.setdefault("history", [])
+                    if isinstance(hist, list):
+                        hist.append(
+                            {
+                                "iter": int(it),
+                                "e_avg": float(e_avg),
+                                "e_roots": np.asarray(e_roots, dtype=np.float64).copy(),
+                                "weights": np.asarray(weights, dtype=np.float64).copy(),
+                                "grad_norm": float(grad_norm),
+                                "t_casci_s": float(_t_post_casci - _t_iter_start),
+                                "t_root_sort_s": float(_t_pre_rdm - _t_post_casci),
+                                "t_rdm_s": 0.0,
+                                "t_orbgrad_s": 0.0,
+                                "t_ao2mo_s": float(_t_post_ao2mo_1s - _t_pre_1s),
+                                "t_1step_micros_s": float(_t_post_1s - _t_post_ao2mo_1s),
+                                "t_orb_update_s": float(_t_iter_end - _t_pre_1s),
+                                "t_iter_total_s": float(_t_iter_end - _t_iter_start),
+                                "max_stepsize_cur": float(max_stepsize_cur),
+                                "1step_micro_iters": int(stat_1s.imic),
+                                "1step_hop_iters": int(stat_1s.tot_hop),
+                                "1step_keyframes": int(stat_1s.tot_kf),
+                            }
+                        )
+                break
+
+            # Apply rotation.
+            C_np = np.asarray(C_np, dtype=np.float64) @ np.asarray(U_1s, dtype=np.float64)
+            if _cp_1s is not None and isinstance(C, _cp_1s.ndarray):
+                C = _cp_1s.asarray(C_np, dtype=C.dtype)
+            else:
+                C = np.asarray(C_np, dtype=np.float64)
+
+            e_last = e_avg
+
+            if profile is not None:
+                _t_iter_end = time.perf_counter()
+                hist = profile.setdefault("history", [])
+                if isinstance(hist, list):
+                    hist.append(
+                        {
+                            "iter": int(it),
+                            "e_avg": float(e_avg),
+                            "e_roots": np.asarray(e_roots, dtype=np.float64).copy(),
+                            "weights": np.asarray(weights, dtype=np.float64).copy(),
+                            "grad_norm": float(grad_norm),
+                            "t_casci_s": float(_t_post_casci - _t_iter_start),
+                            "t_root_sort_s": float(_t_pre_rdm - _t_post_casci),
+                            "t_rdm_s": 0.0,
+                            "t_orbgrad_s": 0.0,
+                            "t_ao2mo_s": float(_t_post_ao2mo_1s - _t_pre_1s),
+                            "t_1step_micros_s": float(_t_post_1s - _t_post_ao2mo_1s),
+                            "t_orb_update_s": float(_t_iter_end - _t_pre_1s),
+                            "t_iter_total_s": float(_t_iter_end - _t_iter_start),
+                            "max_stepsize_cur": float(max_stepsize_cur),
+                            "1step_micro_iters": int(stat_1s.imic),
+                            "1step_hop_iters": int(stat_1s.tot_hop),
+                            "1step_keyframes": int(stat_1s.tot_kf),
                         }
                     )
             continue
@@ -1304,6 +1678,31 @@ def run_casscf_df(
         g_vec = gmat[allowed_xp].ravel()
         _t_post_orbgrad = time.perf_counter() if profile is not None else 0.0
 
+        # Resolve deferred adaptive step-size action for non-AH path.
+        if _adaptive_action.startswith("pending"):
+            _stall_grad_thr = conv_tol_grad * 10.0
+            if grad_norm < _stall_grad_thr and prev_grad_norm < _stall_grad_thr:
+                _adaptive_action = "hold"
+            else:
+                _a_max = float(adaptive_max_stepsize) if adaptive_max_stepsize is not None else 2.0 * float(max_stepsize)
+                _grad_ratio = grad_norm / prev_grad_norm if prev_grad_norm > 1e-15 else 1.0
+                if _adaptive_action == "pending_grad":
+                    if _grad_ratio < 0.7:
+                        max_stepsize_cur = min(_a_max, max_stepsize_cur * adaptive_growth_factor)
+                        _adaptive_action = "grow"
+                    elif _grad_ratio < 1.0:
+                        max_stepsize_cur = min(_a_max, max_stepsize_cur * 1.1)
+                        _adaptive_action = "mild_grow"
+                    else:
+                        _adaptive_action = "hold"
+                elif _adaptive_action == "pending_grad_stall":
+                    if _grad_ratio > 1.5:
+                        max_stepsize_cur = max(float(step_rejection_min_stepsize), max_stepsize_cur * adaptive_shrink_factor)
+                        _adaptive_action = "shrink"
+                    else:
+                        _adaptive_action = "hold"
+            prev_grad_norm = grad_norm
+
         if profile is not None:
             ws_reused = None
             ws_rebuild_mismatches = None
@@ -1345,8 +1744,11 @@ def run_casscf_df(
                         "cueri_b_cache_resident": bool(cached_b_whitened is not None),
                         "step_rejected": False,
                         "max_stepsize_cur": float(max_stepsize_cur),
+                        "adaptive_stepsize_action": str(_adaptive_action),
                     }
                 )
+                if hasattr(fcisolver_use, '_last_kernel_profile') and fcisolver_use._last_kernel_profile:
+                    hist[-1]["solver_kernel_profile"] = dict(fcisolver_use._last_kernel_profile)
 
         if e_last is not None:
             de = abs(float(e_avg) - float(e_last))
@@ -1493,23 +1895,40 @@ def run_casscf_df(
     # reduced Davidson cycles.
     if ci_max_cycle_inner is not None and converged and casci_backend_s == "df":
         cached_b_in = cached_b_whitened if b_cache_enabled else None
-        casci_out = run_casci_df(
-            scf_out,
-            ncore=int(ncore),
-            ncas=int(ncas),
-            nelecas=nelecas,
-            mo_coeff=C,
-            ci0=prev_ci_list,
-            fcisolver=fcisolver_use,
-            twos=twos,
-            nroots=int(nroots),
-            matvec_backend=str(matvec_backend_s),
-            want_eri_mat=bool(want_eri_mat),
-            aux_block_naux=int(aux_block_naux),
-            max_tile_bytes=int(max_tile_bytes),
-            cached_b_whitened=cached_b_in,
-            **solver_kwargs,
-        )
+        if matvec_backend_s in {"cuda_eri_mat", "cuda"}:
+            casci_out = run_casci_df(
+                scf_out,
+                ncore=int(ncore),
+                ncas=int(ncas),
+                nelecas=nelecas,
+                mo_coeff=C,
+                ci0=prev_ci_list,
+                fcisolver=fcisolver_use,
+                twos=twos,
+                nroots=int(nroots),
+                matvec_backend=str(matvec_backend_s),
+                want_eri_mat=bool(want_eri_mat),
+                aux_block_naux=int(aux_block_naux),
+                max_tile_bytes=int(max_tile_bytes),
+                cached_b_whitened=cached_b_in,
+                **solver_kwargs,
+            )
+        else:
+            from .casci import run_casci_df_cpu  # noqa: PLC0415
+
+            casci_out = run_casci_df_cpu(
+                scf_out,
+                ncore=int(ncore),
+                ncas=int(ncas),
+                nelecas=nelecas,
+                mo_coeff=C,
+                ci0=prev_ci_list,
+                fcisolver=fcisolver_use,
+                twos=twos,
+                nroots=int(nroots),
+                matvec_backend=str(matvec_backend_s),
+                **solver_kwargs,
+            )
         if nroots == 1:
             e_roots = np.asarray([float(casci_out.e_tot)], dtype=np.float64)
         else:
@@ -1522,6 +1941,32 @@ def run_casscf_df(
             fix_ci_phases(prev_ci_list, ci_list)
         ci_out = ci_list if nroots > 1 else ci_list[0]
         e_last = float(np.dot(weights, e_roots))
+
+    # --- Sort core/virtual MOs by HF orbital energies (ascending). ---
+    mo_energy = None
+    if sort_mo:
+        C_hf_raw = getattr(scf_out.scf, "mo_coeff", None)
+        eps_hf_raw = getattr(scf_out.scf, "mo_energy", None)
+        is_uhf = isinstance(C_hf_raw, tuple)
+        if not is_uhf and C_hf_raw is not None and eps_hf_raw is not None:
+            S_ao = scf_out.int1e.S
+            _to_np = lambda x: x.get() if hasattr(x, "get") else np.asarray(x, dtype=np.float64)
+            C_hf_np = _to_np(C_hf_raw)
+            eps_hf_np = np.asarray(_to_np(eps_hf_raw), dtype=np.float64).ravel()
+            S_np = _to_np(S_ao)
+            C_np = _to_np(C)
+            O = C_hf_np.T @ S_np @ C_np  # (nmo, nmo)
+            eps_cas = np.sum(O ** 2 * eps_hf_np[:, None], axis=0)
+
+            nocc = ncore + ncas
+            perm = np.arange(nmo)
+            if ncore > 0:
+                perm[:ncore] = np.argsort(eps_cas[:ncore])
+            if nocc < nmo:
+                perm[nocc:] = np.argsort(eps_cas[nocc:]) + nocc
+
+            C = C_np[:, perm] if xp is np else xp.asarray(C_np[:, perm], dtype=xp.float64)
+            mo_energy = eps_cas[perm]
 
     return CASSCFResult(
         mol=scf_out.mol,
@@ -1539,6 +1984,7 @@ def run_casscf_df(
         ecore=float(casci_out.ecore),
         ci=ci_out if ci_out is not None else casci_out.ci,
         mo_coeff=C,
+        mo_energy=mo_energy,
         grad_norm=float(grad_norm),
         casci=casci_out,
         profile=profile,
@@ -1563,12 +2009,13 @@ def run_casscf_dense_cpu(
     conv_tol_grad: float | None = None,
     max_stepsize: float = 0.02,
     damp: float = 1.0,
-    orbital_optimizer: str = "ah",
+    orbital_optimizer: str = "1step",
     lbfgs_history: int = 10,
     dense_cpu_eps_ao: float = 0.0,
     dense_cpu_eps_mo: float = 0.0,
     dense_cpu_threads: int = 0,
     dense_cpu_blas_nthreads: int | None = None,
+    sort_mo: bool = True,
     profile: dict | None = None,
     **solver_kwargs,
 ) -> CASSCFResult:
@@ -1599,6 +2046,7 @@ def run_casscf_dense_cpu(
         dense_cpu_eps_mo=float(dense_cpu_eps_mo),
         dense_cpu_threads=int(dense_cpu_threads),
         dense_cpu_blas_nthreads=None if dense_cpu_blas_nthreads is None else int(dense_cpu_blas_nthreads),
+        sort_mo=bool(sort_mo),
         profile=profile,
         **solver_kwargs,
     )
