@@ -8,7 +8,7 @@ import numpy as np
 from asuka.cueri.cart import ncart
 from asuka.cueri.pair_tables_cpu import build_pair_tables_cpu
 from asuka.integrals.cueri_df_cpu import _build_df_combined_basis_and_shell_pairs
-from asuka.integrals.df_adjoint import chol_lower_adjoint, df_whiten_adjoint
+from asuka.integrals.df_adjoint import chol_lower_adjoint, df_whiten_adjoint, df_whiten_adjoint_Qmn
 from asuka.integrals.int1e_cart import nao_cart_from_basis, shell_to_atom_map
 
 Backend = Literal["cpu", "cuda"]
@@ -361,8 +361,8 @@ class DFGradContractionContext:
         if tuple(map(int, bar_L.shape)) != (int(self.naux), int(self.nao), int(self.nao)):
             raise ValueError("bar_L_ao must have shape (naux, nao, nao)")
 
-        bar_B = np.transpose(bar_L, (1, 2, 0))
-        bar_X, bar_Lchol = df_whiten_adjoint(B, np.asarray(bar_B, dtype=np.float64, order="C"), self.L_metric)
+        bar_L_c = np.asarray(bar_L, dtype=np.float64, order="C")
+        bar_X, bar_Lchol = df_whiten_adjoint_Qmn(B, bar_L_c, self.L_metric)
         bar_V = chol_lower_adjoint(self.L_metric, bar_Lchol)
         bar_X = 0.5 * (bar_X + bar_X.transpose((1, 0, 2)))
         bar_X = np.asarray(bar_X, dtype=np.float64, order="C")
@@ -472,8 +472,8 @@ class DFGradContractionContext:
         cuda = self.cuda
         _ext = cuda["_ext"]
 
-        bar_B = cp.transpose(bar_L, (1, 2, 0))
-        bar_X, bar_Lchol = df_whiten_adjoint(B, bar_B, self.L_metric)
+        bar_L_c = cp.ascontiguousarray(bar_L)
+        bar_X, bar_Lchol = df_whiten_adjoint_Qmn(B, bar_L_c, self.L_metric)
         bar_V = chol_lower_adjoint(self.L_metric, bar_Lchol)
 
         bar_X = 0.5 * (bar_X + bar_X.transpose((1, 0, 2)))

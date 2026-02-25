@@ -386,14 +386,19 @@ def _build_bar_L_casscf_df(
             raise ValueError("rho_core shape mismatch")
     sigma = B2.T @ D_w.reshape(nao * nao)  # (naux,)
 
-    bar_J = sigma[:, None, None] * D_core_ao[None, :, :] + rho[:, None, None] * D_w[None, :, :]
+    # Fused bar_J + bar_K: avoids separate (naux,nao,nao) allocations for
+    # bar_J, t1, t2, bar_K.  Peak is now 2× sizeof(B) instead of ~6×.
+    bar_mean = sigma[:, None, None] * D_core_ao[None, :, :] + rho[:, None, None] * D_w[None, :, :]
 
-    BQ = xp.transpose(B_ao, (2, 0, 1))  # (naux,nao,nao)
-    t1 = xp.matmul(xp.matmul(D_core_ao[None, :, :], BQ), D_w)  # D_core * B_Q * D_w
-    t2 = xp.matmul(xp.matmul(D_w[None, :, :], BQ), D_core_ao)  # D_w * B_Q * D_core
-    bar_K = -0.5 * (t1 + t2)
-
-    bar_mean = bar_J + bar_K
+    BQ = xp.transpose(B_ao, (2, 0, 1))  # (naux,nao,nao) — view, no copy
+    _t = xp.matmul(xp.matmul(D_core_ao[None, :, :], BQ), D_w)  # D_core B_Q D_w
+    _t *= -0.5
+    bar_mean += _t
+    del _t
+    _t = xp.matmul(xp.matmul(D_w[None, :, :], BQ), D_core_ao)  # D_w B_Q D_core
+    _t *= -0.5
+    bar_mean += _t
+    del _t
 
     # Active-active 2-RDM term:
     #   E_aa = 0.5 Σ_{uvwx} dm2_uvwx (uv|wx)
@@ -488,14 +493,18 @@ def _build_bar_L_delta_casscf_df(
     B2 = B_ao.reshape(nao * nao, naux)
     delta_sigma = B2.T @ D_act_delta.reshape(nao * nao)  # (naux,)
 
-    bar_J_delta = delta_sigma[:, None, None] * D_core_ao[None, :, :] + rho_core[:, None, None] * D_act_delta[None, :, :]
+    # Fused bar_J_delta + bar_K_delta to reduce peak VRAM.
+    bar_mean_delta = delta_sigma[:, None, None] * D_core_ao[None, :, :] + rho_core[:, None, None] * D_act_delta[None, :, :]
 
     BQ = xp.transpose(B_ao, (2, 0, 1))  # (naux,nao,nao)
-    t1 = xp.matmul(xp.matmul(D_core_ao[None, :, :], BQ), D_act_delta)
-    t2 = xp.matmul(xp.matmul(D_act_delta[None, :, :], BQ), D_core_ao)
-    bar_K_delta = -0.5 * (t1 + t2)
-
-    bar_mean_delta = bar_J_delta + bar_K_delta
+    _t = xp.matmul(xp.matmul(D_core_ao[None, :, :], BQ), D_act_delta)
+    _t *= -0.5
+    bar_mean_delta += _t
+    del _t
+    _t = xp.matmul(xp.matmul(D_act_delta[None, :, :], BQ), D_core_ao)
+    _t *= -0.5
+    bar_mean_delta += _t
+    del _t
 
     # Active-active 2-RDM delta (linear in dm2)
     dm2_flat = dm2_delta.reshape(ncas * ncas, ncas * ncas)
@@ -571,9 +580,14 @@ def _build_bar_L_df_cross(
     cK = float(coeff_K)
     if cK:
         BQ = xp.transpose(B_ao, (2, 0, 1))  # (naux,nao,nao)
-        t1 = xp.matmul(xp.matmul(D_left[None, :, :], BQ), D_right)  # D_left * B_Q * D_right
-        t2 = xp.matmul(xp.matmul(D_right[None, :, :], BQ), D_left)  # D_right * B_Q * D_left
-        bar += cK * (t1 + t2)
+        _t = xp.matmul(xp.matmul(D_left[None, :, :], BQ), D_right)
+        _t *= cK
+        bar += _t
+        del _t
+        _t = xp.matmul(xp.matmul(D_right[None, :, :], BQ), D_left)
+        _t *= cK
+        bar += _t
+        del _t
 
     bar = 0.5 * (bar + xp.transpose(bar, (0, 2, 1)))
     return xp.asarray(bar, dtype=xp.float64)
@@ -1573,6 +1587,16 @@ def casscf_nuc_grad_df_per_root(
         except Exception:
             _n_streams_env = 4
         _n_streams = max(1, min(int(nroots), int(_n_streams_env)))
+        # Auto-scale: if sizeof(B) * n_streams > 50% free VRAM, reduce streams.
+        try:
+            import cupy as _cp_probe  # noqa: PLC0415
+
+            _sizeof_B = int(B_ao.size) * 8  # float64
+            _free_vram = int(_cp_probe.cuda.runtime.memGetInfo()[0])
+            _vram_cap = max(1, int(0.5 * _free_vram // max(1, _sizeof_B)))
+            _n_streams = min(_n_streams, max(1, _vram_cap))
+        except Exception:
+            pass
         if _n_streams > 1:
             try:
                 import cupy as cp  # noqa: PLC0415

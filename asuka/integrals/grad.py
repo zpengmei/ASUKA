@@ -4,7 +4,7 @@ import time
 import numpy as np
 from typing import Any
 
-from asuka.integrals.df_adjoint import chol_lower_adjoint, df_whiten_adjoint
+from asuka.integrals.df_adjoint import chol_lower_adjoint, df_whiten_adjoint, df_whiten_adjoint_Qmn
 
 def _choose_aux_block_naux(*, nao: int, naux: int, target_bytes: int) -> int:
     """Choose a conservative aux block size for (qblk,nao,nao) float64 chunks."""
@@ -343,20 +343,20 @@ def compute_df_gradient_contributions_analytic_packed_bases(
                 t_metric_chol = 0.0
 
     # ---- DF adjoints: (bar_B, L) -> (bar_X, bar_V) ----
-    # bar_L_ao is stored as (naux,nao,nao); df_whiten_adjoint expects (nao,nao,naux).
+    # bar_L_ao is (naux,nao,nao).  Use df_whiten_adjoint_Qmn which accepts
+    # that layout directly, avoiding a full (nao,nao,naux) transpose copy.
     if backend_s == "cpu":
-        bar_B = np.transpose(bar_L_ao, (1, 2, 0))
-        bar_B = np.asarray(bar_B, dtype=np.float64, order="C")
+        bar_L_ao_c = np.asarray(bar_L_ao, dtype=np.float64, order="C")
         B_ao_c = np.asarray(B_ao, dtype=np.float64, order="C")
         L_c = np.asarray(L, dtype=np.float64, order="C")
     else:
         import cupy as cp  # noqa: PLC0415
 
-        bar_B = cp.ascontiguousarray(bar_L_ao.transpose((1, 2, 0)))
+        bar_L_ao_c = cp.ascontiguousarray(bar_L_ao)
         B_ao_c = cp.ascontiguousarray(B_ao)
         L_c = cp.ascontiguousarray(L)
 
-    bar_X, bar_L = df_whiten_adjoint(B_ao_c, bar_B, L_c)
+    bar_X, bar_L = df_whiten_adjoint_Qmn(B_ao_c, bar_L_ao_c, L_c)
     bar_V = chol_lower_adjoint(L_c, bar_L)
 
     if profile is not None and backend_s == "cuda":

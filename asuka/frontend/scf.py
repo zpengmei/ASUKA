@@ -106,6 +106,7 @@ class UHFDFRunResult:
     profile: dict | None = None
     ao_eri: Any | None = None
     sph_map: tuple[np.ndarray, int, int] | None = None  # (T, nao_cart, nao_sph)
+    df_L: Any | None = None  # Cholesky factor of aux metric (for deterministic gradients)
 
 
 @dataclass(frozen=True)
@@ -121,6 +122,7 @@ class ROHFDFRunResult:
     profile: dict | None = None
     ao_eri: Any | None = None
     sph_map: tuple[np.ndarray, int, int] | None = None  # (T, nao_cart, nao_sph)
+    df_L: Any | None = None  # Cholesky factor of aux metric (for deterministic gradients)
 
 
 _HF_PREP_CACHE_MAX = max(0, int(os.environ.get("ASUKA_HF_PREP_CACHE_MAX", "0")))
@@ -1238,7 +1240,7 @@ def run_uhf_df(
     if profile is not None:
         df_prof = profile.setdefault("df_build", {})
 
-    B = build_df_B_from_cueri_packed_bases(ao_basis, aux_basis, config=df_config, profile=df_prof)
+    B, L_chol = build_df_B_from_cueri_packed_bases(ao_basis, aux_basis, config=df_config, profile=df_prof, return_L=True)
 
     # Spherical AO transform (if requested)
     int1e_scf, B_scf, sph_map = _apply_sph_transform(mol, int1e, B, ao_basis)
@@ -1275,6 +1277,7 @@ def run_uhf_df(
         scf=scf,
         profile=profile,
         sph_map=sph_map,
+        df_L=L_chol,
     )
 
 
@@ -1322,7 +1325,7 @@ def run_rohf_df(
     if profile is not None:
         df_prof = profile.setdefault("df_build", {})
 
-    B = build_df_B_from_cueri_packed_bases(ao_basis, aux_basis, config=df_config, profile=df_prof)
+    B, L_chol = build_df_B_from_cueri_packed_bases(ao_basis, aux_basis, config=df_config, profile=df_prof, return_L=True)
 
     # Spherical AO transform (if requested)
     int1e_scf, B_scf, sph_map = _apply_sph_transform(mol, int1e, B, ao_basis)
@@ -1359,6 +1362,7 @@ def run_rohf_df(
         scf=scf,
         profile=profile,
         sph_map=sph_map,
+        df_L=L_chol,
     )
 
 

@@ -113,6 +113,64 @@ def df_whiten_adjoint(
     return bar_X_flat.reshape(B.shape), bar_L
 
 
+def df_whiten_adjoint_Qmn(
+    B_mnQ: Any,
+    bar_L_Qmn: Any,
+    L: Any,
+) -> tuple[Any, Any]:
+    """Like :func:`df_whiten_adjoint` but *bar_L* is in ``(naux, nao, nao)`` layout.
+
+    This avoids the expensive ``cp.ascontiguousarray(bar_L.transpose((1,2,0)))``
+    copy that the callers would otherwise need: reshaping a C-contiguous
+    ``(naux, nao, nao)`` array to ``(naux, nao*nao)`` is free.
+
+    Parameters
+    ----------
+    B_mnQ
+        Whitened DF factors, shape ``(nao, nao, naux)``.
+    bar_L_Qmn
+        Adjoint w.r.t. B in ``(naux, nao, nao)`` layout (Fortran-like Q-first).
+    L
+        Lower Cholesky factor of the aux metric, shape ``(naux, naux)``.
+
+    Returns
+    -------
+    bar_X
+        Adjoint w.r.t. unwhitened 3c2e X, shape ``(nao, nao, naux)``.
+    bar_Lchol
+        Adjoint w.r.t. the Cholesky factor L, shape ``(naux, naux)``.
+    """
+
+    xp = _get_xp(B_mnQ, bar_L_Qmn, L)
+    B_mnQ = _as_xp_f64(xp, B_mnQ)
+    bar_L_Qmn = _as_xp_f64(xp, bar_L_Qmn)
+    L = _as_xp_f64(xp, L)
+
+    if B_mnQ.ndim != 3:
+        raise ValueError("B_mnQ must have shape (nao, nao, naux)")
+    nao0, nao1, naux = map(int, B_mnQ.shape)
+    if nao0 != nao1:
+        raise ValueError("B_mnQ must have shape (nao, nao, naux)")
+    if bar_L_Qmn.ndim != 3 or int(bar_L_Qmn.shape[0]) != naux or int(bar_L_Qmn.shape[1]) != nao0 or int(bar_L_Qmn.shape[2]) != nao0:
+        raise ValueError("bar_L_Qmn must have shape (naux, nao, nao)")
+    if L.ndim != 2 or int(L.shape[0]) != naux or int(L.shape[1]) != naux:
+        raise ValueError("L must have shape (naux, naux)")
+
+    B_flat = B_mnQ.reshape(nao0 * nao0, naux)
+    # Key optimisation: (naux, nao, nao) -> (naux, nao*nao) is a free reshape
+    # because bar_L_Qmn is C-contiguous.  This is the bar_BT that
+    # df_whiten_adjoint would compute as bar_B.reshape(nao^2,naux).T after a
+    # costly transpose copy.
+    bar_BT = bar_L_Qmn.reshape(naux, nao0 * nao0)
+
+    tmp = _solve_triangular(xp, L, bar_BT, lower=True, trans="T")  # (naux, nao^2)
+    bar_X_flat = tmp.T  # (nao^2, naux) — non-contiguous view, that's fine
+    bar_Lchol = -(tmp @ B_flat)  # (naux, naux)
+    bar_Lchol = xp.tril(bar_Lchol)
+
+    return bar_X_flat.reshape(B_mnQ.shape), bar_Lchol
+
+
 def chol_lower_adjoint(L: Any, bar_L: Any) -> Any:
     """Adjoint of lower-triangular Cholesky: V = L L^T.
 
@@ -159,4 +217,5 @@ def chol_lower_adjoint(L: Any, bar_L: Any) -> Any:
 __all__ = [
     "chol_lower_adjoint",
     "df_whiten_adjoint",
+    "df_whiten_adjoint_Qmn",
 ]
