@@ -238,12 +238,26 @@ class CuERIActiveSpaceDenseGPUBuilder:
                 ao_rep_eff = "cart" if bool(getattr(mol, "cart", False)) else "sph"
 
         if ao_rep_eff == "sph" and sph_map is None:
-            if mol is None:
-                raise ValueError("ao_rep='sph' requires mol=... so spherical AO offsets can be derived")
-            try:
-                _basis_ref, sph_map = pack_cart_shells_from_mol_with_sph_map(mol, expand_contractions=True)
-            except Exception as e:  # pragma: no cover
-                raise RuntimeError("failed to derive spherical AO offsets from mol for ao_rep='sph'") from e
+            if mol is not None:
+                try:
+                    _basis_ref, sph_map = pack_cart_shells_from_mol_with_sph_map(mol, expand_contractions=True)
+                except Exception as e:  # pragma: no cover
+                    raise RuntimeError("failed to derive spherical AO offsets from mol for ao_rep='sph'") from e
+            elif ao_basis is not None:
+                # Derive spherical layout directly from packed Cartesian basis
+                from asuka.integrals.cart2sph import compute_sph_layout_from_cart_basis  # noqa: PLC0415
+
+                _shell_ao_start_sph, _nao_sph = compute_sph_layout_from_cart_basis(ao_basis)
+                _starts_cart = np.asarray(ao_basis.shell_ao_start, dtype=np.int32).ravel()
+                _ls = np.asarray(ao_basis.shell_l, dtype=np.int32).ravel()
+                _nao_cart = int(max(int(_starts_cart[i]) + ncart(int(_ls[i])) for i in range(int(_ls.size)))) if int(_ls.size) else 0
+                sph_map = SphMapForCartBasis(
+                    shell_ao_start_sph=_shell_ao_start_sph,
+                    nao_sph=_nao_sph,
+                    nao_cart=_nao_cart,
+                )
+            else:
+                raise ValueError("ao_rep='sph' requires mol or ao_basis so spherical AO offsets can be derived")
         object.__setattr__(self, "ao_rep", ao_rep_eff)
 
         shell_l = np.asarray(getattr(ao_basis, "shell_l"), dtype=np.int32).ravel()

@@ -60,6 +60,27 @@ def _overlap_1d_table(*, la: int, lb: int, a: float, b: float, Ax: float, Bx: fl
     return out
 
 
+def build_S_cross(
+    basis_bra: BasisCartSoA,
+    basis_ket: BasisCartSoA,
+    *,
+    T_bra: np.ndarray | None = None,
+    T_ket: np.ndarray | None = None,
+    backend: str | None = None,
+) -> np.ndarray:
+    """Compute cross-geometry overlap, optionally in spherical AO basis.
+
+    If ``T_bra`` and/or ``T_ket`` are provided (cart-to-sph matrices), the
+    result is ``T_bra^T @ S_cart_cross @ T_ket``.
+    """
+    S_cart = build_S_cross_cart(basis_bra, basis_ket, backend=backend)
+    if T_bra is not None:
+        S_cart = np.asarray(T_bra, dtype=np.float64).T @ S_cart
+    if T_ket is not None:
+        S_cart = S_cart @ np.asarray(T_ket, dtype=np.float64)
+    return S_cart
+
+
 def build_S_cross_cart(
     basis_bra: BasisCartSoA,
     basis_ket: BasisCartSoA,

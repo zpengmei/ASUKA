@@ -55,6 +55,7 @@ def write_mo_cube(
     spacing: float = 0.25,
     padding: float = 4.0,
     values_per_line: int = 6,
+    sph_map: tuple | None = None,
 ) -> None:
     """Write a cube file for one (real) MO."""
 
@@ -87,7 +88,7 @@ def write_mo_cube(
             base = origin[None, :] + float(kz) * axis2
             pts = base + ixf * axis0 + iyf * axis1  # (nx*ny,3)
 
-            psi = eval_mos_cart_on_points(ao_basis, C, pts, [mo])[:, 0]  # (nx*ny,)
+            psi = eval_mos_cart_on_points(ao_basis, C, pts, [mo], sph_map=sph_map)[:, 0]  # (nx*ny,)
 
             for i, val in enumerate(psi.tolist()):
                 f.write(f"{val:13.5e}")

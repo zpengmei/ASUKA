@@ -29,9 +29,6 @@ def build_df_bases_cart(
 ) -> tuple[Any, Any, str]:
     """Build (ao_basis, aux_basis, auxbasis_name) as cuERI packed bases."""
 
-    if not bool(mol.cart):
-        raise NotImplementedError("cuERI DF path currently requires cart=True")
-
     elements = _unique_elements(mol)
     basis_in = mol.basis if basis is None else basis
 

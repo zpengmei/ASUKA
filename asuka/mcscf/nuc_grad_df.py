@@ -67,6 +67,77 @@ def _as_xp_f64(xp, a):
     return xp.asarray(a, dtype=xp.float64)
 
 
+def _get_sph_T(scf_out):
+    """Return the cart-to-sph matrix T or None if mol.cart=True."""
+    mol = getattr(scf_out, "mol", None)
+    if bool(getattr(mol, "cart", True)):
+        return None
+    sph_map = getattr(scf_out, "sph_map", None)
+    if sph_map is None:
+        raise ValueError("scf_out.sph_map is required for spherical AO gradients (cart=False)")
+    return sph_map[0]  # (nao_cart, nao_sph)
+
+
+def _sph_to_cart_final(T_c2s, *, D_tot_ao, W, bar_L_ao, C, B_ao_sph, scf_out, xp, coords, charges):
+    """Back-transform final gradient quantities from spherical to Cartesian.
+
+    For the DF gradient, bar_L and B must be in Cartesian AO basis to match
+    the Cartesian derivative integrals.  The back-transforms are:
+
+        D_cart  = T @ D_sph  @ T^T
+        W_cart  = T @ W_sph  @ T^T
+        bar_L_cart[Q,:,:] = T @ bar_L_sph[Q,:,:] @ T^T
+        C_cart  = T @ C_sph
+
+    For B, we rebuild from ao_basis/aux_basis (rebuilding is cheaper than
+    storing a second copy, and back-transform T @ B_sph @ T^T is WRONG
+    because T @ T^T is a projector, not identity, for l >= 2).
+    """
+    T_np = np.asarray(T_c2s, dtype=np.float64)
+    nao_cart = int(T_np.shape[0])
+
+    # -- D_tot and W (2D matrices) --
+    D_np = _asnumpy_f64(D_tot_ao)
+    D_cart = T_np @ D_np @ T_np.T
+    W_np = np.asarray(W, dtype=np.float64)
+    W_cart = T_np @ W_np @ T_np.T
+
+    # -- C (MO coefficients) --
+    C_np = _asnumpy_f64(C)
+    C_cart = T_np @ C_np
+
+    # -- bar_L (Q, nao, nao) → (Q, nao_cart, nao_cart) --
+    bar_L_np = _asnumpy_f64(bar_L_ao)
+    naux = int(bar_L_np.shape[0])
+    bar_L_cart = np.empty((naux, nao_cart, nao_cart), dtype=np.float64)
+    for q in range(naux):
+        bar_L_cart[q] = T_np @ bar_L_np[q] @ T_np.T
+
+    # -- B_cart: rebuild from ao_basis/aux_basis (Cartesian) --
+    ao_basis = getattr(scf_out, "ao_basis")
+    aux_basis = getattr(scf_out, "aux_basis")
+    B_cart = _rebuild_B_cart(ao_basis, aux_basis, xp)
+
+    return D_cart, W_cart, bar_L_cart, C_cart, B_cart
+
+
+def _rebuild_B_cart(ao_basis, aux_basis, xp):
+    """Rebuild Cartesian whitened DF factors B[mu,nu,Q] from packed bases."""
+    try:
+        import cupy as cp  # noqa: PLC0415
+        if xp is cp:
+            from asuka.integrals.cueri_df import build_df_B_from_cueri_packed_bases  # noqa: PLC0415
+            B = build_df_B_from_cueri_packed_bases(ao_basis, aux_basis)
+            # GPU builder may return Qmn layout — ensure mnQ
+            if B.ndim == 3 and int(B.shape[0]) != int(B.shape[1]):
+                B = cp.ascontiguousarray(B.transpose((1, 2, 0)))
+            return _asnumpy_f64(B)
+    except Exception:
+        pass
+    from asuka.integrals.cueri_df_cpu import build_df_B_from_cueri_packed_bases_cpu  # noqa: PLC0415
+    return np.asarray(build_df_B_from_cueri_packed_bases_cpu(ao_basis, aux_basis), dtype=np.float64)
+
+
 def _asnumpy_f64(a: Any) -> np.ndarray:
     """Ensure array is numpy.float64 (moves from GPU if needed).
 
@@ -576,8 +647,6 @@ def casscf_nuc_grad_df(
     mol = getattr(scf_out, "mol", None)
     if mol is None:
         raise TypeError("scf_out must have a .mol attribute")
-    if not bool(getattr(mol, "cart", False)):
-        raise NotImplementedError("DF nuclear gradients currently require cart=True")
 
     coords, charges = _mol_coords_charges_bohr(mol)
     natm = int(coords.shape[0])
@@ -621,6 +690,11 @@ def casscf_nuc_grad_df(
     B_ao = _as_xp_f64(xp, getattr(scf_out, "df_B"))
     h_ao = _as_xp_f64(xp, getattr(getattr(scf_out, "int1e"), "hcore"))
 
+    # Detect spherical AO mode.  gfock / D / bar_L are computed in the native
+    # AO basis (spherical when cart=False), then back-transformed to Cartesian
+    # before the derivative-integral contractions.
+    T_c2s = _get_sph_T(scf_out)
+
     gfock, D_core_ao, D_act_ao, D_tot_ao, C_act = _build_gfock_casscf_df(
         B_ao,
         h_ao,
@@ -642,6 +716,28 @@ def casscf_nuc_grad_df(
     )
     t_barL = time.perf_counter() if profile is not None else 0.0
 
+    # Energy-weighted density W (in native AO basis, before sph→cart transform)
+    _C_np = _asnumpy_f64(C)
+    _gfock_np = _asnumpy_f64(gfock)
+    _nocc = ncore + ncas
+    _C_occ = _C_np[:, :_nocc]
+    _tmp_w = _C_np @ _gfock_np[:, :_nocc]  # (nao, nocc)
+    W = 0.5 * (_tmp_w @ _C_occ.T + _C_occ @ _tmp_w.T)
+
+    # ── Spherical → Cartesian back-transform (if needed) ──
+    if T_c2s is not None:
+        D_tot_cart, W_cart, bar_L_cart, C_cart, B_cart = _sph_to_cart_final(
+            T_c2s, D_tot_ao=D_tot_ao, W=W, bar_L_ao=bar_L_ao,
+            C=C, B_ao_sph=B_ao, scf_out=scf_out, xp=xp,
+            coords=coords, charges=charges,
+        )
+    else:
+        D_tot_cart = _asnumpy_f64(D_tot_ao)
+        W_cart = W
+        bar_L_cart = bar_L_ao
+        C_cart = _C_np
+        B_cart = B_ao
+
     df_prof = None if profile is None else profile.setdefault("df_2e", {})
     try:
         t0_df = time.perf_counter() if profile is not None else 0.0
@@ -649,8 +745,8 @@ def casscf_nuc_grad_df(
             getattr(scf_out, "ao_basis"),
             getattr(scf_out, "aux_basis"),
             atom_coords_bohr=coords,
-            B_ao=B_ao,
-            bar_L_ao=bar_L_ao,
+            B_ao=B_cart,
+            bar_L_ao=bar_L_cart,
             backend=str(df_backend),
             df_threads=int(df_threads),
             profile=df_prof,
@@ -662,7 +758,7 @@ def casscf_nuc_grad_df(
             getattr(scf_out, "ao_basis"),
             getattr(scf_out, "aux_basis"),
             atom_coords_bohr=coords,
-            bar_L_ao=bar_L_ao,
+            bar_L_ao=bar_L_cart,
             backend=str(df_backend),
             df_config=df_config,
             df_threads=int(df_threads),
@@ -679,7 +775,7 @@ def casscf_nuc_grad_df(
         ao_basis,
         atom_coords_bohr=coords,
         atom_charges=charges,
-        M=_asnumpy_f64(D_tot_ao),
+        M=D_tot_cart,
         shell_atom=shell_atom,
         contract_backend=str(int1e_contract_backend),
     )
@@ -693,19 +789,11 @@ def casscf_nuc_grad_df(
     t_nuc = time.perf_counter() if profile is not None else 0.0
 
     # Pulay (overlap-derivative) term: -Tr(W · dS/dR).
-    # W = C @ (½(gfock + gfockᵀ)) @ Cᵀ is the energy-weighted density (AO basis).
-    # gfock[:,nocc:] = 0 by construction, so only the occupied MO columns contribute.
-    _C_np = _asnumpy_f64(C)
-    _gfock_np = _asnumpy_f64(gfock)
-    _nocc = ncore + ncas
-    _C_occ = _C_np[:, :_nocc]
-    _tmp_w = _C_np @ _gfock_np[:, :_nocc]  # (nao, nocc)
-    W = 0.5 * (_tmp_w @ _C_occ.T + _C_occ @ _tmp_w.T)
-    # contract_dS_cart returns the full symmetric nuclear derivative (both bra
-    # and ket centres), so -Tr(W dS) = -1 * contract_dS_cart(M=W).  This path
-    # uses the backend selected by int1e_contract_backend.
+    # W_cart is already computed above (and back-transformed to Cartesian if spherical).
     de_pulay = -1.0 * contract_dS_cart(
-        ao_basis, atom_coords_bohr=coords, M=W, shell_atom=shell_atom,
+        ao_basis, atom_coords_bohr=coords,
+        M=np.asarray(W_cart, dtype=np.float64),
+        shell_atom=shell_atom,
         contract_backend=str(int1e_contract_backend),
     )
     t_pulay = time.perf_counter() if profile is not None else 0.0
@@ -990,8 +1078,6 @@ def casci_nuc_grad_df_relaxed(
     mol = getattr(scf_out, "mol", None)
     if mol is None:
         raise TypeError("scf_out must have a .mol attribute")
-    if not bool(getattr(mol, "cart", False)):
-        raise NotImplementedError("DF nuclear gradients currently require cart=True")
 
     coords, charges = _mol_coords_charges_bohr(mol)
     natm = int(coords.shape[0])
@@ -1032,6 +1118,9 @@ def casci_nuc_grad_df_relaxed(
         nelecas=nelecas,
         solver_kwargs=solver_kwargs,
     )
+
+    if not bool(getattr(getattr(scf_out, "mol", None), "cart", True)):
+        raise NotImplementedError("casci_nuc_grad_df_relaxed does not yet support cart=False (spherical AOs)")
 
     C = _asnumpy_f64(getattr(casci, "mo_coeff"))
     B_ao = _asnumpy_f64(getattr(scf_out, "df_B"))
@@ -1340,8 +1429,6 @@ def casscf_nuc_grad_df_per_root(
     mol = getattr(scf_out, "mol", None)
     if mol is None:
         raise TypeError("scf_out must have a .mol attribute")
-    if not bool(getattr(mol, "cart", False)):
-        raise NotImplementedError("DF nuclear gradients currently require cart=True")
 
     coords, charges = _mol_coords_charges_bohr(mol)
     natm = int(coords.shape[0])
@@ -1365,6 +1452,9 @@ def casscf_nuc_grad_df_per_root(
                 fcisolver_use.nroots = int(nroots)
             except Exception:
                 pass
+
+    if not bool(getattr(getattr(scf_out, "mol", None), "cart", True)):
+        raise NotImplementedError("casscf_nuc_grad_df_per_root does not yet support cart=False (spherical AOs)")
 
     xp, _is_gpu = _resolve_xp(df_backend)
     C = _as_xp_f64(xp, getattr(casscf, "mo_coeff"))

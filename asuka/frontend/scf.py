@@ -37,6 +37,46 @@ from .one_electron import build_ao_basis_cart
 from .periodic_table import atomic_number
 
 
+def _apply_sph_transform(
+    mol: Molecule,
+    int1e: Int1eResult,
+    B,
+    ao_basis,
+) -> tuple[Int1eResult, Any, tuple[np.ndarray, int, int] | None]:
+    """If ``mol.cart=False``, transform int1e and B to spherical AOs.
+
+    Returns ``(int1e, B, sph_map_or_None)``.
+    """
+    if bool(mol.cart):
+        return int1e, B, None
+
+    from asuka.integrals.cart2sph import (  # noqa: PLC0415
+        build_cart2sph_matrix,
+        compute_sph_layout_from_cart_basis,
+        transform_1e_cart_to_sph,
+        transform_df_B_cart_to_sph,
+    )
+
+    shell_l = np.asarray(ao_basis.shell_l, dtype=np.int32).ravel()
+    shell_ao_start_cart = np.asarray(ao_basis.shell_ao_start, dtype=np.int32).ravel()
+    shell_ao_start_sph, nao_sph = compute_sph_layout_from_cart_basis(ao_basis)
+    nao_cart = int(int1e.S.shape[0])
+
+    T = build_cart2sph_matrix(shell_l, shell_ao_start_cart, shell_ao_start_sph, nao_cart, nao_sph)
+
+    S_sph = transform_1e_cart_to_sph(int1e.S, T)
+    T_kin_sph = transform_1e_cart_to_sph(int1e.T, T)
+    V_sph = transform_1e_cart_to_sph(int1e.V, T)
+    int1e_sph = Int1eResult(S=S_sph, T=T_kin_sph, V=V_sph)
+
+    if B is not None:
+        B_sph = transform_df_B_cart_to_sph(B, T)
+    else:
+        B_sph = None
+
+    return int1e_sph, B_sph, (T, nao_cart, nao_sph)
+
+
 @dataclass(frozen=True)
 class RHFDFRunResult:
     mol: Molecule
@@ -49,6 +89,7 @@ class RHFDFRunResult:
     scf: SCFResult
     profile: dict | None = None
     ao_eri: Any | None = None
+    sph_map: tuple[np.ndarray, int, int] | None = None  # (T, nao_cart, nao_sph)
 
 
 @dataclass(frozen=True)
@@ -63,6 +104,7 @@ class UHFDFRunResult:
     scf: SCFResult
     profile: dict | None = None
     ao_eri: Any | None = None
+    sph_map: tuple[np.ndarray, int, int] | None = None  # (T, nao_cart, nao_sph)
 
 
 @dataclass(frozen=True)
@@ -77,6 +119,7 @@ class ROHFDFRunResult:
     scf: SCFResult
     profile: dict | None = None
     ao_eri: Any | None = None
+    sph_map: tuple[np.ndarray, int, int] | None = None  # (T, nao_cart, nao_sph)
 
 
 _HF_PREP_CACHE_MAX = max(0, int(os.environ.get("ASUKA_HF_PREP_CACHE_MAX", "0")))
@@ -226,9 +269,6 @@ def _build_aux_basis_cart(
 ) -> tuple[Any, str]:
     """Build (aux_basis, auxbasis_name) as a cuERI packed cart basis."""
 
-    if not bool(mol.cart):
-        raise NotImplementedError("DF path currently requires cart=True")
-
     elements = _unique_elements(mol)
     auxbasis_name = ""
 
@@ -338,6 +378,9 @@ def run_rhf_dense(
 ) -> RHFDFRunResult:
     """Run RHF with dense AO ERIs (non-DF)."""
 
+    if not bool(mol.cart):
+        raise NotImplementedError("Dense ERI path does not yet support spherical AOs (cart=False); use df=True")
+
     if int(mol.spin) != 0:
         raise NotImplementedError("run_rhf_dense currently supports only closed-shell molecules (spin=0)")
 
@@ -424,6 +467,9 @@ def run_uhf_dense(
 ) -> UHFDFRunResult:
     """Run UHF with dense AO ERIs (non-DF)."""
 
+    if not bool(mol.cart):
+        raise NotImplementedError("Dense ERI path does not yet support spherical AOs (cart=False); use df=True")
+
     nalpha, nbeta = _nalpha_nbeta_from_mol(mol)
     basis_in = mol.basis if basis is None else basis
 
@@ -499,6 +545,9 @@ def run_rohf_dense(
     profile: dict | None = None,
 ) -> ROHFDFRunResult:
     """Run ROHF with dense AO ERIs (non-DF)."""
+
+    if not bool(mol.cart):
+        raise NotImplementedError("Dense ERI path does not yet support spherical AOs (cart=False); use df=True")
 
     nalpha, nbeta = _nalpha_nbeta_from_mol(mol)
     if int(nalpha) < int(nbeta):
@@ -631,6 +680,9 @@ def run_rhf_df(
             df_prof = profile.setdefault("df_build", {})
             df_prof["cache_hit"] = True
 
+    # Spherical AO transform (if requested)
+    int1e_scf, B_scf, sph_map = _apply_sph_transform(mol, int1e, B, ao_basis)
+
     if mo_coeff0 is None and dm0 is None:
         guess_key = _rhf_guess_key(
             mol,
@@ -653,9 +705,9 @@ def run_rhf_df(
     )
     scf_prof = profile if profile is not None else None
     scf = rhf_df(
-        int1e.S,
-        int1e.hcore,
-        B,
+        int1e_scf.S,
+        int1e_scf.hcore,
+        B_scf,
         nelec=int(nelec),
         enuc=float(mol.energy_nuc()),
         max_cycle=int(max_cycle),
@@ -693,10 +745,11 @@ def run_rhf_df(
         auxbasis_name=str(auxbasis_name),
         ao_basis=ao_basis,
         aux_basis=aux_basis,
-        int1e=int1e,
-        df_B=B,
+        int1e=int1e_scf,
+        df_B=B_scf,
         scf=scf,
         profile=profile,
+        sph_map=sph_map,
     )
 
 
@@ -933,6 +986,9 @@ def run_rhf_df_cpu(
         df_prof = profile.setdefault("df_build_cpu", {})
     B = build_df_B_from_cueri_packed_bases_cpu(ao_basis, aux_basis, threads=int(df_threads), profile=df_prof)
 
+    # Spherical AO transform (if requested)
+    int1e_scf, B_scf, sph_map = _apply_sph_transform(mol, int1e, B, ao_basis)
+
     # SCF solve on CPU.
     init_fock_cycles_i = int(_HF_INIT_FOCK_CYCLES) if init_fock_cycles is None else max(0, int(init_fock_cycles))
     diis_start_cycle_i = (
@@ -940,9 +996,9 @@ def run_rhf_df_cpu(
     )
     scf_prof = profile if profile is not None else None
     scf = rhf_df(
-        int1e.S,
-        int1e.hcore,
-        B,
+        int1e_scf.S,
+        int1e_scf.hcore,
+        B_scf,
         nelec=int(nelec),
         enuc=float(mol.energy_nuc()),
         max_cycle=int(max_cycle),
@@ -966,10 +1022,11 @@ def run_rhf_df_cpu(
         auxbasis_name=str(auxbasis_name),
         ao_basis=ao_basis,
         aux_basis=aux_basis,
-        int1e=int1e,
-        df_B=B,
+        int1e=int1e_scf,
+        df_B=B_scf,
         scf=scf,
         profile=profile,
+        sph_map=sph_map,
     )
 
 
@@ -1013,11 +1070,14 @@ def run_uhf_df_cpu(
         df_prof = profile.setdefault("df_build_cpu", {})
     B = build_df_B_from_cueri_packed_bases_cpu(ao_basis, aux_basis, threads=int(df_threads), profile=df_prof)
 
+    # Spherical AO transform (if requested)
+    int1e_scf, B_scf, sph_map = _apply_sph_transform(mol, int1e, B, ao_basis)
+
     scf_prof = profile if profile is not None else None
     scf = uhf_df(
-        int1e.S,
-        int1e.hcore,
-        B,
+        int1e_scf.S,
+        int1e_scf.hcore,
+        B_scf,
         nalpha=int(nalpha),
         nbeta=int(nbeta),
         enuc=float(mol.energy_nuc()),
@@ -1040,10 +1100,11 @@ def run_uhf_df_cpu(
         auxbasis_name=str(auxbasis_name),
         ao_basis=ao_basis,
         aux_basis=aux_basis,
-        int1e=int1e,
-        df_B=B,
+        int1e=int1e_scf,
+        df_B=B_scf,
         scf=scf,
         profile=profile,
+        sph_map=sph_map,
     )
 
 
@@ -1090,11 +1151,14 @@ def run_rohf_df_cpu(
         df_prof = profile.setdefault("df_build_cpu", {})
     B = build_df_B_from_cueri_packed_bases_cpu(ao_basis, aux_basis, threads=int(df_threads), profile=df_prof)
 
+    # Spherical AO transform (if requested)
+    int1e_scf, B_scf, sph_map = _apply_sph_transform(mol, int1e, B, ao_basis)
+
     scf_prof = profile if profile is not None else None
     scf = rohf_df(
-        int1e.S,
-        int1e.hcore,
-        B,
+        int1e_scf.S,
+        int1e_scf.hcore,
+        B_scf,
         nalpha=int(nalpha),
         nbeta=int(nbeta),
         enuc=float(mol.energy_nuc()),
@@ -1117,10 +1181,11 @@ def run_rohf_df_cpu(
         auxbasis_name=str(auxbasis_name),
         ao_basis=ao_basis,
         aux_basis=aux_basis,
-        int1e=int1e,
-        df_B=B,
+        int1e=int1e_scf,
+        df_B=B_scf,
         scf=scf,
         profile=profile,
+        sph_map=sph_map,
     )
 
 
@@ -1167,11 +1232,14 @@ def run_uhf_df(
 
     B = build_df_B_from_cueri_packed_bases(ao_basis, aux_basis, config=df_config, profile=df_prof)
 
+    # Spherical AO transform (if requested)
+    int1e_scf, B_scf, sph_map = _apply_sph_transform(mol, int1e, B, ao_basis)
+
     scf_prof = profile if profile is not None else None
     scf = uhf_df(
-        int1e.S,
-        int1e.hcore,
-        B,
+        int1e_scf.S,
+        int1e_scf.hcore,
+        B_scf,
         nalpha=int(nalpha),
         nbeta=int(nbeta),
         enuc=float(mol.energy_nuc()),
@@ -1194,10 +1262,11 @@ def run_uhf_df(
         auxbasis_name=str(auxbasis_name),
         ao_basis=ao_basis,
         aux_basis=aux_basis,
-        int1e=int1e,
-        df_B=B,
+        int1e=int1e_scf,
+        df_B=B_scf,
         scf=scf,
         profile=profile,
+        sph_map=sph_map,
     )
 
 
@@ -1247,11 +1316,14 @@ def run_rohf_df(
 
     B = build_df_B_from_cueri_packed_bases(ao_basis, aux_basis, config=df_config, profile=df_prof)
 
+    # Spherical AO transform (if requested)
+    int1e_scf, B_scf, sph_map = _apply_sph_transform(mol, int1e, B, ao_basis)
+
     scf_prof = profile if profile is not None else None
     scf = rohf_df(
-        int1e.S,
-        int1e.hcore,
-        B,
+        int1e_scf.S,
+        int1e_scf.hcore,
+        B_scf,
         nalpha=int(nalpha),
         nbeta=int(nbeta),
         enuc=float(mol.energy_nuc()),
@@ -1274,10 +1346,11 @@ def run_rohf_df(
         auxbasis_name=str(auxbasis_name),
         ao_basis=ao_basis,
         aux_basis=aux_basis,
-        int1e=int1e,
-        df_B=B,
+        int1e=int1e_scf,
+        df_B=B_scf,
         scf=scf,
         profile=profile,
+        sph_map=sph_map,
     )
 
 

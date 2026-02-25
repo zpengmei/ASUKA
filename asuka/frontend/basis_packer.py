@@ -179,4 +179,40 @@ def pack_cart_basis(
     )
 
 
-__all__ = ["pack_cart_basis", "parse_pyscf_basis_dict"]
+def pack_cart_basis_with_sph_map(
+    atoms_bohr: list[tuple[str, np.ndarray]] | tuple[tuple[str, np.ndarray], ...],
+    basis_shells: dict[str, list[tuple[int, np.ndarray, np.ndarray]]],
+    *,
+    expand_contractions: bool = True,
+) -> tuple:
+    """Pack basis and return ``(BasisCartSoA, shell_ao_start_sph, nao_cart, nao_sph)``.
+
+    This parallels :func:`pack_cart_basis` but additionally computes the
+    spherical AO layout alongside the Cartesian one, without requiring a
+    PySCF mol object.
+    """
+    from asuka.cueri.sph import nsph  # noqa: PLC0415
+
+    ao_basis = pack_cart_basis(atoms_bohr, basis_shells, expand_contractions=expand_contractions)
+
+    shell_l = np.asarray(ao_basis.shell_l, dtype=np.int32).ravel()
+    nshell = int(shell_l.size)
+
+    shell_ao_start_sph = np.empty((nshell,), dtype=np.int32)
+    sph_cursor = 0
+    for i in range(nshell):
+        shell_ao_start_sph[i] = sph_cursor
+        sph_cursor += nsph(int(shell_l[i]))
+    nao_sph = int(sph_cursor)
+
+    # nao_cart from existing basis
+    ao_starts_cart = np.asarray(ao_basis.shell_ao_start, dtype=np.int32).ravel()
+    if nshell > 0:
+        nao_cart = int(max(int(ao_starts_cart[i]) + ncart(int(shell_l[i])) for i in range(nshell)))
+    else:
+        nao_cart = 0
+
+    return ao_basis, shell_ao_start_sph, nao_cart, nao_sph
+
+
+__all__ = ["pack_cart_basis", "pack_cart_basis_with_sph_map", "parse_pyscf_basis_dict"]

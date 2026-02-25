@@ -414,16 +414,28 @@ def _build_casci_df_integrals(
     eri_prof = None
     if profile is not None:
         eri_prof = profile.setdefault("active_df", {})
+
+    # cuERI builder works in Cartesian AO space -- transform MO coefficients
+    # from spherical to Cartesian when mol.cart=False.
+    C_cas_for_eri = C_cas
+    cached_b_for_eri = cached_b_whitened_use
+    sph_map = getattr(scf_out, "sph_map", None)
+    if sph_map is not None:
+        T_c2s = xp.asarray(sph_map[0], dtype=xp.float64)  # (nao_cart, nao_sph)
+        C_cas_for_eri = T_c2s @ C_cas  # (nao_cart, ncas)
+        # Spherical-basis cached B cannot be reused in Cartesian cuERI builder
+        cached_b_for_eri = None
+
     eri = build_device_dfmo_integrals_cueri_df(
         scf_out.ao_basis,
         scf_out.aux_basis,
-        C_cas,
+        C_cas_for_eri,
         aux_block_naux=int(aux_block_naux),
         max_tile_bytes=int(max_tile_bytes),
         want_eri_mat=bool(want_eri_mat),
         want_pair_norm=False,
         profile=eri_prof,
-        cached_b_whitened=cached_b_whitened_use,
+        cached_b_whitened=cached_b_for_eri,
         cache_out=cache_out,
     )
 

@@ -25,9 +25,6 @@ def build_ao_basis_cart(
 ):
     """Build (ao_basis, basis_name) as a cuERI packed cart basis."""
 
-    if not bool(mol.cart):
-        raise NotImplementedError("AO 1e integrals currently require cart=True")
-
     elements = sorted(set(mol.elements))
     basis_in = mol.basis if basis is None else basis
 
@@ -78,9 +75,49 @@ def build_int1e_cart_deriv_from_mol(
     return out, ao_basis, basis_name
 
 
+def build_int1e_from_mol(
+    mol: Molecule,
+    *,
+    basis: Any | None = None,
+    expand_contractions: bool = True,
+) -> tuple[Int1eResult, Any, str, np.ndarray | None]:
+    """Build 1e integrals, optionally transforming to spherical AOs.
+
+    Returns ``(int1e, ao_basis, basis_name, T_or_None)`` where ``T`` is the
+    ``(nao_cart, nao_sph)`` cart-to-sph matrix (or ``None`` when ``mol.cart=True``).
+    """
+    int1e_cart, ao_basis, basis_name = build_int1e_cart_from_mol(
+        mol, basis=basis, expand_contractions=bool(expand_contractions)
+    )
+
+    if bool(mol.cart):
+        return int1e_cart, ao_basis, basis_name, None
+
+    from asuka.integrals.cart2sph import (  # noqa: PLC0415
+        build_cart2sph_matrix,
+        compute_sph_layout_from_cart_basis,
+        transform_1e_cart_to_sph,
+    )
+
+    shell_ao_start_sph, nao_sph = compute_sph_layout_from_cart_basis(ao_basis)
+    shell_l = np.asarray(ao_basis.shell_l, dtype=np.int32).ravel()
+    shell_ao_start_cart = np.asarray(ao_basis.shell_ao_start, dtype=np.int32).ravel()
+    nao_cart = int(int1e_cart.S.shape[0])
+
+    T = build_cart2sph_matrix(shell_l, shell_ao_start_cart, shell_ao_start_sph, nao_cart, nao_sph)
+
+    S_sph = transform_1e_cart_to_sph(int1e_cart.S, T)
+    T_kin_sph = transform_1e_cart_to_sph(int1e_cart.T, T)
+    V_sph = transform_1e_cart_to_sph(int1e_cart.V, T)
+
+    int1e_sph = Int1eResult(S=S_sph, T=T_kin_sph, V=V_sph)
+    return int1e_sph, ao_basis, basis_name, T
+
+
 __all__ = [
     "build_ao_basis_cart",
     "build_int1e_cart_from_mol",
     "build_int1e_cart_deriv_from_mol",
+    "build_int1e_from_mol",
 ]
 

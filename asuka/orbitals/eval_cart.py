@@ -105,8 +105,22 @@ def eval_shell_cart(ao_basis: Any, shell: int, points: np.ndarray) -> np.ndarray
     return out
 
 
-def eval_mos_cart_on_points(ao_basis: Any, C: Any, points: np.ndarray, mo_list: list[int]) -> np.ndarray:
+def eval_mos_cart_on_points(
+    ao_basis: Any,
+    C: Any,
+    points: np.ndarray,
+    mo_list: list[int],
+    *,
+    sph_map: tuple[np.ndarray, int, int] | None = None,
+) -> np.ndarray:
     """Evaluate selected MOs on points (streamed by shell).
+
+    Parameters
+    ----------
+    sph_map : tuple | None
+        If not None, ``(T, nao_cart, nao_sph)`` from SCF result.
+        C is assumed to be in spherical AO basis and will be back-transformed
+        to Cartesian: ``C_cart = T @ C_sph``.
 
     Returns
     -------
@@ -114,6 +128,12 @@ def eval_mos_cart_on_points(ao_basis: Any, C: Any, points: np.ndarray, mo_list: 
     """
 
     Cn = _asnumpy(C)
+
+    # Back-transform spherical MO coefficients to Cartesian for grid evaluation
+    if sph_map is not None:
+        T_c2s = np.asarray(sph_map[0], dtype=np.float64)
+        Cn = T_c2s @ Cn
+
     pts = np.asarray(points, dtype=np.float64).reshape((-1, 3))
     mo_list = [int(i) for i in mo_list]
     if Cn.ndim != 2:
