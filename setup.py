@@ -155,6 +155,27 @@ def _cueri_pair_coeff_cpu_ext() -> Extension:
     )
 
 
+def _cueri_eri_sph_pack_cpu_ext() -> Extension:
+    """Optional CPU packers for spherical ERI tiles (primarily for testing)."""
+
+    try:
+        import numpy as np
+    except Exception as e:  # pragma: no cover
+        raise SystemExit("NumPy is required to build asuka.cueri._eri_sph_pack_cpu") from e
+
+    extra_compile_args = ["-O3"]
+    define_macros: list[tuple[str, str]] = [("NPY_NO_DEPRECATED_API", "NPY_1_7_API_VERSION")]
+
+    return Extension(
+        "asuka.cueri._eri_sph_pack_cpu",
+        sources=["asuka/cueri/_eri_sph_pack_cpu.pyx"],
+        include_dirs=[np.get_include()],
+        language="c",
+        extra_compile_args=extra_compile_args,
+        define_macros=define_macros,
+    )
+
+
 def _cythonize_exts(exts: list[Extension]) -> list[Extension]:
     try:
         from Cython.Build import cythonize
@@ -231,6 +252,14 @@ class build_ext(_build_ext):
 
 
 setup(
-    ext_modules=_cythonize_exts([_epq_ext(), _int1e_ext(), _cueri_eri_cpu_ext(), _cueri_pair_coeff_cpu_ext()]),
+    ext_modules=_cythonize_exts(
+        [
+            _epq_ext(),
+            _int1e_ext(),
+            _cueri_eri_cpu_ext(),
+            _cueri_pair_coeff_cpu_ext(),
+            _cueri_eri_sph_pack_cpu_ext(),
+        ]
+    ),
     cmdclass={"build_ext": build_ext},
 )

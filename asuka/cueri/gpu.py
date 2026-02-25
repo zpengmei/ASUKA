@@ -419,6 +419,232 @@ def sph_coeff_sph_to_cart_device(
         return out
 
 
+def cart2sph_eri_tiles_device(
+    tile_cart,
+    *,
+    la: int,
+    lb: int,
+    lc: int,
+    ld: int,
+    out=None,
+    tmp=None,
+    stream=None,
+    threads: int = 256,
+):
+    """Transform a batch of contracted ERI tiles from Cartesian to spherical AOs on the GPU.
+
+    Parameters
+    ----------
+    tile_cart
+        CuPy array with shape (ntasks, nAB_cart, nCD_cart) and dtype float64.
+    la, lb, lc, ld
+        Angular momenta for the shell quartet class corresponding to the tile axes.
+    out
+        Optional preallocated output array with shape (ntasks, nAB_sph, nCD_sph).
+    tmp
+        Optional preallocated scratch array with shape (ntasks, nAB_cart, nCD_sph).
+
+    Returns
+    -------
+    cupy.ndarray
+        Spherical tile with shape (ntasks, nAB_sph, nCD_sph).
+    """
+
+    import cupy as cp
+
+    _require_cuda_ext()
+    la = int(la)
+    lb = int(lb)
+    lc = int(lc)
+    ld = int(ld)
+    with stream_ctx(stream):
+        tile_cart = cp.asarray(tile_cart, dtype=cp.float64)
+        tile_cart = cp.ascontiguousarray(tile_cart)
+        if tile_cart.ndim != 3:
+            raise ValueError("tile_cart must have shape (ntasks, nAB, nCD)")
+        ntasks = int(tile_cart.shape[0])
+
+        nA_cart = int(ncart(la))
+        nB_cart = int(ncart(lb))
+        nC_cart = int(ncart(lc))
+        nD_cart = int(ncart(ld))
+        nAB_cart = nA_cart * nB_cart
+        nCD_cart = nC_cart * nD_cart
+        if int(tile_cart.shape[1]) != nAB_cart or int(tile_cart.shape[2]) != nCD_cart:
+            raise ValueError(
+                f"tile_cart has shape {tuple(tile_cart.shape)}, expected (nt, {nAB_cart}, {nCD_cart}) for (la,lb,lc,ld)=({la},{lb},{lc},{ld})"
+            )
+
+        nA_sph = 2 * la + 1
+        nB_sph = 2 * lb + 1
+        nC_sph = 2 * lc + 1
+        nD_sph = 2 * ld + 1
+        nAB_sph = nA_sph * nB_sph
+        nCD_sph = nC_sph * nD_sph
+
+        if tmp is None:
+            tmp = cp.empty((ntasks, nAB_cart, nCD_sph), dtype=cp.float64)
+        else:
+            tmp = cp.asarray(tmp, dtype=cp.float64)
+            if tuple(tmp.shape) != (ntasks, nAB_cart, nCD_sph):
+                raise ValueError(f"tmp must have shape {(ntasks, nAB_cart, nCD_sph)}, got {tuple(tmp.shape)}")
+            tmp = cp.ascontiguousarray(tmp)
+
+        if out is None:
+            out = cp.empty((ntasks, nAB_sph, nCD_sph), dtype=cp.float64)
+        else:
+            out = cp.asarray(out, dtype=cp.float64)
+            if tuple(out.shape) != (ntasks, nAB_sph, nCD_sph):
+                raise ValueError(f"out must have shape {(ntasks, nAB_sph, nCD_sph)}, got {tuple(out.shape)}")
+            out = cp.ascontiguousarray(out)
+
+        _ext.cart2sph_eri_right_device(
+            tile_cart.ravel(),
+            tmp.ravel(),
+            int(la),
+            int(lb),
+            int(lc),
+            int(ld),
+            int(threads),
+            int(_stream_ptr(stream)),
+            False,
+        )
+        _ext.cart2sph_eri_left_device(
+            tmp.ravel(),
+            out.ravel(),
+            int(la),
+            int(lb),
+            int(lc),
+            int(ld),
+            int(threads),
+            int(_stream_ptr(stream)),
+            False,
+        )
+        return out
+
+
+def scatter_eri_tiles_sph_s8_inplace_device(
+    tasks: TaskList,
+    shell_pairs: DeviceShellPairs,
+    *,
+    shell_ao_start_sph,
+    nao_sph: int,
+    nA: int,
+    nB: int,
+    nC: int,
+    nD: int,
+    tile_vals,
+    out_s8,
+    stream=None,
+    threads: int = 256,
+):
+    """Scatter spherical ERI tiles into packed s8 layout on the GPU."""
+
+    import cupy as cp
+
+    _require_cuda_ext()
+    nao_sph = int(nao_sph)
+    nA = int(nA)
+    nB = int(nB)
+    nC = int(nC)
+    nD = int(nD)
+
+    with stream_ctx(stream):
+        task_ab = cp.asarray(tasks.task_spAB, dtype=cp.int32)
+        task_cd = cp.asarray(tasks.task_spCD, dtype=cp.int32)
+        task_ab = cp.ascontiguousarray(task_ab)
+        task_cd = cp.ascontiguousarray(task_cd)
+
+        shell_ao_start_sph = cp.asarray(shell_ao_start_sph, dtype=cp.int32)
+        shell_ao_start_sph = cp.ascontiguousarray(shell_ao_start_sph)
+
+        tile_vals = cp.asarray(tile_vals, dtype=cp.float64)
+        tile_vals = cp.ascontiguousarray(tile_vals).ravel()
+
+        out_s8 = cp.asarray(out_s8, dtype=cp.float64)
+        out_s8 = cp.ascontiguousarray(out_s8).ravel()
+
+        _ext.scatter_eri_tiles_sph_s8_inplace_device(
+            task_ab,
+            task_cd,
+            shell_pairs.sp_A,
+            shell_pairs.sp_B,
+            shell_ao_start_sph,
+            int(nao_sph),
+            int(nA),
+            int(nB),
+            int(nC),
+            int(nD),
+            tile_vals,
+            out_s8,
+            int(threads),
+            int(_stream_ptr(stream)),
+            False,
+        )
+        return out_s8
+
+
+def scatter_eri_tiles_sph_s4_inplace_device(
+    tasks: TaskList,
+    shell_pairs: DeviceShellPairs,
+    *,
+    shell_ao_start_sph,
+    nao_sph: int,
+    nA: int,
+    nB: int,
+    nC: int,
+    nD: int,
+    tile_vals,
+    out_s4,
+    stream=None,
+    threads: int = 256,
+):
+    """Scatter spherical ERI tiles into packed s4 layout on the GPU."""
+
+    import cupy as cp
+
+    _require_cuda_ext()
+    nao_sph = int(nao_sph)
+    nA = int(nA)
+    nB = int(nB)
+    nC = int(nC)
+    nD = int(nD)
+
+    with stream_ctx(stream):
+        task_ab = cp.asarray(tasks.task_spAB, dtype=cp.int32)
+        task_cd = cp.asarray(tasks.task_spCD, dtype=cp.int32)
+        task_ab = cp.ascontiguousarray(task_ab)
+        task_cd = cp.ascontiguousarray(task_cd)
+
+        shell_ao_start_sph = cp.asarray(shell_ao_start_sph, dtype=cp.int32)
+        shell_ao_start_sph = cp.ascontiguousarray(shell_ao_start_sph)
+
+        tile_vals = cp.asarray(tile_vals, dtype=cp.float64)
+        tile_vals = cp.ascontiguousarray(tile_vals).ravel()
+
+        out_s4 = cp.asarray(out_s4, dtype=cp.float64)
+        out_s4 = cp.ascontiguousarray(out_s4).ravel()
+
+        _ext.scatter_eri_tiles_sph_s4_inplace_device(
+            task_ab,
+            task_cd,
+            shell_pairs.sp_A,
+            shell_pairs.sp_B,
+            shell_ao_start_sph,
+            int(nao_sph),
+            int(nA),
+            int(nB),
+            int(nC),
+            int(nD),
+            tile_vals,
+            out_s4,
+            int(threads),
+            int(_stream_ptr(stream)),
+            False,
+        )
+        return out_s4
+
+
 def to_device_basis_ss(basis: BasisSoA):
     import cupy as cp
 
@@ -5963,6 +6189,7 @@ __all__ = [
     "df_metric_2c2e_ss_device",
     "df_metric_2c2e_sp_device",
     "df_metric_2c2e_rys_device",
+    "cart2sph_eri_tiles_device",
     "eri_dddd_device",
     "eri_dpdd_device",
     "eri_dpdp_device",
@@ -6020,6 +6247,8 @@ __all__ = [
     "has_cuda_ext",
     "reduce_from_entry_csr_device",
     "rys_roots_weights_device",
+    "scatter_eri_tiles_sph_s4_inplace_device",
+    "scatter_eri_tiles_sph_s8_inplace_device",
     "schwarz_ssss_device",
     "sph_coeff_sph_to_cart_device",
     "to_device_basis_ss",

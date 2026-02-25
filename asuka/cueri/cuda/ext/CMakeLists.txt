@@ -28,6 +28,7 @@ pybind11_add_module(
     src/cueri_cuda_kernels_rys_generic_deriv.cu
     src/cueri_cuda_kernels_dense_scatter.cu
     src/cueri_cuda_kernels_df_deriv.cu
+    src/cueri_cuda_kernels_cart2sph_eri.cu
     src/cueri_cuda_kernels_sph.cu
 )
 

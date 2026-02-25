@@ -32,6 +32,7 @@ from .eri_utils import (
     unpack_pair_id,
 )
 from .gpu import warmup_cuda
+from .intor_sph_gpu import CuERISphERIEngine, int2e_sph_device
 from .mol_basis import SphMapForCartBasis, get_cached_or_pack_cart_ao_basis, pack_cart_shells_from_mol, pack_cart_shells_from_mol_with_sph_map
 from .pair_tables_cpu import PairTablesCPU, build_pair_tables_cpu
 from .reference_ssss import eri_ssss
@@ -60,6 +61,7 @@ __all__ = [
     "BasisSoA",
     "KernelBatch",
     "CuERIActiveSpaceDenseGPUBuilder",
+    "CuERISphERIEngine",
     "PairTablesCPU",
     "SSSSDigestResult",
     "ShellPairs",
@@ -94,6 +96,7 @@ __all__ = [
     "group_tasks_by_spab",
     "iter_deriv_kernel_batches_spd",
     "iter_tile_batches_spd",
+    "int2e_sph_device",
     "j_ps_from_eri_mat",
     "j_ps_from_eri_packed",
     "ncart",

@@ -1121,4 +1121,62 @@ extern "C" cudaError_t cueri_scatter_eri_tiles_ordered_launch_stream(
     cudaStream_t stream,
     int threads);
 
+// Cartesian->spherical transform for ERI tiles.
+extern "C" cudaError_t cueri_cart2sph_eri_right_launch_stream(
+    const double* tile_cart,  // size ntasks * (nA_cart*nB_cart) * (nC_cart*nD_cart)
+    double* tile_tmp,         // size ntasks * (nA_cart*nB_cart) * (nC_sph*nD_sph)
+    int ntasks,
+    int la,
+    int lb,
+    int lc,
+    int ld,
+    cudaStream_t stream,
+    int threads);
+
+extern "C" cudaError_t cueri_cart2sph_eri_left_launch_stream(
+    const double* tile_tmp,  // size ntasks * (nA_cart*nB_cart) * (nC_sph*nD_sph)
+    double* tile_sph,        // size ntasks * (nA_sph*nB_sph) * (nC_sph*nD_sph)
+    int ntasks,
+    int la,
+    int lb,
+    int lc,
+    int ld,
+    cudaStream_t stream,
+    int threads);
+
+// Scatter spherical ERI tiles into PySCF-like packed AO formats.
+extern "C" cudaError_t cueri_scatter_eri_tiles_sph_s8_launch_stream(
+    const int32_t* task_spAB,
+    const int32_t* task_spCD,
+    int ntasks,
+    const int32_t* sp_A,
+    const int32_t* sp_B,
+    const int32_t* shell_ao_start_sph,
+    int nao_sph,
+    int nA,
+    int nB,
+    int nC,
+    int nD,
+    const double* tile_vals,  // size ntasks * (nA*nB) * (nC*nD)
+    double* out_s8,           // size npair(nao_pair)
+    cudaStream_t stream,
+    int threads);
+
+extern "C" cudaError_t cueri_scatter_eri_tiles_sph_s4_launch_stream(
+    const int32_t* task_spAB,
+    const int32_t* task_spCD,
+    int ntasks,
+    const int32_t* sp_A,
+    const int32_t* sp_B,
+    const int32_t* shell_ao_start_sph,
+    int nao_sph,
+    int nA,
+    int nB,
+    int nC,
+    int nD,
+    const double* tile_vals,  // size ntasks * (nA*nB) * (nC*nD)
+    double* out_s4,           // size nao_pair * nao_pair
+    cudaStream_t stream,
+    int threads);
+
 #endif  // CUERI_CUDA_KERNELS_API_H
