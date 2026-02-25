@@ -747,12 +747,24 @@ def casscf_nuc_grad_df(
             atom_coords_bohr=coords,
             B_ao=B_cart,
             bar_L_ao=bar_L_cart,
+            L_chol=getattr(scf_out, "df_L", None),
             backend=str(df_backend),
             df_threads=int(df_threads),
             profile=df_prof,
         )
-    except (NotImplementedError, RuntimeError):
+    except (NotImplementedError, RuntimeError) as _analytic_exc:
         # Fallback for backends without analytic DF derivative kernels (e.g. CUDA).
+        import warnings as _w
+        _w.warn(
+            f"Analytic DF gradient failed ({type(_analytic_exc).__name__}: {_analytic_exc}); "
+            "falling back to finite-difference (much slower). "
+            "Set ASUKA_GRAD_DEBUG=1 for traceback.",
+            stacklevel=1,
+        )
+        import os as _os_grad
+        if _os_grad.environ.get("ASUKA_GRAD_DEBUG"):
+            import traceback as _tb
+            _tb.print_exc()
         t0_df = time.perf_counter() if profile is not None else 0.0
         de_df = compute_df_gradient_contributions_fd_packed_bases(
             getattr(scf_out, "ao_basis"),
@@ -968,6 +980,7 @@ def casci_nuc_grad_df_unrelaxed(
             atom_coords_bohr=coords,
             B_ao=B_ao,
             bar_L_ao=bar_L_ao,
+            L_chol=getattr(scf_out, "df_L", None),
             backend=str(df_backend),
             df_threads=int(df_threads),
             profile=df_prof,
@@ -1258,6 +1271,7 @@ def casci_nuc_grad_df_relaxed(
             atom_coords_bohr=coords,
             B_ao=B_ao,
             bar_L_ao=bar_L_tot,
+            L_chol=getattr(scf_out, "df_L", None),
             backend=str(df_backend),
             df_threads=int(df_threads),
             profile=df_prof,
@@ -1509,6 +1523,7 @@ def casscf_nuc_grad_df_per_root(
             atom_coords_bohr=coords,
             backend=str(df_backend),
             df_threads=int(df_threads),
+            L_chol=getattr(scf_out, "df_L", None),
         )
     except (NotImplementedError, RuntimeError):
         df_grad_ctx = None
@@ -1697,6 +1712,7 @@ def casscf_nuc_grad_df_per_root(
             else:
                 de_df_sa = compute_df_gradient_contributions_analytic_packed_bases(
                     ao_basis, aux_basis, atom_coords_bohr=coords, B_ao=B_ao, bar_L_ao=bar_L_sa,
+                    L_chol=getattr(scf_out, "df_L", None),
                     backend=str(df_backend), df_threads=int(df_threads), profile=None,
                 )
             if _profile_df_per_root:
@@ -1998,6 +2014,7 @@ def casscf_nuc_grad_df_per_root(
             else:
                 de_df_delta = compute_df_gradient_contributions_analytic_packed_bases(
                     ao_basis, aux_basis, atom_coords_bohr=coords, B_ao=B_ao, bar_L_ao=bar_L_delta_total,
+                    L_chol=getattr(scf_out, "df_L", None),
                     backend=str(df_backend), df_threads=int(df_threads), profile=None,
                 )
             if _profile_df_per_root:

@@ -71,6 +71,7 @@ class DFGradContractionContext:
         atom_coords_bohr: np.ndarray,
         backend: Backend,
         df_threads: int = 0,
+        L_chol: Any | None = None,
     ) -> "DFGradContractionContext":
         backend_s = str(backend).strip().lower()
         if backend_s not in ("cpu", "cuda"):
@@ -202,8 +203,14 @@ class DFGradContractionContext:
 
             from asuka.cueri import df as cueri_df  # noqa: PLC0415
 
-            V = cueri_df.metric_2c2e_basis(aux_basis, stream=None, backend="gpu_rys", mode="warp", threads=256)
-            L_metric = cp.linalg.cholesky(V)
+            if L_chol is not None:
+                L_metric = cp.ascontiguousarray(cp.asarray(L_chol, dtype=cp.float64))
+            else:
+                V = cueri_df.metric_2c2e_basis(aux_basis, stream=None, backend="gpu_rys", mode="warp", threads=256)
+                _v_diag = cp.diag(V)
+                _v_shift = max(float(cp.max(cp.abs(_v_diag))) * 1e-14, 1e-12)
+                V[cp.diag_indices_from(V)] += _v_shift
+                L_metric = cp.linalg.cholesky(V)
 
         ctx = DFGradContractionContext(
             backend=backend_s,  # type: ignore[arg-type]

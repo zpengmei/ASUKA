@@ -113,6 +113,7 @@ def compute_df_gradient_contributions_analytic_packed_bases(
     atom_coords_bohr: np.ndarray,
     B_ao: np.ndarray,
     bar_L_ao: np.ndarray,
+    L_chol: Any | None = None,
     backend: str = "cpu",
     df_threads: int = 0,
     profile: dict | None = None,
@@ -127,6 +128,15 @@ def compute_df_gradient_contributions_analytic_packed_bases(
            - V(P,Q)   = (P|Q)
       2) Contract analytic integral derivatives:
            dE/dR = (dX/dR)⋅bar_X + (dV/dR)⋅bar_V
+
+    Parameters
+    ----------
+    L_chol
+        Optional pre-computed lower Cholesky factor of the aux metric V.
+        When provided, the gradient uses *exactly the same* L as the forward
+        DF build, eliminating run-to-run non-determinism from recomputing
+        V on GPU (where 1-ULP kernel non-determinism is amplified by an
+        ill-conditioned V into ~1e-2 gradient errors).
 
     Notes
     -----
@@ -282,8 +292,12 @@ def compute_df_gradient_contributions_analytic_packed_bases(
 
         t_metric_build = time.perf_counter() if profile is not None else 0.0
 
-        V = 0.5 * (V + V.T)
-        L = np.linalg.cholesky(V)
+        if L_chol is not None:
+            L = np.asarray(L_chol, dtype=np.float64, order="C")
+            V = L @ L.T
+        else:
+            V = 0.5 * (V + V.T)
+            L = np.linalg.cholesky(V)
 
         t_metric_chol = time.perf_counter() if profile is not None else 0.0
     else:
@@ -293,19 +307,40 @@ def compute_df_gradient_contributions_analytic_packed_bases(
 
         from asuka.cueri import df as cueri_df  # noqa: PLC0415
 
-        V = cueri_df.metric_2c2e_basis(aux_basis, stream=None, backend="gpu_rys", mode="warp", threads=256)
-        if profile is not None:
-            cp.cuda.get_current_stream().synchronize()
-            t_metric_build = time.perf_counter()
+        if L_chol is not None:
+            # Reuse the forward-pass Cholesky factor — avoids recomputing V
+            # and eliminates non-determinism from GPU 2c2e kernel + ill-conditioned V.
+            L = cp.ascontiguousarray(cp.asarray(L_chol, dtype=cp.float64))
+            # Still need V for the 2c2e derivative adjoint; reconstruct from L.
+            V = L @ L.T
+            if profile is not None:
+                cp.cuda.get_current_stream().synchronize()
+                t_metric_build = time.perf_counter()
+                t_metric_chol = t_metric_build
+            else:
+                t_metric_build = 0.0
+                t_metric_chol = 0.0
         else:
-            t_metric_build = 0.0
+            V = cueri_df.metric_2c2e_basis(aux_basis, stream=None, backend="gpu_rys", mode="warp", threads=256)
+            # Regularize: AutoAux bases can have cond(V) > 1e17, amplifying
+            # 1-ULP GPU kernel non-determinism into ~1e-2 gradient errors
+            # through the Cholesky factor. Apply the same diagonal shift as
+            # the forward DF builder (asuka/integrals/cueri_df.py).
+            _v_diag = cp.diag(V)
+            _v_shift = max(float(cp.max(cp.abs(_v_diag))) * 1e-14, 1e-12)
+            V[cp.diag_indices_from(V)] += _v_shift
+            if profile is not None:
+                cp.cuda.get_current_stream().synchronize()
+                t_metric_build = time.perf_counter()
+            else:
+                t_metric_build = 0.0
 
-        L = cp.linalg.cholesky(V)
-        if profile is not None:
-            cp.cuda.get_current_stream().synchronize()
-            t_metric_chol = time.perf_counter()
-        else:
-            t_metric_chol = 0.0
+            L = cp.linalg.cholesky(V)
+            if profile is not None:
+                cp.cuda.get_current_stream().synchronize()
+                t_metric_chol = time.perf_counter()
+            else:
+                t_metric_chol = 0.0
 
     # ---- DF adjoints: (bar_B, L) -> (bar_X, bar_V) ----
     # bar_L_ao is stored as (naux,nao,nao); df_whiten_adjoint expects (nao,nao,naux).
@@ -458,12 +493,16 @@ def compute_df_gradient_contributions_analytic_packed_bases(
 
         # 3c2e derivative contraction — batched: one kernel per (la,lb,lq) class.
         grad_dev_flat = grad_dev.reshape(-1)  # (natm*3,) view for atomicAdd kernel
+        _3c_class_times: list[tuple[int, int, int, int, int, float]] = []
         for (la_, lb_), spAB_class_dev in spAB_by_lab_dev.items():
             n_spAB = int(spAB_class_dev.shape[0])
             for lq, spCD_dev in spCD_by_l_dev.items():
                 nt = int(spCD_dev.shape[0])
                 if nt == 0 or n_spAB == 0:
                     continue
+                if profile is not None:
+                    cp.cuda.get_current_stream().synchronize()
+                    _t_cls0 = time.perf_counter()
                 _ext_cuda.df_int3c2e_deriv_contracted_cart_allsp_atomgrad_inplace_device(
                     spAB_class_dev,
                     spCD_dev,
@@ -495,6 +534,9 @@ def compute_df_gradient_contributions_analytic_packed_bases(
                     int(stream_ptr),
                     False,
                 )
+                if profile is not None:
+                    cp.cuda.get_current_stream().synchronize()
+                    _3c_class_times.append((int(la_), int(lb_), int(lq), n_spAB, nt, time.perf_counter() - _t_cls0))
 
     if backend_s == "cuda":
         # Synchronize so that async 3c2e kernels complete before 2c2e metric section.
@@ -642,6 +684,8 @@ def compute_df_gradient_contributions_analytic_packed_bases(
         profile["t_3c_deriv_s"] = float(t_3c_deriv - t_df_adjoint)
         profile["t_2c_deriv_s"] = float(t_2c_deriv - t_3c_deriv)
         profile["t_total_s"] = float(t_2c_deriv - t0_total)
+        if _3c_class_times:
+            profile["_3c_class_times"] = _3c_class_times  # [(la, lb, lq, n_spAB, n_spCD, time_s), ...]
 
     return grad
 

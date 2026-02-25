@@ -245,6 +245,7 @@ def mrci_grad_states_from_ref_analytic(
             atom_coords_bohr=coords,
             backend=str(df_backend),
             df_threads=int(df_threads),
+            L_chol=getattr(scf_out, "df_L", None),
         )
     except Exception:
         df_grad_ctx = None
@@ -374,6 +375,7 @@ def mrci_grad_states_from_ref_analytic(
                     atom_coords_bohr=coords,
                     B_ao=_asnumpy_f64(B_ao),
                     bar_L_ao=bar_L_total,
+                    L_chol=getattr(scf_out, "df_L", None),
                     backend=str(df_backend),
                     df_threads=int(df_threads),
                     profile=None,

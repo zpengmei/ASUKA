@@ -439,6 +439,7 @@ def _grad_elec_active_df(
                     atom_coords_bohr=coords,
                     B_ao=B_ao,
                     bar_L_ao=bar_L_net,
+                    L_chol=getattr(scf_out, "df_L", None),
                     backend=str(df_backend),
                     df_threads=int(df_threads),
                     profile=None,
@@ -478,6 +479,7 @@ def _grad_elec_active_df(
                 atom_coords_bohr=coords,
                 B_ao=B_ao,
                 bar_L_ao=bar_L_ao,
+                L_chol=getattr(scf_out, "df_L", None),
                 backend=str(df_backend),
                 df_threads=int(df_threads),
                 profile=None,
@@ -505,6 +507,7 @@ def _grad_elec_active_df(
                 atom_coords_bohr=coords,
                 B_ao=B_ao,
                 bar_L_ao=bar_L_core,
+                L_chol=getattr(scf_out, "df_L", None),
                 backend=str(df_backend),
                 df_threads=int(df_threads),
                 profile=None,
@@ -598,6 +601,7 @@ def _grad_elec_casscf_df(
                 atom_coords_bohr=coords,
                 B_ao=B_ao,
                 bar_L_ao=bar_L_ao,
+                L_chol=getattr(scf_out, "df_L", None),
                 backend=str(df_backend),
                 df_threads=int(df_threads),
                 profile=None,
@@ -810,6 +814,7 @@ def _Lorb_dot_dgorb_dx_df(
                 atom_coords_bohr=coords,
                 B_ao=B_ao,
                 bar_L_ao=bar_L_ao,
+                L_chol=getattr(scf_out, "df_L", None),
                 backend=str(df_backend),
                 df_threads=int(df_threads),
                 profile=None,
@@ -984,6 +989,7 @@ def sacasscf_nonadiabatic_couplings_df(
             atom_coords_bohr=coords,
             backend=str(df_backend),
             df_threads=int(df_threads),
+            L_chol=getattr(scf_out, "df_L", None),
         )
     except (NotImplementedError, RuntimeError):
         df_grad_ctx = None

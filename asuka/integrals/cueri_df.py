@@ -29,12 +29,18 @@ def build_df_B_from_cueri_packed_bases(
     config: CuERIDFConfig | None = None,
     layout: str = "mnQ",
     profile: dict | None = None,
+    return_L: bool = False,
 ):
     """Build whitened DF factors using cuERI DF primitives (GPU).
 
     Layouts
     - ``layout="mnQ"`` (default): returns ``B[μ,ν,Q]`` with shape ``(nao, nao, naux)``.
     - ``layout="Qmn"``: returns ``BQ[Q,μ,ν]`` with shape ``(naux, nao, nao)``.
+
+    If ``return_L=True``, returns ``(B, L)`` where L is the lower Cholesky
+    factor of the regularized aux metric V.  Passing L to the gradient
+    function avoids recomputing V on GPU (where 1-ULP kernel non-determinism
+    is amplified by ill-conditioned V into gradient errors).
     """
 
     try:
@@ -101,6 +107,8 @@ def build_df_B_from_cueri_packed_bases(
         except Exception:
             pass
 
+    if return_L:
+        return out, L
     return out
 
 

@@ -90,6 +90,7 @@ class RHFDFRunResult:
     profile: dict | None = None
     ao_eri: Any | None = None
     sph_map: tuple[np.ndarray, int, int] | None = None  # (T, nao_cart, nao_sph)
+    df_L: Any | None = None  # Cholesky factor of aux metric (for deterministic gradients)
 
 
 @dataclass(frozen=True)
@@ -667,15 +668,21 @@ def run_rhf_df(
             df_prof = profile.setdefault("df_build", {})
             df_prof["cache_hit"] = False
 
-        B = build_df_B_from_cueri_packed_bases(ao_basis, aux_basis, config=df_config, profile=df_prof)
+        B, L_chol = build_df_B_from_cueri_packed_bases(ao_basis, aux_basis, config=df_config, profile=df_prof, return_L=True)
         _cache_put(
             _RHF_PREP_CACHE,
             prep_key,
-            (ao_basis, str(basis_name), int1e, aux_basis, str(auxbasis_name), B),
+            (ao_basis, str(basis_name), int1e, aux_basis, str(auxbasis_name), B, L_chol),
             max_size=int(_HF_PREP_CACHE_MAX),
         )
     else:
-        ao_basis, basis_name, int1e, aux_basis, auxbasis_name, B = prep_hit
+        _prep_tuple = prep_hit
+        if len(_prep_tuple) == 7:
+            ao_basis, basis_name, int1e, aux_basis, auxbasis_name, B, L_chol = _prep_tuple
+        else:
+            # Legacy cache entry without L_chol
+            ao_basis, basis_name, int1e, aux_basis, auxbasis_name, B = _prep_tuple
+            L_chol = None
         if profile is not None:
             df_prof = profile.setdefault("df_build", {})
             df_prof["cache_hit"] = True
@@ -750,6 +757,7 @@ def run_rhf_df(
         scf=scf,
         profile=profile,
         sph_map=sph_map,
+        df_L=L_chol,
     )
 
 
