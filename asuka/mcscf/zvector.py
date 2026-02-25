@@ -1861,6 +1861,17 @@ def solve_mcscf_zvector(
             z = np.asarray(z, dtype=np.float64).ravel()
             z_orb = z[: int(op.n_orb)].copy()
             z_ci = op.ci_unflatten(z[int(op.n_orb) :])
+            if op.is_sa and bool(project_sa_rhs) and op.ci_ref_list is not None:
+                if not isinstance(z_ci, list):
+                    raise RuntimeError("internal error: expected list CI unpacking for SA-CASSCF")
+                z_ci = _project_sa_ci_components(op.ci_ref_list, z_ci, gram_inv=op.sa_gram_inv)
+                if int(op.n_ci) > 0:
+                    z_ci_flat = np.concatenate(
+                        [np.asarray(v, dtype=np.float64).ravel() for v in z_ci]
+                    )
+                else:
+                    z_ci_flat = np.zeros(0, dtype=np.float64)
+                z = np.concatenate([z_orb, z_ci_flat])
 
         resid = float(info.get("residual_norm", np.nan))
         rel = float(info.get("residual_rel", np.nan))
