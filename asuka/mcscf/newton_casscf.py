@@ -3688,6 +3688,16 @@ def gen_g_hop_orbital(
             except Exception:
                 _use_mo_jk = False
 
+    # GPU-resident copies of h_op intermediates (avoids per-call CPU→GPU transfers)
+    if _use_mo_jk:
+        _h1e_mo_g = _cp.asarray(h1e_mo, dtype=_cp.float64)
+        _dm1_full_g = _cp.asarray(dm1_full, dtype=_cp.float64)
+        _g_orb_sym_g = _cp.asarray(g_orb_mat + g_orb_mat.T, dtype=_cp.float64)
+        _vhf_ca_g = _cp.asarray(vhf_ca, dtype=_cp.float64)
+        _vhf_c_g = _cp.asarray(vhf_c_np, dtype=_cp.float64)
+        _casdm1_hop_g = _cp.asarray(casdm1, dtype=_cp.float64)
+        _hdm2_g = _cp.asarray(hdm2, dtype=_cp.float64)
+
     # Orbital diagonal Hessian (PySCF Parts 7-6).
     h_diag = np.einsum("ii,jj->ij", h1e_mo, dm1_full) - h1e_mo * dm1_full
     h_diag = h_diag + h_diag.T
@@ -3722,73 +3732,81 @@ def gen_g_hop_orbital(
         x_packed = np.asarray(x_packed, dtype=np.float64).ravel()
         x1 = casscf.unpack_uniq_var(x_packed)
 
-        # Orbital Hessian assembly (lines 2443-2480 of _h_op_raw, orbital-only).
-        x2 = (h1e_mo @ x1) @ dm1_full
-        x2 -= (g_orb_mat + g_orb_mat.T) @ x1 * 0.5
-        if ncore:
-            x2[:ncore] += (x1[:ncore, ncore:] @ vhf_ca[ncore:]) * 2.0
-        x2[ncore:nocc] += (casdm1 @ x1[ncore:nocc]) @ vhf_c_np
-        x2[:, ncore:nocc] += np.einsum("purv,rv->pu", hdm2, x1[:, ncore:nocc], optimize=True)
+        if _use_mo_jk:
+            # ── Full GPU path: matmuls + block-selective MO-basis JK ──
+            _xp = _cp
+            x1_g = _xp.asarray(x1, dtype=_xp.float64)
 
-        # JK for orbital Hessian.
-        if ncore > 0:
-            if _use_mo_jk:
-                _xp = _cp
-                x1_g = _xp.asarray(x1, dtype=_xp.float64)
-                casdm1_g_jk = _xp.asarray(casdm1, dtype=_xp.float64)
+            # Orbital Hessian assembly (GPU)
+            x2_g = (_h1e_mo_g @ x1_g) @ _dm1_full_g
+            x2_g -= _g_orb_sym_g @ x1_g * 0.5
+            if ncore:
+                x2_g[:ncore] += (x1_g[:ncore, ncore:] @ _vhf_ca_g[ncore:]) * 2.0
+            x2_g[ncore:nocc] += (_casdm1_hop_g @ x1_g[ncore:nocc]) @ _vhf_c_g
+            x2_g[:, ncore:nocc] += _xp.einsum(
+                "purv,rv->pu", _hdm2_g, x1_g[:, ncore:nocc], optimize=True,
+            )
 
+            # Block-selective MO-basis JK with combined K GEMM
+            if ncore > 0:
                 # dm3_MO: symmetric core↔rest block of x1
                 dm3 = _xp.zeros((nmo, nmo), dtype=_xp.float64)
                 dm3[:ncore, ncore:] = x1_g[:ncore, ncore:]
                 dm3[ncore:, :ncore] = x1_g[:ncore, ncore:].T
 
-                # dm4_MO: active-all block weighted by casdm1
+                # dm_total = 2*dm3 + dm4
                 dm4_h = _xp.zeros((nmo, nmo), dtype=_xp.float64)
-                dm4_h[ncore:nocc, :] = casdm1_g_jk @ x1_g[ncore:nocc, :]
+                dm4_h[ncore:nocc, :] = _casdm1_hop_g @ x1_g[ncore:nocc, :]
                 dm_total = dm3 * 2.0 + dm4_h + dm4_h.T
 
                 _naux = int(_L_pq_gpu.shape[2])
-
-                # Precomputed views (no copy)
-                L_t_2d = _L_t_gpu.reshape(nmo, _naux * nmo)              # (nmo, naux*nmo)
+                L_t_2d = _L_t_gpu.reshape(nmo, _naux * nmo)
                 L_t_act_flat = _L_t_gpu[ncore:nocc].reshape(ncas * _naux, nmo)
                 L_t_core_flat = _L_t_gpu[:ncore].reshape(ncore * _naux, nmo)
 
-                # ── K0: only ncas active rows ──
+                # K Step 1: separate small GEMMs for each density
                 LDM0 = (L_t_act_flat @ dm3).reshape(ncas, _naux * nmo)
-                K0_act = LDM0 @ L_t_2d.T                                  # (ncas, nmo)
+                LDM1 = (L_t_core_flat @ dm_total).reshape(ncore, _naux * nmo)
 
-                # ── J0: exploit sparse dm3 (only core↔rest nonzero) ──
+                # K Step 2: combined GEMM — reads L_t once instead of twice
+                K_cat = _xp.vstack([LDM0, LDM1]) @ L_t_2d.T   # (ncas+ncore, nmo)
+                K0_act = K_cat[:ncas]                            # (ncas, nmo)
+                K1_core = K_cat[ncas:]                           # (ncore, nmo)
+
+                # J0: exploit sparse dm3 (only core↔rest nonzero)
                 rho0 = 2.0 * _xp.einsum("iaQ,ia->Q", _L_pq_gpu[:ncore, ncore:],
                                          x1_g[:ncore, ncore:])
                 J0_act = (_L_pq_gpu[ncore:nocc].reshape(ncas * nmo, _naux) @ rho0
                           ).reshape(ncas, nmo)
 
-                va = (casdm1_g_jk @ (J0_act * 2.0 - K0_act)).get()        # → CPU
-
-                # ── K1: only ncore core rows ──
-                LDM1 = (L_t_core_flat @ dm_total).reshape(ncore, _naux * nmo)
-                K1_core = LDM1 @ L_t_2d.T                                 # (ncore, nmo)
-
-                # ── J1: rho1 = 2*rho0 + rho_dm4, exploit sparse dm4 ──
-                dm4_act = casdm1_g_jk @ x1_g[ncore:nocc]                  # (ncas, nmo)
+                # J1: rho1 = 2*rho0 + rho_dm4
+                dm4_act = _casdm1_hop_g @ x1_g[ncore:nocc]
                 rho_dm4 = 2.0 * (_L_pq_gpu[ncore:nocc].reshape(ncas * nmo, _naux).T
                                  @ dm4_act.ravel())
                 rho1 = 2.0 * rho0 + rho_dm4
                 J1_core = (_L_pq_gpu[:ncore].reshape(ncore * nmo, _naux) @ rho1
                            ).reshape(ncore, nmo)
 
-                vc = (J1_core * 2.0 - K1_core)[:, ncore:].get()           # → CPU
+                x2_g[ncore:nocc] += _casdm1_hop_g @ (J0_act * 2.0 - K0_act)
+                x2_g[:ncore, ncore:] += (J1_core * 2.0 - K1_core)[:, ncore:]
 
-                x2[ncore:nocc] += va
-                x2[:ncore, ncore:] += vc
-            else:
-                # Fallback: AO-basis JK
+            x2 = (x2_g - x2_g.T).get()
+        else:
+            # ── CPU fallback ──
+            x2 = (h1e_mo @ x1) @ dm1_full
+            x2 -= (g_orb_mat + g_orb_mat.T) @ x1 * 0.5
+            if ncore:
+                x2[:ncore] += (x1[:ncore, ncore:] @ vhf_ca[ncore:]) * 2.0
+            x2[ncore:nocc] += (casdm1 @ x1[ncore:nocc]) @ vhf_c_np
+            x2[:, ncore:nocc] += np.einsum("purv,rv->pu", hdm2, x1[:, ncore:nocc], optimize=True)
+
+            if ncore > 0:
                 va, vc = casscf.update_jk_in_ah(mo, x1, casdm1, eris)
                 x2[ncore:nocc] += _to_np_f64(va)
                 x2[:ncore, ncore:] += _to_np_f64(vc)
 
-        x2 = x2 - x2.T
+            x2 = x2 - x2.T
+
         return np.asarray(casscf.pack_uniq_var(x2), dtype=np.float64).ravel() * 2.0
 
     def _gorb_update(u_rot: np.ndarray, ci_new: Any) -> tuple[np.ndarray, Callable, np.ndarray]:
