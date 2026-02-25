@@ -3663,6 +3663,31 @@ def gen_g_hop_orbital(
     # paaa
     paaa = ppaa_arr[:, ncore:nocc, :, :]
 
+    # ── Precompute MO-basis 3-index DF integrals for fast block-selective JK ──
+    import os as _os_ghop
+    _L_pq_gpu = None   # (nmo, nmo, naux)
+    _L_t_gpu = None     # (nmo, naux, nmo)
+    _use_mo_jk = False
+    if _os_ghop.environ.get("ASUKA_DISABLE_MO_JK", "0") != "1" and ncore > 0 and _cp is not None:
+        _df_B_raw = getattr(casscf, "df_B", None)
+        if _df_B_raw is not None:
+            try:
+                _B_g = _cp.asarray(_df_B_raw, dtype=_cp.float64)
+                _C_g = _cp.asarray(mo, dtype=_cp.float64)
+                _nao_B = int(_B_g.shape[0])
+                _naux_B = int(_B_g.shape[2])
+                # Half-transform: H[p,n,Q] = C^T @ B[:,:,Q]
+                _H = (_C_g.T @ _B_g.reshape(_nao_B, _nao_B * _naux_B)).reshape(nmo, _nao_B, _naux_B)
+                # Full transform: L_t[p,Q,q] = H[p,:,Q] @ C
+                _H_t = _cp.ascontiguousarray(_H.transpose(0, 2, 1))  # (nmo, naux, nao)
+                _L_t_gpu = (_H_t.reshape(nmo * _naux_B, _nao_B) @ _C_g).reshape(nmo, _naux_B, nmo)
+                _L_t_gpu = _cp.ascontiguousarray(_L_t_gpu)
+                _L_pq_gpu = _cp.ascontiguousarray(_L_t_gpu.transpose(0, 2, 1))
+                del _H, _H_t, _B_g, _C_g
+                _use_mo_jk = True
+            except Exception:
+                _use_mo_jk = False
+
     # Orbital diagonal Hessian (PySCF Parts 7-6).
     h_diag = np.einsum("ii,jj->ij", h1e_mo, dm1_full) - h1e_mo * dm1_full
     h_diag = h_diag + h_diag.T
@@ -3705,13 +3730,63 @@ def gen_g_hop_orbital(
         x2[ncore:nocc] += (casdm1 @ x1[ncore:nocc]) @ vhf_c_np
         x2[:, ncore:nocc] += np.einsum("purv,rv->pu", hdm2, x1[:, ncore:nocc], optimize=True)
 
-        # JK for orbital Hessian (AO-basis fallback through adapter).
+        # JK for orbital Hessian.
         if ncore > 0:
-            va, vc = casscf.update_jk_in_ah(mo, x1, casdm1, eris)
-            va = _to_np_f64(va)
-            vc = _to_np_f64(vc)
-            x2[ncore:nocc] += va
-            x2[:ncore, ncore:] += vc
+            if _use_mo_jk:
+                _xp = _cp
+                x1_g = _xp.asarray(x1, dtype=_xp.float64)
+                casdm1_g_jk = _xp.asarray(casdm1, dtype=_xp.float64)
+
+                # dm3_MO: symmetric core↔rest block of x1
+                dm3 = _xp.zeros((nmo, nmo), dtype=_xp.float64)
+                dm3[:ncore, ncore:] = x1_g[:ncore, ncore:]
+                dm3[ncore:, :ncore] = x1_g[:ncore, ncore:].T
+
+                # dm4_MO: active-all block weighted by casdm1
+                dm4_h = _xp.zeros((nmo, nmo), dtype=_xp.float64)
+                dm4_h[ncore:nocc, :] = casdm1_g_jk @ x1_g[ncore:nocc, :]
+                dm_total = dm3 * 2.0 + dm4_h + dm4_h.T
+
+                _naux = int(_L_pq_gpu.shape[2])
+
+                # Precomputed views (no copy)
+                L_t_2d = _L_t_gpu.reshape(nmo, _naux * nmo)              # (nmo, naux*nmo)
+                L_t_act_flat = _L_t_gpu[ncore:nocc].reshape(ncas * _naux, nmo)
+                L_t_core_flat = _L_t_gpu[:ncore].reshape(ncore * _naux, nmo)
+
+                # ── K0: only ncas active rows ──
+                LDM0 = (L_t_act_flat @ dm3).reshape(ncas, _naux * nmo)
+                K0_act = LDM0 @ L_t_2d.T                                  # (ncas, nmo)
+
+                # ── J0: exploit sparse dm3 (only core↔rest nonzero) ──
+                rho0 = 2.0 * _xp.einsum("iaQ,ia->Q", _L_pq_gpu[:ncore, ncore:],
+                                         x1_g[:ncore, ncore:])
+                J0_act = (_L_pq_gpu[ncore:nocc].reshape(ncas * nmo, _naux) @ rho0
+                          ).reshape(ncas, nmo)
+
+                va = (casdm1_g_jk @ (J0_act * 2.0 - K0_act)).get()        # → CPU
+
+                # ── K1: only ncore core rows ──
+                LDM1 = (L_t_core_flat @ dm_total).reshape(ncore, _naux * nmo)
+                K1_core = LDM1 @ L_t_2d.T                                 # (ncore, nmo)
+
+                # ── J1: rho1 = 2*rho0 + rho_dm4, exploit sparse dm4 ──
+                dm4_act = casdm1_g_jk @ x1_g[ncore:nocc]                  # (ncas, nmo)
+                rho_dm4 = 2.0 * (_L_pq_gpu[ncore:nocc].reshape(ncas * nmo, _naux).T
+                                 @ dm4_act.ravel())
+                rho1 = 2.0 * rho0 + rho_dm4
+                J1_core = (_L_pq_gpu[:ncore].reshape(ncore * nmo, _naux) @ rho1
+                           ).reshape(ncore, nmo)
+
+                vc = (J1_core * 2.0 - K1_core)[:, ncore:].get()           # → CPU
+
+                x2[ncore:nocc] += va
+                x2[:ncore, ncore:] += vc
+            else:
+                # Fallback: AO-basis JK
+                va, vc = casscf.update_jk_in_ah(mo, x1, casdm1, eris)
+                x2[ncore:nocc] += _to_np_f64(va)
+                x2[:ncore, ncore:] += _to_np_f64(vc)
 
         x2 = x2 - x2.T
         return np.asarray(casscf.pack_uniq_var(x2), dtype=np.float64).ravel() * 2.0
