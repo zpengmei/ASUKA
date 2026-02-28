@@ -87,6 +87,103 @@ def _flush_gpu_pool() -> None:
         pass
 
 
+def _normalize_df_vram_policy(value: str | None) -> str:
+    policy = str(value or "auto").strip().lower()
+    if policy in ("", "auto"):
+        return "auto"
+    if policy in ("off", "0", "false", "no", "disabled"):
+        return "off"
+    if policy in ("aggressive", "tight", "low"):
+        return "aggressive"
+    return "auto"
+
+
+def _apply_df_pool_policy(B_ao: Any, *, label: str = ""):
+    """Apply an adaptive CuPy memory-pool cap for DF-heavy phases.
+
+    Returns a restore callback that resets the previous pool limit and flushes
+    cached free blocks.
+    """
+    policy = _normalize_df_vram_policy(_os.environ.get("ASUKA_DF_VRAM_POLICY"))
+    if policy == "off":
+        return lambda: None
+
+    try:
+        import cupy as cp  # noqa: PLC0415
+    except Exception:
+        return lambda: None
+
+    if B_ao is None or not isinstance(B_ao, cp.ndarray):
+        return lambda: None
+
+    try:
+        pool = cp.get_default_memory_pool()
+        free_b, total_b = cp.cuda.runtime.memGetInfo()
+        free_b = int(free_b)
+        total_b = int(total_b)
+        used_b = max(0, int(total_b) - int(free_b))
+        sizeof_B = int(getattr(B_ao, "size", 0)) * 8
+
+        old_limit: int | None = None
+        try:
+            old_limit = int(pool.get_limit())
+        except Exception:
+            old_limit = None
+
+        limit_env = _os.environ.get("ASUKA_DF_POOL_LIMIT_GB")
+        if limit_env:
+            try:
+                limit_b = max(1, int(float(limit_env) * 1024**3))
+            except Exception:
+                limit_b = 0
+        else:
+            if policy == "aggressive":
+                floor_b = int(0.60 * total_b)
+                ceil_b = int(0.90 * total_b)
+                slack_b = max(int(6 * max(1, sizeof_B)), int(5 * 1024**3))
+            else:
+                floor_b = int(0.72 * total_b)
+                ceil_b = int(0.95 * total_b)
+                slack_b = max(int(10 * max(1, sizeof_B)), int(8 * 1024**3))
+            limit_b = max(floor_b, min(ceil_b, int(used_b) + int(slack_b)))
+
+        if limit_b > 0:
+            pool.set_limit(size=int(limit_b))
+            if _os.environ.get("ASUKA_VRAM_DEBUG"):
+                print(f"[VRAM_POLICY] {label}: policy={policy} limit={limit_b/1e9:.2f}GB")
+
+    except Exception:
+        return lambda: None
+
+    def _restore() -> None:
+        try:
+            cp.get_default_memory_pool().free_all_blocks()
+            if old_limit is not None:
+                cp.get_default_memory_pool().set_limit(size=int(old_limit))
+        except Exception:
+            pass
+
+    return _restore
+
+
+def _symmetrize_bar_L_inplace(bar, xp, nchunks: int = 4) -> None:
+    """Compute bar = 0.5 * (bar + bar^T) in-place, chunked over the aux index.
+
+    This avoids allocating a full (naux, nao, nao) temporary for the transpose,
+    reducing the peak VRAM from 2 sizeof_B to sizeof_B + sizeof_B/nchunks.
+    The (0, 2, 1) transpose swaps the last two (AO) dims independently per Q-slice,
+    so chunking over Q is safe.
+    """
+    naux = int(bar.shape[0])
+    _chunk = max(1, naux // nchunks)
+    for _q0 in range(0, naux, _chunk):
+        _q1 = min(_q0 + _chunk, naux)
+        _slc = bar[_q0:_q1].copy()
+        bar[_q0:_q1] += xp.transpose(_slc, (0, 2, 1))
+        del _slc
+    bar *= 0.5
+
+
 def _as_xp_f64(xp, a):
     """Convert any array-like to *xp* float64."""
     # When target is numpy but input is a CuPy array, pull to CPU first.
@@ -591,16 +688,17 @@ def _build_bar_L_casscf_df(
     M_uvQ = M.reshape(ncas, ncas, naux)
 
     tmp = xp.einsum("mu,uvQ->mvQ", C_act, M_uvQ, optimize=True)  # (nao,ncas,naux)
-    bar_act = xp.einsum("mvQ,nv->Qmn", tmp, C_act, optimize=True)  # (naux,nao,nao)
+    # Accumulate bar_act into bar_mean in chunks to avoid sizeof_B temporary.
+    _chunk = max(1, naux // 4)
+    for _q0 in range(0, naux, _chunk):
+        _q1 = min(_q0 + _chunk, naux)
+        bar_mean[_q0:_q1] += xp.einsum("mvQ,nv->Qmn", tmp[:, :, _q0:_q1], C_act, optimize=True)
+    del tmp
     _log_vram("    casscf_df: after bar_act")
 
-    bar_mean += bar_act
-    del bar_act
-    bar_L = bar_mean + xp.transpose(bar_mean, (0, 2, 1))
-    del bar_mean
-    bar_L *= 0.5
+    _symmetrize_bar_L_inplace(bar_mean, xp)
     _log_vram("    casscf_df: after sym")
-    return xp.asarray(bar_L, dtype=xp.float64)
+    return xp.asarray(bar_mean, dtype=xp.float64)
 
 
 def _build_bar_L_delta_casscf_df(
@@ -681,14 +779,15 @@ def _build_bar_L_delta_casscf_df(
     M_uvQ = M.reshape(ncas, ncas, naux)
 
     tmp = xp.einsum("mu,uvQ->mvQ", C_act, M_uvQ, optimize=True)  # (nao,ncas,naux)
-    bar_act_delta = xp.einsum("mvQ,nv->Qmn", tmp, C_act, optimize=True)  # (naux,nao,nao)
+    # Accumulate bar_act_delta into bar_mean_delta in chunks.
+    _chunk = max(1, naux // 4)
+    for _q0 in range(0, naux, _chunk):
+        _q1 = min(_q0 + _chunk, naux)
+        bar_mean_delta[_q0:_q1] += xp.einsum("mvQ,nv->Qmn", tmp[:, :, _q0:_q1], C_act, optimize=True)
+    del tmp
 
-    bar_mean_delta += bar_act_delta
-    del bar_act_delta
-    bar_L_delta = bar_mean_delta + xp.transpose(bar_mean_delta, (0, 2, 1))
-    del bar_mean_delta
-    bar_L_delta *= 0.5
-    return xp.asarray(bar_L_delta, dtype=xp.float64)
+    _symmetrize_bar_L_inplace(bar_mean_delta, xp)
+    return xp.asarray(bar_mean_delta, dtype=xp.float64)
 
 
 def _build_bar_L_df_cross(
@@ -698,6 +797,8 @@ def _build_bar_L_df_cross(
     D_right: np.ndarray,
     coeff_J: float,
     coeff_K: float,
+    out: Any | None = None,
+    symmetrize: bool = True,
 ) -> np.ndarray:
     """Return bar_L for E = coeff_J*Tr(D_left·J(D_right)) + coeff_K*Tr(D_left·K(D_right)).
 
@@ -716,6 +817,11 @@ def _build_bar_L_df_cross(
         Coefficient for Coulomb term.
     coeff_K : float
         Coefficient for Exchange term.
+    out : Any | None, optional
+        Optional output buffer with shape ``(naux,nao,nao)``. If provided,
+        contributions are accumulated in-place.
+    symmetrize : bool, optional
+        Whether to symmetrize in-place before returning.
 
     Returns
     -------
@@ -743,11 +849,19 @@ def _build_bar_L_df_cross(
 
     _log_vram("    cross: before Coulomb")
     cJ = float(coeff_J)
-    if cJ:
-        bar = (cJ * sigma)[:, None, None] * D_right[None, :, :]
-        bar += (cJ * rho)[:, None, None] * D_left[None, :, :]
+    if out is None:
+        if cJ:
+            bar = (cJ * sigma)[:, None, None] * D_right[None, :, :]
+            bar += (cJ * rho)[:, None, None] * D_left[None, :, :]
+        else:
+            bar = xp.zeros((naux, nao, nao), dtype=xp.float64)
     else:
-        bar = xp.zeros((naux, nao, nao), dtype=xp.float64)
+        bar = xp.asarray(out, dtype=xp.float64)
+        if bar.shape != (naux, nao, nao):
+            raise ValueError("out shape mismatch")
+        if cJ:
+            bar += (cJ * sigma)[:, None, None] * D_right[None, :, :]
+            bar += (cJ * rho)[:, None, None] * D_left[None, :, :]
     _log_vram("    cross: after Coulomb")
 
     # Exchange-like part: Tr(D_left K(D_right)) = Σ_Q Tr(D_left B_Q D_right B_Q)
@@ -766,11 +880,10 @@ def _build_bar_L_df_cross(
             del _t
         _log_vram("    cross: after exchange")
 
-    _sym = bar + xp.transpose(bar, (0, 2, 1))
-    del bar
-    _sym *= 0.5
-    _log_vram("    cross: after sym")
-    return xp.asarray(_sym, dtype=xp.float64)
+    if bool(symmetrize):
+        _symmetrize_bar_L_inplace(bar, xp)
+        _log_vram("    cross: after sym")
+    return xp.asarray(bar, dtype=xp.float64)
 
 
 def casscf_nuc_grad_df(
@@ -883,6 +996,7 @@ def casscf_nuc_grad_df(
     C = _as_xp_f64(xp, getattr(casscf, "mo_coeff"))
     B_ao = _as_xp_f64(xp, getattr(scf_out, "df_B"))
     h_ao = _as_xp_f64(xp, getattr(getattr(scf_out, "int1e"), "hcore"))
+    _restore_pool = _apply_df_pool_policy(B_ao, label="casscf_nuc_grad_df")
 
     # Detect spherical AO mode.  gfock / D / bar_L are computed in the native
     # AO basis (spherical when cart=False), then back-transformed to Cartesian
@@ -1035,6 +1149,7 @@ def casscf_nuc_grad_df(
         profile["t_pulay_s"] = float(t_pulay - t_nuc)
         profile["t_total_s"] = float(t_pulay - t0_total)
 
+    _restore_pool()
     return DFNucGradResult(
         e_tot=float(getattr(casscf, "e_tot", 0.0)),
         e_nuc=float(mol.energy_nuc()),
@@ -1142,6 +1257,7 @@ def casci_nuc_grad_df_unrelaxed(
     C = _asnumpy_f64(getattr(casci, "mo_coeff"))
     B_ao = _asnumpy_f64(getattr(scf_out, "df_B"))
     h_ao = _asnumpy_f64(getattr(getattr(scf_out, "int1e"), "hcore"))
+    _restore_pool = _apply_df_pool_policy(B_ao, label="casci_nuc_grad_df_unrelaxed")
 
     gfock, D_core_ao, D_act_ao, D_tot_ao, C_act = _build_gfock_casscf_df(
         B_ao,
@@ -1218,6 +1334,7 @@ def casci_nuc_grad_df_unrelaxed(
     else:
         e_tot = 0.0
 
+    _restore_pool()
     return DFNucGradResult(
         e_tot=float(e_tot),
         e_nuc=float(mol.energy_nuc()),
@@ -1338,6 +1455,7 @@ def casci_nuc_grad_df_relaxed(
     C = _asnumpy_f64(getattr(casci, "mo_coeff"))
     B_ao = _asnumpy_f64(getattr(scf_out, "df_B"))
     h_ao = _asnumpy_f64(getattr(getattr(scf_out, "int1e"), "hcore"))
+    _restore_pool = _apply_df_pool_policy(B_ao, label="casci_nuc_grad_df_relaxed")
 
     gfock, D_core_ao, D_act_ao, D_tot_ao, C_act = _build_gfock_casscf_df(
         B_ao,
@@ -1463,7 +1581,9 @@ def casci_nuc_grad_df_relaxed(
         coeff_J=1.0,
         coeff_K=-0.5,
     )
-    bar_L_tot = np.asarray(bar_L_ao + bar_L_resp, dtype=np.float64)
+    bar_L_tot = np.asarray(bar_L_ao, dtype=np.float64, order="C")
+    bar_L_tot += np.asarray(bar_L_resp, dtype=np.float64)
+    del bar_L_ao, bar_L_resp
 
     df_prof = None if profile is None else profile.setdefault("df_2e", {})
     try:
@@ -1527,6 +1647,7 @@ def casci_nuc_grad_df_relaxed(
     else:
         e_tot = 0.0
 
+    _restore_pool()
     return DFNucGradResult(
         e_tot=float(e_tot),
         e_nuc=float(mol.energy_nuc()),
@@ -1692,6 +1813,7 @@ def casscf_nuc_grad_df_per_root(
     C = _as_xp_f64(xp, getattr(casscf, "mo_coeff"))
     B_ao = _as_xp_f64(xp, getattr(scf_out, "df_B"))
     h_ao = _as_xp_f64(xp, getattr(getattr(scf_out, "int1e"), "hcore"))
+    _restore_pool = _apply_df_pool_policy(B_ao, label="casscf_nuc_grad_df_per_root")
 
     # Per-root RDMs
     per_root_rdms: list[tuple[np.ndarray, np.ndarray]] = []
@@ -1786,10 +1908,15 @@ def casscf_nuc_grad_df_per_root(
         and str(getattr(df_grad_ctx, "backend", "")).strip().lower() == "cuda"
         and int(nroots) > 1
     ):
-        try:
-            _n_streams_env = int(os.environ.get("ASUKA_DF_CONTRACT_STREAMS", "4"))
-        except Exception:
-            _n_streams_env = 4
+        _n_streams_env_raw = os.environ.get("ASUKA_DF_CONTRACT_STREAMS")
+        _n_streams_default = 1 if int(nroots) <= 2 else 4
+        if _n_streams_env_raw is None:
+            _n_streams_env = int(_n_streams_default)
+        else:
+            try:
+                _n_streams_env = int(_n_streams_env_raw)
+            except Exception:
+                _n_streams_env = int(_n_streams_default)
         _n_streams = max(1, min(int(nroots), int(_n_streams_env)))
         # Auto-scale: if sizeof(B) * n_streams > 50% free VRAM, reduce streams.
         try:
@@ -1797,7 +1924,12 @@ def casscf_nuc_grad_df_per_root(
 
             _sizeof_B = int(B_ao.size) * 8  # float64
             _free_vram = int(_cp_probe.cuda.runtime.memGetInfo()[0])
-            _vram_cap = max(1, int(0.5 * _free_vram // max(1, _sizeof_B)))
+            try:
+                _foot_mult = float(_os.environ.get("ASUKA_DF_STREAM_FOOTPRINT_MULT", "2.5"))
+            except Exception:
+                _foot_mult = 2.5
+            _foot_mult = max(1.0, float(_foot_mult))
+            _vram_cap = max(1, int(0.5 * _free_vram // max(1, int(_foot_mult * _sizeof_B))))
             _n_streams = min(_n_streams, max(1, _vram_cap))
         except Exception:
             pass
@@ -2016,6 +2148,9 @@ def casscf_nuc_grad_df_per_root(
     _gfock_zero_np = _asnumpy_f64(_gfock_zero)
 
     for K in range(nroots):
+        # Drain free CuPy blocks between roots so pool caching does not inflate
+        # driver-visible VRAM and trigger avoidable OOM on small GPUs.
+        _flush_gpu_pool()
         _log_vram(f"root {K} start")
         dm1_K, dm2_K = per_root_rdms[K]
 
@@ -2283,6 +2418,19 @@ def casscf_nuc_grad_df_per_root(
                         "de_pulay_delta": np.asarray(de_pulay_delta, dtype=np.float64),
                     }
                 )
+                # Current root payload is now queued; release local refs before
+                # deciding whether to drain an older job.
+                del (
+                    de_h1_delta, de_pulay_delta,
+                    D_1e_delta, _D_1e_delta_ms,
+                    gfock_K_np, _tmp_K, W_K,
+                    _gfock_lci_raw, _dgfock_lci, _dme0_lci, _dme0_lorb, _W_pulay_ms,
+                    rhs_orb, rhs_ci_K, rhs_ci, g_K,
+                    Lci_list, Lorb_mat,
+                    D_tot_K, D_act_lci, D_L_lorb,
+                    dm1_lci, dm2_lci,
+                )
+                _flush_gpu_pool()
 
                 if len(_in_flight) >= int(_n_streams):
                     job = _in_flight.pop(0)
@@ -2320,6 +2468,7 @@ def casscf_nuc_grad_df_per_root(
                         dtype=np.float64,
                     )
                     grads_out[int(job["K"])] = grad_done
+                    del de_df_delta, grad_done, job
                     _flush_gpu_pool()
                 continue
 
@@ -2456,8 +2605,10 @@ def casscf_nuc_grad_df_per_root(
                 dtype=np.float64,
             )
             grads_out[int(job["K"])] = grad_done
+            del de_df_delta, grad_done, job
             _flush_gpu_pool()
 
+    _restore_pool()
     missing = [i for i, g in enumerate(grads_out) if g is None]
     if missing:  # pragma: no cover
         raise RuntimeError(f"internal error: missing per-root gradients for roots {missing!r}")

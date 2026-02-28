@@ -41,8 +41,10 @@ from asuka.mcscf.nuc_grad_df import (
     _build_gfock_casscf_df,
     _resolve_xp,
     _as_xp_f64,
+    _apply_df_pool_policy,
     _log_vram,
     _flush_gpu_pool,
+    _symmetrize_bar_L_inplace,
 )
 from asuka.mcscf.newton_df import DFNewtonCASSCFAdapter, DFNewtonERIs
 from asuka.mcscf import newton_casscf as _newton_casscf
@@ -344,17 +346,18 @@ def _build_bar_L_net_active_df(
     M_uvQ = M.reshape(ncas, ncas, naux)
 
     tmp = xp.einsum("mu,uvQ->mvQ", C_act, M_uvQ, optimize=True)
-    bar_act = xp.einsum("mvQ,nv->Qmn", tmp, C_act, optimize=True)
+    # Accumulate bar_act into bar_net in chunks to avoid sizeof_B temporary.
+    _chunk = max(1, naux // 4)
+    for _q0 in range(0, naux, _chunk):
+        _q1 = min(_q0 + _chunk, naux)
+        bar_net[_q0:_q1] += xp.einsum("mvQ,nv->Qmn", tmp[:, :, _q0:_q1], C_act, optimize=True)
+    del tmp
     _log_vram("  net_active_fused: after bar_act")
 
-    # --- Merge + symmetrize ---
-    bar_net += bar_act
-    del bar_act
-    bar_L_net = bar_net + xp.transpose(bar_net, (0, 2, 1))
-    del bar_net
-    bar_L_net *= 0.5
+    # --- Symmetrize in-place ---
+    _symmetrize_bar_L_inplace(bar_net, xp)
     _log_vram("  net_active_fused: after sym")
-    return xp.asarray(bar_L_net, dtype=xp.float64), D_act_ao
+    return xp.asarray(bar_net, dtype=xp.float64), D_act_ao
 
 
 def _build_bar_L_lorb_df(
@@ -409,11 +412,16 @@ def _build_bar_L_lorb_df(
     D_w = D_act + 0.5 * D_core
     D_wL = D_L_act + 0.5 * D_L_core
     _log_vram("  lorb: before cross1")
-    bar_mean = _build_bar_L_df_cross(B_ao, D_left=D_wL, D_right=D_core, coeff_J=1.0, coeff_K=-0.5)
+    bar_mean = _build_bar_L_df_cross(
+        B_ao, D_left=D_wL, D_right=D_core, coeff_J=1.0, coeff_K=-0.5, symmetrize=False,
+    )
     _log_vram("  lorb: after cross1")
     _flush_gpu_pool()
     _log_vram("  lorb: after cross1 flush")
-    bar_mean += _build_bar_L_df_cross(B_ao, D_left=D_w, D_right=D_L_core, coeff_J=1.0, coeff_K=-0.5)
+    _build_bar_L_df_cross(
+        B_ao, D_left=D_w, D_right=D_L_core, coeff_J=1.0, coeff_K=-0.5,
+        out=bar_mean, symmetrize=False,
+    )
     _log_vram("  lorb: after cross2")
 
     # Active-active DF term: linearize bar_L_casscf active block w.r.t C_act along C_L_act.
@@ -448,19 +456,18 @@ def _build_bar_L_lorb_df(
     tmp_M = xp.einsum("mu,uvQ->mvQ", C_act, dM_uvQ, optimize=True)
     del dM_uvQ
 
-    bar_act = xp.einsum("mvQ,nv->Qmn", tmp_L, C_act, optimize=True)
-    del tmp_L
-    bar_act += xp.einsum("mvQ,nv->Qmn", tmp, C_L_act, optimize=True)
-    del tmp
-    bar_act += xp.einsum("mvQ,nv->Qmn", tmp_M, C_act, optimize=True)
-    del tmp_M
+    # Accumulate all three bar_act einsum terms directly into bar_mean in chunks.
+    _naux = int(bar_mean.shape[0])
+    _chunk = max(1, _naux // 4)
+    for _q0 in range(0, _naux, _chunk):
+        _q1 = min(_q0 + _chunk, _naux)
+        bar_mean[_q0:_q1] += xp.einsum("mvQ,nv->Qmn", tmp_L[:, :, _q0:_q1], C_act, optimize=True)
+        bar_mean[_q0:_q1] += xp.einsum("mvQ,nv->Qmn", tmp[:, :, _q0:_q1], C_L_act, optimize=True)
+        bar_mean[_q0:_q1] += xp.einsum("mvQ,nv->Qmn", tmp_M[:, :, _q0:_q1], C_act, optimize=True)
+    del tmp_L, tmp, tmp_M
 
-    bar_mean += bar_act
-    del bar_act
-    bar_L_lorb = bar_mean + xp.transpose(bar_mean, (0, 2, 1))
-    del bar_mean
-    bar_L_lorb *= 0.5
-    return bar_L_lorb, D_L
+    _symmetrize_bar_L_inplace(bar_mean, xp)
+    return bar_mean, D_L
 
 
 def _grad_elec_active_df(
@@ -486,6 +493,7 @@ def _grad_elec_active_df(
     coords, charges = _mol_coords_charges_bohr(mol)
 
     B_ao = _as_xp_f64(xp, getattr(scf_out, "df_B"))
+    _restore_pool = _apply_df_pool_policy(B_ao, label="_grad_elec_active_df")
     ao_basis = getattr(scf_out, "ao_basis")
     aux_basis = getattr(scf_out, "aux_basis")
     h_ao = _as_xp_f64(xp, getattr(getattr(scf_out, "int1e"), "hcore"))
@@ -569,6 +577,7 @@ def _grad_elec_active_df(
             ao_basis, atom_coords_bohr=coords, atom_charges=charges,
             M=D_core_cpu, shell_atom=shell_atom,
         )
+        _restore_pool()
         return np.asarray(de_h1 + _asnumpy_f64(de_df_net) - de_h1_core, dtype=np.float64)
 
     # ── Debug path (return_terms=True): keep 2 separate contract() calls for breakdown ──
@@ -662,6 +671,7 @@ def _grad_elec_active_df(
         "gfock": _asnumpy_f64(gfock),
         "dme_core": _asnumpy_f64(dme_core),
     }
+    _restore_pool()
     return total, terms
 
 
@@ -687,6 +697,7 @@ def _grad_elec_casscf_df(
     coords, charges = _mol_coords_charges_bohr(mol)
 
     B_ao = _as_xp_f64(xp, getattr(scf_out, "df_B"))
+    _restore_pool = _apply_df_pool_policy(B_ao, label="_grad_elec_casscf_df")
     ao_basis = getattr(scf_out, "ao_basis")
     aux_basis = getattr(scf_out, "aux_basis")
     h_ao = _as_xp_f64(xp, getattr(getattr(scf_out, "int1e"), "hcore"))
@@ -754,6 +765,7 @@ def _grad_elec_casscf_df(
         shell_atom=shell_atom,
     )
 
+    _restore_pool()
     return np.asarray(de_h1 + _asnumpy_f64(de_df), dtype=np.float64)
 
 
@@ -793,6 +805,7 @@ def _Lorb_dot_dgorb_dx_df(
     coords, charges = _mol_coords_charges_bohr(mol)
 
     B_ao = _as_xp_f64(xp, getattr(scf_out, "df_B"))
+    _restore_pool = _apply_df_pool_policy(B_ao, label="_Lorb_dot_dgorb_dx_df")
     ao_basis = getattr(scf_out, "ao_basis")
     aux_basis = getattr(scf_out, "aux_basis")
     h_ao = _as_xp_f64(xp, getattr(getattr(scf_out, "int1e"), "hcore"))
@@ -899,8 +912,13 @@ def _Lorb_dot_dgorb_dx_df(
     # Two-electron DF derivative term: build bar_L for the L-effective contraction.
     D_w = D_act + 0.5 * D_core
     D_wL = D_L_act + 0.5 * D_L_core
-    bar_mean = _build_bar_L_df_cross(B_ao, D_left=D_wL, D_right=D_core, coeff_J=1.0, coeff_K=-0.5)
-    bar_mean += _build_bar_L_df_cross(B_ao, D_left=D_w, D_right=D_L_core, coeff_J=1.0, coeff_K=-0.5)
+    bar_mean = _build_bar_L_df_cross(
+        B_ao, D_left=D_wL, D_right=D_core, coeff_J=1.0, coeff_K=-0.5, symmetrize=False,
+    )
+    _build_bar_L_df_cross(
+        B_ao, D_left=D_w, D_right=D_L_core, coeff_J=1.0, coeff_K=-0.5,
+        out=bar_mean, symmetrize=False,
+    )
 
     # Active-active DF term: linearize _build_bar_L_casscf_df active block w.r.t C_act along C_L_act.
     X = xp.einsum("mnQ,nv->mvQ", B_ao, C_act, optimize=True)  # (nao,ncas,naux)
@@ -924,18 +942,18 @@ def _Lorb_dot_dgorb_dx_df(
     dM_uvQ = dM.reshape(ncas, ncas, -1)
     tmp_M = xp.einsum("mu,uvQ->mvQ", C_act, dM_uvQ, optimize=True)
 
-    bar_act = xp.einsum("mvQ,nv->Qmn", tmp_L, C_act, optimize=True)
-    del tmp_L
-    bar_act += xp.einsum("mvQ,nv->Qmn", tmp, C_L_act, optimize=True)
-    del tmp
-    bar_act += xp.einsum("mvQ,nv->Qmn", tmp_M, C_act, optimize=True)
-    del tmp_M
+    # Accumulate all three bar_act einsum terms directly into bar_mean in chunks.
+    naux_lorb = int(bar_mean.shape[0])
+    _chunk = max(1, naux_lorb // 4)
+    for _q0 in range(0, naux_lorb, _chunk):
+        _q1 = min(_q0 + _chunk, naux_lorb)
+        bar_mean[_q0:_q1] += xp.einsum("mvQ,nv->Qmn", tmp_L[:, :, _q0:_q1], C_act, optimize=True)
+        bar_mean[_q0:_q1] += xp.einsum("mvQ,nv->Qmn", tmp[:, :, _q0:_q1], C_L_act, optimize=True)
+        bar_mean[_q0:_q1] += xp.einsum("mvQ,nv->Qmn", tmp_M[:, :, _q0:_q1], C_act, optimize=True)
+    del tmp_L, tmp, tmp_M
 
-    bar_mean += bar_act
-    del bar_act
-    bar_L_ao = bar_mean + xp.transpose(bar_mean, (0, 2, 1))
-    del bar_mean
-    bar_L_ao *= 0.5
+    _symmetrize_bar_L_inplace(bar_mean, xp)
+    bar_L_ao = bar_mean
 
     try:
         if df_grad_ctx is not None:
@@ -983,6 +1001,7 @@ def _Lorb_dot_dgorb_dx_df(
     # de_df already on CPU (contract() returns numpy).
     total = np.asarray(de_h1 + _asnumpy_f64(de_df), dtype=np.float64)
     if not bool(return_terms):
+        _restore_pool()
         return total
     terms = {
         "dhcore": np.asarray(de_h1, dtype=np.float64),
@@ -991,6 +1010,7 @@ def _Lorb_dot_dgorb_dx_df(
         # for computing the Pulay (overlap-derivative) term externally.
         "gfock": _asnumpy_f64(gfock),
     }
+    _restore_pool()
     return total, terms
 
 

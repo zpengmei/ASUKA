@@ -14,6 +14,28 @@ from asuka.integrals.int1e_cart import nao_cart_from_basis, shell_to_atom_map
 Backend = Literal["cpu", "cuda"]
 
 
+def _symmetrize_mnQ_inplace(arr: Any, xp: Any, *, nchunks: int = 4) -> Any:
+    """In-place symmetrization over AO indices for ``arr[m,n,Q]``.
+
+    Computes ``arr = 0.5 * (arr + arr^T)`` where the transpose swaps only the
+    AO axes (m,n). Chunking along Q limits temporary memory to roughly
+    ``sizeof(arr)/nchunks``.
+    """
+    if int(arr.ndim) != 3:
+        raise ValueError("arr must have shape (nao, nao, naux)")
+    nao0, nao1, naux = map(int, arr.shape)
+    if nao0 != nao1:
+        raise ValueError("arr must have shape (nao, nao, naux)")
+    _chunk = max(1, int(naux) // max(1, int(nchunks)))
+    for _q0 in range(0, int(naux), _chunk):
+        _q1 = min(_q0 + _chunk, int(naux))
+        _blk = arr[:, :, _q0:_q1].copy()
+        arr[:, :, _q0:_q1] += xp.transpose(_blk, (1, 0, 2))
+        del _blk
+    arr *= 0.5
+    return arr
+
+
 @dataclass
 class DFGradContractionContext:
     backend: Backend
@@ -338,6 +360,7 @@ class DFGradContractionContext:
             "shell_l_host": shell_l_np,
             "shell_atom": shell_atom_dev,
             "spAB_by_lab": spAB_by_lab_dev,
+            "work_2c_cache": {},
         }
 
     # ------------------------------------------------------------------
@@ -558,13 +581,16 @@ class DFGradContractionContext:
                     False,
                 )
 
-        work_2c: dict[int, Any] = {}
+        work_2c = cuda.get("work_2c_cache")
+        if not isinstance(work_2c, dict):
+            work_2c = {}
+            cuda["work_2c_cache"] = work_2c
         for spAB, lp, atomP, lq, spCD_dev, atomQ_dev, fac_dev in cuda["metric_batches"]:
             nt = int(spCD_dev.shape[0])
             if nt == 0:
                 continue
             out_dev = work_2c.get(nt)
-            if out_dev is None:
+            if out_dev is None or int(getattr(out_dev, "size", 0)) < int(nt * 6):
                 out_dev = cp.empty((nt * 6,), dtype=cp.float64)
                 work_2c[nt] = out_dev
             _ext.df_metric_2c2e_deriv_contracted_cart_sp_batch_inplace_device(
@@ -641,11 +667,17 @@ class DFGradContractionContext:
         bar_V = chol_lower_adjoint(self.L_metric, bar_Lchol)
         del bar_Lchol
 
-        bar_X = 0.5 * (bar_X + bar_X.transpose((1, 0, 2)))
-        bar_X_dev = cp.ascontiguousarray(bar_X.reshape(-1), dtype=cp.float64)
-        del bar_X
-        bar_V_dev = cp.ascontiguousarray(bar_V.reshape(-1), dtype=cp.float64)
-        del bar_V
+        if not bool(getattr(bar_X, "flags", None).c_contiguous):
+            bar_X = cp.ascontiguousarray(bar_X, dtype=cp.float64)
+        _symmetrize_mnQ_inplace(bar_X, cp)
+        bar_X_dev = bar_X.reshape(-1)
+        if not bool(getattr(bar_X_dev, "flags", None).c_contiguous):
+            bar_X_dev = cp.ascontiguousarray(bar_X_dev, dtype=cp.float64)
+
+        bar_V_dev = bar_V.reshape(-1)
+        if not bool(getattr(bar_V_dev, "flags", None).c_contiguous):
+            bar_V_dev = cp.ascontiguousarray(bar_V_dev, dtype=cp.float64)
+        del bar_X, bar_V
 
         return self._contract_device_from_adjoints(bar_X_dev, bar_V_dev)
 
@@ -684,11 +716,17 @@ class DFGradContractionContext:
         # 2. Transform bar_X to Cartesian: bar_X_cart[mu,nu,Q] = T @ bar_X_sph @ T^T
         bar_X_cart = cp.einsum("mi,ijQ,nj->mnQ", T, bar_X_sph, T, optimize=True)
         del bar_X_sph
-        bar_X_cart = 0.5 * (bar_X_cart + bar_X_cart.transpose((1, 0, 2)))
-        bar_X_dev = cp.ascontiguousarray(bar_X_cart.reshape(-1), dtype=cp.float64)
-        del bar_X_cart
-        bar_V_dev = cp.ascontiguousarray(bar_V.reshape(-1), dtype=cp.float64)
-        del bar_V
+        if not bool(getattr(bar_X_cart, "flags", None).c_contiguous):
+            bar_X_cart = cp.ascontiguousarray(bar_X_cart, dtype=cp.float64)
+        _symmetrize_mnQ_inplace(bar_X_cart, cp)
+        bar_X_dev = bar_X_cart.reshape(-1)
+        if not bool(getattr(bar_X_dev, "flags", None).c_contiguous):
+            bar_X_dev = cp.ascontiguousarray(bar_X_dev, dtype=cp.float64)
+
+        bar_V_dev = bar_V.reshape(-1)
+        if not bool(getattr(bar_V_dev, "flags", None).c_contiguous):
+            bar_V_dev = cp.ascontiguousarray(bar_V_dev, dtype=cp.float64)
+        del bar_X_cart, bar_V
 
         # 3. Reuse existing kernel loops
         return self._contract_device_from_adjoints(bar_X_dev, bar_V_dev)

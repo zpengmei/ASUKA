@@ -124,6 +124,7 @@ def mrci_grad_states_from_ref_analytic(
     )
     from asuka.mcscf.newton_df import DFNewtonCASSCFAdapter  # noqa: PLC0415
     from asuka.mcscf.nuc_grad_df import (  # noqa: PLC0415
+        _apply_df_pool_policy,
         _build_bar_L_casscf_df,
         _build_gfock_casscf_df,
         _mol_coords_charges_bohr,
@@ -193,6 +194,9 @@ def mrci_grad_states_from_ref_analytic(
     h_ao = getattr(getattr(scf_out, "int1e"), "hcore", None)
     if h_ao is None:
         raise ValueError("scf_out.int1e.hcore is required")
+    _restore_pool = _apply_df_pool_policy(B_ao, label="mrci_grad_states_from_ref_analytic")
+    B_ao_np = _asnumpy_f64(B_ao)
+    h_ao_np = _asnumpy_f64(h_ao)
 
     # Reference SA-CASSCF ingredients (Hessian operator for Z-vector solve).
     nroots_ref = int(getattr(ref, "nroots", 1))
@@ -213,8 +217,8 @@ def mrci_grad_states_from_ref_analytic(
     dm2_sa = np.asarray(dm2_sa, dtype=np.float64)
 
     mc_sa = DFNewtonCASSCFAdapter(
-        df_B=_asnumpy_f64(B_ao),
-        hcore_ao=_asnumpy_f64(h_ao),
+        df_B=B_ao_np,
+        hcore_ao=h_ao_np,
         ncore=int(ncore_ref),
         ncas=int(ncas_ref),
         nelecas=nelecas,
@@ -278,8 +282,8 @@ def mrci_grad_states_from_ref_analytic(
 
         # Build target generalized Fock + densities treating correlated orbitals as "active".
         gfock, D_core_ao, D_corr_ao, D_tot_ao, C_corr = _build_gfock_casscf_df(
-            _asnumpy_f64(B_ao),
-            _asnumpy_f64(h_ao),
+            B_ao_np,
+            h_ao_np,
             C_full,
             ncore=int(ncore_frozen),
             ncas=int(ncor),
@@ -289,7 +293,7 @@ def mrci_grad_states_from_ref_analytic(
 
         # Unrelaxed DF 2e derivative term via bar_L (core mean-field + corr 2-RDM).
         bar_L_target = _build_bar_L_casscf_df(
-            _asnumpy_f64(B_ao),
+            B_ao_np,
             D_core_ao=_asnumpy_f64(D_core_ao),
             D_act_ao=_asnumpy_f64(D_corr_ao),
             C_act=_asnumpy_f64(C_corr),
@@ -342,7 +346,7 @@ def mrci_grad_states_from_ref_analytic(
 
         # Response DF pieces (no Pulay / no nuclear term).
         bar_L_lci_net, D_act_lci = _build_bar_L_net_active_df(
-            _asnumpy_f64(B_ao),
+            B_ao_np,
             C_full,
             dm1_lci,
             dm2_lci,
@@ -351,7 +355,7 @@ def mrci_grad_states_from_ref_analytic(
             xp=np,
         )
         bar_L_lorb, D_L_lorb = _build_bar_L_lorb_df(
-            _asnumpy_f64(B_ao),
+            B_ao_np,
             C_full,
             np.asarray(Lorb, dtype=np.float64),
             dm1_sa,
@@ -361,19 +365,25 @@ def mrci_grad_states_from_ref_analytic(
             xp=np,
         )
 
-        bar_L_total = np.asarray(bar_L_target, dtype=np.float64) + _asnumpy_f64(bar_L_lci_net) + _asnumpy_f64(bar_L_lorb)
-        D_h1_total = _asnumpy_f64(D_tot_ao) + _asnumpy_f64(D_act_lci) + _asnumpy_f64(D_L_lorb)
+        bar_L_total = np.asarray(bar_L_target, dtype=np.float64, order="C")
+        bar_L_total += _asnumpy_f64(bar_L_lci_net)
+        bar_L_total += _asnumpy_f64(bar_L_lorb)
+        del bar_L_target, bar_L_lci_net, bar_L_lorb
+        D_h1_total = _asnumpy_f64(D_tot_ao)
+        D_h1_total += _asnumpy_f64(D_act_lci)
+        D_h1_total += _asnumpy_f64(D_L_lorb)
+        del D_act_lci, D_L_lorb
 
         # DF 2e gradient contraction (analytic preferred; fallback to FD-on-B).
         try:
             if df_grad_ctx is not None:
-                de_df = df_grad_ctx.contract(B_ao=_asnumpy_f64(B_ao), bar_L_ao=bar_L_total)
+                de_df = df_grad_ctx.contract(B_ao=B_ao_np, bar_L_ao=bar_L_total)
             else:
                 de_df = compute_df_gradient_contributions_analytic_packed_bases(
                     ao_basis,
                     aux_basis,
                     atom_coords_bohr=coords,
-                    B_ao=_asnumpy_f64(B_ao),
+                    B_ao=B_ao_np,
                     bar_L_ao=bar_L_total,
                     L_chol=getattr(scf_out, "df_L", None),
                     backend=str(df_backend),
@@ -405,6 +415,7 @@ def mrci_grad_states_from_ref_analytic(
         grad = np.asarray(de_nuc + np.asarray(de_h1, dtype=np.float64) + _asnumpy_f64(de_df) + np.asarray(de_pulay, dtype=np.float64), dtype=np.float64)
         grads.append(grad)
 
+    _restore_pool()
     return grads
 
 
