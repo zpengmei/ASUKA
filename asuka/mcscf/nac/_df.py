@@ -344,25 +344,37 @@ def _build_bar_L_lorb_df(
     X = xp.einsum("mnQ,nv->mvQ", B_ao, C_act, optimize=True)
     L_act_mo = xp.einsum("mu,mvQ->uvQ", C_act, X, optimize=True)
     L2 = L_act_mo.reshape(ncas * ncas, -1)
+    del L_act_mo
     M_mat = dm2_flat @ L2
+    del L2
     M_uvQ = M_mat.reshape(ncas, ncas, -1)
+    del M_mat
 
     tmp = xp.einsum("mu,uvQ->mvQ", C_act, M_uvQ, optimize=True)
     tmp_L = xp.einsum("mu,uvQ->mvQ", C_L_act, M_uvQ, optimize=True)
+    del M_uvQ
 
     X_L = xp.einsum("mnQ,nv->mvQ", B_ao, C_L_act, optimize=True)
     dL_act = (
         xp.einsum("mu,mvQ->uvQ", C_L_act, X, optimize=True)
         + xp.einsum("mu,mvQ->uvQ", C_act, X_L, optimize=True)
     )
+    del X, X_L
     dL2 = dL_act.reshape(ncas * ncas, -1)
+    del dL_act
     dM = dm2_flat @ dL2
+    del dL2
     dM_uvQ = dM.reshape(ncas, ncas, -1)
+    del dM
     tmp_M = xp.einsum("mu,uvQ->mvQ", C_act, dM_uvQ, optimize=True)
+    del dM_uvQ
 
     bar_act = xp.einsum("mvQ,nv->Qmn", tmp_L, C_act, optimize=True)
-    bar_act = bar_act + xp.einsum("mvQ,nv->Qmn", tmp, C_L_act, optimize=True)
-    bar_act = bar_act + xp.einsum("mvQ,nv->Qmn", tmp_M, C_act, optimize=True)
+    del tmp_L
+    bar_act += xp.einsum("mvQ,nv->Qmn", tmp, C_L_act, optimize=True)
+    del tmp
+    bar_act += xp.einsum("mvQ,nv->Qmn", tmp_M, C_act, optimize=True)
+    del tmp_M
 
     bar_L_lorb = bar_mean + bar_act
     bar_L_lorb = 0.5 * (bar_L_lorb + xp.transpose(bar_L_lorb, (0, 2, 1)))
@@ -542,6 +554,10 @@ def _grad_elec_active_df(
         # Core-only RHF-like subtraction pieces (returned as the *contribution to total*).
         "dhcore_core_sub": np.asarray(-de_h1_core, dtype=np.float64),
         "df2e_core_sub": np.asarray(-de_df_core, dtype=np.float64),
+        # Generalized Fock (MO basis, nmo×nmo) and core energy-weighted density (AO basis)
+        # for computing the Pulay (overlap-derivative) term externally.
+        "gfock": _asnumpy_f64(gfock),
+        "dme_core": _asnumpy_f64(dme_core),
     }
     return total, terms
 
@@ -848,6 +864,9 @@ def _Lorb_dot_dgorb_dx_df(
     terms = {
         "dhcore": np.asarray(de_h1, dtype=np.float64),
         "df2e": _asnumpy_f64(de_df),
+        # Generalized Fock in AO-like basis (nao×nao, with S^{-1} left-multiplied + 2e terms)
+        # for computing the Pulay (overlap-derivative) term externally.
+        "gfock": _asnumpy_f64(gfock),
     }
     return total, terms
 

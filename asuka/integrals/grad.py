@@ -293,7 +293,8 @@ def compute_df_gradient_contributions_analytic_packed_bases(
         t_metric_build = time.perf_counter() if profile is not None else 0.0
 
         if L_chol is not None:
-            L = np.asarray(L_chol, dtype=np.float64, order="C")
+            L_np = L_chol.get() if hasattr(L_chol, "get") else L_chol
+            L = np.asarray(L_np, dtype=np.float64, order="C")
             V = L @ L.T
         else:
             V = 0.5 * (V + V.T)
@@ -688,6 +689,60 @@ def compute_df_gradient_contributions_analytic_packed_bases(
             profile["_3c_class_times"] = _3c_class_times  # [(la, lb, lq, n_spAB, n_spCD, time_s), ...]
 
     return grad
+
+def compute_df_gradient_contributions_analytic_sph(
+    ao_basis,
+    aux_basis,
+    *,
+    atom_coords_bohr: np.ndarray,
+    B_sph: Any,
+    bar_L_sph: Any,
+    T_c2s: Any,
+    L_chol: Any | None = None,
+    backend: str = "cpu",
+    df_threads: int = 0,
+    profile: dict | None = None,
+) -> np.ndarray:
+    """Analytic DF gradient contraction for spherical AO basis.
+
+    Builds a :class:`DFGradContractionContext` (Cartesian shell pairs) and
+    delegates to :meth:`contract_sph`, which computes the DF adjoint in the
+    smaller spherical basis and transforms only ``bar_X`` to Cartesian for the
+    3-center derivative kernel.
+
+    Parameters
+    ----------
+    ao_basis, aux_basis
+        Packed Cartesian AO and auxiliary basis objects.
+    atom_coords_bohr : np.ndarray, shape (natm, 3)
+    B_sph : array, shape (nao_sph, nao_sph, naux)
+        Whitened DF factors in spherical AO basis.
+    bar_L_sph : array, shape (naux, nao_sph, nao_sph)
+        Adjoint of whitened DF factors in spherical AO basis.
+    T_c2s : array, shape (nao_cart, nao_sph)
+        Cart-to-spherical transformation matrix.
+    L_chol : optional
+        Pre-computed Cholesky factor of the aux metric.
+    backend : str
+    df_threads : int
+    profile : dict | None
+
+    Returns
+    -------
+    np.ndarray, shape (natm, 3)
+    """
+    from asuka.integrals.df_grad_context import DFGradContractionContext  # noqa: PLC0415
+
+    ctx = DFGradContractionContext.build(
+        ao_basis,
+        aux_basis,
+        atom_coords_bohr=np.asarray(atom_coords_bohr, dtype=np.float64),
+        backend=str(backend),
+        df_threads=int(df_threads),
+        L_chol=L_chol,
+    )
+    return ctx.contract_sph(B_sph=B_sph, bar_L_sph=bar_L_sph, T_c2s=T_c2s)
+
 
 def compute_df_gradient_contributions_tiled(
     mol,

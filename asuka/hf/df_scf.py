@@ -219,7 +219,9 @@ def _df_JK(B, D, *, want_J: bool = True, want_K: bool = True, B2=None, BQ=None, 
         B2d = B.reshape(nao, nao * naux)          # view, no copy
         BQD = xp.tensordot(B, D, axes=([1], [0]))  # (nao, naux, nao)
         M1 = xp.ascontiguousarray(BQD.transpose(0, 2, 1)).reshape(nao, nao * naux)
+        del BQD
         K = M1 @ B2d.T
+        del M1
     else:
         BD = xp.matmul(BQ, D)  # (naux, nao, nao)
         KQ = xp.matmul(BD, BQ.transpose((0, 2, 1)))  # (naux, nao, nao)

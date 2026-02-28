@@ -340,35 +340,17 @@ class DFGradContractionContext:
             "spAB_by_lab": spAB_by_lab_dev,
         }
 
-    def contract(self, *, B_ao: Any, bar_L_ao: Any) -> np.ndarray:
-        if self.backend == "cuda":
-            import cupy as cp  # noqa: PLC0415
+    # ------------------------------------------------------------------
+    # Internal: CPU kernel loops extracted for reuse
+    # ------------------------------------------------------------------
+    def _contract_cpu_from_adjoints(self, bar_X_flat: np.ndarray, bar_V: np.ndarray) -> np.ndarray:
+        """Run 3c + 2c CPU kernel loops given pre-computed Cartesian adjoints.
 
-            grad_dev = self.contract_device(B_ao=B_ao, bar_L_ao=bar_L_ao)
-            return np.asarray(cp.asnumpy(grad_dev), dtype=np.float64)
-
-        B = np.asarray(B_ao, dtype=np.float64, order="C")
-        bar_L = np.asarray(bar_L_ao, dtype=np.float64, order="C")
-
-        if B.ndim != 3:
-            raise ValueError("B_ao must have shape (nao, nao, naux)")
-        nao0, nao1, naux = map(int, B.shape)
-        if nao0 != nao1:
-            raise ValueError("B_ao must have shape (nao, nao, naux)")
-        if nao0 != int(self.nao) or naux != int(self.naux):
-            raise ValueError("B_ao shape mismatch with context")
-
-        if tuple(map(int, bar_L.shape)) != (int(self.naux), int(self.nao), int(self.nao)):
-            raise ValueError("bar_L_ao must have shape (naux, nao, nao)")
-
-        bar_L_c = np.asarray(bar_L, dtype=np.float64, order="C")
-        bar_X, bar_Lchol = df_whiten_adjoint_Qmn(B, bar_L_c, self.L_metric)
-        bar_V = chol_lower_adjoint(self.L_metric, bar_Lchol)
-        bar_X = 0.5 * (bar_X + bar_X.transpose((1, 0, 2)))
-        bar_X = np.asarray(bar_X, dtype=np.float64, order="C")
-        bar_V = np.asarray(bar_V, dtype=np.float64, order="C")
-        bar_X_flat = bar_X.reshape((self.nao * self.nao, self.naux))
-
+        Parameters
+        ----------
+        bar_X_flat : np.ndarray, shape (nao_cart * nao_cart, naux)
+        bar_V : np.ndarray, shape (naux, naux)
+        """
         grad = np.zeros((self.natm, 3), dtype=np.float64)
         if self.cpu is None:  # pragma: no cover
             raise RuntimeError("internal error: CPU function table missing")
@@ -440,21 +422,15 @@ class DFGradContractionContext:
 
         return np.asarray(grad, dtype=np.float64)
 
-    def contract_device(self, *, B_ao: Any, bar_L_ao: Any) -> Any:
-        """CUDA-only version of :meth:`contract` that returns the gradient on device.
+    def contract(self, *, B_ao: Any, bar_L_ao: Any) -> np.ndarray:
+        if self.backend == "cuda":
+            import cupy as cp  # noqa: PLC0415
 
-        Returns
-        -------
-        cupy.ndarray
-            Gradient array on device with shape (natm, 3) and dtype float64.
-        """
-        if self.backend != "cuda":
-            raise NotImplementedError("contract_device is only available for backend='cuda'")
+            grad_dev = self.contract_device(B_ao=B_ao, bar_L_ao=bar_L_ao)
+            return np.asarray(cp.asnumpy(grad_dev), dtype=np.float64)
 
-        import cupy as cp  # noqa: PLC0415
-
-        B = cp.ascontiguousarray(cp.asarray(B_ao, dtype=cp.float64))
-        bar_L = cp.ascontiguousarray(cp.asarray(bar_L_ao, dtype=cp.float64))
+        B = np.asarray(B_ao, dtype=np.float64, order="C")
+        bar_L = np.asarray(bar_L_ao, dtype=np.float64, order="C")
 
         if B.ndim != 3:
             raise ValueError("B_ao must have shape (nao, nao, naux)")
@@ -467,25 +443,83 @@ class DFGradContractionContext:
         if tuple(map(int, bar_L.shape)) != (int(self.naux), int(self.nao), int(self.nao)):
             raise ValueError("bar_L_ao must have shape (naux, nao, nao)")
 
+        bar_L_c = np.asarray(bar_L, dtype=np.float64, order="C")
+        bar_X, bar_Lchol = df_whiten_adjoint_Qmn(B, bar_L_c, self.L_metric)
+        bar_V = chol_lower_adjoint(self.L_metric, bar_Lchol)
+        bar_X = 0.5 * (bar_X + bar_X.transpose((1, 0, 2)))
+        bar_X = np.asarray(bar_X, dtype=np.float64, order="C")
+        bar_V = np.asarray(bar_V, dtype=np.float64, order="C")
+        bar_X_flat = bar_X.reshape((self.nao * self.nao, self.naux))
+
+        return self._contract_cpu_from_adjoints(bar_X_flat, bar_V)
+
+    def contract_sph(self, *, B_sph: Any, bar_L_sph: Any, T_c2s: Any) -> np.ndarray:
+        """Contract DF gradient with spherical-basis B and bar_L.
+
+        Computes the DF adjoint (bar_X, bar_V) in the smaller spherical basis,
+        then transforms bar_X to Cartesian for the 3c derivative kernel.
+        The 2c (metric) contribution is basis-independent (no AO indices).
+
+        Parameters
+        ----------
+        B_sph : array, shape (nao_sph, nao_sph, naux)
+            Whitened DF 3-index integrals in spherical AO basis.
+        bar_L_sph : array, shape (naux, nao_sph, nao_sph)
+            Adjoint of whitened DF factors in spherical AO basis.
+        T_c2s : array, shape (nao_cart, nao_sph)
+            Cart-to-spherical transformation matrix.
+
+        Returns
+        -------
+        np.ndarray, shape (natm, 3)
+            Nuclear gradient contribution from DF 2e integrals.
+        """
+        if self.backend == "cuda":
+            import cupy as cp  # noqa: PLC0415
+
+            grad_dev = self.contract_device_sph(B_sph=B_sph, bar_L_sph=bar_L_sph, T_c2s=T_c2s)
+            return np.asarray(cp.asnumpy(grad_dev), dtype=np.float64)
+
+        T = np.asarray(T_c2s, dtype=np.float64)
+        B = np.asarray(B_sph, dtype=np.float64, order="C")
+        bar_L = np.asarray(bar_L_sph, dtype=np.float64, order="C")
+
+        # 1. Compute adjoints in spherical basis (smaller, faster)
+        bar_X_sph, bar_Lchol = df_whiten_adjoint_Qmn(B, bar_L, self.L_metric)
+        bar_V = chol_lower_adjoint(self.L_metric, bar_Lchol)
+
+        # 2. Transform bar_X to Cartesian for 3c kernel: bar_X_cart[mu,nu,Q] = T @ bar_X_sph @ T^T
+        bar_X_cart = np.einsum("mi,ijQ,nj->mnQ", T, bar_X_sph, T, optimize=True)
+        bar_X_cart = 0.5 * (bar_X_cart + bar_X_cart.transpose((1, 0, 2)))
+        bar_X_flat = np.asarray(bar_X_cart.reshape((self.nao * self.nao, self.naux)), dtype=np.float64, order="C")
+        bar_V = np.asarray(bar_V, dtype=np.float64, order="C")
+
+        # 3. Reuse existing kernel loops
+        return self._contract_cpu_from_adjoints(bar_X_flat, bar_V)
+
+    # ------------------------------------------------------------------
+    # Internal: CUDA kernel loops extracted for reuse
+    # ------------------------------------------------------------------
+    def _contract_device_from_adjoints(self, bar_X_dev: Any, bar_V_dev: Any) -> Any:
+        """Run 3c + 2c CUDA kernel loops given pre-computed Cartesian adjoints on device.
+
+        Parameters
+        ----------
+        bar_X_dev : cupy.ndarray, shape (nao_cart * nao_cart * naux,), flat
+        bar_V_dev : cupy.ndarray, shape (naux * naux,), flat
+        """
+        import cupy as cp  # noqa: PLC0415
+
         if self.cuda is None:
             raise RuntimeError("CUDA static context is not initialized")
         cuda = self.cuda
         _ext = cuda["_ext"]
 
-        bar_L_c = cp.ascontiguousarray(bar_L)
-        bar_X, bar_Lchol = df_whiten_adjoint_Qmn(B, bar_L_c, self.L_metric)
-        bar_V = chol_lower_adjoint(self.L_metric, bar_Lchol)
-
-        bar_X = 0.5 * (bar_X + bar_X.transpose((1, 0, 2)))
-        bar_X_dev = cp.ascontiguousarray(bar_X.reshape(-1), dtype=cp.float64)
-        bar_V_dev = cp.ascontiguousarray(bar_V.reshape(-1), dtype=cp.float64)
-
         grad_dev = cp.zeros((self.natm, 3), dtype=cp.float64)
         threads = 256
         stream_ptr = int(cp.cuda.get_current_stream().ptr)
 
-        # Batched 3c2e gradient: one kernel launch per (la,lb,lq) class instead of nsp_ao×nlq loops.
-        grad_dev_flat = grad_dev.reshape(-1)  # view as (natm*3,) for atomicAdd kernel
+        grad_dev_flat = grad_dev.reshape(-1)
         for (la_, lb_), spAB_class_dev in cuda["spAB_by_lab"].items():
             n_spAB = int(spAB_class_dev.shape[0])
             for lq, spCD_dev in cuda["spCD_by_l"].items():
@@ -570,3 +604,91 @@ class DFGradContractionContext:
             cp.add.at(grad_dev[:, 2], atomQ_dev, valsQ[:, 2])
 
         return grad_dev
+
+    def contract_device(self, *, B_ao: Any, bar_L_ao: Any) -> Any:
+        """CUDA-only version of :meth:`contract` that returns the gradient on device.
+
+        Returns
+        -------
+        cupy.ndarray
+            Gradient array on device with shape (natm, 3) and dtype float64.
+        """
+        if self.backend != "cuda":
+            raise NotImplementedError("contract_device is only available for backend='cuda'")
+
+        import cupy as cp  # noqa: PLC0415
+
+        B = cp.asarray(B_ao, dtype=cp.float64)
+        if not B.flags.c_contiguous:
+            B = cp.ascontiguousarray(B)
+        bar_L = cp.asarray(bar_L_ao, dtype=cp.float64)
+        if not bar_L.flags.c_contiguous:
+            bar_L = cp.ascontiguousarray(bar_L)
+
+        if B.ndim != 3:
+            raise ValueError("B_ao must have shape (nao, nao, naux)")
+        nao0, nao1, naux = map(int, B.shape)
+        if nao0 != nao1:
+            raise ValueError("B_ao must have shape (nao, nao, naux)")
+        if nao0 != int(self.nao) or naux != int(self.naux):
+            raise ValueError("B_ao shape mismatch with context")
+
+        if tuple(map(int, bar_L.shape)) != (int(self.naux), int(self.nao), int(self.nao)):
+            raise ValueError("bar_L_ao must have shape (naux, nao, nao)")
+
+        bar_X, bar_Lchol = df_whiten_adjoint_Qmn(B, bar_L, self.L_metric)
+        del bar_L
+        bar_V = chol_lower_adjoint(self.L_metric, bar_Lchol)
+        del bar_Lchol
+
+        bar_X = 0.5 * (bar_X + bar_X.transpose((1, 0, 2)))
+        bar_X_dev = cp.ascontiguousarray(bar_X.reshape(-1), dtype=cp.float64)
+        del bar_X
+        bar_V_dev = cp.ascontiguousarray(bar_V.reshape(-1), dtype=cp.float64)
+        del bar_V
+
+        return self._contract_device_from_adjoints(bar_X_dev, bar_V_dev)
+
+    def contract_device_sph(self, *, B_sph: Any, bar_L_sph: Any, T_c2s: Any) -> Any:
+        """CUDA spherical variant of :meth:`contract_device`.
+
+        Parameters
+        ----------
+        B_sph : cupy.ndarray, shape (nao_sph, nao_sph, naux)
+        bar_L_sph : cupy.ndarray, shape (naux, nao_sph, nao_sph)
+        T_c2s : array, shape (nao_cart, nao_sph)
+
+        Returns
+        -------
+        cupy.ndarray, shape (natm, 3)
+        """
+        if self.backend != "cuda":
+            raise NotImplementedError("contract_device_sph is only available for backend='cuda'")
+
+        import cupy as cp  # noqa: PLC0415
+
+        B = cp.asarray(B_sph, dtype=cp.float64)
+        if not B.flags.c_contiguous:
+            B = cp.ascontiguousarray(B)
+        bar_L = cp.asarray(bar_L_sph, dtype=cp.float64)
+        if not bar_L.flags.c_contiguous:
+            bar_L = cp.ascontiguousarray(bar_L)
+        T = cp.asarray(T_c2s, dtype=cp.float64)
+
+        # 1. Compute adjoints in spherical basis
+        bar_X_sph, bar_Lchol = df_whiten_adjoint_Qmn(B, bar_L, self.L_metric)
+        del bar_L
+        bar_V = chol_lower_adjoint(self.L_metric, bar_Lchol)
+        del bar_Lchol
+
+        # 2. Transform bar_X to Cartesian: bar_X_cart[mu,nu,Q] = T @ bar_X_sph @ T^T
+        bar_X_cart = cp.einsum("mi,ijQ,nj->mnQ", T, bar_X_sph, T, optimize=True)
+        del bar_X_sph
+        bar_X_cart = 0.5 * (bar_X_cart + bar_X_cart.transpose((1, 0, 2)))
+        bar_X_dev = cp.ascontiguousarray(bar_X_cart.reshape(-1), dtype=cp.float64)
+        del bar_X_cart
+        bar_V_dev = cp.ascontiguousarray(bar_V.reshape(-1), dtype=cp.float64)
+        del bar_V
+
+        # 3. Reuse existing kernel loops
+        return self._contract_device_from_adjoints(bar_X_dev, bar_V_dev)

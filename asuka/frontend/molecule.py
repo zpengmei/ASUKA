@@ -55,7 +55,7 @@ class Molecule:
     charge: int = 0
     spin: int = 0  # nalpha - nbeta
     basis: Any = None  # orbital basis: name string or explicit basis dict
-    cart: bool = True
+    cart: bool = False
     # Mutable container for attaching analysis artifacts (geomopt, frequencies, etc.).
     # Note: the dataclass is frozen, but the dict contents can be updated.
     results: dict[str, Any] = field(default_factory=dict, compare=False, repr=False)
@@ -69,7 +69,7 @@ class Molecule:
         charge: int = 0,
         spin: int = 0,
         basis: Any = None,
-        cart: bool = True,
+        cart: bool = False,
     ) -> "Molecule":
         atoms_list = _parse_atoms(atoms)
         unit_norm = str(unit).strip().lower()
