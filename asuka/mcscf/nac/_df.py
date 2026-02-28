@@ -15,6 +15,7 @@ Current scope:
 
 from contextlib import contextmanager
 from typing import Any, Callable, Literal, Sequence
+import warnings
 
 import numpy as np
 
@@ -40,6 +41,8 @@ from asuka.mcscf.nuc_grad_df import (
     _build_gfock_casscf_df,
     _resolve_xp,
     _as_xp_f64,
+    _log_vram,
+    _flush_gpu_pool,
 )
 from asuka.mcscf.newton_df import DFNewtonCASSCFAdapter, DFNewtonERIs
 from asuka.mcscf import newton_casscf as _newton_casscf
@@ -58,6 +61,17 @@ def _asnumpy_f64(a: Any) -> np.ndarray:
     return np.asarray(a, dtype=np.float64)
 
 
+def _warn_df_fd_fallback(*, where: str, backend: str, delta_bohr: float, err: Exception) -> None:
+    warnings.warn(
+        f"DF NAC derivative contraction fell back to finite-difference on B in {where} "
+        f"(backend={backend!s}, delta_bohr={float(delta_bohr):.3e}); "
+        "this may introduce noisy/non-conservative couplings in dynamics. "
+        f"Reason: {type(err).__name__}: {err}",
+        RuntimeWarning,
+        stacklevel=3,
+    )
+
+
 def _base_fcisolver_method(fcisolver: Any, name: str):
     """Return the (possibly unwrapped) fcisolver method ``name``.
 
@@ -68,10 +82,22 @@ def _base_fcisolver_method(fcisolver: Any, name: str):
 
     base_cls = getattr(fcisolver, "_base_class", None)
     if base_cls is not None and hasattr(base_cls, name):
-        return getattr(base_cls, name)
+        fn_unbound = getattr(base_cls, name)
+
+        def _call(solver_obj: Any, *args: Any, **kwargs: Any):
+            return fn_unbound(solver_obj, *args, **kwargs)
+
+        return _call
+
     if not hasattr(fcisolver, name):
         raise AttributeError(f"fcisolver does not implement {name}")
-    return getattr(fcisolver, name)
+
+    fn_bound = getattr(fcisolver, name)
+
+    def _call(_solver_obj: Any, *args: Any, **kwargs: Any):
+        return fn_bound(*args, **kwargs)
+
+    return _call
 
 
 def _symm_sqrt(a: np.ndarray, *, inv: bool, eps: float = 1e-12) -> np.ndarray:
@@ -244,43 +270,91 @@ def _build_bar_L_net_active_df(
 ) -> tuple[Any, Any]:
     """Return (bar_L_net, D_act_ao) for the active DF gradient contribution.
 
-    bar_L_net = bar_L_casscf - bar_L_core_sub (fused, ready for a single contract() call).
-    D_act_ao  = active-space AO density matrix; use as M in contract_dhcore_cart for
-                the net 1e contribution (de_h1_active - de_h1_core_sub).
+    bar_L_net = bar_L_casscf - bar_L_core_sub (fused single-pass).
 
-    This extracts the bar_L construction from _grad_elec_active_df without calling
-    contract(), so the caller can accumulate multiple bar_L tensors before contracting.
-    Unlike _grad_elec_active_df it skips _build_gfock_casscf_df and
-    _core_energy_weighted_density (both only needed for the Fock/overlap terms).
+    Instead of building bar_L_casscf (sizeof_B) and bar_L_core (sizeof_B)
+    separately and subtracting, this computes the net directly.  Peak VRAM is
+    1 sizeof_B (the result) instead of 2 sizeof_B.
+
+    Math:
+        D_w = D_act + 0.5*D_core              (weighted density)
+        D_ah = D_w - D_core = D_act - 0.5*D_core   (net offset)
+        net_J  = u(D_w)*D_core + u(D_core)*D_ah
+        net_K  = -0.5*(D_core @ BQ @ D_ah + D_w @ BQ @ D_core)
+        net_act = bar_act from 2-RDM          (unchanged, core has no active term)
+        bar_L_net = 0.5 * (net + net^T)
     """
     ncore = int(ncore)
     ncas = int(ncas)
     nocc = ncore + ncas
     nao = int(C.shape[0])
 
+    C = xp.asarray(C, dtype=xp.float64)
     C_core = C[:, :ncore]
     C_act = C[:, ncore:nocc]
     D_core_ao = 2.0 * (C_core @ C_core.T) if ncore else xp.zeros((nao, nao), dtype=xp.float64)
-    D_act_ao = C_act @ xp.asarray(dm1_act, dtype=xp.float64) @ C_act.T
+    dm1 = xp.asarray(dm1_act, dtype=xp.float64)
+    D_act_ao = C_act @ dm1 @ C_act.T
 
-    bar_L_ao = _build_bar_L_casscf_df(
-        B_ao,
-        D_core_ao=D_core_ao,
-        D_act_ao=D_act_ao,
-        C_act=C_act,
-        dm2_act=xp.asarray(dm2_act, dtype=xp.float64),
-        L_act=L_act,
-        rho_core=rho_core,
-    )
-    # Core-only RHF subtraction (same D_core_only as in _grad_elec_active_df).
-    bar_L_core = _build_bar_L_df_cross(
-        B_ao,
-        D_left=D_core_ao,
-        D_right=D_core_ao,
-        coeff_J=0.5,
-        coeff_K=-0.25,
-    )
-    return bar_L_ao - bar_L_core, D_act_ao
+    # Weighted density and net offset (both nao×nao — negligible VRAM).
+    D_w = D_act_ao + 0.5 * D_core_ao
+    D_ah = D_w - D_core_ao  # = D_act - 0.5*D_core
+
+    B_ao = xp.asarray(B_ao, dtype=xp.float64)
+    nao_b, _, naux = map(int, B_ao.shape)
+    B2 = B_ao.reshape(nao * nao, naux)
+    if rho_core is None:
+        rho = B2.T @ D_core_ao.reshape(nao * nao)  # (naux,)
+    else:
+        rho = xp.asarray(rho_core, dtype=xp.float64)
+    sigma_w = B2.T @ D_w.reshape(nao * nao)  # (naux,)
+
+    # --- Net Coulomb: sigma_w * D_core + rho * D_ah ---
+    _log_vram("  net_active_fused: before net Coulomb")
+    bar_net = sigma_w[:, None, None] * D_core_ao[None, :, :]
+    bar_net += rho[:, None, None] * D_ah[None, :, :]
+    _log_vram("  net_active_fused: after net Coulomb")
+
+    # --- Net Exchange (chunked): -0.5*(D_core @ BQ @ D_ah + D_w @ BQ @ D_core) ---
+    if ncore:
+        BQ = xp.transpose(B_ao, (2, 0, 1))  # (naux,nao,nao) view
+        _chunk = max(1, naux // 4)
+        for _q0 in range(0, naux, _chunk):
+            _q1 = min(_q0 + _chunk, naux)
+            _bq = BQ[_q0:_q1]
+            _t = xp.matmul(xp.matmul(D_core_ao[None, :, :], _bq), D_ah)
+            _t += xp.matmul(xp.matmul(D_w[None, :, :], _bq), D_core_ao)
+            _t *= -0.5
+            bar_net[_q0:_q1] += _t
+            del _t
+    _log_vram("  net_active_fused: after net exchange")
+
+    # --- Active 2-RDM term (identical to _build_bar_L_casscf_df) ---
+    dm2_arr = xp.asarray(dm2_act, dtype=xp.float64)
+    if L_act is None:
+        X = xp.einsum("mnQ,nv->mvQ", B_ao, C_act, optimize=True)
+        L_act_val = xp.einsum("mu,mvQ->uvQ", C_act, X, optimize=True)
+    else:
+        L_act_val = xp.asarray(L_act, dtype=xp.float64)
+
+    L2 = L_act_val.reshape(ncas * ncas, naux)
+    dm2_flat = dm2_arr.reshape(ncas * ncas, ncas * ncas)
+    dm2_flat = 0.5 * (dm2_flat + dm2_flat.T)
+    M = dm2_flat @ L2
+    M_uvQ = M.reshape(ncas, ncas, naux)
+
+    tmp = xp.einsum("mu,uvQ->mvQ", C_act, M_uvQ, optimize=True)
+    bar_act = xp.einsum("mvQ,nv->Qmn", tmp, C_act, optimize=True)
+    _log_vram("  net_active_fused: after bar_act")
+
+    # --- Merge + symmetrize ---
+    bar_net += bar_act
+    del bar_act
+    bar_L_net = bar_net + xp.transpose(bar_net, (0, 2, 1))
+    del bar_net
+    bar_L_net *= 0.5
+    _log_vram("  net_active_fused: after sym")
+    return xp.asarray(bar_L_net, dtype=xp.float64), D_act_ao
 
 
 def _build_bar_L_lorb_df(
@@ -334,8 +408,13 @@ def _build_bar_L_lorb_df(
     # Mean-field bar_L (two _build_bar_L_df_cross calls, no _df_JK needed).
     D_w = D_act + 0.5 * D_core
     D_wL = D_L_act + 0.5 * D_L_core
+    _log_vram("  lorb: before cross1")
     bar_mean = _build_bar_L_df_cross(B_ao, D_left=D_wL, D_right=D_core, coeff_J=1.0, coeff_K=-0.5)
-    bar_mean = bar_mean + _build_bar_L_df_cross(B_ao, D_left=D_w, D_right=D_L_core, coeff_J=1.0, coeff_K=-0.5)
+    _log_vram("  lorb: after cross1")
+    _flush_gpu_pool()
+    _log_vram("  lorb: after cross1 flush")
+    bar_mean += _build_bar_L_df_cross(B_ao, D_left=D_w, D_right=D_L_core, coeff_J=1.0, coeff_K=-0.5)
+    _log_vram("  lorb: after cross2")
 
     # Active-active DF term: linearize bar_L_casscf active block w.r.t C_act along C_L_act.
     dm2_flat = dm2.reshape(ncas * ncas, ncas * ncas)
@@ -376,8 +455,11 @@ def _build_bar_L_lorb_df(
     bar_act += xp.einsum("mvQ,nv->Qmn", tmp_M, C_act, optimize=True)
     del tmp_M
 
-    bar_L_lorb = bar_mean + bar_act
-    bar_L_lorb = 0.5 * (bar_L_lorb + xp.transpose(bar_L_lorb, (0, 2, 1)))
+    bar_mean += bar_act
+    del bar_act
+    bar_L_lorb = bar_mean + xp.transpose(bar_mean, (0, 2, 1))
+    del bar_mean
+    bar_L_lorb *= 0.5
     return bar_L_lorb, D_L
 
 
@@ -393,6 +475,7 @@ def _grad_elec_active_df(
     df_config: Any | None,
     df_threads: int,
     df_grad_ctx: DFGradContractionContext | None = None,
+    fd_delta_bohr: float = 1e-4,
     return_terms: bool = False,
 ) -> np.ndarray | tuple[np.ndarray, dict[str, np.ndarray]]:
     """Return active-electron part of <dH/dR> using DF integrals (no nuclear term)."""
@@ -440,7 +523,9 @@ def _grad_elec_active_df(
 
     if not bool(return_terms):
         # ── Fast path: single fused contract() call (bar_L_ao - bar_L_core) ──
-        bar_L_net = bar_L_ao - bar_L_core
+        bar_L_ao -= bar_L_core
+        del bar_L_core
+        bar_L_net = bar_L_ao
         try:
             if df_grad_ctx is not None:
                 de_df_net = df_grad_ctx.contract(B_ao=B_ao, bar_L_ao=bar_L_net)
@@ -456,7 +541,13 @@ def _grad_elec_active_df(
                     df_threads=int(df_threads),
                     profile=None,
                 )
-        except (NotImplementedError, RuntimeError):
+        except (NotImplementedError, RuntimeError) as e:
+            _warn_df_fd_fallback(
+                where="_grad_elec_active_df(total)",
+                backend=str(df_backend),
+                delta_bohr=float(fd_delta_bohr),
+                err=e,
+            )
             de_df_net = compute_df_gradient_contributions_fd_packed_bases(
                 ao_basis,
                 aux_basis,
@@ -465,7 +556,7 @@ def _grad_elec_active_df(
                 backend=str(df_backend),
                 df_config=df_config,
                 df_threads=int(df_threads),
-                delta_bohr=1e-4,
+                delta_bohr=float(fd_delta_bohr),
                 profile=None,
             )
         D_tot_cpu = _asnumpy_f64(D_tot_ao)
@@ -496,7 +587,13 @@ def _grad_elec_active_df(
                 df_threads=int(df_threads),
                 profile=None,
             )
-    except (NotImplementedError, RuntimeError):
+    except (NotImplementedError, RuntimeError) as e:
+        _warn_df_fd_fallback(
+            where="_grad_elec_active_df(df2e)",
+            backend=str(df_backend),
+            delta_bohr=float(fd_delta_bohr),
+            err=e,
+        )
         de_df = compute_df_gradient_contributions_fd_packed_bases(
             ao_basis,
             aux_basis,
@@ -505,7 +602,7 @@ def _grad_elec_active_df(
             backend=str(df_backend),
             df_config=df_config,
             df_threads=int(df_threads),
-            delta_bohr=1e-4,
+            delta_bohr=float(fd_delta_bohr),
             profile=None,
         )
 
@@ -524,7 +621,13 @@ def _grad_elec_active_df(
                 df_threads=int(df_threads),
                 profile=None,
             )
-    except (NotImplementedError, RuntimeError):
+    except (NotImplementedError, RuntimeError) as e:
+        _warn_df_fd_fallback(
+            where="_grad_elec_active_df(df2e_core_sub)",
+            backend=str(df_backend),
+            delta_bohr=float(fd_delta_bohr),
+            err=e,
+        )
         de_df_core = compute_df_gradient_contributions_fd_packed_bases(
             ao_basis,
             aux_basis,
@@ -533,7 +636,7 @@ def _grad_elec_active_df(
             backend=str(df_backend),
             df_config=df_config,
             df_threads=int(df_threads),
-            delta_bohr=1e-4,
+            delta_bohr=float(fd_delta_bohr),
             profile=None,
         )
 
@@ -574,6 +677,7 @@ def _grad_elec_casscf_df(
     df_config: Any | None,
     df_threads: int,
     df_grad_ctx: DFGradContractionContext | None = None,
+    fd_delta_bohr: float = 1e-4,
 ) -> np.ndarray:
     """Return electronic SA-CASSCF/CASSCF gradient (no nuclear term), DF-only."""
 
@@ -622,7 +726,13 @@ def _grad_elec_casscf_df(
                 df_threads=int(df_threads),
                 profile=None,
             )
-    except (NotImplementedError, RuntimeError):
+    except (NotImplementedError, RuntimeError) as e:
+        _warn_df_fd_fallback(
+            where="_grad_elec_casscf_df",
+            backend=str(df_backend),
+            delta_bohr=float(fd_delta_bohr),
+            err=e,
+        )
         de_df = compute_df_gradient_contributions_fd_packed_bases(
             ao_basis,
             aux_basis,
@@ -631,7 +741,7 @@ def _grad_elec_casscf_df(
             backend=str(df_backend),
             df_config=df_config,
             df_threads=int(df_threads),
-            delta_bohr=1e-4,
+            delta_bohr=float(fd_delta_bohr),
             profile=None,
         )
 
@@ -661,6 +771,7 @@ def _Lorb_dot_dgorb_dx_df(
     df_config: Any | None,
     df_threads: int,
     df_grad_ctx: DFGradContractionContext | None = None,
+    fd_delta_bohr: float = 1e-4,
     return_terms: bool = False,
 ) -> np.ndarray | tuple[np.ndarray, dict[str, np.ndarray]]:
     """Analytic DF orbital Lagrange term contribution (PySCF Lorb_dot_dgorb_dx analogue).
@@ -789,7 +900,7 @@ def _Lorb_dot_dgorb_dx_df(
     D_w = D_act + 0.5 * D_core
     D_wL = D_L_act + 0.5 * D_L_core
     bar_mean = _build_bar_L_df_cross(B_ao, D_left=D_wL, D_right=D_core, coeff_J=1.0, coeff_K=-0.5)
-    bar_mean = bar_mean + _build_bar_L_df_cross(B_ao, D_left=D_w, D_right=D_L_core, coeff_J=1.0, coeff_K=-0.5)
+    bar_mean += _build_bar_L_df_cross(B_ao, D_left=D_w, D_right=D_L_core, coeff_J=1.0, coeff_K=-0.5)
 
     # Active-active DF term: linearize _build_bar_L_casscf_df active block w.r.t C_act along C_L_act.
     X = xp.einsum("mnQ,nv->mvQ", B_ao, C_act, optimize=True)  # (nao,ncas,naux)
@@ -814,11 +925,17 @@ def _Lorb_dot_dgorb_dx_df(
     tmp_M = xp.einsum("mu,uvQ->mvQ", C_act, dM_uvQ, optimize=True)
 
     bar_act = xp.einsum("mvQ,nv->Qmn", tmp_L, C_act, optimize=True)
-    bar_act = bar_act + xp.einsum("mvQ,nv->Qmn", tmp, C_L_act, optimize=True)
-    bar_act = bar_act + xp.einsum("mvQ,nv->Qmn", tmp_M, C_act, optimize=True)
+    del tmp_L
+    bar_act += xp.einsum("mvQ,nv->Qmn", tmp, C_L_act, optimize=True)
+    del tmp
+    bar_act += xp.einsum("mvQ,nv->Qmn", tmp_M, C_act, optimize=True)
+    del tmp_M
 
-    bar_L_ao = bar_mean + bar_act
-    bar_L_ao = 0.5 * (bar_L_ao + xp.transpose(bar_L_ao, (0, 2, 1)))
+    bar_mean += bar_act
+    del bar_act
+    bar_L_ao = bar_mean + xp.transpose(bar_mean, (0, 2, 1))
+    del bar_mean
+    bar_L_ao *= 0.5
 
     try:
         if df_grad_ctx is not None:
@@ -835,7 +952,13 @@ def _Lorb_dot_dgorb_dx_df(
                 df_threads=int(df_threads),
                 profile=None,
             )
-    except (NotImplementedError, RuntimeError):
+    except (NotImplementedError, RuntimeError) as e:
+        _warn_df_fd_fallback(
+            where="_Lorb_dot_dgorb_dx_df",
+            backend=str(df_backend),
+            delta_bohr=float(fd_delta_bohr),
+            err=e,
+        )
         de_df = compute_df_gradient_contributions_fd_packed_bases(
             ao_basis,
             aux_basis,
@@ -844,7 +967,7 @@ def _Lorb_dot_dgorb_dx_df(
             backend=str(df_backend),
             df_config=df_config,
             df_threads=int(df_threads),
-            delta_bohr=1e-4,
+            delta_bohr=float(fd_delta_bohr),
             profile=None,
         )
 
@@ -916,7 +1039,9 @@ def sacasscf_nonadiabatic_couplings_df(
         - ``'fd_jacobian'``: finite-difference Jacobian of SA stationarity conditions (debug).
         - ``'fd'``: alias for ``'fd_jacobian'`` (kept for historical tests).
     delta_bohr
-        Displacement (Bohr) for finite-difference response term.
+        Displacement (Bohr) for finite-difference response term. Also used as
+        the fallback DF-B finite-difference step if an analytic DF derivative
+        contraction path is unavailable at runtime.
     fd_integrals_builder
         Optional callback to build displaced-geometry integral arrays for the FD
         response term. Signature::
@@ -1046,13 +1171,14 @@ def sacasscf_nonadiabatic_couplings_df(
         response = "fd_jacobian"
     if response not in ("fd_jacobian", "split_orbfd"):
         raise NotImplementedError("response_term must be 'split_orbfd' or 'fd_jacobian'")
+    fd_delta = float(delta_bohr)
+    if fd_delta <= 0.0:
+        raise ValueError("delta_bohr must be > 0")
 
     dg = None
     if response == "fd_jacobian":
         # FD Jacobian of SA stationarity conditions w.r.t nuclear coordinates.
-        delta = float(delta_bohr)
-        if delta <= 0.0:
-            raise ValueError("delta_bohr must be > 0")
+        delta = float(fd_delta)
 
         auxbasis_spec = auxbasis
         if auxbasis_spec is None:
@@ -1211,6 +1337,7 @@ def sacasscf_nonadiabatic_couplings_df(
             df_config=df_config,
             df_threads=int(df_threads),
             df_grad_ctx=df_grad_ctx,
+            fd_delta_bohr=float(fd_delta),
         )
 
         # CSF / AO-overlap term (numerator form).
@@ -1343,6 +1470,7 @@ def sacasscf_nonadiabatic_couplings_df(
                 df_config=df_config,
                 df_threads=int(df_threads),
                 df_grad_ctx=df_grad_ctx,
+                fd_delta_bohr=float(fd_delta),
             )
 
             if dm1_sa is None or dm2_sa is None:  # pragma: no cover
@@ -1363,6 +1491,7 @@ def sacasscf_nonadiabatic_couplings_df(
                 df_config=df_config,
                 df_threads=int(df_threads),
                 df_grad_ctx=df_grad_ctx,
+                fd_delta_bohr=float(fd_delta),
             )
 
             resp_full = np.asarray(de_lci, dtype=np.float64) + np.asarray(de_lorb, dtype=np.float64)

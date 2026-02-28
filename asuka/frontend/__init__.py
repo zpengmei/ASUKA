@@ -9,6 +9,7 @@ from .analysis import (
     MethodWorkflow,
     make_df_casci_energy_grad,
     make_df_casscf_energy_grad,
+    make_df_casscf_multiroot_energy_grad,
 )
 from .df import build_df_B_cueri, build_df_bases_cart
 from .molecule import Molecule
@@ -41,6 +42,7 @@ __all__ = [
     "fd_hessian_molecule",
     "frequency_analysis_molecule",
     "make_df_casscf_energy_grad",
+    "make_df_casscf_multiroot_energy_grad",
     "make_df_casci_energy_grad",
     "build_ao_basis_cart",
     "build_df_B_cueri",

@@ -40,11 +40,13 @@ def sacasscf_nonadiabatic_couplings_df(
     response_term: _ResponseTerm = "split_orbfd",
     z_tol: float = 1e-10,
     z_maxiter: int = 200,
+    delta_bohr: float = 1e-4,
 ) -> np.ndarray:
     """Compute SA-CASSCF NACVs (<bra|d/dR|ket>) using ASUKA DF integrals.
 
     This is the public NAC entry point. It supports only the
-    ``split_orbfd`` response backend.
+    ``split_orbfd`` response backend. ``delta_bohr`` controls the finite-
+    difference step only if the DF derivative contraction falls back to FD.
     """
 
     if str(response_term).lower() != "split_orbfd":
@@ -65,8 +67,8 @@ def sacasscf_nonadiabatic_couplings_df(
         response_term="split_orbfd",
         z_tol=z_tol,
         z_maxiter=z_maxiter,
+        delta_bohr=delta_bohr,
     )
 
 
 __all__ = ["sacasscf_nonadiabatic_couplings_df"]
-

@@ -8,6 +8,7 @@ They run the underlying algorithms and store the resulting objects under
 """
 
 from dataclasses import dataclass
+import warnings
 from typing import Any, Callable, Mapping, Sequence
 
 import numpy as np
@@ -108,6 +109,14 @@ def make_df_casscf_energy_grad(
     if orbital_tracking and (ncore is None or ncas is None):
         raise ValueError(
             "orbital_tracking=True requires 'ncore' and 'ncas' in casscf_kwargs"
+        )
+    nroots_hint = int(casscf_kwargs_use.get("nroots", 1) or 1)
+    if nroots_hint > 1:
+        warnings.warn(
+            "make_df_casscf_energy_grad with nroots>1 returns the state-averaged energy/gradient. "
+            "For state-specific NAMD forces use make_df_casscf_multiroot_energy_grad.",
+            RuntimeWarning,
+            stacklevel=2,
         )
 
     prev_scf_mo_coeff: Any | None = None
@@ -212,6 +221,7 @@ def make_df_casscf_energy_grad(
                 hf_call["mo_coeff0"] = prev_scf_mo_coeff
 
         scf_out = run_hf(mol_eval, **hf_call)
+        tracked_mo_coeff0: np.ndarray | None = None
 
         # Orbital tracking: reorder SCF orbitals to match previous active space
         if bool(orbital_tracking) and bool(warm_start):
@@ -262,14 +272,14 @@ def make_df_casscf_energy_grad(
                         alignment_idx=range(ncore, ncore + ncas),
                     )
 
-                    # Override SCF mo_coeff for CASSCF initial guess
-                    if hasattr(scf_out, "scf") and hasattr(scf_out.scf, "mo_coeff"):
-                        scf_out.scf.mo_coeff = scf_mo_aligned
+                    # Use aligned orbitals directly as CASSCF initial guess.
+                    tracked_mo_coeff0 = np.asarray(scf_mo_aligned, dtype=np.float64)
 
         casscf_call = dict(casscf_kwargs_use)
         if bool(warm_start):
-            if "mo_coeff0" not in casscf_call and prev_casscf_mo_coeff is not None:
-                casscf_call["mo_coeff0"] = prev_casscf_mo_coeff
+            if "mo_coeff0" not in casscf_call:
+                if tracked_mo_coeff0 is not None:
+                    casscf_call["mo_coeff0"] = tracked_mo_coeff0
             if "ci0" not in casscf_call and prev_ci is not None:
                 casscf_call["ci0"] = prev_ci
 
@@ -406,12 +416,25 @@ def make_df_casscf_multiroot_energy_grad(
     save_intermediates: bool = True,
     warm_start: bool = True,
     guess: Any | None = None,
+    orbital_tracking: bool = True,
+    tracking_method: str = "subspace",
+    tracking_ref: Any | None = None,
 ) -> MultirootEnergyGradFn:
     """Build a ``(coords_bohr) -> (e_roots, grads)`` callback for per-root SA-CASSCF gradients.
 
     This adapter re-runs SCF + CASSCF at the requested coordinates and returns
     per-root energies and per-root analytic DF nuclear gradients (with CP-MCSCF
     orbital response).
+
+    Parameters
+    ----------
+    orbital_tracking : bool
+        Enable orbital tracking to maintain active-space continuity across
+        geometry changes (default: True).
+    tracking_method : str
+        Orbital assignment method: ``"subspace"`` (default) or ``"hungarian"``.
+    tracking_ref : Any | None
+        Optional explicit reference used to initialize tracking state.
 
     Returns
     -------
@@ -427,9 +450,19 @@ def make_df_casscf_multiroot_energy_grad(
     if "method" not in hf_kwargs_use:
         hf_kwargs_use["method"] = "rhf" if int(mol.spin) == 0 else "rohf"
 
+    ncore = casscf_kwargs_use.get("ncore")
+    ncas = casscf_kwargs_use.get("ncas")
+    if orbital_tracking and (ncore is None or ncas is None):
+        raise ValueError(
+            "orbital_tracking=True requires 'ncore' and 'ncas' in casscf_kwargs"
+        )
+
     prev_scf_mo_coeff: Any | None = None
     prev_casscf_mo_coeff: Any | None = None
     prev_ci: Any | None = None
+    prev_mol: Molecule | None = None
+    prev_ncore: int | None = None
+    prev_ncas: int | None = None
 
     if guess is not None:
         g_scf = None
@@ -453,12 +486,44 @@ def make_df_casscf_multiroot_energy_grad(
             if prev_scf_mo_coeff is None and prev_casscf_mo_coeff is not None:
                 prev_scf_mo_coeff = prev_casscf_mo_coeff
 
+    if tracking_ref is not None and orbital_tracking:
+        ref_mol_parsed = None
+        ref_casscf_parsed = None
+
+        if isinstance(tracking_ref, Molecule):
+            ref_mol_parsed = tracking_ref
+        elif isinstance(tracking_ref, tuple) and len(tracking_ref) == 2:
+            ref_mol_parsed, ref_casscf_parsed = tracking_ref
+        elif hasattr(tracking_ref, "mol"):
+            ref_mol_parsed = getattr(tracking_ref, "mol", None)
+            ref_casscf_parsed = tracking_ref
+        elif isinstance(tracking_ref, DFMethodEvalArtifacts):
+            ref_scf = getattr(tracking_ref, "scf_out", None)
+            ref_mc = getattr(tracking_ref, "mc", None)
+            if ref_scf is not None and hasattr(ref_scf, "mol"):
+                ref_mol_parsed = ref_scf.mol
+            elif ref_mc is not None and hasattr(ref_mc, "mol"):
+                ref_mol_parsed = ref_mc.mol
+            ref_casscf_parsed = ref_mc
+
+        if ref_mol_parsed is not None:
+            prev_mol = ref_mol_parsed
+
+        if ref_casscf_parsed is not None:
+            prev_casscf_mo_coeff = getattr(ref_casscf_parsed, "mo_coeff", None)
+            prev_ncore = getattr(ref_casscf_parsed, "ncore", ncore)
+            prev_ncas = getattr(ref_casscf_parsed, "ncas", ncas)
+            if prev_ci is None:
+                prev_ci = getattr(ref_casscf_parsed, "ci", None)
+            if prev_scf_mo_coeff is None and prev_casscf_mo_coeff is not None:
+                prev_scf_mo_coeff = prev_casscf_mo_coeff
+
     def energy_grad(coords_bohr: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         from asuka.frontend import run_hf  # noqa: PLC0415
         from asuka.mcscf import run_casscf  # noqa: PLC0415
         from asuka.mcscf.nuc_grad_df import casscf_nuc_grad_df_per_root  # noqa: PLC0415
 
-        nonlocal prev_scf_mo_coeff, prev_casscf_mo_coeff, prev_ci
+        nonlocal prev_scf_mo_coeff, prev_casscf_mo_coeff, prev_ci, prev_mol, prev_ncore, prev_ncas
 
         if bool(warm_start) and (prev_scf_mo_coeff is None and prev_casscf_mo_coeff is None and prev_ci is None):
             prev = mol.results.get(str(save_key))
@@ -484,11 +549,54 @@ def make_df_casscf_multiroot_energy_grad(
                 hf_call["mo_coeff0"] = prev_scf_mo_coeff
 
         scf_out = run_hf(mol_eval, **hf_call)
+        tracked_mo_coeff0: np.ndarray | None = None
+
+        if bool(orbital_tracking) and bool(warm_start):
+            if prev_mol is not None and prev_casscf_mo_coeff is not None:
+                if prev_ncore is not None and prev_ncas is not None:
+                    from asuka.frontend.one_electron import build_ao_basis_cart  # noqa: PLC0415
+                    from asuka.integrals.cross_geometry import build_S_cross_cart  # noqa: PLC0415
+                    from asuka.mcscf.orbital_tracking import (  # noqa: PLC0415
+                        align_orbital_phases,
+                        assign_active_orbitals_by_overlap,
+                        reorder_mo_to_active_space,
+                    )
+
+                    basis_prev, _ = build_ao_basis_cart(prev_mol)
+                    basis_new, _ = build_ao_basis_cart(mol_eval)
+                    S_cross = build_S_cross_cart(basis_prev, basis_new)
+
+                    scf_mo_coeff = np.asarray(
+                        getattr(getattr(scf_out, "scf", None), "mo_coeff", None),
+                        dtype=np.float64,
+                    )
+
+                    prev_active_idx = list(range(prev_ncore, prev_ncore + prev_ncas))
+                    new_active_idx = assign_active_orbitals_by_overlap(
+                        prev_casscf_mo_coeff,
+                        scf_mo_coeff,
+                        S_cross,
+                        prev_active_idx,
+                        ncas,
+                        method=tracking_method,
+                    )
+
+                    scf_mo_reordered = reorder_mo_to_active_space(
+                        scf_mo_coeff, new_active_idx, ncore
+                    )
+                    scf_mo_aligned = align_orbital_phases(
+                        prev_casscf_mo_coeff,
+                        scf_mo_reordered,
+                        S_cross,
+                        alignment_idx=range(ncore, ncore + ncas),
+                    )
+                    tracked_mo_coeff0 = np.asarray(scf_mo_aligned, dtype=np.float64)
 
         casscf_call = dict(casscf_kwargs_use)
         if bool(warm_start):
-            if "mo_coeff0" not in casscf_call and prev_casscf_mo_coeff is not None:
-                casscf_call["mo_coeff0"] = prev_casscf_mo_coeff
+            if "mo_coeff0" not in casscf_call:
+                if tracked_mo_coeff0 is not None:
+                    casscf_call["mo_coeff0"] = tracked_mo_coeff0
             if "ci0" not in casscf_call and prev_ci is not None:
                 casscf_call["ci0"] = prev_ci
 
@@ -503,6 +611,10 @@ def make_df_casscf_multiroot_energy_grad(
         if bool(warm_start) and bool(getattr(mc, "converged", False)):
             prev_casscf_mo_coeff = getattr(mc, "mo_coeff", None)
             prev_ci = getattr(mc, "ci", None)
+            if bool(orbital_tracking):
+                prev_mol = mol_eval
+                prev_ncore = ncore
+                prev_ncas = ncas
 
         return np.asarray(g.e_roots, dtype=np.float64), np.asarray(g.grads, dtype=np.float64)
 
@@ -601,6 +713,7 @@ __all__ = [
     "DFMethodEvalArtifacts",
     "MethodWorkflow",
     "make_df_casscf_energy_grad",
+    "make_df_casscf_multiroot_energy_grad",
     "make_df_casci_energy_grad",
     "geomopt_molecule",
     "fd_hessian_molecule",

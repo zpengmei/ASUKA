@@ -42,15 +42,15 @@ def _as_xp_f64(xp, a: Any):
     return xp.asarray(a, dtype=xp.float64)
 
 
-def _solve_triangular(xp, L, B, *, lower: bool, trans: str):
+def _solve_triangular(xp, L, B, *, lower: bool, trans: str, overwrite_b: bool = False):
     if xp is np:
         from scipy.linalg import solve_triangular  # noqa: PLC0415
 
-        return solve_triangular(L, B, lower=bool(lower), trans=str(trans), unit_diagonal=False, overwrite_b=False, check_finite=False)
+        return solve_triangular(L, B, lower=bool(lower), trans=str(trans), unit_diagonal=False, overwrite_b=bool(overwrite_b), check_finite=False)
 
     import cupyx.scipy.linalg as cpx_linalg  # type: ignore[import-not-found]  # noqa: PLC0415
 
-    return cpx_linalg.solve_triangular(L, B, lower=bool(lower), trans=str(trans), unit_diagonal=False, overwrite_b=False)
+    return cpx_linalg.solve_triangular(L, B, lower=bool(lower), trans=str(trans), unit_diagonal=False, overwrite_b=bool(overwrite_b))
 
 
 def df_whiten_adjoint(
@@ -117,6 +117,8 @@ def df_whiten_adjoint_Qmn(
     B_mnQ: Any,
     bar_L_Qmn: Any,
     L: Any,
+    *,
+    overwrite_bar_L: bool = False,
 ) -> tuple[Any, Any]:
     """Like :func:`df_whiten_adjoint` but *bar_L* is in ``(naux, nao, nao)`` layout.
 
@@ -132,6 +134,10 @@ def df_whiten_adjoint_Qmn(
         Adjoint w.r.t. B in ``(naux, nao, nao)`` layout (Fortran-like Q-first).
     L
         Lower Cholesky factor of the aux metric, shape ``(naux, naux)``.
+    overwrite_bar_L
+        If True, the solve overwrites ``bar_L_Qmn``'s buffer in-place
+        (via cuBLAS TRSM ``overwrite_b``), saving one ``(naux, nao^2)``
+        allocation.  Callers must not use ``bar_L_Qmn`` after this call.
 
     Returns
     -------
@@ -163,7 +169,9 @@ def df_whiten_adjoint_Qmn(
     # costly transpose copy.
     bar_BT = bar_L_Qmn.reshape(naux, nao0 * nao0)
 
-    tmp = _solve_triangular(xp, L, bar_BT, lower=True, trans="T")  # (naux, nao^2)
+    # When overwrite_bar_L=True, TRSM writes the solution directly into
+    # bar_BT's buffer (= bar_L_Qmn's memory), avoiding a full-size temporary.
+    tmp = _solve_triangular(xp, L, bar_BT, lower=True, trans="T", overwrite_b=overwrite_bar_L)  # (naux, nao^2)
     bar_X_flat = tmp.T  # (nao^2, naux) — non-contiguous view, that's fine
     bar_Lchol = -(tmp @ B_flat)  # (naux, naux)
     bar_Lchol = xp.tril(bar_Lchol)

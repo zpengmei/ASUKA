@@ -542,17 +542,24 @@ def _build_bar_L_casscf_df(
 
     # Fused bar_J + bar_K: avoids separate (naux,nao,nao) allocations for
     # bar_J, t1, t2, bar_K.  Peak is now 2× sizeof(B) instead of ~6×.
-    bar_mean = sigma[:, None, None] * D_core_ao[None, :, :] + rho[:, None, None] * D_w[None, :, :]
+    _log_vram("    casscf_df: before bar_mean")
+    bar_mean = sigma[:, None, None] * D_core_ao[None, :, :]
+    bar_mean += rho[:, None, None] * D_w[None, :, :]
+    _log_vram("    casscf_df: after bar_mean J")
 
     BQ = xp.transpose(B_ao, (2, 0, 1))  # (naux,nao,nao) — view, no copy
-    _t = xp.matmul(xp.matmul(D_core_ao[None, :, :], BQ), D_w)  # D_core B_Q D_w
-    _t *= -0.5
-    bar_mean += _t
-    del _t
-    _t = xp.matmul(xp.matmul(D_w[None, :, :], BQ), D_core_ao)  # D_w B_Q D_core
-    _t *= -0.5
-    bar_mean += _t
-    del _t
+    # Chunk over aux index so intermediates are (chunk,nao,nao) instead of
+    # (naux,nao,nao), reducing peak VRAM by ~2×sizeof(B).
+    _chunk = max(1, naux // 4)
+    for _q0 in range(0, naux, _chunk):
+        _q1 = min(_q0 + _chunk, naux)
+        _bq = BQ[_q0:_q1]
+        _t = xp.matmul(xp.matmul(D_core_ao[None, :, :], _bq), D_w)
+        _t += xp.matmul(xp.matmul(D_w[None, :, :], _bq), D_core_ao)
+        _t *= -0.5
+        bar_mean[_q0:_q1] += _t
+        del _t
+    _log_vram("    casscf_df: after exchange")
 
     # Active-active 2-RDM term:
     #   E_aa = 0.5 Σ_{uvwx} dm2_uvwx (uv|wx)
@@ -585,9 +592,14 @@ def _build_bar_L_casscf_df(
 
     tmp = xp.einsum("mu,uvQ->mvQ", C_act, M_uvQ, optimize=True)  # (nao,ncas,naux)
     bar_act = xp.einsum("mvQ,nv->Qmn", tmp, C_act, optimize=True)  # (naux,nao,nao)
+    _log_vram("    casscf_df: after bar_act")
 
-    bar_L = bar_mean + bar_act
-    bar_L = 0.5 * (bar_L + xp.transpose(bar_L, (0, 2, 1)))
+    bar_mean += bar_act
+    del bar_act
+    bar_L = bar_mean + xp.transpose(bar_mean, (0, 2, 1))
+    del bar_mean
+    bar_L *= 0.5
+    _log_vram("    casscf_df: after sym")
     return xp.asarray(bar_L, dtype=xp.float64)
 
 
@@ -648,17 +660,19 @@ def _build_bar_L_delta_casscf_df(
     delta_sigma = B2.T @ D_act_delta.reshape(nao * nao)  # (naux,)
 
     # Fused bar_J_delta + bar_K_delta to reduce peak VRAM.
-    bar_mean_delta = delta_sigma[:, None, None] * D_core_ao[None, :, :] + rho_core[:, None, None] * D_act_delta[None, :, :]
+    bar_mean_delta = delta_sigma[:, None, None] * D_core_ao[None, :, :]
+    bar_mean_delta += rho_core[:, None, None] * D_act_delta[None, :, :]
 
     BQ = xp.transpose(B_ao, (2, 0, 1))  # (naux,nao,nao)
-    _t = xp.matmul(xp.matmul(D_core_ao[None, :, :], BQ), D_act_delta)
-    _t *= -0.5
-    bar_mean_delta += _t
-    del _t
-    _t = xp.matmul(xp.matmul(D_act_delta[None, :, :], BQ), D_core_ao)
-    _t *= -0.5
-    bar_mean_delta += _t
-    del _t
+    _chunk = max(1, naux // 4)
+    for _q0 in range(0, naux, _chunk):
+        _q1 = min(_q0 + _chunk, naux)
+        _bq = BQ[_q0:_q1]
+        _t = xp.matmul(xp.matmul(D_core_ao[None, :, :], _bq), D_act_delta)
+        _t += xp.matmul(xp.matmul(D_act_delta[None, :, :], _bq), D_core_ao)
+        _t *= -0.5
+        bar_mean_delta[_q0:_q1] += _t
+        del _t
 
     # Active-active 2-RDM delta (linear in dm2)
     dm2_flat = dm2_delta.reshape(ncas * ncas, ncas * ncas)
@@ -669,8 +683,11 @@ def _build_bar_L_delta_casscf_df(
     tmp = xp.einsum("mu,uvQ->mvQ", C_act, M_uvQ, optimize=True)  # (nao,ncas,naux)
     bar_act_delta = xp.einsum("mvQ,nv->Qmn", tmp, C_act, optimize=True)  # (naux,nao,nao)
 
-    bar_L_delta = bar_mean_delta + bar_act_delta
-    bar_L_delta = 0.5 * (bar_L_delta + xp.transpose(bar_L_delta, (0, 2, 1)))
+    bar_mean_delta += bar_act_delta
+    del bar_act_delta
+    bar_L_delta = bar_mean_delta + xp.transpose(bar_mean_delta, (0, 2, 1))
+    del bar_mean_delta
+    bar_L_delta *= 0.5
     return xp.asarray(bar_L_delta, dtype=xp.float64)
 
 
@@ -724,27 +741,36 @@ def _build_bar_L_df_cross(
     rho = B2.T @ D_right.reshape(nao * nao)  # (naux,)
     sigma = B2.T @ D_left.reshape(nao * nao)  # (naux,)
 
-    bar = xp.zeros((naux, nao, nao), dtype=xp.float64)
-
+    _log_vram("    cross: before Coulomb")
     cJ = float(coeff_J)
     if cJ:
-        bar += cJ * (sigma[:, None, None] * D_right[None, :, :] + rho[:, None, None] * D_left[None, :, :])
+        bar = (cJ * sigma)[:, None, None] * D_right[None, :, :]
+        bar += (cJ * rho)[:, None, None] * D_left[None, :, :]
+    else:
+        bar = xp.zeros((naux, nao, nao), dtype=xp.float64)
+    _log_vram("    cross: after Coulomb")
 
     # Exchange-like part: Tr(D_left K(D_right)) = Σ_Q Tr(D_left B_Q D_right B_Q)
+    # Chunked over aux index to keep intermediates at (chunk,nao,nao).
     cK = float(coeff_K)
     if cK:
         BQ = xp.transpose(B_ao, (2, 0, 1))  # (naux,nao,nao)
-        _t = xp.matmul(xp.matmul(D_left[None, :, :], BQ), D_right)
-        _t *= cK
-        bar += _t
-        del _t
-        _t = xp.matmul(xp.matmul(D_right[None, :, :], BQ), D_left)
-        _t *= cK
-        bar += _t
-        del _t
+        _chunk = max(1, naux // 4)
+        for _q0 in range(0, naux, _chunk):
+            _q1 = min(_q0 + _chunk, naux)
+            _bq = BQ[_q0:_q1]
+            _t = xp.matmul(xp.matmul(D_left[None, :, :], _bq), D_right)
+            _t += xp.matmul(xp.matmul(D_right[None, :, :], _bq), D_left)
+            _t *= cK
+            bar[_q0:_q1] += _t
+            del _t
+        _log_vram("    cross: after exchange")
 
-    bar = 0.5 * (bar + xp.transpose(bar, (0, 2, 1)))
-    return xp.asarray(bar, dtype=xp.float64)
+    _sym = bar + xp.transpose(bar, (0, 2, 1))
+    del bar
+    _sym *= 0.5
+    _log_vram("    cross: after sym")
+    return xp.asarray(_sym, dtype=xp.float64)
 
 
 def casscf_nuc_grad_df(
@@ -2017,6 +2043,7 @@ def casscf_nuc_grad_df_per_root(
             )
             if _profile_df_per_root:
                 _t_bar_L_delta += time.perf_counter() - t0
+            _flush_gpu_pool()
 
         # Step B: Z-vector RHS
         fcisolver_fixed = _FixedRDMFcisolver(fcisolver_use, dm1=dm1_K, dm2=dm2_K)
@@ -2039,6 +2066,8 @@ def casscf_nuc_grad_df_per_root(
                     mc_K, C, ci_list[K], eris_sa, verbose=0, implementation="internal",
                 )
             g_K = _asnumpy_f64(g_K).ravel()
+        del _gupd, _hop, _hdiag, mc_K, fcisolver_fixed
+        _log_vram(f"root {K} after gen_g_hop cleanup")
 
         rhs_orb = g_K[:n_orb]
         rhs_ci_K = g_K[n_orb:]
@@ -2078,6 +2107,8 @@ def casscf_nuc_grad_df_per_root(
 
         # Step D: CI response — accumulate transition RDMs, then build bar_L without contract().
         Lci_list = hess_op.ci_unflatten(Lvec[n_orb:])
+        del z_K
+        _log_vram(f"root {K} after z_solve cleanup")
         t0 = time.perf_counter()
         if _use_ci_rdm_device and _cp_ci is not None and ci_list_dev is not None:
             cp = _cp_ci
@@ -2135,25 +2166,50 @@ def casscf_nuc_grad_df_per_root(
         if _profile_df_per_root:
             _t_trans_rdm_lci += time.perf_counter() - t0
 
+        # ── Single fused contract(): HF delta + lci response + lorb response ──
+        # Interleave build + fuse: build each bar_L component and immediately
+        # accumulate into bar_L_delta_total before building the next, so at most
+        # 2 (naux,nao,nao) arrays are alive at once instead of 3.
+        _flush_gpu_pool()
+        _log_vram(f"root {K} pre-barL flush")
+        if _os.environ.get("ASUKA_VRAM_DUMP") and K == 0:
+            import gc as _gc  # noqa: PLC0415
+            _gc.collect()
+            _cupy_arrays = []
+            for _obj in _gc.get_objects():
+                try:
+                    if hasattr(_obj, '__class__') and _obj.__class__.__module__ == 'cupy' and hasattr(_obj, 'nbytes'):
+                        _mb = _obj.nbytes / 1e6
+                        if _mb >= 0.5:
+                            _cupy_arrays.append((_mb, _obj.shape, _obj.dtype))
+                except Exception:
+                    pass
+            _cupy_arrays.sort(reverse=True)
+            print(f"[VRAM_DUMP] root {K} pre-barL: {len(_cupy_arrays)} arrays >= 0.5 MB")
+            for _mb, _sh, _dt in _cupy_arrays[:30]:
+                print(f"  {_mb:10.2f} MB  shape={_sh}  dtype={_dt}")
+            del _cupy_arrays
         with _main_stream_cm:
+            bar_L_delta_total = bar_L_delta_hf
+            _log_vram(f"root {K} before lci_net")
+
             # Build bar_L_lci_net = bar_L_lci_active - bar_L_lci_core (fused, GPU).
             bar_L_lci_net, D_act_lci = _build_bar_L_net_active_df(
                 B_ao, C, dm1_lci, dm2_lci, ncore=int(ncore), ncas=int(ncas), xp=xp, L_act=L_act, rho_core=rho_core,
             )
+            _log_vram(f"root {K} after lci_net (before accum)")
+            bar_L_delta_total += bar_L_lci_net
+            del bar_L_lci_net
+            _log_vram(f"root {K} after lci_net accum")
+            _flush_gpu_pool()
+            _log_vram(f"root {K} after lci_net flush")
 
             # Step E: Orbital response — build bar_L_lorb without contract() (GPU).
             bar_L_lorb, D_L_lorb = _build_bar_L_lorb_df(
                 B_ao, C, np.asarray(Lorb_mat, dtype=np.float64), dm1_sa, dm2_sa,
                 ncore=int(ncore), ncas=int(ncas), xp=xp,
             )
-
-        # ── Single fused contract(): HF delta + lci response + lorb response ──
-        # grad_K = grad_sa_base + delta_2e + delta_1e + delta_Pulay
-        # Accumulate in-place to avoid 4× (naux,nao,nao) peak.
-        with _main_stream_cm:
-            bar_L_delta_total = bar_L_delta_hf
-            bar_L_delta_total += bar_L_lci_net
-            del bar_L_lci_net
+            _log_vram(f"root {K} after lorb (before accum)")
             bar_L_delta_total += bar_L_lorb
             del bar_L_lorb
             _log_vram(f"root {K} bar_L fused")

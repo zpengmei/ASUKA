@@ -53,10 +53,22 @@ def _base_fcisolver_method(fcisolver: Any, name: str):
 
     base_cls = getattr(fcisolver, "_base_class", None)
     if base_cls is not None and hasattr(base_cls, name):
-        return getattr(base_cls, name)
+        fn_unbound = getattr(base_cls, name)
+
+        def _call(solver_obj: Any, *args: Any, **kwargs: Any):
+            return fn_unbound(solver_obj, *args, **kwargs)
+
+        return _call
+
     if not hasattr(fcisolver, name):
         raise AttributeError(f"fcisolver does not implement {name}")
-    return getattr(fcisolver, name)
+
+    fn_bound = getattr(fcisolver, name)
+
+    def _call(_solver_obj: Any, *args: Any, **kwargs: Any):
+        return fn_bound(*args, **kwargs)
+
+    return _call
 
 
 def _mol_coords_charges_bohr(mol: Any) -> tuple[np.ndarray, np.ndarray]:

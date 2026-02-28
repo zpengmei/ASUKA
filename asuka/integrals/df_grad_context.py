@@ -636,7 +636,7 @@ class DFGradContractionContext:
         if tuple(map(int, bar_L.shape)) != (int(self.naux), int(self.nao), int(self.nao)):
             raise ValueError("bar_L_ao must have shape (naux, nao, nao)")
 
-        bar_X, bar_Lchol = df_whiten_adjoint_Qmn(B, bar_L, self.L_metric)
+        bar_X, bar_Lchol = df_whiten_adjoint_Qmn(B, bar_L, self.L_metric, overwrite_bar_L=True)
         del bar_L
         bar_V = chol_lower_adjoint(self.L_metric, bar_Lchol)
         del bar_Lchol
@@ -676,7 +676,7 @@ class DFGradContractionContext:
         T = cp.asarray(T_c2s, dtype=cp.float64)
 
         # 1. Compute adjoints in spherical basis
-        bar_X_sph, bar_Lchol = df_whiten_adjoint_Qmn(B, bar_L, self.L_metric)
+        bar_X_sph, bar_Lchol = df_whiten_adjoint_Qmn(B, bar_L, self.L_metric, overwrite_bar_L=True)
         del bar_L
         bar_V = chol_lower_adjoint(self.L_metric, bar_Lchol)
         del bar_Lchol
