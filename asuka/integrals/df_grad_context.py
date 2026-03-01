@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import hashlib
 import os
 from typing import Any, Iterable, Literal, Sequence
 
@@ -62,9 +63,9 @@ def _normalize_df_3c_sched_mode(value: str | None) -> str:
 
 def _normalize_df_3c_ab_tile(value: str | None) -> int:
     try:
-        tile = int(str(value or "4").strip())
+        tile = int(str(value or "8").strip())
     except Exception:
-        tile = 4
+        tile = 8
     return max(1, min(16, int(tile)))
 
 
@@ -98,6 +99,71 @@ def _env_flag_enabled(name: str, *, default: bool = False) -> bool:
     if sval in ("0", "false", "no", "off", "disable", "disabled"):
         return False
     return bool(default)
+
+
+_DF_3C_SCHED_CACHE_MAX = 16
+_DF_3C_SCHED_CACHE: dict[tuple[Any, ...], list[dict[str, Any]]] = {}
+_DF_3C_SCHED_CACHE_ORDER: list[tuple[Any, ...]] = []
+
+
+def _df_3c_sched_cache_enabled() -> bool:
+    return _env_flag_enabled("ASUKA_DF_3C_SCHED_CACHE", default=True)
+
+
+def _df_3c_sched_signature(
+    *,
+    spAB_by_lab: dict[tuple[int, int], np.ndarray],
+    spCD_by_l: dict[int, np.ndarray],
+    sp_npair: np.ndarray,
+) -> str:
+    npair_all = np.asarray(sp_npair, dtype=np.int32).ravel()
+    h = hashlib.blake2b(digest_size=20)
+    h.update(np.asarray([int(npair_all.size), int(len(spAB_by_lab)), int(len(spCD_by_l))], dtype=np.int32).tobytes())
+    for (la, lb), ab_idx_raw in sorted(spAB_by_lab.items(), key=lambda kv: (int(kv[0][0]), int(kv[0][1]))):
+        ab_idx = np.asarray(ab_idx_raw, dtype=np.int32).ravel()
+        h.update(np.asarray([int(la), int(lb), int(ab_idx.size)], dtype=np.int32).tobytes())
+        if int(ab_idx.size):
+            h.update(np.asarray(npair_all[ab_idx], dtype=np.int32).tobytes())
+    for lq, cd_idx_raw in sorted(spCD_by_l.items(), key=lambda kv: int(kv[0])):
+        cd_idx = np.asarray(cd_idx_raw, dtype=np.int32).ravel()
+        h.update(np.asarray([int(lq), int(cd_idx.size)], dtype=np.int32).tobytes())
+        if int(cd_idx.size):
+            h.update(np.asarray(npair_all[cd_idx], dtype=np.int32).tobytes())
+    return h.hexdigest()
+
+
+def _clone_df_3c_jobs_host(jobs: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    for job in jobs:
+        j = dict(job)
+        j["spAB_host"] = np.asarray(job["spAB_host"], dtype=np.int32).copy()
+        j["spCD_host"] = np.asarray(job["spCD_host"], dtype=np.int32).copy()
+        out.append(j)
+    return out
+
+
+def _get_cached_df_3c_jobs(key: tuple[Any, ...]) -> list[dict[str, Any]] | None:
+    jobs = _DF_3C_SCHED_CACHE.get(key)
+    if jobs is None:
+        return None
+    try:
+        _DF_3C_SCHED_CACHE_ORDER.remove(key)
+    except ValueError:
+        pass
+    _DF_3C_SCHED_CACHE_ORDER.append(key)
+    return _clone_df_3c_jobs_host(jobs)
+
+
+def _put_cached_df_3c_jobs(key: tuple[Any, ...], jobs: Sequence[dict[str, Any]]) -> None:
+    _DF_3C_SCHED_CACHE[key] = _clone_df_3c_jobs_host(jobs)
+    try:
+        _DF_3C_SCHED_CACHE_ORDER.remove(key)
+    except ValueError:
+        pass
+    _DF_3C_SCHED_CACHE_ORDER.append(key)
+    while len(_DF_3C_SCHED_CACHE_ORDER) > int(_DF_3C_SCHED_CACHE_MAX):
+        old = _DF_3C_SCHED_CACHE_ORDER.pop(0)
+        _DF_3C_SCHED_CACHE.pop(old, None)
 
 
 def _npair_cv(arr: np.ndarray) -> float:
@@ -152,6 +218,20 @@ def _build_df_3c_launch_jobs(
     cd_edges_n = tuple(int(v) for v in cd_edges)
     ab_tile_n = _normalize_df_3c_ab_tile(str(ab_tile))
     npair_all = np.asarray(sp_npair, dtype=np.int32).ravel()
+    cache_key: tuple[Any, ...] | None = None
+    if _df_3c_sched_cache_enabled():
+        sig = _df_3c_sched_signature(spAB_by_lab=spAB_by_lab, spCD_by_l=spCD_by_l, sp_npair=npair_all)
+        cache_key = (
+            str(mode),
+            tuple(int(v) for v in ab_edges_n),
+            tuple(int(v) for v in cd_edges_n),
+            int(ab_tile_n),
+            int(small_job_blocks),
+            str(sig),
+        )
+        cached = _get_cached_df_3c_jobs(cache_key)
+        if cached is not None:
+            return cached
 
     def _finalize_job(job: dict[str, Any]) -> None:
         ab_np = np.asarray(job["_npair_ab"], dtype=np.int32).ravel()
@@ -165,23 +245,35 @@ def _build_df_3c_launch_jobs(
         cd_sum = int(np.sum(cd_np, dtype=np.int64))
         work_est = int(ab_sum * cd_sum)
         score = float(np.mean(ab_np, dtype=np.float64)) * float(np.mean(cd_np, dtype=np.float64))
+        atomic_pressure = float(blocks) * (1.0 + 0.5 * float(job.get("cv_ab", 0.0)) + 0.5 * float(job.get("cv_cd", 0.0)))
         if mode == "off":
             threads = 256
             tile = 1
             use_abtile = False
         else:
             threads = _choose_df_3c_threads(score)
-            tile = max(1, min(int(ab_tile_n), n_cd))
-            if score >= 160.0:
-                tile = max(1, min(tile, 4))
-            elif score >= 96.0:
-                tile = max(1, min(tile, 6))
-            use_abtile = bool(tile > 1 and blocks >= 2048 and n_ab >= 8 and n_cd >= 2)
+            tile_cap = max(1, min(int(ab_tile_n), n_cd))
+            tile_target = 1
+            if score >= 48.0 or blocks >= 1024:
+                tile_target = 2
+            if score >= 96.0 or blocks >= 4096:
+                tile_target = 4
+            if score >= 160.0 or blocks >= 16384 or atomic_pressure >= 32768.0:
+                tile_target = 6
+            if score >= 256.0 or blocks >= 65536 or atomic_pressure >= 131072.0:
+                tile_target = 8
+            if score >= 384.0 or blocks >= 196608 or atomic_pressure >= 393216.0:
+                tile_target = 12
+            tile = max(1, min(int(tile_cap), int(tile_target)))
+            use_abtile = bool(tile > 1 and n_ab >= 6 and n_cd >= 2 and (blocks >= 1024 or atomic_pressure >= 4096.0))
+            if not use_abtile:
+                tile = 1
         job["n_spAB"] = int(n_ab)
         job["n_spCD"] = int(n_cd)
         job["blocks"] = int(blocks)
         job["work_est"] = int(work_est)
         job["score"] = float(score)
+        job["atomic_pressure"] = float(atomic_pressure)
         job["threads"] = int(threads)
         job["cd_tile"] = int(tile)
         job["use_abtile"] = bool(use_abtile)
@@ -332,6 +424,8 @@ def _build_df_3c_launch_jobs(
         job["job_id"] = int(i)
         job.pop("_npair_ab", None)
         job.pop("_npair_cd", None)
+    if cache_key is not None:
+        _put_cached_df_3c_jobs(cache_key, jobs)
     return jobs
 
 
@@ -731,6 +825,7 @@ class DFGradContractionContext:
                     "blocks": int(job["blocks"]),
                     "work_est": int(job["work_est"]),
                     "score": float(job["score"]),
+                    "atomic_pressure": float(job.get("atomic_pressure", job["blocks"])),
                     "threads": int(job["threads"]),
                     "split": bool(job["split"]),
                     "ab_bucket": int(job.get("ab_bucket", 0)),
@@ -763,6 +858,7 @@ class DFGradContractionContext:
                             "blocks": int(n_spab * n_spcd),
                             "work_est": int(n_spab * n_spcd),
                             "score": 0.0,
+                            "atomic_pressure": float(n_spab * n_spcd),
                             "threads": 256,
                             "split": False,
                             "ab_bucket": 0,
@@ -1035,6 +1131,7 @@ class DFGradContractionContext:
                             "n_spCD": int(nt),
                             "blocks": int(n_spAB * nt),
                             "work_est": int(n_spAB * nt),
+                            "atomic_pressure": float(n_spAB * nt),
                             "threads": int(threads),
                             "split": False,
                             "ab_bucket": 0,
@@ -1059,7 +1156,7 @@ class DFGradContractionContext:
             _n3c = 0
             _n3c_blocks = 0
             _per_lab: dict[tuple[int, int, int], tuple[float, int]] = {}
-            _job_times: list[tuple[float, int, int, int, int, int, int, str, int, int, int]] = []
+            _job_times: list[tuple[float, int, int, int, int, int, int, int, str, int, int, int]] = []
 
         has_abtile = hasattr(_ext, "df_int3c2e_deriv_contracted_cart_allsp_atomgrad_abtile_inplace_device")
         bar_is_f32 = cp.dtype(getattr(bar_X_dev, "dtype", cp.float64)) == cp.dtype(cp.float32)
@@ -1174,6 +1271,7 @@ class DFGradContractionContext:
                             "abtile" if use_abtile else "allsp",
                             int(cd_tile),
                             int(job.get("work_est", _blocks)),
+                            int(job.get("atomic_pressure", _blocks)),
                         )
                     )
 
@@ -1187,10 +1285,10 @@ class DFGradContractionContext:
                 print(f"  (la={la},lb={lb},lq={lq}): {dt:.4f}s  blocks={nb}")
             if _prof_jobs and _job_times:
                 print("[DF_3C_JOBS] top kernels by wall-time:")
-                for dt, jid, la, lb, lq, nab, ncd, thr, mode, tile, west in sorted(_job_times, key=lambda x: -x[0])[:24]:
+                for dt, jid, la, lb, lq, nab, ncd, thr, mode, tile, west, ap in sorted(_job_times, key=lambda x: -x[0])[:24]:
                     print(
                         f"  job={jid} (la={la},lb={lb},lq={lq}) mode={mode} tile={tile} "
-                        f"nAB={nab} nCD={ncd} threads={thr} work={west} dt={dt:.4f}s"
+                        f"nAB={nab} nCD={ncd} threads={thr} work={west} ap={ap} dt={dt:.4f}s"
                     )
 
         metric_mode = str(os.environ.get("ASUKA_DF_METRIC_2C_KERNEL", "auto")).strip().lower()
@@ -1354,6 +1452,7 @@ class DFGradContractionContext:
                             "n_spCD": int(nt),
                             "blocks": int(n_spAB * nt),
                             "work_est": int(n_spAB * nt),
+                            "atomic_pressure": float(n_spAB * nt),
                             "threads": int(threads),
                             "split": False,
                             "ab_bucket": 0,
@@ -1378,7 +1477,7 @@ class DFGradContractionContext:
             _n3c = 0
             _n3c_blocks = 0
             _per_lab: dict[tuple[int, int, int], tuple[float, int]] = {}
-            _job_times: list[tuple[float, int, int, int, int, int, int, int, str, int, int]] = []
+            _job_times: list[tuple[float, int, int, int, int, int, int, int, str, int, int, int]] = []
 
         has_abtile = hasattr(_ext, "df_int3c2e_deriv_contracted_cart_allsp_atomgrad_sphbar_qmn_abtile_inplace_device")
         for job in jobs_3c:
@@ -1496,6 +1595,7 @@ class DFGradContractionContext:
                             "abtile" if use_abtile else "allsp",
                             int(cd_tile),
                             int(job.get("work_est", _blocks)),
+                            int(job.get("atomic_pressure", _blocks)),
                         )
                     )
 
@@ -1509,10 +1609,10 @@ class DFGradContractionContext:
                 print(f"  (la={la},lb={lb},lq={lq}): {dt:.4f}s  blocks={nb}")
             if _prof_jobs and _job_times:
                 print("[DF_3C_JOBS] top kernels by wall-time:")
-                for dt, jid, la, lb, lq, nab, ncd, thr, mode, tile, west in sorted(_job_times, key=lambda x: -x[0])[:24]:
+                for dt, jid, la, lb, lq, nab, ncd, thr, mode, tile, west, ap in sorted(_job_times, key=lambda x: -x[0])[:24]:
                     print(
                         f"  job={jid} (la={la},lb={lb},lq={lq}) mode={mode} tile={tile} "
-                        f"nAB={nab} nCD={ncd} threads={thr} work={west} dt={dt:.4f}s"
+                        f"nAB={nab} nCD={ncd} threads={thr} work={west} ap={ap} dt={dt:.4f}s"
                     )
 
         # Metric 2c contribution (unchanged).

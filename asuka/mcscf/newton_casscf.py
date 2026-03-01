@@ -1203,6 +1203,44 @@ def _compute_ci_cc_matvec_block(
     return np.asarray(pack_ci_list(out_list) * 2.0, dtype=np.float64).ravel()
 
 
+def compute_mcscf_gradient_vector(
+    casscf: Any,
+    mo: np.ndarray,
+    ci0: Any,
+    eris: Any,
+    *,
+    weights: Sequence[float] | None = None,
+    gauge: str = "none",
+    strict_weights: bool = False,
+    enforce_absorb_h1e_direct: bool = True,
+) -> np.ndarray:
+    """Build the full Newton-CASSCF gradient vector ``g = [g_orb; g_ci]``.
+
+    This is a gradient-only path (no Hessian/matvec construction). It is useful
+    for Z-vector RHS construction where only ``g`` is needed.
+    """
+
+    g_orb = _compute_orb_grad_block_from_gpq(
+        casscf,
+        np.asarray(mo, dtype=np.float64),
+        ci0,
+        eris,
+        weights=weights,
+        strict_weights=bool(strict_weights),
+    )
+    g_ci, _ = _compute_ci_grad_and_diag_blocks(
+        casscf,
+        np.asarray(mo, dtype=np.float64),
+        ci0,
+        eris,
+        weights=weights,
+        gauge=str(gauge),
+        strict_weights=bool(strict_weights),
+        enforce_absorb_h1e_direct=bool(enforce_absorb_h1e_direct),
+    )
+    return np.asarray(np.concatenate([g_orb, g_ci]), dtype=np.float64).ravel()
+
+
 def _compute_ci_co_matvec_block(
     casscf: Any,
     mo: np.ndarray,
@@ -3666,9 +3704,10 @@ def gen_g_hop_orbital(
     # ── Precompute MO-basis 3-index DF integrals for fast block-selective JK ──
     import os as _os_ghop
     _L_t_gpu = None          # (nmo, naux, nmo)
-    _L_pq2d_act_gpu = None   # (ncas*nmo, naux)
-    _L_pq2d_core_gpu = None  # (ncore*nmo, naux)
+    _L_pq2d_act_gpu = None   # optional legacy materialized (ncas*nmo, naux)
+    _L_pq2d_core_gpu = None  # optional legacy materialized (ncore*nmo, naux)
     _use_mo_jk = False
+    _canonical_mo_df_layout = str(_os_ghop.environ.get("ASUKA_MO_JK_CANONICAL_LAYOUT", "1")).strip().lower() not in {"0", "false", "off", "no", "disable", "disabled"}
     if _os_ghop.environ.get("ASUKA_DISABLE_MO_JK", "0") != "1" and ncore > 0 and _cp is not None:
         _df_B_raw = getattr(casscf, "df_B", None)
         if _df_B_raw is not None:
@@ -3683,12 +3722,13 @@ def gen_g_hop_orbital(
                 _H_t = _cp.ascontiguousarray(_H.transpose(0, 2, 1))  # (nmo, naux, nao)
                 _L_t_gpu = (_H_t.reshape(nmo * _naux_B, _nao_B) @ _C_g).reshape(nmo, _naux_B, nmo)
                 _L_t_gpu = _cp.ascontiguousarray(_L_t_gpu)
-                _L_pq2d_act_gpu = _cp.ascontiguousarray(
-                    _L_t_gpu[ncore:nocc].transpose(0, 2, 1).reshape(ncas * nmo, _naux_B)
-                )
-                _L_pq2d_core_gpu = _cp.ascontiguousarray(
-                    _L_t_gpu[:ncore].transpose(0, 2, 1).reshape(ncore * nmo, _naux_B)
-                )
+                if not _canonical_mo_df_layout:
+                    _L_pq2d_act_gpu = _cp.ascontiguousarray(
+                        _L_t_gpu[ncore:nocc].transpose(0, 2, 1).reshape(ncas * nmo, _naux_B)
+                    )
+                    _L_pq2d_core_gpu = _cp.ascontiguousarray(
+                        _L_t_gpu[:ncore].transpose(0, 2, 1).reshape(ncore * nmo, _naux_B)
+                    )
                 del _H, _H_t, _B_g, _C_g
                 _use_mo_jk = True
             except Exception:
@@ -3781,13 +3821,22 @@ def gen_g_hop_orbital(
 
                 # J0: exploit sparse dm3 (only core↔rest nonzero)
                 rho0 = 2.0 * _xp.einsum("iQa,ia->Q", _L_t_gpu[:ncore, :, ncore:], x1_g[:ncore, ncore:], optimize=True)
-                J0_act = (_L_pq2d_act_gpu @ rho0).reshape(ncas, nmo)
+                if _canonical_mo_df_layout:
+                    J0_act = _xp.einsum("pQq,Q->pq", _L_t_gpu[ncore:nocc], rho0, optimize=True)
+                else:
+                    J0_act = (_L_pq2d_act_gpu @ rho0).reshape(ncas, nmo)
 
                 # J1: rho1 = 2*rho0 + rho_dm4
                 dm4_act = _casdm1_hop_g @ x1_g[ncore:nocc]
-                rho_dm4 = 2.0 * (_L_pq2d_act_gpu.T @ dm4_act.ravel())
+                if _canonical_mo_df_layout:
+                    rho_dm4 = 2.0 * _xp.einsum("pQq,pq->Q", _L_t_gpu[ncore:nocc], dm4_act, optimize=True)
+                else:
+                    rho_dm4 = 2.0 * (_L_pq2d_act_gpu.T @ dm4_act.ravel())
                 rho1 = 2.0 * rho0 + rho_dm4
-                J1_core = (_L_pq2d_core_gpu @ rho1).reshape(ncore, nmo)
+                if _canonical_mo_df_layout:
+                    J1_core = _xp.einsum("pQq,Q->pq", _L_t_gpu[:ncore], rho1, optimize=True)
+                else:
+                    J1_core = (_L_pq2d_core_gpu @ rho1).reshape(ncore, nmo)
 
                 x2_g[ncore:nocc] += _casdm1_hop_g @ (J0_act * 2.0 - K0_act)
                 x2_g[:ncore, ncore:] += (J1_core * 2.0 - K1_core)[:, ncore:]

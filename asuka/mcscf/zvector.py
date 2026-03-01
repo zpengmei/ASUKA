@@ -76,6 +76,15 @@ class MCSCFZVectorResult:
 
 
 @dataclass(frozen=True)
+class MCSCFZVectorBatchResult:
+    """Container for a batch of Z-vector solves."""
+
+    results: list[MCSCFZVectorResult]
+    order: list[int]
+    info: dict[str, Any]
+
+
+@dataclass(frozen=True)
 class MCSCFHessianOp:
     """Linear operator representation of the MCSCF/CASSCF super-Hessian.
 
@@ -127,6 +136,35 @@ class MCSCFHessianOp:
     @property
     def n_tot(self) -> int:
         return int(self.n_orb + self.n_ci)
+
+
+_SA_PRECOND_CACHE: dict[tuple[Any, ...], Callable[[Any], Any]] = {}
+_SA_PRECOND_CACHE_ORDER: list[tuple[Any, ...]] = []
+_SA_PRECOND_CACHE_MAX = 16
+
+
+def _sa_precond_cache_get(key: tuple[Any, ...]) -> Callable[[Any], Any] | None:
+    fn = _SA_PRECOND_CACHE.get(key)
+    if fn is None:
+        return None
+    try:
+        _SA_PRECOND_CACHE_ORDER.remove(key)
+    except ValueError:
+        pass
+    _SA_PRECOND_CACHE_ORDER.append(key)
+    return fn
+
+
+def _sa_precond_cache_put(key: tuple[Any, ...], fn: Callable[[Any], Any]) -> None:
+    _SA_PRECOND_CACHE[key] = fn
+    try:
+        _SA_PRECOND_CACHE_ORDER.remove(key)
+    except ValueError:
+        pass
+    _SA_PRECOND_CACHE_ORDER.append(key)
+    while len(_SA_PRECOND_CACHE_ORDER) > int(_SA_PRECOND_CACHE_MAX):
+        old = _SA_PRECOND_CACHE_ORDER.pop(0)
+        _SA_PRECOND_CACHE.pop(old, None)
 
 
 @contextmanager
@@ -1728,15 +1766,28 @@ def solve_mcscf_zvector(
         diag_use: np.ndarray | None = op.diag
         precond_use: Callable[[np.ndarray], np.ndarray] | None = None
         if op.is_sa and (not bool(op.orb_only)) and op.diag is not None and op.ci_ref_list is not None:
-            try:
-                precond_use = _build_sa_lagrange_precond(
-                    n_orb=int(op.n_orb),
-                    diag=np.asarray(op.diag, dtype=np.float64),
-                    ci_ref_list=op.ci_ref_list,
-                )
+            _sizes = tuple(int(np.asarray(c, dtype=np.float64).size) for c in op.ci_ref_list)
+            _cache_key = (
+                int(id(op.mv)),
+                int(id(op.diag)),
+                int(op.n_orb),
+                int(op.n_ci),
+                _sizes,
+            )
+            precond_use = _sa_precond_cache_get(_cache_key)
+            if precond_use is None:
+                try:
+                    precond_use = _build_sa_lagrange_precond(
+                        n_orb=int(op.n_orb),
+                        diag=np.asarray(op.diag, dtype=np.float64),
+                        ci_ref_list=op.ci_ref_list,
+                    )
+                    _sa_precond_cache_put(_cache_key, precond_use)
+                except Exception:
+                    precond_use = None
+            if precond_use is not None:
                 diag_use = None
-            except Exception:
-                precond_use = None
+            else:
                 diag_use = op.diag
 
         def _solve_gcrotmk_dispatch(b_vec: np.ndarray, x0_vec: np.ndarray | None):
@@ -1917,6 +1968,126 @@ def solve_mcscf_zvector(
             z_packed=np.asarray(z, dtype=np.float64).ravel(),
             info=info_out,
         )
+
+
+def solve_mcscf_zvector_batch(
+    mc,
+    *,
+    rhs_orb_list: Sequence[np.ndarray | None],
+    rhs_ci_list: Sequence[Any | None],
+    mo_coeff: np.ndarray | None = None,
+    ci: Any | None = None,
+    eris: Any | None = None,
+    casdm1: np.ndarray | None = None,
+    casdm2: np.ndarray | None = None,
+    tol: float = 1e-10,
+    maxiter: int = 200,
+    use_newton_hessian: bool | None = True,
+    restart: int | None = None,
+    x0_list: Sequence[np.ndarray | None] | None = None,
+    method: str = "gcrotmk",
+    gcrotmk_k: int | None = None,
+    recycle_space: list[tuple[np.ndarray | None, np.ndarray]] | None = None,
+    hessian_op: MCSCFHessianOp | None = None,
+    enforce_absorb_h1e_direct: bool = True,
+    project_sa_rhs: bool = True,
+    auto_rdm_backend_cuda: bool = True,
+    rdm_cuda_threshold_ncsf: int = 4096,
+    reorder: str = "norm_desc",
+    shared_recycle: bool = True,
+    chain_x0: bool = True,
+) -> MCSCFZVectorBatchResult:
+    """Solve a batch of Z-vector systems with shared Krylov state.
+
+    Notes
+    -----
+    This is currently a serial batched dispatcher that shares GCROTMK recycle
+    space and optional x0 chaining across RHS vectors. It is designed as the
+    integration point for future true block-Krylov implementations.
+    """
+
+    n_rhs = int(len(rhs_orb_list))
+    if int(len(rhs_ci_list)) != n_rhs:
+        raise ValueError("rhs_orb_list/rhs_ci_list length mismatch")
+    if n_rhs <= 0:
+        return MCSCFZVectorBatchResult(results=[], order=[], info={"n_rhs": 0, "solver": str(method).strip().lower()})
+
+    if x0_list is not None and int(len(x0_list)) != n_rhs:
+        raise ValueError("x0_list length mismatch")
+
+    norms: list[float] = []
+    for rhs in rhs_orb_list:
+        arr = np.asarray(np.zeros(0, dtype=np.float64) if rhs is None else rhs, dtype=np.float64).ravel()
+        norms.append(float(np.linalg.norm(arr)))
+
+    reorder_l = str(reorder).strip().lower()
+    order = list(range(n_rhs))
+    if reorder_l in ("norm_desc", "rhs_norm_desc", "desc"):
+        order = sorted(order, key=lambda i: -float(norms[i]))
+    elif reorder_l in ("norm_asc", "rhs_norm_asc", "asc"):
+        order = sorted(order, key=lambda i: float(norms[i]))
+
+    method_l = str(method).strip().lower()
+    use_shared_recycle = bool(shared_recycle) and method_l == "gcrotmk"
+    shared_space = recycle_space if use_shared_recycle else None
+
+    results: list[MCSCFZVectorResult | None] = [None] * n_rhs
+    x0_chain: np.ndarray | None = None
+    t0 = time.perf_counter()
+    total_matvec = 0
+    total_iter = 0
+
+    for pos, idx in enumerate(order):
+        x0_use = None
+        if x0_list is not None and x0_list[idx] is not None:
+            x0_use = np.asarray(x0_list[idx], dtype=np.float64).ravel()
+        elif bool(chain_x0) and x0_chain is not None:
+            x0_use = np.asarray(x0_chain, dtype=np.float64).ravel()
+
+        res = solve_mcscf_zvector(
+            mc,
+            mo_coeff=mo_coeff,
+            ci=ci,
+            rhs_orb=rhs_orb_list[idx],
+            rhs_ci=rhs_ci_list[idx],
+            eris=eris,
+            casdm1=casdm1,
+            casdm2=casdm2,
+            tol=float(tol),
+            maxiter=int(maxiter),
+            use_newton_hessian=use_newton_hessian,
+            restart=restart,
+            x0=x0_use,
+            method=method_l,
+            gcrotmk_k=gcrotmk_k,
+            recycle_space=shared_space,
+            hessian_op=hessian_op,
+            enforce_absorb_h1e_direct=bool(enforce_absorb_h1e_direct),
+            project_sa_rhs=bool(project_sa_rhs),
+            auto_rdm_backend_cuda=bool(auto_rdm_backend_cuda),
+            rdm_cuda_threshold_ncsf=int(rdm_cuda_threshold_ncsf),
+        )
+        results[idx] = res
+        if bool(chain_x0):
+            x0_chain = np.asarray(res.z_packed, dtype=np.float64).ravel()
+        total_matvec += int(res.info.get("matvec_calls", 0) or 0)
+        total_iter += int(res.info.get("niter", 0) or 0)
+
+    out = [r for r in results if r is not None]
+    if len(out) != n_rhs:  # pragma: no cover
+        raise RuntimeError("internal error: incomplete zvector batch solve")
+
+    info = {
+        "n_rhs": int(n_rhs),
+        "order": [int(i) for i in order],
+        "solver": method_l,
+        "shared_recycle": bool(use_shared_recycle),
+        "chain_x0": bool(chain_x0),
+        "total_matvec_calls": int(total_matvec),
+        "total_niter": int(total_iter),
+        "total_solve_time_s": float(time.perf_counter() - t0),
+    }
+    return MCSCFZVectorBatchResult(results=out, order=[int(i) for i in order], info=info)
 
 
 def build_ci_gradient_from_effective_integrals(

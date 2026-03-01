@@ -23,6 +23,7 @@ Limitations (current)
 
 from dataclasses import dataclass
 from typing import Any, Sequence
+import os
 import time
 import math
 
@@ -48,6 +49,97 @@ from .uhf_guess import spatialize_uhf_mo_coeff
 
 def _as_xp_f64(xp, a):
     return xp.asarray(a, dtype=xp.float64)
+
+
+def _normalize_bool_env(value: str | None, *, default: bool) -> bool:
+    if value is None:
+        return bool(default)
+    sval = str(value).strip().lower()
+    if sval in {"1", "true", "yes", "on", "enable", "enabled"}:
+        return True
+    if sval in {"0", "false", "no", "off", "disable", "disabled"}:
+        return False
+    return bool(default)
+
+
+def _normalize_casscf_vram_policy(value: str | None) -> str:
+    mode = str(value or "auto").strip().lower()
+    if mode in {"", "auto"}:
+        return "auto"
+    if mode in {"off", "0", "false", "no", "disable", "disabled"}:
+        return "off"
+    if mode in {"aggressive", "tight", "low"}:
+        return "aggressive"
+    return "auto"
+
+
+def _apply_casscf_cuda_pool_policy(*, probe: Any, label: str = ""):
+    policy = _normalize_casscf_vram_policy(os.environ.get("ASUKA_CASSCF_VRAM_POLICY"))
+    post_flush = _normalize_bool_env(os.environ.get("ASUKA_CASSCF_POST_FLUSH"), default=True)
+    if policy == "off" and not post_flush:
+        return lambda: None
+    try:
+        import cupy as cp  # noqa: PLC0415
+    except Exception:
+        return lambda: None
+    if probe is None or not isinstance(probe, cp.ndarray):
+        return lambda: None
+
+    pool = cp.get_default_memory_pool()
+    old_limit: int | None
+    try:
+        old_limit = int(pool.get_limit())
+    except Exception:
+        old_limit = None
+
+    limit_b = 0
+    if policy != "off":
+        limit_env = os.environ.get("ASUKA_CASSCF_POOL_LIMIT_GB")
+        if limit_env:
+            try:
+                limit_b = max(1, int(float(limit_env) * 1024**3))
+            except Exception:
+                limit_b = 0
+        else:
+            try:
+                free_b, total_b = cp.cuda.runtime.memGetInfo()
+                free_b = int(free_b)
+                total_b = int(total_b)
+                used_b = max(0, total_b - free_b)
+            except Exception:
+                free_b = 0
+                total_b = 0
+                used_b = 0
+            probe_b = int(getattr(probe, "nbytes", 0))
+            if policy == "aggressive":
+                floor_b = int(0.55 * total_b) if total_b > 0 else int(2 * 1024**3)
+                ceil_b = int(0.85 * total_b) if total_b > 0 else int(6 * 1024**3)
+                slack_b = max(int(4 * max(1, probe_b)), int(3 * 1024**3))
+            else:
+                floor_b = int(0.68 * total_b) if total_b > 0 else int(3 * 1024**3)
+                ceil_b = int(0.92 * total_b) if total_b > 0 else int(8 * 1024**3)
+                slack_b = max(int(6 * max(1, probe_b)), int(5 * 1024**3))
+            limit_b = max(floor_b, min(ceil_b, used_b + slack_b))
+        if limit_b > 0:
+            try:
+                pool.set_limit(size=int(limit_b))
+                if _normalize_bool_env(os.environ.get("ASUKA_VRAM_DEBUG"), default=False):
+                    print(f"[VRAM_POLICY] {label}: policy={policy} limit={float(limit_b)/1e9:.2f}GB")
+            except Exception:
+                pass
+
+    restore_limit = _normalize_bool_env(os.environ.get("ASUKA_CASSCF_RESTORE_POOL_LIMIT"), default=True)
+
+    def _restore() -> None:
+        try:
+            if post_flush:
+                pool.free_all_blocks()
+            if restore_limit and old_limit is not None:
+                pool.set_limit(size=int(old_limit))
+        except Exception:
+            pass
+
+    return _restore
 
 
 def _infer_max_l_from_ao_basis(ao_basis: Any) -> int:
@@ -695,6 +787,7 @@ def run_casscf_df(
     _xp_probe = scf_out.df_B if scf_out.df_B is not None else getattr(scf_out, "ao_eri", C)
     xp, _is_gpu = _df_scf._get_xp(_xp_probe, C)  # noqa: SLF001
     C = _as_xp_f64(xp, C)
+    _restore_cuda_pool = _apply_casscf_cuda_pool_policy(probe=_xp_probe, label="run_casscf_df")
 
     # Optionally scramble frontier virtual orbitals to avoid local minima.
     # With diffuse basis sets (aug-/jun-cc-pVXZ), the lowest HF virtuals are
@@ -1968,7 +2061,7 @@ def run_casscf_df(
             C = C_np[:, perm] if xp is np else xp.asarray(C_np[:, perm], dtype=xp.float64)
             mo_energy = eps_cas[perm]
 
-    return CASSCFResult(
+    result = CASSCFResult(
         mol=scf_out.mol,
         basis_name=str(scf_out.basis_name),
         auxbasis_name=str(scf_out.auxbasis_name),
@@ -1990,6 +2083,8 @@ def run_casscf_df(
         profile=profile,
         scf_out=scf_out,
     )
+    _restore_cuda_pool()
+    return result
 
 
 def run_casscf_dense_cpu(

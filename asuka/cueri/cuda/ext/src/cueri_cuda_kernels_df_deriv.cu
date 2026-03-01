@@ -32,6 +32,8 @@ constexpr int kMaxWarpsPerBlock = 8;  // threads <= 256
 // Cache small DF tiles of bar_X / bar_V in shared memory when nElem is modest.
 // This substantially reduces redundant global loads across primitive+root loops.
 constexpr int kBarCacheMax = 1024;
+// Aggregate C-center atom updates per block before global atomic flush.
+constexpr int kAtomAggMax = 64;
 
 __device__ __forceinline__ int ncart(int l) { return ((l + 1) * (l + 2)) >> 1; }
 __device__ __forceinline__ int nsph(int l) { return (l << 1) + 1; }
@@ -1271,8 +1273,8 @@ __global__ void KernelDFInt3c2eDerivContractedCartAllSPAtomGradABTile(
   __shared__ double sh_Gz[kMaxWarpsPerBlock][kGSizeD];
   __shared__ double sh_warp_sum[kMaxWarpsPerBlock][9];
   __shared__ double sh_bar[kBarCacheMax];
-  __shared__ int sh_atomC_agg[16];
-  __shared__ double sh_sumC_agg[16][3];
+  __shared__ int sh_atomC_agg[kAtomAggMax];
+  __shared__ double sh_sumC_agg[kAtomAggMax][3];
   __shared__ int sh_n_atomC_agg;
 
   const int nA = ncart(la);
@@ -1573,14 +1575,14 @@ __global__ void KernelDFInt3c2eDerivContractedCartAllSPAtomGradABTile(
       const int atomC = static_cast<int>(shell_atom[shellC]);
       int slot = -1;
 #pragma unroll
-      for (int u = 0; u < 16; ++u) {
+      for (int u = 0; u < kAtomAggMax; ++u) {
         if (u >= sh_n_atomC_agg) break;
         if (sh_atomC_agg[u] == atomC) {
           slot = u;
           break;
         }
       }
-      if (slot < 0 && sh_n_atomC_agg < 16) {
+      if (slot < 0 && sh_n_atomC_agg < kAtomAggMax) {
         slot = sh_n_atomC_agg;
         sh_atomC_agg[slot] = atomC;
         sh_sumC_agg[slot][0] = 0.0;
@@ -1667,8 +1669,8 @@ __global__ void KernelDFInt3c2eDerivContractedCartAllSPAtomGradSphBarQmnABTile(
   __shared__ double sh_Gz[kMaxWarpsPerBlock][kGSizeD];
   __shared__ double sh_warp_sum[kMaxWarpsPerBlock][9];
   __shared__ double sh_bar[kBarCacheMax];
-  __shared__ int sh_atomC_agg[16];
-  __shared__ double sh_sumC_agg[16][3];
+  __shared__ int sh_atomC_agg[kAtomAggMax];
+  __shared__ double sh_sumC_agg[kAtomAggMax][3];
   __shared__ int sh_n_atomC_agg;
 
   const int nA = ncart(la);
@@ -1964,14 +1966,14 @@ __global__ void KernelDFInt3c2eDerivContractedCartAllSPAtomGradSphBarQmnABTile(
       const int atomC = static_cast<int>(shell_atom[shellC]);
       int slot = -1;
 #pragma unroll
-      for (int u = 0; u < 16; ++u) {
+      for (int u = 0; u < kAtomAggMax; ++u) {
         if (u >= sh_n_atomC_agg) break;
         if (sh_atomC_agg[u] == atomC) {
           slot = u;
           break;
         }
       }
-      if (slot < 0 && sh_n_atomC_agg < 16) {
+      if (slot < 0 && sh_n_atomC_agg < kAtomAggMax) {
         slot = sh_n_atomC_agg;
         sh_atomC_agg[slot] = atomC;
         sh_sumC_agg[slot][0] = 0.0;
