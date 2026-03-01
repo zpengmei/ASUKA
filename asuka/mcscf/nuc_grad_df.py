@@ -2289,6 +2289,10 @@ def casscf_nuc_grad_df_per_root(
     if bool(_is_gpu):
         _apply_gpu_runtime_config_to_solver(fcisolver_use, _gpu_runtime_cfg)
     _restore_pool = _apply_df_pool_policy(B_ao, label="casscf_nuc_grad_df_per_root")
+    _preflush_grad_pool = _normalize_bool_env(_os.environ.get("ASUKA_DF_GRAD_PRE_FLUSH"), default=True)
+    if bool(_is_gpu) and bool(_preflush_grad_pool):
+        _flush_gpu_pool()
+        _log_vram("casscf_nuc_grad_df_per_root.preflush")
     _barl_policy = _resolve_barl_hybrid(
         xp=xp,
         is_gpu=bool(_is_gpu),

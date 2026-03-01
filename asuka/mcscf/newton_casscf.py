@@ -3665,8 +3665,9 @@ def gen_g_hop_orbital(
 
     # ── Precompute MO-basis 3-index DF integrals for fast block-selective JK ──
     import os as _os_ghop
-    _L_pq_gpu = None   # (nmo, nmo, naux)
-    _L_t_gpu = None     # (nmo, naux, nmo)
+    _L_t_gpu = None          # (nmo, naux, nmo)
+    _L_pq2d_act_gpu = None   # (ncas*nmo, naux)
+    _L_pq2d_core_gpu = None  # (ncore*nmo, naux)
     _use_mo_jk = False
     if _os_ghop.environ.get("ASUKA_DISABLE_MO_JK", "0") != "1" and ncore > 0 and _cp is not None:
         _df_B_raw = getattr(casscf, "df_B", None)
@@ -3682,7 +3683,12 @@ def gen_g_hop_orbital(
                 _H_t = _cp.ascontiguousarray(_H.transpose(0, 2, 1))  # (nmo, naux, nao)
                 _L_t_gpu = (_H_t.reshape(nmo * _naux_B, _nao_B) @ _C_g).reshape(nmo, _naux_B, nmo)
                 _L_t_gpu = _cp.ascontiguousarray(_L_t_gpu)
-                _L_pq_gpu = _cp.ascontiguousarray(_L_t_gpu.transpose(0, 2, 1))
+                _L_pq2d_act_gpu = _cp.ascontiguousarray(
+                    _L_t_gpu[ncore:nocc].transpose(0, 2, 1).reshape(ncas * nmo, _naux_B)
+                )
+                _L_pq2d_core_gpu = _cp.ascontiguousarray(
+                    _L_t_gpu[:ncore].transpose(0, 2, 1).reshape(ncore * nmo, _naux_B)
+                )
                 del _H, _H_t, _B_g, _C_g
                 _use_mo_jk = True
             except Exception:
@@ -3759,7 +3765,7 @@ def gen_g_hop_orbital(
                 dm4_h[ncore:nocc, :] = _casdm1_hop_g @ x1_g[ncore:nocc, :]
                 dm_total = dm3 * 2.0 + dm4_h + dm4_h.T
 
-                _naux = int(_L_pq_gpu.shape[2])
+                _naux = int(_L_t_gpu.shape[1])
                 L_t_2d = _L_t_gpu.reshape(nmo, _naux * nmo)
                 L_t_act_flat = _L_t_gpu[ncore:nocc].reshape(ncas * _naux, nmo)
                 L_t_core_flat = _L_t_gpu[:ncore].reshape(ncore * _naux, nmo)
@@ -3774,18 +3780,14 @@ def gen_g_hop_orbital(
                 K1_core = K_cat[ncas:]                           # (ncore, nmo)
 
                 # J0: exploit sparse dm3 (only core↔rest nonzero)
-                rho0 = 2.0 * _xp.einsum("iaQ,ia->Q", _L_pq_gpu[:ncore, ncore:],
-                                         x1_g[:ncore, ncore:])
-                J0_act = (_L_pq_gpu[ncore:nocc].reshape(ncas * nmo, _naux) @ rho0
-                          ).reshape(ncas, nmo)
+                rho0 = 2.0 * _xp.einsum("iQa,ia->Q", _L_t_gpu[:ncore, :, ncore:], x1_g[:ncore, ncore:], optimize=True)
+                J0_act = (_L_pq2d_act_gpu @ rho0).reshape(ncas, nmo)
 
                 # J1: rho1 = 2*rho0 + rho_dm4
                 dm4_act = _casdm1_hop_g @ x1_g[ncore:nocc]
-                rho_dm4 = 2.0 * (_L_pq_gpu[ncore:nocc].reshape(ncas * nmo, _naux).T
-                                 @ dm4_act.ravel())
+                rho_dm4 = 2.0 * (_L_pq2d_act_gpu.T @ dm4_act.ravel())
                 rho1 = 2.0 * rho0 + rho_dm4
-                J1_core = (_L_pq_gpu[:ncore].reshape(ncore * nmo, _naux) @ rho1
-                           ).reshape(ncore, nmo)
+                J1_core = (_L_pq2d_core_gpu @ rho1).reshape(ncore, nmo)
 
                 x2_g[ncore:nocc] += _casdm1_hop_g @ (J0_act * 2.0 - K0_act)
                 x2_g[:ncore, ncore:] += (J1_core * 2.0 - K1_core)[:, ncore:]
