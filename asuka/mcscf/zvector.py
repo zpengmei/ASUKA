@@ -34,6 +34,7 @@ Design notes
 
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
+import inspect
 from typing import Any, Callable, Sequence
 
 import numpy as np
@@ -627,13 +628,26 @@ def _gmres_solve_gpu(
 
     t_solve0 = time.perf_counter()
     # CuPy GMRES: all iterations on GPU, zero sync.
+    gmres_kwargs: dict[str, Any] = {
+        "x0": x0_d,
+        "maxiter": int(maxiter),
+        "restart": int(restart_val),
+        "M": M,
+    }
+    try:
+        _gmres_params = inspect.signature(cu_gmres).parameters
+    except Exception:
+        _gmres_params = {}
+    if "rtol" in _gmres_params:
+        gmres_kwargs["rtol"] = float(tol)
+        gmres_kwargs["atol"] = 0.0
+    else:
+        gmres_kwargs["tol"] = float(tol)
+
     x_d, info = cu_gmres(
-        A, b_d,
-        x0=x0_d,
-        tol=float(tol),
-        maxiter=int(maxiter),
-        restart=int(restart_val),
-        M=M,
+        A,
+        b_d,
+        **gmres_kwargs,
     )
     solve_time = time.perf_counter() - t_solve0
 

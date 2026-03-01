@@ -234,6 +234,7 @@ class build_ext(_build_ext):
         subprocess.check_call([sys.executable, "-m", "asuka.build.guga_cuda_ext"], cwd=repo_root, env=env)
         subprocess.check_call([sys.executable, "-m", "asuka.build.guga_cuda_linalg_ext"], cwd=repo_root, env=env)
         subprocess.check_call([sys.executable, "-m", "asuka.build.caspt2_cuda_ext"], cwd=repo_root, env=env)
+        subprocess.check_call([sys.executable, "-m", "asuka.build.hf_df_jk_cuda_ext"], cwd=repo_root, env=env)
 
         cueri_build_dir = os.path.join(build_temp, "cueri_cuda_ext")
         subprocess.check_call(

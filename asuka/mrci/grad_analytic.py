@@ -125,9 +125,12 @@ def mrci_grad_states_from_ref_analytic(
     from asuka.mcscf.newton_df import DFNewtonCASSCFAdapter  # noqa: PLC0415
     from asuka.mcscf.nuc_grad_df import (  # noqa: PLC0415
         _apply_df_pool_policy,
+        _as_xp_f64,
         _build_bar_L_casscf_df,
         _build_gfock_casscf_df,
         _mol_coords_charges_bohr,
+        _resolve_barl_hybrid,
+        _resolve_xp,
     )
     from asuka.mcscf.state_average import (  # noqa: PLC0415
         ci_as_list,
@@ -195,6 +198,23 @@ def mrci_grad_states_from_ref_analytic(
     if h_ao is None:
         raise ValueError("scf_out.int1e.hcore is required")
     _restore_pool = _apply_df_pool_policy(B_ao, label="mrci_grad_states_from_ref_analytic")
+    xp, _is_gpu = _resolve_xp(str(df_backend))
+    B_ao_x = _as_xp_f64(xp, B_ao)
+    h_ao_x = _as_xp_f64(xp, h_ao)
+    C_full_x = _as_xp_f64(xp, C_full)
+    _barl_policy = _resolve_barl_hybrid(
+        xp=xp,
+        is_gpu=bool(_is_gpu),
+        naux_hint=int(getattr(B_ao_x, "shape", (0, 0, 1))[2]),
+    )
+    if bool(_barl_policy.get("enabled", False)):
+        _barl_work_dtype = _barl_policy.get("work_dtype", xp.float64)
+        _barl_out_dtype = _barl_policy.get("out_dtype", xp.float64)
+        _barl_qblock = int(_barl_policy.get("qblock", 0))
+    else:
+        _barl_work_dtype = xp.float64
+        _barl_out_dtype = xp.float64
+        _barl_qblock = 0
     B_ao_np = _asnumpy_f64(B_ao)
     h_ao_np = _asnumpy_f64(h_ao)
 
@@ -282,9 +302,9 @@ def mrci_grad_states_from_ref_analytic(
 
         # Build target generalized Fock + densities treating correlated orbitals as "active".
         gfock, D_core_ao, D_corr_ao, D_tot_ao, C_corr = _build_gfock_casscf_df(
-            B_ao_np,
-            h_ao_np,
-            C_full,
+            B_ao_x,
+            h_ao_x,
+            C_full_x,
             ncore=int(ncore_frozen),
             ncas=int(ncor),
             dm1_act=dm1_corr,
@@ -293,11 +313,14 @@ def mrci_grad_states_from_ref_analytic(
 
         # Unrelaxed DF 2e derivative term via bar_L (core mean-field + corr 2-RDM).
         bar_L_target = _build_bar_L_casscf_df(
-            B_ao_np,
-            D_core_ao=_asnumpy_f64(D_core_ao),
-            D_act_ao=_asnumpy_f64(D_corr_ao),
-            C_act=_asnumpy_f64(C_corr),
+            B_ao_x,
+            D_core_ao=D_core_ao,
+            D_act_ao=D_corr_ao,
+            C_act=C_corr,
             dm2_act=dm2_corr,
+            work_dtype=_barl_work_dtype,
+            out_dtype=_barl_out_dtype,
+            qblock=_barl_qblock,
         )
 
         # Pulay term uses energy-weighted density W from gfock.
@@ -346,28 +369,37 @@ def mrci_grad_states_from_ref_analytic(
 
         # Response DF pieces (no Pulay / no nuclear term).
         bar_L_lci_net, D_act_lci = _build_bar_L_net_active_df(
-            B_ao_np,
-            C_full,
+            B_ao_x,
+            C_full_x,
             dm1_lci,
             dm2_lci,
             ncore=int(ncore_ref),
             ncas=int(ncas_ref),
-            xp=np,
+            xp=xp,
+            work_dtype=_barl_work_dtype,
+            out_dtype=_barl_out_dtype,
+            qblock=_barl_qblock,
         )
         bar_L_lorb, D_L_lorb = _build_bar_L_lorb_df(
-            B_ao_np,
-            C_full,
+            B_ao_x,
+            C_full_x,
             np.asarray(Lorb, dtype=np.float64),
             dm1_sa,
             dm2_sa,
             ncore=int(ncore_ref),
             ncas=int(ncas_ref),
-            xp=np,
+            xp=xp,
+            work_dtype=_barl_work_dtype,
+            out_dtype=_barl_out_dtype,
+            qblock=_barl_qblock,
         )
 
-        bar_L_total = np.asarray(bar_L_target, dtype=np.float64, order="C")
-        bar_L_total += _asnumpy_f64(bar_L_lci_net)
-        bar_L_total += _asnumpy_f64(bar_L_lorb)
+        bar_L_total = xp.asarray(bar_L_target, dtype=_barl_out_dtype)
+        bar_L_total += xp.asarray(bar_L_lci_net, dtype=_barl_out_dtype)
+        bar_L_total += xp.asarray(bar_L_lorb, dtype=_barl_out_dtype)
+        bar_L_contract = bar_L_total
+        if str(getattr(bar_L_contract, "dtype", "")) != str(np.float64):
+            bar_L_contract = xp.asarray(bar_L_contract, dtype=xp.float64)
         del bar_L_target, bar_L_lci_net, bar_L_lorb
         D_h1_total = _asnumpy_f64(D_tot_ao)
         D_h1_total += _asnumpy_f64(D_act_lci)
@@ -377,14 +409,14 @@ def mrci_grad_states_from_ref_analytic(
         # DF 2e gradient contraction (analytic preferred; fallback to FD-on-B).
         try:
             if df_grad_ctx is not None:
-                de_df = df_grad_ctx.contract(B_ao=B_ao_np, bar_L_ao=bar_L_total)
+                de_df = df_grad_ctx.contract(B_ao=B_ao_x, bar_L_ao=bar_L_contract)
             else:
                 de_df = compute_df_gradient_contributions_analytic_packed_bases(
                     ao_basis,
                     aux_basis,
                     atom_coords_bohr=coords,
-                    B_ao=B_ao_np,
-                    bar_L_ao=bar_L_total,
+                    B_ao=B_ao_x,
+                    bar_L_ao=bar_L_contract,
                     L_chol=getattr(scf_out, "df_L", None),
                     backend=str(df_backend),
                     df_threads=int(df_threads),
@@ -395,7 +427,7 @@ def mrci_grad_states_from_ref_analytic(
                 ao_basis,
                 aux_basis,
                 atom_coords_bohr=coords,
-                bar_L_ao=bar_L_total,
+                bar_L_ao=bar_L_contract,
                 backend=str(df_backend),
                 df_config=df_config,
                 df_threads=int(df_threads),

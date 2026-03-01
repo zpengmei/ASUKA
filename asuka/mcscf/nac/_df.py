@@ -39,6 +39,8 @@ from asuka.mcscf.nuc_grad_df import (
     _build_bar_L_casscf_df,
     _build_bar_L_df_cross,
     _build_gfock_casscf_df,
+    _barl_coulomb_add_inplace,
+    _resolve_barl_hybrid,
     _resolve_xp,
     _as_xp_f64,
     _apply_df_pool_policy,
@@ -269,6 +271,11 @@ def _build_bar_L_net_active_df(
     xp: Any,
     L_act: Any | None = None,
     rho_core: Any | None = None,
+    out: Any | None = None,
+    symmetrize: bool = True,
+    work_dtype: Any | None = None,
+    out_dtype: Any | None = None,
+    qblock: int | None = None,
 ) -> tuple[Any, Any]:
     """Return (bar_L_net, D_act_ao) for the active DF gradient contribution.
 
@@ -291,53 +298,68 @@ def _build_bar_L_net_active_df(
     nocc = ncore + ncas
     nao = int(C.shape[0])
 
-    C = xp.asarray(C, dtype=xp.float64)
+    _wd = xp.float64 if work_dtype is None else work_dtype
+    _od = xp.float64 if out_dtype is None else out_dtype
+    C = xp.asarray(C, dtype=_wd)
     C_core = C[:, :ncore]
     C_act = C[:, ncore:nocc]
-    D_core_ao = 2.0 * (C_core @ C_core.T) if ncore else xp.zeros((nao, nao), dtype=xp.float64)
-    dm1 = xp.asarray(dm1_act, dtype=xp.float64)
+    D_core_ao = 2.0 * (C_core @ C_core.T) if ncore else xp.zeros((nao, nao), dtype=_wd)
+    dm1 = xp.asarray(dm1_act, dtype=_wd)
     D_act_ao = C_act @ dm1 @ C_act.T
 
     # Weighted density and net offset (both nao×nao — negligible VRAM).
     D_w = D_act_ao + 0.5 * D_core_ao
     D_ah = D_w - D_core_ao  # = D_act - 0.5*D_core
 
-    B_ao = xp.asarray(B_ao, dtype=xp.float64)
+    B_ao = xp.asarray(B_ao, dtype=_wd)
     nao_b, _, naux = map(int, B_ao.shape)
     B2 = B_ao.reshape(nao * nao, naux)
     if rho_core is None:
         rho = B2.T @ D_core_ao.reshape(nao * nao)  # (naux,)
     else:
-        rho = xp.asarray(rho_core, dtype=xp.float64)
+        rho = xp.asarray(rho_core, dtype=_wd)
     sigma_w = B2.T @ D_w.reshape(nao * nao)  # (naux,)
+
+    if out is None:
+        bar_net = xp.zeros((naux, nao, nao), dtype=_od)
+    else:
+        bar_net = xp.asarray(out, dtype=_od)
+        if bar_net.shape != (naux, nao, nao):
+            raise ValueError("out shape mismatch")
 
     # --- Net Coulomb: sigma_w * D_core + rho * D_ah ---
     _log_vram("  net_active_fused: before net Coulomb")
-    bar_net = sigma_w[:, None, None] * D_core_ao[None, :, :]
-    bar_net += rho[:, None, None] * D_ah[None, :, :]
+    _barl_coulomb_add_inplace(
+        bar_net,
+        a_Q=sigma_w,
+        M1_mn=D_core_ao,
+        b_Q=rho,
+        M2_mn=D_ah,
+        xp=xp,
+    )
     _log_vram("  net_active_fused: after net Coulomb")
 
     # --- Net Exchange (chunked): -0.5*(D_core @ BQ @ D_ah + D_w @ BQ @ D_core) ---
     if ncore:
         BQ = xp.transpose(B_ao, (2, 0, 1))  # (naux,nao,nao) view
-        _chunk = max(1, naux // 4)
+        _chunk = int(max(1, qblock if qblock is not None else (naux // 4)))
         for _q0 in range(0, naux, _chunk):
             _q1 = min(_q0 + _chunk, naux)
             _bq = BQ[_q0:_q1]
             _t = xp.matmul(xp.matmul(D_core_ao[None, :, :], _bq), D_ah)
             _t += xp.matmul(xp.matmul(D_w[None, :, :], _bq), D_core_ao)
             _t *= -0.5
-            bar_net[_q0:_q1] += _t
+            bar_net[_q0:_q1] += _t.astype(_od, copy=False)
             del _t
     _log_vram("  net_active_fused: after net exchange")
 
     # --- Active 2-RDM term (identical to _build_bar_L_casscf_df) ---
-    dm2_arr = xp.asarray(dm2_act, dtype=xp.float64)
+    dm2_arr = xp.asarray(dm2_act, dtype=_wd)
     if L_act is None:
         X = xp.einsum("mnQ,nv->mvQ", B_ao, C_act, optimize=True)
         L_act_val = xp.einsum("mu,mvQ->uvQ", C_act, X, optimize=True)
     else:
-        L_act_val = xp.asarray(L_act, dtype=xp.float64)
+        L_act_val = xp.asarray(L_act, dtype=_wd)
 
     L2 = L_act_val.reshape(ncas * ncas, naux)
     dm2_flat = dm2_arr.reshape(ncas * ncas, ncas * ncas)
@@ -347,17 +369,20 @@ def _build_bar_L_net_active_df(
 
     tmp = xp.einsum("mu,uvQ->mvQ", C_act, M_uvQ, optimize=True)
     # Accumulate bar_act into bar_net in chunks to avoid sizeof_B temporary.
-    _chunk = max(1, naux // 4)
+    _chunk = int(max(1, qblock if qblock is not None else (naux // 4)))
     for _q0 in range(0, naux, _chunk):
         _q1 = min(_q0 + _chunk, naux)
-        bar_net[_q0:_q1] += xp.einsum("mvQ,nv->Qmn", tmp[:, :, _q0:_q1], C_act, optimize=True)
+        _blk = xp.einsum("mvQ,nv->Qmn", tmp[:, :, _q0:_q1], C_act, optimize=True)
+        bar_net[_q0:_q1] += _blk.astype(_od, copy=False)
+        del _blk
     del tmp
     _log_vram("  net_active_fused: after bar_act")
 
     # --- Symmetrize in-place ---
-    _symmetrize_bar_L_inplace(bar_net, xp)
-    _log_vram("  net_active_fused: after sym")
-    return xp.asarray(bar_net, dtype=xp.float64), D_act_ao
+    if bool(symmetrize):
+        _symmetrize_bar_L_inplace(bar_net, xp)
+        _log_vram("  net_active_fused: after sym")
+    return xp.asarray(bar_net, dtype=_od), xp.asarray(D_act_ao, dtype=xp.float64)
 
 
 def _build_bar_L_lorb_df(
@@ -370,6 +395,11 @@ def _build_bar_L_lorb_df(
     ncore: int,
     ncas: int,
     xp: Any,
+    out: Any | None = None,
+    symmetrize: bool = True,
+    work_dtype: Any | None = None,
+    out_dtype: Any | None = None,
+    qblock: int | None = None,
 ) -> tuple[Any, Any]:
     """Return (bar_L_lorb, D_L_ao) for the orbital Lagrange DF gradient contribution.
 
@@ -385,9 +415,13 @@ def _build_bar_L_lorb_df(
     nocc = ncore + ncas
     nao = int(C.shape[0])
 
-    L = xp.asarray(Lorb, dtype=xp.float64)
-    dm1 = xp.asarray(dm1_act, dtype=xp.float64)
-    dm2 = xp.asarray(dm2_act, dtype=xp.float64)
+    _wd = xp.float64 if work_dtype is None else work_dtype
+    _od = xp.float64 if out_dtype is None else out_dtype
+    B_ao = xp.asarray(B_ao, dtype=_wd)
+    C = xp.asarray(C, dtype=_wd)
+    L = xp.asarray(Lorb, dtype=_wd)
+    dm1 = xp.asarray(dm1_act, dtype=_wd)
+    dm2 = xp.asarray(dm2_act, dtype=_wd)
 
     C_core = C[:, :ncore]
     C_act = C[:, ncore:nocc]
@@ -400,8 +434,8 @@ def _build_bar_L_lorb_df(
         D_L_core = 2.0 * (C_L_core @ C_core.T)
         D_L_core = D_L_core + D_L_core.T
     else:
-        D_core = xp.zeros((nao, nao), dtype=xp.float64)
-        D_L_core = xp.zeros((nao, nao), dtype=xp.float64)
+        D_core = xp.zeros((nao, nao), dtype=_wd)
+        D_L_core = xp.zeros((nao, nao), dtype=_wd)
 
     D_act = C_act @ dm1 @ C_act.T
     D_L_act = C_L_act @ dm1 @ C_act.T
@@ -412,15 +446,48 @@ def _build_bar_L_lorb_df(
     D_w = D_act + 0.5 * D_core
     D_wL = D_L_act + 0.5 * D_L_core
     _log_vram("  lorb: before cross1")
-    bar_mean = _build_bar_L_df_cross(
-        B_ao, D_left=D_wL, D_right=D_core, coeff_J=1.0, coeff_K=-0.5, symmetrize=False,
-    )
+    if out is None:
+        bar_mean = _build_bar_L_df_cross(
+            B_ao,
+            D_left=D_wL,
+            D_right=D_core,
+            coeff_J=1.0,
+            coeff_K=-0.5,
+            symmetrize=False,
+            work_dtype=_wd,
+            out_dtype=_od,
+            qblock=qblock,
+        )
+    else:
+        bar_mean = xp.asarray(out, dtype=_od)
+        if bar_mean.shape != (int(B_ao.shape[2]), int(B_ao.shape[0]), int(B_ao.shape[0])):
+            raise ValueError("out shape mismatch")
+        _build_bar_L_df_cross(
+            B_ao,
+            D_left=D_wL,
+            D_right=D_core,
+            coeff_J=1.0,
+            coeff_K=-0.5,
+            out=bar_mean,
+            symmetrize=False,
+            work_dtype=_wd,
+            out_dtype=_od,
+            qblock=qblock,
+        )
     _log_vram("  lorb: after cross1")
     _flush_gpu_pool()
     _log_vram("  lorb: after cross1 flush")
     _build_bar_L_df_cross(
-        B_ao, D_left=D_w, D_right=D_L_core, coeff_J=1.0, coeff_K=-0.5,
-        out=bar_mean, symmetrize=False,
+        B_ao,
+        D_left=D_w,
+        D_right=D_L_core,
+        coeff_J=1.0,
+        coeff_K=-0.5,
+        out=bar_mean,
+        symmetrize=False,
+        work_dtype=_wd,
+        out_dtype=_od,
+        qblock=qblock,
     )
     _log_vram("  lorb: after cross2")
 
@@ -458,16 +525,21 @@ def _build_bar_L_lorb_df(
 
     # Accumulate all three bar_act einsum terms directly into bar_mean in chunks.
     _naux = int(bar_mean.shape[0])
-    _chunk = max(1, _naux // 4)
+    _chunk = int(max(1, qblock if qblock is not None else (_naux // 4)))
     for _q0 in range(0, _naux, _chunk):
         _q1 = min(_q0 + _chunk, _naux)
-        bar_mean[_q0:_q1] += xp.einsum("mvQ,nv->Qmn", tmp_L[:, :, _q0:_q1], C_act, optimize=True)
-        bar_mean[_q0:_q1] += xp.einsum("mvQ,nv->Qmn", tmp[:, :, _q0:_q1], C_L_act, optimize=True)
-        bar_mean[_q0:_q1] += xp.einsum("mvQ,nv->Qmn", tmp_M[:, :, _q0:_q1], C_act, optimize=True)
+        _blk = xp.einsum("mvQ,nv->Qmn", tmp_L[:, :, _q0:_q1], C_act, optimize=True)
+        bar_mean[_q0:_q1] += _blk.astype(_od, copy=False)
+        _blk = xp.einsum("mvQ,nv->Qmn", tmp[:, :, _q0:_q1], C_L_act, optimize=True)
+        bar_mean[_q0:_q1] += _blk.astype(_od, copy=False)
+        _blk = xp.einsum("mvQ,nv->Qmn", tmp_M[:, :, _q0:_q1], C_act, optimize=True)
+        bar_mean[_q0:_q1] += _blk.astype(_od, copy=False)
+        del _blk
     del tmp_L, tmp, tmp_M
 
-    _symmetrize_bar_L_inplace(bar_mean, xp)
-    return bar_mean, D_L
+    if bool(symmetrize):
+        _symmetrize_bar_L_inplace(bar_mean, xp)
+    return xp.asarray(bar_mean, dtype=_od), xp.asarray(D_L, dtype=xp.float64)
 
 
 def _grad_elec_active_df(
@@ -487,13 +559,26 @@ def _grad_elec_active_df(
 ) -> np.ndarray | tuple[np.ndarray, dict[str, np.ndarray]]:
     """Return active-electron part of <dH/dR> using DF integrals (no nuclear term)."""
 
-    xp, _ = _resolve_xp(df_backend)
+    xp, _is_gpu = _resolve_xp(df_backend)
 
     mol = getattr(scf_out, "mol")
     coords, charges = _mol_coords_charges_bohr(mol)
 
     B_ao = _as_xp_f64(xp, getattr(scf_out, "df_B"))
     _restore_pool = _apply_df_pool_policy(B_ao, label="_grad_elec_active_df")
+    _barl_policy = _resolve_barl_hybrid(
+        xp=xp,
+        is_gpu=bool(_is_gpu),
+        naux_hint=int(getattr(B_ao, "shape", (0, 0, 1))[2]),
+    )
+    if bool(_barl_policy.get("enabled", False)):
+        _barl_work_dtype = _barl_policy.get("work_dtype", xp.float64)
+        _barl_out_dtype = _barl_policy.get("out_dtype", xp.float64)
+        _barl_qblock = int(_barl_policy.get("qblock", 0))
+    else:
+        _barl_work_dtype = xp.float64
+        _barl_out_dtype = xp.float64
+        _barl_qblock = 0
     ao_basis = getattr(scf_out, "ao_basis")
     aux_basis = getattr(scf_out, "aux_basis")
     h_ao = _as_xp_f64(xp, getattr(getattr(scf_out, "int1e"), "hcore"))
@@ -518,6 +603,9 @@ def _grad_elec_active_df(
         D_act_ao=D_act_ao,
         C_act=C_act,
         dm2_act=xp.asarray(dm2_act, dtype=xp.float64),
+        work_dtype=_barl_work_dtype,
+        out_dtype=_barl_out_dtype,
+        qblock=_barl_qblock,
     )
     # Core-only RHF-like contribution (GPU).
     D_core_only, dme_core = _core_energy_weighted_density(mo_coeff=C, hcore_ao=h_ao, B_ao=B_ao, ncore=int(ncore))
@@ -527,6 +615,9 @@ def _grad_elec_active_df(
         D_right=D_core_only,
         coeff_J=0.5,
         coeff_K=-0.25,
+        work_dtype=_barl_work_dtype,
+        out_dtype=_barl_out_dtype,
+        qblock=_barl_qblock,
     )
 
     if not bool(return_terms):
@@ -534,16 +625,19 @@ def _grad_elec_active_df(
         bar_L_ao -= bar_L_core
         del bar_L_core
         bar_L_net = bar_L_ao
+        bar_L_contract = bar_L_net
+        if str(getattr(bar_L_contract, "dtype", "")) != str(np.float64):
+            bar_L_contract = xp.asarray(bar_L_contract, dtype=xp.float64)
         try:
             if df_grad_ctx is not None:
-                de_df_net = df_grad_ctx.contract(B_ao=B_ao, bar_L_ao=bar_L_net)
+                de_df_net = df_grad_ctx.contract(B_ao=B_ao, bar_L_ao=bar_L_contract)
             else:
                 de_df_net = compute_df_gradient_contributions_analytic_packed_bases(
                     ao_basis,
                     aux_basis,
                     atom_coords_bohr=coords,
                     B_ao=B_ao,
-                    bar_L_ao=bar_L_net,
+                    bar_L_ao=bar_L_contract,
                     L_chol=getattr(scf_out, "df_L", None),
                     backend=str(df_backend),
                     df_threads=int(df_threads),
@@ -560,7 +654,7 @@ def _grad_elec_active_df(
                 ao_basis,
                 aux_basis,
                 atom_coords_bohr=coords,
-                bar_L_ao=bar_L_net,
+                bar_L_ao=bar_L_contract,
                 backend=str(df_backend),
                 df_config=df_config,
                 df_threads=int(df_threads),
@@ -581,16 +675,18 @@ def _grad_elec_active_df(
         return np.asarray(de_h1 + _asnumpy_f64(de_df_net) - de_h1_core, dtype=np.float64)
 
     # ── Debug path (return_terms=True): keep 2 separate contract() calls for breakdown ──
+    bar_L_ao_contract = bar_L_ao if str(getattr(bar_L_ao, "dtype", "")) == str(np.float64) else xp.asarray(bar_L_ao, dtype=xp.float64)
+    bar_L_core_contract = bar_L_core if str(getattr(bar_L_core, "dtype", "")) == str(np.float64) else xp.asarray(bar_L_core, dtype=xp.float64)
     try:
         if df_grad_ctx is not None:
-            de_df = df_grad_ctx.contract(B_ao=B_ao, bar_L_ao=bar_L_ao)
+            de_df = df_grad_ctx.contract(B_ao=B_ao, bar_L_ao=bar_L_ao_contract)
         else:
             de_df = compute_df_gradient_contributions_analytic_packed_bases(
                 ao_basis,
                 aux_basis,
                 atom_coords_bohr=coords,
                 B_ao=B_ao,
-                bar_L_ao=bar_L_ao,
+                bar_L_ao=bar_L_ao_contract,
                 L_chol=getattr(scf_out, "df_L", None),
                 backend=str(df_backend),
                 df_threads=int(df_threads),
@@ -607,7 +703,7 @@ def _grad_elec_active_df(
             ao_basis,
             aux_basis,
             atom_coords_bohr=coords,
-            bar_L_ao=bar_L_ao,
+            bar_L_ao=bar_L_ao_contract,
             backend=str(df_backend),
             df_config=df_config,
             df_threads=int(df_threads),
@@ -617,14 +713,14 @@ def _grad_elec_active_df(
 
     try:
         if df_grad_ctx is not None:
-            de_df_core = df_grad_ctx.contract(B_ao=B_ao, bar_L_ao=bar_L_core)
+            de_df_core = df_grad_ctx.contract(B_ao=B_ao, bar_L_ao=bar_L_core_contract)
         else:
             de_df_core = compute_df_gradient_contributions_analytic_packed_bases(
                 ao_basis,
                 aux_basis,
                 atom_coords_bohr=coords,
                 B_ao=B_ao,
-                bar_L_ao=bar_L_core,
+                bar_L_ao=bar_L_core_contract,
                 L_chol=getattr(scf_out, "df_L", None),
                 backend=str(df_backend),
                 df_threads=int(df_threads),
@@ -641,7 +737,7 @@ def _grad_elec_active_df(
             ao_basis,
             aux_basis,
             atom_coords_bohr=coords,
-            bar_L_ao=bar_L_core,
+            bar_L_ao=bar_L_core_contract,
             backend=str(df_backend),
             df_config=df_config,
             df_threads=int(df_threads),
@@ -691,13 +787,26 @@ def _grad_elec_casscf_df(
 ) -> np.ndarray:
     """Return electronic SA-CASSCF/CASSCF gradient (no nuclear term), DF-only."""
 
-    xp, _ = _resolve_xp(df_backend)
+    xp, _is_gpu = _resolve_xp(df_backend)
 
     mol = getattr(scf_out, "mol")
     coords, charges = _mol_coords_charges_bohr(mol)
 
     B_ao = _as_xp_f64(xp, getattr(scf_out, "df_B"))
     _restore_pool = _apply_df_pool_policy(B_ao, label="_grad_elec_casscf_df")
+    _barl_policy = _resolve_barl_hybrid(
+        xp=xp,
+        is_gpu=bool(_is_gpu),
+        naux_hint=int(getattr(B_ao, "shape", (0, 0, 1))[2]),
+    )
+    if bool(_barl_policy.get("enabled", False)):
+        _barl_work_dtype = _barl_policy.get("work_dtype", xp.float64)
+        _barl_out_dtype = _barl_policy.get("out_dtype", xp.float64)
+        _barl_qblock = int(_barl_policy.get("qblock", 0))
+    else:
+        _barl_work_dtype = xp.float64
+        _barl_out_dtype = xp.float64
+        _barl_qblock = 0
     ao_basis = getattr(scf_out, "ao_basis")
     aux_basis = getattr(scf_out, "aux_basis")
     h_ao = _as_xp_f64(xp, getattr(getattr(scf_out, "int1e"), "hcore"))
@@ -721,17 +830,23 @@ def _grad_elec_casscf_df(
         D_act_ao=D_act_ao,
         C_act=C_act,
         dm2_act=xp.asarray(dm2_act, dtype=xp.float64),
+        work_dtype=_barl_work_dtype,
+        out_dtype=_barl_out_dtype,
+        qblock=_barl_qblock,
     )
+    bar_L_contract = bar_L_ao
+    if str(getattr(bar_L_contract, "dtype", "")) != str(np.float64):
+        bar_L_contract = xp.asarray(bar_L_contract, dtype=xp.float64)
     try:
         if df_grad_ctx is not None:
-            de_df = df_grad_ctx.contract(B_ao=B_ao, bar_L_ao=bar_L_ao)
+            de_df = df_grad_ctx.contract(B_ao=B_ao, bar_L_ao=bar_L_contract)
         else:
             de_df = compute_df_gradient_contributions_analytic_packed_bases(
                 ao_basis,
                 aux_basis,
                 atom_coords_bohr=coords,
                 B_ao=B_ao,
-                bar_L_ao=bar_L_ao,
+                bar_L_ao=bar_L_contract,
                 L_chol=getattr(scf_out, "df_L", None),
                 backend=str(df_backend),
                 df_threads=int(df_threads),
@@ -748,7 +863,7 @@ def _grad_elec_casscf_df(
             ao_basis,
             aux_basis,
             atom_coords_bohr=coords,
-            bar_L_ao=bar_L_ao,
+            bar_L_ao=bar_L_contract,
             backend=str(df_backend),
             df_config=df_config,
             df_threads=int(df_threads),
@@ -799,13 +914,26 @@ def _Lorb_dot_dgorb_dx_df(
     - The active-space RDMs are treated as fixed inputs (state-averaged).
     """
 
-    xp, _ = _resolve_xp(df_backend)
+    xp, _is_gpu = _resolve_xp(df_backend)
 
     mol = getattr(scf_out, "mol")
     coords, charges = _mol_coords_charges_bohr(mol)
 
     B_ao = _as_xp_f64(xp, getattr(scf_out, "df_B"))
     _restore_pool = _apply_df_pool_policy(B_ao, label="_Lorb_dot_dgorb_dx_df")
+    _barl_policy = _resolve_barl_hybrid(
+        xp=xp,
+        is_gpu=bool(_is_gpu),
+        naux_hint=int(getattr(B_ao, "shape", (0, 0, 1))[2]),
+    )
+    if bool(_barl_policy.get("enabled", False)):
+        _barl_work_dtype = _barl_policy.get("work_dtype", xp.float64)
+        _barl_out_dtype = _barl_policy.get("out_dtype", xp.float64)
+        _barl_qblock = int(_barl_policy.get("qblock", 0))
+    else:
+        _barl_work_dtype = xp.float64
+        _barl_out_dtype = xp.float64
+        _barl_qblock = 0
     ao_basis = getattr(scf_out, "ao_basis")
     aux_basis = getattr(scf_out, "aux_basis")
     h_ao = _as_xp_f64(xp, getattr(getattr(scf_out, "int1e"), "hcore"))
@@ -913,11 +1041,27 @@ def _Lorb_dot_dgorb_dx_df(
     D_w = D_act + 0.5 * D_core
     D_wL = D_L_act + 0.5 * D_L_core
     bar_mean = _build_bar_L_df_cross(
-        B_ao, D_left=D_wL, D_right=D_core, coeff_J=1.0, coeff_K=-0.5, symmetrize=False,
+        B_ao,
+        D_left=D_wL,
+        D_right=D_core,
+        coeff_J=1.0,
+        coeff_K=-0.5,
+        symmetrize=False,
+        work_dtype=_barl_work_dtype,
+        out_dtype=_barl_out_dtype,
+        qblock=_barl_qblock,
     )
     _build_bar_L_df_cross(
-        B_ao, D_left=D_w, D_right=D_L_core, coeff_J=1.0, coeff_K=-0.5,
-        out=bar_mean, symmetrize=False,
+        B_ao,
+        D_left=D_w,
+        D_right=D_L_core,
+        coeff_J=1.0,
+        coeff_K=-0.5,
+        out=bar_mean,
+        symmetrize=False,
+        work_dtype=_barl_work_dtype,
+        out_dtype=_barl_out_dtype,
+        qblock=_barl_qblock,
     )
 
     # Active-active DF term: linearize _build_bar_L_casscf_df active block w.r.t C_act along C_L_act.
@@ -944,27 +1088,34 @@ def _Lorb_dot_dgorb_dx_df(
 
     # Accumulate all three bar_act einsum terms directly into bar_mean in chunks.
     naux_lorb = int(bar_mean.shape[0])
-    _chunk = max(1, naux_lorb // 4)
+    _chunk = int(max(1, _barl_qblock if int(_barl_qblock) > 0 else (naux_lorb // 4)))
     for _q0 in range(0, naux_lorb, _chunk):
         _q1 = min(_q0 + _chunk, naux_lorb)
-        bar_mean[_q0:_q1] += xp.einsum("mvQ,nv->Qmn", tmp_L[:, :, _q0:_q1], C_act, optimize=True)
-        bar_mean[_q0:_q1] += xp.einsum("mvQ,nv->Qmn", tmp[:, :, _q0:_q1], C_L_act, optimize=True)
-        bar_mean[_q0:_q1] += xp.einsum("mvQ,nv->Qmn", tmp_M[:, :, _q0:_q1], C_act, optimize=True)
+        _blk = xp.einsum("mvQ,nv->Qmn", tmp_L[:, :, _q0:_q1], C_act, optimize=True)
+        bar_mean[_q0:_q1] += _blk.astype(_barl_out_dtype, copy=False)
+        _blk = xp.einsum("mvQ,nv->Qmn", tmp[:, :, _q0:_q1], C_L_act, optimize=True)
+        bar_mean[_q0:_q1] += _blk.astype(_barl_out_dtype, copy=False)
+        _blk = xp.einsum("mvQ,nv->Qmn", tmp_M[:, :, _q0:_q1], C_act, optimize=True)
+        bar_mean[_q0:_q1] += _blk.astype(_barl_out_dtype, copy=False)
+        del _blk
     del tmp_L, tmp, tmp_M
 
     _symmetrize_bar_L_inplace(bar_mean, xp)
-    bar_L_ao = bar_mean
+    bar_L_ao = xp.asarray(bar_mean, dtype=_barl_out_dtype)
+    bar_L_contract = bar_L_ao
+    if str(getattr(bar_L_contract, "dtype", "")) != str(np.float64):
+        bar_L_contract = xp.asarray(bar_L_contract, dtype=xp.float64)
 
     try:
         if df_grad_ctx is not None:
-            de_df = df_grad_ctx.contract(B_ao=B_ao, bar_L_ao=bar_L_ao)
+            de_df = df_grad_ctx.contract(B_ao=B_ao, bar_L_ao=bar_L_contract)
         else:
             de_df = compute_df_gradient_contributions_analytic_packed_bases(
                 ao_basis,
                 aux_basis,
                 atom_coords_bohr=coords,
                 B_ao=B_ao,
-                bar_L_ao=bar_L_ao,
+                bar_L_ao=bar_L_contract,
                 L_chol=getattr(scf_out, "df_L", None),
                 backend=str(df_backend),
                 df_threads=int(df_threads),
@@ -981,7 +1132,7 @@ def _Lorb_dot_dgorb_dx_df(
             ao_basis,
             aux_basis,
             atom_coords_bohr=coords,
-            bar_L_ao=bar_L_ao,
+            bar_L_ao=bar_L_contract,
             backend=str(df_backend),
             df_config=df_config,
             df_threads=int(df_threads),

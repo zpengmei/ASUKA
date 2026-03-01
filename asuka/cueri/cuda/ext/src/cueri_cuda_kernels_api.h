@@ -839,6 +839,163 @@ extern "C" cudaError_t cueri_df_int3c2e_deriv_contracted_cart_allsp_atomgrad_lau
     cudaStream_t stream,
     int threads);
 
+// Batched DF int3c2e derivative contraction — AB-tiled atomic-reduced variant.
+//
+// Grid: dim3(ceil(ntasks/cd_tile), n_spAB). Each block handles one AO shell-pair
+// and loops over up to `cd_tile` spCD tasks, accumulating A/B-center contributions
+// in-register and emitting a single atomic write per A/B center per block.
+extern "C" cudaError_t cueri_df_int3c2e_deriv_contracted_cart_allsp_atomgrad_abtile_launch_stream(
+    const int32_t* spAB_arr,   // [n_spAB]
+    int n_spAB,
+    const int32_t* spCD,       // [ntasks]
+    int ntasks,
+    const int32_t* sp_A,
+    const int32_t* sp_B,
+    const int32_t* sp_pair_start,
+    const int32_t* sp_npair,
+    const double* shell_cx,
+    const double* shell_cy,
+    const double* shell_cz,
+    const int32_t* shell_prim_start,
+    const int32_t* shell_nprim,
+    const int32_t* shell_ao_start,
+    const double* prim_exp,
+    const double* pair_eta,
+    const double* pair_Px,
+    const double* pair_Py,
+    const double* pair_Pz,
+    const double* pair_cK,
+    int nao,
+    int naux,
+    int la,
+    int lb,
+    int lc,
+    const double* bar_X_flat,  // size (nao*nao*naux)
+    const int32_t* shell_atom, // size (nAOshells+nAuxShells)
+    int cd_tile,               // 1..16
+    double* grad_dev,          // size (natm*3) — atomicAdd target
+    cudaStream_t stream,
+    int threads);
+
+// Batched DF int3c2e derivative contraction with *spherical* bar_X adjoint.
+//
+// This variant avoids materializing bar_X in the Cartesian AO basis when the
+// forward DF build/SCF uses spherical AOs (mol.cart=False).  It takes bar_X in
+// spherical AO basis in Qmn layout and applies the cart->sph transforms
+// (per AO shell, block-diagonal) inside the contraction kernel:
+//   bar_X_cart(m,n,Q) = sum_{i,j} T_c2s(m,i) * bar_X_sph(i,j,Q) * T_c2s(n,j)
+//
+// Inputs:
+// - bar_X_sph_Qmn: [naux, nao_sph, nao_sph] (C-contiguous, Q-first)
+// - shell_ao_start_sph: spherical AO start offsets per *combined* shell index
+//   (AO shells first, then aux shells, then dummy). Only AO shells are used.
+extern "C" cudaError_t cueri_df_int3c2e_deriv_contracted_cart_allsp_atomgrad_sphbar_qmn_launch_stream(
+    const int32_t* spAB_arr,           // [n_spAB]
+    int n_spAB,
+    const int32_t* spCD,               // [ntasks]
+    int ntasks,
+    const int32_t* sp_A,
+    const int32_t* sp_B,
+    const int32_t* sp_pair_start,
+    const int32_t* sp_npair,
+    const double* shell_cx,
+    const double* shell_cy,
+    const double* shell_cz,
+    const int32_t* shell_prim_start,
+    const int32_t* shell_nprim,
+    const int32_t* shell_ao_start,
+    const double* prim_exp,
+    const double* pair_eta,
+    const double* pair_Px,
+    const double* pair_Py,
+    const double* pair_Pz,
+    const double* pair_cK,
+    int nao,
+    int naux,
+    int nao_sph,
+    int la,
+    int lb,
+    int lc,
+    const double* bar_X_sph_Qmn,       // [naux*nao_sph*nao_sph]
+    const int32_t* shell_ao_start_sph, // [nShellTotal]
+    const int32_t* shell_atom,         // [nAOshells+nAuxShells]
+    double* grad_dev,                  // [natm*3] — atomicAdd target
+    cudaStream_t stream,
+    int threads);
+
+// Batched spherical-bar_X variant with AB-tiled atomic reduction (see above).
+extern "C" cudaError_t cueri_df_int3c2e_deriv_contracted_cart_allsp_atomgrad_sphbar_qmn_abtile_launch_stream(
+    const int32_t* spAB_arr,           // [n_spAB]
+    int n_spAB,
+    const int32_t* spCD,               // [ntasks]
+    int ntasks,
+    const int32_t* sp_A,
+    const int32_t* sp_B,
+    const int32_t* sp_pair_start,
+    const int32_t* sp_npair,
+    const double* shell_cx,
+    const double* shell_cy,
+    const double* shell_cz,
+    const int32_t* shell_prim_start,
+    const int32_t* shell_nprim,
+    const int32_t* shell_ao_start,
+    const double* prim_exp,
+    const double* pair_eta,
+    const double* pair_Px,
+    const double* pair_Py,
+    const double* pair_Pz,
+    const double* pair_cK,
+    int nao,
+    int naux,
+    int nao_sph,
+    int la,
+    int lb,
+    int lc,
+    const double* bar_X_sph_Qmn,       // [naux*nao_sph*nao_sph]
+    const int32_t* shell_ao_start_sph, // [nShellTotal]
+    const int32_t* shell_atom,         // [nAOshells+nAuxShells]
+    int cd_tile,                       // 1..16
+    double* grad_dev,                  // [natm*3] — atomicAdd target
+    cudaStream_t stream,
+    int threads);
+
+// Batched DF int3c2e derivative contraction — float32 bar_X variant.
+//
+// Like `cueri_df_int3c2e_deriv_contracted_cart_allsp_atomgrad_launch_stream` but:
+// - reads bar_X_flat as float32 to reduce global memory bandwidth
+// - still accumulates into float64 grad_dev
+extern "C" cudaError_t cueri_df_int3c2e_deriv_contracted_cart_allsp_atomgrad_f32bar_launch_stream(
+    const int32_t* spAB_arr,   // [n_spAB]
+    int n_spAB,
+    const int32_t* spCD,       // [ntasks]
+    int ntasks,
+    const int32_t* sp_A,
+    const int32_t* sp_B,
+    const int32_t* sp_pair_start,
+    const int32_t* sp_npair,
+    const double* shell_cx,
+    const double* shell_cy,
+    const double* shell_cz,
+    const int32_t* shell_prim_start,
+    const int32_t* shell_nprim,
+    const int32_t* shell_ao_start,
+    const double* prim_exp,
+    const double* pair_eta,
+    const double* pair_Px,
+    const double* pair_Py,
+    const double* pair_Pz,
+    const double* pair_cK,
+    int nao,
+    int naux,
+    int la,
+    int lb,
+    int lc,
+    const float* bar_X_flat,   // size (nao*nao*naux)
+    const int32_t* shell_atom, // size (nAOshells+nAuxShells)
+    double* grad_dev,          // size (natm*3) — atomicAdd target
+    cudaStream_t stream,
+    int threads);
+
 // DF metric 2c2e derivative contraction (analytic) for expanded (nctr==1) aux bases.
 //
 // Contracts dV/dR against `bar_V` for a fixed aux spAB and a batch of aux spCD tasks:
@@ -884,6 +1041,42 @@ extern "C" cudaError_t cueri_df_metric_2c2e_deriv_contracted_cart_launch_stream(
 //   • accumulates results directly into grad_dev[natm*3] via atomicAdd
 //   • processes the full (P,Q) matrix (no upper-triangle restriction)
 extern "C" cudaError_t cueri_df_metric_2c2e_deriv_contracted_cart_allsp_atomgrad_launch_stream(
+    const int32_t* spAB_arr,   // [n_spAB]
+    int n_spAB,
+    const int32_t* spCD,       // [ntasks]
+    int ntasks,
+    const int32_t* sp_A,
+    const int32_t* sp_B,
+    const int32_t* sp_pair_start,
+    const int32_t* sp_npair,
+    const double* shell_cx,
+    const double* shell_cy,
+    const double* shell_cz,
+    const int32_t* shell_prim_start,
+    const int32_t* shell_nprim,
+    const int32_t* shell_ao_start,
+    const double* prim_exp,
+    const double* pair_eta,
+    const double* pair_Px,
+    const double* pair_Py,
+    const double* pair_Pz,
+    const double* pair_cK,
+    int nao,
+    int naux,
+    int la,
+    int lc,
+    const double* bar_V,       // size (naux*naux)
+    const int32_t* shell_atom, // size (nAuxShells) — aux shell -> atom map
+    double* grad_dev,          // size (natm*3) — atomicAdd target
+    cudaStream_t stream,
+    int threads);
+
+// DF metric 2c2e derivative contraction — allsp + atomicAdd + upper-triangle skip.
+//
+// Like `cueri_df_metric_2c2e_deriv_contracted_cart_allsp_atomgrad_launch_stream` but:
+// - skips blocks with shellC > shellA (upper triangle in shell index)
+// - scales off-diagonal shell pairs by 2.0 to account for symmetry
+extern "C" cudaError_t cueri_df_metric_2c2e_deriv_contracted_cart_allsp_atomgrad_tril_launch_stream(
     const int32_t* spAB_arr,   // [n_spAB]
     int n_spAB,
     const int32_t* spCD,       // [ntasks]
@@ -1101,6 +1294,65 @@ extern "C" cudaError_t cueri_scatter_add_df_yt_tiles_launch_stream(
     int nops,
     int nP,
     double* YT_out,  // size naux * nops (row-major)
+    cudaStream_t stream,
+    int threads);
+
+// In-place symmetrization over AO indices for DF tensors.
+//
+// mnQ layout:
+//   arr shape (nao, nao, naux), C-order flattened as ((m*nao + n)*naux + Q)
+//   performs arr[m,n,Q] = 0.5 * (arr[m,n,Q] + arr[n,m,Q])
+extern "C" cudaError_t cueri_df_symmetrize_mnq_inplace_launch_stream(
+    double* arr_mnQ,
+    int nao,
+    int naux,
+    cudaStream_t stream,
+    int threads);
+
+// Out-of-place symmetrize + cast for DF mnQ tensors.
+//
+// Reads input as float64 and writes the symmetrized result as float32:
+//   out[m,n,Q] = 0.5 * (in[m,n,Q] + in[n,m,Q])  for m!=n
+//   out[m,m,Q] = in[m,m,Q]
+extern "C" cudaError_t cueri_df_symmetrize_mnq_to_f32_launch_stream(
+    const double* in_mnQ,
+    float* out_mnQ,
+    int nao,
+    int naux,
+    cudaStream_t stream,
+    int threads);
+
+// Qmn layout:
+//   arr shape (naux, nao, nao), C-order flattened as ((Q*nao + m)*nao + n)
+//   performs arr[Q,m,n] = 0.5 * (arr[Q,m,n] + arr[Q,n,m])
+extern "C" cudaError_t cueri_df_symmetrize_qmn_inplace_launch_stream(
+    double* arr_Qmn,
+    int naux,
+    int nao,
+    cudaStream_t stream,
+    int threads);
+
+// Fused Qmn -> mnQ transpose + symmetrize (optionally cast) for DF adjoints.
+//
+// Input Qmn layout:
+//   in shape (naux, nao, nao), C-order flattened as ((Q*nao + m)*nao + n)
+// Output mnQ layout:
+//   out shape (nao, nao, naux), C-order flattened as ((m*nao + n)*naux + Q)
+// Operation:
+//   out[m,n,Q] = 0.5 * (in[Q,m,n] + in[Q,n,m])  for all m,n
+extern "C" cudaError_t cueri_df_symmetrize_qmn_to_mnq_launch_stream(
+    const double* in_Qmn,
+    double* out_mnQ,
+    int naux,
+    int nao,
+    cudaStream_t stream,
+    int threads);
+
+extern "C" cudaError_t cueri_df_symmetrize_qmn_to_mnq_to_f32_launch_stream(
+    const double* in_Qmn,
+    float* out_mnQ,
+    int naux,
+    int nao,
     cudaStream_t stream,
     int threads);
 

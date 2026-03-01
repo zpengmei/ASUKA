@@ -7213,6 +7213,139 @@ class GugaMatvecEriMatWorkspace:
         self._tile_csr_overflow = None
         self._tile_csr_capacity = 0
 
+    @staticmethod
+    def _estimate_object_nbytes(obj, seen: set[int]) -> int:
+        if obj is None:
+            return 0
+        oid = id(obj)
+        if oid in seen:
+            return 0
+        seen.add(oid)
+        nbytes = 0
+        arr_nbytes = getattr(obj, "nbytes", None)
+        if arr_nbytes is not None:
+            try:
+                return int(arr_nbytes)
+            except Exception:
+                return 0
+        if isinstance(obj, dict):
+            for v in obj.values():
+                nbytes += GugaMatvecEriMatWorkspace._estimate_object_nbytes(v, seen)
+            return int(nbytes)
+        if isinstance(obj, (list, tuple)):
+            for v in obj:
+                nbytes += GugaMatvecEriMatWorkspace._estimate_object_nbytes(v, seen)
+            return int(nbytes)
+        return 0
+
+    def workspace_nbytes_estimate(self) -> int:
+        """Best-effort estimate of live device/pinned workspace bytes."""
+        seen: set[int] = set()
+        total = 0
+        for name, value in self.__dict__.items():
+            if name.startswith("__"):
+                continue
+            total += self._estimate_object_nbytes(value, seen)
+        return int(max(0, total))
+
+    def release(self) -> int:
+        """Release large retained buffers and cache structures.
+
+        Returns
+        -------
+        int
+            Best-effort estimated bytes held before release.
+        """
+        if bool(getattr(self, "_released", False)):
+            return 0
+
+        freed_est = int(self.workspace_nbytes_estimate())
+
+        self._cuda_graph = None
+        self._cuda_graph_x = None
+        self._cuda_graph_y = None
+
+        for slot in list(getattr(self, "_csr_pipeline_slots", [])):
+            try:
+                ws = slot.get("ws", None)
+                if ws is not None and hasattr(ws, "release"):
+                    ws.release()
+            except Exception:
+                pass
+        self._csr_pipeline_slots = []
+        self._csr_pipeline_apply_stream = None
+
+        for ws_name in ("_k25_ws", "_offdiag_gemm_ws", "_gdf_ws"):
+            try:
+                ws = getattr(self, ws_name, None)
+                if ws is not None and hasattr(ws, "release"):
+                    ws.release()
+            except Exception:
+                pass
+            setattr(self, ws_name, None)
+
+        for name in (
+            "_g_buf",
+            "_task_scale_rows",
+            "_diag_g_cache",
+            "_g_diag_buf",
+            "_diag_w_buf",
+            "_occ_buf",
+            "_occ_buf_dtype",
+            "_w_offdiag",
+            "_w_block",
+            "_l_full_t",
+            "_offdiag_df_t",
+            "_eri_diag_t",
+            "_eri_mat_t",
+            "_eri_mat_t_cache",
+            "_task_scale_j",
+            "_overflow_w",
+            "overflow_apply",
+            "_csr_row_j",
+            "_csr_row_k",
+            "_csr_indptr",
+            "_csr_indices",
+            "_csr_data",
+            "_csr_overflow",
+            "_csr_single_tile_cache",
+            "_csr_tile_cache",
+            "_csr_host_tile_cache",
+            "_tile_csr_row_j",
+            "_tile_csr_row_k",
+            "_tile_csr_indptr",
+            "_tile_csr_indices",
+            "_tile_csr_data",
+            "_tile_csr_overflow",
+            "_epq_table",
+            "_epq_apply_tile_cache",
+            "_epq_apply_staging_indptr",
+            "_epq_apply_staging_indices",
+            "_epq_apply_staging_pq_ids",
+            "_epq_apply_staging_data",
+            "task_csf_all",
+            "eri_mat",
+            "l_full",
+            "h_eff_flat",
+            "_rs_r_d",
+            "_rs_s_d",
+        ):
+            if hasattr(self, name):
+                setattr(self, name, None)
+
+        self._csr_host_cache_bytes = 0
+        self._epq_apply_cache_bytes = 0
+        self._epq_apply_staging_capacity = 0
+        self._tile_csr_capacity = 0
+        self._released = True
+        return int(freed_est)
+
+    def __del__(self) -> None:
+        try:
+            self.release()
+        except Exception:
+            pass
+
     def _init_csr_pipeline_slots(self) -> None:
         import cupy as cp
 

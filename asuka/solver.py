@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import contextlib
 from concurrent.futures import ThreadPoolExecutor
+from collections import OrderedDict
 from dataclasses import dataclass
 import json
 import os
@@ -507,6 +508,17 @@ def _enforce_cuda_aggregate_offdiag_guard(value: bool, *, context: str) -> bool:
     return True
 
 
+def _normalize_ws_cache_fraction(value: Any) -> float:
+    try:
+        frac = float(value)
+    except Exception:
+        frac = 0.2
+    if not np.isfinite(frac):
+        frac = 0.2
+    # Keep some room for non-workspace allocations and runtime overhead.
+    return max(0.0, min(0.8, float(frac)))
+
+
 class _StreamObject:
     """Minimal solver base class for cuguga."""
 
@@ -674,6 +686,190 @@ class GUGAFCISolver(_StreamObject):
             )
         )
 
+    @staticmethod
+    def _release_matvec_cuda_workspace(ws: Any) -> None:
+        if ws is None:
+            return
+        release_fn = getattr(ws, "release", None)
+        if callable(release_fn):
+            try:
+                release_fn()
+                return
+            except Exception:
+                pass
+        # Best-effort fallback for legacy workspaces without a release() API.
+        for attr in (
+            "_g_buf",
+            "_w_block",
+            "_w_offdiag",
+            "_epq_table",
+            "_epq_apply_tile_cache",
+            "_csr_tile_cache",
+            "_csr_host_tile_cache",
+            "_diag_g_cache",
+            "_k25_ws",
+            "_offdiag_gemm_ws",
+            "_gdf_ws",
+        ):
+            if hasattr(ws, attr):
+                try:
+                    setattr(ws, attr, None)
+                except Exception:
+                    pass
+
+    @staticmethod
+    def _estimate_matvec_cuda_workspace_bytes(ws: Any) -> int:
+        if ws is None:
+            return 0
+        try:
+            est_fn = getattr(ws, "workspace_nbytes_estimate", None)
+            if callable(est_fn):
+                est = int(est_fn())
+                if est >= 0:
+                    return est
+        except Exception:
+            pass
+
+        seen: set[int] = set()
+        stack: list[Any] = [ws]
+        total = 0
+        while stack:
+            obj = stack.pop()
+            oid = id(obj)
+            if oid in seen:
+                continue
+            seen.add(oid)
+            nbytes = getattr(obj, "nbytes", None)
+            if nbytes is not None:
+                try:
+                    total += int(nbytes)
+                    continue
+                except Exception:
+                    pass
+            if isinstance(obj, dict):
+                stack.extend(obj.values())
+            elif isinstance(obj, (list, tuple)):
+                stack.extend(obj)
+        return int(max(0, total))
+
+    def _resolve_matvec_cuda_ws_cache_budget_bytes(
+        self,
+        *,
+        cp_mod: Any | None,
+        hard_cap_gib: float,
+        fraction: float | None = None,
+    ) -> int:
+        frac = self.matvec_cuda_ws_cache_fraction if fraction is None else _normalize_ws_cache_fraction(fraction)
+        if frac <= 0.0:
+            return 0
+        total_b = 0
+        if cp_mod is not None:
+            try:
+                _free_b, _total_b = cp_mod.cuda.runtime.memGetInfo()
+                total_b = int(_total_b)
+            except Exception:
+                total_b = 0
+        cap_b = int(float(hard_cap_gib) * (1024**3)) if float(hard_cap_gib) > 0.0 else 0
+        base_b = int(cap_b if cap_b > 0 else total_b)
+        if base_b <= 0:
+            return 0
+        reserve_b = int(1.5 * 1024**3)
+        usable_b = max(0, int(base_b) - int(reserve_b))
+        return int(max(0, usable_b) * float(frac))
+
+    def _matvec_cuda_ws_cache_touch(self, key: Any) -> None:
+        if key in self._matvec_cuda_ws_cache_lru:
+            self._matvec_cuda_ws_cache_lru.move_to_end(key, last=True)
+        else:
+            self._matvec_cuda_ws_cache_lru[key] = None
+
+    def _matvec_cuda_ws_cache_get(self, key: Any) -> Any:
+        ws = self._matvec_cuda_ws_cache.get(key)
+        if ws is None:
+            self._matvec_cuda_ws_cache_misses += 1
+            return None
+        self._matvec_cuda_ws_cache_hits += 1
+        self._matvec_cuda_ws_cache_touch(key)
+        return ws
+
+    def _matvec_cuda_ws_cache_drop(self, key: Any) -> None:
+        ws = self._matvec_cuda_ws_cache.pop(key, None)
+        old_size = int(self._matvec_cuda_ws_cache_sizes.pop(key, 0))
+        self._matvec_cuda_ws_cache_lru.pop(key, None)
+        if old_size > 0:
+            self._matvec_cuda_ws_cache_bytes = max(0, int(self._matvec_cuda_ws_cache_bytes) - int(old_size))
+        if ws is not None:
+            self._release_matvec_cuda_workspace(ws)
+
+    def _matvec_cuda_ws_cache_enforce_budget(self, *, keep_keys: Sequence[Any] = ()) -> None:
+        budget = int(self._matvec_cuda_ws_cache_budget_bytes)
+        if budget <= 0:
+            return
+        keep = set(keep_keys)
+        if int(self._matvec_cuda_ws_cache_bytes) <= budget:
+            return
+        while int(self._matvec_cuda_ws_cache_bytes) > budget and len(self._matvec_cuda_ws_cache_lru) > 0:
+            if all(k in keep for k in self._matvec_cuda_ws_cache_lru.keys()):
+                break
+            victim = next(iter(self._matvec_cuda_ws_cache_lru.keys()))
+            if victim in keep:
+                self._matvec_cuda_ws_cache_lru.move_to_end(victim, last=True)
+                continue
+            self._matvec_cuda_ws_cache_drop(victim)
+            self._matvec_cuda_ws_cache_evictions += 1
+
+    def _matvec_cuda_ws_cache_put(
+        self,
+        key: Any,
+        ws: Any,
+        *,
+        keep_keys: Sequence[Any] = (),
+    ) -> None:
+        if ws is None:
+            return
+        old_ws = self._matvec_cuda_ws_cache.get(key)
+        old_size = int(self._matvec_cuda_ws_cache_sizes.get(key, 0))
+        if old_ws is not None and old_ws is not ws:
+            self._matvec_cuda_ws_cache_drop(key)
+            old_size = 0
+
+        self._matvec_cuda_ws_cache[key] = ws
+        est_size = self._estimate_matvec_cuda_workspace_bytes(ws)
+        self._matvec_cuda_ws_cache_sizes[key] = int(est_size)
+        delta = int(est_size) - int(old_size)
+        if delta != 0:
+            self._matvec_cuda_ws_cache_bytes = max(0, int(self._matvec_cuda_ws_cache_bytes) + int(delta))
+        self._matvec_cuda_ws_cache_touch(key)
+        self._matvec_cuda_ws_cache_enforce_budget(keep_keys=tuple(keep_keys))
+
+    def _configure_matvec_cuda_ws_cache(
+        self,
+        *,
+        cp_mod: Any | None,
+        hard_cap_gib: float,
+        fraction: float | None = None,
+    ) -> int:
+        if fraction is not None:
+            self.matvec_cuda_ws_cache_fraction = _normalize_ws_cache_fraction(fraction)
+        self._matvec_cuda_ws_cache_budget_bytes = self._resolve_matvec_cuda_ws_cache_budget_bytes(
+            cp_mod=cp_mod,
+            hard_cap_gib=float(hard_cap_gib),
+            fraction=self.matvec_cuda_ws_cache_fraction,
+        )
+        self._matvec_cuda_ws_cache_enforce_budget()
+        return int(self._matvec_cuda_ws_cache_budget_bytes)
+
+    def _matvec_cuda_ws_cache_profile(self) -> dict[str, Any]:
+        return {
+            "matvec_cuda_ws_cache_entries": int(len(self._matvec_cuda_ws_cache)),
+            "matvec_cuda_ws_cache_bytes": int(self._matvec_cuda_ws_cache_bytes),
+            "matvec_cuda_ws_cache_budget_bytes": int(self._matvec_cuda_ws_cache_budget_bytes),
+            "matvec_cuda_ws_cache_fraction": float(self.matvec_cuda_ws_cache_fraction),
+            "matvec_cuda_ws_cache_hits": int(self._matvec_cuda_ws_cache_hits),
+            "matvec_cuda_ws_cache_misses": int(self._matvec_cuda_ws_cache_misses),
+            "matvec_cuda_ws_cache_evictions": int(self._matvec_cuda_ws_cache_evictions),
+        }
+
     def __init__(
         self,
         *,
@@ -705,6 +901,13 @@ class GUGAFCISolver(_StreamObject):
         self._rdm_cuda_ws_cache: dict[_DRTKey, Any] = {}
         self._matvec_cuda_state_cache: dict[_DRTKey, Any] = {}
         self._matvec_cuda_ws_cache: dict[Any, Any] = {}
+        self._matvec_cuda_ws_cache_sizes: dict[Any, int] = {}
+        self._matvec_cuda_ws_cache_lru: OrderedDict[Any, None] = OrderedDict()
+        self._matvec_cuda_ws_cache_bytes: int = 0
+        self._matvec_cuda_ws_cache_budget_bytes: int = 0
+        self._matvec_cuda_ws_cache_hits: int = 0
+        self._matvec_cuda_ws_cache_misses: int = 0
+        self._matvec_cuda_ws_cache_evictions: int = 0
         # Keep the CPU contract workspace cache typed as `Any` so the GPU backend
         # does not import `asuka.contract` at module import time.
         self._contract_ws_cache: dict[_DRTKey, Any] = {}
@@ -764,6 +967,12 @@ class GUGAFCISolver(_StreamObject):
         self.matvec_cuda_policy = getattr(self, "matvec_cuda_policy", "auto")
         self.matvec_cuda_accuracy_mode = getattr(self, "matvec_cuda_accuracy_mode", "balanced")
         self.matvec_cuda_memory_cap_gib = getattr(self, "matvec_cuda_memory_cap_gib", None)
+        # Fraction of the active GPU budget reserved for cached CUDA matvec workspaces.
+        # Can be overridden by `ASUKA_GPU_WS_CACHE_FRAC` or per-call kwargs.
+        _ws_cache_frac_env = os.environ.get("ASUKA_GPU_WS_CACHE_FRAC")
+        if _ws_cache_frac_env is None:
+            _ws_cache_frac_env = getattr(self, "matvec_cuda_ws_cache_fraction", 0.2)
+        self.matvec_cuda_ws_cache_fraction = _normalize_ws_cache_fraction(_ws_cache_frac_env)
         # PySCF determinant-style FCI uses absorb_h1e(..., fac=0.5) to fold the 1e part into a 2e tensor.
         # For cuGUGA we can optionally bypass that allocation-heavy path and pass (h1e,eri,fac) through as a
         # lightweight wrapper, enabling CUDA matvec without reconstructing (or inverting) the absorbed tensor.
@@ -1921,15 +2130,29 @@ class GUGAFCISolver(_StreamObject):
                     getattr(self, "matvec_cuda_mem_hard_cap_gib", 11.5),
                 )
             )
+            matvec_cuda_ws_cache_fraction = _normalize_ws_cache_fraction(
+                kwargs.pop(
+                    "matvec_cuda_ws_cache_fraction",
+                    getattr(self, "matvec_cuda_ws_cache_fraction", 0.2),
+                )
+            )
             _cuda_pool_limit_b = _apply_cuda_pool_hard_cap(cp, float(matvec_cuda_mem_hard_cap_gib))
+            _cuda_ws_cache_budget_b = self._configure_matvec_cuda_ws_cache(
+                cp_mod=cp,
+                hard_cap_gib=float(matvec_cuda_mem_hard_cap_gib),
+                fraction=float(matvec_cuda_ws_cache_fraction),
+            )
 
             if not has_cuda_ext():
                 raise RuntimeError(
                     "CUDA extension not available; build with python -m asuka.build.guga_cuda_ext"
                 )
 
-            if _cuda_pool_limit_b is not None and kprof is not None:
-                kprof["matvec_cuda_pool_limit_bytes"] = int(_cuda_pool_limit_b)
+            if kprof is not None:
+                if _cuda_pool_limit_b is not None:
+                    kprof["matvec_cuda_pool_limit_bytes"] = int(_cuda_pool_limit_b)
+                kprof["matvec_cuda_ws_cache_budget_bytes"] = int(_cuda_ws_cache_budget_b)
+                kprof["matvec_cuda_ws_cache_fraction"] = float(self.matvec_cuda_ws_cache_fraction)
 
             ws_key = self._drt_key(
                 norb,
@@ -2829,7 +3052,7 @@ class GUGAFCISolver(_StreamObject):
                 if int(getattr(ws, "prefilter_trivial_tasks_min_ncsf", -1)) != int(prefilter_trivial_tasks_min_ncsf):
                     out.append("prefilter_trivial_tasks_min_ncsf")
                 return out
-            cuda_ws = self._matvec_cuda_ws_cache.get(ws_cache_key)
+            cuda_ws = self._matvec_cuda_ws_cache_get(ws_cache_key)
             main_ws_needs_rebuild = self._ws_needs_rebuild(
                 cuda_ws,
                 expected_dtype=np.float32 if str(main_ws_dtype) == "float32" else np.float64,
@@ -3000,7 +3223,11 @@ class GUGAFCISolver(_StreamObject):
                         raise
                 if cuda_ws is None:  # pragma: no cover
                     raise RuntimeError("internal error: failed to initialize CUDA matvec workspace")
-                self._matvec_cuda_ws_cache[ws_cache_key] = cuda_ws
+                self._matvec_cuda_ws_cache_put(
+                    ws_cache_key,
+                    cuda_ws,
+                    keep_keys=(ws_cache_key,),
+                )
                 if kprof is not None and t_ws0 is not None:
                     kprof["matvec_cuda_ws_init_s"] = time.perf_counter() - t_ws0
                     try:
@@ -3091,7 +3318,7 @@ class GUGAFCISolver(_StreamObject):
                     else:
                         mixed_low_switch_reason = "no_epq_policy"
                 ws_cache_key_low = (ws_key, "float32")
-                cuda_ws_low = self._matvec_cuda_ws_cache.get(ws_cache_key_low)
+                cuda_ws_low = self._matvec_cuda_ws_cache_get(ws_cache_key_low)
                 low_ws_needs_rebuild = self._ws_needs_rebuild(
                     cuda_ws_low,
                     expected_dtype=np.float32,
@@ -3216,7 +3443,11 @@ class GUGAFCISolver(_StreamObject):
                             if oom:
                                 mixed_low_switch_reason = str(fallback_reason)
                             raise
-                    self._matvec_cuda_ws_cache[ws_cache_key_low] = cuda_ws_low
+                    self._matvec_cuda_ws_cache_put(
+                        ws_cache_key_low,
+                        cuda_ws_low,
+                        keep_keys=(ws_cache_key, ws_cache_key_low),
+                    )
                 else:
                     if kprof is not None:
                         kprof["matvec_cuda_ws_low_reused"] = True
@@ -3927,6 +4158,7 @@ class GUGAFCISolver(_StreamObject):
             self.eci, self.ci = float(e[0]), np.ascontiguousarray(ci[0])
             self._last_drt_key = drt_key
             if kprof is not None:
+                kprof.update(self._matvec_cuda_ws_cache_profile())
                 kprof["total_s"] = time.perf_counter() - t_kernel0
                 self._last_kernel_profile = kprof
                 if kernel_profile_print:
@@ -3936,6 +4168,7 @@ class GUGAFCISolver(_StreamObject):
         self.eci, self.ci = e, [np.ascontiguousarray(v) for v in ci]
         self._last_drt_key = drt_key
         if kprof is not None:
+            kprof.update(self._matvec_cuda_ws_cache_profile())
             kprof["total_s"] = time.perf_counter() - t_kernel0
             self._last_kernel_profile = kprof
             if kernel_profile_print:
@@ -4088,7 +4321,18 @@ class GUGAFCISolver(_StreamObject):
                         getattr(self, "matvec_cuda_mem_hard_cap_gib", 11.5),
                     )
                 )
+                approx_ws_cache_fraction = _normalize_ws_cache_fraction(
+                    kwargs.get(
+                        "matvec_cuda_ws_cache_fraction",
+                        getattr(self, "matvec_cuda_ws_cache_fraction", 0.2),
+                    )
+                )
                 _apply_cuda_pool_hard_cap(cp, float(approx_mem_hard_cap_gib))
+                self._configure_matvec_cuda_ws_cache(
+                    cp_mod=cp,
+                    hard_cap_gib=float(approx_mem_hard_cap_gib),
+                    fraction=float(approx_ws_cache_fraction),
+                )
                 orbsym = kwargs.get("orbsym", self.orbsym)
                 wfnsym = kwargs.get("wfnsym", self.wfnsym)
                 ne_constraints = kwargs.get("ne_constraints", getattr(self, "ne_constraints", None))
@@ -4550,7 +4794,7 @@ class GUGAFCISolver(_StreamObject):
                         matvec_cuda_cache_csr_tiles = bool(matvec_cuda_cache_csr_tiles)
 
                     ws_cache_key = (ws_key, str(approx_cuda_dtype))
-                    cuda_ws = self._matvec_cuda_ws_cache.get(ws_cache_key)
+                    cuda_ws = self._matvec_cuda_ws_cache_get(ws_cache_key)
                     want_max_g_bytes = int(matvec_cuda_max_g_mib * 1024 * 1024)
                     if self._ws_needs_rebuild(
                         cuda_ws,
@@ -4662,7 +4906,11 @@ class GUGAFCISolver(_StreamObject):
                                 cuda_ws = _init_cuda_ws(use_epq_table=False, max_g_bytes=int(want_max_g_bytes))
                             else:
                                 raise
-                        self._matvec_cuda_ws_cache[ws_cache_key] = cuda_ws
+                        self._matvec_cuda_ws_cache_put(
+                            ws_cache_key,
+                            cuda_ws,
+                            keep_keys=(ws_cache_key,),
+                        )
                     else:
                         ws_dtype_obj = np.dtype(getattr(cuda_ws, "dtype", np.float64))
                         cuda_ws.eri_mat = None if eri_mat_d is None else cp.ascontiguousarray(cp.asarray(eri_mat_d, dtype=ws_dtype_obj))
@@ -4927,6 +5175,25 @@ class GUGAFCISolver(_StreamObject):
             except Exception as e:  # pragma: no cover
                 raise RuntimeError("contract_2e backend 'cuda_eri_mat' requires CuPy") from e
 
+            contract_mem_hard_cap_gib = float(
+                kwargs.get(
+                    "matvec_cuda_mem_hard_cap_gib",
+                    getattr(self, "matvec_cuda_mem_hard_cap_gib", 11.5),
+                )
+            )
+            contract_ws_cache_fraction = _normalize_ws_cache_fraction(
+                kwargs.get(
+                    "matvec_cuda_ws_cache_fraction",
+                    getattr(self, "matvec_cuda_ws_cache_fraction", 0.2),
+                )
+            )
+            _apply_cuda_pool_hard_cap(cp, float(contract_mem_hard_cap_gib))
+            self._configure_matvec_cuda_ws_cache(
+                cp_mod=cp,
+                hard_cap_gib=float(contract_mem_hard_cap_gib),
+                fraction=float(contract_ws_cache_fraction),
+            )
+
             from asuka.cuda.cuda_backend import (  # noqa: PLC0415
                 GugaMatvecEriMatWorkspace,
                 has_cuda_ext,
@@ -4939,13 +5206,13 @@ class GUGAFCISolver(_StreamObject):
                     "CUDA extension not available; build with python -m asuka.build.guga_cuda_ext"
                 )
 
-            ws_key = drt_key
-            cuda_state = self._matvec_cuda_state_cache.get(ws_key)
+            ws_state_key = drt_key
+            cuda_state = self._matvec_cuda_state_cache.get(ws_state_key)
             if cuda_state is None:
                 drt_dev = make_device_drt(drt)
                 state_dev = make_device_state_cache(drt, drt_dev)
                 cuda_state = (drt_dev, state_dev)
-                self._matvec_cuda_state_cache[ws_key] = cuda_state
+                self._matvec_cuda_state_cache[ws_state_key] = cuda_state
             drt_dev, state_dev = cuda_state
 
             norb_i = int(drt.norb)
@@ -4955,10 +5222,12 @@ class GUGAFCISolver(_StreamObject):
             # for TF32 GEMM acceleration (used by AH orbital optimizer).
             _use_fp32 = bool(getattr(self, "matvec_cuda_fp32_coeff_data", False))
             _ws_dtype = cp.float32 if _use_fp32 else cp.float64
+            _ws_dtype_name = "float32" if _use_fp32 else "float64"
+            ws_key = (drt_key, str(_ws_dtype_name), "contract_2e")
 
             # Avoid repeated device uploads when PySCF calls absorb_h1e/contract_2e inside a fixed Hessian operator.
             integral_key = (id(eri), id(h1e))
-            cuda_ws = self._matvec_cuda_ws_cache.get(ws_key)
+            cuda_ws = self._matvec_cuda_ws_cache_get(ws_key)
             _path_mode_req = _normalize_matvec_cuda_path_mode(getattr(self, "matvec_cuda_path_mode", "auto"))
             if (
                 cuda_ws is None
@@ -5047,7 +5316,11 @@ class GUGAFCISolver(_StreamObject):
                         epq_build_j_tile=int(getattr(self, "matvec_cuda_epq_build_j_tile", 0)),
                         use_cuda_graph=bool(getattr(self, "matvec_cuda_use_graph", False)),
                     )
-                    self._matvec_cuda_ws_cache[ws_key] = cuda_ws
+                    self._matvec_cuda_ws_cache_put(
+                        ws_key,
+                        cuda_ws,
+                        keep_keys=(ws_key,),
+                    )
                 else:
                     cuda_ws.eri_mat = eri_mat_d
                     h_eff_flat_new = cuda_ws._as_h_eff_flat(h_eff_d)

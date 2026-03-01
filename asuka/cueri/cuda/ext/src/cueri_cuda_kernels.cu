@@ -770,6 +770,162 @@ __global__ void KernelScatterAddDFYTTiles(
   }
 }
 
+__global__ void KernelDFSymmetrizeMnQInplace(
+    double* arr_mnQ,  // shape (nao, nao, naux), C-order
+    int nao,
+    int naux) {
+  const int64_t stride = static_cast<int64_t>(blockDim.x) * static_cast<int64_t>(gridDim.x);
+  int64_t tid = static_cast<int64_t>(blockIdx.x) * static_cast<int64_t>(blockDim.x) + static_cast<int64_t>(threadIdx.x);
+  const int64_t total = static_cast<int64_t>(nao) * static_cast<int64_t>(nao) * static_cast<int64_t>(naux);
+  for (; tid < total; tid += stride) {
+    const int q = static_cast<int>(tid % static_cast<int64_t>(naux));
+    const int64_t mn = tid / static_cast<int64_t>(naux);
+    const int n = static_cast<int>(mn % static_cast<int64_t>(nao));
+    const int m = static_cast<int>(mn / static_cast<int64_t>(nao));
+    if (m >= n) continue;  // process each unordered AO pair exactly once
+
+    const int64_t idx_mn = (static_cast<int64_t>(m) * static_cast<int64_t>(nao) + static_cast<int64_t>(n)) *
+                               static_cast<int64_t>(naux) +
+                           static_cast<int64_t>(q);
+    const int64_t idx_nm = (static_cast<int64_t>(n) * static_cast<int64_t>(nao) + static_cast<int64_t>(m)) *
+                               static_cast<int64_t>(naux) +
+                           static_cast<int64_t>(q);
+    const double avg = 0.5 * (arr_mnQ[idx_mn] + arr_mnQ[idx_nm]);
+    arr_mnQ[idx_mn] = avg;
+    arr_mnQ[idx_nm] = avg;
+  }
+}
+
+__global__ void KernelDFSymmetrizeMnQToF32(
+    const double* in_mnQ,  // shape (nao, nao, naux), C-order
+    float* out_mnQ,        // shape (nao, nao, naux), C-order
+    int nao,
+    int naux) {
+  const int64_t stride = static_cast<int64_t>(blockDim.x) * static_cast<int64_t>(gridDim.x);
+  int64_t tid = static_cast<int64_t>(blockIdx.x) * static_cast<int64_t>(blockDim.x) + static_cast<int64_t>(threadIdx.x);
+  const int64_t total = static_cast<int64_t>(nao) * static_cast<int64_t>(nao) * static_cast<int64_t>(naux);
+  for (; tid < total; tid += stride) {
+    const int q = static_cast<int>(tid % static_cast<int64_t>(naux));
+    const int64_t mn = tid / static_cast<int64_t>(naux);
+    const int n = static_cast<int>(mn % static_cast<int64_t>(nao));
+    const int m = static_cast<int>(mn / static_cast<int64_t>(nao));
+    if (m > n) continue;  // process each unordered AO pair exactly once
+
+    const int64_t idx_mn = (static_cast<int64_t>(m) * static_cast<int64_t>(nao) + static_cast<int64_t>(n)) *
+                               static_cast<int64_t>(naux) +
+                           static_cast<int64_t>(q);
+    if (m == n) {
+      out_mnQ[idx_mn] = static_cast<float>(in_mnQ[idx_mn]);
+      continue;
+    }
+
+    const int64_t idx_nm = (static_cast<int64_t>(n) * static_cast<int64_t>(nao) + static_cast<int64_t>(m)) *
+                               static_cast<int64_t>(naux) +
+                           static_cast<int64_t>(q);
+    const double avg = 0.5 * (in_mnQ[idx_mn] + in_mnQ[idx_nm]);
+    const float favg = static_cast<float>(avg);
+    out_mnQ[idx_mn] = favg;
+    out_mnQ[idx_nm] = favg;
+  }
+}
+
+// Fused Qmn -> mnQ transpose + symmetrize.
+__global__ void KernelDFSymmetrizeQmnToMnQ(
+    const double* in_Qmn,  // shape (naux, nao, nao), C-order
+    double* out_mnQ,       // shape (nao, nao, naux), C-order
+    int naux,
+    int nao) {
+  const int64_t stride = static_cast<int64_t>(blockDim.x) * static_cast<int64_t>(gridDim.x);
+  int64_t tid = static_cast<int64_t>(blockIdx.x) * static_cast<int64_t>(blockDim.x) + static_cast<int64_t>(threadIdx.x);
+  const int64_t total = static_cast<int64_t>(nao) * static_cast<int64_t>(nao) * static_cast<int64_t>(naux);
+  for (; tid < total; tid += stride) {
+    const int q = static_cast<int>(tid % static_cast<int64_t>(naux));
+    const int64_t mn = tid / static_cast<int64_t>(naux);
+    const int n = static_cast<int>(mn % static_cast<int64_t>(nao));
+    const int m = static_cast<int>(mn / static_cast<int64_t>(nao));
+    if (m > n) continue;  // process each unordered AO pair exactly once
+
+    const int64_t idx_in_mn = (static_cast<int64_t>(q) * static_cast<int64_t>(nao) + static_cast<int64_t>(m)) *
+                                  static_cast<int64_t>(nao) +
+                              static_cast<int64_t>(n);
+    const int64_t idx_in_nm = (static_cast<int64_t>(q) * static_cast<int64_t>(nao) + static_cast<int64_t>(n)) *
+                                  static_cast<int64_t>(nao) +
+                              static_cast<int64_t>(m);
+    const double avg = 0.5 * (in_Qmn[idx_in_mn] + in_Qmn[idx_in_nm]);
+
+    const int64_t idx_out_mn = tid;  // ((m*nao + n)*naux + q)
+    const int64_t idx_out_nm = (static_cast<int64_t>(n) * static_cast<int64_t>(nao) + static_cast<int64_t>(m)) *
+                                   static_cast<int64_t>(naux) +
+                               static_cast<int64_t>(q);
+    out_mnQ[idx_out_mn] = avg;
+    out_mnQ[idx_out_nm] = avg;
+  }
+}
+
+// Fused Qmn -> mnQ transpose + symmetrize + cast to float32.
+__global__ void KernelDFSymmetrizeQmnToMnQToF32(
+    const double* in_Qmn,  // shape (naux, nao, nao), C-order
+    float* out_mnQ,        // shape (nao, nao, naux), C-order
+    int naux,
+    int nao) {
+  const int64_t stride = static_cast<int64_t>(blockDim.x) * static_cast<int64_t>(gridDim.x);
+  int64_t tid = static_cast<int64_t>(blockIdx.x) * static_cast<int64_t>(blockDim.x) + static_cast<int64_t>(threadIdx.x);
+  const int64_t total = static_cast<int64_t>(nao) * static_cast<int64_t>(nao) * static_cast<int64_t>(naux);
+  for (; tid < total; tid += stride) {
+    const int q = static_cast<int>(tid % static_cast<int64_t>(naux));
+    const int64_t mn = tid / static_cast<int64_t>(naux);
+    const int n = static_cast<int>(mn % static_cast<int64_t>(nao));
+    const int m = static_cast<int>(mn / static_cast<int64_t>(nao));
+    if (m > n) continue;  // process each unordered AO pair exactly once
+
+    const int64_t idx_in_mn = (static_cast<int64_t>(q) * static_cast<int64_t>(nao) + static_cast<int64_t>(m)) *
+                                  static_cast<int64_t>(nao) +
+                              static_cast<int64_t>(n);
+    const int64_t idx_out_mn = tid;  // ((m*nao + n)*naux + q)
+    if (m == n) {
+      out_mnQ[idx_out_mn] = static_cast<float>(in_Qmn[idx_in_mn]);
+      continue;
+    }
+
+    const int64_t idx_in_nm = (static_cast<int64_t>(q) * static_cast<int64_t>(nao) + static_cast<int64_t>(n)) *
+                                  static_cast<int64_t>(nao) +
+                              static_cast<int64_t>(m);
+    const double avg = 0.5 * (in_Qmn[idx_in_mn] + in_Qmn[idx_in_nm]);
+    const float favg = static_cast<float>(avg);
+    const int64_t idx_out_nm = (static_cast<int64_t>(n) * static_cast<int64_t>(nao) + static_cast<int64_t>(m)) *
+                                   static_cast<int64_t>(naux) +
+                               static_cast<int64_t>(q);
+    out_mnQ[idx_out_mn] = favg;
+    out_mnQ[idx_out_nm] = favg;
+  }
+}
+
+__global__ void KernelDFSymmetrizeQmnInplace(
+    double* arr_Qmn,  // shape (naux, nao, nao), C-order
+    int naux,
+    int nao) {
+  const int64_t stride = static_cast<int64_t>(blockDim.x) * static_cast<int64_t>(gridDim.x);
+  int64_t tid = static_cast<int64_t>(blockIdx.x) * static_cast<int64_t>(blockDim.x) + static_cast<int64_t>(threadIdx.x);
+  const int64_t total = static_cast<int64_t>(naux) * static_cast<int64_t>(nao) * static_cast<int64_t>(nao);
+  for (; tid < total; tid += stride) {
+    const int n = static_cast<int>(tid % static_cast<int64_t>(nao));
+    const int64_t qm = tid / static_cast<int64_t>(nao);
+    const int m = static_cast<int>(qm % static_cast<int64_t>(nao));
+    if (m >= n) continue;  // process each unordered AO pair exactly once
+    const int q = static_cast<int>(qm / static_cast<int64_t>(nao));
+
+    const int64_t idx_mn = (static_cast<int64_t>(q) * static_cast<int64_t>(nao) + static_cast<int64_t>(m)) *
+                               static_cast<int64_t>(nao) +
+                           static_cast<int64_t>(n);
+    const int64_t idx_nm = (static_cast<int64_t>(q) * static_cast<int64_t>(nao) + static_cast<int64_t>(n)) *
+                               static_cast<int64_t>(nao) +
+                           static_cast<int64_t>(m);
+    const double avg = 0.5 * (arr_Qmn[idx_mn] + arr_Qmn[idx_nm]);
+    arr_Qmn[idx_mn] = avg;
+    arr_Qmn[idx_nm] = avg;
+  }
+}
+
 }  // namespace
 
 extern "C" cudaError_t cueri_scatter_df_metric_tiles_launch_stream(
@@ -828,5 +984,78 @@ extern "C" cudaError_t cueri_scatter_add_df_yt_tiles_launch_stream(
   if (n == 0) return cudaSuccess;
   const int blocks = static_cast<int>((n + threads - 1) / threads);
   KernelScatterAddDFYTTiles<<<blocks, threads, 0, stream>>>(tile, p0, ntasks, naux, nops, nP, YT_out);
+  return cudaGetLastError();
+}
+
+extern "C" cudaError_t cueri_df_symmetrize_mnq_inplace_launch_stream(
+    double* arr_mnQ,
+    int nao,
+    int naux,
+    cudaStream_t stream,
+    int threads) {
+  if (nao < 0 || naux < 0 || threads <= 0) return cudaErrorInvalidValue;
+  const int64_t n = static_cast<int64_t>(nao) * static_cast<int64_t>(nao) * static_cast<int64_t>(naux);
+  if (n == 0) return cudaSuccess;
+  const int blocks = static_cast<int>((n + static_cast<int64_t>(threads) - 1) / static_cast<int64_t>(threads));
+  KernelDFSymmetrizeMnQInplace<<<blocks, threads, 0, stream>>>(arr_mnQ, nao, naux);
+  return cudaGetLastError();
+}
+
+extern "C" cudaError_t cueri_df_symmetrize_mnq_to_f32_launch_stream(
+    const double* in_mnQ,
+    float* out_mnQ,
+    int nao,
+    int naux,
+    cudaStream_t stream,
+    int threads) {
+  if (nao < 0 || naux < 0 || threads <= 0) return cudaErrorInvalidValue;
+  const int64_t n = static_cast<int64_t>(nao) * static_cast<int64_t>(nao) * static_cast<int64_t>(naux);
+  if (n == 0) return cudaSuccess;
+  const int blocks = static_cast<int>((n + static_cast<int64_t>(threads) - 1) / static_cast<int64_t>(threads));
+  KernelDFSymmetrizeMnQToF32<<<blocks, threads, 0, stream>>>(in_mnQ, out_mnQ, nao, naux);
+  return cudaGetLastError();
+}
+
+extern "C" cudaError_t cueri_df_symmetrize_qmn_inplace_launch_stream(
+    double* arr_Qmn,
+    int naux,
+    int nao,
+    cudaStream_t stream,
+    int threads) {
+  if (naux < 0 || nao < 0 || threads <= 0) return cudaErrorInvalidValue;
+  const int64_t n = static_cast<int64_t>(naux) * static_cast<int64_t>(nao) * static_cast<int64_t>(nao);
+  if (n == 0) return cudaSuccess;
+  const int blocks = static_cast<int>((n + static_cast<int64_t>(threads) - 1) / static_cast<int64_t>(threads));
+  KernelDFSymmetrizeQmnInplace<<<blocks, threads, 0, stream>>>(arr_Qmn, naux, nao);
+  return cudaGetLastError();
+}
+
+extern "C" cudaError_t cueri_df_symmetrize_qmn_to_mnq_launch_stream(
+    const double* in_Qmn,
+    double* out_mnQ,
+    int naux,
+    int nao,
+    cudaStream_t stream,
+    int threads) {
+  if (naux < 0 || nao < 0 || threads <= 0) return cudaErrorInvalidValue;
+  const int64_t n = static_cast<int64_t>(naux) * static_cast<int64_t>(nao) * static_cast<int64_t>(nao);
+  if (n == 0) return cudaSuccess;
+  const int blocks = static_cast<int>((n + static_cast<int64_t>(threads) - 1) / static_cast<int64_t>(threads));
+  KernelDFSymmetrizeQmnToMnQ<<<blocks, threads, 0, stream>>>(in_Qmn, out_mnQ, naux, nao);
+  return cudaGetLastError();
+}
+
+extern "C" cudaError_t cueri_df_symmetrize_qmn_to_mnq_to_f32_launch_stream(
+    const double* in_Qmn,
+    float* out_mnQ,
+    int naux,
+    int nao,
+    cudaStream_t stream,
+    int threads) {
+  if (naux < 0 || nao < 0 || threads <= 0) return cudaErrorInvalidValue;
+  const int64_t n = static_cast<int64_t>(naux) * static_cast<int64_t>(nao) * static_cast<int64_t>(nao);
+  if (n == 0) return cudaSuccess;
+  const int blocks = static_cast<int>((n + static_cast<int64_t>(threads) - 1) / static_cast<int64_t>(threads));
+  KernelDFSymmetrizeQmnToMnQToF32<<<blocks, threads, 0, stream>>>(in_Qmn, out_mnQ, naux, nao);
   return cudaGetLastError();
 }

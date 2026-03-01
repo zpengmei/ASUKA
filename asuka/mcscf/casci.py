@@ -391,13 +391,15 @@ def _build_casci_df_integrals(
         if bool(_is_gpu):
             import cupy as cp  # type: ignore
 
+            # Memory-critical: avoid materializing a full contiguous BQ copy
+            # (naux,nao,nao), which can be ~10GB for cc-pVTZ-sized systems.
             B_mnQ = cp.asarray(B, dtype=cp.float64)
-            BQ = cp.ascontiguousarray(B_mnQ.transpose((2, 0, 1)))
-            Jc = df_jk.df_J_from_BQ_D(BQ, D_core)
+            B2 = B_mnQ.reshape((int(nao) * int(nao), int(B_mnQ.shape[2])))
+            Jc = df_jk.df_J_from_B2_D(B2, D_core)
             Jc = 0.5 * (Jc + Jc.T)
             Cc = cp.ascontiguousarray(C_core)
             occ_vals = cp.full((int(ncore),), 2.0, dtype=cp.float64)
-            Kc = df_jk.df_K_from_BQ_Cocc(BQ, Cc, occ_vals, q_block=128)
+            Kc = df_jk.df_K_from_BmnQ_Cocc(B_mnQ, Cc, occ_vals, q_block=128)
         else:
             Jc, Kc = _df_scf._df_JK(B, D_core, want_J=True, want_K=True)  # noqa: SLF001
         vhf_core = Jc - 0.5 * Kc
@@ -415,16 +417,20 @@ def _build_casci_df_integrals(
     if profile is not None:
         eri_prof = profile.setdefault("active_df", {})
 
-    # cuERI builder works in Cartesian AO space -- transform MO coefficients
-    # from spherical to Cartesian when mol.cart=False.
+    # cuERI streamed DF builds 3c2e factors in *Cartesian* AO space. Historically
+    # we therefore transformed C_active to Cartesian when mol.cart=False.
+    #
+    # However, when SCF already provides cached *whitened* AO DF factors `B` in
+    # spherical AO space, we can build the active-space DF objects directly from
+    # (B, C_active) without any Cartesian rebuild. This is both faster and
+    # critical for VRAM: rebuilding the Cartesian AO DF tensor can be >10GB for
+    # cc-pVTZ-sized systems and can OOM 24GB GPUs.
     C_cas_for_eri = C_cas
     cached_b_for_eri = cached_b_whitened_use
     sph_map = getattr(scf_out, "sph_map", None)
-    if sph_map is not None:
+    if sph_map is not None and cached_b_for_eri is None:
         T_c2s = xp.asarray(sph_map[0], dtype=xp.float64)  # (nao_cart, nao_sph)
         C_cas_for_eri = T_c2s @ C_cas  # (nao_cart, ncas)
-        # Spherical-basis cached B cannot be reused in Cartesian cuERI builder
-        cached_b_for_eri = None
 
     eri = build_device_dfmo_integrals_cueri_df(
         scf_out.ao_basis,

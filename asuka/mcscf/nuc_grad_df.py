@@ -166,7 +166,260 @@ def _apply_df_pool_policy(B_ao: Any, *, label: str = ""):
     return _restore
 
 
-def _symmetrize_bar_L_inplace(bar, xp, nchunks: int = 4) -> None:
+def _normalize_bool_env(value: str | None, *, default: bool) -> bool:
+    if value is None:
+        return bool(default)
+    sval = str(value).strip().lower()
+    if sval in ("1", "true", "yes", "on", "enable", "enabled"):
+        return True
+    if sval in ("0", "false", "no", "off", "disable", "disabled"):
+        return False
+    return bool(default)
+
+
+def _normalize_sym_kernel_mode(value: str | None) -> str:
+    mode = str(value or "auto").strip().lower()
+    if mode in ("1", "true", "yes", "on", "enable", "enabled", "force"):
+        return "on"
+    if mode in ("0", "false", "no", "off", "disable", "disabled"):
+        return "off"
+    return "auto"
+
+
+def _prefer_sym_kernel(*, arr_nbytes: int, nchunks: int) -> bool:
+    mode = _normalize_sym_kernel_mode(_os.environ.get("ASUKA_DF_SYM_KERNEL"))
+    if mode == "on":
+        return True
+    if mode == "off":
+        return False
+    try:
+        import cupy as cp  # noqa: PLC0415
+
+        free_b, _ = cp.cuda.runtime.memGetInfo()
+    except Exception:
+        return False
+    tmp_b = max(1, int(arr_nbytes) // max(1, int(nchunks)))
+    margin_b = max(int(768 * 1024**2), tmp_b // 4)
+    return int(free_b) < int(tmp_b + margin_b)
+
+
+def _normalize_fused_contract_precision(value: str | None) -> str:
+    mode = str(value or "fp64").strip().lower()
+    if mode in ("tf32",):
+        return "tf32"
+    if mode in ("fp32_acc64", "fp32-acc64", "fp32acc64", "mixed_fp32_acc64"):
+        return "fp32_acc64"
+    return "fp64"
+
+
+def _normalize_barl_fused_mode(value: str | None) -> str:
+    mode = str(value or "auto").strip().lower()
+    if mode in ("", "auto"):
+        return "auto"
+    if mode in ("1", "true", "yes", "on", "enable", "enabled"):
+        return "on"
+    if mode in ("0", "false", "no", "off", "disable", "disabled"):
+        return "off"
+    return "auto"
+
+
+def _normalize_barl_stage(value: str | None) -> str:
+    stage = str(value or "").strip().lower()
+    if stage in ("tf32",):
+        return "tf32"
+    if stage in ("fp32_acc64", "fp32-acc64", "fp32acc64", "mixed_fp32_acc64"):
+        return "fp32_acc64"
+    if stage in ("fp64", "double", "f64"):
+        return "fp64"
+    return ""
+
+
+def _parse_barl_stage_ladder(value: str | None) -> tuple[str, ...]:
+    raw = str(value or "tf32,fp32_acc64,fp64").strip()
+    out: list[str] = []
+    for tok in raw.split(","):
+        st = _normalize_barl_stage(tok)
+        if st and st not in out:
+            out.append(st)
+    if "fp64" not in out:
+        out.append("fp64")
+    if not out:
+        out = ["fp64"]
+    return tuple(out)
+
+
+def _barl_stage_dtypes(xp: Any, stage: str) -> tuple[Any, Any]:
+    stage_n = _normalize_barl_stage(stage)
+    if stage_n == "tf32":
+        return xp.float32, xp.float32
+    if stage_n == "fp32_acc64":
+        return xp.float32, xp.float64
+    return xp.float64, xp.float64
+
+
+def _resolve_barl_hybrid(
+    *,
+    xp: Any,
+    is_gpu: bool,
+    naux_hint: int,
+) -> dict[str, Any]:
+    fused_mode = _normalize_barl_fused_mode(_os.environ.get("ASUKA_DF_BARL_FUSED"))
+    hybrid_mode = str(_os.environ.get("ASUKA_DF_HYBRID_MODE", "off")).strip().lower()
+    enabled = bool(is_gpu) and fused_mode != "off" and hybrid_mode in (
+        "aggressive",
+        "on",
+        "1",
+        "true",
+        "yes",
+        "enable",
+        "enabled",
+    )
+    ladder = _parse_barl_stage_ladder(_os.environ.get("ASUKA_DF_HYBRID_LADDER"))
+    # When hybrid mode is disabled, default to fp64 end-to-end. Low-precision
+    # bar_L without a matching low-precision adjoint path can *increase* peak
+    # VRAM due to implicit fp32->fp64 casts inside the DF contraction.
+    if not bool(enabled):
+        ladder = ("fp64",)
+
+    ab_check = _normalize_bool_env(_os.environ.get("ASUKA_DF_BARL_AB_CHECK"), default=True)
+    try:
+        ab_tol = float(_os.environ.get("ASUKA_DF_BARL_AB_TOL", _os.environ.get("ASUKA_DF_HYBRID_ERROR_ATOL", "1e-6")))
+    except Exception:
+        ab_tol = 1e-6
+    ab_tol = max(0.0, float(ab_tol))
+    warn = _normalize_bool_env(_os.environ.get("ASUKA_DF_HYBRID_WARN"), default=True)
+    _qblock_env = _os.environ.get("ASUKA_DF_BARL_FUSED_QBLOCK")
+    try:
+        qblock = int(_qblock_env) if _qblock_env is not None else 0
+    except Exception:
+        qblock = 0
+    qblock_source = "env" if _qblock_env is not None else "auto_naux"
+    if qblock <= 0:
+        qblock = max(1, int(naux_hint) // 8)
+
+    stage0 = str(ladder[0])
+    work_dtype, out_dtype = _barl_stage_dtypes(xp, stage0)
+    return {
+        "enabled": bool(enabled),
+        "fused_mode": str(fused_mode),
+        "ladder": tuple(ladder),
+        "stage_index": 0,
+        "stage": stage0,
+        "work_dtype": work_dtype,
+        "out_dtype": out_dtype,
+        "ab_check": bool(ab_check),
+        "ab_tol": float(ab_tol),
+        "warn": bool(warn),
+        "qblock": int(qblock),
+        "qblock_source": str(qblock_source),
+        "calibrated": False,
+    }
+
+
+def _advance_barl_stage(policy: dict[str, Any], xp: Any) -> None:
+    ladder = tuple(policy.get("ladder", ("fp64",)))
+    idx = int(policy.get("stage_index", 0))
+    idx = min(max(0, idx + 1), max(0, len(ladder) - 1))
+    stage = str(ladder[idx]) if ladder else "fp64"
+    work_dtype, out_dtype = _barl_stage_dtypes(xp, stage)
+    policy["stage_index"] = int(idx)
+    policy["stage"] = str(stage)
+    policy["work_dtype"] = work_dtype
+    policy["out_dtype"] = out_dtype
+
+
+def _auto_qblock_for_aux_tile(
+    *,
+    nao: int,
+    naux: int,
+    itemsize: int,
+    target_bytes: int | None = None,
+) -> int:
+    """Choose an aux chunk size so (qblock, nao, nao) temporaries fit in VRAM.
+
+    Several bar_L builders allocate intermediates shaped (qblock, nao, nao).
+    For large bases this can exceed VRAM even when the final bar_L fits.
+    """
+    nao = int(nao)
+    naux = int(naux)
+    itemsize = int(itemsize)
+    if target_bytes is None:
+        try:
+            target_mb = int(_os.environ.get("ASUKA_DF_TILE_AUX_TARGET_MB", "256"))
+        except Exception:
+            target_mb = 256
+        target_mb = max(16, int(target_mb))
+        target_bytes = int(target_mb) * 1024**2
+    target_bytes = max(1, int(target_bytes))
+    denom = max(1, int(nao) * int(nao) * int(itemsize))
+    q = int(target_bytes // denom)
+    q = max(1, min(int(naux), int(q)))
+    return int(q)
+
+
+_BARL_COULOMB_ADD_KERNELS: dict[str, Any] = {}
+
+
+def _barl_coulomb_add_inplace(
+    bar_Qmn: Any,
+    *,
+    a_Q: Any,
+    M1_mn: Any,
+    b_Q: Any,
+    M2_mn: Any,
+    xp: Any,
+) -> Any:
+    """In-place: bar[Q,m,n] += a[Q]*M1[m,n] + b[Q]*M2[m,n]."""
+    if xp is np:
+        bar_Qmn += a_Q[:, None, None] * M1_mn[None, :, :] + b_Q[:, None, None] * M2_mn[None, :, :]
+        return bar_Qmn
+
+    import cupy as cp  # noqa: PLC0415
+
+    bar = cp.asarray(bar_Qmn)
+    if not bool(getattr(bar, "flags", None).c_contiguous):
+        bar = cp.ascontiguousarray(bar)
+    dt = cp.dtype(bar.dtype)
+    if dt not in (cp.dtype(cp.float32), cp.dtype(cp.float64)):
+        raise ValueError("bar_L Coulomb kernel supports only float32/float64")
+
+    a = cp.asarray(a_Q, dtype=dt).ravel()
+    b = cp.asarray(b_Q, dtype=dt).ravel()
+    m1 = cp.asarray(M1_mn, dtype=dt).ravel()
+    m2 = cp.asarray(M2_mn, dtype=dt).ravel()
+
+    naux = int(bar.shape[0])
+    nao = int(bar.shape[1])
+    nao2 = int(nao * nao)
+    if int(a.size) != naux or int(b.size) != naux:
+        raise ValueError("a_Q/b_Q length mismatch")
+    if int(m1.size) != nao2 or int(m2.size) != nao2:
+        raise ValueError("M1/M2 shape mismatch")
+
+    key = str(dt)
+    k = _BARL_COULOMB_ADD_KERNELS.get(key)
+    if k is None:
+        if dt == cp.dtype(cp.float32):
+            k = cp.ElementwiseKernel(
+                "raw float32 a, raw float32 m1, raw float32 b, raw float32 m2, int64 nao2",
+                "float32 y",
+                "const long long q = (long long)(i / nao2); const long long mn = (long long)(i - q * nao2); y += a[q] * m1[mn] + b[q] * m2[mn];",
+                "asuka_barl_coulomb_add_f32",
+            )
+        else:
+            k = cp.ElementwiseKernel(
+                "raw float64 a, raw float64 m1, raw float64 b, raw float64 m2, int64 nao2",
+                "float64 y",
+                "const long long q = (long long)(i / nao2); const long long mn = (long long)(i - q * nao2); y += a[q] * m1[mn] + b[q] * m2[mn];",
+                "asuka_barl_coulomb_add_f64",
+            )
+        _BARL_COULOMB_ADD_KERNELS[key] = k
+
+    k(a, m1, b, m2, int(nao2), bar.reshape(-1))
+    return bar
+
+
+def _symmetrize_bar_L_inplace(bar, xp, nchunks: int | None = None) -> None:
     """Compute bar = 0.5 * (bar + bar^T) in-place, chunked over the aux index.
 
     This avoids allocating a full (naux, nao, nao) temporary for the transpose,
@@ -174,6 +427,36 @@ def _symmetrize_bar_L_inplace(bar, xp, nchunks: int = 4) -> None:
     The (0, 2, 1) transpose swaps the last two (AO) dims independently per Q-slice,
     so chunking over Q is safe.
     """
+    if nchunks is None:
+        try:
+            nchunks = int(_os.environ.get("ASUKA_DF_SYM_CHUNKS", "4"))
+        except Exception:
+            nchunks = 4
+    nchunks = max(1, int(nchunks))
+
+    # CUDA fast path: use extension kernel to avoid transpose-copy temporaries.
+    if xp is not np:
+        try:
+            import cupy as cp  # noqa: PLC0415
+
+            if xp is cp and isinstance(bar, cp.ndarray) and int(bar.ndim) == 3:
+                naux_i, nao0, nao1 = map(int, bar.shape)
+                if nao0 == nao1 and bar.dtype == cp.float64 and bool(getattr(bar, "flags", None).c_contiguous):
+                    if _prefer_sym_kernel(arr_nbytes=int(bar.nbytes), nchunks=int(nchunks)):
+                        from asuka.cueri import _cueri_cuda_ext as _ext  # noqa: PLC0415
+
+                        _ext.df_symmetrize_qmn_inplace_device(
+                            bar.reshape(-1),
+                            int(naux_i),
+                            int(nao0),
+                            256,
+                            int(cp.cuda.get_current_stream().ptr),
+                            False,
+                        )
+                        return
+        except Exception:
+            pass
+
     naux = int(bar.shape[0])
     _chunk = max(1, naux // nchunks)
     for _q0 in range(0, naux, _chunk):
@@ -332,6 +615,139 @@ def _mol_coords_charges_bohr(mol: Any) -> tuple[np.ndarray, np.ndarray]:
     return coords, charges
 
 
+_GPU_PRECISION_POLICIES = ("fp64", "mixed_conservative", "mixed_aggressive")
+
+
+@dataclass(frozen=True)
+class GpuRuntimeConfig:
+    memory_cap_gb: float | None = None
+    workspace_cache_fraction: float | None = None
+    precision_policy: str | None = None
+    fused_df: bool | None = None
+    fused_matvec: bool | None = None
+    krylov_recycle_max_vectors: int | None = None
+    tile_aux: int = 0
+    tile_rows: int = 0
+
+
+def _parse_env_float(name: str) -> float | None:
+    raw = _os.environ.get(name)
+    if raw is None:
+        return None
+    try:
+        val = float(raw)
+    except Exception:
+        return None
+    if not np.isfinite(val):
+        return None
+    return float(val)
+
+
+def _parse_env_int(name: str) -> int | None:
+    raw = _os.environ.get(name)
+    if raw is None:
+        return None
+    try:
+        return int(raw)
+    except Exception:
+        return None
+
+
+def _normalize_precision_policy(value: str | None) -> str | None:
+    if value is None:
+        return None
+    mode = str(value).strip().lower()
+    aliases = {
+        "off": "fp64",
+        "none": "fp64",
+        "double": "fp64",
+        "conservative": "mixed_conservative",
+        "balanced": "mixed_conservative",
+        "aggressive": "mixed_aggressive",
+        "mixed": "mixed_conservative",
+    }
+    mode = aliases.get(mode, mode)
+    if mode not in _GPU_PRECISION_POLICIES:
+        return None
+    return mode
+
+
+def _normalize_ws_cache_fraction_local(value: float | None) -> float | None:
+    if value is None:
+        return None
+    if not np.isfinite(value):
+        return None
+    return float(max(0.0, min(0.8, float(value))))
+
+
+def _resolve_gpu_runtime_config() -> GpuRuntimeConfig:
+    memory_cap = _parse_env_float("ASUKA_GPU_MEM_CAP_GB")
+    ws_cache_frac = _normalize_ws_cache_fraction_local(_parse_env_float("ASUKA_GPU_WS_CACHE_FRAC"))
+    precision_policy = _normalize_precision_policy(_os.environ.get("ASUKA_GPU_PRECISION_POLICY"))
+
+    fused_df = None
+    if _os.environ.get("ASUKA_GPU_FUSED_DF") is not None:
+        fused_df = _normalize_bool_env(_os.environ.get("ASUKA_GPU_FUSED_DF"), default=False)
+
+    fused_matvec = None
+    if _os.environ.get("ASUKA_GPU_FUSED_MATVEC") is not None:
+        fused_matvec = _normalize_bool_env(_os.environ.get("ASUKA_GPU_FUSED_MATVEC"), default=True)
+
+    recycle_max = _parse_env_int("ASUKA_GPU_KRYLOV_RECYCLE_MAX")
+    if recycle_max is not None and recycle_max <= 0:
+        recycle_max = None
+
+    tile_aux = _parse_env_int("ASUKA_GPU_TILE_AUX")
+    if tile_aux is None:
+        tile_aux = 0
+    tile_rows = _parse_env_int("ASUKA_GPU_TILE_ROWS")
+    if tile_rows is None:
+        tile_rows = 0
+
+    return GpuRuntimeConfig(
+        memory_cap_gb=memory_cap,
+        workspace_cache_fraction=ws_cache_frac,
+        precision_policy=precision_policy,
+        fused_df=fused_df,
+        fused_matvec=fused_matvec,
+        krylov_recycle_max_vectors=recycle_max,
+        tile_aux=max(0, int(tile_aux)),
+        tile_rows=max(0, int(tile_rows)),
+    )
+
+
+def _apply_gpu_runtime_config_to_solver(fcisolver: Any, cfg: GpuRuntimeConfig) -> None:
+    if cfg.memory_cap_gb is not None:
+        setattr(fcisolver, "matvec_cuda_memory_cap_gib", float(cfg.memory_cap_gb))
+        setattr(fcisolver, "matvec_cuda_mem_hard_cap_gib", float(cfg.memory_cap_gb))
+    if cfg.workspace_cache_fraction is not None:
+        setattr(fcisolver, "matvec_cuda_ws_cache_fraction", float(cfg.workspace_cache_fraction))
+    if cfg.tile_rows > 0:
+        setattr(fcisolver, "matvec_cuda_j_tile", int(cfg.tile_rows))
+    if cfg.fused_matvec is not None:
+        setattr(fcisolver, "matvec_cuda_use_fused_hop", bool(cfg.fused_matvec))
+        if bool(cfg.fused_matvec):
+            setattr(fcisolver, "matvec_cuda_path_mode", "fused_epq_hybrid")
+        else:
+            setattr(fcisolver, "matvec_cuda_path_mode", "epq_blocked")
+
+    if cfg.precision_policy == "fp64":
+        setattr(fcisolver, "matvec_cuda_dtype", "float64")
+        setattr(fcisolver, "approx_cuda_dtype", "float64")
+    elif cfg.precision_policy == "mixed_conservative":
+        setattr(fcisolver, "matvec_cuda_dtype", "mixed")
+        setattr(fcisolver, "approx_cuda_dtype", "float32")
+        setattr(fcisolver, "matvec_cuda_mixed_threshold", 1e-3)
+        setattr(fcisolver, "matvec_cuda_mixed_low_precision_max_iter", 1)
+        setattr(fcisolver, "matvec_cuda_mixed_force_final_full_hop", True)
+    elif cfg.precision_policy == "mixed_aggressive":
+        setattr(fcisolver, "matvec_cuda_dtype", "mixed")
+        setattr(fcisolver, "approx_cuda_dtype", "float32")
+        setattr(fcisolver, "matvec_cuda_mixed_threshold", 1e-6)
+        setattr(fcisolver, "matvec_cuda_mixed_low_precision_max_iter", 4)
+        setattr(fcisolver, "matvec_cuda_mixed_force_final_full_hop", True)
+        setattr(fcisolver, "matvec_cuda_gemm_backend", "cublaslt_tf32")
+
 @dataclass(frozen=True)
 class DFNucGradResult:
     """Container for a DF-based nuclear gradient.
@@ -477,12 +893,20 @@ def _build_dme0_lorb_response(
     *,
     ncore: int,
     ncas: int,
+    vhf_cache: dict | None = None,
 ) -> np.ndarray:
     """Compute response energy-weighted density from orbital Lagrange multiplier.
 
     Follows PySCF's ``Lorb_dot_dgorb_dx`` gfock construction.
     Returns ``dme0 = 0.5*(gfock + gfock^T)`` in AO-like basis (nao, nao).
     GPU-aware: keeps J/K builds on device when inputs are CuPy arrays.
+
+    Parameters
+    ----------
+    vhf_cache : dict, optional
+        Precomputed root-invariant J/K results. Keys: ``"vhf_c"``, ``"vhf_a"``.
+        When provided, skips the 2 root-invariant ``_df_JK`` calls (Jc/Kc from
+        D_core and Ja/Ka from D_act), saving ~40% of per-root DF work.
     """
     xp, _ = _get_xp_arrays(B_ao, h_ao)
 
@@ -518,8 +942,15 @@ def _build_dme0_lorb_response(
     D_L = D_L_core + D_L_act
 
     # J/K builds using DF (GPU-aware via _df_JK xp dispatch).
-    Jc, Kc = _df_scf._df_JK(B_x, D_core, want_J=True, want_K=True)  # noqa: SLF001
-    Ja, Ka = _df_scf._df_JK(B_x, D_act, want_J=True, want_K=True)  # noqa: SLF001
+    # Use cached root-invariant Jc/Kc and Ja/Ka when available.
+    if vhf_cache is not None and "vhf_c" in vhf_cache and "vhf_a" in vhf_cache:
+        vhf_c = vhf_cache["vhf_c"]
+        vhf_a = vhf_cache["vhf_a"]
+    else:
+        Jc, Kc = _df_scf._df_JK(B_x, D_core, want_J=True, want_K=True)  # noqa: SLF001
+        Ja, Ka = _df_scf._df_JK(B_x, D_act, want_J=True, want_K=True)  # noqa: SLF001
+        vhf_c = Jc - 0.5 * Kc
+        vhf_a = Ja - 0.5 * Ka
     if ncore:
         JcL, KcL = _df_scf._df_JK(B_x, D_L_core, want_J=True, want_K=True)  # noqa: SLF001
     else:
@@ -527,8 +958,6 @@ def _build_dme0_lorb_response(
         KcL = xp.zeros((nao, nao), dtype=xp.float64)
     JaL, KaL = _df_scf._df_JK(B_x, D_L_act, want_J=True, want_K=True)  # noqa: SLF001
 
-    vhf_c = Jc - 0.5 * Kc
-    vhf_a = Ja - 0.5 * Ka
     vhfL_c = JcL - 0.5 * KcL
     vhfL_a = JaL - 0.5 * KaL
 
@@ -581,6 +1010,9 @@ def _build_bar_L_casscf_df(
     dm2_act: np.ndarray,
     L_act: Any | None = None,
     rho_core: Any | None = None,
+    work_dtype: Any | None = None,
+    out_dtype: Any | None = None,
+    qblock: int | None = None,
 ) -> np.ndarray:
     """Return bar_L_ao[Q,μ,ν] = ∂E_2e/∂B[μ,ν,Q] for DF-CASSCF.
 
@@ -612,15 +1044,17 @@ def _build_bar_L_casscf_df(
     """
 
     xp, _ = _get_xp_arrays(B_ao, D_core_ao, D_act_ao, C_act, dm2_act, L_act, rho_core)
-    B_ao = xp.asarray(B_ao, dtype=xp.float64)
+    _wd = xp.float64 if work_dtype is None else work_dtype
+    _od = xp.float64 if out_dtype is None else out_dtype
+    B_ao = xp.asarray(B_ao, dtype=_wd)
     if B_ao.ndim != 3:
         raise ValueError("B_ao must have shape (nao, nao, naux)")
     nao, nao1, naux = map(int, B_ao.shape)
     if nao != nao1:
         raise ValueError("B_ao must have shape (nao, nao, naux)")
 
-    D_core_ao = xp.asarray(D_core_ao, dtype=xp.float64)
-    D_act_ao = xp.asarray(D_act_ao, dtype=xp.float64)
+    D_core_ao = xp.asarray(D_core_ao, dtype=_wd)
+    D_act_ao = xp.asarray(D_act_ao, dtype=_wd)
     if D_core_ao.shape != (nao, nao) or D_act_ao.shape != (nao, nao):
         raise ValueError("AO density shape mismatch")
 
@@ -632,43 +1066,49 @@ def _build_bar_L_casscf_df(
     if rho_core is None:
         rho = B2.T @ D_core_ao.reshape(nao * nao)  # (naux,)
     else:
-        rho = xp.asarray(rho_core, dtype=xp.float64)
+        rho = xp.asarray(rho_core, dtype=_wd)
         if rho.shape != (naux,):
             raise ValueError("rho_core shape mismatch")
     sigma = B2.T @ D_w.reshape(nao * nao)  # (naux,)
 
-    # Fused bar_J + bar_K: avoids separate (naux,nao,nao) allocations for
-    # bar_J, t1, t2, bar_K.  Peak is now 2× sizeof(B) instead of ~6×.
+    # Coulomb-like part without materializing full-size broadcast temporaries.
     _log_vram("    casscf_df: before bar_mean")
-    bar_mean = sigma[:, None, None] * D_core_ao[None, :, :]
-    bar_mean += rho[:, None, None] * D_w[None, :, :]
+    bar_mean = xp.zeros((naux, nao, nao), dtype=_od)
+    _barl_coulomb_add_inplace(
+        bar_mean,
+        a_Q=sigma,
+        M1_mn=D_core_ao,
+        b_Q=rho,
+        M2_mn=D_w,
+        xp=xp,
+    )
     _log_vram("    casscf_df: after bar_mean J")
 
     BQ = xp.transpose(B_ao, (2, 0, 1))  # (naux,nao,nao) — view, no copy
     # Chunk over aux index so intermediates are (chunk,nao,nao) instead of
     # (naux,nao,nao), reducing peak VRAM by ~2×sizeof(B).
-    _chunk = max(1, naux // 4)
+    _chunk = int(max(1, qblock if qblock is not None else (naux // 4)))
     for _q0 in range(0, naux, _chunk):
         _q1 = min(_q0 + _chunk, naux)
         _bq = BQ[_q0:_q1]
         _t = xp.matmul(xp.matmul(D_core_ao[None, :, :], _bq), D_w)
         _t += xp.matmul(xp.matmul(D_w[None, :, :], _bq), D_core_ao)
         _t *= -0.5
-        bar_mean[_q0:_q1] += _t
+        bar_mean[_q0:_q1] += _t.astype(_od, copy=False)
         del _t
     _log_vram("    casscf_df: after exchange")
 
     # Active-active 2-RDM term:
     #   E_aa = 0.5 Σ_{uvwx} dm2_uvwx (uv|wx)
     # with (uv|wx) ≈ Σ_Q L_uv,Q L_wx,Q and L_uv,Q = C^T B_Q C in active MO space.
-    C_act = xp.asarray(C_act, dtype=xp.float64)
+    C_act = xp.asarray(C_act, dtype=_wd)
     if C_act.ndim != 2 or int(C_act.shape[0]) != int(nao):
         raise ValueError("C_act shape mismatch")
     ncas = int(C_act.shape[1])
     if ncas <= 0:
         raise ValueError("empty active space")
 
-    dm2_arr = xp.asarray(dm2_act, dtype=xp.float64)
+    dm2_arr = xp.asarray(dm2_act, dtype=_wd)
     if dm2_arr.shape != (ncas, ncas, ncas, ncas):
         raise ValueError("dm2_act shape mismatch")
 
@@ -677,7 +1117,7 @@ def _build_bar_L_casscf_df(
         X = xp.einsum("mnQ,nv->mvQ", B_ao, C_act, optimize=True)
         L_act = xp.einsum("mu,mvQ->uvQ", C_act, X, optimize=True)  # (ncas,ncas,naux)
     else:
-        L_act = xp.asarray(L_act, dtype=xp.float64)
+        L_act = xp.asarray(L_act, dtype=_wd)
         if L_act.shape != (ncas, ncas, naux):
             raise ValueError("L_act shape mismatch")
 
@@ -689,16 +1129,18 @@ def _build_bar_L_casscf_df(
 
     tmp = xp.einsum("mu,uvQ->mvQ", C_act, M_uvQ, optimize=True)  # (nao,ncas,naux)
     # Accumulate bar_act into bar_mean in chunks to avoid sizeof_B temporary.
-    _chunk = max(1, naux // 4)
+    _chunk = int(max(1, qblock if qblock is not None else (naux // 4)))
     for _q0 in range(0, naux, _chunk):
         _q1 = min(_q0 + _chunk, naux)
-        bar_mean[_q0:_q1] += xp.einsum("mvQ,nv->Qmn", tmp[:, :, _q0:_q1], C_act, optimize=True)
+        _blk = xp.einsum("mvQ,nv->Qmn", tmp[:, :, _q0:_q1], C_act, optimize=True)
+        bar_mean[_q0:_q1] += _blk.astype(_od, copy=False)
+        del _blk
     del tmp
     _log_vram("    casscf_df: after bar_act")
 
     _symmetrize_bar_L_inplace(bar_mean, xp)
     _log_vram("    casscf_df: after sym")
-    return xp.asarray(bar_mean, dtype=xp.float64)
+    return xp.asarray(bar_mean, dtype=_od)
 
 
 def _build_bar_L_delta_casscf_df(
@@ -710,6 +1152,11 @@ def _build_bar_L_delta_casscf_df(
     dm2_delta: Any,
     rho_core: Any,
     L2: Any,
+    out: Any | None = None,
+    symmetrize: bool = True,
+    work_dtype: Any | None = None,
+    out_dtype: Any | None = None,
+    qblock: int | None = None,
 ) -> Any:
     """Return Hellmann–Feynman DF derivative delta ``bar_L_K - bar_L_SA``.
 
@@ -720,14 +1167,16 @@ def _build_bar_L_delta_casscf_df(
     contributions cancel exactly in the delta.
     """
 
-    xp, _ = _get_xp_arrays(B_ao, D_core_ao, C_act, dm1_delta, dm2_delta, rho_core, L2)
-    B_ao = xp.asarray(B_ao, dtype=xp.float64)
-    D_core_ao = xp.asarray(D_core_ao, dtype=xp.float64)
-    C_act = xp.asarray(C_act, dtype=xp.float64)
-    dm1_delta = xp.asarray(dm1_delta, dtype=xp.float64)
-    dm2_delta = xp.asarray(dm2_delta, dtype=xp.float64)
-    rho_core = xp.asarray(rho_core, dtype=xp.float64)
-    L2 = xp.asarray(L2, dtype=xp.float64)
+    xp, _ = _get_xp_arrays(B_ao, D_core_ao, C_act, dm1_delta, dm2_delta, rho_core, L2, out)
+    _wd = xp.float64 if work_dtype is None else work_dtype
+    _od = xp.float64 if out_dtype is None else out_dtype
+    B_ao = xp.asarray(B_ao, dtype=_wd)
+    D_core_ao = xp.asarray(D_core_ao, dtype=_wd)
+    C_act = xp.asarray(C_act, dtype=_wd)
+    dm1_delta = xp.asarray(dm1_delta, dtype=_wd)
+    dm2_delta = xp.asarray(dm2_delta, dtype=_wd)
+    rho_core = xp.asarray(rho_core, dtype=_wd)
+    L2 = xp.asarray(L2, dtype=_wd)
 
     if B_ao.ndim != 3:
         raise ValueError("B_ao must have shape (nao, nao, naux)")
@@ -757,19 +1206,32 @@ def _build_bar_L_delta_casscf_df(
     B2 = B_ao.reshape(nao * nao, naux)
     delta_sigma = B2.T @ D_act_delta.reshape(nao * nao)  # (naux,)
 
-    # Fused bar_J_delta + bar_K_delta to reduce peak VRAM.
-    bar_mean_delta = delta_sigma[:, None, None] * D_core_ao[None, :, :]
-    bar_mean_delta += rho_core[:, None, None] * D_act_delta[None, :, :]
+    if out is None:
+        bar_mean_delta = xp.zeros((naux, nao, nao), dtype=_od)
+    else:
+        bar_mean_delta = xp.asarray(out, dtype=_od)
+        if bar_mean_delta.shape != (naux, nao, nao):
+            raise ValueError("out shape mismatch")
+
+    # Fused bar_J_delta + bar_K_delta without materializing full-size broadcast temporaries.
+    _barl_coulomb_add_inplace(
+        bar_mean_delta,
+        a_Q=delta_sigma,
+        M1_mn=D_core_ao,
+        b_Q=rho_core,
+        M2_mn=D_act_delta,
+        xp=xp,
+    )
 
     BQ = xp.transpose(B_ao, (2, 0, 1))  # (naux,nao,nao)
-    _chunk = max(1, naux // 4)
+    _chunk = int(max(1, qblock if qblock is not None else (naux // 4)))
     for _q0 in range(0, naux, _chunk):
         _q1 = min(_q0 + _chunk, naux)
         _bq = BQ[_q0:_q1]
         _t = xp.matmul(xp.matmul(D_core_ao[None, :, :], _bq), D_act_delta)
         _t += xp.matmul(xp.matmul(D_act_delta[None, :, :], _bq), D_core_ao)
         _t *= -0.5
-        bar_mean_delta[_q0:_q1] += _t
+        bar_mean_delta[_q0:_q1] += _t.astype(_od, copy=False)
         del _t
 
     # Active-active 2-RDM delta (linear in dm2)
@@ -780,14 +1242,17 @@ def _build_bar_L_delta_casscf_df(
 
     tmp = xp.einsum("mu,uvQ->mvQ", C_act, M_uvQ, optimize=True)  # (nao,ncas,naux)
     # Accumulate bar_act_delta into bar_mean_delta in chunks.
-    _chunk = max(1, naux // 4)
+    _chunk = int(max(1, qblock if qblock is not None else (naux // 4)))
     for _q0 in range(0, naux, _chunk):
         _q1 = min(_q0 + _chunk, naux)
-        bar_mean_delta[_q0:_q1] += xp.einsum("mvQ,nv->Qmn", tmp[:, :, _q0:_q1], C_act, optimize=True)
+        _blk = xp.einsum("mvQ,nv->Qmn", tmp[:, :, _q0:_q1], C_act, optimize=True)
+        bar_mean_delta[_q0:_q1] += _blk.astype(_od, copy=False)
+        del _blk
     del tmp
 
-    _symmetrize_bar_L_inplace(bar_mean_delta, xp)
-    return xp.asarray(bar_mean_delta, dtype=xp.float64)
+    if bool(symmetrize):
+        _symmetrize_bar_L_inplace(bar_mean_delta, xp)
+    return xp.asarray(bar_mean_delta, dtype=_od)
 
 
 def _build_bar_L_df_cross(
@@ -799,6 +1264,9 @@ def _build_bar_L_df_cross(
     coeff_K: float,
     out: Any | None = None,
     symmetrize: bool = True,
+    work_dtype: Any | None = None,
+    out_dtype: Any | None = None,
+    qblock: int | None = None,
 ) -> np.ndarray:
     """Return bar_L for E = coeff_J*Tr(D_left·J(D_right)) + coeff_K*Tr(D_left·K(D_right)).
 
@@ -830,15 +1298,17 @@ def _build_bar_L_df_cross(
     """
 
     xp, _ = _get_xp_arrays(B_ao)
-    B_ao = xp.asarray(B_ao, dtype=xp.float64)
+    _wd = xp.float64 if work_dtype is None else work_dtype
+    _od = xp.float64 if out_dtype is None else out_dtype
+    B_ao = xp.asarray(B_ao, dtype=_wd)
     if B_ao.ndim != 3:
         raise ValueError("B_ao must have shape (nao, nao, naux)")
     nao, nao1, naux = map(int, B_ao.shape)
     if nao != nao1:
         raise ValueError("B_ao must have shape (nao, nao, naux)")
 
-    D_left = xp.asarray(D_left, dtype=xp.float64)
-    D_right = xp.asarray(D_right, dtype=xp.float64)
+    D_left = xp.asarray(D_left, dtype=_wd)
+    D_right = xp.asarray(D_right, dtype=_wd)
     if D_left.shape != (nao, nao) or D_right.shape != (nao, nao):
         raise ValueError("D_left/D_right shape mismatch")
 
@@ -850,18 +1320,20 @@ def _build_bar_L_df_cross(
     _log_vram("    cross: before Coulomb")
     cJ = float(coeff_J)
     if out is None:
-        if cJ:
-            bar = (cJ * sigma)[:, None, None] * D_right[None, :, :]
-            bar += (cJ * rho)[:, None, None] * D_left[None, :, :]
-        else:
-            bar = xp.zeros((naux, nao, nao), dtype=xp.float64)
+        bar = xp.zeros((naux, nao, nao), dtype=_od)
     else:
-        bar = xp.asarray(out, dtype=xp.float64)
+        bar = xp.asarray(out, dtype=_od)
         if bar.shape != (naux, nao, nao):
             raise ValueError("out shape mismatch")
-        if cJ:
-            bar += (cJ * sigma)[:, None, None] * D_right[None, :, :]
-            bar += (cJ * rho)[:, None, None] * D_left[None, :, :]
+    if cJ:
+        _barl_coulomb_add_inplace(
+            bar,
+            a_Q=(cJ * sigma),
+            M1_mn=D_right,
+            b_Q=(cJ * rho),
+            M2_mn=D_left,
+            xp=xp,
+        )
     _log_vram("    cross: after Coulomb")
 
     # Exchange-like part: Tr(D_left K(D_right)) = Σ_Q Tr(D_left B_Q D_right B_Q)
@@ -869,21 +1341,21 @@ def _build_bar_L_df_cross(
     cK = float(coeff_K)
     if cK:
         BQ = xp.transpose(B_ao, (2, 0, 1))  # (naux,nao,nao)
-        _chunk = max(1, naux // 4)
+        _chunk = int(max(1, qblock if qblock is not None else (naux // 4)))
         for _q0 in range(0, naux, _chunk):
             _q1 = min(_q0 + _chunk, naux)
             _bq = BQ[_q0:_q1]
             _t = xp.matmul(xp.matmul(D_left[None, :, :], _bq), D_right)
             _t += xp.matmul(xp.matmul(D_right[None, :, :], _bq), D_left)
             _t *= cK
-            bar[_q0:_q1] += _t
+            bar[_q0:_q1] += _t.astype(_od, copy=False)
             del _t
         _log_vram("    cross: after exchange")
 
     if bool(symmetrize):
         _symmetrize_bar_L_inplace(bar, xp)
         _log_vram("    cross: after sym")
-    return xp.asarray(bar, dtype=xp.float64)
+    return xp.asarray(bar, dtype=_od)
 
 
 def casscf_nuc_grad_df(
@@ -1804,6 +2276,7 @@ def casscf_nuc_grad_df_per_root(
                 fcisolver_use.nroots = int(nroots)
             except Exception:
                 pass
+    _gpu_runtime_cfg = _resolve_gpu_runtime_config()
 
     # Spherical AO support: detect cart=False and prepare T_c2s.
     T_c2s = _get_sph_T(scf_out)
@@ -1813,7 +2286,34 @@ def casscf_nuc_grad_df_per_root(
     C = _as_xp_f64(xp, getattr(casscf, "mo_coeff"))
     B_ao = _as_xp_f64(xp, getattr(scf_out, "df_B"))
     h_ao = _as_xp_f64(xp, getattr(getattr(scf_out, "int1e"), "hcore"))
+    if bool(_is_gpu):
+        _apply_gpu_runtime_config_to_solver(fcisolver_use, _gpu_runtime_cfg)
     _restore_pool = _apply_df_pool_policy(B_ao, label="casscf_nuc_grad_df_per_root")
+    _barl_policy = _resolve_barl_hybrid(
+        xp=xp,
+        is_gpu=bool(_is_gpu),
+        naux_hint=int(getattr(B_ao, "shape", (0, 0, 1))[2]),
+    )
+    if int(_gpu_runtime_cfg.tile_aux) > 0:
+        _barl_policy["qblock"] = int(_gpu_runtime_cfg.tile_aux)
+        _barl_policy["qblock_source"] = "runtime"
+    else:
+        # Refine qblock using nao to bound (qblock, nao, nao) temporaries.
+        # Keep explicit env overrides intact.
+        if str(_barl_policy.get("qblock_source", "")) != "env":
+            _nao_hint = int(getattr(B_ao, "shape", (0, 0, 1))[0])
+            _naux_hint = int(getattr(B_ao, "shape", (0, 0, 1))[2])
+            try:
+                _itemsize = int(xp.dtype(_barl_policy.get("work_dtype", xp.float64)).itemsize)
+            except Exception:
+                _itemsize = 8
+            _q_auto = _auto_qblock_for_aux_tile(nao=_nao_hint, naux=_naux_hint, itemsize=_itemsize)
+            try:
+                _q_cur = int(_barl_policy.get("qblock", 0) or 0)
+            except Exception:
+                _q_cur = 0
+            _barl_policy["qblock"] = int(_q_auto if _q_cur <= 0 else min(_q_cur, _q_auto))
+    _barl_hybrid_enabled = bool(_barl_policy.get("enabled", False))
 
     # Per-root RDMs
     per_root_rdms: list[tuple[np.ndarray, np.ndarray]] = []
@@ -1868,6 +2368,22 @@ def casscf_nuc_grad_df_per_root(
     except (NotImplementedError, RuntimeError):
         df_grad_ctx = None
 
+    _fused_contract_requested = _normalize_bool_env(_os.environ.get("ASUKA_DF_FUSED_CONTRACT"), default=False)
+    if _gpu_runtime_cfg.fused_df is not None:
+        _fused_contract_requested = bool(_gpu_runtime_cfg.fused_df)
+    _fused_contract_precision = _normalize_fused_contract_precision(_os.environ.get("ASUKA_DF_FUSED_CONTRACT_PRECISION"))
+    try:
+        _fused_contract_ab_tol = float(_os.environ.get("ASUKA_DF_FUSED_CONTRACT_AB_TOL", "1e-6"))
+    except Exception:
+        _fused_contract_ab_tol = 1e-6
+    _fused_contract_ab_tol = max(0.0, float(_fused_contract_ab_tol))
+    _fused_contract_enabled = (
+        bool(_fused_contract_requested)
+        and str(df_backend).strip().lower() == "cuda"
+        and df_grad_ctx is not None
+        and hasattr(df_grad_ctx, "contract_fused_terms")
+    )
+
     # AO basis objects for 1e derivative contractions
     ao_basis = getattr(scf_out, "ao_basis")
     aux_basis = getattr(scf_out, "aux_basis")
@@ -1890,9 +2406,17 @@ def casscf_nuc_grad_df_per_root(
     _t_contract_delta = 0.0
     _t_z_solve = 0.0
     _t_trans_rdm_lci = 0.0
+    _t_gen_g_hop = 0.0
+    _t_gfock = 0.0
+    _t_1e_pulay = 0.0
+    _t_response_pulay = 0.0
     _z_solver: str | None = None
     _z_matvec_calls = 0
     _z_niter = 0
+    _barl_stage_effective = str(_barl_policy.get("stage", "fp64"))
+    _barl_ab_diff_max = 0.0
+    _barl_fallback = False
+    _barl_ab_checked = False
 
     # Multi-stream DF contraction (CUDA only). Escape hatch: ASUKA_DF_CONTRACT_STREAMS=1.
     _use_multistream_contract = False
@@ -1903,6 +2427,9 @@ def casscf_nuc_grad_df_per_root(
     _contract_streams: list[Any] = []
 
     if (
+        not bool(_barl_hybrid_enabled)
+        and not bool(_fused_contract_enabled)
+        and
         str(df_backend).strip().lower() == "cuda"
         and df_grad_ctx is not None
         and str(getattr(df_grad_ctx, "backend", "")).strip().lower() == "cuda"
@@ -1958,7 +2485,35 @@ def casscf_nuc_grad_df_per_root(
     else:
         _z_method = "gcrotmk"
     _z_recycle_space: list[tuple[np.ndarray | None, np.ndarray]] | None = [] if _z_method == "gcrotmk" else None
+    _z_recycle_max = 0
+    if _gpu_runtime_cfg.krylov_recycle_max_vectors is not None:
+        _z_recycle_max = max(0, int(_gpu_runtime_cfg.krylov_recycle_max_vectors))
     _z_prev_x0: np.ndarray | None = None
+    _mixed_policy_active = bool(_gpu_runtime_cfg.precision_policy in ("mixed_conservative", "mixed_aggressive"))
+    _mixed_fallback_rtol = 5e-7 if _gpu_runtime_cfg.precision_policy == "mixed_conservative" else 5e-6
+    _fallback_rtol_env = _parse_env_float("ASUKA_GPU_PRECISION_FALLBACK_RREL")
+    if _fallback_rtol_env is not None and _fallback_rtol_env > 0.0:
+        _mixed_fallback_rtol = float(_fallback_rtol_env)
+
+    _MISSING = object()
+
+    @contextmanager
+    def _temporary_solver_attrs(obj: Any, updates: dict[str, Any]):
+        prev: dict[str, Any] = {}
+        for key, val in updates.items():
+            prev[key] = getattr(obj, key, _MISSING)
+            setattr(obj, key, val)
+        try:
+            yield
+        finally:
+            for key, old in prev.items():
+                if old is _MISSING:
+                    try:
+                        delattr(obj, key)
+                    except Exception:
+                        pass
+                else:
+                    setattr(obj, key, old)
 
     # Per-root CI-response transition RDM accumulation: optionally keep on GPU.
     _ci_rdm_device_env = str(os.environ.get("ASUKA_PER_ROOT_CI_RDM_DEVICE", "auto")).strip().lower()
@@ -2035,6 +2590,10 @@ def casscf_nuc_grad_df_per_root(
     # This is the correct SA-CASSCF gradient (variational w.r.t. SA energy).
     # Per-root gradients are expressed as: grad_K = grad_sa_base + delta_K
     # ------------------------------------------------------------------
+    # Drain CASSCF pool residue — the optimizer leaves ~10 GB in the CuPy
+    # pool that is no longer referenced.  Flushing here reduces the peak
+    # driver-visible VRAM for the entire gradient phase.
+    _flush_gpu_pool()
     with _main_stream_cm:
         C_np = _asnumpy_f64(C)
         gfock_sa, D_core_sa, D_act_sa, D_tot_sa, C_act_sa = _build_gfock_casscf_df(
@@ -2138,6 +2697,20 @@ def casscf_nuc_grad_df_per_root(
     grads_out: list[np.ndarray | None] = [None] * int(nroots)
     _in_flight: list[dict[str, Any]] = []
 
+    # Precompute root-invariant vhf_c/vhf_a from SA-averaged densities.
+    # These are reused by _build_dme0_lorb_response every root, avoiding 2
+    # redundant _df_JK calls per root (~3s each on cc-pVDZ).
+    with _main_stream_cm:
+        _D_core_cached = 2.0 * (C[:, :ncore] @ C[:, :ncore].T) if ncore else xp.zeros((int(B_ao.shape[0]), int(B_ao.shape[0])), dtype=xp.float64)
+        _D_act_sa_cached = C_act_sa @ xp.asarray(dm1_sa, dtype=xp.float64) @ C_act_sa.T
+        _Jc_cached, _Kc_cached = _df_scf._df_JK(B_ao, _D_core_cached, want_J=True, want_K=True)  # noqa: SLF001
+        _Ja_cached, _Ka_cached = _df_scf._df_JK(B_ao, _D_act_sa_cached, want_J=True, want_K=True)  # noqa: SLF001
+    _vhf_cache = {
+        "vhf_c": _Jc_cached - 0.5 * _Kc_cached,
+        "vhf_a": _Ja_cached - 0.5 * _Ka_cached,
+    }
+    del _D_core_cached, _D_act_sa_cached, _Jc_cached, _Kc_cached, _Ja_cached, _Ka_cached
+
     # Precompute gfock with zero active density (for CI response Pulay subtraction).
     _dm1_zero = xp.zeros((int(ncas), int(ncas)), dtype=xp.float64)
     _dm2_zero = xp.zeros((int(ncas), int(ncas), int(ncas), int(ncas)), dtype=xp.float64)
@@ -2147,40 +2720,95 @@ def casscf_nuc_grad_df_per_root(
     )
     _gfock_zero_np = _asnumpy_f64(_gfock_zero)
 
+    def _contract_df_delta_sync(_bar_L: Any) -> np.ndarray:
+        nonlocal warned_df_fd
+        try:
+            if _T_np is not None:
+                if df_grad_ctx is not None:
+                    _de = df_grad_ctx.contract_sph(B_sph=B_ao, bar_L_sph=_bar_L, T_c2s=_T_np)
+                else:
+                    _de = compute_df_gradient_contributions_analytic_sph(
+                        ao_basis,
+                        aux_basis,
+                        atom_coords_bohr=coords,
+                        B_sph=B_ao,
+                        bar_L_sph=_bar_L,
+                        T_c2s=_T_np,
+                        L_chol=getattr(scf_out, "df_L", None),
+                        backend=str(df_backend),
+                        df_threads=int(df_threads),
+                        profile=None,
+                    )
+            else:
+                if df_grad_ctx is not None:
+                    _de = df_grad_ctx.contract(B_ao=B_ao, bar_L_ao=_bar_L)
+                else:
+                    _de = compute_df_gradient_contributions_analytic_packed_bases(
+                        ao_basis,
+                        aux_basis,
+                        atom_coords_bohr=coords,
+                        B_ao=B_ao,
+                        bar_L_ao=_bar_L,
+                        L_chol=getattr(scf_out, "df_L", None),
+                        backend=str(df_backend),
+                        df_threads=int(df_threads),
+                        profile=None,
+                    )
+            return np.asarray(_asnumpy_f64(_de), dtype=np.float64)
+        except (NotImplementedError, RuntimeError) as e:
+            if not warned_df_fd:
+                warnings.warn(
+                    f"DF 2e gradient contraction fell back to finite-difference on B (backend={df_backend!s}); "
+                    "expect noisy/non-conservative forces in MD. "
+                    f"Reason: {type(e).__name__}: {e}",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+                warned_df_fd = True
+            _bar_fd = _transform_bar_L_to_cart(_T_np, _bar_L) if _T_np is not None else _bar_L
+            _de = compute_df_gradient_contributions_fd_packed_bases(
+                ao_basis,
+                aux_basis,
+                atom_coords_bohr=coords,
+                bar_L_ao=_bar_fd,
+                backend=str(df_backend),
+                df_config=df_config,
+                df_threads=int(df_threads),
+                delta_bohr=float(delta_bohr),
+                profile=None,
+            )
+            return np.asarray(_asnumpy_f64(_de), dtype=np.float64)
+
     for K in range(nroots):
         # Drain free CuPy blocks between roots so pool caching does not inflate
         # driver-visible VRAM and trigger avoidable OOM on small GPUs.
         _flush_gpu_pool()
         _log_vram(f"root {K} start")
         dm1_K, dm2_K = per_root_rdms[K]
+        _barl_stage = str(_barl_policy.get("stage", "fp64"))
+        _barl_work_dtype = _barl_policy.get("work_dtype", xp.float64)
+        _barl_out_dtype = _barl_policy.get("out_dtype", xp.float64)
+        _barl_stage_effective = _barl_stage
 
         # For single-state CASSCF: no response — SA base gradient IS the exact per-root gradient.
         if nroots == 1:
             grads_out[int(K)] = np.asarray(grad_sa_base, dtype=np.float64)
             continue
 
-        # Step A: Build per-root densities and bar_L delta for the Hellmann–Feynman term (GPU).
+        # Step A: Build per-root densities (GPU) and cache RDM deltas (CPU).
+        t0 = time.perf_counter()
         with _main_stream_cm:
             gfock_K, _D_core_K, _D_act_K, D_tot_K, _C_act_K = _build_gfock_casscf_df(
                 B_ao, h_ao, C, ncore=int(ncore), ncas=int(ncas), dm1_act=dm1_K, dm2_act=dm2_K,
             )
             dm1_delta = dm1_K - dm1_sa
             dm2_delta = dm2_K - dm2_sa
-            t0 = time.perf_counter()
-            bar_L_delta_hf = _build_bar_L_delta_casscf_df(
-                B_ao,
-                D_core_ao=D_core_sa,
-                C_act=C_act_sa,
-                dm1_delta=dm1_delta,
-                dm2_delta=dm2_delta,
-                rho_core=rho_core,
-                L2=L2,
-            )
-            if _profile_df_per_root:
-                _t_bar_L_delta += time.perf_counter() - t0
             _flush_gpu_pool()
+        if _profile_df_per_root:
+            _t_gfock += time.perf_counter() - t0
 
         # Step B: Z-vector RHS
+        t0 = time.perf_counter()
         fcisolver_fixed = _FixedRDMFcisolver(fcisolver_use, dm1=dm1_K, dm2=dm2_K)
         mc_K = DFNewtonCASSCFAdapter(
             df_B=B_ao,
@@ -2202,6 +2830,13 @@ def casscf_nuc_grad_df_per_root(
                 )
             g_K = _asnumpy_f64(g_K).ravel()
         del _gupd, _hop, _hdiag, mc_K, fcisolver_fixed
+        if _profile_df_per_root:
+            _t_gen_g_hop += time.perf_counter() - t0
+        # gen_g_hop pre-computes MO-basis JK integrals (L_pq, L_t ~ 2×nmo×nmo×naux)
+        # for the hessian operator, but we only needed the gradient g_K.  The
+        # closures captured those arrays; deleting them releases ~4×sizeof(B) back
+        # to the CuPy pool.  Flush now so the z-solver runs with lower VRAM.
+        _flush_gpu_pool()
         _log_vram(f"root {K} after gen_g_hop cleanup")
 
         rhs_orb = g_K[:n_orb]
@@ -2216,6 +2851,7 @@ def casscf_nuc_grad_df_per_root(
         # Step C: Z-vector solve
         t0 = time.perf_counter()
         _x0_use = _z_prev_x0 if (_z_use_x0 and _z_prev_x0 is not None) else None
+        _gcrotmk_k = int(_z_recycle_max) if (_z_method == "gcrotmk" and _z_recycle_max > 0) else None
         z_K = solve_mcscf_zvector(
             mc_sa,
             rhs_orb=np.asarray(rhs_orb, dtype=np.float64),
@@ -2226,7 +2862,49 @@ def casscf_nuc_grad_df_per_root(
             method=str(_z_method),
             x0=_x0_use,
             recycle_space=_z_recycle_space,
+            gcrotmk_k=_gcrotmk_k,
         )
+        if _z_recycle_space is not None and _z_recycle_max > 0 and len(_z_recycle_space) > _z_recycle_max:
+            del _z_recycle_space[:-int(_z_recycle_max)]
+
+        if _mixed_policy_active:
+            _res_rel = float(z_K.info.get("residual_rel", np.inf))
+            _needs_fp64_fallback = bool(
+                (not bool(z_K.converged))
+                or (not np.isfinite(_res_rel))
+                or (float(_res_rel) > float(_mixed_fallback_rtol))
+            )
+            if _needs_fp64_fallback:
+                _fallback_start = time.perf_counter()
+                _fallback_updates = {
+                    "matvec_cuda_dtype": "float64",
+                    "approx_cuda_dtype": "float64",
+                    "matvec_cuda_mixed_low_precision_max_iter": 0,
+                }
+                with _temporary_solver_attrs(fcisolver_use, _fallback_updates):
+                    z_fp64 = solve_mcscf_zvector(
+                        mc_sa,
+                        rhs_orb=np.asarray(rhs_orb, dtype=np.float64),
+                        rhs_ci=rhs_ci,
+                        hessian_op=hess_op,
+                        tol=float(z_tol),
+                        maxiter=int(z_maxiter),
+                        method=str(_z_method),
+                        x0=np.asarray(z_K.z_packed, dtype=np.float64).ravel(),
+                        recycle_space=_z_recycle_space,
+                        gcrotmk_k=_gcrotmk_k,
+                    )
+                if _z_recycle_space is not None and _z_recycle_max > 0 and len(_z_recycle_space) > _z_recycle_max:
+                    del _z_recycle_space[:-int(_z_recycle_max)]
+                try:
+                    z_fp64.info["precision_fallback"] = "mixed_to_fp64"
+                    z_fp64.info["precision_fallback_trigger_residual_rel"] = float(_res_rel)
+                    z_fp64.info["precision_fallback_threshold_residual_rel"] = float(_mixed_fallback_rtol)
+                    z_fp64.info["precision_fallback_time_s"] = float(time.perf_counter() - _fallback_start)
+                except Exception:
+                    pass
+                z_K = z_fp64
+
         if _profile_df_per_root:
             _t_z_solve += time.perf_counter() - t0
             try:
@@ -2302,9 +2980,6 @@ def casscf_nuc_grad_df_per_root(
             _t_trans_rdm_lci += time.perf_counter() - t0
 
         # ── Single fused contract(): HF delta + lci response + lorb response ──
-        # Interleave build + fuse: build each bar_L component and immediately
-        # accumulate into bar_L_delta_total before building the next, so at most
-        # 2 (naux,nao,nao) arrays are alive at once instead of 3.
         _flush_gpu_pool()
         _log_vram(f"root {K} pre-barL flush")
         if _os.environ.get("ASUKA_VRAM_DUMP") and K == 0:
@@ -2324,30 +2999,198 @@ def casscf_nuc_grad_df_per_root(
             for _mb, _sh, _dt in _cupy_arrays[:30]:
                 print(f"  {_mb:10.2f} MB  shape={_sh}  dtype={_dt}")
             del _cupy_arrays
+        bar_L_delta_total: Any | None = None
+        bar_L_contract: Any | None = None
+        bar_L_terms_contract: list[Any] | None = None
+        de_df_delta_precomputed: np.ndarray | None = None
         with _main_stream_cm:
-            bar_L_delta_total = bar_L_delta_hf
-            _log_vram(f"root {K} before lci_net")
+            qblock_eff = int(_barl_policy.get("qblock", 0))
+            t0 = time.perf_counter()
 
-            # Build bar_L_lci_net = bar_L_lci_active - bar_L_lci_core (fused, GPU).
-            bar_L_lci_net, D_act_lci = _build_bar_L_net_active_df(
-                B_ao, C, dm1_lci, dm2_lci, ncore=int(ncore), ncas=int(ncas), xp=xp, L_act=L_act, rho_core=rho_core,
+            # Allocate a single accumulation buffer and build all bar_L terms into it.
+            nao = int(getattr(B_ao, "shape", (0, 0, 1))[0])
+            naux = int(getattr(B_ao, "shape", (0, 0, 1))[2])
+            bar_L_delta_total = xp.zeros((naux, nao, nao), dtype=_barl_out_dtype)
+
+            _build_bar_L_delta_casscf_df(
+                B_ao,
+                D_core_ao=D_core_sa,
+                C_act=C_act_sa,
+                dm1_delta=dm1_delta,
+                dm2_delta=dm2_delta,
+                rho_core=rho_core,
+                L2=L2,
+                out=bar_L_delta_total,
+                symmetrize=False,
+                work_dtype=_barl_work_dtype,
+                out_dtype=_barl_out_dtype,
+                qblock=qblock_eff,
             )
-            _log_vram(f"root {K} after lci_net (before accum)")
-            bar_L_delta_total += bar_L_lci_net
-            del bar_L_lci_net
-            _log_vram(f"root {K} after lci_net accum")
+            _log_vram(f"root {K} after delta_hf")
+            _flush_gpu_pool()
+            _log_vram(f"root {K} after delta_hf flush")
+
+            # CI response term: accumulate directly into bar_L_delta_total.
+            _, D_act_lci = _build_bar_L_net_active_df(
+                B_ao,
+                C,
+                dm1_lci,
+                dm2_lci,
+                ncore=int(ncore),
+                ncas=int(ncas),
+                xp=xp,
+                L_act=L_act,
+                rho_core=rho_core,
+                out=bar_L_delta_total,
+                symmetrize=False,
+                work_dtype=_barl_work_dtype,
+                out_dtype=_barl_out_dtype,
+                qblock=qblock_eff,
+            )
+            _log_vram(f"root {K} after lci_net")
             _flush_gpu_pool()
             _log_vram(f"root {K} after lci_net flush")
 
-            # Step E: Orbital response — build bar_L_lorb without contract() (GPU).
-            bar_L_lorb, D_L_lorb = _build_bar_L_lorb_df(
-                B_ao, C, np.asarray(Lorb_mat, dtype=np.float64), dm1_sa, dm2_sa,
-                ncore=int(ncore), ncas=int(ncas), xp=xp,
+            # Orbital response term: accumulate directly into bar_L_delta_total.
+            _, D_L_lorb = _build_bar_L_lorb_df(
+                B_ao,
+                C,
+                np.asarray(Lorb_mat, dtype=np.float64),
+                dm1_sa,
+                dm2_sa,
+                ncore=int(ncore),
+                ncas=int(ncas),
+                xp=xp,
+                out=bar_L_delta_total,
+                symmetrize=False,
+                work_dtype=_barl_work_dtype,
+                out_dtype=_barl_out_dtype,
+                qblock=qblock_eff,
             )
-            _log_vram(f"root {K} after lorb (before accum)")
-            bar_L_delta_total += bar_L_lorb
-            del bar_L_lorb
+            _log_vram(f"root {K} after lorb")
+
+            _symmetrize_bar_L_inplace(bar_L_delta_total, xp)
             _log_vram(f"root {K} bar_L fused")
+            if _profile_df_per_root:
+                _t_bar_L_delta += time.perf_counter() - t0
+
+        bar_L_contract = bar_L_delta_total
+        if bar_L_contract is None:  # pragma: no cover
+            raise RuntimeError("internal error: bar_L buffer was not constructed")
+        if str(getattr(bar_L_contract, "dtype", "")) != str(np.float64):
+            bar_L_contract = xp.asarray(bar_L_contract, dtype=xp.float64)
+
+        if (
+            bool(_barl_hybrid_enabled)
+            and int(K) == 0
+            and bool(_barl_policy.get("ab_check", True))
+            and not bool(_barl_policy.get("calibrated", False))
+            and str(_barl_policy.get("stage", "fp64")) != "fp64"
+        ):
+            # Reference fp64 bar_L built in a single buffer to avoid holding multiple
+            # sizeof(B) arrays simultaneously.
+            _nao = int(getattr(B_ao, "shape", (0, 0, 1))[0])
+            _naux = int(getattr(B_ao, "shape", (0, 0, 1))[2])
+            bar_L_ref = xp.zeros((_naux, _nao, _nao), dtype=xp.float64)
+            _build_bar_L_delta_casscf_df(
+                B_ao,
+                D_core_ao=D_core_sa,
+                C_act=C_act_sa,
+                dm1_delta=dm1_delta,
+                dm2_delta=dm2_delta,
+                rho_core=rho_core,
+                L2=L2,
+                out=bar_L_ref,
+                symmetrize=False,
+                work_dtype=xp.float64,
+                out_dtype=xp.float64,
+                qblock=int(_barl_policy.get("qblock", 0)),
+            )
+            _, D_act_lci_ref = _build_bar_L_net_active_df(
+                B_ao,
+                C,
+                dm1_lci,
+                dm2_lci,
+                ncore=int(ncore),
+                ncas=int(ncas),
+                xp=xp,
+                L_act=L_act,
+                rho_core=rho_core,
+                out=bar_L_ref,
+                symmetrize=False,
+                work_dtype=xp.float64,
+                out_dtype=xp.float64,
+                qblock=int(_barl_policy.get("qblock", 0)),
+            )
+            _, D_L_lorb_ref = _build_bar_L_lorb_df(
+                B_ao,
+                C,
+                np.asarray(Lorb_mat, dtype=np.float64),
+                dm1_sa,
+                dm2_sa,
+                ncore=int(ncore),
+                ncas=int(ncas),
+                xp=xp,
+                out=bar_L_ref,
+                symmetrize=False,
+                work_dtype=xp.float64,
+                out_dtype=xp.float64,
+                qblock=int(_barl_policy.get("qblock", 0)),
+            )
+            _symmetrize_bar_L_inplace(bar_L_ref, xp)
+
+            de_df_ref = _contract_df_delta_sync(bar_L_ref)
+            if de_df_delta_precomputed is not None:
+                de_df_stage = np.asarray(de_df_delta_precomputed, dtype=np.float64)
+            elif bool(_fused_contract_enabled) and bar_L_terms_contract is not None and df_grad_ctx is not None:
+                if _T_np is not None:
+                    de_df_stage = np.asarray(
+                        df_grad_ctx.contract_fused_terms_sph(
+                            B_sph=B_ao,
+                            bar_L_terms_sph=bar_L_terms_contract,
+                            T_c2s=_T_np,
+                            precision=str(_fused_contract_precision),
+                        ),
+                        dtype=np.float64,
+                    )
+                else:
+                    de_df_stage = np.asarray(
+                        df_grad_ctx.contract_fused_terms(
+                            B_ao=B_ao,
+                            bar_L_terms=bar_L_terms_contract,
+                            precision=str(_fused_contract_precision),
+                        ),
+                        dtype=np.float64,
+                    )
+            else:
+                de_df_stage = _contract_df_delta_sync(bar_L_contract)
+            _barl_diff = float(np.max(np.abs(de_df_stage - de_df_ref)))
+            _barl_ab_checked = True
+            _barl_ab_diff_max = max(float(_barl_ab_diff_max), float(_barl_diff))
+            _ab_tol_eff = float(_fused_contract_ab_tol) if bool(_fused_contract_enabled) else float(_barl_policy.get("ab_tol", 1e-6))
+            if _barl_diff > _ab_tol_eff:
+                if bool(_barl_policy.get("warn", True)):
+                    warnings.warn(
+                        "[DF_HYBRID] root-0 A/B check exceeded tolerance; falling back to fp64 "
+                        f"(stage={_barl_policy.get('stage')} max_abs={_barl_diff:.3e} tol={_ab_tol_eff:.3e})",
+                        RuntimeWarning,
+                        stacklevel=2,
+                    )
+                _barl_policy["stage_index"] = max(0, len(tuple(_barl_policy.get("ladder", ("fp64",)))) - 1)
+                _advance_barl_stage(_barl_policy, xp)
+                bar_L_contract = bar_L_ref
+                bar_L_delta_total = bar_L_ref
+                bar_L_terms_contract = None
+                D_act_lci = D_act_lci_ref
+                D_L_lorb = D_L_lorb_ref
+                de_df_delta_precomputed = de_df_ref
+                _barl_stage_effective = str(_barl_policy.get("stage", "fp64"))
+                _barl_fallback = True
+                _fused_contract_enabled = False
+            else:
+                de_df_delta_precomputed = de_df_stage
+                del bar_L_ref
+            _barl_policy["calibrated"] = True
 
         # Multi-stream CUDA path: launch contract_device() asynchronously and
         # overlap CPU work while kernels run on independent streams.
@@ -2361,9 +3204,9 @@ def casscf_nuc_grad_df_per_root(
             try:
                 with stream:
                     if _T_np is not None:
-                        grad_dev = df_grad_ctx.contract_device_sph(B_sph=B_ao, bar_L_sph=bar_L_delta_total, T_c2s=_T_np)
+                        grad_dev = df_grad_ctx.contract_device_sph(B_sph=B_ao, bar_L_sph=bar_L_contract, T_c2s=_T_np)
                     else:
-                        grad_dev = df_grad_ctx.contract_device(B_ao=B_ao, bar_L_ao=bar_L_delta_total)
+                        grad_dev = df_grad_ctx.contract_device(B_ao=B_ao, bar_L_ao=bar_L_contract)
             except (NotImplementedError, RuntimeError, ValueError):
                 grad_dev = None
 
@@ -2396,6 +3239,7 @@ def casscf_nuc_grad_df_per_root(
                     _asnumpy_f64(dm1_sa), _asnumpy_f64(dm2_sa),
                     ppaa_sa, papa_sa,
                     ncore=int(ncore), ncas=int(ncas),
+                    vhf_cache=_vhf_cache,
                 )
 
                 _W_pulay_ms = W_K - W_sa + _dme0_lci + _dme0_lorb
@@ -2413,7 +3257,7 @@ def casscf_nuc_grad_df_per_root(
                         "K": int(K),
                         "stream": stream,
                         "grad_dev": grad_dev,
-                        "bar_L": bar_L_delta_total,
+                        "bar_L": bar_L_contract,
                         "de_h1_delta": np.asarray(de_h1_delta, dtype=np.float64),
                         "de_pulay_delta": np.asarray(de_pulay_delta, dtype=np.float64),
                     }
@@ -2429,6 +3273,7 @@ def casscf_nuc_grad_df_per_root(
                     Lci_list, Lorb_mat,
                     D_tot_K, D_act_lci, D_L_lorb,
                     dm1_lci, dm2_lci,
+                    bar_L_delta_total, bar_L_contract,
                 )
                 _flush_gpu_pool()
 
@@ -2473,45 +3318,75 @@ def casscf_nuc_grad_df_per_root(
                 continue
 
         # Synchronous contraction (CPU / single-stream CUDA fallback)
-        try:
-            t0 = time.perf_counter()
-            if _T_np is not None:
-                # ── Spherical path ──
-                if df_grad_ctx is not None:
-                    de_df_delta = df_grad_ctx.contract_sph(B_sph=B_ao, bar_L_sph=bar_L_delta_total, T_c2s=_T_np)
+        if de_df_delta_precomputed is not None:
+            de_df_delta = np.asarray(de_df_delta_precomputed, dtype=np.float64)
+        else:
+            try:
+                t0 = time.perf_counter()
+                if bool(_fused_contract_enabled) and df_grad_ctx is not None and bar_L_terms_contract is not None:
+                    if _T_np is not None:
+                        de_df_delta = df_grad_ctx.contract_fused_terms_sph(
+                            B_sph=B_ao,
+                            bar_L_terms_sph=bar_L_terms_contract,
+                            T_c2s=_T_np,
+                            precision=str(_fused_contract_precision),
+                        )
+                    else:
+                        de_df_delta = df_grad_ctx.contract_fused_terms(
+                            B_ao=B_ao,
+                            bar_L_terms=bar_L_terms_contract,
+                            precision=str(_fused_contract_precision),
+                        )
                 else:
-                    de_df_delta = compute_df_gradient_contributions_analytic_sph(
-                        ao_basis, aux_basis, atom_coords_bohr=coords, B_sph=B_ao, bar_L_sph=bar_L_delta_total,
-                        T_c2s=_T_np, L_chol=getattr(scf_out, "df_L", None),
-                        backend=str(df_backend), df_threads=int(df_threads), profile=None,
+                    if _T_np is not None:
+                        # ── Spherical path ──
+                        if df_grad_ctx is not None:
+                            de_df_delta = df_grad_ctx.contract_sph(B_sph=B_ao, bar_L_sph=bar_L_contract, T_c2s=_T_np)
+                        else:
+                            de_df_delta = compute_df_gradient_contributions_analytic_sph(
+                                ao_basis, aux_basis, atom_coords_bohr=coords, B_sph=B_ao, bar_L_sph=bar_L_contract,
+                                T_c2s=_T_np, L_chol=getattr(scf_out, "df_L", None),
+                                backend=str(df_backend), df_threads=int(df_threads), profile=None,
+                            )
+                    else:
+                        if df_grad_ctx is not None:
+                            de_df_delta = df_grad_ctx.contract(B_ao=B_ao, bar_L_ao=bar_L_contract)
+                        else:
+                            de_df_delta = compute_df_gradient_contributions_analytic_packed_bases(
+                                ao_basis, aux_basis, atom_coords_bohr=coords, B_ao=B_ao, bar_L_ao=bar_L_contract,
+                                L_chol=getattr(scf_out, "df_L", None),
+                                backend=str(df_backend), df_threads=int(df_threads), profile=None,
+                            )
+                if _profile_df_per_root:
+                    _t_contract_delta += time.perf_counter() - t0
+            except (NotImplementedError, RuntimeError, ValueError) as e:
+                if not warned_df_fd:
+                    warnings.warn(
+                        f"DF 2e gradient contraction fell back to finite-difference on B (backend={df_backend!s}); "
+                        "expect noisy/non-conservative forces in MD. "
+                        f"Reason: {type(e).__name__}: {e}",
+                        RuntimeWarning,
+                        stacklevel=2,
                     )
-            else:
-                if df_grad_ctx is not None:
-                    de_df_delta = df_grad_ctx.contract(B_ao=B_ao, bar_L_ao=bar_L_delta_total)
+                    warned_df_fd = True
+                if bool(_fused_contract_enabled) and bar_L_terms_contract is not None:
+                    _bar_L_dt_fd = None
+                    for _term in bar_L_terms_contract:
+                        _term64 = xp.asarray(_term, dtype=xp.float64)
+                        if _bar_L_dt_fd is None:
+                            _bar_L_dt_fd = _term64
+                        else:
+                            _bar_L_dt_fd += _term64
+                    if _bar_L_dt_fd is None:
+                        raise RuntimeError("internal error: fused term list was empty")
+                    _bar_L_dt_fd = _transform_bar_L_to_cart(_T_np, _bar_L_dt_fd) if _T_np is not None else _bar_L_dt_fd
                 else:
-                    de_df_delta = compute_df_gradient_contributions_analytic_packed_bases(
-                        ao_basis, aux_basis, atom_coords_bohr=coords, B_ao=B_ao, bar_L_ao=bar_L_delta_total,
-                        L_chol=getattr(scf_out, "df_L", None),
-                        backend=str(df_backend), df_threads=int(df_threads), profile=None,
-                    )
-            if _profile_df_per_root:
-                _t_contract_delta += time.perf_counter() - t0
-        except (NotImplementedError, RuntimeError) as e:
-            if not warned_df_fd:
-                warnings.warn(
-                    f"DF 2e gradient contraction fell back to finite-difference on B (backend={df_backend!s}); "
-                    "expect noisy/non-conservative forces in MD. "
-                    f"Reason: {type(e).__name__}: {e}",
-                    RuntimeWarning,
-                    stacklevel=2,
+                    _bar_L_dt_fd = _transform_bar_L_to_cart(_T_np, bar_L_contract) if _T_np is not None else bar_L_contract
+                de_df_delta = compute_df_gradient_contributions_fd_packed_bases(
+                    ao_basis, aux_basis, atom_coords_bohr=coords, bar_L_ao=_bar_L_dt_fd,
+                    backend=str(df_backend), df_config=df_config, df_threads=int(df_threads),
+                    delta_bohr=float(delta_bohr), profile=None,
                 )
-                warned_df_fd = True
-            _bar_L_dt_fd = _transform_bar_L_to_cart(_T_np, bar_L_delta_total) if _T_np is not None else bar_L_delta_total
-            de_df_delta = compute_df_gradient_contributions_fd_packed_bases(
-                ao_basis, aux_basis, atom_coords_bohr=coords, bar_L_ao=_bar_L_dt_fd,
-                backend=str(df_backend), df_config=df_config, df_threads=int(df_threads),
-                delta_bohr=float(delta_bohr), profile=None,
-            )
 
         # ── Single fused 1e call: delta from SA + lci + lorb ──
         with _main_stream_cm:
@@ -2523,6 +3398,7 @@ def casscf_nuc_grad_df_per_root(
         )
 
         # ── Per-root Pulay delta: -Tr((W_K - W_sa) · dS/dR) ──
+        t0 = time.perf_counter()
         with _main_stream_cm:
             gfock_K_np = _asnumpy_f64(gfock_K)
         _tmp_K = C_np @ gfock_K_np[:, :nocc]  # (nao, nocc)
@@ -2544,6 +3420,7 @@ def casscf_nuc_grad_df_per_root(
             _asnumpy_f64(dm1_sa), _asnumpy_f64(dm2_sa),
             ppaa_sa, papa_sa,
             ncore=int(ncore), ncas=int(ncas),
+            vhf_cache=_vhf_cache,
         )
 
         _W_delta = W_K - W_sa + _dme0_lci + _dme0_lorb
@@ -2555,9 +3432,17 @@ def casscf_nuc_grad_df_per_root(
             shell_atom=shell_atom,
             contract_backend=str(int1e_contract_backend),
         )
+        if _profile_df_per_root:
+            _t_response_pulay += time.perf_counter() - t0
 
         # Step F: Combine — grad_sa_base + delta 2e + delta 1e + delta Pulay
-        del bar_L_delta_total
+        if bar_L_terms_contract is not None:
+            bar_L_terms_contract.clear()
+            bar_L_terms_contract = None
+        if bar_L_contract is not None and bar_L_contract is not bar_L_delta_total:
+            del bar_L_contract
+        if bar_L_delta_total is not None:
+            del bar_L_delta_total
         grad_K = np.asarray(
             grad_sa_base + _asnumpy_f64(de_df_delta) + de_h1_delta + de_pulay_delta,
             dtype=np.float64,
@@ -2631,9 +3516,19 @@ def casscf_nuc_grad_df_per_root(
             f"nroots={int(nroots)} streams={nstreams} "
             f"bar_L_sa={_t_bar_L_sa:.3f}s contract_sa={_t_contract_sa:.3f}s "
             f"bar_L_delta={_t_bar_L_delta:.3f}s contract_delta={_t_contract_delta:.3f}s "
+            f"barL_hybrid={int(bool(_barl_hybrid_enabled))} "
+            f"barL_stage={_barl_stage_effective} "
+            f"barL_ab_checked={int(bool(_barl_ab_checked))} "
+            f"barL_ab_max={float(_barl_ab_diff_max):.3e} "
+            f"barL_fallback={int(bool(_barl_fallback))} "
+            f"fused_contract={int(bool(_fused_contract_requested))} "
+            f"fused_contract_live={int(bool(_fused_contract_enabled))} "
+            f"fused_precision={str(_fused_contract_precision)} "
             f"z_solve_total={_t_z_solve:.3f}s z_solver={_z_solver or 'unknown'} "
             f"z_niter={int(_z_niter)} z_matvec_calls={int(_z_matvec_calls)} "
-            f"t_trans_rdm_lci={_t_trans_rdm_lci:.3f}s",
+            f"t_trans_rdm_lci={_t_trans_rdm_lci:.3f}s "
+            f"t_gen_g_hop={_t_gen_g_hop:.3f}s t_gfock={_t_gfock:.3f}s "
+            f"t_response_pulay={_t_response_pulay:.3f}s",
             file=sys.stderr,
         )
 

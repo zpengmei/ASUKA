@@ -42,6 +42,8 @@ def _apply_sph_transform(
     int1e: Int1eResult,
     B,
     ao_basis,
+    *,
+    df_B_layout: str = "mnQ",
 ) -> tuple[Int1eResult, Any, tuple[np.ndarray, int, int] | None]:
     """If ``mol.cart=False``, transform int1e and B to spherical AOs.
 
@@ -70,7 +72,14 @@ def _apply_sph_transform(
     int1e_sph = Int1eResult(S=S_sph, T=T_kin_sph, V=V_sph)
 
     if B is not None:
-        B_sph = transform_df_B_cart_to_sph(B, T)
+        B_sph = transform_df_B_cart_to_sph(
+            B,
+            T,
+            shell_l=shell_l,
+            shell_ao_start_cart=shell_ao_start_cart,
+            shell_ao_start_sph=shell_ao_start_sph,
+            out_layout=str(df_B_layout),
+        )
     else:
         B_sph = None
 
@@ -210,6 +219,7 @@ def _rhf_prep_key(
     auxbasis: Any,
     expand_contractions: bool,
     df_config: CuERIDFConfig | None,
+    df_layout_build: str = "mnQ",
 ) -> tuple[Any, ...]:
     return (
         _mol_cache_key(mol),
@@ -217,6 +227,7 @@ def _rhf_prep_key(
         _normalize_basis_key(auxbasis),
         bool(expand_contractions),
         _df_config_key(df_config),
+        str(df_layout_build).strip().lower(),
     )
 
 
@@ -612,6 +623,7 @@ def run_rhf_df(
     basis: Any | None = None,
     auxbasis: Any = "autoaux",
     df_config: CuERIDFConfig | None = None,
+    df_layout: str = "mnQ",
     expand_contractions: bool = True,
     max_cycle: int = 50,
     conv_tol: float = 1e-10,
@@ -622,6 +634,7 @@ def run_rhf_df(
     damping: float = 0.0,
     level_shift: float = 0.0,
     k_q_block: int = 128,
+    cublas_math_mode: str | None = None,
     dm0: Any | None = None,
     mo_coeff0: Any | None = None,
     init_fock_cycles: int | None = None,
@@ -643,12 +656,20 @@ def run_rhf_df(
         raise ValueError("RHF requires an even, positive electron count")
 
     basis_in = mol.basis if basis is None else basis
+
+    df_layout_s = str(df_layout).strip().lower()
+    if df_layout_s not in {"mnq", "qmn"}:
+        raise ValueError("df_layout must be one of: 'mnQ', 'Qmn'")
+    # Build layout only affects the cached/prep B object. For spherical SCF we
+    # must build Cartesian B in mnQ for the cart->sph transform kernels.
+    df_build_layout = df_layout_s if bool(mol.cart) else "mnq"
     prep_key = _rhf_prep_key(
         mol,
         basis_in=basis_in,
         auxbasis=auxbasis,
         expand_contractions=bool(expand_contractions),
         df_config=df_config,
+        df_layout_build=str(df_build_layout),
     )
     prep_hit = _cache_get(_RHF_PREP_CACHE, prep_key)
     if prep_hit is None:
@@ -670,7 +691,14 @@ def run_rhf_df(
             df_prof = profile.setdefault("df_build", {})
             df_prof["cache_hit"] = False
 
-        B, L_chol = build_df_B_from_cueri_packed_bases(ao_basis, aux_basis, config=df_config, profile=df_prof, return_L=True)
+        B, L_chol = build_df_B_from_cueri_packed_bases(
+            ao_basis,
+            aux_basis,
+            config=df_config,
+            layout=str(df_build_layout),
+            profile=df_prof,
+            return_L=True,
+        )
         _cache_put(
             _RHF_PREP_CACHE,
             prep_key,
@@ -690,7 +718,24 @@ def run_rhf_df(
             df_prof["cache_hit"] = True
 
     # Spherical AO transform (if requested)
-    int1e_scf, B_scf, sph_map = _apply_sph_transform(mol, int1e, B, ao_basis)
+    int1e_scf, B_scf, sph_map = _apply_sph_transform(mol, int1e, B, ao_basis, df_B_layout=str(df_layout))
+    # For large bases, building and transforming DF factors can leave very large
+    # freed blocks cached in CuPy's default memory pool, inflating driver-visible
+    # VRAM and triggering avoidable OOM/non-deterministic failures downstream.
+    #
+    # In the spherical path, we also no longer need the Cartesian B tensor after
+    # the transform. Drop the reference early so its blocks are eligible for pool
+    # release/reuse.
+    try:  # pragma: no cover (best-effort memory hygiene)
+        if B is not None and B is not B_scf:
+            del B
+        import cupy as cp  # noqa: PLC0415
+
+        if isinstance(B_scf, cp.ndarray) and int(getattr(B_scf, "nbytes", 0)) >= 2_000_000_000:
+            cp.cuda.Device().synchronize()
+            cp.get_default_memory_pool().free_all_blocks()
+    except Exception:
+        pass
 
     if mo_coeff0 is None and dm0 is None:
         guess_key = _rhf_guess_key(
@@ -728,6 +773,7 @@ def run_rhf_df(
         damping=float(damping),
         level_shift=float(level_shift),
         k_q_block=int(k_q_block),
+        cublas_math_mode=cublas_math_mode,
         dm0=dm0,
         mo_coeff0=mo_coeff0,
         init_fock_cycles=int(init_fock_cycles_i),
@@ -1055,6 +1101,7 @@ def run_uhf_df_cpu(
     diis_space: int = 8,
     damping: float = 0.0,
     k_q_block: int = 128,
+    cublas_math_mode: str | None = None,
     dm0: Any | None = None,
     mo_coeff0: Any | None = None,
     profile: dict | None = None,
@@ -1099,6 +1146,7 @@ def run_uhf_df_cpu(
         diis_space=int(diis_space),
         damping=float(damping),
         k_q_block=int(k_q_block),
+        cublas_math_mode=cublas_math_mode,
         dm0=dm0,
         mo_coeff0=mo_coeff0,
         profile=scf_prof,
@@ -1133,6 +1181,7 @@ def run_rohf_df_cpu(
     diis_space: int = 8,
     damping: float = 0.0,
     k_q_block: int = 128,
+    cublas_math_mode: str | None = None,
     dm0: Any | None = None,
     mo_coeff0: Any | None = None,
     profile: dict | None = None,
@@ -1180,6 +1229,7 @@ def run_rohf_df_cpu(
         diis_space=int(diis_space),
         damping=float(damping),
         k_q_block=int(k_q_block),
+        cublas_math_mode=cublas_math_mode,
         dm0=dm0,
         mo_coeff0=mo_coeff0,
         profile=scf_prof,
@@ -1205,6 +1255,7 @@ def run_uhf_df(
     basis: Any | None = None,
     auxbasis: Any = "autoaux",
     df_config: CuERIDFConfig | None = None,
+    df_layout: str = "mnQ",
     expand_contractions: bool = True,
     max_cycle: int = 50,
     conv_tol: float = 1e-10,
@@ -1223,6 +1274,11 @@ def run_uhf_df(
     nalpha, nbeta = _nalpha_nbeta_from_mol(mol)
     basis_in = mol.basis if basis is None else basis
 
+    df_layout_s = str(df_layout).strip().lower()
+    if df_layout_s not in {"mnq", "qmn"}:
+        raise ValueError("df_layout must be one of: 'mnQ', 'Qmn'")
+    df_build_layout = df_layout_s if bool(mol.cart) else "mnq"
+
     # AO basis + 1e integrals
     ao_basis, basis_name = build_ao_basis_cart(mol, basis=basis_in, expand_contractions=bool(expand_contractions))
     coords, charges = _atom_coords_charges_bohr(mol)
@@ -1240,10 +1296,17 @@ def run_uhf_df(
     if profile is not None:
         df_prof = profile.setdefault("df_build", {})
 
-    B, L_chol = build_df_B_from_cueri_packed_bases(ao_basis, aux_basis, config=df_config, profile=df_prof, return_L=True)
+    B, L_chol = build_df_B_from_cueri_packed_bases(
+        ao_basis,
+        aux_basis,
+        config=df_config,
+        layout=str(df_build_layout),
+        profile=df_prof,
+        return_L=True,
+    )
 
     # Spherical AO transform (if requested)
-    int1e_scf, B_scf, sph_map = _apply_sph_transform(mol, int1e, B, ao_basis)
+    int1e_scf, B_scf, sph_map = _apply_sph_transform(mol, int1e, B, ao_basis, df_B_layout=str(df_layout))
 
     scf_prof = profile if profile is not None else None
     scf = uhf_df(
@@ -1287,6 +1350,7 @@ def run_rohf_df(
     basis: Any | None = None,
     auxbasis: Any = "autoaux",
     df_config: CuERIDFConfig | None = None,
+    df_layout: str = "mnQ",
     expand_contractions: bool = True,
     max_cycle: int = 50,
     conv_tol: float = 1e-10,
@@ -1308,6 +1372,11 @@ def run_rohf_df(
 
     basis_in = mol.basis if basis is None else basis
 
+    df_layout_s = str(df_layout).strip().lower()
+    if df_layout_s not in {"mnq", "qmn"}:
+        raise ValueError("df_layout must be one of: 'mnQ', 'Qmn'")
+    df_build_layout = df_layout_s if bool(mol.cart) else "mnq"
+
     # AO basis + 1e integrals
     ao_basis, basis_name = build_ao_basis_cart(mol, basis=basis_in, expand_contractions=bool(expand_contractions))
     coords, charges = _atom_coords_charges_bohr(mol)
@@ -1325,10 +1394,17 @@ def run_rohf_df(
     if profile is not None:
         df_prof = profile.setdefault("df_build", {})
 
-    B, L_chol = build_df_B_from_cueri_packed_bases(ao_basis, aux_basis, config=df_config, profile=df_prof, return_L=True)
+    B, L_chol = build_df_B_from_cueri_packed_bases(
+        ao_basis,
+        aux_basis,
+        config=df_config,
+        layout=str(df_build_layout),
+        profile=df_prof,
+        return_L=True,
+    )
 
     # Spherical AO transform (if requested)
-    int1e_scf, B_scf, sph_map = _apply_sph_transform(mol, int1e, B, ao_basis)
+    int1e_scf, B_scf, sph_map = _apply_sph_transform(mol, int1e, B, ao_basis, df_B_layout=str(df_layout))
 
     scf_prof = profile if profile is not None else None
     scf = rohf_df(

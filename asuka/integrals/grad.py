@@ -367,14 +367,39 @@ def compute_df_gradient_contributions_analytic_packed_bases(
     t_df_adjoint = time.perf_counter() if profile is not None else 0.0
 
     # X(μ,ν,P) is symmetric in (μ,ν); enforce symmetric adjoint.
-    bar_X = 0.5 * (bar_X + bar_X.transpose((1, 0, 2)))
     if backend_s == "cpu":
+        bar_X = 0.5 * (bar_X + bar_X.transpose((1, 0, 2)))
         bar_X = np.asarray(bar_X, dtype=np.float64, order="C")
         bar_V = np.asarray(bar_V, dtype=np.float64, order="C")
     else:
         import cupy as cp  # noqa: PLC0415
 
-        bar_X = cp.ascontiguousarray(bar_X)
+        _ext_sym = None
+        try:
+            from asuka.cueri import _cueri_cuda_ext as _ext_sym  # noqa: PLC0415
+        except Exception:
+            _ext_sym = None
+
+        # Prefer fused Qmn->mnQ transpose+symmetrize to avoid allocating a large
+        # intermediate for `0.5*(bar_X + bar_X.T)` and then copying to C-order.
+        if _ext_sym is not None and hasattr(_ext_sym, "df_symmetrize_qmn_to_mnq_device"):
+            bar_X_qmn = bar_X.transpose((2, 0, 1))  # (naux, nao, nao), C-order view
+            if not bool(getattr(bar_X_qmn, "flags", None).c_contiguous):
+                bar_X_qmn = cp.ascontiguousarray(bar_X_qmn, dtype=cp.float64)
+            bar_X_contig = cp.empty((int(nao0), int(nao0), int(naux)), dtype=cp.float64)
+            _ext_sym.df_symmetrize_qmn_to_mnq_device(
+                bar_X_qmn.reshape(-1),
+                bar_X_contig.reshape(-1),
+                int(naux),
+                int(nao0),
+                256,
+                int(cp.cuda.get_current_stream().ptr),
+                False,
+            )
+            bar_X = bar_X_contig
+        else:
+            bar_X = 0.5 * (bar_X + bar_X.transpose((1, 0, 2)))
+            bar_X = cp.ascontiguousarray(bar_X)
         bar_V = cp.ascontiguousarray(bar_V)
 
     bar_X_flat = bar_X.reshape((nao0 * nao0, naux))

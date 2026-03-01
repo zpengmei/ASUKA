@@ -464,9 +464,21 @@ def rhf_df(
     K_prev = None
 
     # Ensure BQ layout is contiguous on GPU (K is bandwidth/throughput sensitive).
+    #
+    # For large bases in mnQ layout, making a full contiguous copy of BQ
+    # doubles the footprint of the DF tensor (often >10GB) and can OOM a
+    # 24GB GPU.  When we can compute K directly from mnQ with q-blocking,
+    # skip the full BQ copy and keep BQ as a strided view.
     b_layout = "streamed" if use_streamed else ("mnQ" if B_mnQ is not None else "Qmn")
     bq_copied = False
-    if not use_streamed and bool(is_gpu) and hasattr(BQ, "flags") and not bool(BQ.flags.c_contiguous):
+    if (
+        (not use_streamed)
+        and bool(is_gpu)
+        and (BQ is not None)
+        and hasattr(BQ, "flags")
+        and (not bool(BQ.flags.c_contiguous))
+        and (not (use_k_cocc and B_mnQ is not None))
+    ):
         BQ = xp.ascontiguousarray(BQ)
         bq_copied = True
 
@@ -561,13 +573,22 @@ def rhf_df(
 
                 C_occ = xp.ascontiguousarray(C[:, :nocc])
                 occ_vals = occ[:nocc]
-                K = df_jk.df_K_from_BQ_Cocc(
-                    BQ,
-                    C_occ,
-                    occ_vals,
-                    q_block=int(k_q_block),
-                    cublas_math_mode=cublas_math_mode,
-                )
+                if B_mnQ is not None:
+                    K = df_jk.df_K_from_BmnQ_Cocc(
+                        B_mnQ,
+                        C_occ,
+                        occ_vals,
+                        q_block=int(k_q_block),
+                        cublas_math_mode=cublas_math_mode,
+                    )
+                else:
+                    K = df_jk.df_K_from_BQ_Cocc(
+                        BQ,
+                        C_occ,
+                        occ_vals,
+                        q_block=int(k_q_block),
+                        cublas_math_mode=cublas_math_mode,
+                    )
                 K = _symmetrize(xp, K)
                 K_prev = K
             else:
@@ -644,13 +665,24 @@ def rhf_df(
             tK = _time_ms_start(xp) if profile is not None else None
             C_occ = xp.ascontiguousarray(C[:, :nocc])
             occ_vals = occ[:nocc]
-            K_pure = df_jk.df_K_from_BQ_Cocc(
-                BQ,
-                C_occ,
-                occ_vals,
-                q_block=int(k_q_block),
-                cublas_math_mode=cublas_math_mode,
-            )
+            if B_mnQ is not None:
+                K_pure = df_jk.df_K_from_BmnQ_Cocc(
+                    B_mnQ,
+                    C_occ,
+                    occ_vals,
+                    q_block=int(k_q_block),
+                    cublas_math_mode=cublas_math_mode,
+                    profile=profile,
+                )
+            else:
+                K_pure = df_jk.df_K_from_BQ_Cocc(
+                    BQ,
+                    C_occ,
+                    occ_vals,
+                    q_block=int(k_q_block),
+                    cublas_math_mode=cublas_math_mode,
+                    profile=profile,
+                )
             if damping and K_prev is not None:
                 K = (1.0 - lam) * K_pure + lam * K_prev
             else:
@@ -660,9 +692,8 @@ def rhf_df(
             if profile is not None and tK is not None:
                 jk_prof = profile.setdefault("jk", {})
                 jk_prof["k_ms"] = float(jk_prof.get("k_ms", 0.0)) + _time_ms_end(xp, tK)
-                jk_prof["k_impl"] = "cocc_block_syrk"
-                jk_prof["k_q_block"] = int(k_q_block)
-                jk_prof["k_nocc"] = int(nocc)
+                jk_prof.setdefault("k_q_block", int(k_q_block))
+                jk_prof.setdefault("k_nocc", int(nocc))
 
             K_prev = K
         else:
@@ -876,7 +907,14 @@ def uhf_df(
 
     b_layout = "streamed" if use_streamed else ("mnQ" if B_mnQ is not None else "Qmn")
     bq_copied = False
-    if not use_streamed and bool(is_gpu) and hasattr(BQ, "flags") and not bool(BQ.flags.c_contiguous):
+    if (
+        (not use_streamed)
+        and bool(is_gpu)
+        and (BQ is not None)
+        and hasattr(BQ, "flags")
+        and (not bool(BQ.flags.c_contiguous))
+        and (not (use_k_cocc and B_mnQ is not None))
+    ):
         BQ = xp.ascontiguousarray(BQ)
         bq_copied = True
 
@@ -991,20 +1029,40 @@ def uhf_df(
             Cb_occ = xp.ascontiguousarray(Cb[:, : int(nbeta)])
             occ_a_vals = occ_a[: int(nalpha)]
             occ_b_vals = occ_b[: int(nbeta)]
-            Ka_pure = df_jk.df_K_from_BQ_Cocc(
-                BQ,
-                Ca_occ,
-                occ_a_vals,
-                q_block=int(k_q_block),
-                cublas_math_mode=cublas_math_mode,
-            )
-            Kb_pure = df_jk.df_K_from_BQ_Cocc(
-                BQ,
-                Cb_occ,
-                occ_b_vals,
-                q_block=int(k_q_block),
-                cublas_math_mode=cublas_math_mode,
-            )
+            if B_mnQ is not None:
+                Ka_pure = df_jk.df_K_from_BmnQ_Cocc(
+                    B_mnQ,
+                    Ca_occ,
+                    occ_a_vals,
+                    q_block=int(k_q_block),
+                    cublas_math_mode=cublas_math_mode,
+                    profile=profile,
+                )
+                Kb_pure = df_jk.df_K_from_BmnQ_Cocc(
+                    B_mnQ,
+                    Cb_occ,
+                    occ_b_vals,
+                    q_block=int(k_q_block),
+                    cublas_math_mode=cublas_math_mode,
+                    profile=profile,
+                )
+            else:
+                Ka_pure = df_jk.df_K_from_BQ_Cocc(
+                    BQ,
+                    Ca_occ,
+                    occ_a_vals,
+                    q_block=int(k_q_block),
+                    cublas_math_mode=cublas_math_mode,
+                    profile=profile,
+                )
+                Kb_pure = df_jk.df_K_from_BQ_Cocc(
+                    BQ,
+                    Cb_occ,
+                    occ_b_vals,
+                    q_block=int(k_q_block),
+                    cublas_math_mode=cublas_math_mode,
+                    profile=profile,
+                )
             if damping and Ka_prev is not None:
                 Ka = (1.0 - lam) * Ka_pure + lam * Ka_prev
             else:
@@ -1019,7 +1077,6 @@ def uhf_df(
             if profile is not None and tK is not None:
                 jk_prof = profile.setdefault("jk", {})
                 jk_prof["k_ms"] = float(jk_prof.get("k_ms", 0.0)) + _time_ms_end(xp, tK)
-                jk_prof["k_impl"] = "cocc_block_syrk"
                 jk_prof["k_q_block"] = int(k_q_block)
                 jk_prof["k_nocc"] = [int(nalpha), int(nbeta)]
 
@@ -1240,7 +1297,14 @@ def rohf_df(
 
     b_layout = "streamed" if use_streamed else ("mnQ" if B_mnQ is not None else "Qmn")
     bq_copied = False
-    if not use_streamed and bool(is_gpu) and hasattr(BQ, "flags") and not bool(BQ.flags.c_contiguous):
+    if (
+        (not use_streamed)
+        and bool(is_gpu)
+        and (BQ is not None)
+        and hasattr(BQ, "flags")
+        and (not bool(BQ.flags.c_contiguous))
+        and (not (use_k_cocc and B_mnQ is not None))
+    ):
         BQ = xp.ascontiguousarray(BQ)
         bq_copied = True
 
@@ -1359,20 +1423,40 @@ def rohf_df(
             C_occ_b = xp.ascontiguousarray(C[:, : int(nbeta)])
             occ_a_vals = occ_a[: int(nalpha)]
             occ_b_vals = occ_b[: int(nbeta)]
-            Ka_pure = df_jk.df_K_from_BQ_Cocc(
-                BQ,
-                C_occ_a,
-                occ_a_vals,
-                q_block=int(k_q_block),
-                cublas_math_mode=cublas_math_mode,
-            )
-            Kb_pure = df_jk.df_K_from_BQ_Cocc(
-                BQ,
-                C_occ_b,
-                occ_b_vals,
-                q_block=int(k_q_block),
-                cublas_math_mode=cublas_math_mode,
-            )
+            if B_mnQ is not None:
+                Ka_pure = df_jk.df_K_from_BmnQ_Cocc(
+                    B_mnQ,
+                    C_occ_a,
+                    occ_a_vals,
+                    q_block=int(k_q_block),
+                    cublas_math_mode=cublas_math_mode,
+                    profile=profile,
+                )
+                Kb_pure = df_jk.df_K_from_BmnQ_Cocc(
+                    B_mnQ,
+                    C_occ_b,
+                    occ_b_vals,
+                    q_block=int(k_q_block),
+                    cublas_math_mode=cublas_math_mode,
+                    profile=profile,
+                )
+            else:
+                Ka_pure = df_jk.df_K_from_BQ_Cocc(
+                    BQ,
+                    C_occ_a,
+                    occ_a_vals,
+                    q_block=int(k_q_block),
+                    cublas_math_mode=cublas_math_mode,
+                    profile=profile,
+                )
+                Kb_pure = df_jk.df_K_from_BQ_Cocc(
+                    BQ,
+                    C_occ_b,
+                    occ_b_vals,
+                    q_block=int(k_q_block),
+                    cublas_math_mode=cublas_math_mode,
+                    profile=profile,
+                )
             if damping and Ka_prev is not None:
                 Ka = (1.0 - lam) * Ka_pure + lam * Ka_prev
             else:
@@ -1387,7 +1471,6 @@ def rohf_df(
             if profile is not None and tK is not None:
                 jk_prof = profile.setdefault("jk", {})
                 jk_prof["k_ms"] = float(jk_prof.get("k_ms", 0.0)) + _time_ms_end(xp, tK)
-                jk_prof["k_impl"] = "cocc_block_syrk"
                 jk_prof["k_q_block"] = int(k_q_block)
                 jk_prof["k_nocc"] = [int(nalpha), int(nbeta)]
 

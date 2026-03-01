@@ -636,7 +636,41 @@ def cholesky_metric(V):
     V = cp.asarray(V, dtype=cp.float64)
     if V.ndim != 2 or V.shape[0] != V.shape[1]:
         raise ValueError("V must be a square 2D array")
-    return cp.linalg.cholesky(V)
+    # Regularize near-singular auxiliary basis metrics.
+    #
+    # AutoAux bases can have near-linear dependencies that produce tiny negative
+    # eigenvalues (e.g. -1e-14).  On GPU, Cholesky can sometimes silently
+    # propagate this into NaNs rather than raising, which then poisons all
+    # downstream DF quantities (B, L_full, ERIs).
+    n = int(V.shape[0])
+    if n == 0:
+        return cp.empty((0, 0), dtype=cp.float64)
+
+    diag_idx = cp.diag_indices(n)
+    vdiag = V[diag_idx]
+    try:
+        scale = float(cp.max(cp.abs(vdiag)).item())
+    except Exception:  # pragma: no cover
+        scale = 0.0
+    shift0 = max(scale * 1e-14, 1e-12)
+
+    added = 0.0
+    for k in range(6):
+        target = float(shift0 * (10.0**k))
+        delta = float(target - added)
+        if delta != 0.0:
+            V[diag_idx] += delta
+            added = target
+        try:
+            L = cp.linalg.cholesky(V)
+        except Exception:
+            continue
+        try:
+            if bool(cp.isfinite(L).all().item()):
+                return L
+        except Exception:
+            return L
+    raise RuntimeError("cholesky_metric failed after diagonal regularization retries")
 
 
 def whiten_3c2e(X, L):
@@ -655,7 +689,7 @@ def whiten_3c2e(X, L):
     except Exception as e:  # pragma: no cover
         raise RuntimeError("CuPy is required for DF whiten_3c2e") from e
 
-    import cupyx.scipy.linalg as cpx_linalg
+    from cupy.cuda import cublas
 
     X = cp.asarray(X, dtype=cp.float64)
     L = cp.asarray(L, dtype=cp.float64)
@@ -669,19 +703,66 @@ def whiten_3c2e(X, L):
     if int(L.shape[0]) != naux:
         raise ValueError(f"L has shape {L.shape}, but X implies naux={naux}")
 
-    X_flat = X.reshape((nao0 * nao0, naux))
-    # B^T = L^{-1} X^T  (L is lower).
-    # Make an explicit C-contiguous copy of X_flat.T so solve_triangular can
-    # overwrite it in-place, avoiding an internal allocation.
-    X_flat_T = cp.ascontiguousarray(X_flat.T)       # (naux, nao²)
-    del X_flat
-    BT = cpx_linalg.solve_triangular(L, X_flat_T, lower=True, trans="N", unit_diagonal=False, overwrite_b=True)
-    del X_flat_T
-    # Normalize layout to C-contiguous so downstream (J/K, transforms) have
-    # stable performance regardless of the input X memory order/strides.
-    B_flat = cp.ascontiguousarray(BT.T)
-    del BT
-    return B_flat.reshape((nao0, nao0, naux))
+    # ------------------------------------------------------------------
+    # Memory-critical path:
+    #   B^T = L^{-1} X^T  (L is lower).
+    #
+    # A naive implementation materializes a C-contiguous copy of X^T with shape
+    # (naux, nao^2), which can be >10GB for large bases and can OOM a 24GB GPU.
+    #
+    # We avoid that by calling cuBLAS TRSM directly on the *existing* X buffer:
+    # - X is C-contiguous (row-major) with shape (nao^2, naux)
+    # - The same memory, interpreted as a column-major matrix of shape
+    #   (naux, nao^2), is exactly X^T
+    # - TRSM overwrites that column-major view in-place with B^T
+    # - Interpreting the same memory back as row-major (nao^2, naux) yields B
+    #
+    # This avoids allocating any additional O(nao^2*naux) buffers.
+    # ------------------------------------------------------------------
+    if not bool(getattr(X, "flags", None).c_contiguous):
+        X = cp.ascontiguousarray(X, dtype=cp.float64)
+    # Ensure the triangular factor is column-major for cuBLAS.
+    L_f = cp.asfortranarray(L, dtype=cp.float64)
+
+    X_flat = X.reshape((nao0 * nao0, naux))  # view on X
+
+    # Call cuBLAS dtrsm on the column-major view of X_flat (naux, nao^2).
+    handle = cp.cuda.get_cublas_handle()
+    prev_stream = cublas.getStream(handle)
+    prev_mode = cublas.getPointerMode(handle)
+    try:
+        cublas.setStream(handle, int(cp.cuda.get_current_stream().ptr))
+        cublas.setPointerMode(handle, cublas.CUBLAS_POINTER_MODE_HOST)
+        import numpy as np
+
+        alpha = np.array(1.0, dtype=np.float64)
+        cublas.dtrsm(
+            handle,
+            cublas.CUBLAS_SIDE_LEFT,
+            cublas.CUBLAS_FILL_MODE_LOWER,
+            cublas.CUBLAS_OP_N,
+            cublas.CUBLAS_DIAG_NON_UNIT,
+            int(naux),                # m: rows of X^T
+            int(nao0 * nao0),         # n: cols of X^T
+            int(alpha.ctypes.data),   # pointer to host scalar
+            int(L_f.data.ptr),
+            int(L_f.shape[0]),
+            int(X_flat.data.ptr),
+            int(naux),
+        )
+    finally:
+        # Restore handle state so other callers (and other streams) behave as expected.
+        try:
+            cublas.setStream(handle, int(prev_stream))
+        except Exception:
+            pass
+        try:
+            cublas.setPointerMode(handle, int(prev_mode))
+        except Exception:
+            pass
+
+    # X now holds B in-place.
+    return X_flat.reshape((nao0, nao0, naux))
 
 
 def active_Lfull_from_B(B, C_active):
