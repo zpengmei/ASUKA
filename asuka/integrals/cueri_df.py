@@ -28,6 +28,7 @@ def build_df_B_from_cueri_packed_bases(
     *,
     config: CuERIDFConfig | None = None,
     layout: str = "mnQ",
+    ao_rep: str = "cart",
     profile: dict | None = None,
     return_L: bool = False,
 ):
@@ -80,6 +81,7 @@ def build_df_B_from_cueri_packed_bases(
         backend=str(cfg.backend),
         mode=str(cfg.mode),
         threads=int(cfg.threads),
+        ao_rep=str(ao_rep),
         profile=profile,
     )
     B = cueri_df.whiten_3c2e(X, L)

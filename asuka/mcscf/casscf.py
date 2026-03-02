@@ -605,6 +605,20 @@ def run_casscf_df(
     if not bool(getattr(scf_out.scf, "converged", False)):
         raise RuntimeError("SCF must be converged before CASSCF")
 
+    # DF-CASSCF assumes AO DF factors in mnQ layout (B[mu,nu,Q]).
+    B = getattr(scf_out, "df_B", None)
+    if B is None:
+        raise ValueError("DF-CASSCF requires scf_out.df_B (cached DF factors)")
+    B_shape = getattr(B, "shape", None)
+    if B_shape is None or len(B_shape) != 3:
+        raise ValueError("scf_out.df_B must be a 3D tensor with shape (nao, nao, naux) (mnQ layout)")
+    nao_work = int(getattr(getattr(scf_out, "int1e"), "S").shape[0])
+    if int(B_shape[0]) != int(nao_work) or int(B_shape[1]) != int(nao_work):
+        raise ValueError(
+            "DF-CASSCF currently requires df_layout='mnQ' (B[mu,nu,Q] with shape (nao,nao,naux)). "
+            f"Got df_B.shape={tuple(map(int, B_shape))} for nao={int(nao_work)}."
+        )
+
     ncore = int(ncore)
     ncas = int(ncas)
     if ncore < 0:

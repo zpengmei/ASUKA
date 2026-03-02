@@ -228,7 +228,7 @@ def make_df_casscf_energy_grad(
             if prev_mol is not None and prev_casscf_mo_coeff is not None:
                 if prev_ncore is not None and prev_ncas is not None:
                     from asuka.frontend.one_electron import build_ao_basis_cart  # noqa: PLC0415
-                    from asuka.integrals.cross_geometry import build_S_cross_cart  # noqa: PLC0415
+                    from asuka.integrals.cross_geometry import build_S_cross  # noqa: PLC0415
                     from asuka.mcscf.orbital_tracking import (  # noqa: PLC0415
                         align_orbital_phases,
                         assign_active_orbitals_by_overlap,
@@ -239,8 +239,30 @@ def make_df_casscf_energy_grad(
                     basis_prev, _ = build_ao_basis_cart(prev_mol)
                     basis_new, _ = build_ao_basis_cart(mol_eval)
 
-                    # Compute cross-geometry overlap
-                    S_cross = build_S_cross_cart(basis_prev, basis_new)
+                    # Compute cross-geometry overlap (project to spherical AO space when cart=False).
+                    T_prev = None
+                    T_new = None
+                    if not bool(getattr(mol_eval, "cart", True)):
+                        from asuka.integrals.cart2sph import build_cart2sph_matrix, compute_sph_layout_from_cart_basis  # noqa: PLC0415
+                        from asuka.integrals.int1e_cart import nao_cart_from_basis  # noqa: PLC0415
+
+                        sh0_sph_prev, nao_sph_prev = compute_sph_layout_from_cart_basis(basis_prev)
+                        T_prev = build_cart2sph_matrix(
+                            basis_prev.shell_l,
+                            basis_prev.shell_ao_start,
+                            sh0_sph_prev,
+                            nao_cart_from_basis(basis_prev),
+                            nao_sph_prev,
+                        )
+                        sh0_sph_new, nao_sph_new = compute_sph_layout_from_cart_basis(basis_new)
+                        T_new = build_cart2sph_matrix(
+                            basis_new.shell_l,
+                            basis_new.shell_ao_start,
+                            sh0_sph_new,
+                            nao_cart_from_basis(basis_new),
+                            nao_sph_new,
+                        )
+                    S_cross = build_S_cross(basis_prev, basis_new, T_bra=T_prev, T_ket=T_new)
 
                     # Get new SCF orbitals
                     scf_mo_coeff = np.asarray(
@@ -555,7 +577,7 @@ def make_df_casscf_multiroot_energy_grad(
             if prev_mol is not None and prev_casscf_mo_coeff is not None:
                 if prev_ncore is not None and prev_ncas is not None:
                     from asuka.frontend.one_electron import build_ao_basis_cart  # noqa: PLC0415
-                    from asuka.integrals.cross_geometry import build_S_cross_cart  # noqa: PLC0415
+                    from asuka.integrals.cross_geometry import build_S_cross  # noqa: PLC0415
                     from asuka.mcscf.orbital_tracking import (  # noqa: PLC0415
                         align_orbital_phases,
                         assign_active_orbitals_by_overlap,
@@ -564,7 +586,31 @@ def make_df_casscf_multiroot_energy_grad(
 
                     basis_prev, _ = build_ao_basis_cart(prev_mol)
                     basis_new, _ = build_ao_basis_cart(mol_eval)
-                    S_cross = build_S_cross_cart(basis_prev, basis_new)
+
+                    # Compute cross-geometry overlap (project to spherical AO space when cart=False).
+                    T_prev = None
+                    T_new = None
+                    if not bool(getattr(mol_eval, "cart", True)):
+                        from asuka.integrals.cart2sph import build_cart2sph_matrix, compute_sph_layout_from_cart_basis  # noqa: PLC0415
+                        from asuka.integrals.int1e_cart import nao_cart_from_basis  # noqa: PLC0415
+
+                        sh0_sph_prev, nao_sph_prev = compute_sph_layout_from_cart_basis(basis_prev)
+                        T_prev = build_cart2sph_matrix(
+                            basis_prev.shell_l,
+                            basis_prev.shell_ao_start,
+                            sh0_sph_prev,
+                            nao_cart_from_basis(basis_prev),
+                            nao_sph_prev,
+                        )
+                        sh0_sph_new, nao_sph_new = compute_sph_layout_from_cart_basis(basis_new)
+                        T_new = build_cart2sph_matrix(
+                            basis_new.shell_l,
+                            basis_new.shell_ao_start,
+                            sh0_sph_new,
+                            nao_cart_from_basis(basis_new),
+                            nao_sph_new,
+                        )
+                    S_cross = build_S_cross(basis_prev, basis_new, T_bra=T_prev, T_ket=T_new)
 
                     scf_mo_coeff = np.asarray(
                         getattr(getattr(scf_out, "scf", None), "mo_coeff", None),

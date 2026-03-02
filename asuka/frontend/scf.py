@@ -19,7 +19,7 @@ from dataclasses import dataclass
 import json
 import os
 import threading
-from typing import Any
+from typing import Any, TYPE_CHECKING
 
 import numpy as np
 
@@ -36,6 +36,9 @@ from .molecule import Molecule
 from .one_electron import build_ao_basis_cart
 from .periodic_table import atomic_number
 
+if TYPE_CHECKING:
+    from asuka.integrals.cart2sph import AOSphericalTransform
+
 
 def _apply_sph_transform(
     mol: Molecule,
@@ -44,7 +47,7 @@ def _apply_sph_transform(
     ao_basis,
     *,
     df_B_layout: str = "mnQ",
-) -> tuple[Int1eResult, Any, tuple[np.ndarray, int, int] | None]:
+) -> tuple[Int1eResult, Any, AOSphericalTransform | None]:
     """If ``mol.cart=False``, transform int1e and B to spherical AOs.
 
     Returns ``(int1e, B, sph_map_or_None)``.
@@ -53,6 +56,7 @@ def _apply_sph_transform(
         return int1e, B, None
 
     from asuka.integrals.cart2sph import (  # noqa: PLC0415
+        AOSphericalTransform,
         build_cart2sph_matrix,
         compute_sph_layout_from_cart_basis,
         transform_1e_cart_to_sph,
@@ -60,6 +64,11 @@ def _apply_sph_transform(
     )
 
     shell_l = np.asarray(ao_basis.shell_l, dtype=np.int32).ravel()
+    if int(shell_l.size) and int(np.max(shell_l)) > 5:
+        raise ValueError(
+            "Spherical AO transform supports basis shells up to l<=5. "
+            f"Got max(shell_l)={int(np.max(shell_l))}. Use cart=True for higher angular momentum."
+        )
     shell_ao_start_cart = np.asarray(ao_basis.shell_ao_start, dtype=np.int32).ravel()
     shell_ao_start_sph, nao_sph = compute_sph_layout_from_cart_basis(ao_basis)
     nao_cart = int(int1e.S.shape[0])
@@ -83,7 +92,7 @@ def _apply_sph_transform(
     else:
         B_sph = None
 
-    return int1e_sph, B_sph, (T, nao_cart, nao_sph)
+    return int1e_sph, B_sph, AOSphericalTransform(T_c2s=T, nao_cart=nao_cart, nao_sph=nao_sph)
 
 
 @dataclass(frozen=True)
@@ -98,7 +107,7 @@ class RHFDFRunResult:
     scf: SCFResult
     profile: dict | None = None
     ao_eri: Any | None = None
-    sph_map: tuple[np.ndarray, int, int] | None = None  # (T, nao_cart, nao_sph)
+    sph_map: AOSphericalTransform | tuple[np.ndarray, int, int] | None = None
     df_L: Any | None = None  # Cholesky factor of aux metric (for deterministic gradients)
 
 
@@ -114,7 +123,7 @@ class UHFDFRunResult:
     scf: SCFResult
     profile: dict | None = None
     ao_eri: Any | None = None
-    sph_map: tuple[np.ndarray, int, int] | None = None  # (T, nao_cart, nao_sph)
+    sph_map: AOSphericalTransform | tuple[np.ndarray, int, int] | None = None
     df_L: Any | None = None  # Cholesky factor of aux metric (for deterministic gradients)
 
 
@@ -130,7 +139,7 @@ class ROHFDFRunResult:
     scf: SCFResult
     profile: dict | None = None
     ao_eri: Any | None = None
-    sph_map: tuple[np.ndarray, int, int] | None = None  # (T, nao_cart, nao_sph)
+    sph_map: AOSphericalTransform | tuple[np.ndarray, int, int] | None = None
     df_L: Any | None = None  # Cholesky factor of aux metric (for deterministic gradients)
 
 
@@ -392,9 +401,6 @@ def run_rhf_dense(
 ) -> RHFDFRunResult:
     """Run RHF with dense AO ERIs (non-DF)."""
 
-    if not bool(mol.cart):
-        raise NotImplementedError("Dense ERI path does not yet support spherical AOs (cart=False); use df=True")
-
     if int(mol.spin) != 0:
         raise NotImplementedError("run_rhf_dense currently supports only closed-shell molecules (spin=0)")
 
@@ -418,6 +424,14 @@ def run_rhf_dense(
         profile=profile,
     )
 
+    sph_map: AOSphericalTransform | None = None
+    eri_mat_use = dense.eri_mat
+    if not bool(mol.cart):
+        int1e, _, sph_map = _apply_sph_transform(mol, int1e, None, ao_basis)
+        from asuka.integrals.cart2sph import transform_dense_eri_cart_to_sph  # noqa: PLC0415
+        T, nao_cart, nao_sph = sph_map
+        eri_mat_use = transform_dense_eri_cart_to_sph(dense.eri_mat, T, nao_cart, nao_sph)
+
     init_fock_cycles_i = int(_HF_INIT_FOCK_CYCLES) if init_fock_cycles is None else max(0, int(init_fock_cycles))
     diis_start_cycle_i = (
         int(diis_start_cycle) if diis_start_cycle is not None else (1 if int(init_fock_cycles_i) > 0 else 2)
@@ -426,7 +440,7 @@ def run_rhf_dense(
     scf = rhf_dense(
         int1e.S,
         int1e.hcore,
-        dense.eri_mat,
+        eri_mat_use,
         nelec=int(nelec),
         enuc=float(mol.energy_nuc()),
         max_cycle=int(max_cycle),
@@ -453,7 +467,8 @@ def run_rhf_dense(
         df_B=None,
         scf=scf,
         profile=profile,
-        ao_eri=dense.eri_mat,
+        ao_eri=eri_mat_use,
+        sph_map=sph_map,
     )
 
 
@@ -481,9 +496,6 @@ def run_uhf_dense(
 ) -> UHFDFRunResult:
     """Run UHF with dense AO ERIs (non-DF)."""
 
-    if not bool(mol.cart):
-        raise NotImplementedError("Dense ERI path does not yet support spherical AOs (cart=False); use df=True")
-
     nalpha, nbeta = _nalpha_nbeta_from_mol(mol)
     basis_in = mol.basis if basis is None else basis
 
@@ -502,11 +514,19 @@ def run_uhf_dense(
         profile=profile,
     )
 
+    sph_map: AOSphericalTransform | None = None
+    eri_mat_use = dense.eri_mat
+    if not bool(mol.cart):
+        int1e, _, sph_map = _apply_sph_transform(mol, int1e, None, ao_basis)
+        from asuka.integrals.cart2sph import transform_dense_eri_cart_to_sph  # noqa: PLC0415
+        T, nao_cart, nao_sph = sph_map
+        eri_mat_use = transform_dense_eri_cart_to_sph(dense.eri_mat, T, nao_cart, nao_sph)
+
     scf_prof = profile if profile is not None else None
     scf = uhf_dense(
         int1e.S,
         int1e.hcore,
-        dense.eri_mat,
+        eri_mat_use,
         nalpha=int(nalpha),
         nbeta=int(nbeta),
         enuc=float(mol.energy_nuc()),
@@ -532,7 +552,8 @@ def run_uhf_dense(
         df_B=None,
         scf=scf,
         profile=profile,
-        ao_eri=dense.eri_mat,
+        ao_eri=eri_mat_use,
+        sph_map=sph_map,
     )
 
 
@@ -560,9 +581,6 @@ def run_rohf_dense(
 ) -> ROHFDFRunResult:
     """Run ROHF with dense AO ERIs (non-DF)."""
 
-    if not bool(mol.cart):
-        raise NotImplementedError("Dense ERI path does not yet support spherical AOs (cart=False); use df=True")
-
     nalpha, nbeta = _nalpha_nbeta_from_mol(mol)
     if int(nalpha) < int(nbeta):
         raise ValueError("run_rohf_dense requires spin >= 0 (nalpha >= nbeta)")
@@ -583,11 +601,19 @@ def run_rohf_dense(
         profile=profile,
     )
 
+    sph_map: AOSphericalTransform | None = None
+    eri_mat_use = dense.eri_mat
+    if not bool(mol.cart):
+        int1e, _, sph_map = _apply_sph_transform(mol, int1e, None, ao_basis)
+        from asuka.integrals.cart2sph import transform_dense_eri_cart_to_sph  # noqa: PLC0415
+        T, nao_cart, nao_sph = sph_map
+        eri_mat_use = transform_dense_eri_cart_to_sph(dense.eri_mat, T, nao_cart, nao_sph)
+
     scf_prof = profile if profile is not None else None
     scf = rohf_dense(
         int1e.S,
         int1e.hcore,
-        dense.eri_mat,
+        eri_mat_use,
         nalpha=int(nalpha),
         nbeta=int(nbeta),
         enuc=float(mol.energy_nuc()),
@@ -613,7 +639,8 @@ def run_rohf_dense(
         df_B=None,
         scf=scf,
         profile=profile,
-        ao_eri=dense.eri_mat,
+        ao_eri=eri_mat_use,
+        sph_map=sph_map,
     )
 
 
@@ -660,9 +687,8 @@ def run_rhf_df(
     df_layout_s = str(df_layout).strip().lower()
     if df_layout_s not in {"mnq", "qmn"}:
         raise ValueError("df_layout must be one of: 'mnQ', 'Qmn'")
-    # Build layout only affects the cached/prep B object. For spherical SCF we
-    # must build Cartesian B in mnQ for the cart->sph transform kernels.
-    df_build_layout = df_layout_s if bool(mol.cart) else "mnq"
+    df_build_layout = df_layout_s
+    df_ao_rep = "cart" if bool(mol.cart) else "sph"
     prep_key = _rhf_prep_key(
         mol,
         basis_in=basis_in,
@@ -696,6 +722,7 @@ def run_rhf_df(
             aux_basis,
             config=df_config,
             layout=str(df_build_layout),
+            ao_rep=str(df_ao_rep),
             profile=df_prof,
             return_L=True,
         )
@@ -718,7 +745,11 @@ def run_rhf_df(
             df_prof["cache_hit"] = True
 
     # Spherical AO transform (if requested)
-    int1e_scf, B_scf, sph_map = _apply_sph_transform(mol, int1e, B, ao_basis, df_B_layout=str(df_layout))
+    if bool(mol.cart):
+        int1e_scf, B_scf, sph_map = _apply_sph_transform(mol, int1e, B, ao_basis, df_B_layout=str(df_layout))
+    else:
+        int1e_scf, _B_unused, sph_map = _apply_sph_transform(mol, int1e, None, ao_basis, df_B_layout=str(df_layout))
+        B_scf = B
     # For large bases, building and transforming DF factors can leave very large
     # freed blocks cached in CuPy's default memory pool, inflating driver-visible
     # VRAM and triggering avoidable OOM/non-deterministic failures downstream.
@@ -1277,7 +1308,8 @@ def run_uhf_df(
     df_layout_s = str(df_layout).strip().lower()
     if df_layout_s not in {"mnq", "qmn"}:
         raise ValueError("df_layout must be one of: 'mnQ', 'Qmn'")
-    df_build_layout = df_layout_s if bool(mol.cart) else "mnq"
+    df_build_layout = df_layout_s
+    df_ao_rep = "cart" if bool(mol.cart) else "sph"
 
     # AO basis + 1e integrals
     ao_basis, basis_name = build_ao_basis_cart(mol, basis=basis_in, expand_contractions=bool(expand_contractions))
@@ -1301,12 +1333,17 @@ def run_uhf_df(
         aux_basis,
         config=df_config,
         layout=str(df_build_layout),
+        ao_rep=str(df_ao_rep),
         profile=df_prof,
         return_L=True,
     )
 
     # Spherical AO transform (if requested)
-    int1e_scf, B_scf, sph_map = _apply_sph_transform(mol, int1e, B, ao_basis, df_B_layout=str(df_layout))
+    if bool(mol.cart):
+        int1e_scf, B_scf, sph_map = _apply_sph_transform(mol, int1e, B, ao_basis, df_B_layout=str(df_layout))
+    else:
+        int1e_scf, _B_unused, sph_map = _apply_sph_transform(mol, int1e, None, ao_basis, df_B_layout=str(df_layout))
+        B_scf = B
 
     scf_prof = profile if profile is not None else None
     scf = uhf_df(
@@ -1375,7 +1412,8 @@ def run_rohf_df(
     df_layout_s = str(df_layout).strip().lower()
     if df_layout_s not in {"mnq", "qmn"}:
         raise ValueError("df_layout must be one of: 'mnQ', 'Qmn'")
-    df_build_layout = df_layout_s if bool(mol.cart) else "mnq"
+    df_build_layout = df_layout_s
+    df_ao_rep = "cart" if bool(mol.cart) else "sph"
 
     # AO basis + 1e integrals
     ao_basis, basis_name = build_ao_basis_cart(mol, basis=basis_in, expand_contractions=bool(expand_contractions))
@@ -1399,12 +1437,17 @@ def run_rohf_df(
         aux_basis,
         config=df_config,
         layout=str(df_build_layout),
+        ao_rep=str(df_ao_rep),
         profile=df_prof,
         return_L=True,
     )
 
     # Spherical AO transform (if requested)
-    int1e_scf, B_scf, sph_map = _apply_sph_transform(mol, int1e, B, ao_basis, df_B_layout=str(df_layout))
+    if bool(mol.cart):
+        int1e_scf, B_scf, sph_map = _apply_sph_transform(mol, int1e, B, ao_basis, df_B_layout=str(df_layout))
+    else:
+        int1e_scf, _B_unused, sph_map = _apply_sph_transform(mol, int1e, None, ao_basis, df_B_layout=str(df_layout))
+        B_scf = B
 
     scf_prof = profile if profile is not None else None
     scf = rohf_df(

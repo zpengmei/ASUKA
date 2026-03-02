@@ -44,6 +44,7 @@ class RHFCPHFResult:
     info : dict[str, Any]
         Additional solver information/statistics.
     """
+    converged: bool
     niter: int
     residual_norm: float
     x_vo: np.ndarray  # (nvir,nocc)

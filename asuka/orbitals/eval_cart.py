@@ -6,6 +6,7 @@ from typing import Any
 import numpy as np
 
 from asuka.cueri.cart import cartesian_components, ncart
+from asuka.integrals.cart2sph import AOSphericalTransform, coerce_sph_map
 
 
 def _asnumpy(a: Any) -> np.ndarray:
@@ -111,14 +112,14 @@ def eval_mos_cart_on_points(
     points: np.ndarray,
     mo_list: list[int],
     *,
-    sph_map: tuple[np.ndarray, int, int] | None = None,
+    sph_map: AOSphericalTransform | tuple[np.ndarray, int, int] | None = None,
 ) -> np.ndarray:
     """Evaluate selected MOs on points (streamed by shell).
 
     Parameters
     ----------
-    sph_map : tuple | None
-        If not None, ``(T, nao_cart, nao_sph)`` from SCF result.
+    sph_map : AOSphericalTransform | tuple | None
+        If not None, spherical AO transform metadata (dataclass or legacy tuple).
         C is assumed to be in spherical AO basis and will be back-transformed
         to Cartesian: ``C_cart = T @ C_sph``.
 
@@ -131,7 +132,7 @@ def eval_mos_cart_on_points(
 
     # Back-transform spherical MO coefficients to Cartesian for grid evaluation
     if sph_map is not None:
-        T_c2s = np.asarray(sph_map[0], dtype=np.float64)
+        T_c2s = np.asarray(coerce_sph_map(sph_map).T_c2s, dtype=np.float64)
         Cn = T_c2s @ Cn
 
     pts = np.asarray(points, dtype=np.float64).reshape((-1, 3))
@@ -162,4 +163,3 @@ __all__ = [
     "eval_shell_cart",
     "make_cube_grid_from_atoms",
 ]
-

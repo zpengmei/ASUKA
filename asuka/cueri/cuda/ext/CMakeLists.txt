@@ -30,6 +30,7 @@ pybind11_add_module(
     src/cueri_cuda_kernels_df_deriv.cu
     src/cueri_cuda_kernels_cart2sph_eri.cu
     src/cueri_cuda_kernels_sph.cu
+    src/cueri_cuda_kernels_int1e_sph.cu
 )
 
 target_link_libraries(

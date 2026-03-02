@@ -2077,10 +2077,32 @@ def solve_mcscf_zvector_batch(
     if len(out) != n_rhs:  # pragma: no cover
         raise RuntimeError("internal error: incomplete zvector batch solve")
 
+    _solver_set = sorted(
+        {
+            str((r.info or {}).get("solver", method_l)).strip().lower()
+            for r in out
+        }
+    )
+    _backend_set = sorted(
+        {
+            str((r.info or {}).get("backend", "unknown")).strip().lower()
+            for r in out
+        }
+    )
+    if len(_backend_set) == 1:
+        _backend = _backend_set[0]
+    elif len(_backend_set) == 0:
+        _backend = "unknown"
+    else:
+        _backend = "mixed"
+
     info = {
         "n_rhs": int(n_rhs),
         "order": [int(i) for i in order],
         "solver": method_l,
+        "solver_detail": _solver_set,
+        "backend": _backend,
+        "backend_detail": _backend_set,
         "shared_recycle": bool(use_shared_recycle),
         "chain_x0": bool(chain_x0),
         "total_matvec_calls": int(total_matvec),

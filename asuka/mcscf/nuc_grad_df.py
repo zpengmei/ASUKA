@@ -33,6 +33,7 @@ import numpy as np
 
 from asuka.frontend.periodic_table import atomic_number
 from asuka.hf import df_scf as _df_scf
+from asuka.integrals.cart2sph import coerce_sph_map
 from asuka.integrals.grad import (
     compute_df_gradient_contributions_analytic_packed_bases,
     compute_df_gradient_contributions_analytic_sph,
@@ -60,6 +61,126 @@ def _resolve_xp(df_backend: str):
         except ImportError:
             raise RuntimeError("df_backend='cuda' requires CuPy")
     return np, False
+
+
+def _normalize_int1e_backend_mode(value: str | None) -> str:
+    mode = str(value or "auto").strip().lower()
+    if mode not in ("auto", "cpu", "cuda"):
+        raise ValueError("int1e_contract_backend must be one of {'auto','cpu','cuda'}")
+    return mode
+
+
+def _has_sph_int1e_cuda_kernels() -> bool:
+    try:
+        from asuka.integrals.int1e_sph_cuda import has_int1e_sph_cuda_kernels  # noqa: PLC0415
+    except Exception:
+        return False
+    try:
+        return bool(has_int1e_sph_cuda_kernels())
+    except Exception:
+        return False
+
+
+def _select_sph_int1e_backend(*, contract_backend: str, df_backend: str) -> Literal["cpu", "cuda"]:
+    mode = _normalize_int1e_backend_mode(contract_backend)
+    want_cuda = bool(mode == "cuda" or (mode == "auto" and str(df_backend).strip().lower() == "cuda"))
+    if not want_cuda:
+        return "cpu"
+
+    if _has_sph_int1e_cuda_kernels():
+        return "cuda"
+
+    if mode == "cuda":
+        raise RuntimeError(
+            "Spherical int1e CUDA backend requested but fused spherical 1e CUDA kernels are unavailable. "
+            "Rebuild cuERI CUDA extension with cueri_cuda_kernels_int1e_sph.cu."
+        )
+    return "cpu"
+
+
+def _build_sph_int1e_prebuilt(
+    ao_basis: Any,
+    *,
+    atom_coords_bohr: np.ndarray,
+    atom_charges: np.ndarray | None,
+    shell_atom: np.ndarray,
+    need_overlap: bool,
+    need_hcore: bool,
+    to_gpu: bool,
+) -> tuple[Any | None, Any | None, Any | None]:
+    from asuka.integrals.int1e_sph import build_dS_sph, build_dT_sph, build_dV_sph  # noqa: PLC0415
+
+    dS_pre = None
+    dT_pre = None
+    dV_pre = None
+
+    if bool(need_overlap):
+        dS_pre = build_dS_sph(
+            ao_basis,
+            atom_coords_bohr=atom_coords_bohr,
+            shell_atom=shell_atom,
+        )
+    if bool(need_hcore):
+        dT_pre = build_dT_sph(
+            ao_basis,
+            atom_coords_bohr=atom_coords_bohr,
+            shell_atom=shell_atom,
+        )
+        dV_pre = build_dV_sph(
+            ao_basis,
+            atom_coords_bohr=atom_coords_bohr,
+            atom_charges=np.asarray(atom_charges, dtype=np.float64),
+            shell_atom=shell_atom,
+            include_operator_deriv=True,
+        )
+
+    if bool(to_gpu):
+        try:
+            import cupy as cp  # noqa: PLC0415
+        except Exception as e:  # pragma: no cover
+            raise RuntimeError("Spherical int1e CUDA backend requires CuPy") from e
+        if dS_pre is not None:
+            dS_pre = cp.asarray(dS_pre, dtype=cp.float64)
+        if dT_pre is not None:
+            dT_pre = cp.asarray(dT_pre, dtype=cp.float64)
+        if dV_pre is not None:
+            dV_pre = cp.asarray(dV_pre, dtype=cp.float64)
+
+    return dS_pre, dT_pre, dV_pre
+
+
+def _require_df_mnq_layout(scf_out: Any, *, where: str) -> tuple[int, int, int]:
+    """Validate that cached DF factors are in mnQ layout: ``(nao, nao, naux)``."""
+    B = getattr(scf_out, "df_B", None)
+    if B is None:
+        raise ValueError(f"{where} requires scf_out.df_B in df_layout='mnQ' with shape (nao,nao,naux); got None")
+
+    B_shape = getattr(B, "shape", None)
+    if B_shape is None or len(B_shape) != 3:
+        raise ValueError(
+            f"{where} requires scf_out.df_B in df_layout='mnQ' with shape (nao,nao,naux); "
+            f"got shape={B_shape!r}"
+        )
+
+    nao_int1e = None
+    try:
+        nao_int1e = int(getattr(getattr(scf_out, "int1e", None), "S").shape[0])
+    except Exception:
+        nao_int1e = None
+
+    n0, n1, naux = map(int, B_shape)
+    if n0 != n1:
+        raise ValueError(
+            f"{where} requires df_layout='mnQ' (B[mu,nu,Q] with shape (nao,nao,naux)); "
+            f"got df_B.shape={tuple(map(int, B_shape))}. If SCF used Qmn, rerun with df_layout='mnQ'."
+        )
+    if nao_int1e is not None and (n0 != nao_int1e or n1 != nao_int1e):
+        raise ValueError(
+            f"{where} requires df_layout='mnQ' with AO dimensions matching int1e.S "
+            f"(expected nao={int(nao_int1e)}). Got df_B.shape={tuple(map(int, B_shape))}. "
+            "Rerun SCF with df_layout='mnQ'."
+        )
+    return n0, n1, naux
 
 
 def _log_vram(label: str) -> None:
@@ -210,6 +331,31 @@ def _normalize_fused_contract_precision(value: str | None) -> str:
     if mode in ("fp32_acc64", "fp32-acc64", "fp32acc64", "mixed_fp32_acc64"):
         return "fp32_acc64"
     return "fp64"
+
+
+def _apply_df_grad_optimal_defaults() -> dict[str, Any]:
+    """Apply the single production DF-gradient preset."""
+    applied: dict[str, str] = {}
+
+    def _setdefault_env(name: str, value: str) -> None:
+        if name in _os.environ:
+            return
+        _os.environ[name] = str(value)
+        applied[name] = str(value)
+
+    # Single production preset: fused fp64 contraction + scheduler-guided 3c launches.
+    _setdefault_env("ASUKA_DF_FUSED_CONTRACT", "1")
+    _setdefault_env("ASUKA_DF_FUSED_CONTRACT_PRECISION", "fp64")
+    _setdefault_env("ASUKA_DF_3C_SCHED_MODE", "on")
+    _setdefault_env("ASUKA_DF_3C_AB_TILE", "8")
+
+    if _os.environ.get("ASUKA_VRAM_DEBUG") or _os.environ.get("ASUKA_PROFILE_DF_PER_ROOT"):
+        applied_s = "none"
+        if applied:
+            applied_s = ",".join(f"{k}={v}" for k, v in sorted(applied.items()))
+        print(f"[ASUKA_DF_GRAD_DEFAULTS] preset=optimal applied={applied_s}")
+
+    return {"preset": "optimal", "applied": dict(applied)}
 
 
 def _normalize_barl_fused_mode(value: str | None) -> str:
@@ -480,70 +626,10 @@ def _get_sph_T(scf_out):
     mol = getattr(scf_out, "mol", None)
     if bool(getattr(mol, "cart", True)):
         return None
-    sph_map = getattr(scf_out, "sph_map", None)
+    sph_map = coerce_sph_map(getattr(scf_out, "sph_map", None))
     if sph_map is None:
         raise ValueError("scf_out.sph_map is required for spherical AO gradients (cart=False)")
-    return sph_map[0]  # (nao_cart, nao_sph)
-
-
-def _sph_to_cart_final(T_c2s, *, D_tot_ao, W, bar_L_ao, C, B_ao_sph, scf_out, xp, coords, charges):
-    """Back-transform final gradient quantities from spherical to Cartesian.
-
-    For the DF gradient, bar_L and B must be in Cartesian AO basis to match
-    the Cartesian derivative integrals.  The back-transforms are:
-
-        D_cart  = T @ D_sph  @ T^T
-        W_cart  = T @ W_sph  @ T^T
-        bar_L_cart[Q,:,:] = T @ bar_L_sph[Q,:,:] @ T^T
-        C_cart  = T @ C_sph
-
-    For B, we rebuild from ao_basis/aux_basis (rebuilding is cheaper than
-    storing a second copy, and back-transform T @ B_sph @ T^T is WRONG
-    because T @ T^T is a projector, not identity, for l >= 2).
-    """
-    T_np = np.asarray(T_c2s, dtype=np.float64)
-    nao_cart = int(T_np.shape[0])
-
-    # -- D_tot and W (2D matrices) --
-    D_np = _asnumpy_f64(D_tot_ao)
-    D_cart = T_np @ D_np @ T_np.T
-    W_np = np.asarray(W, dtype=np.float64)
-    W_cart = T_np @ W_np @ T_np.T
-
-    # -- C (MO coefficients) --
-    C_np = _asnumpy_f64(C)
-    C_cart = T_np @ C_np
-
-    # -- bar_L (Q, nao, nao) → (Q, nao_cart, nao_cart) --
-    bar_L_np = _asnumpy_f64(bar_L_ao)
-    naux = int(bar_L_np.shape[0])
-    bar_L_cart = np.empty((naux, nao_cart, nao_cart), dtype=np.float64)
-    for q in range(naux):
-        bar_L_cart[q] = T_np @ bar_L_np[q] @ T_np.T
-
-    # -- B_cart: rebuild from ao_basis/aux_basis (Cartesian) --
-    ao_basis = getattr(scf_out, "ao_basis")
-    aux_basis = getattr(scf_out, "aux_basis")
-    B_cart = _rebuild_B_cart(ao_basis, aux_basis, xp)
-
-    return D_cart, W_cart, bar_L_cart, C_cart, B_cart
-
-
-def _rebuild_B_cart(ao_basis, aux_basis, xp):
-    """Rebuild Cartesian whitened DF factors B[mu,nu,Q] from packed bases."""
-    try:
-        import cupy as cp  # noqa: PLC0415
-        if xp is cp:
-            from asuka.integrals.cueri_df import build_df_B_from_cueri_packed_bases  # noqa: PLC0415
-            B = build_df_B_from_cueri_packed_bases(ao_basis, aux_basis)
-            # GPU builder may return Qmn layout — ensure mnQ
-            if B.ndim == 3 and int(B.shape[0]) != int(B.shape[1]):
-                B = cp.ascontiguousarray(B.transpose((1, 2, 0)))
-            return _asnumpy_f64(B)
-    except Exception:
-        pass
-    from asuka.integrals.cueri_df_cpu import build_df_B_from_cueri_packed_bases_cpu  # noqa: PLC0415
-    return np.asarray(build_df_B_from_cueri_packed_bases_cpu(ao_basis, aux_basis), dtype=np.float64)
+    return sph_map.T_c2s  # (nao_cart, nao_sph)
 
 
 def _transform_bar_L_to_cart(T_np: np.ndarray, bar_L_sph: Any) -> np.ndarray:
@@ -896,7 +982,8 @@ def _build_dme0_lorb_response(
     vhf_cache: dict | None = None,
     lorb_cache: dict | None = None,
     return_xp: bool = False,
-) -> np.ndarray:
+    return_parts: bool = False,
+) -> np.ndarray | tuple[np.ndarray, dict[str, Any]]:
     """Compute response energy-weighted density from orbital Lagrange multiplier.
 
     Follows PySCF's ``Lorb_dot_dgorb_dx`` gfock construction.
@@ -917,6 +1004,9 @@ def _build_dme0_lorb_response(
     return_xp : bool, optional
         When True, return the matrix in the native ``xp`` backend dtype
         (float64). When False (default), return a NumPy float64 array.
+    return_parts : bool, optional
+        When True, also return a dictionary with symmetrized AO-channel
+        components (h1/mean-field/aa1/aa2/total) for response debugging.
     """
     xp, _ = _get_xp_arrays(B_ao, h_ao)
 
@@ -972,15 +1062,35 @@ def _build_dme0_lorb_response(
     vhfL_a = JaL - 0.5 * KaL
 
     # Build gfock in AO basis (PySCF Lorb_dot_dgorb_dx formula).
-    gfock = h_ao_x @ D_L
-    gfock += (vhf_c + vhf_a) @ D_L_core
-    gfock += (vhfL_c + vhfL_a) @ D_core
-    gfock += vhfL_c @ D_act
-    gfock += vhf_c @ D_L_act
+    import os
+
+    _reco_mode = str(os.environ.get("ASUKA_CASPT2_LORB_RECO_MODE", "pyscf")).strip().lower()
+    if _reco_mode not in {"pyscf", "core_only", "core_minus_active"}:
+        _reco_mode = "pyscf"
+    if _reco_mode == "core_only":
+        _vhf_mix = vhf_c
+        _vhfL_mix = vhfL_c
+    elif _reco_mode == "core_minus_active":
+        _vhf_mix = vhf_c - vhf_a
+        _vhfL_mix = vhfL_c - vhfL_a
+    else:
+        _vhf_mix = vhf_c + vhf_a
+        _vhfL_mix = vhfL_c + vhfL_a
+
+    g_h1 = h_ao_x @ D_L
+    g_vmix = _vhf_mix @ D_L_core
+    g_vLmix = _vhfL_mix @ D_core
+    g_vL_c = vhfL_c @ D_act
+    g_vc_L = vhf_c @ D_L_act
 
     # S^{-1} ≈ CC^T (orthogonal MO basis).
     s0_inv = C @ C.T
-    gfock = s0_inv @ gfock
+    g_h1 = s0_inv @ g_h1
+    g_vmix = s0_inv @ g_vmix
+    g_vLmix = s0_inv @ g_vLmix
+    g_vL_c = s0_inv @ g_vL_c
+    g_vc_L = s0_inv @ g_vc_L
+    gfock = g_h1 + g_vmix + g_vLmix + g_vL_c + g_vc_L
 
     # 2e active-active ERI contribution (from ppaa/papa).
     cache = lorb_cache if isinstance(lorb_cache, dict) else None
@@ -1022,9 +1132,28 @@ def _build_dme0_lorb_response(
         C_act_np = _asnumpy_f64(C_act)
         C_L_act_np = _asnumpy_f64(C_L_act)
         gfock_np = _asnumpy_f64(gfock)
-        gfock_np += C_np @ t1 @ C_act_np.T
-        gfock_np += C_np @ t2 @ C_L_act_np.T
+        g_aa1_np = np.asarray(C_np @ t1 @ C_act_np.T, dtype=np.float64)
+        g_aa2_np = np.asarray(C_np @ t2 @ C_L_act_np.T, dtype=np.float64)
+        gfock_np += g_aa1_np
+        gfock_np += g_aa2_np
         out_np = np.asarray(0.5 * (gfock_np + gfock_np.T), dtype=np.float64)
+        if bool(return_parts):
+            g_h1_np = _asnumpy_f64(g_h1)
+            g_vmix_np = _asnumpy_f64(g_vmix)
+            g_vLmix_np = _asnumpy_f64(g_vLmix)
+            g_vL_c_np = _asnumpy_f64(g_vL_c)
+            g_vc_L_np = _asnumpy_f64(g_vc_L)
+            g_mean_np = np.asarray(g_vmix_np + g_vLmix_np + g_vL_c_np + g_vc_L_np, dtype=np.float64)
+            parts_np: dict[str, Any] = {
+                "dme0_h1": np.asarray(0.5 * (g_h1_np + g_h1_np.T), dtype=np.float64),
+                "dme0_mean": np.asarray(0.5 * (g_mean_np + g_mean_np.T), dtype=np.float64),
+                "dme0_aa1": np.asarray(0.5 * (g_aa1_np + g_aa1_np.T), dtype=np.float64),
+                "dme0_aa2": np.asarray(0.5 * (g_aa2_np + g_aa2_np.T), dtype=np.float64),
+                "dme0_total": np.asarray(out_np, dtype=np.float64),
+            }
+            if return_xp:
+                return np.asarray(out_np, dtype=np.float64), parts_np
+            return out_np, parts_np
         if return_xp:
             return np.asarray(out_np, dtype=np.float64)
         return out_np
@@ -1057,9 +1186,23 @@ def _build_dme0_lorb_response(
 
     t1_x = xp.einsum("uviw,uvtw->it", aapaL_x, dm2, optimize=True)
     t2_x = xp.einsum("uviw,vuwt->it", aapa_x, dm2, optimize=True)
-    gfock += C @ t1_x @ C_act.T
-    gfock += C @ t2_x @ C_L_act.T
+    g_aa1_x = C @ t1_x @ C_act.T
+    g_aa2_x = C @ t2_x @ C_L_act.T
+    gfock += g_aa1_x
+    gfock += g_aa2_x
     out_x = xp.asarray(0.5 * (gfock + gfock.T), dtype=xp.float64)
+    if bool(return_parts):
+        g_mean_x = g_vmix + g_vLmix + g_vL_c + g_vc_L
+        parts_x: dict[str, Any] = {
+            "dme0_h1": xp.asarray(0.5 * (g_h1 + g_h1.T), dtype=xp.float64),
+            "dme0_mean": xp.asarray(0.5 * (g_mean_x + g_mean_x.T), dtype=xp.float64),
+            "dme0_aa1": xp.asarray(0.5 * (g_aa1_x + g_aa1_x.T), dtype=xp.float64),
+            "dme0_aa2": xp.asarray(0.5 * (g_aa2_x + g_aa2_x.T), dtype=xp.float64),
+            "dme0_total": xp.asarray(out_x, dtype=xp.float64),
+        }
+        if return_xp:
+            return out_x, parts_x
+        return _asnumpy_f64(out_x), {k: _asnumpy_f64(v) for k, v in parts_x.items()}
     if return_xp:
         return out_x
     return _asnumpy_f64(out_x)
@@ -1475,21 +1618,36 @@ def casscf_nuc_grad_df(
         The computed nuclear gradient.
     """
 
-    # When df_backend='cuda', auto-promote the 1e contraction backend so the
-    # full gradient pipeline stays GPU-resident (avoids CPU↔GPU ping-pong).
-    if str(int1e_contract_backend).strip().lower() == "cpu" and str(df_backend).strip().lower() == "cuda":
-        int1e_contract_backend = "cuda"
-
     t0_total = time.perf_counter() if profile is not None else 0.0
     if profile is not None:
         profile.clear()
-        profile["df_backend"] = str(df_backend).strip().lower()
-        profile["int1e_contract_backend"] = str(int1e_contract_backend).strip().lower()
         profile["df_threads"] = int(df_threads)
 
     mol = getattr(scf_out, "mol", None)
     if mol is None:
         raise TypeError("scf_out must have a .mol attribute")
+    _require_df_mnq_layout(scf_out, where="casscf_nuc_grad_df")
+    is_spherical = not bool(getattr(mol, "cart", True))
+
+    # Keep default behavior convenient on CUDA runs:
+    # - Cartesian: promote CPU -> CUDA
+    # - Spherical: promote CPU -> AUTO (uses CUDA fused kernels when available)
+    if str(int1e_contract_backend).strip().lower() == "cpu" and str(df_backend).strip().lower() == "cuda":
+        int1e_contract_backend = "auto" if bool(is_spherical) else "cuda"
+
+    _int1e_mode = _normalize_int1e_backend_mode(str(int1e_contract_backend))
+    _sph_int1e_backend: Literal["cpu", "cuda"] = "cpu"
+    if bool(is_spherical):
+        _sph_int1e_backend = _select_sph_int1e_backend(
+            contract_backend=str(int1e_contract_backend),
+            df_backend=str(df_backend),
+        )
+
+    if profile is not None:
+        profile["df_backend"] = str(df_backend).strip().lower()
+        profile["int1e_contract_backend"] = _int1e_mode
+        if bool(is_spherical):
+            profile["int1e_sph_backend"] = str(_sph_int1e_backend)
 
     coords, charges = _mol_coords_charges_bohr(mol)
     natm = int(coords.shape[0])
@@ -1534,11 +1692,6 @@ def casscf_nuc_grad_df(
     h_ao = _as_xp_f64(xp, getattr(getattr(scf_out, "int1e"), "hcore"))
     _restore_pool = _apply_df_pool_policy(B_ao, label="casscf_nuc_grad_df")
 
-    # Detect spherical AO mode.  gfock / D / bar_L are computed in the native
-    # AO basis (spherical when cart=False), then back-transformed to Cartesian
-    # before the derivative-integral contractions.
-    T_c2s = _get_sph_T(scf_out)
-
     gfock, D_core_ao, D_act_ao, D_tot_ao, C_act = _build_gfock_casscf_df(
         B_ao,
         h_ao,
@@ -1569,19 +1722,17 @@ def casscf_nuc_grad_df(
     W = 0.5 * (_tmp_w @ _C_occ.T + _C_occ @ _tmp_w.T)
 
     # ── Native spherical DF gradient (no B_cart rebuild / bar_L back-transform) ──
-    _T_np = None if T_c2s is None else np.asarray(T_c2s, dtype=np.float64)
-
     df_prof = None if profile is None else profile.setdefault("df_2e", {})
     try:
         t0_df = time.perf_counter() if profile is not None else 0.0
-        if _T_np is not None:
+        if is_spherical:
             de_df = compute_df_gradient_contributions_analytic_sph(
                 getattr(scf_out, "ao_basis"),
                 getattr(scf_out, "aux_basis"),
                 atom_coords_bohr=coords,
                 B_sph=B_ao,
                 bar_L_sph=bar_L_ao,
-                T_c2s=_T_np,
+                T_c2s=None,
                 L_chol=getattr(scf_out, "df_L", None),
                 backend=str(df_backend),
                 df_threads=int(df_threads),
@@ -1600,6 +1751,8 @@ def casscf_nuc_grad_df(
                 profile=df_prof,
             )
     except (NotImplementedError, RuntimeError) as _analytic_exc:
+        if is_spherical:
+            raise
         # Fallback for backends without analytic DF derivative kernels (e.g. CUDA).
         import warnings as _w
         _w.warn(
@@ -1613,12 +1766,11 @@ def casscf_nuc_grad_df(
             import traceback as _tb
             _tb.print_exc()
         t0_df = time.perf_counter() if profile is not None else 0.0
-        _bar_L_fd = _transform_bar_L_to_cart(_T_np, bar_L_ao) if _T_np is not None else bar_L_ao
         de_df = compute_df_gradient_contributions_fd_packed_bases(
             getattr(scf_out, "ao_basis"),
             getattr(scf_out, "aux_basis"),
             atom_coords_bohr=coords,
-            bar_L_ao=_bar_L_fd,
+            bar_L_ao=bar_L_ao,
             backend=str(df_backend),
             df_config=df_config,
             df_threads=int(df_threads),
@@ -1628,18 +1780,50 @@ def casscf_nuc_grad_df(
     t_df = time.perf_counter() if profile is not None else 0.0
 
     # ── CPU phase: 1e AO derivative contractions ──
-    # For spherical: transform D/W to Cartesian for the 1e kernels.
     ao_basis = getattr(scf_out, "ao_basis")
     shell_atom = shell_to_atom_map(ao_basis, atom_coords_bohr=coords)
-    _D_tot_1e = _T_np @ _asnumpy_f64(D_tot_ao) @ _T_np.T if _T_np is not None else _asnumpy_f64(D_tot_ao)
-    de_h1 = contract_dhcore_cart(
-        ao_basis,
-        atom_coords_bohr=coords,
-        atom_charges=charges,
-        M=_D_tot_1e,
-        shell_atom=shell_atom,
-        contract_backend=str(int1e_contract_backend),
-    )
+    _dS_sph_pre = None
+    _dT_sph_pre = None
+    _dV_sph_pre = None
+    if bool(is_spherical) and str(_sph_int1e_backend) == "cuda":
+        _dS_sph_pre, _dT_sph_pre, _dV_sph_pre = _build_sph_int1e_prebuilt(
+            ao_basis,
+            atom_coords_bohr=coords,
+            atom_charges=charges,
+            shell_atom=shell_atom,
+            need_overlap=True,
+            need_hcore=True,
+            to_gpu=True,
+        )
+
+    if is_spherical:
+        if str(_sph_int1e_backend) == "cuda":
+            from asuka.integrals.int1e_sph_cuda import contract_dhcore_sph_prebuilt_cuda  # noqa: PLC0415
+
+            de_h1 = contract_dhcore_sph_prebuilt_cuda(
+                _dT_sph_pre,
+                _dV_sph_pre,
+                D_tot_ao,
+            )
+        else:
+            from asuka.integrals.int1e_sph import contract_dhcore_sph  # noqa: PLC0415
+
+            de_h1 = contract_dhcore_sph(
+                ao_basis,
+                atom_coords_bohr=coords,
+                atom_charges=charges,
+                M_sph=_asnumpy_f64(D_tot_ao),
+                shell_atom=shell_atom,
+            )
+    else:
+        de_h1 = contract_dhcore_cart(
+            ao_basis,
+            atom_coords_bohr=coords,
+            atom_charges=charges,
+            M=_asnumpy_f64(D_tot_ao),
+            shell_atom=shell_atom,
+            contract_backend=str(int1e_contract_backend),
+        )
 
     t_1e = time.perf_counter() if profile is not None else 0.0
 
@@ -1650,13 +1834,31 @@ def casscf_nuc_grad_df(
     t_nuc = time.perf_counter() if profile is not None else 0.0
 
     # Pulay (overlap-derivative) term: -Tr(W · dS/dR).
-    _W_1e = _T_np @ W @ _T_np.T if _T_np is not None else W
-    de_pulay = -1.0 * contract_dS_cart(
-        ao_basis, atom_coords_bohr=coords,
-        M=np.asarray(_W_1e, dtype=np.float64),
-        shell_atom=shell_atom,
-        contract_backend=str(int1e_contract_backend),
-    )
+    if is_spherical:
+        if str(_sph_int1e_backend) == "cuda":
+            from asuka.integrals.int1e_sph_cuda import contract_dS_sph_prebuilt_cuda  # noqa: PLC0415
+
+            de_pulay = -1.0 * contract_dS_sph_prebuilt_cuda(
+                _dS_sph_pre,
+                W,
+            )
+        else:
+            from asuka.integrals.int1e_sph import contract_dS_sph  # noqa: PLC0415
+
+            de_pulay = -1.0 * contract_dS_sph(
+                ao_basis,
+                atom_coords_bohr=coords,
+                M_sph=np.asarray(W, dtype=np.float64),
+                shell_atom=shell_atom,
+            )
+    else:
+        de_pulay = -1.0 * contract_dS_cart(
+            ao_basis,
+            atom_coords_bohr=coords,
+            M=np.asarray(W, dtype=np.float64),
+            shell_atom=shell_atom,
+            contract_backend=str(int1e_contract_backend),
+        )
     t_pulay = time.perf_counter() if profile is not None else 0.0
 
     _de_h1_np = np.asarray(de_h1, dtype=np.float64)
@@ -1702,6 +1904,7 @@ def casci_nuc_grad_df_unrelaxed(
     root_weights: Sequence[float] | None = None,
     atmlst: Sequence[int] | None = None,
     df_backend: Literal["cpu", "cuda"] = "cpu",
+    int1e_contract_backend: Literal["auto", "cpu", "cuda"] = "cpu",
     df_config: Any | None = None,
     df_threads: int = 0,
     delta_bohr: float = 1e-4,
@@ -1730,6 +1933,8 @@ def casci_nuc_grad_df_unrelaxed(
         Atom list.
     df_backend : Literal["cpu", "cuda"], optional
         DF backend.
+    int1e_contract_backend : Literal["auto", "cpu", "cuda"], optional
+        Backend for AO 1e derivative contractions.
     df_config : Any | None, optional
         DF config.
     df_threads : int, optional
@@ -1750,6 +1955,21 @@ def casci_nuc_grad_df_unrelaxed(
     mol = getattr(scf_out, "mol", None)
     if mol is None:
         raise TypeError("scf_out must have a .mol attribute")
+    _require_df_mnq_layout(scf_out, where="casci_nuc_grad_df_unrelaxed")
+    is_spherical = not bool(getattr(mol, "cart", True))
+    if str(int1e_contract_backend).strip().lower() == "cpu" and str(df_backend).strip().lower() == "cuda":
+        int1e_contract_backend = "auto" if bool(is_spherical) else "cuda"
+    _int1e_mode = _normalize_int1e_backend_mode(str(int1e_contract_backend))
+    _sph_int1e_backend: Literal["cpu", "cuda"] = "cpu"
+    if bool(is_spherical):
+        _sph_int1e_backend = _select_sph_int1e_backend(
+            contract_backend=str(int1e_contract_backend),
+            df_backend=str(df_backend),
+        )
+    if profile is not None:
+        profile["int1e_contract_backend"] = _int1e_mode
+        if bool(is_spherical):
+            profile["int1e_sph_backend"] = str(_sph_int1e_backend)
 
     coords, charges = _mol_coords_charges_bohr(mol)
     natm = int(coords.shape[0])
@@ -1807,13 +2027,39 @@ def casci_nuc_grad_df_unrelaxed(
 
     ao_basis = getattr(scf_out, "ao_basis")
     shell_atom = shell_to_atom_map(ao_basis, atom_coords_bohr=coords)
-    de_h1 = contract_dhcore_cart(
-        ao_basis,
-        atom_coords_bohr=coords,
-        atom_charges=charges,
-        M=D_tot_ao,
-        shell_atom=shell_atom,
-    )
+    if is_spherical:
+        if str(_sph_int1e_backend) == "cuda":
+            from asuka.integrals.int1e_sph_cuda import contract_dhcore_sph_prebuilt_cuda  # noqa: PLC0415
+
+            _dS_pre, _dT_pre, _dV_pre = _build_sph_int1e_prebuilt(
+                ao_basis,
+                atom_coords_bohr=coords,
+                atom_charges=charges,
+                shell_atom=shell_atom,
+                need_overlap=False,
+                need_hcore=True,
+                to_gpu=True,
+            )
+            de_h1 = contract_dhcore_sph_prebuilt_cuda(_dT_pre, _dV_pre, D_tot_ao)
+        else:
+            from asuka.integrals.int1e_sph import contract_dhcore_sph  # noqa: PLC0415
+
+            de_h1 = contract_dhcore_sph(
+                ao_basis,
+                atom_coords_bohr=coords,
+                atom_charges=charges,
+                M_sph=D_tot_ao,
+                shell_atom=shell_atom,
+            )
+    else:
+        de_h1 = contract_dhcore_cart(
+            ao_basis,
+            atom_coords_bohr=coords,
+            atom_charges=charges,
+            M=D_tot_ao,
+            shell_atom=shell_atom,
+            contract_backend=str(int1e_contract_backend),
+        )
 
     bar_L_ao = _build_bar_L_casscf_df(
         B_ao,
@@ -1825,18 +2071,34 @@ def casci_nuc_grad_df_unrelaxed(
 
     df_prof = None if profile is None else profile.setdefault("df_2e", {})
     try:
-        de_df = compute_df_gradient_contributions_analytic_packed_bases(
-            getattr(scf_out, "ao_basis"),
-            getattr(scf_out, "aux_basis"),
-            atom_coords_bohr=coords,
-            B_ao=B_ao,
-            bar_L_ao=bar_L_ao,
-            L_chol=getattr(scf_out, "df_L", None),
-            backend=str(df_backend),
-            df_threads=int(df_threads),
-            profile=df_prof,
-        )
+        if is_spherical:
+            de_df = compute_df_gradient_contributions_analytic_sph(
+                getattr(scf_out, "ao_basis"),
+                getattr(scf_out, "aux_basis"),
+                atom_coords_bohr=coords,
+                B_sph=B_ao,
+                bar_L_sph=bar_L_ao,
+                T_c2s=None,
+                L_chol=getattr(scf_out, "df_L", None),
+                backend=str(df_backend),
+                df_threads=int(df_threads),
+                profile=df_prof,
+            )
+        else:
+            de_df = compute_df_gradient_contributions_analytic_packed_bases(
+                getattr(scf_out, "ao_basis"),
+                getattr(scf_out, "aux_basis"),
+                atom_coords_bohr=coords,
+                B_ao=B_ao,
+                bar_L_ao=bar_L_ao,
+                L_chol=getattr(scf_out, "df_L", None),
+                backend=str(df_backend),
+                df_threads=int(df_threads),
+                profile=df_prof,
+            )
     except (NotImplementedError, RuntimeError):
+        if is_spherical:
+            raise
         de_df = compute_df_gradient_contributions_fd_packed_bases(
             getattr(scf_out, "ao_basis"),
             getattr(scf_out, "aux_basis"),
@@ -1887,6 +2149,7 @@ def casci_nuc_grad_df_relaxed(
     root_weights: Sequence[float] | None = None,
     atmlst: Sequence[int] | None = None,
     df_backend: Literal["cpu", "cuda"] = "cpu",
+    int1e_contract_backend: Literal["auto", "cpu", "cuda"] = "cpu",
     df_config: Any | None = None,
     df_threads: int = 0,
     delta_bohr: float = 1e-4,
@@ -1917,6 +2180,8 @@ def casci_nuc_grad_df_relaxed(
         Atom list.
     df_backend : Literal["cpu", "cuda"], optional
         DF backend.
+    int1e_contract_backend : Literal["auto", "cpu", "cuda"], optional
+        Backend for AO 1e derivative contractions.
     df_config : Any | None, optional
         DF config.
     df_threads : int, optional
@@ -1943,6 +2208,21 @@ def casci_nuc_grad_df_relaxed(
     mol = getattr(scf_out, "mol", None)
     if mol is None:
         raise TypeError("scf_out must have a .mol attribute")
+    _require_df_mnq_layout(scf_out, where="casci_nuc_grad_df_relaxed")
+    is_spherical = not bool(getattr(mol, "cart", True))
+    if str(int1e_contract_backend).strip().lower() == "cpu" and str(df_backend).strip().lower() == "cuda":
+        int1e_contract_backend = "auto" if bool(is_spherical) else "cuda"
+    _int1e_mode = _normalize_int1e_backend_mode(str(int1e_contract_backend))
+    _sph_int1e_backend: Literal["cpu", "cuda"] = "cpu"
+    if bool(is_spherical):
+        _sph_int1e_backend = _select_sph_int1e_backend(
+            contract_backend=str(int1e_contract_backend),
+            df_backend=str(df_backend),
+        )
+    if profile is not None:
+        profile["int1e_contract_backend"] = _int1e_mode
+        if bool(is_spherical):
+            profile["int1e_sph_backend"] = str(_sph_int1e_backend)
 
     coords, charges = _mol_coords_charges_bohr(mol)
     natm = int(coords.shape[0])
@@ -1983,10 +2263,6 @@ def casci_nuc_grad_df_relaxed(
         nelecas=nelecas,
         solver_kwargs=solver_kwargs,
     )
-
-    # Spherical AO support
-    T_c2s = _get_sph_T(scf_out)
-    _T_np = None if T_c2s is None else np.asarray(T_c2s, dtype=np.float64)
 
     C = _asnumpy_f64(getattr(casci, "mo_coeff"))
     B_ao = _asnumpy_f64(getattr(scf_out, "df_B"))
@@ -2084,6 +2360,17 @@ def casci_nuc_grad_df_relaxed(
     Imat_m[neleca:, :neleca] = Imat_m[:neleca, neleca:].T
     im1 = C @ Imat_m @ C.T
 
+    # Energy-weighted density W for the Pulay (overlap-derivative) term.
+    #
+    # PySCF formula (grad/casci.py): W = im1 + 2*zeta + 2*vhf_s1occ
+    # where im1 = C @ Imat_m @ C.T, zeta = C @ (zvec * eps) @ C.T,
+    # vhf_s1occ = P1 @ Veff[zvec_ao] @ P1.
+    #
+    # IMPORTANT: contract_dS_{cart,sph}(M) computes sum_ij dS[A,x,i,j]*M[i,j]
+    # where dS includes BOTH bra and ket derivative sides, effectively computing
+    # Tr(dS * (M + M.T)) per atom.  Therefore W must NOT be pre-symmetrized.
+    W = im1 + 2.0 * zeta + 2.0 * vhf_s1occ
+
     # ------------------------------------------------------------------
     # Nuclear gradient contractions
     # ------------------------------------------------------------------
@@ -2091,14 +2378,39 @@ def casci_nuc_grad_df_relaxed(
     shell_atom = shell_to_atom_map(ao_basis, atom_coords_bohr=coords)
 
     _M_h1 = np.asarray(D_tot_ao + zvec_ao, dtype=np.float64)
-    _M_h1_cart = _T_np @ _M_h1 @ _T_np.T if _T_np is not None else _M_h1
-    de_h1 = contract_dhcore_cart(
-        ao_basis,
-        atom_coords_bohr=coords,
-        atom_charges=charges,
-        M=_M_h1_cart,
-        shell_atom=shell_atom,
-    )
+    if is_spherical:
+        if str(_sph_int1e_backend) == "cuda":
+            from asuka.integrals.int1e_sph_cuda import contract_dhcore_sph_prebuilt_cuda  # noqa: PLC0415
+
+            _dS_pre, _dT_pre, _dV_pre = _build_sph_int1e_prebuilt(
+                ao_basis,
+                atom_coords_bohr=coords,
+                atom_charges=charges,
+                shell_atom=shell_atom,
+                need_overlap=True,
+                need_hcore=True,
+                to_gpu=True,
+            )
+            de_h1 = contract_dhcore_sph_prebuilt_cuda(_dT_pre, _dV_pre, _M_h1)
+        else:
+            from asuka.integrals.int1e_sph import contract_dhcore_sph  # noqa: PLC0415
+
+            de_h1 = contract_dhcore_sph(
+                ao_basis,
+                atom_coords_bohr=coords,
+                atom_charges=charges,
+                M_sph=_M_h1,
+                shell_atom=shell_atom,
+            )
+    else:
+        de_h1 = contract_dhcore_cart(
+            ao_basis,
+            atom_coords_bohr=coords,
+            atom_charges=charges,
+            M=_M_h1,
+            shell_atom=shell_atom,
+            contract_backend=str(int1e_contract_backend),
+        )
 
     bar_L_ao = _build_bar_L_casscf_df(
         B_ao,
@@ -2123,14 +2435,14 @@ def casci_nuc_grad_df_relaxed(
 
     df_prof = None if profile is None else profile.setdefault("df_2e", {})
     try:
-        if _T_np is not None:
+        if is_spherical:
             de_df = compute_df_gradient_contributions_analytic_sph(
                 getattr(scf_out, "ao_basis"),
                 getattr(scf_out, "aux_basis"),
                 atom_coords_bohr=coords,
                 B_sph=B_ao,
                 bar_L_sph=bar_L_tot,
-                T_c2s=_T_np,
+                T_c2s=None,
                 L_chol=getattr(scf_out, "df_L", None),
                 backend=str(df_backend),
                 df_threads=int(df_threads),
@@ -2149,12 +2461,13 @@ def casci_nuc_grad_df_relaxed(
                 profile=df_prof,
             )
     except (NotImplementedError, RuntimeError):
-        _bar_L_tot_fd = _transform_bar_L_to_cart(_T_np, bar_L_tot) if _T_np is not None else bar_L_tot
+        if is_spherical:
+            raise
         de_df = compute_df_gradient_contributions_fd_packed_bases(
             getattr(scf_out, "ao_basis"),
             getattr(scf_out, "aux_basis"),
             atom_coords_bohr=coords,
-            bar_L_ao=_bar_L_tot_fd,
+            bar_L_ao=bar_L_tot,
             backend=str(df_backend),
             df_config=df_config,
             df_threads=int(df_threads),
@@ -2167,7 +2480,31 @@ def casci_nuc_grad_df_relaxed(
     except Exception:
         de_nuc = np.zeros((natm, 3), dtype=np.float64)
 
-    grad = np.asarray(de_h1 + de_df + de_nuc, dtype=np.float64)
+    # Pulay (overlap-derivative) term: -Tr(W · dS/dR).
+    if is_spherical:
+        if str(_sph_int1e_backend) == "cuda":
+            from asuka.integrals.int1e_sph_cuda import contract_dS_sph_prebuilt_cuda  # noqa: PLC0415
+
+            de_pulay = -1.0 * contract_dS_sph_prebuilt_cuda(_dS_pre, W)
+        else:
+            from asuka.integrals.int1e_sph import contract_dS_sph  # noqa: PLC0415
+
+            de_pulay = -1.0 * contract_dS_sph(
+                ao_basis,
+                atom_coords_bohr=coords,
+                M_sph=np.asarray(W, dtype=np.float64),
+                shell_atom=shell_atom,
+            )
+    else:
+        de_pulay = -1.0 * contract_dS_cart(
+            ao_basis,
+            atom_coords_bohr=coords,
+            M=np.asarray(W, dtype=np.float64),
+            shell_atom=shell_atom,
+            contract_backend=str(int1e_contract_backend),
+        )
+
+    grad = np.asarray(de_h1 + de_df + de_nuc + de_pulay, dtype=np.float64)
     if atmlst is not None:
         idx = np.asarray(list(atmlst), dtype=np.int32).ravel()
         grad = grad[idx]
@@ -2291,6 +2628,8 @@ def casscf_nuc_grad_df_per_root(
         _build_bar_L_lorb_df,
     )
 
+    _apply_df_grad_optimal_defaults()
+
     @contextmanager
     def _force_internal_newton():
         k_prefer = "CUGUGA_NEWTON_CASSCF"
@@ -2317,6 +2656,10 @@ def casscf_nuc_grad_df_per_root(
     mol = getattr(scf_out, "mol", None)
     if mol is None:
         raise TypeError("scf_out must have a .mol attribute")
+    _require_df_mnq_layout(scf_out, where="casscf_nuc_grad_df_per_root")
+    is_spherical = not bool(getattr(mol, "cart", True))
+    if str(int1e_contract_backend).strip().lower() == "cpu" and str(df_backend).strip().lower() == "cuda":
+        int1e_contract_backend = "auto" if bool(is_spherical) else "cuda"
 
     coords, charges = _mol_coords_charges_bohr(mol)
     natm = int(coords.shape[0])
@@ -2341,10 +2684,6 @@ def casscf_nuc_grad_df_per_root(
             except Exception:
                 pass
     _gpu_runtime_cfg = _resolve_gpu_runtime_config()
-
-    # Spherical AO support: detect cart=False and prepare T_c2s.
-    T_c2s = _get_sph_T(scf_out)
-    _T_np = None if T_c2s is None else np.asarray(T_c2s, dtype=np.float64)
 
     xp, _is_gpu = _resolve_xp(df_backend)
     C = _as_xp_f64(xp, getattr(casscf, "mo_coeff"))
@@ -2451,6 +2790,7 @@ def casscf_nuc_grad_df_per_root(
         and df_grad_ctx is not None
         and hasattr(df_grad_ctx, "contract_fused_terms")
     )
+    _fused_contract_warned_inert = False
 
     # AO basis objects for 1e derivative contractions
     ao_basis = getattr(scf_out, "ao_basis")
@@ -2458,49 +2798,96 @@ def casscf_nuc_grad_df_per_root(
     from asuka.integrals.int1e_cart import shell_to_atom_map  # noqa: PLC0415
 
     shell_atom = shell_to_atom_map(ao_basis, atom_coords_bohr=coords)
-    _int1e_backend_mode = str(int1e_contract_backend).strip().lower()
-    _gpu_int1e_path = bool(_is_gpu) and _int1e_backend_mode in ("cuda", "auto")
-    _T_xp = None
-    if _gpu_int1e_path and _T_np is not None:
-        try:
-            _T_xp = xp.asarray(_T_np, dtype=xp.float64)
-        except Exception:
-            _T_xp = None
-    dm1_sa_xp = _as_xp_f64(xp, dm1_sa) if _gpu_int1e_path else np.asarray(dm1_sa, dtype=np.float64)
-    dm2_sa_xp = _as_xp_f64(xp, dm2_sa) if _gpu_int1e_path else np.asarray(dm2_sa, dtype=np.float64)
+    _int1e_backend_mode = _normalize_int1e_backend_mode(str(int1e_contract_backend))
+    _sph_int1e_backend = (
+        _select_sph_int1e_backend(contract_backend=str(int1e_contract_backend), df_backend=str(df_backend))
+        if bool(is_spherical)
+        else "cpu"
+    )
+    _gpu_int1e_path = (not bool(is_spherical)) and bool(_is_gpu) and _int1e_backend_mode in ("cuda", "auto")
+    _gpu_sph_int1e_path = bool(is_spherical) and bool(_is_gpu) and str(_sph_int1e_backend) == "cuda"
+    _gpu_1e_tensor_path = bool(_is_gpu) and bool(_gpu_int1e_path or _gpu_sph_int1e_path)
+    dm1_sa_xp = _as_xp_f64(xp, dm1_sa) if _gpu_1e_tensor_path else np.asarray(dm1_sa, dtype=np.float64)
+    dm2_sa_xp = _as_xp_f64(xp, dm2_sa) if _gpu_1e_tensor_path else np.asarray(dm2_sa, dtype=np.float64)
 
     _int1e_prebuild = _normalize_bool_env(_os.environ.get("ASUKA_INT1E_PREBUILD"), default=(int(nroots) > 1))
+    if bool(_gpu_sph_int1e_path):
+        _int1e_prebuild = True
     _dS_pre: Any | None = None
     _dT_pre: Any | None = None
     _dV_pre: Any | None = None
     if _int1e_prebuild:
         try:
-            from asuka.integrals.int1e_cart import build_dS_cart, build_dT_cart, build_dV_cart  # noqa: PLC0415
+            if bool(is_spherical):
+                from asuka.integrals.int1e_sph import build_dS_sph, build_dT_sph, build_dV_sph  # noqa: PLC0415
 
-            _dS_np = build_dS_cart(ao_basis, atom_coords_bohr=coords, shell_atom=shell_atom)
-            _dT_np = build_dT_cart(ao_basis, atom_coords_bohr=coords, shell_atom=shell_atom)
-            _dV_np = build_dV_cart(
-                ao_basis,
-                atom_coords_bohr=coords,
-                atom_charges=charges,
-                shell_atom=shell_atom,
-                include_operator_deriv=True,
-            )
-            if _gpu_int1e_path:
-                _dS_pre = xp.asarray(_dS_np, dtype=xp.float64)
-                _dT_pre = xp.asarray(_dT_np, dtype=xp.float64)
-                _dV_pre = xp.asarray(_dV_np, dtype=xp.float64)
-                del _dS_np, _dT_np, _dV_np
+                _dS_pre = build_dS_sph(ao_basis, atom_coords_bohr=coords, shell_atom=shell_atom)
+                _dT_pre = build_dT_sph(ao_basis, atom_coords_bohr=coords, shell_atom=shell_atom)
+                _dV_pre = build_dV_sph(
+                    ao_basis,
+                    atom_coords_bohr=coords,
+                    atom_charges=charges,
+                    shell_atom=shell_atom,
+                    include_operator_deriv=True,
+                )
+                if bool(_gpu_sph_int1e_path):
+                    _dS_pre = xp.asarray(_dS_pre, dtype=xp.float64)
+                    _dT_pre = xp.asarray(_dT_pre, dtype=xp.float64)
+                    _dV_pre = xp.asarray(_dV_pre, dtype=xp.float64)
             else:
-                _dS_pre = np.asarray(_dS_np, dtype=np.float64)
-                _dT_pre = np.asarray(_dT_np, dtype=np.float64)
-                _dV_pre = np.asarray(_dV_np, dtype=np.float64)
+                from asuka.integrals.int1e_cart import build_dS_cart, build_dT_cart, build_dV_cart  # noqa: PLC0415
+
+                _dS_np = build_dS_cart(ao_basis, atom_coords_bohr=coords, shell_atom=shell_atom)
+                _dT_np = build_dT_cart(ao_basis, atom_coords_bohr=coords, shell_atom=shell_atom)
+                _dV_np = build_dV_cart(
+                    ao_basis,
+                    atom_coords_bohr=coords,
+                    atom_charges=charges,
+                    shell_atom=shell_atom,
+                    include_operator_deriv=True,
+                )
+                if _gpu_int1e_path:
+                    _dS_pre = xp.asarray(_dS_np, dtype=xp.float64)
+                    _dT_pre = xp.asarray(_dT_np, dtype=xp.float64)
+                    _dV_pre = xp.asarray(_dV_np, dtype=xp.float64)
+                    del _dS_np, _dT_np, _dV_np
+                else:
+                    _dS_pre = np.asarray(_dS_np, dtype=np.float64)
+                    _dT_pre = np.asarray(_dT_np, dtype=np.float64)
+                    _dV_pre = np.asarray(_dV_np, dtype=np.float64)
         except Exception:
             _dS_pre = None
             _dT_pre = None
             _dV_pre = None
 
     def _contract_hcore_fast(Mmat: Any) -> np.ndarray:
+        if bool(is_spherical):
+            if _dT_pre is not None and _dV_pre is not None:
+                if bool(_gpu_sph_int1e_path):
+                    from asuka.integrals.int1e_sph_cuda import contract_dhcore_sph_prebuilt_cuda  # noqa: PLC0415
+
+                    return np.asarray(
+                        contract_dhcore_sph_prebuilt_cuda(
+                            _dT_pre,
+                            _dV_pre,
+                            Mmat,
+                        ),
+                        dtype=np.float64,
+                    )
+                Mn = np.asarray(_asnumpy_f64(Mmat), dtype=np.float64)
+                gn = np.einsum("axij,ij->ax", _dT_pre, Mn, optimize=True) + np.einsum(
+                    "axij,ij->ax", _dV_pre, Mn, optimize=True
+                )
+                return np.asarray(gn, dtype=np.float64)
+            from asuka.integrals.int1e_sph import contract_dhcore_sph  # noqa: PLC0415
+
+            return contract_dhcore_sph(
+                ao_basis,
+                atom_coords_bohr=coords,
+                atom_charges=charges,
+                M_sph=_asnumpy_f64(Mmat),
+                shell_atom=shell_atom,
+            )
         if _dT_pre is None or _dV_pre is None:
             return contract_dhcore_cart(
                 ao_basis,
@@ -2523,6 +2910,37 @@ def casscf_nuc_grad_df_per_root(
         return np.asarray(gn, dtype=np.float64)
 
     def _contract_pulay_fast(Wmat: Any) -> np.ndarray:
+        if bool(is_spherical):
+            if _dS_pre is not None:
+                if bool(_gpu_sph_int1e_path):
+                    from asuka.integrals.int1e_sph_cuda import contract_dS_sph_prebuilt_cuda  # noqa: PLC0415
+
+                    Wv = xp.asarray(Wmat, dtype=xp.float64)
+                    Wv = 0.5 * (Wv + Wv.T)
+                    return -np.asarray(
+                        contract_dS_sph_prebuilt_cuda(
+                            _dS_pre,
+                            Wv,
+                        ),
+                        dtype=np.float64,
+                    )
+                Wn = _asnumpy_f64(Wmat)
+                Wn = 0.5 * (Wn + Wn.T)
+                gn = np.einsum("axij,ij->ax", _dS_pre, Wn, optimize=True)
+                return -np.asarray(gn, dtype=np.float64)
+            from asuka.integrals.int1e_sph import contract_dS_sph  # noqa: PLC0415
+
+            Wn = _asnumpy_f64(Wmat)
+            Wn = 0.5 * (Wn + Wn.T)
+            return -np.asarray(
+                contract_dS_sph(
+                    ao_basis,
+                    atom_coords_bohr=coords,
+                    M_sph=Wn,
+                    shell_atom=shell_atom,
+                ),
+                dtype=np.float64,
+            )
         if _dS_pre is None:
             return -2.0 * contract_dS_ip_cart(
                 ao_basis,
@@ -2561,6 +2979,8 @@ def casscf_nuc_grad_df_per_root(
     _t_1e_pulay = 0.0
     _t_response_pulay = 0.0
     _z_solver: str | None = None
+    _z_solver_detail: str | None = None
+    _z_backend: str | None = None
     _z_matvec_calls = 0
     _z_niter = 0
     _barl_stage_effective = str(_barl_policy.get("stage", "fp64"))
@@ -2712,8 +3132,8 @@ def casscf_nuc_grad_df_per_root(
     nocc = ncore + ncas
     ppaa_sa_np = _asnumpy_f64(getattr(eris_sa, "ppaa"))  # (nmo,nmo,ncas,ncas)
     papa_sa_np = _asnumpy_f64(getattr(eris_sa, "papa"))  # (nmo,ncas,nmo,ncas)
-    ppaa_sa = _as_xp_f64(xp, ppaa_sa_np) if _gpu_int1e_path else np.asarray(ppaa_sa_np, dtype=np.float64)
-    papa_sa = _as_xp_f64(xp, papa_sa_np) if _gpu_int1e_path else np.asarray(papa_sa_np, dtype=np.float64)
+    ppaa_sa = _as_xp_f64(xp, ppaa_sa_np) if _gpu_1e_tensor_path else np.asarray(ppaa_sa_np, dtype=np.float64)
+    papa_sa = _as_xp_f64(xp, papa_sa_np) if _gpu_1e_tensor_path else np.asarray(papa_sa_np, dtype=np.float64)
     _lorb_resp_cache: dict[str, Any] = {
         "ppaa_np": np.asarray(ppaa_sa_np, dtype=np.float64),
         "papa_np": np.asarray(papa_sa_np, dtype=np.float64),
@@ -2722,7 +3142,7 @@ def casscf_nuc_grad_df_per_root(
         _lorb_resp_cache["ppaa_np"][:, ncore:nocc, :, :].transpose(2, 3, 0, 1),
         dtype=np.float64,
     )
-    if _gpu_int1e_path:
+    if _gpu_1e_tensor_path:
         _lorb_resp_cache["ppaa_xp"] = _as_xp_f64(xp, ppaa_sa)
         _lorb_resp_cache["papa_xp"] = _as_xp_f64(xp, papa_sa)
         _lorb_resp_cache["aapa_xp"] = _as_xp_f64(
@@ -2792,16 +3212,21 @@ def casscf_nuc_grad_df_per_root(
             _t_bar_L_sa += time.perf_counter() - t0
 
         try:
-            t0 = time.perf_counter()
-            if _T_np is not None:
-                # ── Spherical path: compute DF adjoint in sph, transform bar_X to cart ──
+            if bool(is_spherical):
                 if df_grad_ctx is not None:
-                    de_df_sa = df_grad_ctx.contract_sph(B_sph=B_ao, bar_L_sph=bar_L_sa, T_c2s=_T_np)
+                    de_df_sa = df_grad_ctx.contract_sph(B_sph=B_ao, bar_L_sph=bar_L_sa, T_c2s=None)
                 else:
                     de_df_sa = compute_df_gradient_contributions_analytic_sph(
-                        ao_basis, aux_basis, atom_coords_bohr=coords, B_sph=B_ao, bar_L_sph=bar_L_sa,
-                        T_c2s=_T_np, L_chol=getattr(scf_out, "df_L", None),
-                        backend=str(df_backend), df_threads=int(df_threads), profile=None,
+                        ao_basis,
+                        aux_basis,
+                        atom_coords_bohr=coords,
+                        B_sph=B_ao,
+                        bar_L_sph=bar_L_sa,
+                        T_c2s=None,
+                        L_chol=getattr(scf_out, "df_L", None),
+                        backend=str(df_backend),
+                        df_threads=int(df_threads),
+                        profile=None,
                     )
             else:
                 if df_grad_ctx is not None:
@@ -2815,6 +3240,8 @@ def casscf_nuc_grad_df_per_root(
             if _profile_df_per_root:
                 _t_contract_sa += time.perf_counter() - t0
         except (NotImplementedError, RuntimeError) as e:
+            if bool(is_spherical):
+                raise
             warnings.warn(
                 f"DF 2e gradient contraction fell back to finite-difference on B (backend={df_backend!s}); "
                 "expect noisy/non-conservative forces in MD. "
@@ -2823,24 +3250,19 @@ def casscf_nuc_grad_df_per_root(
                 stacklevel=2,
             )
             warned_df_fd = True
-            _bar_L_sa_fd = _transform_bar_L_to_cart(_T_np, bar_L_sa) if _T_np is not None else bar_L_sa
             de_df_sa = compute_df_gradient_contributions_fd_packed_bases(
-                ao_basis, aux_basis, atom_coords_bohr=coords, bar_L_ao=_bar_L_sa_fd,
+                ao_basis, aux_basis, atom_coords_bohr=coords, bar_L_ao=bar_L_sa,
                 backend=str(df_backend), df_config=df_config, df_threads=int(df_threads),
                 delta_bohr=float(delta_bohr), profile=None,
             )
 
-    # ── 1e and Pulay: transform D/W to Cartesian if spherical ──
+    # ── 1e and Pulay contractions ──
     W_sa_xp: Any | None = None
     C_occ_xp: Any | None = None
-    if _gpu_int1e_path:
+    if _gpu_1e_tensor_path:
         with _main_stream_cm:
             _D_tot_sa_x = xp.asarray(D_tot_sa, dtype=xp.float64)
-            if _T_xp is not None:
-                _D_tot_sa_1e = _T_xp @ _D_tot_sa_x @ _T_xp.T
-            else:
-                _D_tot_sa_1e = _D_tot_sa_x
-        de_h1_sa = _contract_hcore_fast(_D_tot_sa_1e)
+        de_h1_sa = _contract_hcore_fast(_D_tot_sa_x)
 
         # SA Pulay term: -Tr(W_sa · dS/dR).
         with _main_stream_cm:
@@ -2848,22 +3270,17 @@ def casscf_nuc_grad_df_per_root(
             gfock_sa_xp = xp.asarray(gfock_sa, dtype=xp.float64)
             _tmp_sa = C @ gfock_sa_xp[:, :nocc]  # (nao, nocc)
             W_sa_xp = 0.5 * (_tmp_sa @ C_occ_xp.T + C_occ_xp @ _tmp_sa.T)
-            if _T_xp is not None:
-                _W_sa_1e = _T_xp @ W_sa_xp @ _T_xp.T
-            else:
-                _W_sa_1e = W_sa_xp
-        de_pulay_sa = _contract_pulay_fast(_W_sa_1e)
+        de_pulay_sa = _contract_pulay_fast(W_sa_xp)
         W_sa = _asnumpy_f64(W_sa_xp)
         C_occ_np = _asnumpy_f64(C_occ_xp)
     else:
-        _D_tot_sa_1e = _T_np @ _asnumpy_f64(D_tot_sa) @ _T_np.T if _T_np is not None else _asnumpy_f64(D_tot_sa)
+        _D_tot_sa_1e = _asnumpy_f64(D_tot_sa)
         de_h1_sa = _contract_hcore_fast(_D_tot_sa_1e)
         gfock_sa_np = _asnumpy_f64(gfock_sa)
         C_occ_np = C_np[:, :nocc]
         _tmp_sa = C_np @ gfock_sa_np[:, :nocc]  # (nao, nocc)
         W_sa = 0.5 * (_tmp_sa @ C_occ_np.T + C_occ_np @ _tmp_sa.T)
-        _W_sa_1e = _T_np @ W_sa @ _T_np.T if _T_np is not None else W_sa
-        de_pulay_sa = _contract_pulay_fast(_W_sa_1e)
+        de_pulay_sa = _contract_pulay_fast(W_sa)
 
     # SA base gradient: de_h1_sa + de_df_sa + de_nuc + de_pulay_sa.
     grad_sa_base = np.asarray(
@@ -2900,15 +3317,15 @@ def casscf_nuc_grad_df_per_root(
         B_ao, h_ao, C, ncore=int(ncore), ncas=int(ncas),
         dm1_act=_dm1_zero, dm2_act=_dm2_zero,
     )
-    _gfock_zero_xp = xp.asarray(_gfock_zero, dtype=xp.float64) if _gpu_int1e_path else None
+    _gfock_zero_xp = xp.asarray(_gfock_zero, dtype=xp.float64) if _gpu_1e_tensor_path else None
     _gfock_zero_np = _asnumpy_f64(_gfock_zero)
 
     def _contract_df_delta_sync(_bar_L: Any) -> np.ndarray:
         nonlocal warned_df_fd
         try:
-            if _T_np is not None:
+            if bool(is_spherical):
                 if df_grad_ctx is not None:
-                    _de = df_grad_ctx.contract_sph(B_sph=B_ao, bar_L_sph=_bar_L, T_c2s=_T_np)
+                    _de = df_grad_ctx.contract_sph(B_sph=B_ao, bar_L_sph=_bar_L, T_c2s=None)
                 else:
                     _de = compute_df_gradient_contributions_analytic_sph(
                         ao_basis,
@@ -2916,7 +3333,7 @@ def casscf_nuc_grad_df_per_root(
                         atom_coords_bohr=coords,
                         B_sph=B_ao,
                         bar_L_sph=_bar_L,
-                        T_c2s=_T_np,
+                        T_c2s=None,
                         L_chol=getattr(scf_out, "df_L", None),
                         backend=str(df_backend),
                         df_threads=int(df_threads),
@@ -2939,6 +3356,8 @@ def casscf_nuc_grad_df_per_root(
                     )
             return np.asarray(_asnumpy_f64(_de), dtype=np.float64)
         except (NotImplementedError, RuntimeError) as e:
+            if bool(is_spherical):
+                raise
             if not warned_df_fd:
                 warnings.warn(
                     f"DF 2e gradient contraction fell back to finite-difference on B (backend={df_backend!s}); "
@@ -2948,12 +3367,11 @@ def casscf_nuc_grad_df_per_root(
                     stacklevel=2,
                 )
                 warned_df_fd = True
-            _bar_fd = _transform_bar_L_to_cart(_T_np, _bar_L) if _T_np is not None else _bar_L
             _de = compute_df_gradient_contributions_fd_packed_bases(
                 ao_basis,
                 aux_basis,
                 atom_coords_bohr=coords,
-                bar_L_ao=_bar_fd,
+                bar_L_ao=_bar_L,
                 backend=str(df_backend),
                 df_config=df_config,
                 df_threads=int(df_threads),
@@ -3057,6 +3475,12 @@ def casscf_nuc_grad_df_per_root(
         if _profile_df_per_root:
             _t_z_solve += time.perf_counter() - t0
             _z_solver = str(z_batch.info.get("solver", _z_solver or "")).strip() or _z_solver
+            _z_backend = str(z_batch.info.get("backend", _z_backend or "")).strip() or _z_backend
+            _solver_detail = z_batch.info.get("solver_detail", None)
+            if isinstance(_solver_detail, (list, tuple)):
+                _z_solver_detail = "|".join(str(s).strip() for s in _solver_detail if str(s).strip()) or _z_solver_detail
+            elif _solver_detail is not None:
+                _z_solver_detail = str(_solver_detail).strip() or _z_solver_detail
             _z_matvec_calls += int(z_batch.info.get("total_matvec_calls", 0) or 0)
             _z_niter += int(z_batch.info.get("total_niter", 0) or 0)
 
@@ -3261,6 +3685,8 @@ def casscf_nuc_grad_df_per_root(
                 _t_z_solve += time.perf_counter() - t0
                 try:
                     _z_solver = str(z_K.info.get("solver", _z_solver or "")).strip() or _z_solver
+                    _z_solver_detail = str(z_K.info.get("solver", _z_solver_detail or "")).strip() or _z_solver_detail
+                    _z_backend = str(z_K.info.get("backend", _z_backend or "")).strip() or _z_backend
                     _z_matvec_calls += int(z_K.info.get("matvec_calls", 0) or 0)
                     _z_niter += int(z_K.info.get("niter", 0) or 0)
                 except Exception:
@@ -3359,78 +3785,120 @@ def casscf_nuc_grad_df_per_root(
         with _main_stream_cm:
             qblock_eff = int(_barl_policy.get("qblock", 0))
             t0 = time.perf_counter()
-
-            # Allocate a single accumulation buffer and build all bar_L terms into it.
             nao = int(getattr(B_ao, "shape", (0, 0, 1))[0])
             naux = int(getattr(B_ao, "shape", (0, 0, 1))[2])
-            bar_L_delta_total = xp.zeros((naux, nao, nao), dtype=_barl_out_dtype)
+            # Always use a single accumulation buffer for bar_L construction.
+            # The old per-term path (3 separate buffers) wastes 2×sizeof(B) VRAM
+            # with no benefit: contraction now sums terms before the kernel anyway.
+            if False:  # kept for reference; the 3-buffer path is strictly dominated
+                pass
+            else:
+                # Default path: allocate one accumulation buffer and build all terms into it.
+                bar_L_delta_total = xp.zeros((naux, nao, nao), dtype=_barl_out_dtype)
 
-            _build_bar_L_delta_casscf_df(
-                B_ao,
-                D_core_ao=D_core_sa,
-                C_act=C_act_sa,
-                dm1_delta=dm1_delta,
-                dm2_delta=dm2_delta,
-                rho_core=rho_core,
-                L2=L2,
-                out=bar_L_delta_total,
-                symmetrize=False,
-                work_dtype=_barl_work_dtype,
-                out_dtype=_barl_out_dtype,
-                qblock=qblock_eff,
-            )
-            _log_vram(f"root {K} after delta_hf")
-            _flush_gpu_pool()
-            _log_vram(f"root {K} after delta_hf flush")
+                _build_bar_L_delta_casscf_df(
+                    B_ao,
+                    D_core_ao=D_core_sa,
+                    C_act=C_act_sa,
+                    dm1_delta=dm1_delta,
+                    dm2_delta=dm2_delta,
+                    rho_core=rho_core,
+                    L2=L2,
+                    out=bar_L_delta_total,
+                    symmetrize=False,
+                    work_dtype=_barl_work_dtype,
+                    out_dtype=_barl_out_dtype,
+                    qblock=qblock_eff,
+                )
+                _log_vram(f"root {K} after delta_hf")
+                _flush_gpu_pool()
+                _log_vram(f"root {K} after delta_hf flush")
 
-            # CI response term: accumulate directly into bar_L_delta_total.
-            _, D_act_lci = _build_bar_L_net_active_df(
-                B_ao,
-                C,
-                dm1_lci,
-                dm2_lci,
-                ncore=int(ncore),
-                ncas=int(ncas),
-                xp=xp,
-                L_act=L_act,
-                rho_core=rho_core,
-                out=bar_L_delta_total,
-                symmetrize=False,
-                work_dtype=_barl_work_dtype,
-                out_dtype=_barl_out_dtype,
-                qblock=qblock_eff,
-            )
-            _log_vram(f"root {K} after lci_net")
-            _flush_gpu_pool()
-            _log_vram(f"root {K} after lci_net flush")
+                # CI response term: accumulate directly into bar_L_delta_total.
+                _, D_act_lci = _build_bar_L_net_active_df(
+                    B_ao,
+                    C,
+                    dm1_lci,
+                    dm2_lci,
+                    ncore=int(ncore),
+                    ncas=int(ncas),
+                    xp=xp,
+                    L_act=L_act,
+                    rho_core=rho_core,
+                    out=bar_L_delta_total,
+                    symmetrize=False,
+                    work_dtype=_barl_work_dtype,
+                    out_dtype=_barl_out_dtype,
+                    qblock=qblock_eff,
+                )
+                _log_vram(f"root {K} after lci_net")
+                _flush_gpu_pool()
+                _log_vram(f"root {K} after lci_net flush")
 
-            # Orbital response term: accumulate directly into bar_L_delta_total.
-            _, D_L_lorb = _build_bar_L_lorb_df(
-                B_ao,
-                C,
-                np.asarray(Lorb_mat, dtype=np.float64),
-                dm1_sa,
-                dm2_sa,
-                ncore=int(ncore),
-                ncas=int(ncas),
-                xp=xp,
-                out=bar_L_delta_total,
-                symmetrize=False,
-                work_dtype=_barl_work_dtype,
-                out_dtype=_barl_out_dtype,
-                qblock=qblock_eff,
-            )
-            _log_vram(f"root {K} after lorb")
+                # Orbital response term: accumulate directly into bar_L_delta_total.
+                _, D_L_lorb = _build_bar_L_lorb_df(
+                    B_ao,
+                    C,
+                    np.asarray(Lorb_mat, dtype=np.float64),
+                    dm1_sa,
+                    dm2_sa,
+                    ncore=int(ncore),
+                    ncas=int(ncas),
+                    xp=xp,
+                    out=bar_L_delta_total,
+                    symmetrize=False,
+                    work_dtype=_barl_work_dtype,
+                    out_dtype=_barl_out_dtype,
+                    qblock=qblock_eff,
+                )
+                _log_vram(f"root {K} after lorb")
 
+                _symmetrize_bar_L_inplace(bar_L_delta_total, xp)
+                _log_vram(f"root {K} bar_L fused")
+                if _profile_df_per_root:
+                    _t_bar_L_delta += time.perf_counter() - t0
+
+        if bool(_fused_contract_enabled):
+            if bar_L_terms_contract is None:
+                # Single-buffer accumulation was used; fused term-list not needed.
+                _fused_contract_enabled = False
+            else:
+                _terms_fp64: list[Any] = []
+                for _term in bar_L_terms_contract:
+                    if _term is None:
+                        continue
+                    _term64 = _term if str(getattr(_term, "dtype", "")) == str(np.float64) else xp.asarray(_term, dtype=xp.float64)
+                    _terms_fp64.append(_term64)
+                if len(_terms_fp64) == 0:
+                    if not bool(_fused_contract_warned_inert):
+                        warnings.warn(
+                            "ASUKA_DF_FUSED_CONTRACT requested but produced an empty term list; "
+                            "falling back to non-fused DF contraction.",
+                            RuntimeWarning,
+                            stacklevel=2,
+                        )
+                        _fused_contract_warned_inert = True
+                    _fused_contract_enabled = False
+                    bar_L_terms_contract = None
+                else:
+                    bar_L_terms_contract = _terms_fp64
+
+        if (
+            not bool(_fused_contract_enabled)
+            and bar_L_delta_total is None
+            and bar_L_terms_contract is not None
+            and len(bar_L_terms_contract) > 0
+        ):
+            bar_L_delta_total = xp.zeros((naux, nao, nao), dtype=xp.float64)
+            for _term in bar_L_terms_contract:
+                bar_L_delta_total += xp.asarray(_term, dtype=xp.float64)
             _symmetrize_bar_L_inplace(bar_L_delta_total, xp)
-            _log_vram(f"root {K} bar_L fused")
-            if _profile_df_per_root:
-                _t_bar_L_delta += time.perf_counter() - t0
+            bar_L_terms_contract = None
 
         bar_L_contract = bar_L_delta_total
-        if bar_L_contract is None:  # pragma: no cover
+        if bar_L_contract is None and not bool(_fused_contract_enabled):  # pragma: no cover
             raise RuntimeError("internal error: bar_L buffer was not constructed")
-        if str(getattr(bar_L_contract, "dtype", "")) != str(np.float64):
+        if bar_L_contract is not None and str(getattr(bar_L_contract, "dtype", "")) != str(np.float64):
             bar_L_contract = xp.asarray(bar_L_contract, dtype=xp.float64)
 
         if (
@@ -3496,12 +3964,12 @@ def casscf_nuc_grad_df_per_root(
             if de_df_delta_precomputed is not None:
                 de_df_stage = np.asarray(de_df_delta_precomputed, dtype=np.float64)
             elif bool(_fused_contract_enabled) and bar_L_terms_contract is not None and df_grad_ctx is not None:
-                if _T_np is not None:
+                if bool(is_spherical):
                     de_df_stage = np.asarray(
                         df_grad_ctx.contract_fused_terms_sph(
                             B_sph=B_ao,
                             bar_L_terms_sph=bar_L_terms_contract,
-                            T_c2s=_T_np,
+                            T_c2s=None,
                             precision=str(_fused_contract_precision),
                         ),
                         dtype=np.float64,
@@ -3556,8 +4024,8 @@ def casscf_nuc_grad_df_per_root(
             stream.wait_event(evt_ready)
             try:
                 with stream:
-                    if _T_np is not None:
-                        grad_dev = df_grad_ctx.contract_device_sph(B_sph=B_ao, bar_L_sph=bar_L_contract, T_c2s=_T_np)
+                    if bool(is_spherical):
+                        grad_dev = df_grad_ctx.contract_device_sph(B_sph=B_ao, bar_L_sph=bar_L_contract, T_c2s=None)
                     else:
                         grad_dev = df_grad_ctx.contract_device(B_ao=B_ao, bar_L_ao=bar_L_contract)
             except (NotImplementedError, RuntimeError, ValueError):
@@ -3565,18 +4033,13 @@ def casscf_nuc_grad_df_per_root(
 
             if grad_dev is not None:
                 # ── Single fused 1e call: delta from SA + lci + lorb ──
-                if _gpu_int1e_path:
+                if _gpu_1e_tensor_path:
                     with _main_stream_cm:
                         D_1e_delta = xp.asarray(D_tot_K - D_tot_sa + D_act_lci + D_L_lorb, dtype=xp.float64)
-                        if _T_xp is not None:
-                            _D_1e_delta_ms = _T_xp @ D_1e_delta @ _T_xp.T
-                        else:
-                            _D_1e_delta_ms = D_1e_delta
                 else:
                     with _main_stream_cm:
                         D_1e_delta = _asnumpy_f64(D_tot_K - D_tot_sa + D_act_lci + D_L_lorb)
-                    _D_1e_delta_ms = _T_np @ D_1e_delta @ _T_np.T if _T_np is not None else D_1e_delta
-                de_h1_delta = _contract_hcore_fast(_D_1e_delta_ms)
+                de_h1_delta = _contract_hcore_fast(D_1e_delta)
 
                 # ── Per-root Pulay delta: -Tr((W_K - W_sa) · dS/dR) ──
                 # ── Response Pulay (multi-stream path) ──
@@ -3585,7 +4048,7 @@ def casscf_nuc_grad_df_per_root(
                     dm1_act=xp.asarray(dm1_lci, dtype=xp.float64),
                     dm2_act=xp.asarray(dm2_lci, dtype=xp.float64),
                 )
-                if _gpu_int1e_path and W_sa_xp is not None and C_occ_xp is not None:
+                if _gpu_1e_tensor_path and W_sa_xp is not None and C_occ_xp is not None:
                     with _main_stream_cm:
                         gfock_K_xp = xp.asarray(gfock_K, dtype=xp.float64)
                         _tmp_K = C @ gfock_K_xp[:, :nocc]  # (nao, nocc)
@@ -3602,8 +4065,6 @@ def casscf_nuc_grad_df_per_root(
                             return_xp=True,
                         )
                         _W_pulay_ms = W_K_xp - W_sa_xp + _dme0_lci + _dme0_lorb
-                        if _T_xp is not None:
-                            _W_pulay_ms = _T_xp @ _W_pulay_ms @ _T_xp.T
                     gfock_K_np = None
                     W_K = None
                 else:
@@ -3622,7 +4083,6 @@ def casscf_nuc_grad_df_per_root(
                         lorb_cache=_lorb_resp_cache,
                     )
                     _W_pulay_ms = W_K - W_sa + _dme0_lci + _dme0_lorb
-                    _W_pulay_ms = _T_np @ _W_pulay_ms @ _T_np.T if _T_np is not None else _W_pulay_ms
                 de_pulay_delta = _contract_pulay_fast(_W_pulay_ms)
 
                 _in_flight.append(
@@ -3639,7 +4099,7 @@ def casscf_nuc_grad_df_per_root(
                 # deciding whether to drain an older job.
                 del (
                     de_h1_delta, de_pulay_delta,
-                    D_1e_delta, _D_1e_delta_ms,
+                    D_1e_delta,
                     gfock_K_np, _tmp_K, W_K,
                     _gfock_lci_raw, _dgfock_lci, _dme0_lci, _dme0_lorb, _W_pulay_ms,
                     rhs_orb, rhs_ci_K, rhs_ci, g_K,
@@ -3661,6 +4121,8 @@ def casscf_nuc_grad_df_per_root(
                             de_df_delta = cp.asnumpy(job["grad_dev"])
                         de_df_delta = np.asarray(de_df_delta, dtype=np.float64)
                     except Exception as e:
+                        if bool(is_spherical):
+                            raise
                         if not warned_df_fd:
                             warnings.warn(
                                 f"DF 2e gradient contraction fell back to finite-difference on B (backend={df_backend!s}); "
@@ -3670,9 +4132,8 @@ def casscf_nuc_grad_df_per_root(
                                 stacklevel=2,
                             )
                             warned_df_fd = True
-                        _bar_L_fd_ms = _transform_bar_L_to_cart(_T_np, job["bar_L"]) if _T_np is not None else job["bar_L"]
                         de_df_delta = compute_df_gradient_contributions_fd_packed_bases(
-                            ao_basis, aux_basis, atom_coords_bohr=coords, bar_L_ao=_bar_L_fd_ms,
+                            ao_basis, aux_basis, atom_coords_bohr=coords, bar_L_ao=job["bar_L"],
                             backend=str(df_backend), df_config=df_config, df_threads=int(df_threads),
                             delta_bohr=float(delta_bohr), profile=None,
                         )
@@ -3697,11 +4158,11 @@ def casscf_nuc_grad_df_per_root(
             try:
                 t0 = time.perf_counter()
                 if bool(_fused_contract_enabled) and df_grad_ctx is not None and bar_L_terms_contract is not None:
-                    if _T_np is not None:
+                    if bool(is_spherical):
                         de_df_delta = df_grad_ctx.contract_fused_terms_sph(
                             B_sph=B_ao,
                             bar_L_terms_sph=bar_L_terms_contract,
-                            T_c2s=_T_np,
+                            T_c2s=None,
                             precision=str(_fused_contract_precision),
                         )
                     else:
@@ -3711,14 +4172,13 @@ def casscf_nuc_grad_df_per_root(
                             precision=str(_fused_contract_precision),
                         )
                 else:
-                    if _T_np is not None:
-                        # ── Spherical path ──
+                    if bool(is_spherical):
                         if df_grad_ctx is not None:
-                            de_df_delta = df_grad_ctx.contract_sph(B_sph=B_ao, bar_L_sph=bar_L_contract, T_c2s=_T_np)
+                            de_df_delta = df_grad_ctx.contract_sph(B_sph=B_ao, bar_L_sph=bar_L_contract, T_c2s=None)
                         else:
                             de_df_delta = compute_df_gradient_contributions_analytic_sph(
                                 ao_basis, aux_basis, atom_coords_bohr=coords, B_sph=B_ao, bar_L_sph=bar_L_contract,
-                                T_c2s=_T_np, L_chol=getattr(scf_out, "df_L", None),
+                                T_c2s=None, L_chol=getattr(scf_out, "df_L", None),
                                 backend=str(df_backend), df_threads=int(df_threads), profile=None,
                             )
                     else:
@@ -3733,6 +4193,8 @@ def casscf_nuc_grad_df_per_root(
                 if _profile_df_per_root:
                     _t_contract_delta += time.perf_counter() - t0
             except (NotImplementedError, RuntimeError, ValueError) as e:
+                if bool(is_spherical):
+                    raise
                 if not warned_df_fd:
                     warnings.warn(
                         f"DF 2e gradient contraction fell back to finite-difference on B (backend={df_backend!s}); "
@@ -3752,9 +4214,8 @@ def casscf_nuc_grad_df_per_root(
                             _bar_L_dt_fd += _term64
                     if _bar_L_dt_fd is None:
                         raise RuntimeError("internal error: fused term list was empty")
-                    _bar_L_dt_fd = _transform_bar_L_to_cart(_T_np, _bar_L_dt_fd) if _T_np is not None else _bar_L_dt_fd
                 else:
-                    _bar_L_dt_fd = _transform_bar_L_to_cart(_T_np, bar_L_contract) if _T_np is not None else bar_L_contract
+                    _bar_L_dt_fd = bar_L_contract
                 de_df_delta = compute_df_gradient_contributions_fd_packed_bases(
                     ao_basis, aux_basis, atom_coords_bohr=coords, bar_L_ao=_bar_L_dt_fd,
                     backend=str(df_backend), df_config=df_config, df_threads=int(df_threads),
@@ -3762,18 +4223,13 @@ def casscf_nuc_grad_df_per_root(
                 )
 
         # ── Single fused 1e call: delta from SA + lci + lorb ──
-        if _gpu_int1e_path:
+        if _gpu_1e_tensor_path:
             with _main_stream_cm:
                 D_1e_delta = xp.asarray(D_tot_K - D_tot_sa + D_act_lci + D_L_lorb, dtype=xp.float64)
-                if _T_xp is not None:
-                    _D_1e_delta_1e = _T_xp @ D_1e_delta @ _T_xp.T
-                else:
-                    _D_1e_delta_1e = D_1e_delta
         else:
             with _main_stream_cm:
                 D_1e_delta = _asnumpy_f64(D_tot_K - D_tot_sa + D_act_lci + D_L_lorb)
-            _D_1e_delta_1e = _T_np @ D_1e_delta @ _T_np.T if _T_np is not None else D_1e_delta
-        de_h1_delta = _contract_hcore_fast(_D_1e_delta_1e)
+        de_h1_delta = _contract_hcore_fast(D_1e_delta)
 
         # ── Per-root Pulay delta: -Tr((W_K - W_sa) · dS/dR) ──
         t0 = time.perf_counter()
@@ -3784,7 +4240,7 @@ def casscf_nuc_grad_df_per_root(
             dm1_act=xp.asarray(dm1_lci, dtype=xp.float64),
             dm2_act=xp.asarray(dm2_lci, dtype=xp.float64),
         )
-        if _gpu_int1e_path and W_sa_xp is not None and C_occ_xp is not None:
+        if _gpu_1e_tensor_path and W_sa_xp is not None and C_occ_xp is not None:
             with _main_stream_cm:
                 gfock_K_xp = xp.asarray(gfock_K, dtype=xp.float64)
                 _tmp_K = C @ gfock_K_xp[:, :nocc]  # (nao, nocc)
@@ -3801,10 +4257,6 @@ def casscf_nuc_grad_df_per_root(
                     return_xp=True,
                 )
                 _W_delta = W_K_xp - W_sa_xp + _dme0_lci + _dme0_lorb
-                if _T_xp is not None:
-                    _W_delta_1e = _T_xp @ _W_delta @ _T_xp.T
-                else:
-                    _W_delta_1e = _W_delta
         else:
             with _main_stream_cm:
                 gfock_K_np = _asnumpy_f64(gfock_K)
@@ -3821,8 +4273,7 @@ def casscf_nuc_grad_df_per_root(
                 lorb_cache=_lorb_resp_cache,
             )
             _W_delta = W_K - W_sa + _dme0_lci + _dme0_lorb
-            _W_delta_1e = _T_np @ _W_delta @ _T_np.T if _T_np is not None else _W_delta
-        de_pulay_delta = _contract_pulay_fast(_W_delta_1e)
+        de_pulay_delta = _contract_pulay_fast(_W_delta)
         if _profile_df_per_root:
             _t_response_pulay += time.perf_counter() - t0
 
@@ -3856,6 +4307,8 @@ def casscf_nuc_grad_df_per_root(
                     de_df_delta = cp.asnumpy(job["grad_dev"])
                 de_df_delta = np.asarray(de_df_delta, dtype=np.float64)
             except Exception as e:
+                if bool(is_spherical):
+                    raise
                 if not warned_df_fd:
                     warnings.warn(
                         f"DF 2e gradient contraction fell back to finite-difference on B (backend={df_backend!s}); "
@@ -3865,9 +4318,8 @@ def casscf_nuc_grad_df_per_root(
                         stacklevel=2,
                     )
                     warned_df_fd = True
-                _bar_L_fd_drain = _transform_bar_L_to_cart(_T_np, job["bar_L"]) if _T_np is not None else job["bar_L"]
                 de_df_delta = compute_df_gradient_contributions_fd_packed_bases(
-                    ao_basis, aux_basis, atom_coords_bohr=coords, bar_L_ao=_bar_L_fd_drain,
+                    ao_basis, aux_basis, atom_coords_bohr=coords, bar_L_ao=job["bar_L"],
                     backend=str(df_backend), df_config=df_config, df_threads=int(df_threads),
                     delta_bohr=float(delta_bohr), profile=None,
                 )
@@ -3916,6 +4368,8 @@ def casscf_nuc_grad_df_per_root(
             f"fused_contract_live={int(bool(_fused_contract_enabled))} "
             f"fused_precision={str(_fused_contract_precision)} "
             f"z_solve_total={_t_z_solve:.3f}s z_solver={_z_solver or 'unknown'} "
+            f"z_solver_detail={_z_solver_detail or _z_solver or 'unknown'} "
+            f"z_backend={_z_backend or 'unknown'} "
             f"z_niter={int(_z_niter)} z_matvec_calls={int(_z_matvec_calls)} "
             f"t_trans_rdm_lci={_t_trans_rdm_lci:.3f}s "
             f"t_gen_g_hop={_t_gen_g_hop:.3f}s t_gfock={_t_gfock:.3f}s "

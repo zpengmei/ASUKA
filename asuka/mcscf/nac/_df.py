@@ -26,6 +26,7 @@ from asuka.integrals.df_context import DFCholeskyContext
 from asuka.integrals.df_grad_context import DFGradContractionContext
 from asuka.integrals.grad import (
     compute_df_gradient_contributions_analytic_packed_bases,
+    compute_df_gradient_contributions_analytic_sph,
     compute_df_gradient_contributions_fd_packed_bases,
 )
 from asuka.integrals.int1e_cart import (
@@ -562,6 +563,7 @@ def _grad_elec_active_df(
     xp, _is_gpu = _resolve_xp(df_backend)
 
     mol = getattr(scf_out, "mol")
+    _is_sph = not bool(getattr(mol, "cart", True))
     coords, charges = _mol_coords_charges_bohr(mol)
 
     B_ao = _as_xp_f64(xp, getattr(scf_out, "df_B"))
@@ -629,7 +631,20 @@ def _grad_elec_active_df(
         if str(getattr(bar_L_contract, "dtype", "")) != str(np.float64):
             bar_L_contract = xp.asarray(bar_L_contract, dtype=xp.float64)
         try:
-            if df_grad_ctx is not None:
+            if _is_sph:
+                if df_grad_ctx is not None:
+                    de_df_net = df_grad_ctx.contract_sph(B_sph=B_ao, bar_L_sph=bar_L_contract, T_c2s=None)
+                else:
+                    de_df_net = compute_df_gradient_contributions_analytic_sph(
+                        ao_basis, aux_basis,
+                        atom_coords_bohr=coords,
+                        B_sph=B_ao, bar_L_sph=bar_L_contract,
+                        L_chol=getattr(scf_out, "df_L", None),
+                        backend=str(df_backend),
+                        df_threads=int(df_threads),
+                        profile=None,
+                    )
+            elif df_grad_ctx is not None:
                 de_df_net = df_grad_ctx.contract(B_ao=B_ao, bar_L_ao=bar_L_contract)
             else:
                 de_df_net = compute_df_gradient_contributions_analytic_packed_bases(
@@ -644,6 +659,8 @@ def _grad_elec_active_df(
                     profile=None,
                 )
         except (NotImplementedError, RuntimeError) as e:
+            if _is_sph:
+                raise
             _warn_df_fd_fallback(
                 where="_grad_elec_active_df(total)",
                 backend=str(df_backend),
@@ -663,96 +680,83 @@ def _grad_elec_active_df(
             )
         D_tot_cpu = _asnumpy_f64(D_tot_ao)
         D_core_cpu = _asnumpy_f64(D_core_only)
-        de_h1 = contract_dhcore_cart(
-            ao_basis, atom_coords_bohr=coords, atom_charges=charges,
-            M=D_tot_cpu, shell_atom=shell_atom,
-        )
-        de_h1_core = contract_dhcore_cart(
-            ao_basis, atom_coords_bohr=coords, atom_charges=charges,
-            M=D_core_cpu, shell_atom=shell_atom,
-        )
+        if _is_sph:
+            from asuka.integrals.int1e_sph import contract_dhcore_sph  # noqa: PLC0415
+            de_h1 = contract_dhcore_sph(
+                ao_basis, atom_coords_bohr=coords, atom_charges=charges,
+                M_sph=D_tot_cpu, shell_atom=shell_atom,
+            )
+            de_h1_core = contract_dhcore_sph(
+                ao_basis, atom_coords_bohr=coords, atom_charges=charges,
+                M_sph=D_core_cpu, shell_atom=shell_atom,
+            )
+        else:
+            de_h1 = contract_dhcore_cart(
+                ao_basis, atom_coords_bohr=coords, atom_charges=charges,
+                M=D_tot_cpu, shell_atom=shell_atom,
+            )
+            de_h1_core = contract_dhcore_cart(
+                ao_basis, atom_coords_bohr=coords, atom_charges=charges,
+                M=D_core_cpu, shell_atom=shell_atom,
+            )
         _restore_pool()
         return np.asarray(de_h1 + _asnumpy_f64(de_df_net) - de_h1_core, dtype=np.float64)
 
     # ── Debug path (return_terms=True): keep 2 separate contract() calls for breakdown ──
     bar_L_ao_contract = bar_L_ao if str(getattr(bar_L_ao, "dtype", "")) == str(np.float64) else xp.asarray(bar_L_ao, dtype=xp.float64)
     bar_L_core_contract = bar_L_core if str(getattr(bar_L_core, "dtype", "")) == str(np.float64) else xp.asarray(bar_L_core, dtype=xp.float64)
-    try:
-        if df_grad_ctx is not None:
-            de_df = df_grad_ctx.contract(B_ao=B_ao, bar_L_ao=bar_L_ao_contract)
-        else:
-            de_df = compute_df_gradient_contributions_analytic_packed_bases(
-                ao_basis,
-                aux_basis,
-                atom_coords_bohr=coords,
-                B_ao=B_ao,
-                bar_L_ao=bar_L_ao_contract,
-                L_chol=getattr(scf_out, "df_L", None),
-                backend=str(df_backend),
-                df_threads=int(df_threads),
-                profile=None,
-            )
-    except (NotImplementedError, RuntimeError) as e:
-        _warn_df_fd_fallback(
-            where="_grad_elec_active_df(df2e)",
-            backend=str(df_backend),
-            delta_bohr=float(fd_delta_bohr),
-            err=e,
-        )
-        de_df = compute_df_gradient_contributions_fd_packed_bases(
-            ao_basis,
-            aux_basis,
-            atom_coords_bohr=coords,
-            bar_L_ao=bar_L_ao_contract,
-            backend=str(df_backend),
-            df_config=df_config,
-            df_threads=int(df_threads),
-            delta_bohr=float(fd_delta_bohr),
-            profile=None,
-        )
 
-    try:
-        if df_grad_ctx is not None:
-            de_df_core = df_grad_ctx.contract(B_ao=B_ao, bar_L_ao=bar_L_core_contract)
-        else:
-            de_df_core = compute_df_gradient_contributions_analytic_packed_bases(
-                ao_basis,
-                aux_basis,
-                atom_coords_bohr=coords,
-                B_ao=B_ao,
-                bar_L_ao=bar_L_core_contract,
+    def _contract_df_2e(bar_L, *, where_label):
+        try:
+            if _is_sph:
+                if df_grad_ctx is not None:
+                    return df_grad_ctx.contract_sph(B_sph=B_ao, bar_L_sph=bar_L, T_c2s=None)
+                return compute_df_gradient_contributions_analytic_sph(
+                    ao_basis, aux_basis, atom_coords_bohr=coords,
+                    B_sph=B_ao, bar_L_sph=bar_L,
+                    L_chol=getattr(scf_out, "df_L", None),
+                    backend=str(df_backend), df_threads=int(df_threads), profile=None,
+                )
+            if df_grad_ctx is not None:
+                return df_grad_ctx.contract(B_ao=B_ao, bar_L_ao=bar_L)
+            return compute_df_gradient_contributions_analytic_packed_bases(
+                ao_basis, aux_basis, atom_coords_bohr=coords,
+                B_ao=B_ao, bar_L_ao=bar_L,
                 L_chol=getattr(scf_out, "df_L", None),
-                backend=str(df_backend),
-                df_threads=int(df_threads),
-                profile=None,
+                backend=str(df_backend), df_threads=int(df_threads), profile=None,
             )
-    except (NotImplementedError, RuntimeError) as e:
-        _warn_df_fd_fallback(
-            where="_grad_elec_active_df(df2e_core_sub)",
-            backend=str(df_backend),
-            delta_bohr=float(fd_delta_bohr),
-            err=e,
-        )
-        de_df_core = compute_df_gradient_contributions_fd_packed_bases(
-            ao_basis,
-            aux_basis,
-            atom_coords_bohr=coords,
-            bar_L_ao=bar_L_core_contract,
-            backend=str(df_backend),
-            df_config=df_config,
-            df_threads=int(df_threads),
-            delta_bohr=float(fd_delta_bohr),
-            profile=None,
-        )
+        except (NotImplementedError, RuntimeError) as e:
+            if _is_sph:
+                raise
+            _warn_df_fd_fallback(where=where_label, backend=str(df_backend), delta_bohr=float(fd_delta_bohr), err=e)
+            return compute_df_gradient_contributions_fd_packed_bases(
+                ao_basis, aux_basis, atom_coords_bohr=coords,
+                bar_L_ao=bar_L, backend=str(df_backend), df_config=df_config,
+                df_threads=int(df_threads), delta_bohr=float(fd_delta_bohr), profile=None,
+            )
+
+    de_df = _contract_df_2e(bar_L_ao_contract, where_label="_grad_elec_active_df(df2e)")
+    de_df_core = _contract_df_2e(bar_L_core_contract, where_label="_grad_elec_active_df(df2e_core_sub)")
 
     D_tot_cpu = _asnumpy_f64(D_tot_ao)
     D_core_cpu = _asnumpy_f64(D_core_only)
-    de_h1 = contract_dhcore_cart(
-        ao_basis, atom_coords_bohr=coords, atom_charges=charges,
-        M=D_tot_cpu, shell_atom=shell_atom,
-    )
-    de_h1_core = contract_dhcore_cart(
-        ao_basis, atom_coords_bohr=coords, atom_charges=charges,
+    if _is_sph:
+        from asuka.integrals.int1e_sph import contract_dhcore_sph  # noqa: PLC0415
+        de_h1 = contract_dhcore_sph(
+            ao_basis, atom_coords_bohr=coords, atom_charges=charges,
+            M_sph=D_tot_cpu, shell_atom=shell_atom,
+        )
+        de_h1_core = contract_dhcore_sph(
+            ao_basis, atom_coords_bohr=coords, atom_charges=charges,
+            M_sph=D_core_cpu, shell_atom=shell_atom,
+        )
+    else:
+        de_h1 = contract_dhcore_cart(
+            ao_basis, atom_coords_bohr=coords, atom_charges=charges,
+            M=D_tot_cpu, shell_atom=shell_atom,
+        )
+        de_h1_core = contract_dhcore_cart(
+            ao_basis, atom_coords_bohr=coords, atom_charges=charges,
         M=D_core_cpu, shell_atom=shell_atom,
     )
     total = np.asarray(de_h1 + _asnumpy_f64(de_df) - de_h1_core - _asnumpy_f64(de_df_core), dtype=np.float64)
@@ -790,6 +794,7 @@ def _grad_elec_casscf_df(
     xp, _is_gpu = _resolve_xp(df_backend)
 
     mol = getattr(scf_out, "mol")
+    _is_sph_c = not bool(getattr(mol, "cart", True))
     coords, charges = _mol_coords_charges_bohr(mol)
 
     B_ao = _as_xp_f64(xp, getattr(scf_out, "df_B"))
@@ -838,21 +843,28 @@ def _grad_elec_casscf_df(
     if str(getattr(bar_L_contract, "dtype", "")) != str(np.float64):
         bar_L_contract = xp.asarray(bar_L_contract, dtype=xp.float64)
     try:
-        if df_grad_ctx is not None:
+        if _is_sph_c:
+            if df_grad_ctx is not None:
+                de_df = df_grad_ctx.contract_sph(B_sph=B_ao, bar_L_sph=bar_L_contract, T_c2s=None)
+            else:
+                de_df = compute_df_gradient_contributions_analytic_sph(
+                    ao_basis, aux_basis, atom_coords_bohr=coords,
+                    B_sph=B_ao, bar_L_sph=bar_L_contract,
+                    L_chol=getattr(scf_out, "df_L", None),
+                    backend=str(df_backend), df_threads=int(df_threads), profile=None,
+                )
+        elif df_grad_ctx is not None:
             de_df = df_grad_ctx.contract(B_ao=B_ao, bar_L_ao=bar_L_contract)
         else:
             de_df = compute_df_gradient_contributions_analytic_packed_bases(
-                ao_basis,
-                aux_basis,
-                atom_coords_bohr=coords,
-                B_ao=B_ao,
-                bar_L_ao=bar_L_contract,
+                ao_basis, aux_basis, atom_coords_bohr=coords,
+                B_ao=B_ao, bar_L_ao=bar_L_contract,
                 L_chol=getattr(scf_out, "df_L", None),
-                backend=str(df_backend),
-                df_threads=int(df_threads),
-                profile=None,
+                backend=str(df_backend), df_threads=int(df_threads), profile=None,
             )
     except (NotImplementedError, RuntimeError) as e:
+        if _is_sph_c:
+            raise
         _warn_df_fd_fallback(
             where="_grad_elec_casscf_df",
             backend=str(df_backend),
@@ -860,25 +872,23 @@ def _grad_elec_casscf_df(
             err=e,
         )
         de_df = compute_df_gradient_contributions_fd_packed_bases(
-            ao_basis,
-            aux_basis,
-            atom_coords_bohr=coords,
-            bar_L_ao=bar_L_contract,
-            backend=str(df_backend),
-            df_config=df_config,
-            df_threads=int(df_threads),
-            delta_bohr=float(fd_delta_bohr),
-            profile=None,
+            ao_basis, aux_basis, atom_coords_bohr=coords,
+            bar_L_ao=bar_L_contract, backend=str(df_backend), df_config=df_config,
+            df_threads=int(df_threads), delta_bohr=float(fd_delta_bohr), profile=None,
         )
 
     # ── CPU phase: 1e contractions (device synced by contract()) ──
-    de_h1 = contract_dhcore_cart(
-        ao_basis,
-        atom_coords_bohr=coords,
-        atom_charges=charges,
-        M=_asnumpy_f64(D_tot_ao),
-        shell_atom=shell_atom,
-    )
+    if _is_sph_c:
+        from asuka.integrals.int1e_sph import contract_dhcore_sph  # noqa: PLC0415
+        de_h1 = contract_dhcore_sph(
+            ao_basis, atom_coords_bohr=coords, atom_charges=charges,
+            M_sph=_asnumpy_f64(D_tot_ao), shell_atom=shell_atom,
+        )
+    else:
+        de_h1 = contract_dhcore_cart(
+            ao_basis, atom_coords_bohr=coords, atom_charges=charges,
+            M=_asnumpy_f64(D_tot_ao), shell_atom=shell_atom,
+        )
 
     _restore_pool()
     return np.asarray(de_h1 + _asnumpy_f64(de_df), dtype=np.float64)
@@ -917,6 +927,7 @@ def _Lorb_dot_dgorb_dx_df(
     xp, _is_gpu = _resolve_xp(df_backend)
 
     mol = getattr(scf_out, "mol")
+    _is_sph_l = not bool(getattr(mol, "cart", True))
     coords, charges = _mol_coords_charges_bohr(mol)
 
     B_ao = _as_xp_f64(xp, getattr(scf_out, "df_B"))
@@ -1107,21 +1118,28 @@ def _Lorb_dot_dgorb_dx_df(
         bar_L_contract = xp.asarray(bar_L_contract, dtype=xp.float64)
 
     try:
-        if df_grad_ctx is not None:
+        if _is_sph_l:
+            if df_grad_ctx is not None:
+                de_df = df_grad_ctx.contract_sph(B_sph=B_ao, bar_L_sph=bar_L_contract, T_c2s=None)
+            else:
+                de_df = compute_df_gradient_contributions_analytic_sph(
+                    ao_basis, aux_basis, atom_coords_bohr=coords,
+                    B_sph=B_ao, bar_L_sph=bar_L_contract,
+                    L_chol=getattr(scf_out, "df_L", None),
+                    backend=str(df_backend), df_threads=int(df_threads), profile=None,
+                )
+        elif df_grad_ctx is not None:
             de_df = df_grad_ctx.contract(B_ao=B_ao, bar_L_ao=bar_L_contract)
         else:
             de_df = compute_df_gradient_contributions_analytic_packed_bases(
-                ao_basis,
-                aux_basis,
-                atom_coords_bohr=coords,
-                B_ao=B_ao,
-                bar_L_ao=bar_L_contract,
+                ao_basis, aux_basis, atom_coords_bohr=coords,
+                B_ao=B_ao, bar_L_ao=bar_L_contract,
                 L_chol=getattr(scf_out, "df_L", None),
-                backend=str(df_backend),
-                df_threads=int(df_threads),
-                profile=None,
+                backend=str(df_backend), df_threads=int(df_threads), profile=None,
             )
     except (NotImplementedError, RuntimeError) as e:
+        if _is_sph_l:
+            raise
         _warn_df_fd_fallback(
             where="_Lorb_dot_dgorb_dx_df",
             backend=str(df_backend),
@@ -1129,26 +1147,24 @@ def _Lorb_dot_dgorb_dx_df(
             err=e,
         )
         de_df = compute_df_gradient_contributions_fd_packed_bases(
-            ao_basis,
-            aux_basis,
-            atom_coords_bohr=coords,
-            bar_L_ao=bar_L_contract,
-            backend=str(df_backend),
-            df_config=df_config,
-            df_threads=int(df_threads),
-            delta_bohr=float(fd_delta_bohr),
-            profile=None,
+            ao_basis, aux_basis, atom_coords_bohr=coords,
+            bar_L_ao=bar_L_contract, backend=str(df_backend), df_config=df_config,
+            df_threads=int(df_threads), delta_bohr=float(fd_delta_bohr), profile=None,
         )
 
     # ── CPU phase: 1e derivative contractions (device synced by contract()) ──
     shell_atom = shell_to_atom_map(ao_basis, atom_coords_bohr=coords)
-    de_h1 = contract_dhcore_cart(
-        ao_basis,
-        atom_coords_bohr=coords,
-        atom_charges=charges,
-        M=_asnumpy_f64(D_L),
-        shell_atom=shell_atom,
-    )
+    if _is_sph_l:
+        from asuka.integrals.int1e_sph import contract_dhcore_sph  # noqa: PLC0415
+        de_h1 = contract_dhcore_sph(
+            ao_basis, atom_coords_bohr=coords, atom_charges=charges,
+            M_sph=_asnumpy_f64(D_L), shell_atom=shell_atom,
+        )
+    else:
+        de_h1 = contract_dhcore_cart(
+            ao_basis, atom_coords_bohr=coords, atom_charges=charges,
+            M=_asnumpy_f64(D_L), shell_atom=shell_atom,
+        )
     # de_df already on CPU (contract() returns numpy).
     total = np.asarray(de_h1 + _asnumpy_f64(de_df), dtype=np.float64)
     if not bool(return_terms):
@@ -1230,9 +1246,7 @@ def sacasscf_nonadiabatic_couplings_df(
     mol = getattr(scf_out, "mol", None)
     if mol is None:
         raise TypeError("scf_out must have a .mol attribute")
-    if not bool(getattr(mol, "cart", False)):
-        raise NotImplementedError("DF NAC currently requires cart=True")
-
+    _is_sph_nac = not bool(getattr(mol, "cart", True))
     coords, _charges = _mol_coords_charges_bohr(mol)
     natm = int(coords.shape[0])
 
@@ -1518,12 +1532,21 @@ def sacasscf_nonadiabatic_couplings_df(
             castm1 = np.asarray(dm1, dtype=np.float64).T - np.asarray(dm1, dtype=np.float64)
             mo_cas = C_ref[:, ncore:nocc]
             tm1 = mo_cas @ castm1 @ mo_cas.T
-            nac_csf = 0.5 * contract_dS_ip_cart(
-                ao_basis_ref,
-                atom_coords_bohr=coords,
-                M=tm1,
-                shell_atom=shell_atom_ref,
-            )
+            if _is_sph_nac:
+                from asuka.integrals.int1e_sph import contract_dS_ip_sph  # noqa: PLC0415
+                nac_csf = 0.5 * contract_dS_ip_sph(
+                    ao_basis_ref,
+                    atom_coords_bohr=coords,
+                    M_sph=tm1,
+                    shell_atom=shell_atom_ref,
+                )
+            else:
+                nac_csf = 0.5 * contract_dS_ip_cart(
+                    ao_basis_ref,
+                    atom_coords_bohr=coords,
+                    M=tm1,
+                    shell_atom=shell_atom_ref,
+                )
             ham = np.asarray(ham, dtype=np.float64) + np.asarray(nac_csf * ediff, dtype=np.float64)
 
         # Pair-specific Z-vector RHS in SA parameter space.

@@ -305,7 +305,25 @@ class _DIIS:
 
         rhs = xp.zeros((n + 1,), dtype=xp.float64)
         rhs[n] = -1.0
-        coeff = xp.linalg.solve(B, rhs)[:n]  # (n,)
+        finite = xp.isfinite(B).all()
+        try:
+            finite = bool(finite)
+        except Exception:
+            finite = bool(finite.item())
+        if not finite:
+            return self._F[-1]
+
+        try:
+            coeff_full = xp.linalg.solve(B, rhs)
+        except Exception:
+            # The DIIS Gram matrix can become (nearly) singular due to linear
+            # dependence in the error vectors. Prefer a least-squares fallback
+            # to keep SCF iterations robust (esp. along dissociation scans).
+            try:
+                coeff_full = xp.linalg.lstsq(B, rhs, rcond=None)[0]
+            except Exception:
+                return self._F[-1]
+        coeff = coeff_full[:n]  # (n,)
 
         Fstk = xp.stack([xp.asarray(F, dtype=xp.float64) for F in self._F], axis=0)  # (n, nao, nao)
         return xp.tensordot(coeff, Fstk, axes=(0, 0))

@@ -18,6 +18,7 @@ import time
 import numpy as np
 
 from asuka.integrals.df_integrals import DFMOIntegrals
+from asuka.integrals.cart2sph import coerce_sph_map
 from asuka.cuda.active_space_df.active_space_integrals import (
     build_device_dfmo_integrals_cueri_dense_rys,
     build_device_dfmo_integrals_cueri_df,
@@ -364,6 +365,16 @@ def _build_casci_df_integrals(
     C_cas = C[:, ncore : ncore + ncas]
 
     B = scf_out.df_B
+    if B is None:
+        raise ValueError("scf_out.df_B is missing (DF CASCI/CASSCF requires cached DF factors)")
+    B_shape = getattr(B, "shape", None)
+    if B_shape is None or len(B_shape) != 3:
+        raise ValueError("scf_out.df_B must be a 3D tensor with shape (nao, nao, naux) (mnQ layout)")
+    if int(B_shape[0]) != int(nao) or int(B_shape[1]) != int(nao):
+        raise ValueError(
+            "DF CASCI/CASSCF currently requires df_layout='mnQ' (B[mu,nu,Q] with shape (nao,nao,naux)). "
+            f"Got df_B.shape={tuple(map(int, B_shape))} for nao={int(nao)}."
+        )
 
     _t_core_start = time.perf_counter() if profile is not None else 0.0
     xp, _is_gpu = _df_scf._get_xp(B, C_cas)  # noqa: SLF001
@@ -427,9 +438,9 @@ def _build_casci_df_integrals(
     # cc-pVTZ-sized systems and can OOM 24GB GPUs.
     C_cas_for_eri = C_cas
     cached_b_for_eri = cached_b_whitened_use
-    sph_map = getattr(scf_out, "sph_map", None)
+    sph_map = coerce_sph_map(getattr(scf_out, "sph_map", None))
     if sph_map is not None and cached_b_for_eri is None:
-        T_c2s = xp.asarray(sph_map[0], dtype=xp.float64)  # (nao_cart, nao_sph)
+        T_c2s = xp.asarray(sph_map.T_c2s, dtype=xp.float64)  # (nao_cart, nao_sph)
         C_cas_for_eri = T_c2s @ C_cas  # (nao_cart, ncas)
 
     eri = build_device_dfmo_integrals_cueri_df(

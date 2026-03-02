@@ -799,6 +799,42 @@ extern "C" cudaError_t cueri_df_int3c2e_deriv_contracted_cart_launch_stream(
     cudaStream_t stream,
     int threads);
 
+// DF int3c2e derivative contraction with *spherical* bar_X adjoint (batch output).
+//
+// Like `cueri_df_int3c2e_deriv_contracted_cart_launch_stream` but takes bar_X in the spherical
+// AO basis in Qmn layout and applies the cart<-sph transforms inside the contraction kernel.
+extern "C" cudaError_t cueri_df_int3c2e_deriv_contracted_cart_sphbar_qmn_launch_stream(
+    int32_t spAB,
+    const int32_t* spCD,
+    int ntasks,
+    const int32_t* sp_A,
+    const int32_t* sp_B,
+    const int32_t* sp_pair_start,
+    const int32_t* sp_npair,
+    const double* shell_cx,
+    const double* shell_cy,
+    const double* shell_cz,
+    const int32_t* shell_prim_start,
+    const int32_t* shell_nprim,
+    const int32_t* shell_ao_start,
+    const double* prim_exp,
+    const double* pair_eta,
+    const double* pair_Px,
+    const double* pair_Py,
+    const double* pair_Pz,
+    const double* pair_cK,
+    int nao,
+    int naux,
+    int nao_sph,
+    int la,
+    int lb,
+    int lc,
+    const double* bar_X_sph_Qmn,       // [naux*nao_sph*nao_sph]
+    const int32_t* shell_ao_start_sph, // [nShellTotal]
+    double* out,                       // size (ntasks*9)
+    cudaStream_t stream,
+    int threads);
+
 // Batched DF int3c2e derivative contraction — processes all AO shell pairs in one (la,lb) class
 // × all aux shell pairs in one lq class with a single 2D kernel launch.
 // Accumulates gradient contributions directly into grad_dev via atomicAdd (no output buffer).
@@ -959,6 +995,85 @@ extern "C" cudaError_t cueri_df_int3c2e_deriv_contracted_cart_allsp_atomgrad_sph
     cudaStream_t stream,
     int threads);
 
+// Streamed-QAB spherical-bar_X variant.
+//
+// The input bar_X is a Q-slice chunk [q_count, nao_sph, nao_sph] corresponding
+// to absolute aux AO indices q in [q_offset, q_offset + q_count). Contributions
+// outside this Q-window are ignored by the kernel.
+extern "C" cudaError_t cueri_df_int3c2e_deriv_contracted_cart_allsp_atomgrad_sphbar_qmn_streamed_launch_stream(
+    const int32_t* spAB_arr,                 // [n_spAB]
+    int n_spAB,
+    const int32_t* spCD,                     // [ntasks]
+    int ntasks,
+    const int32_t* sp_A,
+    const int32_t* sp_B,
+    const int32_t* sp_pair_start,
+    const int32_t* sp_npair,
+    const double* shell_cx,
+    const double* shell_cy,
+    const double* shell_cz,
+    const int32_t* shell_prim_start,
+    const int32_t* shell_nprim,
+    const int32_t* shell_ao_start,
+    const double* prim_exp,
+    const double* pair_eta,
+    const double* pair_Px,
+    const double* pair_Py,
+    const double* pair_Pz,
+    const double* pair_cK,
+    int nao,
+    int naux,
+    int nao_sph,
+    int la,
+    int lb,
+    int lc,
+    const double* bar_X_sph_Qmn_chunk,       // [q_count*nao_sph*nao_sph]
+    const int32_t* shell_ao_start_sph,       // [nShellTotal]
+    const int32_t* shell_atom,               // [nAOshells+nAuxShells]
+    int q_offset,                            // absolute aux AO start of this chunk
+    int q_count,                             // number of aux AO rows in this chunk
+    double* grad_dev,                        // [natm*3] — atomicAdd target
+    cudaStream_t stream,
+    int threads);
+
+// Streamed-QAB + AB-tiled spherical-bar_X variant.
+extern "C" cudaError_t cueri_df_int3c2e_deriv_contracted_cart_allsp_atomgrad_sphbar_qmn_streamed_abtile_launch_stream(
+    const int32_t* spAB_arr,                 // [n_spAB]
+    int n_spAB,
+    const int32_t* spCD,                     // [ntasks]
+    int ntasks,
+    const int32_t* sp_A,
+    const int32_t* sp_B,
+    const int32_t* sp_pair_start,
+    const int32_t* sp_npair,
+    const double* shell_cx,
+    const double* shell_cy,
+    const double* shell_cz,
+    const int32_t* shell_prim_start,
+    const int32_t* shell_nprim,
+    const int32_t* shell_ao_start,
+    const double* prim_exp,
+    const double* pair_eta,
+    const double* pair_Px,
+    const double* pair_Py,
+    const double* pair_Pz,
+    const double* pair_cK,
+    int nao,
+    int naux,
+    int nao_sph,
+    int la,
+    int lb,
+    int lc,
+    const double* bar_X_sph_Qmn_chunk,       // [q_count*nao_sph*nao_sph]
+    const int32_t* shell_ao_start_sph,       // [nShellTotal]
+    const int32_t* shell_atom,               // [nAOshells+nAuxShells]
+    int q_offset,                            // absolute aux AO start of this chunk
+    int q_count,                             // number of aux AO rows in this chunk
+    int cd_tile,                             // 1..16
+    double* grad_dev,                        // [natm*3] — atomicAdd target
+    cudaStream_t stream,
+    int threads);
+
 // Batched DF int3c2e derivative contraction — float32 bar_X variant.
 //
 // Like `cueri_df_int3c2e_deriv_contracted_cart_allsp_atomgrad_launch_stream` but:
@@ -993,6 +1108,81 @@ extern "C" cudaError_t cueri_df_int3c2e_deriv_contracted_cart_allsp_atomgrad_f32
     const float* bar_X_flat,   // size (nao*nao*naux)
     const int32_t* shell_atom, // size (nAOshells+nAuxShells)
     double* grad_dev,          // size (natm*3) — atomicAdd target
+    cudaStream_t stream,
+    int threads);
+
+// Batched spherical-bar_X variant — float32 bar_X_sph_Qmn.
+//
+// Like `cueri_df_int3c2e_deriv_contracted_cart_allsp_atomgrad_sphbar_qmn_launch_stream` but
+// reads the spherical bar_X adjoint as float32 (still accumulates into float64 grad_dev).
+extern "C" cudaError_t cueri_df_int3c2e_deriv_contracted_cart_allsp_atomgrad_sphbar_qmn_f32bar_launch_stream(
+    const int32_t* spAB_arr,           // [n_spAB]
+    int n_spAB,
+    const int32_t* spCD,               // [ntasks]
+    int ntasks,
+    const int32_t* sp_A,
+    const int32_t* sp_B,
+    const int32_t* sp_pair_start,
+    const int32_t* sp_npair,
+    const double* shell_cx,
+    const double* shell_cy,
+    const double* shell_cz,
+    const int32_t* shell_prim_start,
+    const int32_t* shell_nprim,
+    const int32_t* shell_ao_start,
+    const double* prim_exp,
+    const double* pair_eta,
+    const double* pair_Px,
+    const double* pair_Py,
+    const double* pair_Pz,
+    const double* pair_cK,
+    int nao,
+    int naux,
+    int nao_sph,
+    int la,
+    int lb,
+    int lc,
+    const float* bar_X_sph_Qmn,        // [naux*nao_sph*nao_sph]
+    const int32_t* shell_ao_start_sph, // [nShellTotal]
+    const int32_t* shell_atom,         // [nAOshells+nAuxShells]
+    double* grad_dev,                  // [natm*3] — atomicAdd target
+    cudaStream_t stream,
+    int threads);
+
+// ---------------------------------------------------------------------------
+// Spherical 1e derivative contractions (prebuilt derivative tensors)
+// ---------------------------------------------------------------------------
+//
+// Contracts spherical overlap derivatives:
+//   grad[a,x] = sum_{i,j} dS_sph[a,x,i,j] * M_sph[i,j]
+//
+// Layouts:
+// - dS_sph_flat: [natm*3*nao_sph*nao_sph] (C-order, flattened)
+// - M_sph_flat:  [nao_sph*nao_sph] (C-order, flattened)
+// - grad_flat:   [natm*3] (flattened)
+extern "C" cudaError_t cueri_int1e_dS_deriv_contracted_sph_launch_stream(
+    const double* dS_sph_flat,
+    const double* M_sph_flat,
+    int natm,
+    int nao_sph,
+    double* grad_flat,
+    cudaStream_t stream,
+    int threads);
+
+// Contracts spherical hcore derivatives using prebuilt dT and dV tensors:
+//   grad[a,x] = sum_{i,j} (dT_sph[a,x,i,j] + dV_sph[a,x,i,j]) * M_sph[i,j]
+//
+// Layouts:
+// - dT_sph_flat, dV_sph_flat: [natm*3*nao_sph*nao_sph] (flattened)
+// - M_sph_flat:               [nao_sph*nao_sph]
+// - grad_flat:                [natm*3]
+extern "C" cudaError_t cueri_int1e_dhcore_deriv_contracted_sph_launch_stream(
+    const double* dT_sph_flat,
+    const double* dV_sph_flat,
+    const double* M_sph_flat,
+    int natm,
+    int nao_sph,
+    double* grad_flat,
     cudaStream_t stream,
     int threads);
 
@@ -1283,6 +1473,36 @@ extern "C" cudaError_t cueri_scatter_df_int3c2e_tiles_launch_stream(
     int nB,
     int nP,
     double* X_out,  // size nao * nao * naux (row-major)
+    cudaStream_t stream,
+    int threads);
+
+// Scatter DF 3c2e tiles (cart evaluation) into a *spherical* AO tensor X_sph.
+//
+// Inputs
+// - tile: shape (ntasks, nAB_cart, nP) flattened C-order
+// - a0_sph/b0_sph: spherical AO start offsets for each task (shell pair)
+// - p0: aux AO start offsets for each task (relative to current aux block)
+//
+// Output
+// - X_out: shape (nao_sph, nao_sph, naux) flattened C-order (mnQ-like)
+//
+// Notes
+// - la/lb are the angular momenta of the AO shells for this batch (fixed per kernel batch).
+// - nAB/nB/nP must be consistent with the cart tile shape produced by Step-2 kernels.
+extern "C" cudaError_t cueri_scatter_df_int3c2e_tiles_cart_to_sph_launch_stream(
+    const double* tile,       // size ntasks * nAB * nP
+    const int32_t* a0_sph,    // size ntasks
+    const int32_t* b0_sph,    // size ntasks
+    const int32_t* p0,        // size ntasks (relative to current aux block)
+    int ntasks,
+    int nao_sph,
+    int naux,
+    int nAB,
+    int nB,
+    int nP,
+    int la,
+    int lb,
+    double* X_out,  // size nao_sph * nao_sph * naux (row-major)
     cudaStream_t stream,
     int threads);
 

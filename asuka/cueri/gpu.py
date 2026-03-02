@@ -147,9 +147,14 @@ class _DFInt3c2eRysPlan:
     batches: list[object]
     batch_a0_dev: list[object]
     batch_b0_dev: list[object]
+    batch_a0_sph_dev: list[object]
+    batch_b0_sph_dev: list[object]
     batch_p0_dev: list[object]
     batch_nB: list[int]
+    batch_la: list[int]
+    batch_lb: list[int]
     nao: int
+    nao_sph: int
     naux: int
 
 
@@ -1337,22 +1342,39 @@ def _get_df_int3c2e_rys_plan(
     ao_nfunc = np.asarray([ncart(int(l)) for l in ao_l], dtype=np.int32)
     nao = int(np.max(ao_start + ao_nfunc))
 
+    # Spherical AO layout for the AO basis shells (real spherical harmonics).
+    # For expanded cart bases (BasisCartSoA), each logical shell has one contraction (nctr=1).
+    shell_ao_start_sph = np.empty((int(n_shell_ao),), dtype=np.int32)
+    cursor = 0
+    for sh in range(int(n_shell_ao)):
+        shell_ao_start_sph[sh] = np.int32(cursor)
+        cursor += int(int(ao_l[sh]) * 2 + 1)
+    nao_sph = int(cursor)
+
     aux_start = np.asarray(aux_basis.shell_ao_start, dtype=np.int32)
     aux_nfunc = np.asarray([ncart(int(l)) for l in aux_l], dtype=np.int32)
     naux = int(np.max(aux_start + aux_nfunc))
 
     batch_a0_dev: list[object] = []
     batch_b0_dev: list[object] = []
+    batch_a0_sph_dev: list[object] = []
+    batch_b0_sph_dev: list[object] = []
     batch_p0_dev: list[object] = []
     batch_nB: list[int] = []
+    batch_la: list[int] = []
+    batch_lb: list[int] = []
 
     for batch in batches:
         idx = np.asarray(batch.task_idx, dtype=np.int32).ravel()
         if idx.size == 0:
             batch_a0_dev.append(cp.empty((0,), dtype=cp.int32))
             batch_b0_dev.append(cp.empty((0,), dtype=cp.int32))
+            batch_a0_sph_dev.append(cp.empty((0,), dtype=cp.int32))
+            batch_b0_sph_dev.append(cp.empty((0,), dtype=cp.int32))
             batch_p0_dev.append(cp.empty((0,), dtype=cp.int32))
             batch_nB.append(0)
+            batch_la.append(0)
+            batch_lb.append(0)
             continue
 
         spab = np.asarray(tasks.task_spAB[idx], dtype=np.int32).ravel()
@@ -1366,12 +1388,20 @@ def _get_df_int3c2e_rys_plan(
         b0 = np.asarray(ao_basis.shell_ao_start[B], dtype=np.int32).ravel()
         p0 = np.asarray(aux_basis.shell_ao_start[P], dtype=np.int32).ravel()
 
+        a0_sph = np.asarray(shell_ao_start_sph[A], dtype=np.int32).ravel()
+        b0_sph = np.asarray(shell_ao_start_sph[B], dtype=np.int32).ravel()
+
         batch_a0_dev.append(cp.ascontiguousarray(cp.asarray(a0, dtype=cp.int32)))
         batch_b0_dev.append(cp.ascontiguousarray(cp.asarray(b0, dtype=cp.int32)))
+        batch_a0_sph_dev.append(cp.ascontiguousarray(cp.asarray(a0_sph, dtype=cp.int32)))
+        batch_b0_sph_dev.append(cp.ascontiguousarray(cp.asarray(b0_sph, dtype=cp.int32)))
         batch_p0_dev.append(cp.ascontiguousarray(cp.asarray(p0, dtype=cp.int32)))
 
+        la = int(ao_l[int(A[0])])
         lb = int(ao_l[int(B[0])])
         batch_nB.append(int(ncart(lb)))
+        batch_la.append(int(la))
+        batch_lb.append(int(lb))
 
     cp.cuda.get_current_stream().synchronize()
 
@@ -1382,9 +1412,14 @@ def _get_df_int3c2e_rys_plan(
         batches=batches,
         batch_a0_dev=batch_a0_dev,
         batch_b0_dev=batch_b0_dev,
+        batch_a0_sph_dev=batch_a0_sph_dev,
+        batch_b0_sph_dev=batch_b0_sph_dev,
         batch_p0_dev=batch_p0_dev,
         batch_nB=batch_nB,
+        batch_la=batch_la,
+        batch_lb=batch_lb,
         nao=int(nao),
+        nao_sph=int(nao_sph),
         naux=int(naux),
     )
     _df_int3c2e_rys_plan_cache[key] = (weakref.ref(ao_basis), weakref.ref(aux_basis), plan)
@@ -1651,6 +1686,7 @@ def df_int3c2e_sp_device(
     work_large_min: int = 200_000,
     blocks_per_task: int = 4,
     ao_contract_mode: str = "auto",
+    ao_rep: str = "cart",
     profile: dict | None = None,
 ):
     """Compute 3c2e integrals X(μ,ν,P) = (μν|P) on GPU for s/p-only AO+aux bases (cart).
@@ -1681,6 +1717,7 @@ def df_int3c2e_sp_device(
         work_large_min=work_large_min,
         blocks_per_task=blocks_per_task,
         ao_contract_mode=ao_contract_mode,
+        ao_rep=ao_rep,
         profile=profile,
     )
 
@@ -1696,6 +1733,7 @@ def df_int3c2e_rys_device(
     work_large_min: int = 200_000,
     blocks_per_task: int = 4,
     ao_contract_mode: str = "auto",
+    ao_rep: str = "cart",
     profile: dict | None = None,
 ):
     """Compute 3c2e integrals X(μ,ν,P) = (μν|P) on GPU for Cartesian AO+aux bases (general-l, reference-oriented).
@@ -1717,6 +1755,7 @@ def df_int3c2e_rys_device(
         work_large_min=work_large_min,
         blocks_per_task=blocks_per_task,
         ao_contract_mode=ao_contract_mode,
+        ao_rep=ao_rep,
         profile=profile,
     )
 
@@ -2156,9 +2195,10 @@ def df_int3c2e_rys_device_block(
     work_large_min: int = 200_000,
     blocks_per_task: int = 4,
     ao_contract_mode: str = "auto",
+    ao_rep: str = "cart",
     profile: dict | None = None,
 ):
-    """Compute 3c2e integrals X(μ,ν,P) = (μν|P) on GPU for Cartesian AO+aux bases (general-l, reference-oriented).
+    """Compute 3c2e integrals X(μ,ν,P) = (μν|P) on GPU for AO+aux bases (general-l, reference-oriented).
 
     Uses the Step-2 4c2e evaluator via the identity:
       (μν|P) == (μν | P*1)
@@ -2167,6 +2207,10 @@ def df_int3c2e_rys_device_block(
     Current limitation
     - requires `ao_basis`/`aux_basis` to provide `shell_ao_start` (i.e., `BasisCartSoA`)
     - CUDA backend supports `l<=CUDA_MAX_L` per shell (nroots<=CUDA_MAX_NROOTS)
+
+    Parameters
+    - ao_rep: 'cart' or 'sph'. When 'sph', scatters directly into spherical AO space
+      (real spherical harmonics) without materializing a full Cartesian X tensor.
     """
 
     import cupy as cp
@@ -2187,6 +2231,19 @@ def df_int3c2e_rys_device_block(
     ao_contract_mode = str(ao_contract_mode).lower().strip()
     if ao_contract_mode not in ("auto", "expanded", "native_contracted"):
         raise ValueError("ao_contract_mode must be one of: 'auto', 'expanded', 'native_contracted'")
+
+    ao_rep_s = str(ao_rep).lower().strip()
+    if ao_rep_s not in ("cart", "sph"):
+        raise ValueError("ao_rep must be one of: 'cart', 'sph'")
+    if ao_rep_s == "sph" and (_ext is None or not hasattr(_ext, "scatter_df_int3c2e_tiles_cart_to_sph_inplace_device")):
+        raise RuntimeError(
+            "ao_rep='sph' requires a cuERI CUDA extension with spherical DF scatter support; "
+            "rebuild via `python -m asuka.cueri.build_cuda_ext`"
+        )
+
+    if profile is not None:
+        prof = profile.setdefault("df_int3c2e", {})
+        prof.setdefault("ao_rep", str(ao_rep_s))
 
     is_contracted_ao = (
         hasattr(ao_basis, "shell_nctr") and hasattr(ao_basis, "shell_coef_start") and hasattr(ao_basis, "prim_coef_flat")
@@ -2216,6 +2273,13 @@ def df_int3c2e_rys_device_block(
                 fallback_reason = "nctr_limit"
             else:
                 use_native = True
+
+        if ao_rep_s == "sph":
+            if ao_contract_mode == "native_contracted":
+                raise NotImplementedError("ao_rep='sph' does not support ao_contract_mode='native_contracted' (use 'expanded')")
+            if use_native:
+                use_native = False
+                fallback_reason = "ao_rep_sph_requires_expanded"
 
         if use_native:
             if profile is not None:
@@ -2266,12 +2330,18 @@ def df_int3c2e_rys_device_block(
             raise ValueError("aux_shell_start/aux_shell_stop out of range")
 
         if ao_l.size == 0 or aux_l.size == 0 or aux_shell_start == aux_shell_stop:
-            ao_start = np.asarray(getattr(ao_basis, "shell_ao_start", np.asarray([0], dtype=np.int32)), dtype=np.int32)
-            ao_nfunc = (
-                np.asarray([ncart(int(l)) for l in ao_l], dtype=np.int32) if ao_l.size else np.asarray([0], dtype=np.int32)
-            )
-            nao = int(np.max(ao_start + ao_nfunc)) if ao_l.size else 0
-            return cp.empty((nao, nao, 0), dtype=cp.float64)
+            if ao_rep_s == "cart":
+                ao_start = np.asarray(getattr(ao_basis, "shell_ao_start", np.asarray([0], dtype=np.int32)), dtype=np.int32)
+                ao_nfunc = (
+                    np.asarray([ncart(int(l)) for l in ao_l], dtype=np.int32)
+                    if ao_l.size
+                    else np.asarray([0], dtype=np.int32)
+                )
+                nao_out = int(np.max(ao_start + ao_nfunc)) if ao_l.size else 0
+            else:
+                # Expanded cart shells -> real spherical harmonics have nsph(l) = 2*l+1.
+                nao_out = int(sum(int(int(l) * 2 + 1) for l in ao_l)) if ao_l.size else 0
+            return cp.empty((nao_out, nao_out, 0), dtype=cp.float64)
 
         if int(ao_l.max()) > CUDA_MAX_L or int(aux_l.max()) > CUDA_MAX_L:
             raise NotImplementedError(
@@ -2305,11 +2375,20 @@ def df_int3c2e_rys_device_block(
                 prof = profile.setdefault("df_int3c2e", {})
                 prof["plan_ms"] = float(cp.cuda.get_elapsed_time(t0, t1))
 
-            X = cp.zeros((int(plan.nao), int(plan.nao), int(plan.naux)), dtype=cp.float64)
+            nao_out = int(plan.nao_sph) if ao_rep_s == "sph" else int(plan.nao)
+            X = cp.zeros((nao_out, nao_out, int(plan.naux)), dtype=cp.float64)
             from .eri_dispatch import run_kernel_batch_spd
 
-            for batch, a0_dev, b0_dev, p0_dev, nB in zip(
-                plan.batches, plan.batch_a0_dev, plan.batch_b0_dev, plan.batch_p0_dev, plan.batch_nB
+            for batch, a0_dev, b0_dev, a0_sph_dev, b0_sph_dev, p0_dev, nB, la, lb in zip(
+                plan.batches,
+                plan.batch_a0_dev,
+                plan.batch_b0_dev,
+                plan.batch_a0_sph_dev,
+                plan.batch_b0_sph_dev,
+                plan.batch_p0_dev,
+                plan.batch_nB,
+                plan.batch_la,
+                plan.batch_lb,
             ):
                 start_k = cp.cuda.Event() if profile is not None else None
                 end_k = cp.cuda.Event() if profile is not None else None
@@ -2344,21 +2423,40 @@ def df_int3c2e_rys_device_block(
                 nP = int(tile.shape[2])
                 if start_sc is not None and end_sc is not None:
                     start_sc.record(s0)
-                _ext.scatter_df_int3c2e_tiles_inplace_device(
-                    tile.ravel(),
-                    a0_dev,
-                    b0_dev,
-                    p0_dev,
-                    int(plan.nao),
-                    int(plan.naux),
-                    int(nAB),
-                    int(nB),
-                    int(nP),
-                    X.ravel(),
-                    int(threads),
-                    int(_stream_ptr(stream)),
-                    False,
-                )
+                if ao_rep_s == "cart":
+                    _ext.scatter_df_int3c2e_tiles_inplace_device(
+                        tile.ravel(),
+                        a0_dev,
+                        b0_dev,
+                        p0_dev,
+                        int(plan.nao),
+                        int(plan.naux),
+                        int(nAB),
+                        int(nB),
+                        int(nP),
+                        X.ravel(),
+                        int(threads),
+                        int(_stream_ptr(stream)),
+                        False,
+                    )
+                else:
+                    _ext.scatter_df_int3c2e_tiles_cart_to_sph_inplace_device(
+                        tile.ravel(),
+                        a0_sph_dev,
+                        b0_sph_dev,
+                        p0_dev,
+                        int(plan.nao_sph),
+                        int(plan.naux),
+                        int(nAB),
+                        int(nB),
+                        int(nP),
+                        int(la),
+                        int(lb),
+                        X.ravel(),
+                        int(threads),
+                        int(_stream_ptr(stream)),
+                        False,
+                    )
                 if start_sc is not None and end_sc is not None:
                     end_sc.record(s0)
                     end_sc.synchronize()
@@ -2457,14 +2555,24 @@ def df_int3c2e_rys_device_block(
 
         ao_start = np.asarray(ao_basis.shell_ao_start, dtype=np.int32)
         ao_nfunc = np.asarray([ncart(int(l)) for l in ao_l], dtype=np.int32)
-        nao = int(np.max(ao_start + ao_nfunc))
+        nao_cart = int(np.max(ao_start + ao_nfunc))
+        shell_ao_start_sph = None
+        if ao_rep_s == "sph":
+            shell_ao_start_sph = np.empty((int(n_shell_ao),), dtype=np.int32)
+            cursor = 0
+            for sh in range(int(n_shell_ao)):
+                shell_ao_start_sph[sh] = np.int32(cursor)
+                cursor += int(int(ao_l[sh]) * 2 + 1)
+            nao_out = int(cursor)
+        else:
+            nao_out = int(nao_cart)
 
         aux_start = np.asarray(aux_basis.shell_ao_start, dtype=np.int32)
         p0_block = int(aux_start[aux_shell_start])
         p1_block = int(aux_start[aux_shell_stop - 1]) + int(ncart(int(aux_l[aux_shell_stop - 1])))
         naux = int(p1_block - p0_block)
 
-        X = cp.zeros((nao, nao, naux), dtype=cp.float64)
+        X = cp.zeros((int(nao_out), int(nao_out), int(naux)), dtype=cp.float64)
 
         from .eri_dispatch import plan_kernel_batches_spd, run_kernel_batch_spd
 
@@ -2493,33 +2601,59 @@ def df_int3c2e_rys_device_block(
             B = np.asarray(sp_all.sp_B[spab], dtype=np.int32).ravel()
             P = (np.asarray(sp_all.sp_A[spcd], dtype=np.int32).ravel() - np.int32(n_shell_ao)).astype(np.int32, copy=False)
 
-            a0 = np.asarray(ao_basis.shell_ao_start[A], dtype=np.int32).ravel()
-            b0 = np.asarray(ao_basis.shell_ao_start[B], dtype=np.int32).ravel()
             p0 = (np.asarray(aux_basis.shell_ao_start[P], dtype=np.int32).ravel() - np.int32(p0_block)).astype(np.int32, copy=False)
 
-            a0_dev = cp.ascontiguousarray(cp.asarray(a0, dtype=cp.int32))
-            b0_dev = cp.ascontiguousarray(cp.asarray(b0, dtype=cp.int32))
             p0_dev = cp.ascontiguousarray(cp.asarray(p0, dtype=cp.int32))
 
             nAB = int(tile.shape[1])
             nP = int(tile.shape[2])
             lb = int(ao_l[int(B[0])])
             nB = int(ncart(lb))
-            _ext.scatter_df_int3c2e_tiles_inplace_device(
-                tile.ravel(),
-                a0_dev,
-                b0_dev,
-                p0_dev,
-                int(nao),
-                int(naux),
-                int(nAB),
-                int(nB),
-                int(nP),
-                X.ravel(),
-                int(threads),
-                int(_stream_ptr(stream)),
-                False,
-            )
+            if ao_rep_s == "cart":
+                a0 = np.asarray(ao_basis.shell_ao_start[A], dtype=np.int32).ravel()
+                b0 = np.asarray(ao_basis.shell_ao_start[B], dtype=np.int32).ravel()
+                a0_dev = cp.ascontiguousarray(cp.asarray(a0, dtype=cp.int32))
+                b0_dev = cp.ascontiguousarray(cp.asarray(b0, dtype=cp.int32))
+                _ext.scatter_df_int3c2e_tiles_inplace_device(
+                    tile.ravel(),
+                    a0_dev,
+                    b0_dev,
+                    p0_dev,
+                    int(nao_cart),
+                    int(naux),
+                    int(nAB),
+                    int(nB),
+                    int(nP),
+                    X.ravel(),
+                    int(threads),
+                    int(_stream_ptr(stream)),
+                    False,
+                )
+            else:
+                if shell_ao_start_sph is None:  # pragma: no cover
+                    raise RuntimeError("internal error: shell_ao_start_sph is None for ao_rep='sph'")
+                a0_sph = np.asarray(shell_ao_start_sph[A], dtype=np.int32).ravel()
+                b0_sph = np.asarray(shell_ao_start_sph[B], dtype=np.int32).ravel()
+                a0_sph_dev = cp.ascontiguousarray(cp.asarray(a0_sph, dtype=cp.int32))
+                b0_sph_dev = cp.ascontiguousarray(cp.asarray(b0_sph, dtype=cp.int32))
+                la = int(ao_l[int(A[0])])
+                _ext.scatter_df_int3c2e_tiles_cart_to_sph_inplace_device(
+                    tile.ravel(),
+                    a0_sph_dev,
+                    b0_sph_dev,
+                    p0_dev,
+                    int(nao_out),
+                    int(naux),
+                    int(nAB),
+                    int(nB),
+                    int(nP),
+                    int(la),
+                    int(lb),
+                    X.ravel(),
+                    int(threads),
+                    int(_stream_ptr(stream)),
+                    False,
+                )
 
         return X
 

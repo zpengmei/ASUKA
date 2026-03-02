@@ -6,6 +6,7 @@ import numpy as np
 
 from asuka.frontend.molecule import Molecule
 from asuka.frontend.periodic_table import atomic_number
+from asuka.integrals.cart2sph import AOSphericalTransform
 
 from .eval_cart import CubeGrid, eval_mos_cart_on_points, make_cube_grid_from_atoms
 
@@ -55,7 +56,7 @@ def write_mo_cube(
     spacing: float = 0.25,
     padding: float = 4.0,
     values_per_line: int = 6,
-    sph_map: tuple | None = None,
+    sph_map: AOSphericalTransform | tuple[np.ndarray, int, int] | None = None,
 ) -> None:
     """Write a cube file for one (real) MO."""
 
@@ -99,4 +100,3 @@ def write_mo_cube(
 
 
 __all__ = ["write_cube_header", "write_mo_cube"]
-

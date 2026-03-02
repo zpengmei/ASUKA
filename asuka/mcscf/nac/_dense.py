@@ -1046,9 +1046,6 @@ def build_dense_nac_cache_cpu(
     mol = getattr(scf_out, "mol", None)
     if mol is None:
         raise TypeError("scf_out must have a .mol attribute")
-    if not bool(getattr(mol, "cart", False)):
-        raise NotImplementedError("dense NAC currently requires cart=True")
-
     coords, charges = _mol_coords_charges_bohr(mol)
     ao_basis = getattr(scf_out, "ao_basis", None)
     if ao_basis is None:
@@ -1060,10 +1057,13 @@ def build_dense_nac_cache_cpu(
         pair_table_threads=int(pair_table_threads),
     )
 
+    _is_sph_cache = not bool(getattr(mol, "cart", True))
     h_ao = None
-    int1e = getattr(scf_out, "int1e", None)
-    if int1e is not None:
-        h_ao = getattr(int1e, "hcore", None)
+    if not _is_sph_cache:
+        int1e = getattr(scf_out, "int1e", None)
+        if int1e is not None:
+            h_ao = getattr(int1e, "hcore", None)
+    # For spherical AOs, scf_out.int1e.hcore is in spherical basis; rebuild in Cartesian.
     if h_ao is None:
         h_ao = build_int1e_cart(ao_basis, atom_coords_bohr=coords, atom_charges=charges).hcore
 
@@ -1119,8 +1119,7 @@ def sacasscf_nonadiabatic_couplings_dense(
     mol = getattr(scf_out, "mol", None)
     if mol is None:
         raise TypeError("scf_out must have .mol")
-    if not bool(getattr(mol, "cart", False)):
-        raise NotImplementedError("dense NAC currently requires cart=True")
+    _is_sph_dn = not bool(getattr(mol, "cart", True))
 
     if cache_cpu is None:
         cache_cpu = build_dense_nac_cache_cpu(
@@ -1183,6 +1182,23 @@ def sacasscf_nonadiabatic_couplings_dense(
     nao, nmo = map(int, C_ref.shape)
     if nocc > nmo:
         raise ValueError("ncore+ncas exceeds nmo")
+
+    # For spherical AOs: back-transform MO coefficients to Cartesian so that all
+    # internal dense ERI and 1e contractions (which operate on ao_basis = Cartesian)
+    # receive Cartesian-dimensioned quantities.
+    _sph_T_dn = None
+    if _is_sph_dn:
+        from asuka.integrals.cart2sph import (  # noqa: PLC0415
+            build_cart2sph_matrix,
+            compute_sph_layout_from_cart_basis,
+        )
+        _shell_l = np.asarray(ao_basis_ref.shell_l, dtype=np.int32).ravel()
+        _sh0_cart = np.asarray(ao_basis_ref.shell_ao_start, dtype=np.int32).ravel()
+        _sh0_sph, _nao_sph = compute_sph_layout_from_cart_basis(ao_basis_ref)
+        from asuka.integrals.int1e_cart import nao_cart_from_basis  # noqa: PLC0415
+        _nao_cart = nao_cart_from_basis(ao_basis_ref)
+        _sph_T_dn = build_cart2sph_matrix(_shell_l, _sh0_cart, _sh0_sph, _nao_cart, _nao_sph)
+        C_ref = _sph_T_dn @ C_ref  # (nao_cart, nmo)
 
     # Output tensor
     nac = np.zeros((nroots, nroots, len(atmlst_use), 3), dtype=np.float64)

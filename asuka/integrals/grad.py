@@ -722,7 +722,7 @@ def compute_df_gradient_contributions_analytic_sph(
     atom_coords_bohr: np.ndarray,
     B_sph: Any,
     bar_L_sph: Any,
-    T_c2s: Any,
+    T_c2s: Any | None = None,
     L_chol: Any | None = None,
     backend: str = "cpu",
     df_threads: int = 0,
@@ -744,8 +744,10 @@ def compute_df_gradient_contributions_analytic_sph(
         Whitened DF factors in spherical AO basis.
     bar_L_sph : array, shape (naux, nao_sph, nao_sph)
         Adjoint of whitened DF factors in spherical AO basis.
-    T_c2s : array, shape (nao_cart, nao_sph)
-        Cart-to-spherical transformation matrix.
+    T_c2s : array | None, optional
+        Optional cart-to-spherical transformation matrix. If omitted, the
+        contraction must be performed without materializing Cartesian-sized
+        AO intermediates.
     L_chol : optional
         Pre-computed Cholesky factor of the aux metric.
     backend : str

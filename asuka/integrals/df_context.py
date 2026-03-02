@@ -240,9 +240,6 @@ class DFCholeskyContext:
         expand_contractions: bool = True,
         threads: int = 0,
     ) -> "DFCholeskyContext":
-        if not bool(getattr(mol, "cart", True)):
-            raise NotImplementedError("DFCholeskyContext currently supports only cart=True")
-
         mol_fp = _mol_fingerprint(mol)
         ao_basis, aux_basis, auxbasis_name = _build_df_bases_cart(
             mol,
@@ -254,6 +251,22 @@ class DFCholeskyContext:
 
         B_ao = build_df_B_from_cueri_packed_bases_cpu(ao_basis, aux_basis, threads=int(threads))
         B_ao = np.asarray(B_ao, dtype=np.float64, order="C")
+
+        # If spherical AOs requested, transform B to spherical basis.
+        if not bool(getattr(mol, "cart", True)):
+            from asuka.integrals.cart2sph import (  # noqa: PLC0415
+                build_cart2sph_matrix,
+                compute_sph_layout_from_cart_basis,
+                transform_df_B_cart_to_sph,
+            )
+
+            shell_l = np.asarray(ao_basis.shell_l, dtype=np.int32).ravel()
+            shell_ao_start_cart = np.asarray(ao_basis.shell_ao_start, dtype=np.int32).ravel()
+            shell_ao_start_sph, nao_sph = compute_sph_layout_from_cart_basis(ao_basis)
+            nao_cart = int(B_ao.shape[0])
+            T = build_cart2sph_matrix(shell_l, shell_ao_start_cart, shell_ao_start_sph, nao_cart, nao_sph)
+            B_ao = transform_df_B_cart_to_sph(B_ao, T)
+            B_ao = np.asarray(B_ao, dtype=np.float64, order="C")
 
         max_bytes = _env_int("CUGUGA_DF_MO_CACHE_BYTES", 512 * 1024 * 1024)
         max_entry = _env_int("CUGUGA_DF_MO_CACHE_ENTRY_BYTES", 256 * 1024 * 1024)

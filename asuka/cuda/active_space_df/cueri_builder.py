@@ -237,12 +237,12 @@ class CuERIActiveSpaceDFBuilder:
             object.__setattr__(self, "_aux_basis", aux_basis)
             object.__setattr__(self, "_nao", _infer_nao_from_basis_cart_soa(ao_basis))
             object.__setattr__(self, "_naux", _infer_nao_from_basis_cart_soa(aux_basis))
+            object.__setattr__(self, "_sph_T", None)
+            object.__setattr__(self, "_nao_sph", None)
         else:
             mol = self.mol
             if mol is None:
                 raise ValueError("mol must be provided when ao_basis/aux_basis are not given")
-            if not bool(getattr(mol, "cart", False)):
-                raise NotImplementedError("CuERIActiveSpaceDFBuilder currently requires mol.cart=True")
 
             # Standalone mode: build packed AO/AUX bases from a mol-like object.
             #
@@ -281,6 +281,25 @@ class CuERIActiveSpaceDFBuilder:
             object.__setattr__(self, "_aux_basis", aux_basis)
             object.__setattr__(self, "_nao", _infer_nao_from_basis_cart_soa(ao_basis))
             object.__setattr__(self, "_naux", _infer_nao_from_basis_cart_soa(aux_basis))
+
+            # For spherical AOs: store T matrix so build() can back-transform c_cas.
+            if not bool(getattr(mol, "cart", True)):
+                from asuka.integrals.cart2sph import (  # noqa: PLC0415
+                    build_cart2sph_matrix,
+                    compute_sph_layout_from_cart_basis,
+                )
+
+                shell_l = np.asarray(ao_basis.shell_l, dtype=np.int32).ravel()
+                shell_ao_start_cart = np.asarray(ao_basis.shell_ao_start, dtype=np.int32).ravel()
+                shell_ao_start_sph, nao_sph = compute_sph_layout_from_cart_basis(ao_basis)
+                nao_cart = _infer_nao_from_basis_cart_soa(ao_basis)
+                T = build_cart2sph_matrix(shell_l, shell_ao_start_cart, shell_ao_start_sph, nao_cart, nao_sph)
+                object.__setattr__(self, "_sph_T", T)
+                object.__setattr__(self, "_nao_sph", int(nao_sph))
+            else:
+                object.__setattr__(self, "_sph_T", None)
+                object.__setattr__(self, "_nao_sph", None)
+
         object.__setattr__(self, "_device_id", int(cp.cuda.Device().id))
 
     def allocate(
@@ -330,6 +349,16 @@ class CuERIActiveSpaceDFBuilder:
         c_cas = cp.ascontiguousarray(c_cas)
         if c_cas.ndim != 2:
             raise ValueError("c_cas must be 2D (nao,norb)")
+
+        # For spherical AOs: back-transform c_cas from spherical to Cartesian.
+        sph_T = getattr(self, "_sph_T", None)
+        if sph_T is not None:
+            nao_sph = int(getattr(self, "_nao_sph"))
+            nao_in = int(c_cas.shape[0])
+            if nao_in != nao_sph:
+                raise ValueError(f"c_cas has nao={nao_in}, expected {nao_sph} (spherical AOs)")
+            T_dev = cp.asarray(sph_T, dtype=cp.float64)
+            c_cas = cp.ascontiguousarray(T_dev @ c_cas)
 
         nao, norb = map(int, c_cas.shape)
         nao_expected = int(getattr(self, "_nao"))

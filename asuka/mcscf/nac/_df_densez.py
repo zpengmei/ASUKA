@@ -60,8 +60,7 @@ def sacasscf_nonadiabatic_couplings_df_densez(
     mol = getattr(scf_out, "mol", None)
     if mol is None:
         raise TypeError("scf_out must have .mol")
-    if not bool(getattr(mol, "cart", False)):
-        raise NotImplementedError("DF NAC currently requires cart=True")
+    _is_sph_dz = not bool(getattr(mol, "cart", True))
 
     coords, _charges = _mol_coords_charges_bohr(mol)
     natm = int(coords.shape[0])
@@ -190,12 +189,21 @@ def sacasscf_nonadiabatic_couplings_df_densez(
             castm1 = np.asarray(dm1, dtype=np.float64).T - np.asarray(dm1, dtype=np.float64)
             mo_cas = C_ref[:, ncore:nocc]
             tm1 = mo_cas @ castm1 @ mo_cas.T
-            nac_csf = 0.5 * contract_dS_ip_cart(
-                ao_basis_ref,
-                atom_coords_bohr=coords,
-                M=tm1,
-                shell_atom=shell_atom_ref,
-            )
+            if _is_sph_dz:
+                from asuka.integrals.int1e_sph import contract_dS_ip_sph  # noqa: PLC0415
+                nac_csf = 0.5 * contract_dS_ip_sph(
+                    ao_basis_ref,
+                    atom_coords_bohr=coords,
+                    M_sph=tm1,
+                    shell_atom=shell_atom_ref,
+                )
+            else:
+                nac_csf = 0.5 * contract_dS_ip_cart(
+                    ao_basis_ref,
+                    atom_coords_bohr=coords,
+                    M=tm1,
+                    shell_atom=shell_atom_ref,
+                )
             ham = np.asarray(ham, dtype=np.float64) + np.asarray(nac_csf * ediff, dtype=np.float64)
 
         # Pair-specific RHS for Z-vector

@@ -5,15 +5,74 @@ from __future__ import annotations
 This module builds the block-diagonal matrix ``T (nao_cart, nao_sph)`` that
 transforms AO quantities from Cartesian Gaussians to real spherical harmonics.
 
-Design principle: all integrals are computed in Cartesian on GPU, then
-transformed at the front-end boundary.  For gradients, density matrices are
-back-transformed to Cartesian so existing derivative code works unchanged.
+Design principle: evaluation kernels use Cartesian AOs, while SCF/MCSCF can use
+real spherical harmonics (``mol.cart=False``).  Gradient contractions keep the
+evaluation basis Cartesian but avoid materializing full Cartesian AO matrices
+by contracting Cartesian derivative kernels with spherical AO densities/adjoints
+on-the-fly.
 """
+
+from dataclasses import dataclass
 
 import numpy as np
 
 from asuka.cueri.cart import ncart
 from asuka.cueri.sph import cart2sph_matrix, nsph
+
+
+@dataclass(frozen=True)
+class AOSphericalTransform:
+    """Canonical Cartesian↔spherical AO transform metadata."""
+
+    T_c2s: np.ndarray
+    nao_cart: int
+    nao_sph: int
+
+    def __post_init__(self) -> None:
+        T = np.asarray(self.T_c2s, dtype=np.float64)
+        if T.ndim != 2:
+            raise ValueError("T_c2s must be a 2D array")
+        nao_cart = int(self.nao_cart)
+        nao_sph = int(self.nao_sph)
+        if tuple(map(int, T.shape)) != (nao_cart, nao_sph):
+            raise ValueError(
+                f"T_c2s shape mismatch: expected ({nao_cart},{nao_sph}), got {tuple(map(int, T.shape))}"
+            )
+        object.__setattr__(self, "T_c2s", np.ascontiguousarray(T, dtype=np.float64))
+        object.__setattr__(self, "nao_cart", nao_cart)
+        object.__setattr__(self, "nao_sph", nao_sph)
+
+    def as_tuple(self) -> tuple[np.ndarray, int, int]:
+        return self.T_c2s, int(self.nao_cart), int(self.nao_sph)
+
+    def __len__(self) -> int:
+        return 3
+
+    def __iter__(self):
+        yield self.T_c2s
+        yield int(self.nao_cart)
+        yield int(self.nao_sph)
+
+    def __getitem__(self, idx: int):
+        return self.as_tuple()[int(idx)]
+
+
+def coerce_sph_map(
+    sph_map: AOSphericalTransform | tuple[np.ndarray, int, int] | None,
+) -> AOSphericalTransform | None:
+    """Normalize spherical transform metadata to :class:`AOSphericalTransform`."""
+    if sph_map is None:
+        return None
+    if isinstance(sph_map, AOSphericalTransform):
+        return sph_map
+    if isinstance(sph_map, tuple) and len(sph_map) == 3:
+        T_c2s, nao_cart, nao_sph = sph_map
+        return AOSphericalTransform(
+            T_c2s=np.asarray(T_c2s, dtype=np.float64),
+            nao_cart=int(nao_cart),
+            nao_sph=int(nao_sph),
+        )
+    raise TypeError("sph_map must be AOSphericalTransform, (T, nao_cart, nao_sph), or None")
 
 
 def compute_sph_layout_from_cart_basis(
@@ -220,6 +279,37 @@ def transform_df_B_cart_to_sph(
     return xp.ascontiguousarray(B_sph.transpose((2, 0, 1)), dtype=xp.float64)
 
 
+def transform_dense_eri_cart_to_sph(
+    eri_2d: np.ndarray,
+    T: np.ndarray,
+    nao_cart: int,
+    nao_sph: int,
+) -> np.ndarray:
+    """Transform dense ERI from Cartesian to spherical AOs.
+
+    Parameters
+    ----------
+    eri_2d : ndarray
+        Dense ERI matrix of shape ``(nao_cart**2, nao_cart**2)``.
+    T : ndarray
+        Cart-to-sph transform ``(nao_cart, nao_sph)``.
+    nao_cart, nao_sph : int
+        Cartesian / spherical AO counts.
+
+    Returns
+    -------
+    ndarray of shape ``(nao_sph**2, nao_sph**2)``
+    """
+    nao_cart = int(nao_cart)
+    nao_sph = int(nao_sph)
+    eri_4d = np.asarray(eri_2d, dtype=np.float64).reshape(nao_cart, nao_cart, nao_cart, nao_cart)
+    T = np.asarray(T, dtype=np.float64)
+    # Two-step transform to keep cost at O(N^5) per step instead of O(N^8).
+    tmp = np.einsum("pi,qj,pqrs->ijrs", T, T, eri_4d, optimize=True)
+    eri_sph = np.einsum("ijrs,rk,sl->ijkl", tmp, T, T, optimize=True)
+    return eri_sph.reshape(nao_sph * nao_sph, nao_sph * nao_sph)
+
+
 def transform_density_sph_to_cart(D_sph, T: np.ndarray):
     """Back-transform density: ``D_cart = T @ D_sph @ T^T``."""
     xp = _get_array_module(D_sph)
@@ -261,10 +351,13 @@ def _get_array_module(a):
 
 
 __all__ = [
+    "AOSphericalTransform",
     "build_cart2sph_matrix",
+    "coerce_sph_map",
     "compute_sph_layout_from_cart_basis",
     "transform_1e_cart_to_sph",
     "transform_3idx_sph_to_cart",
+    "transform_dense_eri_cart_to_sph",
     "transform_density_sph_to_cart",
     "transform_df_B_cart_to_sph",
 ]

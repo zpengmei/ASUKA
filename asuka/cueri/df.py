@@ -568,9 +568,14 @@ def int3c2e_basis(
     mode: str = "warp",
     threads: int = 256,
     ao_contract_mode: str = "auto",
+    ao_rep: str = "cart",
     profile: dict | None = None,
 ):
-    """Compute 3-center Coulomb integrals X(μ,ν,P) = (μν|P) from packed bases (GPU)."""
+    """Compute 3-center Coulomb integrals X(μ,ν,P) = (μν|P) from packed bases (GPU).
+
+    Parameters
+    - ao_rep: 'cart' or 'sph'. When 'sph', returns X in spherical AO space (real harmonics).
+    """
 
     try:
         import cupy as cp
@@ -603,6 +608,7 @@ def int3c2e_basis(
                     threads=int(threads),
                     mode=str(mode),
                     ao_contract_mode=str(ao_contract_mode),
+                    ao_rep=str(ao_rep),
                     profile=profile,
                 )
             )
@@ -620,6 +626,7 @@ def int3c2e_basis(
                 threads=int(threads),
                 mode=str(mode),
                 ao_contract_mode=str(ao_contract_mode),
+                ao_rep=str(ao_rep),
                 profile=profile,
             )
         )

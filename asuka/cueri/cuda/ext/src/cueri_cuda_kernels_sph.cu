@@ -544,6 +544,145 @@ __global__ void KernelDFBCartToSphQmnSym(
   }
 }
 
+__global__ void KernelScatterDFInt3c2eTilesCartToSphSym(
+    const double* __restrict__ tile,    // [ntasks, nAB, nP], C-order flattened
+    const int32_t* __restrict__ a0_sph,  // [ntasks]
+    const int32_t* __restrict__ b0_sph,  // [ntasks]
+    const int32_t* __restrict__ p0,      // [ntasks] (relative to current aux block)
+    int ntasks,
+    int nao_sph,
+    int naux,
+    int nAB,
+    int nB_cart,
+    int nP,
+    int la,
+    int lb,
+    double* __restrict__ X_out) {  // [nao_sph, nao_sph, naux], C-order flattened
+  // Threading: x-dim is a 32-wide P lane, y-dim is warp id.
+  const int lane = static_cast<int>(threadIdx.x);
+  const int wid = static_cast<int>(threadIdx.y);
+  const int nwarps = static_cast<int>(blockDim.y);
+  if (lane >= 32) return;
+
+  const int t = static_cast<int>(blockIdx.x);
+  if (t >= ntasks) return;
+
+  const int p_block0 = static_cast<int>(blockIdx.y) * 32;
+  const int P = p_block0 + lane;
+  if (P >= nP) return;
+
+  const int a0 = static_cast<int>(a0_sph[t]);
+  const int b0 = static_cast<int>(b0_sph[t]);
+  const int p = static_cast<int>(p0[t]) + P;
+  if (p < 0 || p >= naux) return;
+
+  const int nA_cart = ncart(la);
+  const int nA_sph = nsph(la);
+  const int nB_sph = nsph(lb);
+  const int nElem = nA_sph * nB_sph;
+
+  // Each warp computes 2 spherical output elements (elem0/elem1) for this task and P lane.
+  const int base = (static_cast<int>(blockIdx.z) * nwarps + wid) * 2;
+  int elem0 = base;
+  int elem1 = base + 1;
+
+  int isA0 = 0, isB0 = 0;
+  int isA1 = 0, isB1 = 0;
+  bool active0 = (elem0 < nElem);
+  bool active1 = (elem1 < nElem);
+  if (active0) {
+    isA0 = elem0 / nB_sph;
+    isB0 = elem0 - isA0 * nB_sph;
+  }
+  if (active1) {
+    isA1 = elem1 / nB_sph;
+    isB1 = elem1 - isA1 * nB_sph;
+  }
+  const bool diag_shell = (a0 == b0);
+  if (diag_shell) {
+    if (active0 && isA0 < isB0) active0 = false;
+    if (active1 && isA1 < isB1) active1 = false;
+  }
+
+  double acc0 = 0.0;
+  double acc1 = 0.0;
+
+  // Shared cache for one Cartesian row slice: sh_cart[icB,lane] = tile[(icA*nB_cart+icB), lane]
+  extern __shared__ double sh_cart[];
+
+#pragma unroll
+  for (int icA = 0; icA < 21; ++icA) {
+    if (icA >= nA_cart) break;
+
+    // Load the Cartesian slice for this icA into shared memory.
+    for (int icB = wid; icB < nB_cart; icB += nwarps) {
+      const int ab = icA * nB_cart + icB;
+      const int64_t idx = (static_cast<int64_t>(t) * static_cast<int64_t>(nAB) + static_cast<int64_t>(ab)) *
+                              static_cast<int64_t>(nP) +
+                          static_cast<int64_t>(P);
+      sh_cart[icB * 32 + lane] = tile[idx];
+    }
+
+    __syncthreads();
+
+    if (active0) {
+      const double ta = cart2sph_coeff(la, icA, isA0);
+      if (ta != 0.0) {
+        double tmp = 0.0;
+#pragma unroll
+        for (int icB = 0; icB < 21; ++icB) {
+          if (icB >= nB_cart) break;
+          const double tb = cart2sph_coeff(lb, icB, isB0);
+          if (tb == 0.0) continue;
+          tmp += tb * sh_cart[icB * 32 + lane];
+        }
+        acc0 += ta * tmp;
+      }
+    }
+    if (active1) {
+      const double ta = cart2sph_coeff(la, icA, isA1);
+      if (ta != 0.0) {
+        double tmp = 0.0;
+#pragma unroll
+        for (int icB = 0; icB < 21; ++icB) {
+          if (icB >= nB_cart) break;
+          const double tb = cart2sph_coeff(lb, icB, isB1);
+          if (tb == 0.0) continue;
+          tmp += tb * sh_cart[icB * 32 + lane];
+        }
+        acc1 += ta * tmp;
+      }
+    }
+
+    __syncthreads();
+  }
+
+  if (active0) {
+    const int i = a0 + isA0;
+    const int j = b0 + isB0;
+    const int64_t idx_ij =
+        (static_cast<int64_t>(i) * static_cast<int64_t>(nao_sph) + static_cast<int64_t>(j)) * static_cast<int64_t>(naux) +
+        static_cast<int64_t>(p);
+    const int64_t idx_ji =
+        (static_cast<int64_t>(j) * static_cast<int64_t>(nao_sph) + static_cast<int64_t>(i)) * static_cast<int64_t>(naux) +
+        static_cast<int64_t>(p);
+    X_out[idx_ij] = acc0;
+    if (idx_ji != idx_ij) X_out[idx_ji] = acc0;
+  }
+  if (active1) {
+    const int i = a0 + isA1;
+    const int j = b0 + isB1;
+    const int64_t idx_ij =
+        (static_cast<int64_t>(i) * static_cast<int64_t>(nao_sph) + static_cast<int64_t>(j)) * static_cast<int64_t>(naux) +
+        static_cast<int64_t>(p);
+    const int64_t idx_ji =
+        (static_cast<int64_t>(j) * static_cast<int64_t>(nao_sph) + static_cast<int64_t>(i)) * static_cast<int64_t>(naux) +
+        static_cast<int64_t>(p);
+    X_out[idx_ij] = acc1;
+    if (idx_ji != idx_ij) X_out[idx_ji] = acc1;
+  }
+}
+
 }  // namespace
 
 extern "C" cudaError_t cueri_sph_coeff_sph_to_cart_launch_stream(
@@ -934,5 +1073,59 @@ extern "C" cudaError_t cueri_df_B_cart_to_sph_qmn_sym_to_f32_launch_stream(
       lb,
       in_cart_mnQ,
       out_sph_Qmn);
+  return cudaGetLastError();
+}
+
+extern "C" cudaError_t cueri_scatter_df_int3c2e_tiles_cart_to_sph_launch_stream(
+    const double* tile,
+    const int32_t* a0_sph,
+    const int32_t* b0_sph,
+    const int32_t* p0,
+    int ntasks,
+    int nao_sph,
+    int naux,
+    int nAB,
+    int nB,
+    int nP,
+    int la,
+    int lb,
+    double* X_out,
+    cudaStream_t stream,
+    int threads) {
+  if (ntasks < 0 || nao_sph < 0 || naux < 0 || nAB < 0 || nB < 0 || nP < 0) return cudaErrorInvalidValue;
+  if (la < 0 || lb < 0 || la > 5 || lb > 5) return cudaErrorInvalidValue;
+  if (threads <= 0 || threads > 256) return cudaErrorInvalidValue;
+  if ((threads & 31) != 0) return cudaErrorInvalidValue;
+  if (ntasks == 0 || nAB == 0 || nP == 0) return cudaSuccess;
+
+  const int nB_cart = ((lb + 1) * (lb + 2)) >> 1;
+  const int nA_cart = ((la + 1) * (la + 2)) >> 1;
+  if (nB != nB_cart) return cudaErrorInvalidValue;
+  if (nAB != nA_cart * nB_cart) return cudaErrorInvalidValue;
+
+  const int nPBlocks = (nP + 31) >> 5;
+  const int nwarps = threads >> 5;
+  const int nElem = ((la << 1) + 1) * ((lb << 1) + 1);
+  const int nElemBlocks = (nElem + (nwarps * 2) - 1) / (nwarps * 2);
+  const dim3 block(32, static_cast<unsigned int>(nwarps), 1);
+  const dim3 grid(
+      static_cast<unsigned int>(ntasks),
+      static_cast<unsigned int>(nPBlocks),
+      static_cast<unsigned int>(nElemBlocks));
+  const size_t sh_bytes = static_cast<size_t>(nB_cart) * static_cast<size_t>(32) * sizeof(double);
+  KernelScatterDFInt3c2eTilesCartToSphSym<<<grid, block, sh_bytes, stream>>>(
+      tile,
+      a0_sph,
+      b0_sph,
+      p0,
+      ntasks,
+      nao_sph,
+      naux,
+      nAB,
+      nB,
+      nP,
+      la,
+      lb,
+      X_out);
   return cudaGetLastError();
 }

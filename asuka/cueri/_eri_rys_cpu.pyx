@@ -28,6 +28,96 @@ DEF K_LMAX_D = K_LMAX + 1
 DEF K_STRIDE_D = 2 * K_LMAX_D + 1
 DEF K_GSIZE_D = K_STRIDE_D * K_STRIDE_D
 
+# Real spherical support is limited by the available cart2sph tables.
+DEF K_SPH_LMAX = 5
+DEF K_NSPH_MAX = 2 * K_SPH_LMAX + 1
+
+
+cdef double _CART2SPH_SP_L0[1]
+cdef double _CART2SPH_SP_L1[9]
+cdef double _CART2SPH_SP_L2[30]
+cdef double _CART2SPH_SP_L3[70]
+cdef double _CART2SPH_SP_L4[135]
+cdef double _CART2SPH_SP_L5[231]
+cdef bint _CART2SPH_SP_INIT = False
+
+
+cdef void _init_cart2sph_sp_tables() except *:
+    global _CART2SPH_SP_INIT
+    if _CART2SPH_SP_INIT:
+        return
+
+    # Fill tables from the canonical Python reference implementation to avoid
+    # hard-coding large numeric arrays in Cython.
+    from asuka.cueri.sph import cart2sph_matrix as _cart2sph_py  # noqa: PLC0415
+
+    cdef cnp.ndarray[cnp.double_t, ndim=1, mode="c"] flat
+    cdef const double* src
+    cdef Py_ssize_t i
+
+    flat = np.asarray(_cart2sph_py(0), dtype=np.float64).ravel()
+    if flat.size != 1:
+        raise RuntimeError("unexpected cart2sph_matrix(0) size")
+    src = <const double*>flat.data
+    for i in range(1):
+        _CART2SPH_SP_L0[i] = src[i]
+
+    flat = np.asarray(_cart2sph_py(1), dtype=np.float64).ravel()
+    if flat.size != 9:
+        raise RuntimeError("unexpected cart2sph_matrix(1) size")
+    src = <const double*>flat.data
+    for i in range(9):
+        _CART2SPH_SP_L1[i] = src[i]
+
+    flat = np.asarray(_cart2sph_py(2), dtype=np.float64).ravel()
+    if flat.size != 30:
+        raise RuntimeError("unexpected cart2sph_matrix(2) size")
+    src = <const double*>flat.data
+    for i in range(30):
+        _CART2SPH_SP_L2[i] = src[i]
+
+    flat = np.asarray(_cart2sph_py(3), dtype=np.float64).ravel()
+    if flat.size != 70:
+        raise RuntimeError("unexpected cart2sph_matrix(3) size")
+    src = <const double*>flat.data
+    for i in range(70):
+        _CART2SPH_SP_L3[i] = src[i]
+
+    flat = np.asarray(_cart2sph_py(4), dtype=np.float64).ravel()
+    if flat.size != 135:
+        raise RuntimeError("unexpected cart2sph_matrix(4) size")
+    src = <const double*>flat.data
+    for i in range(135):
+        _CART2SPH_SP_L4[i] = src[i]
+
+    flat = np.asarray(_cart2sph_py(5), dtype=np.float64).ravel()
+    if flat.size != 231:
+        raise RuntimeError("unexpected cart2sph_matrix(5) size")
+    src = <const double*>flat.data
+    for i in range(231):
+        _CART2SPH_SP_L5[i] = src[i]
+
+    _CART2SPH_SP_INIT = True
+
+cdef inline int _nsph(int l) noexcept nogil:
+    return 2 * l + 1
+
+
+cdef inline const double* _cart2sph_sp_ptr(int l) noexcept nogil:
+    if l == 0:
+        return &_CART2SPH_SP_L0[0]
+    if l == 1:
+        return &_CART2SPH_SP_L1[0]
+    if l == 2:
+        return &_CART2SPH_SP_L2[0]
+    if l == 3:
+        return &_CART2SPH_SP_L3[0]
+    if l == 4:
+        return &_CART2SPH_SP_L4[0]
+    if l == 5:
+        return &_CART2SPH_SP_L5[0]
+    return <const double*>0
+
 
 cdef extern from *:
     """
@@ -3217,6 +3307,446 @@ def df_int3c2e_deriv_contracted_cart_sp_batch_cy(
     return out
 
 
+def df_symmetrize_qmn_inplace_cy(
+    cnp.ndarray[cnp.double_t, ndim=1, mode="c"] x_flat,
+    int naux,
+    int nao,
+):
+    """In-place symmetrization for a Qmn-layout tensor.
+
+    Parameters
+    ----------
+    x_flat
+        Flat view of ``x[Q,m,n]`` with total length ``naux*nao*nao``.
+    naux
+        Number of auxiliary functions.
+    nao
+        Number of (working) AO functions on m/n indices.
+    """
+    naux = int(naux)
+    nao = int(nao)
+    if naux < 0 or nao < 0:
+        raise ValueError("naux and nao must be >= 0")
+    cdef Py_ssize_t expected = (<Py_ssize_t>naux) * (<Py_ssize_t>nao) * (<Py_ssize_t>nao)
+    if (<Py_ssize_t>x_flat.shape[0]) != expected:
+        raise ValueError("x_flat length mismatch with naux*nao*nao")
+
+    cdef double* data = <double*>x_flat.data
+    cdef Py_ssize_t stride_q = (<Py_ssize_t>nao) * (<Py_ssize_t>nao)
+    cdef Py_ssize_t stride_m = <Py_ssize_t>nao
+    cdef int q, m, n
+    cdef Py_ssize_t base, idx_mn, idx_nm
+    cdef double avg
+
+    with nogil:
+        for q in range(naux):
+            base = (<Py_ssize_t>q) * stride_q
+            for m in range(nao):
+                for n in range(m + 1, nao):
+                    idx_mn = base + (<Py_ssize_t>m) * stride_m + (<Py_ssize_t>n)
+                    idx_nm = base + (<Py_ssize_t>n) * stride_m + (<Py_ssize_t>m)
+                    avg = 0.5 * (data[idx_mn] + data[idx_nm])
+                    data[idx_mn] = avg
+                    data[idx_nm] = avg
+
+
+def df_int3c2e_deriv_contracted_cart_sp_batch_sphbar_qmn_cy(
+    cnp.ndarray[cnp.double_t, ndim=2, mode="c"] shell_cxyz,
+    cnp.ndarray[cnp.int32_t, ndim=1, mode="c"] shell_prim_start,
+    cnp.ndarray[cnp.int32_t, ndim=1, mode="c"] shell_nprim,
+    cnp.ndarray[cnp.int32_t, ndim=1, mode="c"] shell_l,
+    cnp.ndarray[cnp.int32_t, ndim=1, mode="c"] shell_ao_start,
+    cnp.ndarray[cnp.double_t, ndim=1, mode="c"] prim_exp,
+    cnp.ndarray[cnp.int32_t, ndim=1, mode="c"] sp_A,
+    cnp.ndarray[cnp.int32_t, ndim=1, mode="c"] sp_B,
+    cnp.ndarray[cnp.int32_t, ndim=1, mode="c"] sp_pair_start,
+    cnp.ndarray[cnp.int32_t, ndim=1, mode="c"] sp_npair,
+    cnp.ndarray[cnp.double_t, ndim=1, mode="c"] pair_eta,
+    cnp.ndarray[cnp.double_t, ndim=1, mode="c"] pair_Px,
+    cnp.ndarray[cnp.double_t, ndim=1, mode="c"] pair_Py,
+    cnp.ndarray[cnp.double_t, ndim=1, mode="c"] pair_Pz,
+    cnp.ndarray[cnp.double_t, ndim=1, mode="c"] pair_cK,
+    int spAB,
+    cnp.ndarray[cnp.int32_t, ndim=1, mode="c"] spCD,
+    int nao_cart,
+    int naux,
+    int nao_sph,
+    cnp.ndarray[cnp.double_t, ndim=1, mode="c"] bar_X_sph_Qmn_flat,
+    cnp.ndarray[cnp.int32_t, ndim=1, mode="c"] shell_ao_start_sph_all,
+):
+    """DF 3c2e derivative contraction with spherical bar_X in Qmn layout.
+
+    This variant avoids materializing a full Cartesian ``bar_X_flat`` tensor.
+    It transforms spherical ``bar_X_sph[Q,mu_sph,nu_sph]`` to the needed
+    Cartesian shell-pair block on-the-fly using cart2sph tables.
+    """
+    if shell_cxyz.shape[1] != 3:
+        raise ValueError("shell_cxyz must have shape (nShell, 3)")
+
+    cdef int nsp = <int>sp_A.shape[0]
+    if spAB < 0 or spAB >= nsp:
+        raise ValueError("spAB out of range")
+
+    cdef int nt = <int>spCD.shape[0]
+    if nt == 0:
+        return np.empty((0, 3, 3), dtype=np.float64)
+    if np.any(spCD < 0) or np.any(spCD >= nsp):
+        raise ValueError("spCD entries out of range")
+
+    cdef int shellA = <int>sp_A[spAB]
+    cdef int shellB = <int>sp_B[spAB]
+    cdef int la = <int>shell_l[shellA]
+    cdef int lb = <int>shell_l[shellB]
+    if la > K_LMAX or lb > K_LMAX:
+        raise NotImplementedError(f"df_int3c2e_deriv_contracted_cart_sp_batch_sphbar_qmn_cy supports only l<={K_LMAX} per shell")
+    if la > K_SPH_LMAX or lb > K_SPH_LMAX:
+        raise NotImplementedError(
+            f"df_int3c2e_deriv_contracted_cart_sp_batch_sphbar_qmn_cy supports only l<={K_SPH_LMAX} for cart2sph (got la={la}, lb={lb})"
+        )
+
+    nao_cart = int(nao_cart)
+    if nao_cart <= 0:
+        raise ValueError("nao_cart must be > 0")
+    naux = int(naux)
+    if naux <= 0:
+        raise ValueError("naux must be > 0")
+    nao_sph = int(nao_sph)
+    if nao_sph <= 0:
+        raise ValueError("nao_sph must be > 0")
+
+    cdef Py_ssize_t expected_bar = (<Py_ssize_t>naux) * (<Py_ssize_t>nao_sph) * (<Py_ssize_t>nao_sph)
+    if (<Py_ssize_t>bar_X_sph_Qmn_flat.shape[0]) != expected_bar:
+        raise ValueError("bar_X_sph_Qmn_flat length mismatch with naux*nao_sph*nao_sph")
+    if (<Py_ssize_t>shell_ao_start_sph_all.shape[0]) != (<Py_ssize_t>shell_ao_start.shape[0]):
+        raise ValueError("shell_ao_start_sph_all length must match shell_ao_start length")
+
+    cdef int spCD0 = <int>spCD[0]
+    cdef int shellC0 = <int>sp_A[spCD0]
+    cdef int shellD0 = <int>sp_B[spCD0]
+    cdef int lc0 = <int>shell_l[shellC0]
+    cdef int ld0 = <int>shell_l[shellD0]
+    if lc0 > K_LMAX or ld0 > K_LMAX:
+        raise NotImplementedError(f"df_int3c2e_deriv_contracted_cart_sp_batch_sphbar_qmn_cy supports only l<={K_LMAX} per shell")
+    if ld0 != 0:
+        raise ValueError("df_int3c2e_deriv_contracted_cart_sp_batch_sphbar_qmn_cy requires ld=0")
+
+    cdef int t, sp_i, Ci, Di, lc, ld
+    for t in range(nt):
+        sp_i = <int>spCD[t]
+        Ci = <int>sp_A[sp_i]
+        Di = <int>sp_B[sp_i]
+        lc = <int>shell_l[Ci]
+        ld = <int>shell_l[Di]
+        if lc != lc0 or ld != ld0:
+            raise ValueError("all spCD tasks must share the same (lc,ld)")
+
+    cdef int nA = _ncart(la)
+    cdef int nB = _ncart(lb)
+    cdef int nC = _ncart(lc0)
+    cdef int nsphA = _nsph(la)
+    cdef int nsphB = _nsph(lb)
+
+    _init_cart2sph_sp_tables()
+
+    cdef const double* TA = _cart2sph_sp_ptr(la)
+    cdef const double* TB = _cart2sph_sp_ptr(lb)
+    if TA == <const double*>0 or TB == <const double*>0:  # pragma: no cover
+        raise NotImplementedError("cart2sph table missing for requested l")
+
+    cdef const cnp.int32_t* shell_ao_start_sph_data = <const cnp.int32_t*>shell_ao_start_sph_all.data
+    cdef int a0_sph = <int>shell_ao_start_sph_data[shellA]
+    cdef int b0_sph = <int>shell_ao_start_sph_data[shellB]
+    if a0_sph < 0 or b0_sph < 0:
+        raise ValueError("invalid spherical AO offsets")
+    if (a0_sph + nsphA) > nao_sph or (b0_sph + nsphB) > nao_sph:
+        raise ValueError("spherical AO offset out of range for nao_sph")
+
+    cdef cnp.ndarray[cnp.double_t, ndim=3] out = np.zeros((nt, 3, 3), dtype=np.float64)
+    cdef double* out_data = <double*>out.data
+    cdef Py_ssize_t stride_out = <Py_ssize_t>(9)  # 3*3 per task
+
+    cdef const double* shell_cxyz_data = <const double*>shell_cxyz.data
+    cdef const cnp.int32_t* shell_prim_start_data = <const cnp.int32_t*>shell_prim_start.data
+    cdef const cnp.int32_t* shell_nprim_data = <const cnp.int32_t*>shell_nprim.data
+    cdef const cnp.int32_t* shell_ao_start_data = <const cnp.int32_t*>shell_ao_start.data
+    cdef const cnp.int32_t* sp_pair_start_data = <const cnp.int32_t*>sp_pair_start.data
+    cdef const cnp.int32_t* sp_npair_data = <const cnp.int32_t*>sp_npair.data
+    cdef const double* prim_exp_data = <const double*>prim_exp.data
+    cdef const double* pair_eta_data = <const double*>pair_eta.data
+    cdef const double* pair_Px_data = <const double*>pair_Px.data
+    cdef const double* pair_Py_data = <const double*>pair_Py.data
+    cdef const double* pair_Pz_data = <const double*>pair_Pz.data
+    cdef const double* pair_cK_data = <const double*>pair_cK.data
+    cdef const double* bar_sph_data = <const double*>bar_X_sph_Qmn_flat.data
+
+    cdef double Ax = shell_cxyz_data[shellA * 3 + 0]
+    cdef double Ay = shell_cxyz_data[shellA * 3 + 1]
+    cdef double Az = shell_cxyz_data[shellA * 3 + 2]
+    cdef double Bx = shell_cxyz_data[shellB * 3 + 0]
+    cdef double By = shell_cxyz_data[shellB * 3 + 1]
+    cdef double Bz = shell_cxyz_data[shellB * 3 + 2]
+
+    cdef double ABx = Ax - Bx
+    cdef double ABy = Ay - By
+    cdef double ABz = Az - Bz
+
+    cdef double xij_pow[K_LMAX_D + 1]
+    cdef double yij_pow[K_LMAX_D + 1]
+    cdef double zij_pow[K_LMAX_D + 1]
+    cdef int pwr
+    xij_pow[0] = 1.0
+    yij_pow[0] = 1.0
+    zij_pow[0] = 1.0
+    for pwr in range(1, K_LMAX_D + 1):
+        xij_pow[pwr] = xij_pow[pwr - 1] * ABx
+        yij_pow[pwr] = yij_pow[pwr - 1] * ABy
+        zij_pow[pwr] = zij_pow[pwr - 1] * ABz
+
+    cdef int8_t A_lx[K_NCART_MAX]
+    cdef int8_t A_ly[K_NCART_MAX]
+    cdef int8_t A_lz[K_NCART_MAX]
+    cdef int8_t B_lx[K_NCART_MAX]
+    cdef int8_t B_ly[K_NCART_MAX]
+    cdef int8_t B_lz[K_NCART_MAX]
+    cdef int8_t C_lx[K_NCART_MAX]
+    cdef int8_t C_ly[K_NCART_MAX]
+    cdef int8_t C_lz[K_NCART_MAX]
+    _fill_cart_comp(la, &A_lx[0], &A_ly[0], &A_lz[0])
+    _fill_cart_comp(lb, &B_lx[0], &B_ly[0], &B_lz[0])
+    _fill_cart_comp(lc0, &C_lx[0], &C_ly[0], &C_lz[0])
+
+    cdef int baseAB = <int>sp_pair_start_data[spAB]
+    cdef int nprimAB = <int>sp_npair_data[spAB]
+    cdef int nprimB = <int>shell_nprim_data[shellB]
+    cdef int sA = <int>shell_prim_start_data[shellA]
+    cdef int sB = <int>shell_prim_start_data[shellB]
+
+    cdef int nmax = la + lb + 1
+    cdef int mmax = lc0 + 1
+    cdef int L_total = la + lb + lc0  # ld=0
+    cdef int nroots = ((L_total + 1) // 2) + 1
+    if nroots < 1 or nroots > K_NROOTS_MAX:
+        raise RuntimeError("unsupported nroots")
+
+    cdef double roots[K_NROOTS_MAX]
+    cdef double weights[K_NROOTS_MAX]
+
+    cdef double Gx[K_GSIZE_D]
+    cdef double Gy[K_GSIZE_D]
+    cdef double Gz[K_GSIZE_D]
+
+    cdef cnp.ndarray[cnp.int32_t, ndim=1] baseCD_arr = np.empty((nt,), dtype=np.int32)
+    cdef cnp.ndarray[cnp.int32_t, ndim=1] nprimCD_arr = np.empty((nt,), dtype=np.int32)
+    cdef cnp.ndarray[cnp.int32_t, ndim=1] sC_arr = np.empty((nt,), dtype=np.int32)
+    cdef cnp.ndarray[cnp.int32_t, ndim=1] c0_arr = np.empty((nt,), dtype=np.int32)
+    cdef cnp.ndarray[cnp.double_t, ndim=2] Cxyz_arr = np.empty((nt, 3), dtype=np.float64)
+
+    for t in range(nt):
+        sp_i = <int>spCD[t]
+        Ci = <int>sp_A[sp_i]
+        baseCD_arr[t] = <cnp.int32_t>sp_pair_start_data[sp_i]
+        nprimCD_arr[t] = <cnp.int32_t>sp_npair_data[sp_i]
+        sC_arr[t] = <cnp.int32_t>shell_prim_start_data[Ci]
+        c0_arr[t] = <cnp.int32_t>(<int>shell_ao_start_data[Ci] - nao_cart)
+        Cxyz_arr[t, 0] = shell_cxyz_data[Ci * 3 + 0]
+        Cxyz_arr[t, 1] = shell_cxyz_data[Ci * 3 + 1]
+        Cxyz_arr[t, 2] = shell_cxyz_data[Ci * 3 + 2]
+        if (<int>c0_arr[t]) < 0 or (<int>c0_arr[t] + nC) > naux:
+            raise ValueError("aux index range mismatch between shell_ao_start and bar_X_sph")
+
+    cdef cnp.int32_t* baseCD_ptr = <cnp.int32_t*>baseCD_arr.data
+    cdef cnp.int32_t* nprimCD_ptr = <cnp.int32_t*>nprimCD_arr.data
+    cdef cnp.int32_t* sC_ptr = <cnp.int32_t*>sC_arr.data
+    cdef cnp.int32_t* c0_ptr = <cnp.int32_t*>c0_arr.data
+    cdef double* Cxyz_ptr = <double*>Cxyz_arr.data
+
+    cdef Py_ssize_t nao_sph_sq = (<Py_ssize_t>nao_sph) * (<Py_ssize_t>nao_sph)
+    cdef double tmpAB[K_NCART_MAX * K_NSPH_MAX]
+    cdef Py_ssize_t bar_cart_size = (<Py_ssize_t>nC) * (<Py_ssize_t>nA) * (<Py_ssize_t>nB)
+    cdef double* bar_cart_buf = <double*>malloc(bar_cart_size * sizeof(double))
+    if bar_cart_buf == NULL:
+        raise MemoryError("failed to allocate bar_cart_buf")
+
+    cdef int row_out
+    cdef int baseCD, nprimCD, sC, c0, Q
+    cdef double Cx, Cy, Cz
+    cdef int iAB, iCD, u
+    cdef int ia, ib, ic
+    cdef int iax, iay, iaz, ibx, iby, ibz, icx, icy, icz
+    cdef double p, q
+    cdef double Px, Py, Pz, Qx, Qy, Qz
+    cdef double cKab, cKcd
+    cdef double aexp, bexp, cexp
+    cdef double denom, inv_denom, Tval, dx, dy, dz
+    cdef double base, scale
+    cdef double x, w
+    cdef double B0, B1, B1p
+    cdef double Cx_, Cy_, Cz_, Cpx_, Cpy_, Cpz_
+    cdef double Ix, Iy, Iz
+    cdef double Ix_p, Ix_m, dIx
+    cdef double Iy_p, Iy_m, dIy
+    cdef double Iz_p, Iz_m, dIz
+    cdef double bar
+    cdef int ia_cart, ib_cart, isphA, jsphB
+    cdef double s
+
+    try:
+        with nogil:
+            for t in range(nt):
+                row_out = <int>(t * stride_out)
+                baseCD = <int>baseCD_ptr[t]
+                nprimCD = <int>nprimCD_ptr[t]
+                sC = <int>sC_ptr[t]
+                c0 = <int>c0_ptr[t]
+                Cx = Cxyz_ptr[t * 3 + 0]
+                Cy = Cxyz_ptr[t * 3 + 1]
+                Cz = Cxyz_ptr[t * 3 + 2]
+
+                # Precompute bar_cart_buf for this aux shell task t.
+                for ic in range(nC):
+                    Q = c0 + ic
+                    for ia_cart in range(nA):
+                        for jsphB in range(nsphB):
+                            s = 0.0
+                            for isphA in range(nsphA):
+                                s += TA[ia_cart * nsphA + isphA] * bar_sph_data[
+                                    (<Py_ssize_t>Q) * nao_sph_sq
+                                    + (<Py_ssize_t>(a0_sph + isphA)) * (<Py_ssize_t>nao_sph)
+                                    + (<Py_ssize_t>(b0_sph + jsphB))
+                                ]
+                            tmpAB[ia_cart * K_NSPH_MAX + jsphB] = s
+                    for ia_cart in range(nA):
+                        for ib_cart in range(nB):
+                            s = 0.0
+                            for jsphB in range(nsphB):
+                                s += tmpAB[ia_cart * K_NSPH_MAX + jsphB] * TB[ib_cart * nsphB + jsphB]
+                            bar_cart_buf[(<Py_ssize_t>ic) * (<Py_ssize_t>nA) * (<Py_ssize_t>nB) + (<Py_ssize_t>ia_cart) * (<Py_ssize_t>nB) + (<Py_ssize_t>ib_cart)] = s
+
+                for iAB in range(nprimAB):
+                    p = pair_eta_data[baseAB + iAB]
+                    Px = pair_Px_data[baseAB + iAB]
+                    Py = pair_Py_data[baseAB + iAB]
+                    Pz = pair_Pz_data[baseAB + iAB]
+                    cKab = pair_cK_data[baseAB + iAB]
+
+                    ia = iAB // nprimB
+                    ib = iAB - ia * nprimB
+                    aexp = prim_exp_data[sA + ia]
+                    bexp = prim_exp_data[sB + ib]
+
+                    for iCD in range(nprimCD):
+                        q = pair_eta_data[baseCD + iCD]
+                        Qx = pair_Px_data[baseCD + iCD]
+                        Qy = pair_Py_data[baseCD + iCD]
+                        Qz = pair_Pz_data[baseCD + iCD]
+                        cKcd = pair_cK_data[baseCD + iCD]
+                        cexp = prim_exp_data[sC + iCD]
+
+                        denom = p + q
+                        inv_denom = 1.0 / denom
+                        dx = Px - Qx
+                        dy = Py - Qy
+                        dz = Pz - Qz
+                        Tval = (p * q) * inv_denom * (dx * dx + dy * dy + dz * dz)
+
+                        base = kTwoPiToFiveHalves / (p * q * sqrt(denom)) * cKab * cKcd
+                        _rys_roots_weights(nroots, Tval, &roots[0], &weights[0])
+
+                        for u in range(nroots):
+                            x = roots[u]
+                            w = weights[u]
+
+                            B0 = x * 0.5 * inv_denom
+                            B1 = (1.0 - x) * 0.5 / p + B0
+                            B1p = (1.0 - x) * 0.5 / q + B0
+
+                            Cx_ = (Px - Ax) + (q * inv_denom) * x * (Qx - Px)
+                            Cy_ = (Py - Ay) + (q * inv_denom) * x * (Qy - Py)
+                            Cz_ = (Pz - Az) + (q * inv_denom) * x * (Qz - Pz)
+
+                            Cpx_ = (Qx - Cx) + (p * inv_denom) * x * (Px - Qx)
+                            Cpy_ = (Qy - Cy) + (p * inv_denom) * x * (Py - Qy)
+                            Cpz_ = (Qz - Cz) + (p * inv_denom) * x * (Pz - Qz)
+
+                            _compute_G_d(&Gx[0], nmax, mmax, Cx_, Cpx_, B0, B1, B1p)
+                            _compute_G_d(&Gy[0], nmax, mmax, Cy_, Cpy_, B0, B1, B1p)
+                            _compute_G_d(&Gz[0], nmax, mmax, Cz_, Cpz_, B0, B1, B1p)
+
+                            scale = base * w
+
+                            for ia in range(nA):
+                                iax = <int>A_lx[ia]
+                                iay = <int>A_ly[ia]
+                                iaz = <int>A_lz[ia]
+                                for ib in range(nB):
+                                    ibx = <int>B_lx[ib]
+                                    iby = <int>B_ly[ib]
+                                    ibz = <int>B_lz[ib]
+                                    for ic in range(nC):
+                                        bar = bar_cart_buf[(<Py_ssize_t>ic) * (<Py_ssize_t>nA) * (<Py_ssize_t>nB) + (<Py_ssize_t>ia) * (<Py_ssize_t>nB) + (<Py_ssize_t>ib)]
+                                        if bar == 0.0:
+                                            continue
+                                        icx = <int>C_lx[ic]
+                                        icy = <int>C_ly[ic]
+                                        icz = <int>C_lz[ic]
+
+                                        Ix = _shift_from_G_ld0_d(&Gx[0], iax, ibx, icx, &xij_pow[0])
+                                        Iy = _shift_from_G_ld0_d(&Gy[0], iay, iby, icy, &yij_pow[0])
+                                        Iz = _shift_from_G_ld0_d(&Gz[0], iaz, ibz, icz, &zij_pow[0])
+
+                                        # Center A derivatives
+                                        Ix_m = _shift_from_G_ld0_d(&Gx[0], iax - 1, ibx, icx, &xij_pow[0]) if iax > 0 else 0.0
+                                        Ix_p = _shift_from_G_ld0_d(&Gx[0], iax + 1, ibx, icx, &xij_pow[0])
+                                        dIx = (-<double>iax) * Ix_m + (2.0 * aexp) * Ix_p
+                                        out_data[row_out + 0 * 3 + 0] += bar * scale * (dIx * Iy * Iz)
+
+                                        Iy_m = _shift_from_G_ld0_d(&Gy[0], iay - 1, iby, icy, &yij_pow[0]) if iay > 0 else 0.0
+                                        Iy_p = _shift_from_G_ld0_d(&Gy[0], iay + 1, iby, icy, &yij_pow[0])
+                                        dIy = (-<double>iay) * Iy_m + (2.0 * aexp) * Iy_p
+                                        out_data[row_out + 0 * 3 + 1] += bar * scale * (Ix * dIy * Iz)
+
+                                        Iz_m = _shift_from_G_ld0_d(&Gz[0], iaz - 1, ibz, icz, &zij_pow[0]) if iaz > 0 else 0.0
+                                        Iz_p = _shift_from_G_ld0_d(&Gz[0], iaz + 1, ibz, icz, &zij_pow[0])
+                                        dIz = (-<double>iaz) * Iz_m + (2.0 * aexp) * Iz_p
+                                        out_data[row_out + 0 * 3 + 2] += bar * scale * (Ix * Iy * dIz)
+
+                                        # Center B derivatives
+                                        Ix_m = _shift_from_G_ld0_d(&Gx[0], iax, ibx - 1, icx, &xij_pow[0]) if ibx > 0 else 0.0
+                                        Ix_p = _shift_from_G_ld0_d(&Gx[0], iax, ibx + 1, icx, &xij_pow[0])
+                                        dIx = (-<double>ibx) * Ix_m + (2.0 * bexp) * Ix_p
+                                        out_data[row_out + 1 * 3 + 0] += bar * scale * (dIx * Iy * Iz)
+
+                                        Iy_m = _shift_from_G_ld0_d(&Gy[0], iay, iby - 1, icy, &yij_pow[0]) if iby > 0 else 0.0
+                                        Iy_p = _shift_from_G_ld0_d(&Gy[0], iay, iby + 1, icy, &yij_pow[0])
+                                        dIy = (-<double>iby) * Iy_m + (2.0 * bexp) * Iy_p
+                                        out_data[row_out + 1 * 3 + 1] += bar * scale * (Ix * dIy * Iz)
+
+                                        Iz_m = _shift_from_G_ld0_d(&Gz[0], iaz, ibz - 1, icz, &zij_pow[0]) if ibz > 0 else 0.0
+                                        Iz_p = _shift_from_G_ld0_d(&Gz[0], iaz, ibz + 1, icz, &zij_pow[0])
+                                        dIz = (-<double>ibz) * Iz_m + (2.0 * bexp) * Iz_p
+                                        out_data[row_out + 1 * 3 + 2] += bar * scale * (Ix * Iy * dIz)
+
+                                        # Center C derivatives (aux)
+                                        Ix_m = _shift_from_G_ld0_d(&Gx[0], iax, ibx, icx - 1, &xij_pow[0]) if icx > 0 else 0.0
+                                        Ix_p = _shift_from_G_ld0_d(&Gx[0], iax, ibx, icx + 1, &xij_pow[0])
+                                        dIx = (-<double>icx) * Ix_m + (2.0 * cexp) * Ix_p
+                                        out_data[row_out + 2 * 3 + 0] += bar * scale * (dIx * Iy * Iz)
+
+                                        Iy_m = _shift_from_G_ld0_d(&Gy[0], iay, iby, icy - 1, &yij_pow[0]) if icy > 0 else 0.0
+                                        Iy_p = _shift_from_G_ld0_d(&Gy[0], iay, iby, icy + 1, &yij_pow[0])
+                                        dIy = (-<double>icy) * Iy_m + (2.0 * cexp) * Iy_p
+                                        out_data[row_out + 2 * 3 + 1] += bar * scale * (Ix * dIy * Iz)
+
+                                        Iz_m = _shift_from_G_ld0_d(&Gz[0], iaz, ibz, icz - 1, &zij_pow[0]) if icz > 0 else 0.0
+                                        Iz_p = _shift_from_G_ld0_d(&Gz[0], iaz, ibz, icz + 1, &zij_pow[0])
+                                        dIz = (-<double>icz) * Iz_m + (2.0 * cexp) * Iz_p
+                                        out_data[row_out + 2 * 3 + 2] += bar * scale * (Ix * Iy * dIz)
+    finally:
+        free(bar_cart_buf)
+
+    return out
+
+
 def df_metric_2c2e_deriv_contracted_cart_sp_cy(
     cnp.ndarray[cnp.double_t, ndim=2, mode="c"] shell_cxyz,
     cnp.ndarray[cnp.int32_t, ndim=1, mode="c"] shell_prim_start,
@@ -4334,8 +4864,10 @@ __all__ = [
     "build_pair_tables_cart_inplace_cpu",
     "df_int3c2e_deriv_contracted_cart_sp_cy",
     "df_int3c2e_deriv_contracted_cart_sp_batch_cy",
+    "df_int3c2e_deriv_contracted_cart_sp_batch_sphbar_qmn_cy",
     "df_metric_2c2e_deriv_contracted_cart_sp_cy",
     "df_metric_2c2e_deriv_contracted_cart_sp_batch_cy",
+    "df_symmetrize_qmn_inplace_cy",
     "eri_rys_deriv_contracted_cart_sp_cy",
     "eri_rys_deriv_contracted_cart_sp_batch_cy",
     "eri_rys_tile_cart_batch_cy",
