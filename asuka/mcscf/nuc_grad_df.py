@@ -32,6 +32,7 @@ import warnings
 import numpy as np
 
 from asuka.frontend.periodic_table import atomic_number
+from asuka.hf import df_jk as _df_jk
 from asuka.hf import df_scf as _df_scf
 from asuka.integrals.cart2sph import coerce_sph_map
 from asuka.integrals.grad import (
@@ -150,23 +151,46 @@ def _build_sph_int1e_prebuilt(
 
 
 def _require_df_mnq_layout(scf_out: Any, *, where: str) -> tuple[int, int, int]:
-    """Validate that cached DF factors are in mnQ layout: ``(nao, nao, naux)``."""
+    """Validate cached DF factors.
+
+    Legacy DF gradient code assumes mnQ layout: ``(nao, nao, naux)``.
+    When ASUKA_DF_AO_PACKED_S2=1, frontend SCF may provide packed Qp factors:
+      ``(naux, ntri)``, where ``ntri=nao*(nao+1)//2``.
+
+    This helper accepts both and returns ``(nao, nao, naux)`` metadata.
+    """
     B = getattr(scf_out, "df_B", None)
     if B is None:
         raise ValueError(f"{where} requires scf_out.df_B in df_layout='mnQ' with shape (nao,nao,naux); got None")
 
     B_shape = getattr(B, "shape", None)
-    if B_shape is None or len(B_shape) != 3:
-        raise ValueError(
-            f"{where} requires scf_out.df_B in df_layout='mnQ' with shape (nao,nao,naux); "
-            f"got shape={B_shape!r}"
-        )
+    if B_shape is None:
+        raise ValueError(f"{where} requires scf_out.df_B with a valid shape; got shape={B_shape!r}")
 
     nao_int1e = None
     try:
         nao_int1e = int(getattr(getattr(scf_out, "int1e", None), "S").shape[0])
     except Exception:
         nao_int1e = None
+
+    if len(B_shape) == 2:
+        from asuka.integrals.tri_packed import ntri_from_nao, nao_from_ntri  # noqa: PLC0415
+
+        naux, ntri = map(int, B_shape)
+        nao = int(nao_int1e) if nao_int1e is not None else int(nao_from_ntri(int(ntri)))
+        expected = int(ntri_from_nao(int(nao)))
+        if int(ntri) != int(expected):
+            raise ValueError(
+                f"{where} requires packed df_B with ntri=nao*(nao+1)//2 (expected ntri={int(expected)} for nao={int(nao)}). "
+                f"Got df_B.shape={tuple(map(int, B_shape))}."
+            )
+        return int(nao), int(nao), int(naux)
+
+    if len(B_shape) != 3:
+        raise ValueError(
+            f"{where} requires scf_out.df_B in df_layout='mnQ' with shape (nao,nao,naux) or packed (naux,ntri); "
+            f"got shape={B_shape!r}"
+        )
 
     n0, n1, naux = map(int, B_shape)
     if n0 != n1:
@@ -181,6 +205,41 @@ def _require_df_mnq_layout(scf_out: Any, *, where: str) -> tuple[int, int, int]:
             "Rerun SCF with df_layout='mnQ'."
         )
     return n0, n1, naux
+
+
+def _df_B_dims(df_B: Any, *, nao: int, where: str = "") -> tuple[bool, int, int, int]:
+    """Return (is_qp, nao, naux, ntri) for df_B in mnQ or packed Qp layout."""
+
+    sh = getattr(df_B, "shape", None)
+    if sh is None:
+        raise ValueError(f"{where} df_B must have a shape")
+    sh_t = tuple(sh)
+    nao_i = int(nao)
+    if nao_i < 0:
+        raise ValueError(f"{where} nao must be >= 0")
+
+    if len(sh_t) == 3:
+        n0, n1, naux = map(int, sh_t)
+        if n0 != n1:
+            raise ValueError(f"{where} df_B must have shape (nao,nao,naux); got {tuple(map(int, sh_t))}")
+        if n0 != nao_i:
+            raise ValueError(f"{where} df_B nao mismatch (expected nao={nao_i}, got {n0})")
+        ntri = nao_i * (nao_i + 1) // 2
+        return False, nao_i, int(naux), int(ntri)
+
+    if len(sh_t) == 2:
+        from asuka.integrals.tri_packed import ntri_from_nao  # noqa: PLC0415
+
+        naux, ntri = map(int, sh_t)
+        expected = int(ntri_from_nao(int(nao_i)))
+        if int(ntri) != int(expected):
+            raise ValueError(
+                f"{where} packed df_B must have shape (naux, nao*(nao+1)//2) with ntri={int(expected)} for nao={nao_i}; "
+                f"got df_B.shape={tuple(map(int, sh_t))}"
+            )
+        return True, nao_i, int(naux), int(ntri)
+
+    raise ValueError(f"{where} df_B must be 2D (Qp) or 3D (mnQ); got shape={sh_t!r}")
 
 
 def _log_vram(label: str) -> None:
@@ -504,6 +563,118 @@ def _auto_qblock_for_aux_tile(
 
 
 _BARL_COULOMB_ADD_KERNELS: dict[str, Any] = {}
+
+
+_BARL_COULOMB_ADD_QP_KERNELS: dict[str, Any] = {}
+
+
+def _barl_coulomb_add_inplace_qp(
+    bar_Qp: Any,
+    *,
+    a_Q: Any,
+    M1_p: Any,
+    b_Q: Any,
+    M2_p: Any,
+    xp: Any,
+) -> Any:
+    """In-place: bar[Q,p] += a[Q]*M1[p] + b[Q]*M2[p]."""
+    if xp is np:
+        bar_Qp += a_Q[:, None] * M1_p[None, :] + b_Q[:, None] * M2_p[None, :]
+        return bar_Qp
+
+    import cupy as cp  # noqa: PLC0415
+
+    bar = cp.asarray(bar_Qp)
+    if not bool(getattr(bar, "flags", None).c_contiguous):
+        bar = cp.ascontiguousarray(bar)
+    dt = cp.dtype(bar.dtype)
+    if dt not in (cp.dtype(cp.float32), cp.dtype(cp.float64)):
+        raise ValueError("bar_L Coulomb kernel (Qp) supports only float32/float64")
+
+    a = cp.asarray(a_Q, dtype=dt).ravel()
+    b = cp.asarray(b_Q, dtype=dt).ravel()
+    m1 = cp.asarray(M1_p, dtype=dt).ravel()
+    m2 = cp.asarray(M2_p, dtype=dt).ravel()
+
+    naux = int(bar.shape[0])
+    ntri = int(bar.shape[1])
+    if int(a.size) != naux or int(b.size) != naux:
+        raise ValueError("a_Q/b_Q length mismatch")
+    if int(m1.size) != ntri or int(m2.size) != ntri:
+        raise ValueError("M1_p/M2_p length mismatch")
+
+    key = str(dt)
+    k = _BARL_COULOMB_ADD_QP_KERNELS.get(key)
+    if k is None:
+        if dt == cp.dtype(cp.float32):
+            k = cp.ElementwiseKernel(
+                "raw float32 a, raw float32 m1, raw float32 b, raw float32 m2, int64 ntri",
+                "float32 y",
+                "const long long q = (long long)(i / ntri); const long long p = (long long)(i - q * ntri); y += a[q] * m1[p] + b[q] * m2[p];",
+                "asuka_barl_coulomb_add_qp_f32",
+            )
+        else:
+            k = cp.ElementwiseKernel(
+                "raw float64 a, raw float64 m1, raw float64 b, raw float64 m2, int64 ntri",
+                "float64 y",
+                "const long long q = (long long)(i / ntri); const long long p = (long long)(i - q * ntri); y += a[q] * m1[p] + b[q] * m2[p];",
+                "asuka_barl_coulomb_add_qp_f64",
+            )
+        _BARL_COULOMB_ADD_QP_KERNELS[key] = k
+
+    k(a, m1, b, m2, int(ntri), bar.reshape(-1))
+    return bar
+
+
+def _pack_qmn_block_to_qp(xp, Qmn_block: Any, *, nao: int, out: Any | None = None) -> Any:
+    """Pack a Qmn block (q,nao,nao) into Qp block (q,ntri) in lower-triangle order."""
+
+    nao_i = int(nao)
+    if nao_i < 0:
+        raise ValueError("nao must be >= 0")
+
+    arr = xp.asarray(Qmn_block)
+    if int(arr.ndim) != 3:
+        raise ValueError("Qmn_block must be 3D (q,nao,nao)")
+    q_count, nao0, nao1 = map(int, arr.shape)
+    if nao0 != nao1 or nao0 != nao_i:
+        raise ValueError("Qmn_block shape mismatch")
+    ntri = nao_i * (nao_i + 1) // 2
+
+    if out is None:
+        out_arr = xp.empty((q_count, ntri), dtype=arr.dtype)
+    else:
+        out_arr = xp.asarray(out)
+        if tuple(map(int, out_arr.shape)) != (q_count, ntri):
+            raise ValueError("out shape mismatch")
+
+    if xp is np:
+        tri_i, tri_j = np.tril_indices(nao_i)
+        out_arr[...] = np.asarray(arr[:, tri_i, tri_j], dtype=out_arr.dtype)
+        return out_arr
+
+    import cupy as cp  # noqa: PLC0415
+    from asuka.cueri import _cueri_cuda_ext as _ext  # noqa: PLC0415
+
+    inp = cp.asarray(arr, dtype=cp.float64)
+    if not bool(getattr(inp, "flags", None).c_contiguous):
+        inp = cp.ascontiguousarray(inp)
+    out_dev = cp.asarray(out_arr, dtype=cp.float64)
+    if not bool(getattr(out_dev, "flags", None).c_contiguous):
+        out_dev = cp.ascontiguousarray(out_dev)
+
+    threads = 256
+    stream_ptr = int(cp.cuda.get_current_stream().ptr)
+    _ext.df_pack_qmn_block_to_qp_device(
+        inp.reshape(-1),
+        out_dev.reshape(-1),
+        int(q_count),
+        int(nao_i),
+        int(threads),
+        int(stream_ptr),
+        False,
+    )
+    return out_dev
 
 
 def _barl_coulomb_add_inplace(
@@ -899,8 +1070,6 @@ def _build_gfock_casscf_df(
     B_ao = xp.asarray(B_ao, dtype=xp.float64)
     h_ao = xp.asarray(h_ao, dtype=xp.float64)
     C = xp.asarray(C, dtype=xp.float64)
-    if B_ao.ndim != 3:
-        raise ValueError("B_ao must have shape (nao, nao, naux)")
     if h_ao.ndim != 2 or h_ao.shape[0] != h_ao.shape[1]:
         raise ValueError("h_ao must be a square 2D matrix")
     if C.ndim != 2:
@@ -908,8 +1077,7 @@ def _build_gfock_casscf_df(
     nao, nmo = map(int, C.shape)
     if tuple(h_ao.shape) != (nao, nao):
         raise ValueError("h_ao/C nao mismatch")
-    if tuple(B_ao.shape[:2]) != (nao, nao):
-        raise ValueError("B_ao/C nao mismatch")
+    is_qp, _nao_i, naux, _ntri = _df_B_dims(B_ao, nao=int(nao), where="_build_gfock_casscf_df")
 
     nocc = ncore + ncas
     if nocc > nmo:
@@ -918,6 +1086,7 @@ def _build_gfock_casscf_df(
     dm1_act = xp.asarray(dm1_act, dtype=xp.float64)
     if dm1_act.shape != (ncas, ncas):
         raise ValueError("dm1_act shape mismatch")
+    dm1_act = 0.5 * (dm1_act + dm1_act.T)
 
     dm2_arr = xp.asarray(dm2_act, dtype=xp.float64)
     if dm2_arr.shape != (ncas, ncas, ncas, ncas):
@@ -934,8 +1103,37 @@ def _build_gfock_casscf_df(
     D_tot_ao = D_core_ao + D_act_ao
 
     # AO potentials
-    Jc, Kc = _df_scf._df_JK(B_ao, D_core_ao, want_J=True, want_K=True)  # noqa: SLF001
-    Ja, Ka = _df_scf._df_JK(B_ao, D_act_ao, want_J=True, want_K=True)  # noqa: SLF001
+    # Default to occupied-driven K on GPU only.
+    use_cocc_k = (xp is not np) and _normalize_bool_env(_os.environ.get("ASUKA_MCSCF_DF_K_COCC"), default=True)
+    if use_cocc_k:
+        try:
+            q_block = int(_os.environ.get("ASUKA_DF_JK_K_QBLOCK", "128"))
+        except Exception:
+            q_block = 128
+        q_block = max(1, min(int(naux), int(q_block)))
+
+        if ncore:
+            Jc, _ = _df_scf._df_JK(B_ao, D_core_ao, want_J=True, want_K=False)  # noqa: SLF001
+            occ_core = xp.full((int(ncore),), 2.0, dtype=xp.float64)
+            Kc = _df_jk.df_K_from_BmnQ_Cocc(B_ao, C_core, occ_core, q_block=int(q_block))
+        else:
+            Jc = xp.zeros((nao, nao), dtype=xp.float64)
+            Kc = xp.zeros((nao, nao), dtype=xp.float64)
+
+        Ja, _ = _df_scf._df_JK(B_ao, D_act_ao, want_J=True, want_K=False)  # noqa: SLF001
+        dm1_h = np.asarray(dm1_act if xp is np else xp.asnumpy(dm1_act), dtype=np.float64)
+        w_h, U_h = np.linalg.eigh(dm1_h)
+        if float(np.min(w_h)) < -1e-8:
+            _, Ka = _df_scf._df_JK(B_ao, D_act_ao, want_J=False, want_K=True)  # noqa: SLF001
+        else:
+            w_h = np.clip(w_h, 0.0, None)
+            w = xp.asarray(w_h, dtype=xp.float64)
+            U = xp.asarray(U_h, dtype=xp.float64)
+            C_no = C_act @ U
+            Ka = _df_jk.df_K_from_BmnQ_Cocc(B_ao, C_no, w, q_block=int(q_block))
+    else:
+        Jc, Kc = _df_scf._df_JK(B_ao, D_core_ao, want_J=True, want_K=True)  # noqa: SLF001
+        Ja, Ka = _df_scf._df_JK(B_ao, D_act_ao, want_J=True, want_K=True)  # noqa: SLF001
     vhf_c_ao = Jc - 0.5 * Kc
     vhf_ca_ao = (Jc + Ja) - 0.5 * (Kc + Ka)
 
@@ -945,8 +1143,32 @@ def _build_gfock_casscf_df(
     vhf_ca_mo = C.T @ vhf_ca_ao @ C
 
     # DF MO factors for dm2 contraction (same construction as orbital_grad_df)
-    X = xp.einsum("mnQ,nv->mvQ", B_ao, C_act, optimize=True)
-    L_pact = xp.einsum("mp,mvQ->pvQ", C, X, optimize=True)  # (nmo,ncas,naux)
+    if not bool(is_qp):
+        X = xp.einsum("mnQ,nv->mvQ", B_ao, C_act, optimize=True)
+        L_pact = xp.einsum("mp,mvQ->pvQ", C, X, optimize=True)  # (nmo,ncas,naux)
+        del X
+    else:
+        from asuka.integrals.df_packed_s2 import unpack_Qp_to_Qmn_block  # noqa: PLC0415
+
+        # Build L_pact in aux blocks by unpacking Qp -> Qmn. ncas is small so
+        # the intermediate (q,nao,ncas) fits comfortably even for large nao.
+        try:
+            q_block_L = int(_os.environ.get("ASUKA_DF_L_PACT_QBLOCK", "128"))
+        except Exception:
+            q_block_L = 128
+        q_block_L = max(1, min(int(naux), int(q_block_L)))
+
+        L_pact = xp.empty((nmo, ncas, naux), dtype=xp.float64)
+        for q0 in range(0, int(naux), int(q_block_L)):
+            q1 = min(int(naux), int(q0) + int(q_block_L))
+            q = int(q1 - q0)
+            if q <= 0:
+                continue
+            BQc = unpack_Qp_to_Qmn_block(B_ao, nao=int(nao), q0=int(q0), q_count=int(q))  # (q,nao,nao)
+            X_blk = xp.matmul(BQc, C_act)  # (q,nao,ncas)
+            L_blk = xp.matmul(C.T[None, :, :], X_blk)  # (q,nmo,ncas)
+            L_pact[:, :, int(q0) : int(q1)] = L_blk.transpose(1, 2, 0)
+            del BQc, X_blk, L_blk
     L_act = L_pact[ncore:nocc]  # (ncas,ncas,naux)
 
     dm2_flat = dm2_arr.reshape(ncas * ncas, ncas * ncas)
@@ -1025,30 +1247,94 @@ def _build_dme0_lorb_response(
     C_L_act = C_L[:, ncore:nocc]
 
     dm1 = xp.asarray(dm1_act, dtype=xp.float64)
+    dm1 = 0.5 * (dm1 + dm1.T)
     dm2 = xp.asarray(dm2_act, dtype=xp.float64)
+    _dm2_mode = str(_os.environ.get("ASUKA_CASPT2_LORB_DM2_MODE", "native")).strip().lower()
+    if _dm2_mode == "swap_uv":
+        dm2 = dm2.transpose(1, 0, 2, 3)
+    elif _dm2_mode == "swap_wt":
+        dm2 = dm2.transpose(0, 1, 3, 2)
+    elif _dm2_mode == "swap_pairs":
+        dm2 = dm2.transpose(2, 3, 0, 1)
+    elif _dm2_mode == "pair_sym_half":
+        dm2 = 0.5 * (dm2 + dm2.transpose(1, 0, 3, 2))
+    elif _dm2_mode == "pair_sym_sum":
+        dm2 = dm2 + dm2.transpose(1, 0, 3, 2)
 
     # AO densities and L-effective densities.
+    _dml_sym_mode = str(_os.environ.get("ASUKA_CASPT2_LORB_DML_SYM_MODE", "full")).strip().lower()
+    if _dml_sym_mode not in {"full", "core_raw", "act_raw", "raw"}:
+        _dml_sym_mode = "full"
+    D_L_core_raw = xp.zeros((nao, nao), dtype=xp.float64)
+    D_L_core_sym = xp.zeros((nao, nao), dtype=xp.float64)
     if ncore:
         D_core = 2.0 * (C_core @ C_core.T)
-        D_L_core = 2.0 * (C_L_core @ C_core.T)
-        D_L_core = D_L_core + D_L_core.T
+        D_L_core_raw = 2.0 * (C_L_core @ C_core.T)
+        D_L_core_sym = D_L_core_raw + D_L_core_raw.T
+        if _dml_sym_mode in {"core_raw", "raw"}:
+            D_L_core = D_L_core_raw
+        else:
+            D_L_core = D_L_core_sym
     else:
         D_core = xp.zeros((nao, nao), dtype=xp.float64)
         D_L_core = xp.zeros((nao, nao), dtype=xp.float64)
 
     D_act = C_act @ dm1 @ C_act.T
-    D_L_act = C_L_act @ dm1 @ C_act.T
-    D_L_act = D_L_act + D_L_act.T
+    D_L_act_raw = C_L_act @ dm1 @ C_act.T
+    if _dml_sym_mode in {"act_raw", "raw"}:
+        D_L_act = D_L_act_raw
+    else:
+        D_L_act = D_L_act_raw + D_L_act_raw.T
     D_L = D_L_core + D_L_act
+    _vmix_dml_mode = str(_os.environ.get("ASUKA_CASPT2_LORB_VMIX_DML_CORE_MODE", "as_dml")).strip().lower()
+    if _vmix_dml_mode not in {"as_dml", "full", "raw"}:
+        _vmix_dml_mode = "as_dml"
+    if _vmix_dml_mode == "full":
+        D_L_core_vmix = D_L_core_sym
+    elif _vmix_dml_mode == "raw":
+        D_L_core_vmix = D_L_core_raw
+    else:
+        D_L_core_vmix = D_L_core
 
     # J/K builds using DF (GPU-aware via _df_JK xp dispatch).
-    # Use cached root-invariant Jc/Kc and Ja/Ka when available.
+    # Use cached root-invariant vhf_c/vhf_a when available.
+    Jc = Kc = Ja = Ka = None
     if vhf_cache is not None and "vhf_c" in vhf_cache and "vhf_a" in vhf_cache:
         vhf_c = vhf_cache["vhf_c"]
         vhf_a = vhf_cache["vhf_a"]
     else:
-        Jc, Kc = _df_scf._df_JK(B_x, D_core, want_J=True, want_K=True)  # noqa: SLF001
-        Ja, Ka = _df_scf._df_JK(B_x, D_act, want_J=True, want_K=True)  # noqa: SLF001
+        use_cocc_k = (xp is not np) and _normalize_bool_env(_os.environ.get("ASUKA_MCSCF_DF_K_COCC"), default=True)
+        if use_cocc_k:
+            try:
+                q_block = int(_os.environ.get("ASUKA_DF_JK_K_QBLOCK", "128"))
+            except Exception:
+                q_block = 128
+            _is_qp_b, _nao_b, _naux_b, _ntri_b = _df_B_dims(B_x, nao=int(nao), where="_build_dme0_lorb_response")
+            q_block = max(1, min(int(_naux_b), int(q_block)))
+
+            if ncore:
+                Jc, _ = _df_scf._df_JK(B_x, D_core, want_J=True, want_K=False)  # noqa: SLF001
+                occ_core = xp.full((int(ncore),), 2.0, dtype=xp.float64)
+                Kc = _df_jk.df_K_from_BmnQ_Cocc(B_x, C_core, occ_core, q_block=int(q_block))
+            else:
+                Jc = xp.zeros((nao, nao), dtype=xp.float64)
+                Kc = xp.zeros((nao, nao), dtype=xp.float64)
+
+            Ja, _ = _df_scf._df_JK(B_x, D_act, want_J=True, want_K=False)  # noqa: SLF001
+            dm1_h = np.asarray(dm1 if xp is np else xp.asnumpy(dm1), dtype=np.float64)
+            w_h, U_h = np.linalg.eigh(dm1_h)
+            if float(np.min(w_h)) < -1e-8:
+                _, Ka = _df_scf._df_JK(B_x, D_act, want_J=False, want_K=True)  # noqa: SLF001
+            else:
+                w_h = np.clip(w_h, 0.0, None)
+                w = xp.asarray(w_h, dtype=xp.float64)
+                U = xp.asarray(U_h, dtype=xp.float64)
+                C_no = C_act @ U
+                Ka = _df_jk.df_K_from_BmnQ_Cocc(B_x, C_no, w, q_block=int(q_block))
+        else:
+            Jc, Kc = _df_scf._df_JK(B_x, D_core, want_J=True, want_K=True)  # noqa: SLF001
+            Ja, Ka = _df_scf._df_JK(B_x, D_act, want_J=True, want_K=True)  # noqa: SLF001
+
         vhf_c = Jc - 0.5 * Kc
         vhf_a = Ja - 0.5 * Ka
     if ncore:
@@ -1077,19 +1363,78 @@ def _build_dme0_lorb_response(
         _vhf_mix = vhf_c + vhf_a
         _vhfL_mix = vhfL_c + vhfL_a
 
-    g_h1 = h_ao_x @ D_L
-    g_vmix = _vhf_mix @ D_L_core
-    g_vLmix = _vhfL_mix @ D_core
-    g_vL_c = vhfL_c @ D_act
-    g_vc_L = vhf_c @ D_L_act
+    g_vmix_j = g_vmix_k = None
+    g_vmix_j_core = g_vmix_j_act = None
+    g_vmix_k_core = g_vmix_k_act = None
+    g_vLmix_j = g_vLmix_k = None
+    g_vL_c_j = g_vL_c_k = None
+    g_vc_L_j = g_vc_L_k = None
+    if Jc is not None and Kc is not None and Ja is not None and Ka is not None:
+        g_vmix_j_core = Jc @ D_L_core_vmix
+        g_vmix_j_act = Ja @ D_L_core_vmix
+        g_vmix_k_core = (-0.5 * Kc) @ D_L_core_vmix
+        g_vmix_k_act = (-0.5 * Ka) @ D_L_core_vmix
+        if _reco_mode == "core_only":
+            g_vmix_j = g_vmix_j_core
+            g_vmix_k = g_vmix_k_core
+        elif _reco_mode == "core_minus_active":
+            g_vmix_j = g_vmix_j_core - g_vmix_j_act
+            g_vmix_k = g_vmix_k_core - g_vmix_k_act
+        else:
+            g_vmix_j = g_vmix_j_core + g_vmix_j_act
+            g_vmix_k = g_vmix_k_core + g_vmix_k_act
+        if _reco_mode == "core_only":
+            _JL_mix = JcL
+            _KL_mix = KcL
+        elif _reco_mode == "core_minus_active":
+            _JL_mix = JcL - JaL
+            _KL_mix = KcL - KaL
+        else:
+            _JL_mix = JcL + JaL
+            _KL_mix = KcL + KaL
+        g_vLmix_j = _JL_mix @ D_core
+        g_vLmix_k = (-0.5 * _KL_mix) @ D_core
+        g_vL_c_j = JcL @ D_act
+        g_vL_c_k = (-0.5 * KcL) @ D_act
+        g_vc_L_j = Jc @ D_L_act
+        g_vc_L_k = (-0.5 * Kc) @ D_L_act
 
-    # S^{-1} ≈ CC^T (orthogonal MO basis).
-    s0_inv = C @ C.T
-    g_h1 = s0_inv @ g_h1
-    g_vmix = s0_inv @ g_vmix
-    g_vLmix = s0_inv @ g_vLmix
-    g_vL_c = s0_inv @ g_vL_c
-    g_vc_L = s0_inv @ g_vc_L
+    g_h1 = h_ao_x @ D_L
+    if g_vmix_j is not None and g_vmix_k is not None:
+        g_vmix = g_vmix_j + g_vmix_k
+        g_vLmix = g_vLmix_j + g_vLmix_k  # type: ignore[operator]
+        g_vL_c = g_vL_c_j + g_vL_c_k  # type: ignore[operator]
+        g_vc_L = g_vc_L_j + g_vc_L_k  # type: ignore[operator]
+    else:
+        g_vmix = _vhf_mix @ D_L_core
+        g_vLmix = _vhfL_mix @ D_core
+        g_vL_c = vhfL_c @ D_act
+        g_vc_L = vhf_c @ D_L_act
+
+    # S^{-1} ≈ C C^T in an orthogonal MO metric.
+    _s0_mode = str(_os.environ.get("ASUKA_CASPT2_LORB_S0INV_MODE", "left")).strip().lower()
+    if _s0_mode not in {"left", "none"}:
+        _s0_mode = "left"
+    if _s0_mode == "left":
+        s0_inv = C @ C.T
+        g_h1 = s0_inv @ g_h1
+        g_vmix = s0_inv @ g_vmix
+        g_vLmix = s0_inv @ g_vLmix
+        g_vL_c = s0_inv @ g_vL_c
+        g_vc_L = s0_inv @ g_vc_L
+        if g_vmix_j is not None:
+            g_vmix_j = s0_inv @ g_vmix_j
+            g_vmix_k = s0_inv @ g_vmix_k  # type: ignore[operator]
+            g_vmix_j_core = s0_inv @ g_vmix_j_core  # type: ignore[operator]
+            g_vmix_j_act = s0_inv @ g_vmix_j_act  # type: ignore[operator]
+            g_vmix_k_core = s0_inv @ g_vmix_k_core  # type: ignore[operator]
+            g_vmix_k_act = s0_inv @ g_vmix_k_act  # type: ignore[operator]
+            g_vLmix_j = s0_inv @ g_vLmix_j  # type: ignore[operator]
+            g_vLmix_k = s0_inv @ g_vLmix_k  # type: ignore[operator]
+            g_vL_c_j = s0_inv @ g_vL_c_j  # type: ignore[operator]
+            g_vL_c_k = s0_inv @ g_vL_c_k  # type: ignore[operator]
+            g_vc_L_j = s0_inv @ g_vc_L_j  # type: ignore[operator]
+            g_vc_L_k = s0_inv @ g_vc_L_k  # type: ignore[operator]
     gfock = g_h1 + g_vmix + g_vLmix + g_vL_c + g_vc_L
 
     # 2e active-active ERI contribution (from ppaa/papa).
@@ -1123,16 +1468,21 @@ def _build_dme0_lorb_response(
         #                     + sym_{u,v} sum_j papa[i,u,j,:] L[j,v]
         aapaL_j = np.einsum("ijuv,jt->uvit", ppaa_np, L_act_slice, optimize=True)
         aapaL_k = np.einsum("iujw,jt->wtiu", papa_np, L_act_slice, optimize=True)
-        aapaL = np.asarray(aapaL_j + aapaL_k + aapaL_k.transpose(1, 0, 2, 3), dtype=np.float64)
+        aapaL_k_sym = np.asarray(aapaL_k + aapaL_k.transpose(1, 0, 2, 3), dtype=np.float64)
+        aapaL = np.asarray(aapaL_j + aapaL_k_sym, dtype=np.float64)
 
         dm2_np = _asnumpy_f64(dm2)
-        t1 = np.einsum("uviw,uvtw->it", aapaL, dm2_np, optimize=True)
+        t1_j = np.einsum("uviw,uvtw->it", aapaL_j, dm2_np, optimize=True)
+        t1_k = np.einsum("uviw,uvtw->it", aapaL_k_sym, dm2_np, optimize=True)
+        t1 = np.asarray(t1_j + t1_k, dtype=np.float64)
         t2 = np.einsum("uviw,vuwt->it", aapa, dm2_np, optimize=True)
         C_np = _asnumpy_f64(C)
         C_act_np = _asnumpy_f64(C_act)
         C_L_act_np = _asnumpy_f64(C_L_act)
         gfock_np = _asnumpy_f64(gfock)
-        g_aa1_np = np.asarray(C_np @ t1 @ C_act_np.T, dtype=np.float64)
+        g_aa1_j_np = np.asarray(C_np @ t1_j @ C_act_np.T, dtype=np.float64)
+        g_aa1_k_np = np.asarray(C_np @ t1_k @ C_act_np.T, dtype=np.float64)
+        g_aa1_np = np.asarray(g_aa1_j_np + g_aa1_k_np, dtype=np.float64)
         g_aa2_np = np.asarray(C_np @ t2 @ C_L_act_np.T, dtype=np.float64)
         gfock_np += g_aa1_np
         gfock_np += g_aa2_np
@@ -1147,10 +1497,63 @@ def _build_dme0_lorb_response(
             parts_np: dict[str, Any] = {
                 "dme0_h1": np.asarray(0.5 * (g_h1_np + g_h1_np.T), dtype=np.float64),
                 "dme0_mean": np.asarray(0.5 * (g_mean_np + g_mean_np.T), dtype=np.float64),
+                "dme0_mean_vmix": np.asarray(0.5 * (g_vmix_np + g_vmix_np.T), dtype=np.float64),
+                "dme0_mean_vLmix": np.asarray(0.5 * (g_vLmix_np + g_vLmix_np.T), dtype=np.float64),
+                "dme0_mean_vL_c": np.asarray(0.5 * (g_vL_c_np + g_vL_c_np.T), dtype=np.float64),
+                "dme0_mean_vc_L": np.asarray(0.5 * (g_vc_L_np + g_vc_L_np.T), dtype=np.float64),
                 "dme0_aa1": np.asarray(0.5 * (g_aa1_np + g_aa1_np.T), dtype=np.float64),
+                "dme0_aa1_j": np.asarray(0.5 * (g_aa1_j_np + g_aa1_j_np.T), dtype=np.float64),
+                "dme0_aa1_k": np.asarray(0.5 * (g_aa1_k_np + g_aa1_k_np.T), dtype=np.float64),
                 "dme0_aa2": np.asarray(0.5 * (g_aa2_np + g_aa2_np.T), dtype=np.float64),
                 "dme0_total": np.asarray(out_np, dtype=np.float64),
             }
+            if g_vmix_j is not None:
+                g_vmix_j_np = _asnumpy_f64(g_vmix_j)
+                g_vmix_k_np = _asnumpy_f64(g_vmix_k)
+                g_vmix_j_core_np = _asnumpy_f64(g_vmix_j_core)
+                g_vmix_j_act_np = _asnumpy_f64(g_vmix_j_act)
+                g_vmix_k_core_np = _asnumpy_f64(g_vmix_k_core)
+                g_vmix_k_act_np = _asnumpy_f64(g_vmix_k_act)
+                g_vLmix_j_np = _asnumpy_f64(g_vLmix_j)
+                g_vLmix_k_np = _asnumpy_f64(g_vLmix_k)
+                g_vL_c_j_np = _asnumpy_f64(g_vL_c_j)
+                g_vL_c_k_np = _asnumpy_f64(g_vL_c_k)
+                g_vc_L_j_np = _asnumpy_f64(g_vc_L_j)
+                g_vc_L_k_np = _asnumpy_f64(g_vc_L_k)
+                g_mean_j_np = np.asarray(
+                    g_vmix_j_np + g_vLmix_j_np + g_vL_c_j_np + g_vc_L_j_np,
+                    dtype=np.float64,
+                )
+                g_mean_k_np = np.asarray(
+                    g_vmix_k_np + g_vLmix_k_np + g_vL_c_k_np + g_vc_L_k_np,
+                    dtype=np.float64,
+                )
+                parts_np.update(
+                    {
+                        "dme0_mean_j": np.asarray(0.5 * (g_mean_j_np + g_mean_j_np.T), dtype=np.float64),
+                        "dme0_mean_k": np.asarray(0.5 * (g_mean_k_np + g_mean_k_np.T), dtype=np.float64),
+                        "dme0_mean_vmix_j": np.asarray(0.5 * (g_vmix_j_np + g_vmix_j_np.T), dtype=np.float64),
+                        "dme0_mean_vmix_k": np.asarray(0.5 * (g_vmix_k_np + g_vmix_k_np.T), dtype=np.float64),
+                        "dme0_mean_vmix_j_core": np.asarray(
+                            0.5 * (g_vmix_j_core_np + g_vmix_j_core_np.T), dtype=np.float64
+                        ),
+                        "dme0_mean_vmix_j_act": np.asarray(
+                            0.5 * (g_vmix_j_act_np + g_vmix_j_act_np.T), dtype=np.float64
+                        ),
+                        "dme0_mean_vmix_k_core": np.asarray(
+                            0.5 * (g_vmix_k_core_np + g_vmix_k_core_np.T), dtype=np.float64
+                        ),
+                        "dme0_mean_vmix_k_act": np.asarray(
+                            0.5 * (g_vmix_k_act_np + g_vmix_k_act_np.T), dtype=np.float64
+                        ),
+                        "dme0_mean_vLmix_j": np.asarray(0.5 * (g_vLmix_j_np + g_vLmix_j_np.T), dtype=np.float64),
+                        "dme0_mean_vLmix_k": np.asarray(0.5 * (g_vLmix_k_np + g_vLmix_k_np.T), dtype=np.float64),
+                        "dme0_mean_vL_c_j": np.asarray(0.5 * (g_vL_c_j_np + g_vL_c_j_np.T), dtype=np.float64),
+                        "dme0_mean_vL_c_k": np.asarray(0.5 * (g_vL_c_k_np + g_vL_c_k_np.T), dtype=np.float64),
+                        "dme0_mean_vc_L_j": np.asarray(0.5 * (g_vc_L_j_np + g_vc_L_j_np.T), dtype=np.float64),
+                        "dme0_mean_vc_L_k": np.asarray(0.5 * (g_vc_L_k_np + g_vc_L_k_np.T), dtype=np.float64),
+                    }
+                )
             if return_xp:
                 return np.asarray(out_np, dtype=np.float64), parts_np
             return out_np, parts_np
@@ -1182,11 +1585,16 @@ def _build_dme0_lorb_response(
     L_act_slice_x = L[:, ncore:nocc]
     aapaL_j_x = xp.einsum("ijuv,jt->uvit", ppaa_x, L_act_slice_x, optimize=True)
     aapaL_k_x = xp.einsum("iujw,jt->wtiu", papa_x, L_act_slice_x, optimize=True)
-    aapaL_x = aapaL_j_x + aapaL_k_x + aapaL_k_x.transpose(1, 0, 2, 3)
+    aapaL_k_sym_x = aapaL_k_x + aapaL_k_x.transpose(1, 0, 2, 3)
+    aapaL_x = aapaL_j_x + aapaL_k_sym_x
 
-    t1_x = xp.einsum("uviw,uvtw->it", aapaL_x, dm2, optimize=True)
+    t1_j_x = xp.einsum("uviw,uvtw->it", aapaL_j_x, dm2, optimize=True)
+    t1_k_x = xp.einsum("uviw,uvtw->it", aapaL_k_sym_x, dm2, optimize=True)
+    t1_x = t1_j_x + t1_k_x
     t2_x = xp.einsum("uviw,vuwt->it", aapa_x, dm2, optimize=True)
-    g_aa1_x = C @ t1_x @ C_act.T
+    g_aa1_j_x = C @ t1_j_x @ C_act.T
+    g_aa1_k_x = C @ t1_k_x @ C_act.T
+    g_aa1_x = g_aa1_j_x + g_aa1_k_x
     g_aa2_x = C @ t2_x @ C_L_act.T
     gfock += g_aa1_x
     gfock += g_aa2_x
@@ -1196,16 +1604,175 @@ def _build_dme0_lorb_response(
         parts_x: dict[str, Any] = {
             "dme0_h1": xp.asarray(0.5 * (g_h1 + g_h1.T), dtype=xp.float64),
             "dme0_mean": xp.asarray(0.5 * (g_mean_x + g_mean_x.T), dtype=xp.float64),
+            "dme0_mean_vmix": xp.asarray(0.5 * (g_vmix + g_vmix.T), dtype=xp.float64),
+            "dme0_mean_vLmix": xp.asarray(0.5 * (g_vLmix + g_vLmix.T), dtype=xp.float64),
+            "dme0_mean_vL_c": xp.asarray(0.5 * (g_vL_c + g_vL_c.T), dtype=xp.float64),
+            "dme0_mean_vc_L": xp.asarray(0.5 * (g_vc_L + g_vc_L.T), dtype=xp.float64),
             "dme0_aa1": xp.asarray(0.5 * (g_aa1_x + g_aa1_x.T), dtype=xp.float64),
+            "dme0_aa1_j": xp.asarray(0.5 * (g_aa1_j_x + g_aa1_j_x.T), dtype=xp.float64),
+            "dme0_aa1_k": xp.asarray(0.5 * (g_aa1_k_x + g_aa1_k_x.T), dtype=xp.float64),
             "dme0_aa2": xp.asarray(0.5 * (g_aa2_x + g_aa2_x.T), dtype=xp.float64),
             "dme0_total": xp.asarray(out_x, dtype=xp.float64),
         }
+        if g_vmix_j is not None:
+            g_mean_j_x = g_vmix_j + g_vLmix_j + g_vL_c_j + g_vc_L_j  # type: ignore[operator]
+            g_mean_k_x = g_vmix_k + g_vLmix_k + g_vL_c_k + g_vc_L_k  # type: ignore[operator]
+            parts_x.update(
+                {
+                    "dme0_mean_j": xp.asarray(0.5 * (g_mean_j_x + g_mean_j_x.T), dtype=xp.float64),
+                    "dme0_mean_k": xp.asarray(0.5 * (g_mean_k_x + g_mean_k_x.T), dtype=xp.float64),
+                    "dme0_mean_vmix_j": xp.asarray(0.5 * (g_vmix_j + g_vmix_j.T), dtype=xp.float64),
+                    "dme0_mean_vmix_k": xp.asarray(0.5 * (g_vmix_k + g_vmix_k.T), dtype=xp.float64),
+                    "dme0_mean_vmix_j_core": xp.asarray(0.5 * (g_vmix_j_core + g_vmix_j_core.T), dtype=xp.float64),
+                    "dme0_mean_vmix_j_act": xp.asarray(0.5 * (g_vmix_j_act + g_vmix_j_act.T), dtype=xp.float64),
+                    "dme0_mean_vmix_k_core": xp.asarray(0.5 * (g_vmix_k_core + g_vmix_k_core.T), dtype=xp.float64),
+                    "dme0_mean_vmix_k_act": xp.asarray(0.5 * (g_vmix_k_act + g_vmix_k_act.T), dtype=xp.float64),
+                    "dme0_mean_vLmix_j": xp.asarray(0.5 * (g_vLmix_j + g_vLmix_j.T), dtype=xp.float64),
+                    "dme0_mean_vLmix_k": xp.asarray(0.5 * (g_vLmix_k + g_vLmix_k.T), dtype=xp.float64),
+                    "dme0_mean_vL_c_j": xp.asarray(0.5 * (g_vL_c_j + g_vL_c_j.T), dtype=xp.float64),
+                    "dme0_mean_vL_c_k": xp.asarray(0.5 * (g_vL_c_k + g_vL_c_k.T), dtype=xp.float64),
+                    "dme0_mean_vc_L_j": xp.asarray(0.5 * (g_vc_L_j + g_vc_L_j.T), dtype=xp.float64),
+                    "dme0_mean_vc_L_k": xp.asarray(0.5 * (g_vc_L_k + g_vc_L_k.T), dtype=xp.float64),
+                }
+            )
         if return_xp:
             return out_x, parts_x
         return _asnumpy_f64(out_x), {k: _asnumpy_f64(v) for k, v in parts_x.items()}
     if return_xp:
         return out_x
     return _asnumpy_f64(out_x)
+
+
+def _build_bar_L_casscf_df_qp(
+    B_Qp: Any,
+    *,
+    D_core_ao: Any,
+    D_act_ao: Any,
+    C_act: Any,
+    dm2_act: Any,
+    L_act: Any | None = None,
+    rho_core: Any | None = None,
+    work_dtype: Any | None = None,
+    out_dtype: Any | None = None,
+    qblock: int | None = None,
+) -> Any:
+    """Packed-Qp variant of `_build_bar_L_casscf_df` (returns (naux,ntri))."""
+
+    xp, _ = _get_xp_arrays(B_Qp, D_core_ao, D_act_ao, C_act, dm2_act, L_act, rho_core)
+    _wd = xp.float64 if work_dtype is None else work_dtype
+    _od = xp.float64 if out_dtype is None else out_dtype
+
+    B_Qp = xp.asarray(B_Qp, dtype=_wd)
+    if int(B_Qp.ndim) != 2:
+        raise ValueError("B_Qp must have shape (naux, ntri)")
+
+    D_core_ao = xp.asarray(D_core_ao, dtype=_wd)
+    D_act_ao = xp.asarray(D_act_ao, dtype=_wd)
+    if D_core_ao.ndim != 2 or int(D_core_ao.shape[0]) != int(D_core_ao.shape[1]):
+        raise ValueError("D_core_ao must be (nao,nao)")
+    nao = int(D_core_ao.shape[0])
+    if D_act_ao.shape != (nao, nao):
+        raise ValueError("D_act_ao shape mismatch")
+
+    is_qp, _nao_i, naux, ntri = _df_B_dims(B_Qp, nao=int(nao), where="_build_bar_L_casscf_df_qp")
+    if not bool(is_qp):  # pragma: no cover
+        raise RuntimeError("internal error: expected packed Qp df_B")
+
+    from asuka.integrals.tri_packed import pack_tril, tri_weights  # noqa: PLC0415
+    from asuka.integrals.df_packed_s2 import unpack_Qp_to_Qmn_block  # noqa: PLC0415
+
+    # Mean-field interaction with the core potential:
+    #   E_cc + E_ca = Tr(D_w * (J(Dc) - 0.5 K(Dc))), where D_w = D_act + 0.5 D_core
+    D_w = D_act_ao + 0.5 * D_core_ao
+
+    w = tri_weights(xp, int(nao), dtype=_wd)
+    D_core_p = pack_tril(xp, D_core_ao)
+    D_w_p = pack_tril(xp, D_w)
+    if rho_core is None:
+        rho = B_Qp @ (w * D_core_p)  # (naux,)
+    else:
+        rho = xp.asarray(rho_core, dtype=_wd).ravel()
+        if rho.shape != (naux,):
+            raise ValueError("rho_core shape mismatch")
+    sigma = B_Qp @ (w * D_w_p)  # (naux,)
+
+    _log_vram("    casscf_df_qp: before bar_mean")
+    bar_mean = xp.zeros((naux, ntri), dtype=_od)
+    _barl_coulomb_add_inplace_qp(
+        bar_mean,
+        a_Q=sigma,
+        M1_p=D_core_p,
+        b_Q=rho,
+        M2_p=D_w_p,
+        xp=xp,
+    )
+    _log_vram("    casscf_df_qp: after bar_mean J")
+
+    # Exchange part: unpack B in aux blocks, build Qmn blocks, then pack back to Qp.
+    _chunk = int(max(1, qblock if qblock is not None else (naux // 4)))
+    for _q0 in range(0, naux, _chunk):
+        _q1 = min(_q0 + _chunk, naux)
+        _q = int(_q1 - _q0)
+        if _q <= 0:
+            continue
+        _bq = unpack_Qp_to_Qmn_block(B_Qp, nao=int(nao), q0=int(_q0), q_count=int(_q))  # (q,nao,nao)
+        _t = xp.matmul(xp.matmul(D_core_ao[None, :, :], _bq), D_w)
+        _t += xp.matmul(xp.matmul(D_w[None, :, :], _bq), D_core_ao)
+        _t *= -0.5
+        _tp = _pack_qmn_block_to_qp(xp, _t.astype(xp.float64, copy=False), nao=int(nao))
+        bar_mean[_q0:_q1] += _tp.astype(_od, copy=False)
+        del _bq, _t, _tp
+    _log_vram("    casscf_df_qp: after exchange")
+
+    # Active-active 2-RDM term.
+    C_act = xp.asarray(C_act, dtype=_wd)
+    if C_act.ndim != 2 or int(C_act.shape[0]) != int(nao):
+        raise ValueError("C_act shape mismatch")
+    ncas = int(C_act.shape[1])
+    if ncas <= 0:
+        raise ValueError("empty active space")
+
+    dm2_arr = xp.asarray(dm2_act, dtype=_wd)
+    if dm2_arr.shape != (ncas, ncas, ncas, ncas):
+        raise ValueError("dm2_act shape mismatch")
+
+    if L_act is None:
+        # Build L_act[u,v,Q] = C_act^T B_Q C_act in aux blocks.
+        L_act_val = xp.empty((ncas, ncas, naux), dtype=_wd)
+        _chunkL = int(max(1, qblock if qblock is not None else (naux // 4)))
+        for _q0 in range(0, naux, _chunkL):
+            _q1 = min(_q0 + _chunkL, naux)
+            _q = int(_q1 - _q0)
+            if _q <= 0:
+                continue
+            _bq = unpack_Qp_to_Qmn_block(B_Qp, nao=int(nao), q0=int(_q0), q_count=int(_q))  # (q,nao,nao)
+            _x = xp.matmul(_bq, C_act)  # (q,nao,ncas)
+            _l = xp.matmul(C_act.T[None, :, :], _x)  # (q,ncas,ncas)
+            L_act_val[:, :, _q0:_q1] = _l.transpose(1, 2, 0)
+            del _bq, _x, _l
+    else:
+        L_act_val = xp.asarray(L_act, dtype=_wd)
+        if L_act_val.shape != (ncas, ncas, naux):
+            raise ValueError("L_act shape mismatch")
+
+    L2 = L_act_val.reshape(ncas * ncas, naux)
+    dm2_flat = dm2_arr.reshape(ncas * ncas, ncas * ncas)
+    dm2_flat = 0.5 * (dm2_flat + dm2_flat.T)
+    M = dm2_flat @ L2  # (ncas^2,naux)
+    M_uvQ = M.reshape(ncas, ncas, naux)
+
+    tmp = xp.einsum("mu,uvQ->mvQ", C_act, M_uvQ, optimize=True)  # (nao,ncas,naux)
+    _chunk = int(max(1, qblock if qblock is not None else (naux // 4)))
+    for _q0 in range(0, naux, _chunk):
+        _q1 = min(_q0 + _chunk, naux)
+        _blk = xp.einsum("mvQ,nv->Qmn", tmp[:, :, _q0:_q1], C_act, optimize=True)
+        _bp = _pack_qmn_block_to_qp(xp, _blk.astype(xp.float64, copy=False), nao=int(nao))
+        bar_mean[_q0:_q1] += _bp.astype(_od, copy=False)
+        del _blk, _bp
+    del tmp
+    _log_vram("    casscf_df_qp: after bar_act")
+
+    return xp.asarray(bar_mean, dtype=_od)
 
 
 def _build_bar_L_casscf_df(
@@ -1254,6 +1821,19 @@ def _build_bar_L_casscf_df(
     _wd = xp.float64 if work_dtype is None else work_dtype
     _od = xp.float64 if out_dtype is None else out_dtype
     B_ao = xp.asarray(B_ao, dtype=_wd)
+    if int(B_ao.ndim) == 2:
+        return _build_bar_L_casscf_df_qp(
+            B_ao,
+            D_core_ao=D_core_ao,
+            D_act_ao=D_act_ao,
+            C_act=C_act,
+            dm2_act=dm2_act,
+            L_act=L_act,
+            rho_core=rho_core,
+            work_dtype=work_dtype,
+            out_dtype=out_dtype,
+            qblock=qblock,
+        )
     if B_ao.ndim != 3:
         raise ValueError("B_ao must have shape (nao, nao, naux)")
     nao, nao1, naux = map(int, B_ao.shape)
@@ -1373,6 +1953,101 @@ def _build_bar_L_delta_casscf_df(
     Assumes the core density is root-invariant (shared orbitals), so core-core
     contributions cancel exactly in the delta.
     """
+
+    # Packed Qp path: out/out buffer is (naux,ntri).
+    if int(getattr(B_ao, "ndim", 0)) == 2:
+        xp, _ = _get_xp_arrays(B_ao, D_core_ao, C_act, dm1_delta, dm2_delta, rho_core, L2, out)
+        _wd = xp.float64 if work_dtype is None else work_dtype
+        _od = xp.float64 if out_dtype is None else out_dtype
+
+        B_Qp = xp.asarray(B_ao, dtype=_wd)
+        D_core = xp.asarray(D_core_ao, dtype=_wd)
+        C_act_x = xp.asarray(C_act, dtype=_wd)
+        dm1_d = xp.asarray(dm1_delta, dtype=_wd)
+        dm2_d = xp.asarray(dm2_delta, dtype=_wd)
+        rho = xp.asarray(rho_core, dtype=_wd).ravel()
+        L2_x = xp.asarray(L2, dtype=_wd)
+
+        if D_core.ndim != 2 or int(D_core.shape[0]) != int(D_core.shape[1]):
+            raise ValueError("D_core_ao must be (nao,nao)")
+        nao = int(D_core.shape[0])
+        is_qp, _nao_i, naux, ntri = _df_B_dims(B_Qp, nao=int(nao), where="_build_bar_L_delta_casscf_df(Qp)")
+        if not bool(is_qp):  # pragma: no cover
+            raise RuntimeError("internal error: expected packed df_B")
+
+        if rho.shape != (naux,):
+            raise ValueError("rho_core shape mismatch")
+        if C_act_x.ndim != 2 or int(C_act_x.shape[0]) != int(nao):
+            raise ValueError("C_act shape mismatch")
+        ncas = int(C_act_x.shape[1])
+        if ncas <= 0:
+            raise ValueError("empty active space")
+        if dm1_d.shape != (ncas, ncas):
+            raise ValueError("dm1_delta shape mismatch")
+        if dm2_d.shape != (ncas, ncas, ncas, ncas):
+            raise ValueError("dm2_delta shape mismatch")
+        if L2_x.shape != (ncas * ncas, naux):
+            raise ValueError("L2 shape mismatch")
+
+        from asuka.integrals.tri_packed import pack_tril, tri_weights  # noqa: PLC0415
+        from asuka.integrals.df_packed_s2 import unpack_Qp_to_Qmn_block  # noqa: PLC0415
+
+        # AO active density delta
+        D_act_delta = C_act_x @ dm1_d @ C_act_x.T
+
+        w = tri_weights(xp, int(nao), dtype=_wd)
+        D_act_p = pack_tril(xp, D_act_delta)
+        delta_sigma = B_Qp @ (w * D_act_p)  # (naux,)
+
+        if out is None:
+            bar = xp.zeros((naux, ntri), dtype=_od)
+        else:
+            bar = xp.asarray(out, dtype=_od)
+            if tuple(map(int, bar.shape)) != (naux, ntri):
+                raise ValueError("out shape mismatch")
+
+        D_core_p = pack_tril(xp, D_core)
+        _barl_coulomb_add_inplace_qp(
+            bar,
+            a_Q=delta_sigma,
+            M1_p=D_core_p,
+            b_Q=rho,
+            M2_p=D_act_p,
+            xp=xp,
+        )
+
+        _chunk = int(max(1, qblock if qblock is not None else (naux // 4)))
+        for _q0 in range(0, naux, _chunk):
+            _q1 = min(_q0 + _chunk, naux)
+            _q = int(_q1 - _q0)
+            if _q <= 0:
+                continue
+            _bq = unpack_Qp_to_Qmn_block(B_Qp, nao=int(nao), q0=int(_q0), q_count=int(_q))
+            _t = xp.matmul(xp.matmul(D_core[None, :, :], _bq), D_act_delta)
+            _t += xp.matmul(xp.matmul(D_act_delta[None, :, :], _bq), D_core)
+            _t *= -0.5
+            _tp = _pack_qmn_block_to_qp(xp, _t.astype(xp.float64, copy=False), nao=int(nao))
+            bar[_q0:_q1] += _tp.astype(_od, copy=False)
+            del _bq, _t, _tp
+
+        # Active-active 2-RDM delta (linear in dm2)
+        dm2_flat = dm2_d.reshape(ncas * ncas, ncas * ncas)
+        dm2_flat = 0.5 * (dm2_flat + dm2_flat.T)
+        M = dm2_flat @ L2_x  # (ncas^2,naux)
+        M_uvQ = M.reshape(ncas, ncas, naux)
+
+        tmp = xp.einsum("mu,uvQ->mvQ", C_act_x, M_uvQ, optimize=True)  # (nao,ncas,naux)
+        _chunk = int(max(1, qblock if qblock is not None else (naux // 4)))
+        for _q0 in range(0, naux, _chunk):
+            _q1 = min(_q0 + _chunk, naux)
+            _blk = xp.einsum("mvQ,nv->Qmn", tmp[:, :, _q0:_q1], C_act_x, optimize=True)
+            _bp = _pack_qmn_block_to_qp(xp, _blk.astype(xp.float64, copy=False), nao=int(nao))
+            bar[_q0:_q1] += _bp.astype(_od, copy=False)
+            del _blk, _bp
+        del tmp
+
+        # symmetrize: packed storage already contains only the unique triangle.
+        return xp.asarray(bar, dtype=_od)
 
     xp, _ = _get_xp_arrays(B_ao, D_core_ao, C_act, dm1_delta, dm2_delta, rho_core, L2, out)
     _wd = xp.float64 if work_dtype is None else work_dtype
@@ -1508,6 +2183,69 @@ def _build_bar_L_df_cross(
     _wd = xp.float64 if work_dtype is None else work_dtype
     _od = xp.float64 if out_dtype is None else out_dtype
     B_ao = xp.asarray(B_ao, dtype=_wd)
+    if int(B_ao.ndim) == 2:
+        D_left = xp.asarray(D_left, dtype=_wd)
+        D_right = xp.asarray(D_right, dtype=_wd)
+        if D_left.ndim != 2 or int(D_left.shape[0]) != int(D_left.shape[1]):
+            raise ValueError("D_left must be (nao,nao)")
+        nao = int(D_left.shape[0])
+        if D_right.shape != (nao, nao):
+            raise ValueError("D_left/D_right shape mismatch")
+
+        is_qp, _nao_i, naux, ntri = _df_B_dims(B_ao, nao=int(nao), where="_build_bar_L_df_cross(Qp)")
+        if not bool(is_qp):  # pragma: no cover
+            raise RuntimeError("internal error: expected packed df_B")
+
+        from asuka.integrals.tri_packed import pack_tril, tri_weights  # noqa: PLC0415
+        from asuka.integrals.df_packed_s2 import unpack_Qp_to_Qmn_block  # noqa: PLC0415
+
+        # Symmetrize densities to match the assumed AO-pair symmetry.
+        Dl = 0.5 * (D_left + D_left.T)
+        Dr = 0.5 * (D_right + D_right.T)
+        w = tri_weights(xp, int(nao), dtype=_wd)
+        Dl_p = pack_tril(xp, Dl)
+        Dr_p = pack_tril(xp, Dr)
+
+        rho = B_ao @ (w * Dr_p)  # (naux,)
+        sigma = B_ao @ (w * Dl_p)  # (naux,)
+
+        _log_vram("    cross_qp: before Coulomb")
+        cJ = float(coeff_J)
+        if out is None:
+            bar = xp.zeros((naux, ntri), dtype=_od)
+        else:
+            bar = xp.asarray(out, dtype=_od)
+            if tuple(map(int, bar.shape)) != (naux, ntri):
+                raise ValueError("out shape mismatch")
+        if cJ:
+            _barl_coulomb_add_inplace_qp(
+                bar,
+                a_Q=(cJ * sigma),
+                M1_p=Dr_p,
+                b_Q=(cJ * rho),
+                M2_p=Dl_p,
+                xp=xp,
+            )
+        _log_vram("    cross_qp: after Coulomb")
+
+        cK = float(coeff_K)
+        if cK:
+            _chunk = int(max(1, qblock if qblock is not None else (naux // 4)))
+            for _q0 in range(0, naux, _chunk):
+                _q1 = min(_q0 + _chunk, naux)
+                _q = int(_q1 - _q0)
+                if _q <= 0:
+                    continue
+                _bq = unpack_Qp_to_Qmn_block(B_ao, nao=int(nao), q0=int(_q0), q_count=int(_q))  # (q,nao,nao)
+                _t = xp.matmul(xp.matmul(Dl[None, :, :], _bq), Dr)
+                _t += xp.matmul(xp.matmul(Dr[None, :, :], _bq), Dl)
+                _t *= cK
+                _tp = _pack_qmn_block_to_qp(xp, _t.astype(xp.float64, copy=False), nao=int(nao))
+                bar[_q0:_q1] += _tp.astype(_od, copy=False)
+                del _bq, _t, _tp
+            _log_vram("    cross_qp: after exchange")
+
+        return xp.asarray(bar, dtype=_od)
     if B_ao.ndim != 3:
         raise ValueError("B_ao must have shape (nao, nao, naux)")
     nao, nao1, naux = map(int, B_ao.shape)
@@ -1726,18 +2464,32 @@ def casscf_nuc_grad_df(
     try:
         t0_df = time.perf_counter() if profile is not None else 0.0
         if is_spherical:
-            de_df = compute_df_gradient_contributions_analytic_sph(
-                getattr(scf_out, "ao_basis"),
-                getattr(scf_out, "aux_basis"),
-                atom_coords_bohr=coords,
-                B_sph=B_ao,
-                bar_L_sph=bar_L_ao,
-                T_c2s=None,
-                L_chol=getattr(scf_out, "df_L", None),
-                backend=str(df_backend),
-                df_threads=int(df_threads),
-                profile=df_prof,
-            )
+            if int(getattr(B_ao, "ndim", 0)) == 2:
+                # Packed-Qp path: require the DFGradContractionContext (CUDA fused kernels).
+                from asuka.integrals.df_grad_context import DFGradContractionContext  # noqa: PLC0415
+
+                _ctx = DFGradContractionContext.build(
+                    getattr(scf_out, "ao_basis"),
+                    getattr(scf_out, "aux_basis"),
+                    atom_coords_bohr=coords,
+                    backend=str(df_backend),
+                    df_threads=int(df_threads),
+                    L_chol=getattr(scf_out, "df_L", None),
+                )
+                de_df = _ctx.contract_sph(B_sph=B_ao, bar_L_sph=bar_L_ao, T_c2s=None)
+            else:
+                de_df = compute_df_gradient_contributions_analytic_sph(
+                    getattr(scf_out, "ao_basis"),
+                    getattr(scf_out, "aux_basis"),
+                    atom_coords_bohr=coords,
+                    B_sph=B_ao,
+                    bar_L_sph=bar_L_ao,
+                    T_c2s=None,
+                    L_chol=getattr(scf_out, "df_L", None),
+                    backend=str(df_backend),
+                    df_threads=int(df_threads),
+                    profile=df_prof,
+                )
         else:
             de_df = compute_df_gradient_contributions_analytic_packed_bases(
                 getattr(scf_out, "ao_basis"),
@@ -2689,17 +3441,20 @@ def casscf_nuc_grad_df_per_root(
     C = _as_xp_f64(xp, getattr(casscf, "mo_coeff"))
     B_ao = _as_xp_f64(xp, getattr(scf_out, "df_B"))
     h_ao = _as_xp_f64(xp, getattr(getattr(scf_out, "int1e"), "hcore"))
+    nao = int(getattr(C, "shape", (0, 0))[0])
+    is_qp, _nao_i, naux, ntri = _df_B_dims(B_ao, nao=int(nao), where="casscf_nuc_grad_df_per_root")
     if bool(_is_gpu):
         _apply_gpu_runtime_config_to_solver(fcisolver_use, _gpu_runtime_cfg)
     _restore_pool = _apply_df_pool_policy(B_ao, label="casscf_nuc_grad_df_per_root")
     _preflush_grad_pool = _normalize_bool_env(_os.environ.get("ASUKA_DF_GRAD_PRE_FLUSH"), default=True)
+    _vram_debug_fine = _normalize_bool_env(_os.environ.get("ASUKA_VRAM_DEBUG_FINE"), default=False)
     if bool(_is_gpu) and bool(_preflush_grad_pool):
         _flush_gpu_pool()
         _log_vram("casscf_nuc_grad_df_per_root.preflush")
     _barl_policy = _resolve_barl_hybrid(
         xp=xp,
         is_gpu=bool(_is_gpu),
-        naux_hint=int(getattr(B_ao, "shape", (0, 0, 1))[2]),
+        naux_hint=int(naux),
     )
     if int(_gpu_runtime_cfg.tile_aux) > 0:
         _barl_policy["qblock"] = int(_gpu_runtime_cfg.tile_aux)
@@ -2708,8 +3463,8 @@ def casscf_nuc_grad_df_per_root(
         # Refine qblock using nao to bound (qblock, nao, nao) temporaries.
         # Keep explicit env overrides intact.
         if str(_barl_policy.get("qblock_source", "")) != "env":
-            _nao_hint = int(getattr(B_ao, "shape", (0, 0, 1))[0])
-            _naux_hint = int(getattr(B_ao, "shape", (0, 0, 1))[2])
+            _nao_hint = int(nao)
+            _naux_hint = int(naux)
             try:
                 _itemsize = int(xp.dtype(_barl_policy.get("work_dtype", xp.float64)).itemsize)
             except Exception:
@@ -2720,6 +3475,16 @@ def casscf_nuc_grad_df_per_root(
             except Exception:
                 _q_cur = 0
             _barl_policy["qblock"] = int(_q_auto if _q_cur <= 0 else min(_q_cur, _q_auto))
+    # Packed-Qp bar_L kernels can still create sizeable transient work buffers
+    # inside cross/exchange contractions. Cap default qblock (unless explicitly
+    # set by env) to bound hidden driver-level spikes.
+    if bool(is_qp) and str(_barl_policy.get("qblock_source", "")) != "env":
+        try:
+            _q_cap = int(_os.environ.get("ASUKA_DF_BARL_QBLOCK_CAP_PACKED", "64"))
+        except Exception:
+            _q_cap = 64
+        if _q_cap > 0:
+            _barl_policy["qblock"] = int(max(1, min(int(_barl_policy.get("qblock", 1)), int(_q_cap))))
     _barl_hybrid_enabled = bool(_barl_policy.get("enabled", False))
 
     # Per-root RDMs
@@ -2739,7 +3504,17 @@ def casscf_nuc_grad_df_per_root(
     except Exception:
         de_nuc = np.zeros((natm, 3), dtype=np.float64)
 
-    # Build SA adapter and Hessian operator (shared across all roots)
+    # Build SA adapter and Hessian operator (shared across all roots).
+    # For packed-Qp DF factors, Newton AO2MO can run in aux-blocked mode
+    # directly from Qp (no full Qp->mnQ materialization).
+    _newton_aux_block_naux = 0
+    try:
+        _newton_aux_block_naux = int(_os.environ.get("ASUKA_NEWTON_AUX_BLOCK_NAUX", "0"))
+    except Exception:
+        _newton_aux_block_naux = 0
+    if bool(is_qp) and int(_newton_aux_block_naux) <= 0:
+        _newton_aux_block_naux = min(int(naux), 128)
+
     mc_sa = DFNewtonCASSCFAdapter(
         df_B=B_ao,
         hcore_ao=h_ao,
@@ -2752,8 +3527,12 @@ def casscf_nuc_grad_df_per_root(
         frozen=getattr(casscf, "frozen", None),
         internal_rotation=bool(getattr(casscf, "internal_rotation", False)),
         extrasym=getattr(casscf, "extrasym", None),
+        aux_block_naux=int(_newton_aux_block_naux),
     )
     eris_sa = mc_sa.ao2mo(C)
+    if bool(_is_gpu):
+        _flush_gpu_pool()
+        _log_vram("casscf_nuc_grad_df_per_root.after_drop_full_B_newton")
     with _force_internal_newton():
         hess_op = build_mcscf_hessian_operator(
             mc_sa, mo_coeff=C, ci=ci_list, eris=eris_sa, use_newton_hessian=True,
@@ -3188,15 +3967,43 @@ def casscf_nuc_grad_df_per_root(
         )
 
         # Precompute root-invariant DF intermediates for active contractions.
-        nao = int(B_ao.shape[0])
-        naux = int(B_ao.shape[2])
-        B2 = B_ao.reshape(nao * nao, naux)
-        rho_core = B2.T @ D_core_sa.reshape(nao * nao)  # (naux,)
+        if not bool(is_qp):
+            nao = int(B_ao.shape[0])
+            naux = int(B_ao.shape[2])
+            B2 = B_ao.reshape(nao * nao, naux)
+            rho_core = B2.T @ D_core_sa.reshape(nao * nao)  # (naux,)
 
-        X_act = xp.einsum("mnQ,nv->mvQ", B_ao, C_act_sa, optimize=True)
-        L_act = xp.einsum("mu,mvQ->uvQ", C_act_sa, X_act, optimize=True)  # (ncas,ncas,naux)
-        L2 = L_act.reshape(int(ncas) * int(ncas), naux)  # (ncas^2,naux)
-        del X_act
+            X_act = xp.einsum("mnQ,nv->mvQ", B_ao, C_act_sa, optimize=True)
+            L_act = xp.einsum("mu,mvQ->uvQ", C_act_sa, X_act, optimize=True)  # (ncas,ncas,naux)
+            L2 = L_act.reshape(int(ncas) * int(ncas), naux)  # (ncas^2,naux)
+            del X_act
+        else:
+            # Packed-Qp path: compute rho_core and L_act in aux blocks without
+            # materializing a full mnQ tensor.
+            from asuka.integrals.tri_packed import pack_tril, tri_weights  # noqa: PLC0415
+            from asuka.integrals.df_packed_s2 import unpack_Qp_to_Qmn_block  # noqa: PLC0415
+
+            nao = int(C_act_sa.shape[0])
+            naux = int(B_ao.shape[0])
+            w = tri_weights(xp, int(nao), dtype=xp.float64)
+            rho_core = B_ao @ (w * pack_tril(xp, D_core_sa))  # (naux,)
+
+            _qblk = int(max(1, int(_barl_policy.get("qblock", 0) or 0)))
+            if _qblk <= 0:
+                _qblk = max(1, int(naux // 4))
+            _qblk = max(1, min(int(naux), int(_qblk)))
+            L_act = xp.empty((int(ncas), int(ncas), int(naux)), dtype=xp.float64)
+            for _q0 in range(0, int(naux), int(_qblk)):
+                _q1 = min(int(naux), int(_q0) + int(_qblk))
+                _q = int(_q1 - _q0)
+                if _q <= 0:
+                    continue
+                _bq = unpack_Qp_to_Qmn_block(B_ao, nao=int(nao), q0=int(_q0), q_count=int(_q))
+                _x = xp.matmul(_bq, C_act_sa)  # (q,nao,ncas)
+                _l = xp.matmul(C_act_sa.T[None, :, :], _x)  # (q,ncas,ncas)
+                L_act[:, :, int(_q0) : int(_q1)] = _l.transpose(1, 2, 0)
+                del _bq, _x, _l
+            L2 = L_act.reshape(int(ncas) * int(ncas), int(naux))  # (ncas^2,naux)
 
         t0 = time.perf_counter()
         bar_L_sa = _build_bar_L_casscf_df(
@@ -3212,6 +4019,8 @@ def casscf_nuc_grad_df_per_root(
             _t_bar_L_sa += time.perf_counter() - t0
 
         try:
+            if bool(_vram_debug_fine):
+                _log_vram("sa contract start")
             if bool(is_spherical):
                 if df_grad_ctx is not None:
                     de_df_sa = df_grad_ctx.contract_sph(B_sph=B_ao, bar_L_sph=bar_L_sa, T_c2s=None)
@@ -3237,6 +4046,8 @@ def casscf_nuc_grad_df_per_root(
                         L_chol=getattr(scf_out, "df_L", None),
                         backend=str(df_backend), df_threads=int(df_threads), profile=None,
                     )
+            if bool(_vram_debug_fine):
+                _log_vram("sa contract done")
             if _profile_df_per_root:
                 _t_contract_sa += time.perf_counter() - t0
         except (NotImplementedError, RuntimeError) as e:
@@ -3257,6 +4068,12 @@ def casscf_nuc_grad_df_per_root(
             )
 
     # ── 1e and Pulay contractions ──
+    de_df_sa_np = np.asarray(_asnumpy_f64(de_df_sa), dtype=np.float64)
+    del bar_L_sa, de_df_sa
+    _flush_gpu_pool()
+    if bool(_vram_debug_fine):
+        _log_vram("sa contract released")
+
     W_sa_xp: Any | None = None
     C_occ_xp: Any | None = None
     if _gpu_1e_tensor_path:
@@ -3284,9 +4101,8 @@ def casscf_nuc_grad_df_per_root(
 
     # SA base gradient: de_h1_sa + de_df_sa + de_nuc + de_pulay_sa.
     grad_sa_base = np.asarray(
-        de_h1_sa + _asnumpy_f64(de_df_sa) + de_nuc + de_pulay_sa, dtype=np.float64,
+        de_h1_sa + de_df_sa_np + de_nuc + de_pulay_sa, dtype=np.float64,
     )
-    del bar_L_sa, de_df_sa
     _log_vram("after SA base gradient")
     _flush_gpu_pool()
 
@@ -3300,10 +4116,45 @@ def casscf_nuc_grad_df_per_root(
     # These are reused by _build_dme0_lorb_response every root, avoiding 2
     # redundant _df_JK calls per root (~3s each on cc-pVDZ).
     with _main_stream_cm:
-        _D_core_cached = 2.0 * (C[:, :ncore] @ C[:, :ncore].T) if ncore else xp.zeros((int(B_ao.shape[0]), int(B_ao.shape[0])), dtype=xp.float64)
+        use_cocc_k = (xp is not np) and _normalize_bool_env(_os.environ.get("ASUKA_MCSCF_DF_K_COCC"), default=True)
+        try:
+            q_block = int(_os.environ.get("ASUKA_DF_JK_K_QBLOCK", "128"))
+        except Exception:
+            q_block = 128
+        _nao_jk = int(C.shape[0])
+        _naux_jk = int(B_ao.shape[0]) if bool(is_qp) else int(B_ao.shape[2])
+        q_block = max(1, min(int(_naux_jk), int(q_block)))
+
+        _D_core_cached = (
+            2.0 * (C[:, :ncore] @ C[:, :ncore].T)
+            if ncore
+            else xp.zeros((int(_nao_jk), int(_nao_jk)), dtype=xp.float64)
+        )
         _D_act_sa_cached = C_act_sa @ xp.asarray(dm1_sa, dtype=xp.float64) @ C_act_sa.T
-        _Jc_cached, _Kc_cached = _df_scf._df_JK(B_ao, _D_core_cached, want_J=True, want_K=True)  # noqa: SLF001
-        _Ja_cached, _Ka_cached = _df_scf._df_JK(B_ao, _D_act_sa_cached, want_J=True, want_K=True)  # noqa: SLF001
+
+        if use_cocc_k:
+            _Jc_cached, _ = _df_scf._df_JK(B_ao, _D_core_cached, want_J=True, want_K=False)  # noqa: SLF001
+            if ncore:
+                _occ_core = xp.full((int(ncore),), 2.0, dtype=xp.float64)
+                _Kc_cached = _df_jk.df_K_from_BmnQ_Cocc(B_ao, C[:, :ncore], _occ_core, q_block=int(q_block))
+            else:
+                _Kc_cached = xp.zeros_like(_Jc_cached)
+
+            _Ja_cached, _ = _df_scf._df_JK(B_ao, _D_act_sa_cached, want_J=True, want_K=False)  # noqa: SLF001
+            _dm1_h = np.asarray(dm1_sa, dtype=np.float64)
+            _dm1_h = 0.5 * (_dm1_h + _dm1_h.T)
+            _w_h, _U_h = np.linalg.eigh(_dm1_h)
+            if float(np.min(_w_h)) < -1e-8:
+                _, _Ka_cached = _df_scf._df_JK(B_ao, _D_act_sa_cached, want_J=False, want_K=True)  # noqa: SLF001
+            else:
+                _w_h = np.clip(_w_h, 0.0, None)
+                _w = xp.asarray(_w_h, dtype=xp.float64)
+                _U = xp.asarray(_U_h, dtype=xp.float64)
+                _C_no = C_act_sa @ _U
+                _Ka_cached = _df_jk.df_K_from_BmnQ_Cocc(B_ao, _C_no, _w, q_block=int(q_block))
+        else:
+            _Jc_cached, _Kc_cached = _df_scf._df_JK(B_ao, _D_core_cached, want_J=True, want_K=True)  # noqa: SLF001
+            _Ja_cached, _Ka_cached = _df_scf._df_JK(B_ao, _D_act_sa_cached, want_J=True, want_K=True)  # noqa: SLF001
     _vhf_cache = {
         "vhf_c": _Jc_cached - 0.5 * _Kc_cached,
         "vhf_a": _Ja_cached - 0.5 * _Ka_cached,
@@ -3785,16 +4636,21 @@ def casscf_nuc_grad_df_per_root(
         with _main_stream_cm:
             qblock_eff = int(_barl_policy.get("qblock", 0))
             t0 = time.perf_counter()
-            nao = int(getattr(B_ao, "shape", (0, 0, 1))[0])
-            naux = int(getattr(B_ao, "shape", (0, 0, 1))[2])
+            nao = int(C.shape[0])
+            naux = int(B_ao.shape[0]) if bool(is_qp) else int(B_ao.shape[2])
+            ntri = int(nao) * int(nao + 1) // 2
             # Always use a single accumulation buffer for bar_L construction.
-            # The old per-term path (3 separate buffers) wastes 2×sizeof(B) VRAM
+            # The old per-term path (3 separate buffers) wastes 2xsizeof(B) VRAM
             # with no benefit: contraction now sums terms before the kernel anyway.
             if False:  # kept for reference; the 3-buffer path is strictly dominated
                 pass
             else:
                 # Default path: allocate one accumulation buffer and build all terms into it.
-                bar_L_delta_total = xp.zeros((naux, nao, nao), dtype=_barl_out_dtype)
+                bar_L_delta_total = (
+                    xp.zeros((naux, ntri), dtype=_barl_out_dtype)
+                    if bool(is_qp)
+                    else xp.zeros((naux, nao, nao), dtype=_barl_out_dtype)
+                )
 
                 _build_bar_L_delta_casscf_df(
                     B_ao,
@@ -3853,7 +4709,8 @@ def casscf_nuc_grad_df_per_root(
                 )
                 _log_vram(f"root {K} after lorb")
 
-                _symmetrize_bar_L_inplace(bar_L_delta_total, xp)
+                if not bool(is_qp):
+                    _symmetrize_bar_L_inplace(bar_L_delta_total, xp)
                 _log_vram(f"root {K} bar_L fused")
                 if _profile_df_per_root:
                     _t_bar_L_delta += time.perf_counter() - t0
@@ -3889,10 +4746,15 @@ def casscf_nuc_grad_df_per_root(
             and bar_L_terms_contract is not None
             and len(bar_L_terms_contract) > 0
         ):
-            bar_L_delta_total = xp.zeros((naux, nao, nao), dtype=xp.float64)
+            bar_L_delta_total = (
+                xp.zeros((naux, ntri), dtype=xp.float64)
+                if bool(is_qp)
+                else xp.zeros((naux, nao, nao), dtype=xp.float64)
+            )
             for _term in bar_L_terms_contract:
                 bar_L_delta_total += xp.asarray(_term, dtype=xp.float64)
-            _symmetrize_bar_L_inplace(bar_L_delta_total, xp)
+            if not bool(is_qp):
+                _symmetrize_bar_L_inplace(bar_L_delta_total, xp)
             bar_L_terms_contract = None
 
         bar_L_contract = bar_L_delta_total
@@ -3904,6 +4766,7 @@ def casscf_nuc_grad_df_per_root(
         if (
             bool(_barl_hybrid_enabled)
             and int(K) == 0
+            and not bool(is_qp)
             and bool(_barl_policy.get("ab_check", True))
             and not bool(_barl_policy.get("calibrated", False))
             and str(_barl_policy.get("stage", "fp64")) != "fp64"
@@ -4156,6 +5019,8 @@ def casscf_nuc_grad_df_per_root(
             de_df_delta = np.asarray(de_df_delta_precomputed, dtype=np.float64)
         else:
             try:
+                if bool(_vram_debug_fine):
+                    _log_vram(f"root {K} delta2e contract start")
                 t0 = time.perf_counter()
                 if bool(_fused_contract_enabled) and df_grad_ctx is not None and bar_L_terms_contract is not None:
                     if bool(is_spherical):
@@ -4190,6 +5055,8 @@ def casscf_nuc_grad_df_per_root(
                                 L_chol=getattr(scf_out, "df_L", None),
                                 backend=str(df_backend), df_threads=int(df_threads), profile=None,
                             )
+                if bool(_vram_debug_fine):
+                    _log_vram(f"root {K} delta2e contract done")
                 if _profile_df_per_root:
                     _t_contract_delta += time.perf_counter() - t0
             except (NotImplementedError, RuntimeError, ValueError) as e:
@@ -4221,6 +5088,22 @@ def casscf_nuc_grad_df_per_root(
                     backend=str(df_backend), df_config=df_config, df_threads=int(df_threads),
                     delta_bohr=float(delta_bohr), profile=None,
                 )
+        de_df_delta_np = np.asarray(_asnumpy_f64(de_df_delta), dtype=np.float64)
+
+        # Contracted delta no longer needs bar_L buffers. Drop them before
+        # building response/Pulay terms to reduce transient peak VRAM.
+        if bar_L_terms_contract is not None:
+            bar_L_terms_contract.clear()
+            bar_L_terms_contract = None
+        if bar_L_contract is not None and bar_L_contract is not bar_L_delta_total:
+            del bar_L_contract
+        if bar_L_delta_total is not None:
+            del bar_L_delta_total
+        bar_L_contract = None
+        bar_L_delta_total = None
+        _flush_gpu_pool()
+        if bool(_vram_debug_fine):
+            _log_vram(f"root {K} after delta2e + release barL")
 
         # ── Single fused 1e call: delta from SA + lci + lorb ──
         if _gpu_1e_tensor_path:
@@ -4230,6 +5113,8 @@ def casscf_nuc_grad_df_per_root(
             with _main_stream_cm:
                 D_1e_delta = _asnumpy_f64(D_tot_K - D_tot_sa + D_act_lci + D_L_lorb)
         de_h1_delta = _contract_hcore_fast(D_1e_delta)
+        if bool(_vram_debug_fine):
+            _log_vram(f"root {K} after delta h1")
 
         # ── Per-root Pulay delta: -Tr((W_K - W_sa) · dS/dR) ──
         t0 = time.perf_counter()
@@ -4240,6 +5125,8 @@ def casscf_nuc_grad_df_per_root(
             dm1_act=xp.asarray(dm1_lci, dtype=xp.float64),
             dm2_act=xp.asarray(dm2_lci, dtype=xp.float64),
         )
+        if bool(_vram_debug_fine):
+            _log_vram(f"root {K} after gfock_lci")
         if _gpu_1e_tensor_path and W_sa_xp is not None and C_occ_xp is not None:
             with _main_stream_cm:
                 gfock_K_xp = xp.asarray(gfock_K, dtype=xp.float64)
@@ -4273,20 +5160,17 @@ def casscf_nuc_grad_df_per_root(
                 lorb_cache=_lorb_resp_cache,
             )
             _W_delta = W_K - W_sa + _dme0_lci + _dme0_lorb
+        if bool(_vram_debug_fine):
+            _log_vram(f"root {K} after response pulay pieces")
         de_pulay_delta = _contract_pulay_fast(_W_delta)
+        if bool(_vram_debug_fine):
+            _log_vram(f"root {K} after delta pulay")
         if _profile_df_per_root:
             _t_response_pulay += time.perf_counter() - t0
 
         # Step F: Combine — grad_sa_base + delta 2e + delta 1e + delta Pulay
-        if bar_L_terms_contract is not None:
-            bar_L_terms_contract.clear()
-            bar_L_terms_contract = None
-        if bar_L_contract is not None and bar_L_contract is not bar_L_delta_total:
-            del bar_L_contract
-        if bar_L_delta_total is not None:
-            del bar_L_delta_total
         grad_K = np.asarray(
-            grad_sa_base + _asnumpy_f64(de_df_delta) + de_h1_delta + de_pulay_delta,
+            grad_sa_base + de_df_delta_np + de_h1_delta + de_pulay_delta,
             dtype=np.float64,
         )
         grads_out[int(K)] = grad_K

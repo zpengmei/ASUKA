@@ -812,6 +812,66 @@ def active_Lfull_from_B(B, C_active):
     return L_pqQ.reshape((norb * norb, naux))
 
 
+def active_Lfull_from_B_Qp(B_Qp, C_active, *, aux_block_naux: int = 64):
+    """Transform packed-Qp whitened AO DF factors to active MO DF vectors.
+
+    Parameters
+    ----------
+    B_Qp
+        Packed AO-pair DF factors with shape (naux, ntri), lower-triangular order.
+    C_active
+        Active MO coefficients with shape (nao, norb).
+    aux_block_naux
+        Aux block size used for unpack+transform. Smaller values reduce transient
+        VRAM at the cost of more kernel launches.
+    """
+
+    try:
+        import cupy as cp
+    except Exception as e:  # pragma: no cover
+        raise RuntimeError("CuPy is required for DF active_Lfull_from_B_Qp") from e
+
+    from asuka.integrals.df_packed_s2 import unpack_Qp_to_Qmn_block  # noqa: PLC0415
+    from asuka.integrals.tri_packed import ntri_from_nao  # noqa: PLC0415
+
+    B_qp = cp.asarray(B_Qp, dtype=cp.float64)
+    C_active = cp.asarray(C_active, dtype=cp.float64)
+    C_active = cp.ascontiguousarray(C_active)
+
+    if B_qp.ndim != 2:
+        raise ValueError("B_Qp must have shape (naux, ntri)")
+    if C_active.ndim != 2:
+        raise ValueError("C_active must have shape (nao, norb)")
+
+    naux, ntri = map(int, B_qp.shape)
+    nao, norb = map(int, C_active.shape)
+    ntri_expected = int(ntri_from_nao(int(nao)))
+    if int(ntri) != int(ntri_expected):
+        raise ValueError(
+            f"B_Qp has ntri={int(ntri)}, expected {int(ntri_expected)} for C_active nao={int(nao)}"
+        )
+    if not bool(B_qp.flags.c_contiguous):
+        B_qp = cp.ascontiguousarray(B_qp)
+
+    q_block = int(aux_block_naux)
+    if q_block <= 0:
+        q_block = min(int(naux), 64)
+    q_block = max(1, min(int(naux), int(q_block)))
+
+    out = cp.empty((norb * norb, naux), dtype=cp.float64)
+    for q0 in range(0, int(naux), int(q_block)):
+        q1 = min(int(naux), int(q0) + int(q_block))
+        qb = int(q1 - q0)
+        if qb <= 0:
+            continue
+        B_qmn = unpack_Qp_to_Qmn_block(B_qp, nao=int(nao), q0=int(q0), q_count=int(qb))  # (qb,nao,nao)
+        tmp = cp.matmul(B_qmn, C_active)  # (qb,nao,norb)
+        L_blk = cp.matmul(C_active.T[None, :, :], tmp)  # (qb,norb,norb)
+        out[:, q0:q1] = L_blk.transpose(1, 2, 0).reshape(norb * norb, qb)
+        del B_qmn, tmp, L_blk
+    return out
+
+
 def active_Lfull_from_cached_B_whitened(B_whitened, C_active):
     """Transform a cached whitened AO DF tensor to active-space DF vectors.
 
@@ -819,7 +879,24 @@ def active_Lfull_from_cached_B_whitened(B_whitened, C_active):
     tensor path explicit at call sites.
     """
 
-    return active_Lfull_from_B(B_whitened, C_active)
+    try:
+        import cupy as cp
+    except Exception as e:  # pragma: no cover
+        raise RuntimeError("CuPy is required for DF active_Lfull_from_cached_B_whitened") from e
+
+    B_whitened = cp.asarray(B_whitened, dtype=cp.float64)
+    if int(B_whitened.ndim) == 3:
+        return active_Lfull_from_B(B_whitened, C_active)
+    if int(B_whitened.ndim) == 2:
+        import os as _os  # noqa: PLC0415
+
+        qblk_env = str(_os.environ.get("ASUKA_ACTIVE_LFULL_QP_QBLOCK", "")).strip()
+        try:
+            qblk = int(qblk_env) if qblk_env else 64
+        except Exception:
+            qblk = 64
+        return active_Lfull_from_B_Qp(B_whitened, C_active, aux_block_naux=int(qblk))
+    raise ValueError("cached B_whitened must be mnQ (nao,nao,naux) or packed Qp (naux,ntri)")
 
 
 def _active_YT_streamed_rys_basis(
@@ -1759,6 +1836,7 @@ def int3c2e_block(ao_basis, aux_basis, p0: int, p1: int, *, stream=None, backend
 
 __all__ = [
     "active_Lfull_from_B",
+    "active_Lfull_from_B_Qp",
     "active_Lfull_from_cached_B_whitened",
     "active_Lfull_streamed_basis",
     "cholesky_metric",

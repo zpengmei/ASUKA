@@ -622,6 +622,9 @@ def df_K_from_BmnQ_Cocc(
 ):
     """Occupied-driven DF exchange (RI-K) from mnQ layout without forming BQ.
 
+    Also supports packed AO-pair DF factors in Qp layout:
+      B_Qp: (naux, nao*(nao+1)//2)
+
     Computes:
       K_{μν} = Σ_i occ_i Σ_Q (μi|Q) (νi|Q)
     with:
@@ -629,6 +632,7 @@ def df_K_from_BmnQ_Cocc(
 
     Inputs
     - B_mnQ: (nao, nao, naux) contiguous, float64 preferred
+      or packed B_Qp: (naux, ntri) where ntri=nao*(nao+1)//2
     - C_occ: (nao, nocc) float64 (need not be contiguous; copied if needed)
     - occ_vals: (nocc,) float64
     """
@@ -638,17 +642,30 @@ def df_K_from_BmnQ_Cocc(
     C_occ = _as_xp(xp, C_occ, dtype=xp.float64)
     occ_vals = _as_xp(xp, occ_vals, dtype=xp.float64).ravel()
 
-    if B_mnQ.ndim != 3:
-        raise ValueError("B_mnQ must have shape (nao, nao, naux)")
+    is_qp = int(getattr(B_mnQ, "ndim", 0)) == 2
+    if not is_qp and B_mnQ.ndim != 3:
+        raise ValueError("B_mnQ must have shape (nao, nao, naux) or packed (naux, ntri)")
     if C_occ.ndim != 2:
         raise ValueError("C_occ must be 2D")
     if occ_vals.ndim != 1:
         raise ValueError("occ_vals must be 1D")
 
-    nao0, nao1, naux = map(int, B_mnQ.shape)
-    if nao0 != nao1:
-        raise ValueError("B_mnQ must have shape (nao, nao, naux)")
-    nao = int(nao0)
+    if not is_qp:
+        nao0, nao1, naux = map(int, B_mnQ.shape)
+        if nao0 != nao1:
+            raise ValueError("B_mnQ must have shape (nao, nao, naux)")
+        nao = int(nao0)
+    else:
+        nao = int(C_occ.shape[0])
+        naux, ntri = map(int, B_mnQ.shape)
+        from asuka.integrals.tri_packed import ntri_from_nao  # noqa: PLC0415
+
+        expected_ntri = int(ntri_from_nao(int(nao)))
+        if int(ntri) != int(expected_ntri):
+            raise ValueError(
+                "packed B_Qp must have shape (naux, nao*(nao+1)//2). "
+                f"Got B.shape={tuple(map(int, B_mnQ.shape))} but expected ntri={int(expected_ntri)} for nao={int(nao)}."
+            )
     if int(C_occ.shape[0]) != nao:
         raise ValueError("C_occ nao mismatch with B_mnQ")
     nocc = int(C_occ.shape[1])
@@ -660,6 +677,42 @@ def df_K_from_BmnQ_Cocc(
     q_block = int(q_block)
     if q_block <= 0:
         raise ValueError("q_block must be > 0")
+
+    # Packed-Qp path: no CUDA extension fast path yet (would require materializing BQ).
+    if bool(is_qp):
+        from asuka.integrals.df_packed_s2 import unpack_Qp_to_Qmn_block  # noqa: PLC0415
+
+        q_block_eff = max(1, min(int(naux), int(q_block)))
+        # Weight occupied orbitals by sqrt(occ) so K becomes a simple sum of outer products.
+        sqrt_occ = xp.sqrt(occ_vals)
+        Cw = C_occ * sqrt_occ[None, :]
+        if hasattr(Cw, "flags") and not bool(Cw.flags.c_contiguous):
+            Cw = xp.ascontiguousarray(Cw)
+
+        K = xp.zeros((nao, nao), dtype=xp.float64)
+        for q0 in range(0, int(naux), int(q_block_eff)):
+            q1 = min(int(naux), int(q0) + int(q_block_eff))
+            q = int(q1 - q0)
+            if q <= 0:
+                continue
+            BQc = unpack_Qp_to_Qmn_block(B_mnQ, nao=int(nao), q0=int(q0), q_count=int(q))  # (q,nao,nao)
+
+            # (q, μ, ν) x (ν, i) -> (μ, q, i)
+            tmp = xp.einsum("qmn,ni->mqi", BQc, Cw, optimize=True)
+            if hasattr(tmp, "flags") and not bool(tmp.flags.c_contiguous):
+                tmp = xp.ascontiguousarray(tmp)
+            U = tmp.reshape((nao, q * nocc))
+            K += U @ U.T
+
+            del BQc, tmp, U
+
+        if profile is not None:
+            jk_prof = profile.setdefault("jk", {})
+            jk_prof["k_impl"] = "cocc_qp_unpack_qmn_einsum"
+            jk_prof["k_q_block"] = int(q_block_eff)
+            jk_prof["k_nocc"] = int(nocc)
+
+        return _symmetrize(xp, K)
 
     # Weight occupied orbitals by sqrt(occ) so K becomes a simple sum of outer products.
     sqrt_occ = xp.sqrt(occ_vals)

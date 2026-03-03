@@ -357,7 +357,9 @@ def compute_df_gradient_contributions_analytic_packed_bases(
         B_ao_c = cp.ascontiguousarray(B_ao)
         L_c = cp.ascontiguousarray(L)
 
-    bar_X, bar_L = df_whiten_adjoint_Qmn(B_ao_c, bar_L_ao_c, L_c)
+    # bar_L_ao_c is not reused after this call; allow in-place TRSM to save a
+    # full-size (naux, nao^2) temporary.
+    bar_X, bar_L = df_whiten_adjoint_Qmn(B_ao_c, bar_L_ao_c, L_c, overwrite_bar_L=True)
     bar_V = chol_lower_adjoint(L_c, bar_L)
 
     if profile is not None and backend_s == "cuda":

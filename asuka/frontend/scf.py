@@ -811,6 +811,17 @@ def run_rhf_df(
         profile=scf_prof,
     )
 
+    # Optional: pack DF factors to unique AO-pair triangle (Qp layout) to reduce VRAM.
+    if B_scf is not None:
+        try:  # pragma: no cover (best-effort: keep legacy behavior if something goes wrong)
+            from asuka.integrals.df_packed_s2 import ao_packed_s2_enabled, pack_B_to_Qp  # noqa: PLC0415
+
+            if bool(ao_packed_s2_enabled()):
+                layout = "mnQ" if str(df_layout_s) == "mnq" else "Qmn"
+                B_scf = pack_B_to_Qp(B_scf, layout=layout, nao=int(int1e_scf.S.shape[0]))
+        except Exception:
+            pass
+
     if bool(getattr(scf, "converged", False)):
         guess_key = _rhf_guess_key(
             mol,
@@ -1366,6 +1377,16 @@ def run_uhf_df(
         profile=scf_prof,
     )
 
+    if B_scf is not None:
+        try:  # pragma: no cover
+            from asuka.integrals.df_packed_s2 import ao_packed_s2_enabled, pack_B_to_Qp  # noqa: PLC0415
+
+            if bool(ao_packed_s2_enabled()):
+                layout = "mnQ" if str(df_layout_s) == "mnq" else "Qmn"
+                B_scf = pack_B_to_Qp(B_scf, layout=layout, nao=int(int1e_scf.S.shape[0]))
+        except Exception:
+            pass
+
     return UHFDFRunResult(
         mol=mol,
         basis_name=str(basis_name),
@@ -1469,6 +1490,16 @@ def run_rohf_df(
         mo_coeff0=mo_coeff0,
         profile=scf_prof,
     )
+
+    if B_scf is not None:
+        try:  # pragma: no cover
+            from asuka.integrals.df_packed_s2 import ao_packed_s2_enabled, pack_B_to_Qp  # noqa: PLC0415
+
+            if bool(ao_packed_s2_enabled()):
+                layout = "mnQ" if str(df_layout_s) == "mnq" else "Qmn"
+                B_scf = pack_B_to_Qp(B_scf, layout=layout, nao=int(int1e_scf.S.shape[0]))
+        except Exception:
+            pass
 
     return ROHFDFRunResult(
         mol=mol,

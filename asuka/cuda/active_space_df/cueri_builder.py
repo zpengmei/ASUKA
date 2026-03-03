@@ -407,12 +407,21 @@ class CuERIActiveSpaceDFBuilder:
 
         if cached_b_whitened is not None:
             B_whitened = cp.asarray(cached_b_whitened, dtype=cp.float64)
-            if B_whitened.ndim != 3:
-                raise ValueError("cached_b_whitened must have shape (nao, nao, naux)")
-            if tuple(B_whitened.shape) != (nao, nao, naux):
-                raise ValueError(
-                    f"cached_b_whitened has shape {tuple(B_whitened.shape)}, expected {(nao, nao, naux)}"
-                )
+            if int(B_whitened.ndim) == 3:
+                if tuple(B_whitened.shape) != (nao, nao, naux):
+                    raise ValueError(
+                        f"cached_b_whitened has shape {tuple(B_whitened.shape)}, expected {(nao, nao, naux)}"
+                    )
+            elif int(B_whitened.ndim) == 2:
+                naux_b, ntri_b = map(int, B_whitened.shape)
+                ntri_expected = int(nao * (nao + 1) // 2)
+                if int(naux_b) != int(naux) or int(ntri_b) != int(ntri_expected):
+                    raise ValueError(
+                        "cached_b_whitened packed-Qp shape mismatch: "
+                        f"got {tuple(map(int, B_whitened.shape))}, expected ({int(naux)}, {int(ntri_expected)})"
+                    )
+            else:
+                raise ValueError("cached_b_whitened must be mnQ (nao,nao,naux) or packed Qp (naux,ntri)")
             if not bool(B_whitened.flags.c_contiguous):
                 B_whitened = cp.ascontiguousarray(B_whitened)
             l_full = _as_l_full(cueri_df.active_Lfull_from_cached_B_whitened(B_whitened, c_cas))

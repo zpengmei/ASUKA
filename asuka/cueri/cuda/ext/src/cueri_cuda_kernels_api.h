@@ -1576,6 +1576,86 @@ extern "C" cudaError_t cueri_df_symmetrize_qmn_to_mnq_to_f32_launch_stream(
     cudaStream_t stream,
     int threads);
 
+// Packed AO-pair ("s2") DF tensor helpers.
+//
+// Qp packed layout:
+//   arr shape (naux, ntri) where ntri=nao*(nao+1)/2.
+//   Flattened C-order index: idx = Q*ntri + p.
+//   p indexes the packed lower triangle (m>=n) in canonical order:
+//     p(m,n) = m*(m+1)//2 + n
+
+// Pack a symmetrized mnQ DF tensor into Qp (stores only m>=n entries).
+//
+// Input mnQ layout:
+//   in shape (nao, nao, naux), C-order flattened as ((m*nao + n)*naux + Q)
+// Output Qp layout:
+//   out shape (naux, ntri), flattened as (Q*ntri + p)
+extern "C" cudaError_t cueri_df_pack_mnq_to_qp_launch_stream(
+    const double* in_mnQ,
+    double* out_Qp,
+    int nao,
+    int naux,
+    cudaStream_t stream,
+    int threads);
+
+// Pack a symmetrized Qmn DF tensor into Qp (stores only m>=n entries).
+//
+// Input Qmn layout:
+//   in shape (naux, nao, nao), C-order flattened as ((Q*nao + m)*nao + n)
+// Output Qp layout:
+//   out shape (naux, ntri), flattened as (Q*ntri + p)
+extern "C" cudaError_t cueri_df_pack_qmn_to_qp_launch_stream(
+    const double* in_Qmn,
+    double* out_Qp,
+    int naux,
+    int nao,
+    cudaStream_t stream,
+    int threads);
+
+// Pack a Qmn block (q_count, nao, nao) into a Qp block (q_count, ntri).
+//
+// Input:
+//   in_Qmn_block shape (q_count, nao, nao), flattened as ((q*nao + m)*nao + n)
+// Output:
+//   out_Qp_block shape (q_count, ntri), flattened as (q*ntri + p)
+extern "C" cudaError_t cueri_df_pack_qmn_block_to_qp_launch_stream(
+    const double* in_Qmn_block,
+    double* out_Qp_block,
+    int q_count,
+    int nao,
+    cudaStream_t stream,
+    int threads);
+
+// Unpack a Qp packed DF tensor into a Qmn block (q_count, nao, nao), symmetric.
+//
+// Input:
+//   in_Qp shape (naux, ntri), flattened as (Q*ntri + p)
+// Output:
+//   out_Qmn_block shape (q_count, nao, nao), flattened as ((q*nao + m)*nao + n)
+extern "C" cudaError_t cueri_df_unpack_qp_to_qmn_block_launch_stream(
+    const double* in_Qp,
+    double* out_Qmn_block,
+    int naux,
+    int nao,
+    int q0,
+    int q_count,
+    cudaStream_t stream,
+    int threads);
+
+// Unpack a Qp packed DF tensor into full mnQ layout (nao, nao, naux), symmetric.
+//
+// Input:
+//   in_Qp shape (naux, ntri), flattened as (Q*ntri + p)
+// Output:
+//   out_mnQ shape (nao, nao, naux), flattened as ((m*nao + n)*naux + Q)
+extern "C" cudaError_t cueri_df_unpack_qp_to_mnq_launch_stream(
+    const double* in_Qp,
+    double* out_mnQ,
+    int naux,
+    int nao,
+    cudaStream_t stream,
+    int threads);
+
 extern "C" cudaError_t cueri_scatter_eri_tiles_ordered_launch_stream(
     const int32_t* task_spAB,
     const int32_t* task_spCD,

@@ -24,6 +24,7 @@ We need:
 
 from typing import Any
 
+import os
 import numpy as np
 
 
@@ -51,6 +52,66 @@ def _solve_triangular(xp, L, B, *, lower: bool, trans: str, overwrite_b: bool = 
     import cupyx.scipy.linalg as cpx_linalg  # type: ignore[import-not-found]  # noqa: PLC0415
 
     return cpx_linalg.solve_triangular(L, B, lower=bool(lower), trans=str(trans), unit_diagonal=False, overwrite_b=bool(overwrite_b))
+
+
+def _solve_triangular_qp_inplace_cupy(L: Any, B_qp: Any) -> Any:
+    """In-place packed-Qp triangular solve on CUDA.
+
+    Compute ``X = L^{-T} B`` for ``B`` shaped ``(naux, ntri)`` without allocating
+    another full-sized RHS buffer. Uses a row-major/column-major reinterpretation:
+
+    - row-major ``B_rm(naux,ntri)``
+    - same memory as column-major ``B_cm(ntri,naux) = B_rm^T``
+    - solve on the right: ``X_cm = B_cm * L^{-1}``
+    - reinterpret back: ``X_rm = X_cm^T = L^{-T} B_rm``
+    """
+
+    import cupy as cp  # noqa: PLC0415
+    from cupy.cuda import cublas  # noqa: PLC0415
+
+    B = cp.asarray(B_qp, dtype=cp.float64)
+    if not bool(getattr(B, "flags", None).c_contiguous):
+        B = cp.ascontiguousarray(B, dtype=cp.float64)
+    Lf = cp.asfortranarray(cp.asarray(L, dtype=cp.float64))
+
+    if int(B.ndim) != 2:
+        raise ValueError("B_qp must have shape (naux, ntri)")
+    naux, ntri = map(int, B.shape)
+    if int(Lf.ndim) != 2 or int(Lf.shape[0]) != int(Lf.shape[1]) or int(Lf.shape[0]) != int(naux):
+        raise ValueError("L must have shape (naux, naux)")
+
+    handle = cp.cuda.get_cublas_handle()
+    prev_stream = cublas.getStream(handle)
+    prev_mode = cublas.getPointerMode(handle)
+    try:
+        cublas.setStream(handle, int(cp.cuda.get_current_stream().ptr))
+        cublas.setPointerMode(handle, cublas.CUBLAS_POINTER_MODE_HOST)
+        alpha = np.array(1.0, dtype=np.float64)
+        cublas.dtrsm(
+            handle,
+            cublas.CUBLAS_SIDE_RIGHT,
+            cublas.CUBLAS_FILL_MODE_LOWER,
+            cublas.CUBLAS_OP_N,
+            cublas.CUBLAS_DIAG_NON_UNIT,
+            int(ntri),               # m (rows of column-major view B_cm)
+            int(naux),               # n (cols of B_cm)
+            int(alpha.ctypes.data),  # host pointer to alpha
+            int(Lf.data.ptr),
+            int(Lf.shape[0]),
+            int(B.data.ptr),
+            int(ntri),               # ldb for B_cm
+        )
+    finally:
+        try:
+            cublas.setStream(handle, int(prev_stream))
+        except Exception:
+            pass
+        try:
+            cublas.setPointerMode(handle, int(prev_mode))
+        except Exception:
+            pass
+
+    return B
 
 
 def df_whiten_adjoint(
@@ -177,6 +238,90 @@ def df_whiten_adjoint_Qmn(
     bar_Lchol = xp.tril(bar_Lchol)
 
     return bar_X_flat.reshape(B_mnQ.shape), bar_Lchol
+
+
+def df_whiten_adjoint_Qp(
+    B_Qp: Any,
+    bar_L_Qp: Any,
+    L: Any,
+    *,
+    nao: int,
+    overwrite_bar_L: bool = False,
+    p_block: int | None = None,
+) -> tuple[Any, Any]:
+    """Adjoint of DF whitening for packed AO-pair ("s2") storage.
+
+    This is analogous to :func:`df_whiten_adjoint_Qmn`, but with both B and the
+    adjoint bar_L stored in packed Qp layout: shape ``(naux, ntri)`` where
+    ``ntri=nao*(nao+1)//2``.
+
+    Returns
+    -------
+    bar_X_Qp
+        Adjoint w.r.t. unwhitened 3c2e X, in packed Qp layout (naux,ntri).
+        This is the packed analogue of the Qmn buffer that
+        :func:`df_whiten_adjoint_Qmn` overwrites in-place.
+    bar_Lchol
+        Adjoint w.r.t. the Cholesky factor L, shape (naux,naux) lower triangle.
+    """
+
+    from asuka.integrals.tri_packed import ntri_from_nao, tri_weights  # noqa: PLC0415
+
+    xp = _get_xp(B_Qp, bar_L_Qp, L)
+    B_Qp = _as_xp_f64(xp, B_Qp)
+    bar_L_Qp = _as_xp_f64(xp, bar_L_Qp)
+    L = _as_xp_f64(xp, L)
+
+    if B_Qp.ndim != 2:
+        raise ValueError("B_Qp must have shape (naux, ntri)")
+    naux, ntri = map(int, B_Qp.shape)
+    if bar_L_Qp.shape != (naux, ntri):
+        raise ValueError("bar_L_Qp shape mismatch")
+    if L.ndim != 2 or int(L.shape[0]) != int(naux) or int(L.shape[1]) != int(naux):
+        raise ValueError("L must have shape (naux, naux)")
+
+    nao_i = int(nao)
+    expected_ntri = int(ntri_from_nao(nao_i))
+    if int(ntri) != int(expected_ntri):
+        raise ValueError(f"B_Qp has ntri={int(ntri)} but expected {int(expected_ntri)} for nao={int(nao_i)}")
+
+    # Triangular solve in aux space: tmp = L^{-T} bar_BT, with bar_BT == bar_L_Qp.
+    # For CUDA+overwrite, use an in-place TRSM variant specialized for row-major
+    # packed Qp RHS to avoid a full-size temporary allocation.
+    if xp is not np and bool(overwrite_bar_L):
+        tmp = _solve_triangular_qp_inplace_cupy(L, bar_L_Qp)
+    else:
+        tmp = _solve_triangular(xp, L, bar_L_Qp, lower=True, trans="T", overwrite_b=overwrite_bar_L)  # (naux,ntri)
+
+    # bar_Lchol = -(tmp @ B_flat) in full layout.
+    # For packed symmetry, the ordered-pair sum becomes a packed sum with weights:
+    #   bar_Lchol[i,j] = -sum_p w[p] * tmp[i,p] * B[j,p]
+    w = tri_weights(xp, nao_i, dtype=xp.float64)  # (ntri,)
+
+    if p_block is None:
+        try:
+            p_block = int(str(os.environ.get("ASUKA_DF_QP_MM_PBLOCK", "")).strip() or "0")
+        except Exception:
+            p_block = 0
+        if int(p_block) <= 0:
+            # Default: keep (naux,p_block) work buffers reasonable.
+            p_block = 8192
+    p_block = int(max(1, min(int(ntri), int(p_block))))
+
+    bar_Lchol = xp.zeros((naux, naux), dtype=xp.float64)
+    work = xp.empty((naux, p_block), dtype=xp.float64)
+    for p0 in range(0, int(ntri), int(p_block)):
+        p1 = min(int(ntri), int(p0) + int(p_block))
+        pb = int(p1 - p0)
+        tmp_blk = tmp[:, int(p0) : int(p1)]
+        B_blk = B_Qp[:, int(p0) : int(p1)]
+        w_blk = w[int(p0) : int(p1)]
+
+        xp.multiply(tmp_blk, w_blk[None, :], out=work[:, :pb])
+        bar_Lchol -= work[:, :pb] @ B_blk.T
+
+    bar_Lchol = xp.tril(bar_Lchol)
+    return tmp, bar_Lchol
 
 
 def chol_lower_adjoint(L: Any, bar_L: Any) -> Any:

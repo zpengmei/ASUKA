@@ -926,6 +926,149 @@ __global__ void KernelDFSymmetrizeQmnInplace(
   }
 }
 
+__device__ __forceinline__ void TriUnpackS2Index(int64_t p, int& m, int& n) {
+  // Invert p = m*(m+1)/2 + n with m>=n>=0.
+  // Use sqrt approximation with robust fix-up to avoid rare off-by-one from FP rounding.
+  if (p <= 0) {
+    m = 0;
+    n = static_cast<int>(p);
+    return;
+  }
+  const double x = sqrt(8.0 * static_cast<double>(p) + 1.0);
+  int64_t mm = static_cast<int64_t>((x - 1.0) * 0.5);
+  int64_t t = mm * (mm + 1) / 2;
+  while (t > p) {
+    --mm;
+    t = mm * (mm + 1) / 2;
+  }
+  while (true) {
+    const int64_t mm1 = mm + 1;
+    const int64_t tnext = mm1 * (mm1 + 1) / 2;
+    if (tnext <= p) {
+      mm = mm1;
+      t = tnext;
+    } else {
+      break;
+    }
+  }
+  m = static_cast<int>(mm);
+  n = static_cast<int>(p - t);
+}
+
+__global__ void KernelDFPackMnQToQp(
+    const double* in_mnQ,  // (nao, nao, naux), C-order ((m*nao+n)*naux+q)
+    double* out_Qp,        // (naux, ntri), C-order (q*ntri+p)
+    int nao,
+    int naux) {
+  const int64_t stride = static_cast<int64_t>(blockDim.x) * static_cast<int64_t>(gridDim.x);
+  int64_t tid = static_cast<int64_t>(blockIdx.x) * static_cast<int64_t>(blockDim.x) + static_cast<int64_t>(threadIdx.x);
+  const int64_t ntri = static_cast<int64_t>(nao) * static_cast<int64_t>(nao + 1) / 2;
+  const int64_t total = static_cast<int64_t>(naux) * ntri;
+  for (; tid < total; tid += stride) {
+    const int q = static_cast<int>(tid / ntri);
+    const int64_t p = tid - static_cast<int64_t>(q) * ntri;
+    int m, n;
+    TriUnpackS2Index(p, m, n);
+    const int64_t idx_in = (static_cast<int64_t>(m) * static_cast<int64_t>(nao) + static_cast<int64_t>(n)) *
+                               static_cast<int64_t>(naux) +
+                           static_cast<int64_t>(q);
+    out_Qp[tid] = in_mnQ[idx_in];
+  }
+}
+
+__global__ void KernelDFPackQmnToQp(
+    const double* in_Qmn,  // (naux, nao, nao), C-order ((q*nao+m)*nao+n)
+    double* out_Qp,        // (naux, ntri), C-order (q*ntri+p)
+    int naux,
+    int nao) {
+  const int64_t stride = static_cast<int64_t>(blockDim.x) * static_cast<int64_t>(gridDim.x);
+  int64_t tid = static_cast<int64_t>(blockIdx.x) * static_cast<int64_t>(blockDim.x) + static_cast<int64_t>(threadIdx.x);
+  const int64_t ntri = static_cast<int64_t>(nao) * static_cast<int64_t>(nao + 1) / 2;
+  const int64_t total = static_cast<int64_t>(naux) * ntri;
+  for (; tid < total; tid += stride) {
+    const int q = static_cast<int>(tid / ntri);
+    const int64_t p = tid - static_cast<int64_t>(q) * ntri;
+    int m, n;
+    TriUnpackS2Index(p, m, n);
+    const int64_t idx_in = (static_cast<int64_t>(q) * static_cast<int64_t>(nao) + static_cast<int64_t>(m)) *
+                               static_cast<int64_t>(nao) +
+                           static_cast<int64_t>(n);
+    out_Qp[tid] = in_Qmn[idx_in];
+  }
+}
+
+__global__ void KernelDFPackQmnBlockToQp(
+    const double* in_Qmn_block,  // (q_count, nao, nao), C-order ((q*nao+m)*nao+n)
+    double* out_Qp_block,        // (q_count, ntri), C-order (q*ntri+p)
+    int q_count,
+    int nao) {
+  const int64_t stride = static_cast<int64_t>(blockDim.x) * static_cast<int64_t>(gridDim.x);
+  int64_t tid = static_cast<int64_t>(blockIdx.x) * static_cast<int64_t>(blockDim.x) + static_cast<int64_t>(threadIdx.x);
+  const int64_t ntri = static_cast<int64_t>(nao) * static_cast<int64_t>(nao + 1) / 2;
+  const int64_t total = static_cast<int64_t>(q_count) * ntri;
+  for (; tid < total; tid += stride) {
+    const int q = static_cast<int>(tid / ntri);
+    const int64_t p = tid - static_cast<int64_t>(q) * ntri;
+    int m, n;
+    TriUnpackS2Index(p, m, n);
+    const int64_t idx_in = (static_cast<int64_t>(q) * static_cast<int64_t>(nao) + static_cast<int64_t>(m)) *
+                               static_cast<int64_t>(nao) +
+                           static_cast<int64_t>(n);
+    out_Qp_block[tid] = in_Qmn_block[idx_in];
+  }
+}
+
+__global__ void KernelDFUnpackQpToQmnBlock(
+    const double* in_Qp,   // (naux, ntri), C-order (q*ntri+p)
+    double* out_Qmn_block, // (q_count, nao, nao), C-order ((q*nao+m)*nao+n)
+    int nao,
+    int naux,
+    int q0,
+    int q_count) {
+  const int64_t stride = static_cast<int64_t>(blockDim.x) * static_cast<int64_t>(gridDim.x);
+  int64_t tid = static_cast<int64_t>(blockIdx.x) * static_cast<int64_t>(blockDim.x) + static_cast<int64_t>(threadIdx.x);
+  const int64_t ntri = static_cast<int64_t>(nao) * static_cast<int64_t>(nao + 1) / 2;
+  const int64_t total = static_cast<int64_t>(q_count) * ntri;
+  for (; tid < total; tid += stride) {
+    const int q_local = static_cast<int>(tid / ntri);
+    const int64_t p = tid - static_cast<int64_t>(q_local) * ntri;
+    const int q = int(q0 + q_local);
+    if (q < 0 || q >= naux) continue;
+    int m, n;
+    TriUnpackS2Index(p, m, n);
+    const double v = in_Qp[static_cast<int64_t>(q) * ntri + p];
+    const int64_t base = static_cast<int64_t>(q_local) * static_cast<int64_t>(nao) * static_cast<int64_t>(nao);
+    out_Qmn_block[base + static_cast<int64_t>(m) * static_cast<int64_t>(nao) + static_cast<int64_t>(n)] = v;
+    out_Qmn_block[base + static_cast<int64_t>(n) * static_cast<int64_t>(nao) + static_cast<int64_t>(m)] = v;
+  }
+}
+
+__global__ void KernelDFUnpackQpToMnQ(
+    const double* in_Qp,  // (naux, ntri), C-order (q*ntri+p)
+    double* out_mnQ,      // (nao, nao, naux), C-order ((m*nao+n)*naux+q)
+    int nao,
+    int naux) {
+  const int64_t stride = static_cast<int64_t>(blockDim.x) * static_cast<int64_t>(gridDim.x);
+  int64_t tid = static_cast<int64_t>(blockIdx.x) * static_cast<int64_t>(blockDim.x) + static_cast<int64_t>(threadIdx.x);
+  const int64_t ntri = static_cast<int64_t>(nao) * static_cast<int64_t>(nao + 1) / 2;
+  const int64_t total = static_cast<int64_t>(naux) * ntri;
+  for (; tid < total; tid += stride) {
+    const int q = static_cast<int>(tid / ntri);
+    const int64_t p = tid - static_cast<int64_t>(q) * ntri;
+    int m, n;
+    TriUnpackS2Index(p, m, n);
+    const double v = in_Qp[tid];
+    const int64_t idx_mn =
+        (static_cast<int64_t>(m) * static_cast<int64_t>(nao) + static_cast<int64_t>(n)) * static_cast<int64_t>(naux) +
+        static_cast<int64_t>(q);
+    const int64_t idx_nm =
+        (static_cast<int64_t>(n) * static_cast<int64_t>(nao) + static_cast<int64_t>(m)) * static_cast<int64_t>(naux) +
+        static_cast<int64_t>(q);
+    out_mnQ[idx_mn] = v;
+    out_mnQ[idx_nm] = v;
+  }
+}
+
 }  // namespace
 
 extern "C" cudaError_t cueri_scatter_df_metric_tiles_launch_stream(
@@ -1057,5 +1200,89 @@ extern "C" cudaError_t cueri_df_symmetrize_qmn_to_mnq_to_f32_launch_stream(
   if (n == 0) return cudaSuccess;
   const int blocks = static_cast<int>((n + static_cast<int64_t>(threads) - 1) / static_cast<int64_t>(threads));
   KernelDFSymmetrizeQmnToMnQToF32<<<blocks, threads, 0, stream>>>(in_Qmn, out_mnQ, naux, nao);
+  return cudaGetLastError();
+}
+
+extern "C" cudaError_t cueri_df_pack_mnq_to_qp_launch_stream(
+    const double* in_mnQ,
+    double* out_Qp,
+    int nao,
+    int naux,
+    cudaStream_t stream,
+    int threads) {
+  if (nao < 0 || naux < 0 || threads <= 0) return cudaErrorInvalidValue;
+  const int64_t ntri = static_cast<int64_t>(nao) * static_cast<int64_t>(nao + 1) / 2;
+  const int64_t n = static_cast<int64_t>(naux) * ntri;
+  if (n == 0) return cudaSuccess;
+  const int blocks = static_cast<int>((n + static_cast<int64_t>(threads) - 1) / static_cast<int64_t>(threads));
+  KernelDFPackMnQToQp<<<blocks, threads, 0, stream>>>(in_mnQ, out_Qp, nao, naux);
+  return cudaGetLastError();
+}
+
+extern "C" cudaError_t cueri_df_pack_qmn_to_qp_launch_stream(
+    const double* in_Qmn,
+    double* out_Qp,
+    int naux,
+    int nao,
+    cudaStream_t stream,
+    int threads) {
+  if (naux < 0 || nao < 0 || threads <= 0) return cudaErrorInvalidValue;
+  const int64_t ntri = static_cast<int64_t>(nao) * static_cast<int64_t>(nao + 1) / 2;
+  const int64_t n = static_cast<int64_t>(naux) * ntri;
+  if (n == 0) return cudaSuccess;
+  const int blocks = static_cast<int>((n + static_cast<int64_t>(threads) - 1) / static_cast<int64_t>(threads));
+  KernelDFPackQmnToQp<<<blocks, threads, 0, stream>>>(in_Qmn, out_Qp, naux, nao);
+  return cudaGetLastError();
+}
+
+extern "C" cudaError_t cueri_df_pack_qmn_block_to_qp_launch_stream(
+    const double* in_Qmn_block,
+    double* out_Qp_block,
+    int q_count,
+    int nao,
+    cudaStream_t stream,
+    int threads) {
+  if (q_count < 0 || nao < 0 || threads <= 0) return cudaErrorInvalidValue;
+  const int64_t ntri = static_cast<int64_t>(nao) * static_cast<int64_t>(nao + 1) / 2;
+  const int64_t n = static_cast<int64_t>(q_count) * ntri;
+  if (n == 0) return cudaSuccess;
+  const int blocks = static_cast<int>((n + static_cast<int64_t>(threads) - 1) / static_cast<int64_t>(threads));
+  KernelDFPackQmnBlockToQp<<<blocks, threads, 0, stream>>>(in_Qmn_block, out_Qp_block, q_count, nao);
+  return cudaGetLastError();
+}
+
+extern "C" cudaError_t cueri_df_unpack_qp_to_qmn_block_launch_stream(
+    const double* in_Qp,
+    double* out_Qmn_block,
+    int naux,
+    int nao,
+    int q0,
+    int q_count,
+    cudaStream_t stream,
+    int threads) {
+  if (naux < 0 || nao < 0 || q0 < 0 || q_count < 0 || threads <= 0) return cudaErrorInvalidValue;
+  if (q0 > naux) return cudaErrorInvalidValue;
+  if (q_count > naux - q0) return cudaErrorInvalidValue;
+  const int64_t ntri = static_cast<int64_t>(nao) * static_cast<int64_t>(nao + 1) / 2;
+  const int64_t n = static_cast<int64_t>(q_count) * ntri;
+  if (n == 0) return cudaSuccess;
+  const int blocks = static_cast<int>((n + static_cast<int64_t>(threads) - 1) / static_cast<int64_t>(threads));
+  KernelDFUnpackQpToQmnBlock<<<blocks, threads, 0, stream>>>(in_Qp, out_Qmn_block, nao, naux, q0, q_count);
+  return cudaGetLastError();
+}
+
+extern "C" cudaError_t cueri_df_unpack_qp_to_mnq_launch_stream(
+    const double* in_Qp,
+    double* out_mnQ,
+    int naux,
+    int nao,
+    cudaStream_t stream,
+    int threads) {
+  if (naux < 0 || nao < 0 || threads <= 0) return cudaErrorInvalidValue;
+  const int64_t ntri = static_cast<int64_t>(nao) * static_cast<int64_t>(nao + 1) / 2;
+  const int64_t n = static_cast<int64_t>(naux) * ntri;
+  if (n == 0) return cudaSuccess;
+  const int blocks = static_cast<int>((n + static_cast<int64_t>(threads) - 1) / static_cast<int64_t>(threads));
+  KernelDFUnpackQpToMnQ<<<blocks, threads, 0, stream>>>(in_Qp, out_mnQ, nao, naux);
   return cudaGetLastError();
 }

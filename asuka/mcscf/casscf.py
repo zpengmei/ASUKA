@@ -605,18 +605,45 @@ def run_casscf_df(
     if not bool(getattr(scf_out.scf, "converged", False)):
         raise RuntimeError("SCF must be converged before CASSCF")
 
-    # DF-CASSCF assumes AO DF factors in mnQ layout (B[mu,nu,Q]).
-    B = getattr(scf_out, "df_B", None)
+    # Keep the incoming SCF object unchanged in the returned result.
+    # CASSCF now accepts both DF layouts directly:
+    # - mnQ: (nao, nao, naux)
+    # - Qp:  (naux, nao*(nao+1)//2)
+    scf_out_in = scf_out
+    packed_qp_input = False
+
+    B = getattr(scf_out_in, "df_B", None)
     if B is None:
         raise ValueError("DF-CASSCF requires scf_out.df_B (cached DF factors)")
     B_shape = getattr(B, "shape", None)
-    if B_shape is None or len(B_shape) != 3:
-        raise ValueError("scf_out.df_B must be a 3D tensor with shape (nao, nao, naux) (mnQ layout)")
-    nao_work = int(getattr(getattr(scf_out, "int1e"), "S").shape[0])
-    if int(B_shape[0]) != int(nao_work) or int(B_shape[1]) != int(nao_work):
+    nao_work = int(getattr(getattr(scf_out_in, "int1e"), "S").shape[0])
+    if B_shape is None:
+        raise ValueError("scf_out.df_B must have a shape")
+
+    if len(B_shape) == 2:
+        packed_qp_input = True
+        from asuka.integrals.tri_packed import ntri_from_nao  # noqa: PLC0415
+
+        naux, ntri = map(int, B_shape)
+        expected_ntri = int(ntri_from_nao(int(nao_work)))
+        if int(ntri) != int(expected_ntri):
+            raise ValueError(
+                "Packed DF factors must have shape (naux, nao*(nao+1)/2). "
+                f"Got df_B.shape={tuple(map(int, B_shape))} but expected ntri={int(expected_ntri)} for nao={int(nao_work)}."
+            )
+        naux_df_work = int(naux)
+    elif len(B_shape) == 3:
+        if int(B_shape[0]) != int(nao_work) or int(B_shape[1]) != int(nao_work):
+            raise ValueError(
+                "DF-CASSCF requires scf_out.df_B in mnQ layout (nao,nao,naux) "
+                f"or packed Qp layout (naux,ntri). Got df_B.shape={tuple(map(int, B_shape))} for nao={int(nao_work)}."
+            )
+        naux_df_work = int(B_shape[2])
+    else:
         raise ValueError(
-            "DF-CASSCF currently requires df_layout='mnQ' (B[mu,nu,Q] with shape (nao,nao,naux)). "
-            f"Got df_B.shape={tuple(map(int, B_shape))} for nao={int(nao_work)}."
+            "DF-CASSCF requires scf_out.df_B in mnQ layout (nao,nao,naux) "
+            "or packed Qp layout (naux,ntri). "
+            f"Got df_B.shape={tuple(map(int, B_shape))}."
         )
 
     ncore = int(ncore)
@@ -660,6 +687,9 @@ def run_casscf_df(
     orbital_optimizer = str(orbital_optimizer).strip().lower()
     if orbital_optimizer not in {"jacobi", "lbfgs", "ah", "1step"}:
         raise ValueError("orbital_optimizer must be one of: 'jacobi', 'lbfgs', 'ah', '1step'")
+    newton_aux_block_naux = int(newton_aux_block_naux)
+    if newton_aux_block_naux < 0:
+        raise ValueError("newton_aux_block_naux must be >= 0")
     lbfgs_history = int(lbfgs_history)
     if lbfgs_history < 0:
         raise ValueError("lbfgs_history must be >= 0")
@@ -760,6 +790,35 @@ def run_casscf_df(
     casci_backend_s = str(casci_backend).strip().lower()
     if casci_backend_s not in {"df", "dense_cpu", "dense_gpu"}:
         raise ValueError("casci_backend must be one of: 'df', 'dense_cpu', 'dense_gpu'")
+
+    _newton_aux_block_env = os.environ.get("ASUKA_NEWTON_AUX_BLOCK_NAUX")
+    if _newton_aux_block_env not in (None, ""):
+        try:
+            _newton_aux_block_env_i = int(_newton_aux_block_env)
+        except Exception as exc:
+            raise ValueError("ASUKA_NEWTON_AUX_BLOCK_NAUX must be an integer") from exc
+        if _newton_aux_block_env_i < 0:
+            raise ValueError("ASUKA_NEWTON_AUX_BLOCK_NAUX must be >= 0")
+        newton_aux_block_naux = int(_newton_aux_block_env_i)
+
+    # Packed-Qp Newton AO2MO should run aux-blocked by default to avoid
+    # multi-GB monolithic temporaries.
+    if (
+        packed_qp_input
+        and casci_backend_s == "df"
+        and orbital_optimizer in {"ah", "1step"}
+        and int(newton_aux_block_naux) <= 0
+        and int(naux_df_work) > 0
+    ):
+        auto_block = min(int(naux_df_work), 128)
+        if auto_block >= 1:
+            newton_aux_block_naux = int(auto_block)
+            if _normalize_bool_env(os.environ.get("ASUKA_VRAM_DEBUG"), default=False):
+                print(
+                    "[VRAM_POLICY] run_casscf_df: "
+                    f"auto newton_aux_block_naux={int(newton_aux_block_naux)} "
+                    "for packed-Qp input"
+                )
 
     matvec_backend_s = str(matvec_backend).strip().lower()
     if casci_backend_s == "dense_cpu" and matvec_backend_s != "contract":
@@ -862,7 +921,16 @@ def run_casscf_df(
         and matvec_backend_s in {"cuda_eri_mat", "cuda"}
     )
     b_cache_est_nbytes = _estimate_b_whitened_nbytes(scf_out.ao_basis, scf_out.aux_basis) if b_cache_enabled else 0
-    if b_cache_enabled and b_cache_est_nbytes > 0 and b_cache_est_nbytes > max_b_cache_bytes:
+    b_cache_candidate_nbytes = int(b_cache_est_nbytes)
+    if b_cache_enabled:
+        _seed_probe = getattr(scf_out, "df_B", None)
+        try:
+            _seed_nbytes = int(getattr(_seed_probe, "nbytes", 0))
+        except Exception:
+            _seed_nbytes = 0
+        if _seed_nbytes > 0:
+            b_cache_candidate_nbytes = int(_seed_nbytes)
+    if b_cache_enabled and b_cache_candidate_nbytes > 0 and b_cache_candidate_nbytes > max_b_cache_bytes:
         b_cache_enabled = False
 
     if fcisolver is None:
@@ -938,9 +1006,17 @@ def run_casscf_df(
             except Exception:  # pragma: no cover
                 cp = None  # type: ignore
             if cp is not None and isinstance(B_seed, cp.ndarray):  # type: ignore[attr-defined]
-                if B_seed.dtype == cp.float64 and B_seed.ndim == 3:  # type: ignore[attr-defined]
-                    nao_b, nao_b1, _naux_b = map(int, B_seed.shape)
-                    if nao_b == nao_b1 and nao_b == int(C.shape[0]) and int(B_seed.nbytes) <= int(max_b_cache_bytes):
+                if B_seed.dtype == cp.float64:  # type: ignore[attr-defined]
+                    _seed_ok = False
+                    if int(B_seed.ndim) == 3:
+                        nao_b, nao_b1, _naux_b = map(int, B_seed.shape)
+                        _seed_ok = bool(nao_b == nao_b1 and nao_b == int(C.shape[0]))
+                    elif int(B_seed.ndim) == 2:
+                        from asuka.integrals.tri_packed import ntri_from_nao  # noqa: PLC0415
+
+                        _naux_b, _ntri_b = map(int, B_seed.shape)
+                        _seed_ok = bool(_ntri_b == int(ntri_from_nao(int(C.shape[0]))))
+                    if _seed_ok and int(B_seed.nbytes) <= int(max_b_cache_bytes):
                         if hasattr(B_seed, "flags") and not bool(B_seed.flags.c_contiguous):
                             B_seed = cp.ascontiguousarray(B_seed)
                         cached_b_whitened = B_seed
@@ -955,12 +1031,13 @@ def run_casscf_df(
             b_cache_disabled_reason = f"casci_backend={casci_backend_s}"
         elif matvec_backend_s not in {"cuda_eri_mat", "cuda"}:
             b_cache_disabled_reason = f"matvec_backend={matvec_backend_s}"
-        elif b_cache_est_nbytes > max_b_cache_bytes:
+        elif b_cache_candidate_nbytes > max_b_cache_bytes:
             b_cache_disabled_reason = "estimated_cache_too_large"
     if profile is not None:
         profile["cueri_b_cache_enabled"] = bool(b_cache_enabled)
         profile["cueri_b_cache_max_bytes"] = int(max_b_cache_bytes)
         profile["cueri_b_cache_estimated_bytes"] = int(b_cache_est_nbytes)
+        profile["cueri_b_cache_candidate_bytes"] = int(b_cache_candidate_nbytes)
         profile["orbital_diis_enabled"] = bool(diis is not None and diis.enabled)
         profile["orbital_diis_start_cycle"] = int(diis_start_cycle)
         profile["orbital_diis_space"] = int(diis_space)
@@ -986,6 +1063,7 @@ def run_casscf_df(
         profile["ah_conv_tol_grad"] = float(ah_conv_tol_grad)
         profile["ah_conv_tol_energy"] = float(ah_conv_tol_energy)
         profile["ah_ci_update"] = str(ah_ci_update)
+        profile["newton_aux_block_naux"] = int(newton_aux_block_naux)
         profile["dense_gpu_ao_rep"] = str(dense_gpu_ao_rep)
         profile["dense_exact_jk"] = bool(dense_exact_jk)
         if b_cache_disabled_reason is not None:
@@ -2075,10 +2153,18 @@ def run_casscf_df(
             C = C_np[:, perm] if xp is np else xp.asarray(C_np[:, perm], dtype=xp.float64)
             mo_energy = eps_cas[perm]
 
+    # Ensure returned CASCI/CASSCF objects keep the original scf_out (which may hold packed df_B).
+    try:
+        from dataclasses import replace as _dc_replace  # noqa: PLC0415
+
+        casci_out = _dc_replace(casci_out, scf_out=scf_out_in)
+    except Exception:
+        pass
+
     result = CASSCFResult(
-        mol=scf_out.mol,
-        basis_name=str(scf_out.basis_name),
-        auxbasis_name=str(scf_out.auxbasis_name),
+        mol=scf_out_in.mol,
+        basis_name=str(scf_out_in.basis_name),
+        auxbasis_name=str(scf_out_in.auxbasis_name),
         converged=bool(converged),
         niter=int(it),
         ncore=int(ncore),
@@ -2095,7 +2181,7 @@ def run_casscf_df(
         grad_norm=float(grad_norm),
         casci=casci_out,
         profile=profile,
-        scf_out=scf_out,
+        scf_out=scf_out_in,
     )
     _restore_cuda_pool()
     return result

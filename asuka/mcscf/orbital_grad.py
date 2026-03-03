@@ -23,15 +23,24 @@ with `g` being the generalized "Fock-like" matrix described in
 
 from typing import Any
 
+import os
 import time
 import numpy as np
 
+from asuka.hf import df_jk as _df_jk
 from asuka.hf import df_scf as _df_scf
 from asuka.utils.einsum_cache import cached_einsum
 
 
 def _as_xp_f64(xp: Any, a: Any) -> Any:
     return xp.asarray(a, dtype=xp.float64)
+
+
+def _bool_env(name: str, default: bool) -> bool:
+    v = os.environ.get(str(name))
+    if v is None:
+        return bool(default)
+    return str(v).strip().lower() not in {"0", "false", "no", "off"}
 
 
 def _asnumpy_f64(a: Any) -> np.ndarray:
@@ -386,6 +395,10 @@ def orbital_gradient_df(
     dm1_act = np.asarray(dm1_act, dtype=np.float64)
     if dm1_act.shape != (ncas, ncas):
         raise ValueError(f"dm1_act must have shape {(ncas, ncas)}, got {tuple(dm1_act.shape)}")
+    dm1_act = 0.5 * (dm1_act + dm1_act.T)
+    dm1_act = 0.5 * (dm1_act + dm1_act.T)
+    dm1_act = 0.5 * (dm1_act + dm1_act.T)
+    dm1_act = 0.5 * (dm1_act + dm1_act.T)
 
     dm2_arr = np.asarray(dm2_act, dtype=np.float64)
     if dm2_arr.shape == (ncas, ncas, ncas, ncas):
@@ -427,8 +440,60 @@ def orbital_gradient_df(
             _gpu_jk_events = None
 
     # AO potentials: core and active JK (for generalized Fock pieces and preconditioner)
-    Jc, Kc = _df_scf._df_JK(B, D_core_ao, want_J=True, want_K=True)  # noqa: SLF001
-    Ja, Ka = _df_scf._df_JK(B, D_act_ao, want_J=True, want_K=True)  # noqa: SLF001
+    # Default to occupied-driven K on GPU only (CPU performance can be better
+    # with the dense-D path depending on BLAS/tensor sizes).
+    use_cocc_k = (xp is not np) and _bool_env("ASUKA_MCSCF_DF_K_COCC", True)
+    if use_cocc_k:
+        q_block = _df_scf._env_int("ASUKA_DF_JK_K_QBLOCK", 128)  # noqa: SLF001
+        q_block = max(1, min(int(B.shape[2]), int(q_block)))
+
+        if ncore:
+            Jc, _ = _df_scf._df_JK(B, D_core_ao, want_J=True, want_K=False)  # noqa: SLF001
+            occ_core = xp.full((int(ncore),), 2.0, dtype=xp.float64)
+            Kc = _df_jk.df_K_from_BmnQ_Cocc(B, C_core, occ_core, q_block=int(q_block))
+        else:
+            Jc = xp.zeros((nao, nao), dtype=xp.float64)
+            Kc = xp.zeros((nao, nao), dtype=xp.float64)
+
+        Ja, _ = _df_scf._df_JK(B, D_act_ao, want_J=True, want_K=False)  # noqa: SLF001
+        w_h, U_h = np.linalg.eigh(dm1_act)
+        if float(np.min(w_h)) < -1e-8:
+            # Active 1-RDM must be PSD for occupied-driven K (sqrt(occ)).
+            # Fall back to dense-D K if numerical noise is unexpectedly large.
+            _, Ka = _df_scf._df_JK(B, D_act_ao, want_J=False, want_K=True)  # noqa: SLF001
+        else:
+            w_h = np.clip(w_h, 0.0, None)
+            w = _as_xp_f64(xp, w_h)
+            U = _as_xp_f64(xp, U_h)
+            C_no = C_act @ U
+            Ka = _df_jk.df_K_from_BmnQ_Cocc(B, C_no, w, q_block=int(q_block))
+    else:
+        use_cocc_k = (xp is not np) and _bool_env("ASUKA_MCSCF_DF_K_COCC", True)
+        if use_cocc_k:
+            q_block = _df_scf._env_int("ASUKA_DF_JK_K_QBLOCK", 128)  # noqa: SLF001
+            q_block = max(1, min(int(B.shape[2]), int(q_block)))
+
+            if ncore:
+                Jc, _ = _df_scf._df_JK(B, D_core_ao, want_J=True, want_K=False)  # noqa: SLF001
+                occ_core = xp.full((int(ncore),), 2.0, dtype=xp.float64)
+                Kc = _df_jk.df_K_from_BmnQ_Cocc(B, C_core, occ_core, q_block=int(q_block))
+            else:
+                Jc = xp.zeros((nao, nao), dtype=xp.float64)
+                Kc = xp.zeros((nao, nao), dtype=xp.float64)
+
+            Ja, _ = _df_scf._df_JK(B, D_act_ao, want_J=True, want_K=False)  # noqa: SLF001
+            w_h, U_h = np.linalg.eigh(dm1_act)
+            if float(np.min(w_h)) < -1e-8:
+                _, Ka = _df_scf._df_JK(B, D_act_ao, want_J=False, want_K=True)  # noqa: SLF001
+            else:
+                w_h = np.clip(w_h, 0.0, None)
+                w = _as_xp_f64(xp, w_h)
+                U = _as_xp_f64(xp, U_h)
+                C_no = C_act @ U
+                Ka = _df_jk.df_K_from_BmnQ_Cocc(B, C_no, w, q_block=int(q_block))
+        else:
+            Jc, Kc = _df_scf._df_JK(B, D_core_ao, want_J=True, want_K=True)  # noqa: SLF001
+            Ja, Ka = _df_scf._df_JK(B, D_act_ao, want_J=True, want_K=True)  # noqa: SLF001
     vhf_c_ao = Jc - 0.5 * Kc
     vhf_a_ao = Ja - 0.5 * Ka
     vhf_ca_ao = vhf_c_ao + vhf_a_ao
@@ -1060,8 +1125,32 @@ def orbital_gradient_dense(
         Jc, Kc = _jk_exact(D_core_ao)
         Ja, Ka = _jk_exact(D_act_ao)
     else:
-        Jc, Kc = _df_scf._df_JK(B, D_core_ao, want_J=True, want_K=True)  # noqa: SLF001
-        Ja, Ka = _df_scf._df_JK(B, D_act_ao, want_J=True, want_K=True)  # noqa: SLF001
+        use_cocc_k = (xp is not np) and _bool_env("ASUKA_MCSCF_DF_K_COCC", True)
+        if use_cocc_k:
+            q_block = _df_scf._env_int("ASUKA_DF_JK_K_QBLOCK", 128)  # noqa: SLF001
+            q_block = max(1, min(int(B.shape[2]), int(q_block)))
+
+            if ncore:
+                Jc, _ = _df_scf._df_JK(B, D_core_ao, want_J=True, want_K=False)  # noqa: SLF001
+                occ_core = xp.full((int(ncore),), 2.0, dtype=xp.float64)
+                Kc = _df_jk.df_K_from_BmnQ_Cocc(B, C_core, occ_core, q_block=int(q_block))
+            else:
+                Jc = xp.zeros((nao, nao), dtype=xp.float64)
+                Kc = xp.zeros((nao, nao), dtype=xp.float64)
+
+            Ja, _ = _df_scf._df_JK(B, D_act_ao, want_J=True, want_K=False)  # noqa: SLF001
+            w_h, U_h = np.linalg.eigh(dm1_act)
+            if float(np.min(w_h)) < -1e-8:
+                _, Ka = _df_scf._df_JK(B, D_act_ao, want_J=False, want_K=True)  # noqa: SLF001
+            else:
+                w_h = np.clip(w_h, 0.0, None)
+                w = _as_xp_f64(xp, w_h)
+                U = _as_xp_f64(xp, U_h)
+                C_no = C_act @ U
+                Ka = _df_jk.df_K_from_BmnQ_Cocc(B, C_no, w, q_block=int(q_block))
+        else:
+            Jc, Kc = _df_scf._df_JK(B, D_core_ao, want_J=True, want_K=True)  # noqa: SLF001
+            Ja, Ka = _df_scf._df_JK(B, D_act_ao, want_J=True, want_K=True)  # noqa: SLF001
     vhf_c_ao = Jc - 0.5 * Kc
     vhf_a_ao = Ja - 0.5 * Ka
     vhf_ca_ao = vhf_c_ao + vhf_a_ao

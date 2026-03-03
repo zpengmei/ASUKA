@@ -16,8 +16,10 @@ Tests may compare against PySCF.
 from dataclasses import dataclass
 from typing import Any
 
+import os
 import numpy as np
 
+from asuka.hf import df_jk as _df_jk
 from asuka.hf import df_scf as _df_scf
 from asuka.mcscf.orbital_grad import cayley_update
 from asuka.utils.einsum_cache import cached_einsum
@@ -138,7 +140,8 @@ def build_df_newton_eris(
     Parameters
     ----------
     B_ao : Any
-        Density fitting tensor (nao, nao, naux).
+        Density fitting tensor in mnQ ``(nao, nao, naux)`` or packed Qp
+        ``(naux, nao*(nao+1)//2)`` layout.
     mo_coeff : Any
         Molecular orbital coefficients.
     ncore : int
@@ -175,22 +178,50 @@ def build_df_newton_eris(
         raise ValueError("ncore must be >= 0")
     if ncas <= 0:
         raise ValueError("ncas must be > 0")
-    if B.ndim != 3:
-        raise ValueError("B_ao must have shape (nao,nao,naux)")
     if mo.ndim != 2:
         raise ValueError("mo_coeff must have shape (nao,nmo)")
-    nao0, nao1, naux = map(int, B.shape)
-    if nao0 != nao1:
-        raise ValueError("B_ao must have shape (nao,nao,naux)")
     nao, nmo = map(int, mo.shape)
-    if nao != nao0:
-        raise ValueError("B_ao and mo_coeff nao mismatch")
     nocc = ncore + ncas
     if nocc > nmo:
         raise ValueError("ncore+ncas exceeds nmo")
 
     _cdtype = xp.float32 if mixed_precision else xp.float64
     act = slice(ncore, nocc)
+
+    # Packed-Qp path: always use aux-blocked transform to avoid ever
+    # materializing full mnQ.
+    if int(B.ndim) == 2:
+        naux, ntri = map(int, B.shape)
+        expected_ntri = int(nao * (nao + 1) // 2)
+        if int(ntri) != int(expected_ntri):
+            raise ValueError(
+                "packed B_ao must have shape (naux, nao*(nao+1)//2); "
+                f"got ntri={int(ntri)} for nao={int(nao)}"
+            )
+        block_q = int(aux_block_naux)
+        if block_q <= 0:
+            block_q = min(int(naux), 128 if bool(_is_gpu) else 64)
+        return _build_df_newton_eris_blocked_qp(
+            xp,
+            B,
+            mo,
+            ncore=ncore,
+            ncas=ncas,
+            nmo=nmo,
+            naux=naux,
+            nocc=nocc,
+            act=act,
+            cdtype=_cdtype,
+            block_size=int(block_q),
+        )
+
+    if int(B.ndim) != 3:
+        raise ValueError("B_ao must have shape (nao,nao,naux) or packed (naux,ntri)")
+    nao0, nao1, naux = map(int, B.shape)
+    if nao0 != nao1:
+        raise ValueError("B_ao must have shape (nao,nao,naux)")
+    if nao != nao0:
+        raise ValueError("B_ao and mo_coeff nao mismatch")
 
     if aux_block_naux > 0:
         return _build_df_newton_eris_blocked(
@@ -267,6 +298,106 @@ def build_df_newton_eris(
     return DFNewtonERIs(
         ppaa=ppaa, papa=papa, vhf_c=vhf_c, j_pc=j_pc, k_pc=k_pc,
         L_pu=L_pu_f64, L_pi=L_pi_f64, L_uv=L_act_f64,
+    )
+
+
+def _build_df_newton_eris_blocked_qp(
+    xp,
+    B_Qp: Any,
+    mo: Any,
+    *,
+    ncore: int,
+    ncas: int,
+    nmo: int,
+    naux: int,
+    nocc: int,
+    act: slice,
+    cdtype: Any,
+    block_size: int,
+) -> DFNewtonERIs:
+    """Aux-blocked Newton ERIs directly from packed Qp DF factors.
+
+    This avoids materializing full mnQ and unpacks only one aux chunk at a time.
+    """
+    from asuka.integrals.df_packed_s2 import unpack_Qp_to_Qmn_block  # noqa: PLC0415
+
+    nao = int(mo.shape[0])
+    mo_c = xp.asarray(mo, dtype=cdtype)
+
+    ppaa = xp.zeros((nmo, nmo, ncas, ncas), dtype=xp.float64)
+    papa = xp.zeros((nmo, ncas, nmo, ncas), dtype=xp.float64)
+    j_pc = xp.zeros((nmo, max(ncore, 1)), dtype=xp.float64)[:, :ncore]
+    k_pc = xp.zeros((nmo, max(ncore, 1)), dtype=xp.float64)[:, :ncore]
+    vhf_J = xp.zeros((nmo, nmo), dtype=xp.float64)
+    vhf_K = xp.zeros((nmo, nmo), dtype=xp.float64)
+
+    L_pu_full = xp.zeros((nmo, ncas, naux), dtype=xp.float64)
+    L_pi_full = xp.zeros((nmo, ncore, naux), dtype=xp.float64) if ncore else None
+    L_act_full = xp.zeros((ncas, ncas, naux), dtype=xp.float64)
+
+    for q0 in range(0, naux, block_size):
+        q1 = min(q0 + block_size, naux)
+        q = int(q1 - q0)
+        if q <= 0:
+            continue
+
+        # Qp -> Qmn for the current aux block, then transpose to mnQ.
+        B_qmn = unpack_Qp_to_Qmn_block(B_Qp, nao=int(nao), q0=int(q0), q_count=int(q))  # (q,nao,nao)
+        B_blk = xp.ascontiguousarray(xp.asarray(B_qmn, dtype=cdtype).transpose(1, 2, 0))  # (nao,nao,q)
+        del B_qmn
+
+        tmp = xp.tensordot(B_blk, mo_c, axes=([1], [0]))  # (nao, q, nmo)
+        L_raw = mo_c.T @ tmp.reshape(nao, q * nmo)  # (nmo, q*nmo)
+        del tmp, B_blk
+        L_blk = xp.ascontiguousarray(L_raw.reshape(nmo, q, nmo).transpose(0, 2, 1))
+        del L_raw
+
+        L_blk_f64 = xp.asarray(L_blk, dtype=xp.float64)
+        del L_blk
+
+        L_act_blk = xp.ascontiguousarray(L_blk_f64[act, act])  # (ncas,ncas,q)
+        L_pu_blk = xp.ascontiguousarray(L_blk_f64[:, act])  # (nmo,ncas,q)
+
+        ppaa += cached_einsum("pqQ,uvQ->pquv", L_blk_f64, L_act_blk, xp=xp)
+        papa += cached_einsum("puQ,qvQ->puqv", L_pu_blk, L_pu_blk, xp=xp)
+
+        L_pp_blk = L_blk_f64[xp.arange(nmo), xp.arange(nmo)]  # (nmo,q)
+        if ncore:
+            L_ii_blk = L_pp_blk[:ncore]  # (ncore,q)
+            j_pc += L_pp_blk @ L_ii_blk.T
+            k_pc += cached_einsum("piQ,piQ->pi", L_blk_f64[:, :ncore], L_blk_f64[:, :ncore], xp=xp)
+
+            gamma_blk = L_ii_blk.sum(axis=0)  # (q,)
+            vhf_J += xp.tensordot(L_blk_f64, gamma_blk, axes=([2], [0]))
+            vhf_K += cached_einsum("piQ,qiQ->pq", L_blk_f64[:, :ncore], L_blk_f64[:, :ncore], xp=xp)
+
+        L_pu_full[:, :, q0:q1] = L_pu_blk
+        if L_pi_full is not None:
+            L_pi_full[:, :, q0:q1] = xp.ascontiguousarray(L_blk_f64[:, :ncore])
+        L_act_full[:, :, q0:q1] = L_act_blk
+
+        del L_blk_f64, L_act_blk, L_pu_blk, L_pp_blk
+
+    ppaa = xp.ascontiguousarray(ppaa)
+    papa = xp.ascontiguousarray(papa)
+    j_pc = xp.ascontiguousarray(j_pc)
+    k_pc = xp.ascontiguousarray(k_pc)
+
+    if ncore:
+        vhf_c = xp.ascontiguousarray(2.0 * vhf_J - vhf_K)
+    else:
+        vhf_c = xp.zeros((nmo, nmo), dtype=xp.float64)
+    del vhf_J, vhf_K
+
+    return DFNewtonERIs(
+        ppaa=ppaa,
+        papa=papa,
+        vhf_c=vhf_c,
+        j_pc=j_pc,
+        k_pc=k_pc,
+        L_pu=xp.ascontiguousarray(L_pu_full),
+        L_pi=xp.ascontiguousarray(L_pi_full) if L_pi_full is not None else None,
+        L_uv=xp.ascontiguousarray(L_act_full),
     )
 
 
@@ -545,7 +676,21 @@ def build_dense_newton_eris(
         B = cp.asarray(B_ao_for_vhf, dtype=cp.float64)
         mo_core = mo[:, :ncore]
         D_core = 2.0 * (mo_core @ mo_core.T)
-        Jc, Kc = _df_scf._df_JK(B, D_core, want_J=True, want_K=True)  # noqa: SLF001
+        use_cocc_k = str(os.environ.get("ASUKA_MCSCF_DF_K_COCC", "1")).strip().lower() not in {"0", "false", "no", "off"}
+        if use_cocc_k:
+            # Build J from dense D (cheap) and K from occupied-driven factorization.
+            Jc, _ = _df_scf._df_JK(B, D_core, want_J=True, want_K=False)  # noqa: SLF001
+            try:
+                q_block = int(os.environ.get("ASUKA_DF_JK_K_QBLOCK", "128"))
+            except Exception:
+                q_block = 128
+            # `B` can be mnQ (nao,nao,naux) or packed Qp (naux,ntri).
+            naux = int(B.shape[0]) if int(getattr(B, "ndim", 0)) == 2 else int(B.shape[2])
+            q_block = max(1, min(int(naux), int(q_block)))
+            occ_core = cp.full((int(ncore),), 2.0, dtype=cp.float64)
+            Kc = _df_jk.df_K_from_BmnQ_Cocc(B, mo_core, occ_core, q_block=int(q_block))
+        else:
+            Jc, Kc = _df_scf._df_JK(B, D_core, want_J=True, want_K=True)  # noqa: SLF001
         v_ao = cp.asarray(Jc - 0.5 * Kc, dtype=cp.float64)
         vhf_c = cp.ascontiguousarray(mo.T @ v_ao @ mo)
     elif ao_eri_for_vhf is not None and ncore:

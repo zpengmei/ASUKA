@@ -26,6 +26,253 @@ from . import df_jk
 
 _HF_CPU_EIGH_MAX_NAO = max(0, int(os.environ.get("ASUKA_HF_CPU_EIGH_MAX_NAO", "96")))
 
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(str(os.environ.get(str(name), str(default))).strip())
+    except Exception:
+        return int(default)
+
+
+def _dfjk_k_gpu_impl_pref() -> str:
+    return str(os.environ.get("ASUKA_DF_JK_K_GPU_IMPL", "auto")).strip().lower()
+
+
+def _pick_dfjk_k_gpu_impl(*, xp, nao: int, naux: int) -> str:
+    """Pick the GPU K implementation for _df_JK.
+
+    - mega_gemm: legacy single GEMM path (fast but can peak at ~3x sizeof(B))
+    - qblocked:  block over aux index Q to cap temporaries
+    """
+
+    pref = _dfjk_k_gpu_impl_pref()
+    if pref not in {"auto", "mega_gemm", "qblocked"}:
+        raise ValueError("ASUKA_DF_JK_K_GPU_IMPL must be one of: 'auto', 'mega_gemm', 'qblocked'")
+    if pref != "auto":
+        return str(pref)
+
+    # Heuristic threshold (mirrors df_jk.df_K_from_BQ_D style).
+    use_qblocked = int(nao) * int(nao) * int(naux) >= 10_000_000
+    return "qblocked" if (xp is not np and use_qblocked) else "mega_gemm"
+
+
+def _df_K_qblocked_mnQ(B, D, *, q_block: int) -> Any:
+    """Compute DF-K with aux blocking without materializing O(sizeof(B)) temporaries.
+
+    Inputs
+    - B: (nao, nao, naux), float64
+    - D: (nao, nao), float64
+    """
+
+    xp, _ = _get_xp(B, D)
+    B = _as_xp(xp, B, dtype=xp.float64)
+    D = _as_xp(xp, D, dtype=xp.float64)
+    if B.ndim != 3:
+        raise ValueError("B must have shape (nao, nao, naux)")
+    if D.ndim != 2 or D.shape[0] != D.shape[1]:
+        raise ValueError("D must be a square 2D matrix")
+    nao = int(D.shape[0])
+    if tuple(B.shape[:2]) != (nao, nao):
+        raise ValueError("B and D nao mismatch")
+
+    naux = int(B.shape[2])
+    q_block = int(q_block)
+    if q_block <= 0:
+        raise ValueError("q_block must be > 0")
+    q_block = min(int(naux), int(q_block))
+
+    K = xp.zeros((nao, nao), dtype=xp.float64)
+    for q0 in range(0, int(naux), int(q_block)):
+        q1 = min(int(naux), int(q0) + int(q_block))
+        q = int(q1 - q0)
+        if q <= 0:
+            continue
+
+        # Bq is strided (q is a slice of the last axis); make it contiguous so
+        # the (nao, nao, q) -> (nao, nao*q) reshape is a view.
+        Bq_c = xp.ascontiguousarray(B[:, :, int(q0) : int(q1)])
+        B2 = Bq_c.reshape(nao, nao * q)
+
+        # BQD[m, Q, n] = sum_p B[m, p, Q] * D[p, n]
+        BQD = xp.tensordot(Bq_c, D, axes=([1], [0]))  # (nao, q, nao)
+        M1 = xp.ascontiguousarray(BQD.transpose(0, 2, 1)).reshape(nao, nao * q)
+
+        K += M1 @ B2.T
+
+        # Hint to the allocator that these can be released between blocks.
+        del Bq_c, B2, BQD, M1
+
+    return K
+
+
+def _df_K_qblocked_Qp(B_Qp, D, *, nao: int, q_block: int) -> Any:
+    """Compute DF-K from packed Qp DF factors with aux blocking.
+
+    Inputs
+    - B_Qp: (naux, ntri) packed lower triangle, float64
+    - D:    (nao, nao) density, float64
+
+    This unpacks B in aux blocks to a contiguous (nao,nao,q) buffer and then
+    reuses the same q-blocked algorithm as `_df_K_qblocked_mnQ`.
+    """
+
+    xp, _ = _get_xp(B_Qp, D)
+    B_Qp = _as_xp(xp, B_Qp, dtype=xp.float64)
+    D = _as_xp(xp, D, dtype=xp.float64)
+    if B_Qp.ndim != 2:
+        raise ValueError("B_Qp must have shape (naux, ntri)")
+    if D.ndim != 2 or D.shape[0] != D.shape[1]:
+        raise ValueError("D must be a square 2D matrix")
+
+    nao_i = int(nao)
+    if int(D.shape[0]) != nao_i:
+        raise ValueError("nao mismatch between D and provided nao")
+
+    from asuka.integrals.tri_packed import ntri_from_nao  # noqa: PLC0415
+
+    naux, ntri = map(int, B_Qp.shape)
+    expected_ntri = int(ntri_from_nao(int(nao_i)))
+    if int(ntri) != int(expected_ntri):
+        raise ValueError(
+            "B_Qp must have shape (naux, nao*(nao+1)//2); "
+            f"got ntri={int(ntri)} but expected {int(expected_ntri)} for nao={int(nao_i)}"
+        )
+
+    q_block = int(q_block)
+    if q_block <= 0:
+        raise ValueError("q_block must be > 0")
+    q_block = min(int(naux), int(q_block))
+
+    from asuka.integrals.df_packed_s2 import unpack_Qp_to_Qmn_block  # noqa: PLC0415
+
+    K = xp.zeros((nao_i, nao_i), dtype=xp.float64)
+    for q0 in range(0, int(naux), int(q_block)):
+        q1 = min(int(naux), int(q0) + int(q_block))
+        q = int(q1 - q0)
+        if q <= 0:
+            continue
+
+        # Unpack to (q,nao,nao), then transpose+copy to (nao,nao,q) contiguous
+        # so the reshape below is a view.
+        Bq_qmn = unpack_Qp_to_Qmn_block(B_Qp, nao=int(nao_i), q0=int(q0), q_count=int(q))
+        Bq_c = xp.ascontiguousarray(Bq_qmn.transpose(1, 2, 0))
+        del Bq_qmn
+
+        B2 = Bq_c.reshape(nao_i, nao_i * q)
+        BQD = xp.tensordot(Bq_c, D, axes=([1], [0]))  # (nao, q, nao)
+        M1 = xp.ascontiguousarray(BQD.transpose(0, 2, 1)).reshape(nao_i, nao_i * q)
+        K += M1 @ B2.T
+        del Bq_c, B2, BQD, M1
+
+    return K
+
+
+def _df_K_qblocked_Qp_rows_cols(
+    B_Qp,
+    D,
+    *,
+    nao: int,
+    row0: int,
+    row_count: int,
+    col0: int,
+    col_count: int,
+    q_block: int,
+    col_block: int,
+) -> Any:
+    """Compute selected K block from packed Qp DF factors with aux+col blocking.
+
+    Returns K[row0:row0+row_count, col0:col0+col_count] without materializing
+    full mnQ blocks. Useful for CASSCF AH where only a few K slices are needed.
+    """
+
+    xp, _ = _get_xp(B_Qp, D)
+    B_Qp = _as_xp(xp, B_Qp, dtype=xp.float64)
+    D = _as_xp(xp, D, dtype=xp.float64)
+    if B_Qp.ndim != 2:
+        raise ValueError("B_Qp must have shape (naux, ntri)")
+    if D.ndim != 2 or D.shape[0] != D.shape[1]:
+        raise ValueError("D must be a square 2D matrix")
+
+    nao_i = int(nao)
+    if int(D.shape[0]) != nao_i:
+        raise ValueError("nao mismatch between D and provided nao")
+
+    row0_i = int(row0)
+    row_count_i = int(row_count)
+    col0_i = int(col0)
+    col_count_i = int(col_count)
+    if row0_i < 0 or row_count_i < 0 or col0_i < 0 or col_count_i < 0:
+        raise ValueError("invalid row/col arguments")
+    if row0_i > nao_i or row_count_i > (nao_i - row0_i):
+        raise ValueError("row range out of bounds")
+    if col0_i > nao_i or col_count_i > (nao_i - col0_i):
+        raise ValueError("col range out of bounds")
+    if row_count_i == 0 or col_count_i == 0:
+        return xp.zeros((row_count_i, col_count_i), dtype=xp.float64)
+
+    from asuka.integrals.tri_packed import ntri_from_nao  # noqa: PLC0415
+
+    naux, ntri = map(int, B_Qp.shape)
+    expected_ntri = int(ntri_from_nao(int(nao_i)))
+    if int(ntri) != int(expected_ntri):
+        raise ValueError(
+            "B_Qp must have shape (naux, nao*(nao+1)//2); "
+            f"got ntri={int(ntri)} but expected {int(expected_ntri)} for nao={int(nao_i)}"
+        )
+
+    q_block_i = int(q_block)
+    if q_block_i <= 0:
+        raise ValueError("q_block must be > 0")
+    q_block_i = min(int(naux), int(q_block_i))
+
+    col_block_i = int(col_block)
+    if col_block_i <= 0:
+        raise ValueError("col_block must be > 0")
+    col_block_i = min(int(col_count_i), int(col_block_i))
+
+    from asuka.integrals.df_packed_s2 import extract_Qp_rows_cols_block  # noqa: PLC0415
+
+    K_sub = xp.zeros((row_count_i, col_count_i), dtype=xp.float64)
+    for q0 in range(0, int(naux), int(q_block_i)):
+        q1 = min(int(naux), int(q0) + int(q_block_i))
+        qb = int(q1 - q0)
+        if qb <= 0:
+            continue
+
+        B_rows = extract_Qp_rows_cols_block(
+            B_Qp,
+            nao=int(nao_i),
+            q0=int(q0),
+            q_count=int(qb),
+            row0=int(row0_i),
+            row_count=int(row_count_i),
+            col0=0,
+            col_count=int(nao_i),
+        )
+        Y = xp.matmul(B_rows, D)  # (qb,row_count,nao)
+        Y2 = xp.ascontiguousarray(Y.transpose(1, 0, 2)).reshape(row_count_i, qb * nao_i)
+        del B_rows, Y
+
+        for c_off in range(0, int(col_count_i), int(col_block_i)):
+            cb = min(int(col_block_i), int(col_count_i) - int(c_off))
+            c_abs = int(col0_i + c_off)
+
+            B_cols = extract_Qp_rows_cols_block(
+                B_Qp,
+                nao=int(nao_i),
+                q0=int(q0),
+                q_count=int(qb),
+                row0=int(c_abs),
+                row_count=int(cb),
+                col0=0,
+                col_count=int(nao_i),
+            )
+            Z2 = xp.ascontiguousarray(B_cols.transpose(1, 0, 2)).reshape(cb, qb * nao_i)
+            K_sub[:, c_off : c_off + cb] += Y2 @ Z2.T
+            del B_cols, Z2
+        del Y2
+
+    return K_sub
+
 
 def _get_xp(*arrays: Any):
     """Return (xp, is_gpu) where xp is numpy or cupy based on array types."""
@@ -144,20 +391,35 @@ def _df_JK(B, D, *, want_J: bool = True, want_K: bool = True, B2=None, BQ=None, 
     """Compute Coulomb J and (optionally) exchange K from DF factors and density.
 
     Inputs
-    - B: (nao, nao, naux), float64
+    - B: (nao, nao, naux) in mnQ layout OR packed (naux, nao*(nao+1)//2) in Qp layout, float64
     - D: (nao, nao), float64
     """
 
     xp, _ = _get_xp(B, D)
     B = _as_xp(xp, B, dtype=xp.float64)
     D = _as_xp(xp, D, dtype=xp.float64)
-    if B.ndim != 3:
-        raise ValueError("B must have shape (nao, nao, naux)")
     if D.ndim != 2 or D.shape[0] != D.shape[1]:
         raise ValueError("D must be a square 2D matrix")
     nao = int(D.shape[0])
-    if tuple(B.shape[:2]) != (nao, nao):
-        raise ValueError("B and D nao mismatch")
+
+    is_qp = int(getattr(B, "ndim", 0)) == 2
+    if not is_qp:
+        if B.ndim != 3:
+            raise ValueError("B must have shape (nao, nao, naux) or packed (naux, ntri)")
+        if tuple(B.shape[:2]) != (nao, nao):
+            raise ValueError("B and D nao mismatch")
+    else:
+        from asuka.integrals.tri_packed import ntri_from_nao  # noqa: PLC0415
+
+        if B.ndim != 2:
+            raise ValueError("packed B must be 2D (naux,ntri)")
+        _naux, ntri = map(int, B.shape)
+        expected_ntri = int(ntri_from_nao(int(nao)))
+        if int(ntri) != int(expected_ntri):
+            raise ValueError(
+                "packed B must have shape (naux, nao*(nao+1)//2). "
+                f"Got B.shape={tuple(map(int, B.shape))} but expected ntri={int(expected_ntri)} for nao={int(nao)}."
+            )
 
     if profile is not None:
         jk_prof = profile.setdefault("jk", {})
@@ -174,14 +436,25 @@ def _df_JK(B, D, *, want_J: bool = True, want_K: bool = True, B2=None, BQ=None, 
     J = None
     if want_J:
         tJ = _time_ms_start(xp) if profile is not None else None
-        # J via vectorization:
-        #   J_{μν} = Σ_Q B_{μν}^Q * Σ_{λσ} D_{λσ} B_{λσ}^Q
-        naux = int(B.shape[2])
-        if B2 is None:
-            B2 = B.reshape((nao * nao, naux))
-        dvec = D.reshape((nao * nao,))
-        v = B2.T @ dvec
-        J = (B2 @ v).reshape((nao, nao))
+        if not is_qp:
+            # J via vectorization:
+            #   J_{μν} = Σ_Q B_{μν}^Q * Σ_{λσ} D_{λσ} B_{λσ}^Q
+            naux = int(B.shape[2])
+            if B2 is None:
+                B2 = B.reshape((nao * nao, naux))
+            dvec = D.reshape((nao * nao,))
+            v = B2.T @ dvec
+            J = (B2 @ v).reshape((nao, nao))
+        else:
+            # Packed (Qp) J: convert the full (mu,nu) sum into packed form using weights.
+            from asuka.integrals.tri_packed import pack_tril, tri_weights, unpack_tril  # noqa: PLC0415
+
+            Dsym = 0.5 * (D + D.T)
+            d_p = pack_tril(xp, Dsym)
+            w = tri_weights(xp, int(nao), dtype=xp.float64)
+            rho = B @ (w * d_p)
+            J_p = B.T @ rho
+            J = unpack_tril(xp, J_p, nao=int(nao))
         if profile is not None and tJ is not None:
             jk_prof = profile.setdefault("jk", {})
             jk_prof["j_ms"] = float(jk_prof.get("j_ms", 0.0)) + _time_ms_end(xp, tJ)
@@ -189,43 +462,69 @@ def _df_JK(B, D, *, want_J: bool = True, want_K: bool = True, B2=None, BQ=None, 
     if not want_K:
         return J, None
 
-    # K via batched GEMMs: K = Σ_Q B_Q @ D @ B_Q^T
-    if BQ is None:
-        BQ = B.transpose((2, 0, 1))  # (naux, nao, nao)
-    if profile is not None:
-        try:
-            jk_prof = profile.setdefault("jk", {})
-            jk_prof.setdefault("BQ_shape", list(map(int, BQ.shape)))
-            jk_prof.setdefault("BQ_strides", list(map(int, getattr(BQ, "strides", ()))))
-            jk_prof.setdefault("BQ_c_contig", bool(getattr(BQ, "flags", {}).c_contiguous) if hasattr(BQ, "flags") else None)
-        except Exception:
-            pass
-
-    naux = int(BQ.shape[0])
-
-    if profile is not None:
-        jk_prof = profile.setdefault("jk", {})
-        jk_prof["k_impl"] = "gemm_gpu" if xp is not np else "batched_matmul"
-
     tK = _time_ms_start(xp) if profile is not None else None
     BD = None
     KQ = None
-    if xp is not np:
-        # GPU path: single GEMM  K = M1 @ B2d.T
-        #   B2d[k, n*naux+Q] = B[k,n,Q]  (free reshape, C-contiguous)
-        #   BQD[m,Q,n]       = Σ_p B[m,p,Q]*D[p,n]  via tensordot
-        #   M1[m, n*naux+Q]  = BQD[m,Q,n]  (contiguous copy of BQD.T021)
-        #   K[m,k]           = Σ_{n,Q} M1[m,n*naux+Q] * B2d[k,n*naux+Q]
-        B2d = B.reshape(nao, nao * naux)          # view, no copy
-        BQD = xp.tensordot(B, D, axes=([1], [0]))  # (nao, naux, nao)
-        M1 = xp.ascontiguousarray(BQD.transpose(0, 2, 1)).reshape(nao, nao * naux)
-        del BQD
-        K = M1 @ B2d.T
-        del M1
+    if not is_qp:
+        # K via batched GEMMs: K = Σ_Q B_Q @ D @ B_Q^T
+        if BQ is None:
+            BQ = B.transpose((2, 0, 1))  # (naux, nao, nao)
+        if profile is not None:
+            try:
+                jk_prof = profile.setdefault("jk", {})
+                jk_prof.setdefault("BQ_shape", list(map(int, BQ.shape)))
+                jk_prof.setdefault("BQ_strides", list(map(int, getattr(BQ, "strides", ()))))
+                jk_prof.setdefault(
+                    "BQ_c_contig",
+                    bool(getattr(BQ, "flags", {}).c_contiguous) if hasattr(BQ, "flags") else None,
+                )
+            except Exception:
+                pass
+
+        naux = int(BQ.shape[0])
+
+        if xp is not np:
+            impl = _pick_dfjk_k_gpu_impl(xp=xp, nao=int(nao), naux=int(naux))
+            if impl == "qblocked":
+                q_block = _env_int("ASUKA_DF_JK_K_QBLOCK", 128)
+                q_block = max(1, min(int(naux), int(q_block)))
+                if profile is not None:
+                    jk_prof = profile.setdefault("jk", {})
+                    jk_prof["k_impl"] = "gemm_gpu_qblocked"
+                    jk_prof["k_q_block"] = int(q_block)
+                K = _df_K_qblocked_mnQ(B, D, q_block=int(q_block))
+            else:
+                # Legacy GPU path: single GEMM  K = M1 @ B2d.T
+                #   B2d[k, n*naux+Q] = B[k,n,Q]  (free reshape, C-contiguous)
+                #   BQD[m,Q,n]       = Σ_p B[m,p,Q]*D[p,n]  via tensordot
+                #   M1[m, n*naux+Q]  = BQD[m,Q,n]  (contiguous copy of BQD.T021)
+                #   K[m,k]           = Σ_{n,Q} M1[m,n*naux+Q] * B2d[k,n*naux+Q]
+                if profile is not None:
+                    jk_prof = profile.setdefault("jk", {})
+                    jk_prof["k_impl"] = "gemm_gpu"
+                B2d = B.reshape(nao, nao * naux)  # view, no copy
+                BQD = xp.tensordot(B, D, axes=([1], [0]))  # (nao, naux, nao)
+                M1 = xp.ascontiguousarray(BQD.transpose(0, 2, 1)).reshape(nao, nao * naux)
+                del BQD
+                K = M1 @ B2d.T
+                del M1
+        else:
+            if profile is not None:
+                jk_prof = profile.setdefault("jk", {})
+                jk_prof["k_impl"] = "batched_matmul"
+            BD = xp.matmul(BQ, D)  # (naux, nao, nao)
+            KQ = xp.matmul(BD, BQ.transpose((0, 2, 1)))  # (naux, nao, nao)
+            K = xp.sum(KQ, axis=0)
     else:
-        BD = xp.matmul(BQ, D)  # (naux, nao, nao)
-        KQ = xp.matmul(BD, BQ.transpose((0, 2, 1)))  # (naux, nao, nao)
-        K = xp.sum(KQ, axis=0)
+        # Packed Qp path: always use aux blocking to avoid materializing full mnQ.
+        naux = int(B.shape[0])
+        q_block = _env_int("ASUKA_DF_JK_K_QBLOCK_PACKED", _env_int("ASUKA_DF_JK_K_QBLOCK", 64))
+        q_block = max(1, min(int(naux), int(q_block)))
+        if profile is not None:
+            jk_prof = profile.setdefault("jk", {})
+            jk_prof["k_impl"] = "gemm_qblocked_qp"
+            jk_prof["k_q_block"] = int(q_block)
+        K = _df_K_qblocked_Qp(B, D, nao=int(nao), q_block=int(q_block))
     if profile is not None and tK is not None:
         jk_prof = profile.setdefault("jk", {})
         jk_prof["k_ms"] = float(jk_prof.get("k_ms", 0.0)) + _time_ms_end(xp, tK)

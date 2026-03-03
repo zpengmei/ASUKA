@@ -368,12 +368,29 @@ def _build_casci_df_integrals(
     if B is None:
         raise ValueError("scf_out.df_B is missing (DF CASCI/CASSCF requires cached DF factors)")
     B_shape = getattr(B, "shape", None)
-    if B_shape is None or len(B_shape) != 3:
-        raise ValueError("scf_out.df_B must be a 3D tensor with shape (nao, nao, naux) (mnQ layout)")
-    if int(B_shape[0]) != int(nao) or int(B_shape[1]) != int(nao):
+    if B_shape is None:
+        raise ValueError("scf_out.df_B must have a valid shape")
+    is_qp = False
+    if len(B_shape) == 3:
+        if int(B_shape[0]) != int(nao) or int(B_shape[1]) != int(nao):
+            raise ValueError(
+                "DF CASCI/CASSCF requires df_B in mnQ (nao,nao,naux) or packed Qp (naux,ntri) layout. "
+                f"Got df_B.shape={tuple(map(int, B_shape))} for nao={int(nao)}."
+            )
+    elif len(B_shape) == 2:
+        from asuka.integrals.tri_packed import ntri_from_nao  # noqa: PLC0415
+
+        is_qp = True
+        ntri_expected = int(ntri_from_nao(int(nao)))
+        if int(B_shape[1]) != int(ntri_expected):
+            raise ValueError(
+                "Packed df_B must have shape (naux, nao*(nao+1)//2). "
+                f"Got df_B.shape={tuple(map(int, B_shape))} but expected ntri={int(ntri_expected)} for nao={int(nao)}."
+            )
+    else:
         raise ValueError(
-            "DF CASCI/CASSCF currently requires df_layout='mnQ' (B[mu,nu,Q] with shape (nao,nao,naux)). "
-            f"Got df_B.shape={tuple(map(int, B_shape))} for nao={int(nao)}."
+            "scf_out.df_B must be mnQ (nao,nao,naux) or packed Qp (naux,ntri). "
+            f"Got df_B.shape={tuple(map(int, B_shape))}."
         )
 
     _t_core_start = time.perf_counter() if profile is not None else 0.0
@@ -389,10 +406,15 @@ def _build_casci_df_integrals(
         except Exception:  # pragma: no cover
             cp = None  # type: ignore
         if cp is not None and isinstance(B, cp.ndarray):  # type: ignore[attr-defined]
-            if B.dtype == cp.float64 and B.ndim == 3 and int(B.shape[0]) == int(nao) and int(B.shape[1]) == int(nao):
-                if hasattr(B, "flags") and not bool(B.flags.c_contiguous):
-                    B = cp.ascontiguousarray(B)
-                cached_b_whitened_use = B
+            if B.dtype == cp.float64:
+                if B.ndim == 3 and int(B.shape[0]) == int(nao) and int(B.shape[1]) == int(nao):
+                    if hasattr(B, "flags") and not bool(B.flags.c_contiguous):
+                        B = cp.ascontiguousarray(B)
+                    cached_b_whitened_use = B
+                elif B.ndim == 2 and bool(is_qp):
+                    if hasattr(B, "flags") and not bool(B.flags.c_contiguous):
+                        B = cp.ascontiguousarray(B)
+                    cached_b_whitened_use = B
 
     if ncore == 0:
         vhf_core = xp.zeros((nao, nao), dtype=xp.float64)
@@ -402,15 +424,18 @@ def _build_casci_df_integrals(
         if bool(_is_gpu):
             import cupy as cp  # type: ignore
 
-            # Memory-critical: avoid materializing a full contiguous BQ copy
-            # (naux,nao,nao), which can be ~10GB for cc-pVTZ-sized systems.
-            B_mnQ = cp.asarray(B, dtype=cp.float64)
-            B2 = B_mnQ.reshape((int(nao) * int(nao), int(B_mnQ.shape[2])))
-            Jc = df_jk.df_J_from_B2_D(B2, D_core)
-            Jc = 0.5 * (Jc + Jc.T)
-            Cc = cp.ascontiguousarray(C_core)
-            occ_vals = cp.full((int(ncore),), 2.0, dtype=cp.float64)
-            Kc = df_jk.df_K_from_BmnQ_Cocc(B_mnQ, Cc, occ_vals, q_block=128)
+            B_dev = cp.asarray(B, dtype=cp.float64)
+            if int(B_dev.ndim) == 3:
+                # Memory-critical: avoid materializing a full contiguous BQ copy
+                # (naux,nao,nao), which can be ~10GB for cc-pVTZ-sized systems.
+                B2 = B_dev.reshape((int(nao) * int(nao), int(B_dev.shape[2])))
+                Jc = df_jk.df_J_from_B2_D(B2, D_core)
+                Jc = 0.5 * (Jc + Jc.T)
+                Cc = cp.ascontiguousarray(C_core)
+                occ_vals = cp.full((int(ncore),), 2.0, dtype=cp.float64)
+                Kc = df_jk.df_K_from_BmnQ_Cocc(B_dev, Cc, occ_vals, q_block=128)
+            else:
+                Jc, Kc = _df_scf._df_JK(B_dev, D_core, want_J=True, want_K=True)  # noqa: SLF001
         else:
             Jc, Kc = _df_scf._df_JK(B, D_core, want_J=True, want_K=True)  # noqa: SLF001
         vhf_core = Jc - 0.5 * Kc

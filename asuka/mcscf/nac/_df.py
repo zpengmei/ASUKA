@@ -15,12 +15,14 @@ Current scope:
 
 from contextlib import contextmanager
 from typing import Any, Callable, Literal, Sequence
+import os
 import warnings
 
 import numpy as np
 
 from asuka.frontend.molecule import Molecule
 from asuka.frontend.periodic_table import atomic_number
+from asuka.hf import df_jk as _df_jk
 from asuka.hf import df_scf as _df_scf
 from asuka.integrals.df_context import DFCholeskyContext
 from asuka.integrals.df_grad_context import DFGradContractionContext
@@ -41,6 +43,9 @@ from asuka.mcscf.nuc_grad_df import (
     _build_bar_L_df_cross,
     _build_gfock_casscf_df,
     _barl_coulomb_add_inplace,
+    _barl_coulomb_add_inplace_qp,
+    _df_B_dims,
+    _pack_qmn_block_to_qp,
     _resolve_barl_hybrid,
     _resolve_xp,
     _as_xp_f64,
@@ -64,6 +69,13 @@ def _asnumpy_f64(a: Any) -> np.ndarray:
     if cp is not None and isinstance(a, cp.ndarray):  # type: ignore[attr-defined]
         a = cp.asnumpy(a)
     return np.asarray(a, dtype=np.float64)
+
+
+def _bool_env(name: str, default: bool) -> bool:
+    v = os.environ.get(str(name))
+    if v is None:
+        return bool(default)
+    return str(v).strip().lower() not in {"0", "false", "no", "off"}
 
 
 def _warn_df_fd_fallback(*, where: str, backend: str, delta_bohr: float, err: Exception) -> None:
@@ -243,7 +255,19 @@ def _core_energy_weighted_density(
     if ncore:
         mo_core = mo[:, :ncore]
         D_core_ao = 2.0 * (mo_core @ mo_core.T)
-        Jc, Kc = _df_scf._df_JK(B_ao, D_core_ao, want_J=True, want_K=True)  # noqa: SLF001
+        use_cocc_k = (xp is not np) and _bool_env("ASUKA_MCSCF_DF_K_COCC", True)
+        if use_cocc_k:
+            try:
+                q_block = int(os.environ.get("ASUKA_DF_JK_K_QBLOCK", "128"))
+            except Exception:
+                q_block = 128
+            q_block = max(1, min(int(getattr(B_ao, "shape", (0, 0, 0))[2]), int(q_block)))
+
+            Jc, _ = _df_scf._df_JK(B_ao, D_core_ao, want_J=True, want_K=False)  # noqa: SLF001
+            occ_core = xp.full((int(ncore),), 2.0, dtype=xp.float64)
+            Kc = _df_jk.df_K_from_BmnQ_Cocc(B_ao, mo_core, occ_core, q_block=int(q_block))
+        else:
+            Jc, Kc = _df_scf._df_JK(B_ao, D_core_ao, want_J=True, want_K=True)  # noqa: SLF001
         v_ao = xp.asarray(Jc - 0.5 * Kc, dtype=xp.float64)
     else:
         D_core_ao = xp.zeros((nao, nao), dtype=xp.float64)
@@ -313,6 +337,100 @@ def _build_bar_L_net_active_df(
     D_ah = D_w - D_core_ao  # = D_act - 0.5*D_core
 
     B_ao = xp.asarray(B_ao, dtype=_wd)
+    if int(getattr(B_ao, "ndim", 0)) == 2:
+        # Packed Qp path: keep bar_L in (naux,ntri).
+        is_qp, _nao_i, naux, ntri = _df_B_dims(B_ao, nao=int(nao), where="_build_bar_L_net_active_df")
+        if not bool(is_qp):  # pragma: no cover
+            raise RuntimeError("internal error: expected packed df_B")
+        from asuka.integrals.tri_packed import pack_tril, tri_weights  # noqa: PLC0415
+        from asuka.integrals.df_packed_s2 import unpack_Qp_to_Qmn_block  # noqa: PLC0415
+
+        w = tri_weights(xp, int(nao), dtype=_wd)
+        D_core_p = pack_tril(xp, D_core_ao)
+        D_w_p = pack_tril(xp, D_w)
+        D_ah_p = pack_tril(xp, D_ah)
+
+        if rho_core is None:
+            rho = B_ao @ (w * D_core_p)  # (naux,)
+        else:
+            rho = xp.asarray(rho_core, dtype=_wd)
+        sigma_w = B_ao @ (w * D_w_p)  # (naux,)
+
+        if out is None:
+            bar_net = xp.zeros((naux, ntri), dtype=_od)
+        else:
+            bar_net = xp.asarray(out, dtype=_od)
+            if tuple(map(int, bar_net.shape)) != (naux, ntri):
+                raise ValueError("out shape mismatch")
+
+        # --- Net Coulomb: sigma_w * D_core + rho * D_ah ---
+        _log_vram("  net_active_fused_qp: before net Coulomb")
+        _barl_coulomb_add_inplace_qp(
+            bar_net,
+            a_Q=sigma_w,
+            M1_p=D_core_p,
+            b_Q=rho,
+            M2_p=D_ah_p,
+            xp=xp,
+        )
+        _log_vram("  net_active_fused_qp: after net Coulomb")
+
+        # --- Net Exchange (chunked): -0.5*(D_core @ BQ @ D_ah + D_w @ BQ @ D_core) ---
+        if ncore:
+            _chunk = int(max(1, qblock if qblock is not None else (naux // 4)))
+            for _q0 in range(0, naux, _chunk):
+                _q1 = min(_q0 + _chunk, naux)
+                _q = int(_q1 - _q0)
+                if _q <= 0:
+                    continue
+                _bq = unpack_Qp_to_Qmn_block(B_ao, nao=int(nao), q0=int(_q0), q_count=int(_q))
+                _t = xp.matmul(xp.matmul(D_core_ao[None, :, :], _bq), D_ah)
+                _t += xp.matmul(xp.matmul(D_w[None, :, :], _bq), D_core_ao)
+                _t *= -0.5
+                _tp = _pack_qmn_block_to_qp(xp, _t.astype(xp.float64, copy=False), nao=int(nao))
+                bar_net[_q0:_q1] += _tp.astype(_od, copy=False)
+                del _bq, _t, _tp
+        _log_vram("  net_active_fused_qp: after net exchange")
+
+        # --- Active 2-RDM term (identical to _build_bar_L_casscf_df) ---
+        dm2_arr = xp.asarray(dm2_act, dtype=_wd)
+        if L_act is None:
+            # Build L_act in aux blocks.
+            L_act_val = xp.empty((ncas, ncas, naux), dtype=_wd)
+            _chunkL = int(max(1, qblock if qblock is not None else (naux // 4)))
+            for _q0 in range(0, naux, _chunkL):
+                _q1 = min(_q0 + _chunkL, naux)
+                _q = int(_q1 - _q0)
+                if _q <= 0:
+                    continue
+                _bq = unpack_Qp_to_Qmn_block(B_ao, nao=int(nao), q0=int(_q0), q_count=int(_q))
+                _x = xp.matmul(_bq, C_act)  # (q,nao,ncas)
+                _l = xp.matmul(C_act.T[None, :, :], _x)  # (q,ncas,ncas)
+                L_act_val[:, :, _q0:_q1] = _l.transpose(1, 2, 0)
+                del _bq, _x, _l
+        else:
+            L_act_val = xp.asarray(L_act, dtype=_wd)
+
+        L2 = L_act_val.reshape(ncas * ncas, naux)
+        dm2_flat = dm2_arr.reshape(ncas * ncas, ncas * ncas)
+        dm2_flat = 0.5 * (dm2_flat + dm2_flat.T)
+        M = dm2_flat @ L2
+        M_uvQ = M.reshape(ncas, ncas, naux)
+
+        tmp = xp.einsum("mu,uvQ->mvQ", C_act, M_uvQ, optimize=True)
+        _chunk = int(max(1, qblock if qblock is not None else (naux // 4)))
+        for _q0 in range(0, naux, _chunk):
+            _q1 = min(_q0 + _chunk, naux)
+            _blk = xp.einsum("mvQ,nv->Qmn", tmp[:, :, _q0:_q1], C_act, optimize=True)
+            _bp = _pack_qmn_block_to_qp(xp, _blk.astype(xp.float64, copy=False), nao=int(nao))
+            bar_net[_q0:_q1] += _bp.astype(_od, copy=False)
+            del _blk, _bp
+        del tmp
+        _log_vram("  net_active_fused_qp: after bar_act")
+
+        return xp.asarray(bar_net, dtype=_od), xp.asarray(D_act_ao, dtype=xp.float64)
+
+    # Full mnQ path.
     nao_b, _, naux = map(int, B_ao.shape)
     B2 = B_ao.reshape(nao * nao, naux)
     if rho_core is None:
@@ -419,6 +537,7 @@ def _build_bar_L_lorb_df(
     _wd = xp.float64 if work_dtype is None else work_dtype
     _od = xp.float64 if out_dtype is None else out_dtype
     B_ao = xp.asarray(B_ao, dtype=_wd)
+    is_qp, _nao_i, naux, ntri = _df_B_dims(B_ao, nao=int(nao), where="_build_bar_L_lorb_df")
     C = xp.asarray(C, dtype=_wd)
     L = xp.asarray(Lorb, dtype=_wd)
     dm1 = xp.asarray(dm1_act, dtype=_wd)
@@ -461,8 +580,12 @@ def _build_bar_L_lorb_df(
         )
     else:
         bar_mean = xp.asarray(out, dtype=_od)
-        if bar_mean.shape != (int(B_ao.shape[2]), int(B_ao.shape[0]), int(B_ao.shape[0])):
-            raise ValueError("out shape mismatch")
+        if bool(is_qp):
+            if tuple(map(int, bar_mean.shape)) != (int(naux), int(ntri)):
+                raise ValueError("out shape mismatch")
+        else:
+            if tuple(map(int, bar_mean.shape)) != (int(naux), int(nao), int(nao)):
+                raise ValueError("out shape mismatch")
         _build_bar_L_df_cross(
             B_ao,
             D_left=D_wL,
@@ -496,50 +619,116 @@ def _build_bar_L_lorb_df(
     dm2_flat = dm2.reshape(ncas * ncas, ncas * ncas)
     dm2_flat = 0.5 * (dm2_flat + dm2_flat.T)
 
-    X = xp.einsum("mnQ,nv->mvQ", B_ao, C_act, optimize=True)
-    L_act_mo = xp.einsum("mu,mvQ->uvQ", C_act, X, optimize=True)
-    L2 = L_act_mo.reshape(ncas * ncas, -1)
-    del L_act_mo
-    M_mat = dm2_flat @ L2
-    del L2
-    M_uvQ = M_mat.reshape(ncas, ncas, -1)
-    del M_mat
+    if not bool(is_qp):
+        X = xp.einsum("mnQ,nv->mvQ", B_ao, C_act, optimize=True)
+        L_act_mo = xp.einsum("mu,mvQ->uvQ", C_act, X, optimize=True)
+        L2 = L_act_mo.reshape(ncas * ncas, -1)
+        del L_act_mo
+        M_mat = dm2_flat @ L2
+        del L2
+        M_uvQ = M_mat.reshape(ncas, ncas, -1)
+        del M_mat
 
-    tmp = xp.einsum("mu,uvQ->mvQ", C_act, M_uvQ, optimize=True)
-    tmp_L = xp.einsum("mu,uvQ->mvQ", C_L_act, M_uvQ, optimize=True)
-    del M_uvQ
+        tmp = xp.einsum("mu,uvQ->mvQ", C_act, M_uvQ, optimize=True)
+        tmp_L = xp.einsum("mu,uvQ->mvQ", C_L_act, M_uvQ, optimize=True)
+        del M_uvQ
 
-    X_L = xp.einsum("mnQ,nv->mvQ", B_ao, C_L_act, optimize=True)
-    dL_act = (
-        xp.einsum("mu,mvQ->uvQ", C_L_act, X, optimize=True)
-        + xp.einsum("mu,mvQ->uvQ", C_act, X_L, optimize=True)
-    )
-    del X, X_L
-    dL2 = dL_act.reshape(ncas * ncas, -1)
-    del dL_act
-    dM = dm2_flat @ dL2
-    del dL2
-    dM_uvQ = dM.reshape(ncas, ncas, -1)
-    del dM
-    tmp_M = xp.einsum("mu,uvQ->mvQ", C_act, dM_uvQ, optimize=True)
-    del dM_uvQ
+        X_L = xp.einsum("mnQ,nv->mvQ", B_ao, C_L_act, optimize=True)
+        dL_act = (
+            xp.einsum("mu,mvQ->uvQ", C_L_act, X, optimize=True)
+            + xp.einsum("mu,mvQ->uvQ", C_act, X_L, optimize=True)
+        )
+        del X, X_L
+        dL2 = dL_act.reshape(ncas * ncas, -1)
+        del dL_act
+        dM = dm2_flat @ dL2
+        del dL2
+        dM_uvQ = dM.reshape(ncas, ncas, -1)
+        del dM
+        tmp_M = xp.einsum("mu,uvQ->mvQ", C_act, dM_uvQ, optimize=True)
+        del dM_uvQ
 
-    # Accumulate all three bar_act einsum terms directly into bar_mean in chunks.
-    _naux = int(bar_mean.shape[0])
-    _chunk = int(max(1, qblock if qblock is not None else (_naux // 4)))
-    for _q0 in range(0, _naux, _chunk):
-        _q1 = min(_q0 + _chunk, _naux)
-        _blk = xp.einsum("mvQ,nv->Qmn", tmp_L[:, :, _q0:_q1], C_act, optimize=True)
-        bar_mean[_q0:_q1] += _blk.astype(_od, copy=False)
-        _blk = xp.einsum("mvQ,nv->Qmn", tmp[:, :, _q0:_q1], C_L_act, optimize=True)
-        bar_mean[_q0:_q1] += _blk.astype(_od, copy=False)
-        _blk = xp.einsum("mvQ,nv->Qmn", tmp_M[:, :, _q0:_q1], C_act, optimize=True)
-        bar_mean[_q0:_q1] += _blk.astype(_od, copy=False)
-        del _blk
-    del tmp_L, tmp, tmp_M
+        # Accumulate all three bar_act einsum terms directly into bar_mean in chunks.
+        _naux = int(bar_mean.shape[0])
+        _chunk = int(max(1, qblock if qblock is not None else (_naux // 4)))
+        for _q0 in range(0, _naux, _chunk):
+            _q1 = min(_q0 + _chunk, _naux)
+            _blk = xp.einsum("mvQ,nv->Qmn", tmp_L[:, :, _q0:_q1], C_act, optimize=True)
+            bar_mean[_q0:_q1] += _blk.astype(_od, copy=False)
+            _blk = xp.einsum("mvQ,nv->Qmn", tmp[:, :, _q0:_q1], C_L_act, optimize=True)
+            bar_mean[_q0:_q1] += _blk.astype(_od, copy=False)
+            _blk = xp.einsum("mvQ,nv->Qmn", tmp_M[:, :, _q0:_q1], C_act, optimize=True)
+            bar_mean[_q0:_q1] += _blk.astype(_od, copy=False)
+            del _blk
+        del tmp_L, tmp, tmp_M
+    else:
+        # Packed-Qp path: build the same intermediates using aux-block unpacking and
+        # accumulate bar_act into (naux,ntri) storage.
+        from asuka.integrals.df_packed_s2 import unpack_Qp_to_Qmn_block  # noqa: PLC0415
+
+        _chunk = int(max(1, qblock if qblock is not None else (int(naux) // 4)))
+        _chunk = max(1, min(int(naux), int(_chunk)))
+
+        # Build X=B*C_act and X_L=B*C_L_act, plus L_act= C_act^T X, in aux blocks.
+        X = xp.empty((nao, ncas, naux), dtype=_wd)
+        X_L = xp.empty((nao, ncas, naux), dtype=_wd)
+        L_act_mo = xp.empty((ncas, ncas, naux), dtype=_wd)
+        for _q0 in range(0, int(naux), int(_chunk)):
+            _q1 = min(int(naux), int(_q0) + int(_chunk))
+            _q = int(_q1 - _q0)
+            if _q <= 0:
+                continue
+            BQc = unpack_Qp_to_Qmn_block(B_ao, nao=int(nao), q0=int(_q0), q_count=int(_q))  # (q,nao,nao)
+            X_blk = xp.matmul(BQc, C_act)  # (q,nao,ncas)
+            X_L_blk = xp.matmul(BQc, C_L_act)  # (q,nao,ncas)
+            L_blk = xp.matmul(C_act.T[None, :, :], X_blk)  # (q,ncas,ncas)
+            X[:, :, int(_q0) : int(_q1)] = X_blk.transpose(1, 2, 0)
+            X_L[:, :, int(_q0) : int(_q1)] = X_L_blk.transpose(1, 2, 0)
+            L_act_mo[:, :, int(_q0) : int(_q1)] = L_blk.transpose(1, 2, 0)
+            del BQc, X_blk, X_L_blk, L_blk
+
+        L2 = L_act_mo.reshape(ncas * ncas, int(naux))
+        M_mat = dm2_flat @ L2
+        M_uvQ = M_mat.reshape(ncas, ncas, int(naux))
+        del L2, M_mat
+
+        # tmp = C_act @ M, tmp_L = C_L_act @ M (batch matmul over Q)
+        M_batch = M_uvQ.transpose(2, 0, 1)  # (naux,ncas,ncas)
+        tmp = xp.matmul(C_act[None, :, :], M_batch).transpose(1, 2, 0)  # (nao,ncas,naux)
+        tmp_L = xp.matmul(C_L_act[None, :, :], M_batch).transpose(1, 2, 0)
+        del M_uvQ, M_batch
+
+        # dL_act = C_L_act^T X + C_act^T X_L (batch matmul over Q)
+        X_batch = X.transpose(2, 0, 1)  # (naux,nao,ncas)
+        X_L_batch = X_L.transpose(2, 0, 1)
+        dL1 = xp.matmul(C_L_act.T[None, :, :], X_batch)  # (naux,ncas,ncas)
+        dL2 = xp.matmul(C_act.T[None, :, :], X_L_batch)
+        dL_act = (dL1 + dL2).transpose(1, 2, 0)  # (ncas,ncas,naux)
+        del X_batch, X_L_batch, dL1, dL2
+
+        dL2_flat = dL_act.reshape(ncas * ncas, int(naux))
+        dM = dm2_flat @ dL2_flat
+        dM_uvQ = dM.reshape(ncas, ncas, int(naux))
+        del dL_act, dL2_flat, dM
+
+        dM_batch = dM_uvQ.transpose(2, 0, 1)  # (naux,ncas,ncas)
+        tmp_M = xp.matmul(C_act[None, :, :], dM_batch).transpose(1, 2, 0)  # (nao,ncas,naux)
+        del dM_uvQ, dM_batch
+
+        for _q0 in range(0, int(naux), int(_chunk)):
+            _q1 = min(int(naux), int(_q0) + int(_chunk))
+            _blk = xp.einsum("mvQ,nv->Qmn", tmp_L[:, :, _q0:_q1], C_act, optimize=True)
+            bar_mean[_q0:_q1] += _pack_qmn_block_to_qp(xp, _blk.astype(xp.float64, copy=False), nao=int(nao)).astype(_od, copy=False)
+            _blk = xp.einsum("mvQ,nv->Qmn", tmp[:, :, _q0:_q1], C_L_act, optimize=True)
+            bar_mean[_q0:_q1] += _pack_qmn_block_to_qp(xp, _blk.astype(xp.float64, copy=False), nao=int(nao)).astype(_od, copy=False)
+            _blk = xp.einsum("mvQ,nv->Qmn", tmp_M[:, :, _q0:_q1], C_act, optimize=True)
+            bar_mean[_q0:_q1] += _pack_qmn_block_to_qp(xp, _blk.astype(xp.float64, copy=False), nao=int(nao)).astype(_od, copy=False)
+            del _blk
+        del tmp_L, tmp, tmp_M, X, X_L, L_act_mo
 
     if bool(symmetrize):
-        _symmetrize_bar_L_inplace(bar_mean, xp)
+        if not bool(is_qp):
+            _symmetrize_bar_L_inplace(bar_mean, xp)
     return xp.asarray(bar_mean, dtype=_od), xp.asarray(D_L, dtype=xp.float64)
 
 
@@ -568,10 +757,12 @@ def _grad_elec_active_df(
 
     B_ao = _as_xp_f64(xp, getattr(scf_out, "df_B"))
     _restore_pool = _apply_df_pool_policy(B_ao, label="_grad_elec_active_df")
+    _nao_hint = int(getattr(mo_coeff, "shape", (0, 0))[0])
+    _is_qp, _nao_i, _naux_hint, _ntri_hint = _df_B_dims(B_ao, nao=int(_nao_hint), where="_grad_elec_active_df")
     _barl_policy = _resolve_barl_hybrid(
         xp=xp,
         is_gpu=bool(_is_gpu),
-        naux_hint=int(getattr(B_ao, "shape", (0, 0, 1))[2]),
+        naux_hint=int(_naux_hint),
     )
     if bool(_barl_policy.get("enabled", False)):
         _barl_work_dtype = _barl_policy.get("work_dtype", xp.float64)
@@ -964,6 +1155,7 @@ def _Lorb_dot_dgorb_dx_df(
         raise ValueError("invalid ncore/ncas for Lorb response")
 
     dm1_act = xp.asarray(dm1_act, dtype=xp.float64)
+    dm1_act = 0.5 * (dm1_act + dm1_act.T)
     dm2_act = xp.asarray(dm2_act, dtype=xp.float64)
     if dm1_act.shape != (ncas, ncas):
         raise ValueError("dm1_act shape mismatch")
@@ -995,12 +1187,41 @@ def _Lorb_dot_dgorb_dx_df(
 
     # Build the L-effective generalized Fock matrix for the orbital Lagrange term.
     # This mirrors PySCF's construction in Lorb_dot_dgorb_dx, but uses DF J/K.
-    if ncore:
-        Jc, Kc = _df_scf._df_JK(B_ao, D_core, want_J=True, want_K=True)  # noqa: SLF001
+    use_cocc_k = (xp is not np) and _bool_env("ASUKA_MCSCF_DF_K_COCC", True)
+    if use_cocc_k:
+        try:
+            q_block = int(os.environ.get("ASUKA_DF_JK_K_QBLOCK", "128"))
+        except Exception:
+            q_block = 128
+        _is_qp, _nao_i, _naux, _ntri = _df_B_dims(B_ao, nao=int(nao), where="_Lorb_dot_dgorb_dx_df")
+        q_block = max(1, min(int(_naux), int(q_block)))
+
+        if ncore:
+            Jc, _ = _df_scf._df_JK(B_ao, D_core, want_J=True, want_K=False)  # noqa: SLF001
+            occ_core = xp.full((int(ncore),), 2.0, dtype=xp.float64)
+            Kc = _df_jk.df_K_from_BmnQ_Cocc(B_ao, C_core, occ_core, q_block=int(q_block))
+        else:
+            Jc = xp.zeros((nao, nao), dtype=xp.float64)
+            Kc = xp.zeros((nao, nao), dtype=xp.float64)
+
+        Ja, _ = _df_scf._df_JK(B_ao, D_act, want_J=True, want_K=False)  # noqa: SLF001
+        dm1_h = np.asarray(dm1_act if xp is np else xp.asnumpy(dm1_act), dtype=np.float64)
+        w_h, U_h = np.linalg.eigh(dm1_h)
+        if float(np.min(w_h)) < -1e-8:
+            _, Ka = _df_scf._df_JK(B_ao, D_act, want_J=False, want_K=True)  # noqa: SLF001
+        else:
+            w_h = np.clip(w_h, 0.0, None)
+            w = xp.asarray(w_h, dtype=xp.float64)
+            U = xp.asarray(U_h, dtype=xp.float64)
+            C_no = C_act @ U
+            Ka = _df_jk.df_K_from_BmnQ_Cocc(B_ao, C_no, w, q_block=int(q_block))
     else:
-        Jc = xp.zeros((nao, nao), dtype=xp.float64)
-        Kc = xp.zeros((nao, nao), dtype=xp.float64)
-    Ja, Ka = _df_scf._df_JK(B_ao, D_act, want_J=True, want_K=True)  # noqa: SLF001
+        if ncore:
+            Jc, Kc = _df_scf._df_JK(B_ao, D_core, want_J=True, want_K=True)  # noqa: SLF001
+        else:
+            Jc = xp.zeros((nao, nao), dtype=xp.float64)
+            Kc = xp.zeros((nao, nao), dtype=xp.float64)
+        Ja, Ka = _df_scf._df_JK(B_ao, D_act, want_J=True, want_K=True)  # noqa: SLF001
     if ncore:
         JcL, KcL = _df_scf._df_JK(B_ao, D_L_core, want_J=True, want_K=True)  # noqa: SLF001
     else:

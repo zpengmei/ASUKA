@@ -47,8 +47,8 @@ def build_device_dfmo_integrals_cueri_df(
 
         t0 = time.perf_counter()
         B_whitened = cp.asarray(cached_b_whitened, dtype=cp.float64)
-        if B_whitened.ndim != 3:
-            raise ValueError("cached_b_whitened must have shape (nao, nao, naux)")
+        if int(B_whitened.ndim) not in (2, 3):
+            raise ValueError("cached_b_whitened must be mnQ (nao,nao,naux) or packed Qp (naux,ntri)")
         if hasattr(B_whitened, "flags") and not bool(B_whitened.flags.c_contiguous):
             B_whitened = cp.ascontiguousarray(B_whitened)
 
