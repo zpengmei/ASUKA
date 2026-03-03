@@ -8236,10 +8236,10 @@ m.def(
       py::arg("stream") = 0,
       py::arg("sync") = false);
 
-  m.def(
-      "df_pack_qmn_block_to_qp_device",
-      [](py::object in_Qmn_block,
-         py::object out_Qp_block,
+	  m.def(
+	      "df_pack_qmn_block_to_qp_device",
+	      [](py::object in_Qmn_block,
+	         py::object out_Qp_block,
          int q_count,
          int nao,
          int threads,
@@ -8277,14 +8277,67 @@ m.def(
       py::arg("out_Qp_block"),
       py::arg("q_count"),
       py::arg("nao"),
-      py::arg("threads") = 256,
-      py::arg("stream") = 0,
-      py::arg("sync") = false);
+	      py::arg("threads") = 256,
+	      py::arg("stream") = 0,
+	      py::arg("sync") = false);
 
-  m.def(
-      "df_unpack_qp_to_qmn_block_device",
-      [](py::object in_Qp,
-         py::object out_Qmn_block,
+	  m.def(
+	      "df_pack_lf_block_to_qp_device",
+	      [](py::object in_Lf_block,
+	         py::object out_Qp,
+	         int naux,
+	         int nao,
+	         int q0,
+	         int q_count,
+	         int threads,
+	         uint64_t stream_ptr,
+	         bool sync) {
+	        require_threads_multiple_of_32(threads, "df_pack_lf_block_to_qp_device");
+	        if (nao < 0 || naux < 0 || q0 < 0 || q_count < 0) throw std::invalid_argument("invalid nao/naux/q0/q_count");
+	        if (q0 > naux || q_count > (naux - q0)) throw std::invalid_argument("q0/q_count must satisfy q0+q_count<=naux");
+	        auto in = cuda_array_view_from_object(in_Lf_block, "in_Lf_block");
+	        auto out = cuda_array_view_from_object(out_Qp, "out_Qp");
+	        require_typestr(in, "in_Lf_block", "<f8");
+	        require_typestr(out, "out_Qp", "<f8");
+
+	        const int64_t n_in = require_1d(in, "in_Lf_block");
+	        const int64_t expected_in =
+	            static_cast<int64_t>(q_count) * static_cast<int64_t>(nao) * static_cast<int64_t>(nao);
+	        if (n_in != expected_in) throw std::invalid_argument("in_Lf_block must have shape (q_count*nao*nao,)");
+
+	        const int64_t ntri = static_cast<int64_t>(nao) * static_cast<int64_t>(nao + 1) / 2;
+	        const int64_t expected_out = static_cast<int64_t>(naux) * ntri;
+	        const int64_t n_out = require_1d(out, "out_Qp");
+	        if (n_out != expected_out) throw std::invalid_argument("out_Qp must have shape (naux*ntri,)");
+
+	        cudaStream_t stream = stream_from_uint(stream_ptr);
+	        throw_on_cuda_error(
+	            cueri_df_pack_lf_block_to_qp_launch_stream(
+	                static_cast<const double*>(in.ptr),
+	                static_cast<double*>(out.ptr),
+	                static_cast<int>(naux),
+	                static_cast<int>(nao),
+	                static_cast<int>(q0),
+	                static_cast<int>(q_count),
+	                stream,
+	                threads),
+	            "cueri_df_pack_lf_block_to_qp_launch_stream");
+	        if (sync) throw_on_cuda_error(cudaStreamSynchronize(stream), "cudaStreamSynchronize");
+	      },
+	      py::arg("in_Lf_block"),
+	      py::arg("out_Qp"),
+	      py::arg("naux"),
+	      py::arg("nao"),
+	      py::arg("q0"),
+	      py::arg("q_count"),
+	      py::arg("threads") = 256,
+	      py::arg("stream") = 0,
+	      py::arg("sync") = false);
+
+	  m.def(
+	      "df_unpack_qp_to_qmn_block_device",
+	      [](py::object in_Qp,
+	         py::object out_Qmn_block,
          int naux,
          int nao,
          int q0,

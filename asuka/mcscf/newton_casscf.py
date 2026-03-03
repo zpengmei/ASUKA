@@ -2409,7 +2409,7 @@ def gen_g_hop_internal(
             else:
                 # Default to packed storage for packed-Qp input.
                 _store_mojk_packed = bool(int(getattr(_B, "ndim", 0)) == 2)
-            _use_qp_apply_kernel = str(_os_hop.environ.get("ASUKA_MO_JK_QP_APPLY_KERNEL", "1")).strip().lower() in {
+            _use_qp_apply_kernel = str(_os_hop.environ.get("ASUKA_MO_JK_QP_APPLY_KERNEL", "0")).strip().lower() in {
                 "1",
                 "true",
                 "yes",
@@ -2765,6 +2765,7 @@ def gen_g_hop_internal(
             if _L_qp_dev is not None:
                 # Memory-saving path: keep MO DF tensor packed in MO-pair space.
                 from asuka.hf import df_scf as _df_scf  # noqa: PLC0415
+                from asuka.integrals.df_packed_s2 import extract_Qp_rows_cols_block  # noqa: PLC0415
 
                 _L_dtype = _L_qp_dev.dtype
                 _use_fp32_l = bool(_L_dtype != xp.float64)
@@ -2774,10 +2775,6 @@ def gen_g_hop_internal(
                 else:
                     _dm3_jk = _dm3
                     _dm_total_jk = _dm_total
-
-                # Default packed-K strategy: compute J globally, K only for the required slices.
-                _J0, _ = _df_scf._df_JK(_L_qp_dev, _dm3_jk, want_J=True, want_K=False)  # noqa: SLF001
-                _J1, _ = _df_scf._df_JK(_L_qp_dev, _dm_total_jk, want_J=True, want_K=False)  # noqa: SLF001
 
                 _naux_L = int(_L_qp_dev.shape[0])
                 try:
@@ -2790,7 +2787,7 @@ def gen_g_hop_internal(
                     except Exception:
                         _k_qblk = 0
                 if _k_qblk <= 0:
-                    _k_qblk = 64
+                    _k_qblk = 128
                 _k_qblk = int(max(1, min(_naux_L, _k_qblk)))
 
                 _k_cblk = _choose_mojk_colblk(
@@ -2799,12 +2796,67 @@ def gen_g_hop_internal(
                     qblk=int(_k_qblk),
                     nao=int(_nmo_L),
                     ncol_total=int(_nmo_L),
-                    default_colblk=128,
+                    default_colblk=256,
                     dtype_nbytes=int(np.dtype(_L_dtype).itemsize),
                     label="gen_g_hop_internal packed-K",
                     debug=bool(_mojk_vram_debug and not bool(_mojk_kblk_logged["done"])),
                 )
                 _mojk_kblk_logged["done"] = True
+
+                # J blocks (avoid full J build; exploit dm3/dm4 structure like the dense-L_t path).
+                _nrest_L = int(_nmo_L - _ncore_L)
+                _x_core_rest = x1[:_ncore_L, _ncore_L:]  # (ncore, nrest)
+                _dm4_act = _casdm1 @ x1[_ncore_L:_nocc_L, :]  # (ncas, nmo)
+                _J0_act = xp.zeros((_ncas_L, _nmo_L), dtype=xp.float64)
+                _J1_core_rest = xp.zeros((_ncore_L, _nrest_L), dtype=xp.float64)
+                for _q0 in range(0, _naux_L, _k_qblk):
+                    _q1 = min(_naux_L, _q0 + _k_qblk)
+                    _qb = int(_q1 - _q0)
+                    if _qb <= 0:
+                        continue
+
+                    _L_rest_core = extract_Qp_rows_cols_block(
+                        _L_qp_dev,
+                        nao=int(_nmo_L),
+                        q0=int(_q0),
+                        q_count=int(_qb),
+                        row0=int(_ncore_L),
+                        row_count=int(_nrest_L),
+                        col0=0,
+                        col_count=int(_ncore_L),
+                    )
+                    _rho0 = 2.0 * xp.einsum("qai,ia->q", _L_rest_core, _x_core_rest, optimize=True)
+                    del _L_rest_core
+
+                    _L_act_all = extract_Qp_rows_cols_block(
+                        _L_qp_dev,
+                        nao=int(_nmo_L),
+                        q0=int(_q0),
+                        q_count=int(_qb),
+                        row0=int(_ncore_L),
+                        row_count=int(_ncas_L),
+                        col0=0,
+                        col_count=int(_nmo_L),
+                    )
+                    _J0_act += xp.einsum("q,qpm->pm", _rho0, _L_act_all, optimize=True)
+                    _rho_dm4 = 2.0 * xp.einsum("qpm,pm->q", _L_act_all, _dm4_act, optimize=True)
+                    del _L_act_all
+
+                    _rho1 = _rho0 * 2.0 + _rho_dm4
+                    del _rho0, _rho_dm4
+
+                    _L_core_rest = extract_Qp_rows_cols_block(
+                        _L_qp_dev,
+                        nao=int(_nmo_L),
+                        q0=int(_q0),
+                        q_count=int(_qb),
+                        row0=0,
+                        row_count=int(_ncore_L),
+                        col0=int(_ncore_L),
+                        col_count=int(_nrest_L),
+                    )
+                    _J1_core_rest += xp.einsum("q,qim->im", _rho1, _L_core_rest, optimize=True)
+                    del _L_core_rest, _rho1
 
                 _K0_act = _df_scf._df_K_qblocked_Qp_rows_cols(  # noqa: SLF001
                     _L_qp_dev,
@@ -2829,13 +2881,9 @@ def gen_g_hop_internal(
                     col_block=int(_k_cblk),
                 )
                 if _use_fp32_l:
-                    _J0 = _J0.astype(xp.float64, copy=False)
-                    _J1 = _J1.astype(xp.float64, copy=False)
                     _K0_act = _K0_act.astype(xp.float64, copy=False)
                     _K1_core_rest = _K1_core_rest.astype(xp.float64, copy=False)
 
-                _J0_act = _J0[_ncore_L:_nocc_L, :]
-                _J1_core_rest = _J1[:_ncore_L, _ncore_L:]
                 va = _casdm1 @ (_J0_act * 2.0 - _K0_act)
                 vc = _J1_core_rest * 2.0 - _K1_core_rest
             else:
@@ -4161,162 +4209,221 @@ def gen_g_hop_orbital(
     paaa = ppaa_arr[:, ncore:nocc, :, :]
 
     # ── Precompute MO-basis 3-index DF integrals for fast block-selective JK ──
+    #
+    # This is the dominant transient VRAM spike in orbital-only AH when it is
+    # rebuilt repeatedly during rejected keyframe trust checks.  We make it
+    # lazy and prefer packed (Qp) storage in MO-pair space.
     import os as _os_ghop
-    _L_t_gpu = None          # (nmo, naux, nmo)
-    _L_pq2d_act_gpu = None   # optional legacy materialized (ncas*nmo, naux)
-    _L_pq2d_core_gpu = None  # optional legacy materialized (ncore*nmo, naux)
-    _use_mo_jk = False
+
     _mojk_vram_debug = _env_bool_from_map(_os_ghop.environ, "ASUKA_MO_JK_VRAM_DEBUG", default=False)
     _mojk_vram_debug_fine = _env_bool_from_map(_os_ghop.environ, "ASUKA_MO_JK_VRAM_DEBUG_FINE", default=False)
-    _canonical_mo_df_layout = str(_os_ghop.environ.get("ASUKA_MO_JK_CANONICAL_LAYOUT", "1")).strip().lower() not in {"0", "false", "off", "no", "disable", "disabled"}
-    if _os_ghop.environ.get("ASUKA_DISABLE_MO_JK", "0") != "1" and ncore > 0 and _cp is not None:
-        _df_B_raw = getattr(casscf, "df_B", None)
-        if _df_B_raw is not None:
-            try:
-                _B_g = _cp.asarray(_df_B_raw, dtype=_cp.float64)
-                _C_g = _cp.asarray(mo, dtype=_cp.float64)
-                _nao_C = int(_C_g.shape[0])
-                _allow_packed_mojk = str(_os_ghop.environ.get("ASUKA_MO_JK_ALLOW_PACKED_QP", "1")).strip().lower() in {
-                    "1",
-                    "true",
-                    "yes",
-                    "on",
-                }
-                _use_qp_apply_kernel = str(_os_ghop.environ.get("ASUKA_MO_JK_QP_APPLY_KERNEL", "1")).strip().lower() in {
-                    "1",
-                    "true",
-                    "yes",
-                    "on",
-                }
+    _canonical_mo_df_layout = str(_os_ghop.environ.get("ASUKA_MO_JK_CANONICAL_LAYOUT", "1")).strip().lower() not in {
+        "0",
+        "false",
+        "off",
+        "no",
+        "disable",
+        "disabled",
+    }
+    _mojk_kblk_logged = {"done": False}
 
-                # Dense mnQ path.
-                if int(getattr(_B_g, "ndim", 0)) == 3 and int(_B_g.shape[0]) == int(_B_g.shape[1]):
-                    _nao_B = int(_B_g.shape[0])
-                    _naux_B = int(_B_g.shape[2])
+    _mojk_state: dict[str, Any] = {
+        "ready": False,
+        "use": False,
+        "L_qp": None,          # (naux, ntri_mo) packed triangle in MO-pair space
+        "L_t": None,           # (nmo, naux, nmo) legacy dense layout (fallback)
+        "L_pq2d_act": None,    # optional legacy materialized (ncas*nmo, naux)
+        "L_pq2d_core": None,   # optional legacy materialized (ncore*nmo, naux)
+        # GPU-resident copies of h_op intermediates
+        "h1e_mo": None,
+        "dm1_full": None,
+        "g_orb_sym": None,
+        "vhf_ca": None,
+        "vhf_c": None,
+        "casdm1": None,
+        "hdm2": None,
+    }
+
+    def _ensure_orb_mojk_precompute() -> None:
+        if bool(_mojk_state["ready"]):
+            return
+        _mojk_state["ready"] = True
+
+        if _os_ghop.environ.get("ASUKA_DISABLE_MO_JK", "0") == "1" or ncore <= 0 or _cp is None:
+            return
+        _df_B_raw = getattr(casscf, "df_B", None)
+        if _df_B_raw is None:
+            return
+
+        try:
+            _B_g = _cp.asarray(_df_B_raw, dtype=_cp.float64)
+            _C_g = _cp.asarray(mo, dtype=_cp.float64)
+            _nao_C = int(_C_g.shape[0])
+
+            _allow_packed_mojk = str(_os_ghop.environ.get("ASUKA_MO_JK_ALLOW_PACKED_QP", "1")).strip().lower() in {
+                "1",
+                "true",
+                "yes",
+                "on",
+            }
+            _use_qp_apply_kernel = str(_os_ghop.environ.get("ASUKA_MO_JK_QP_APPLY_KERNEL", "0")).strip().lower() in {
+                "1",
+                "true",
+                "yes",
+                "on",
+            }
+
+            _L_qp_gpu = None
+            _L_t_gpu = None
+
+            # Packed Qp path (preferred for VRAM).
+            if int(getattr(_B_g, "ndim", 0)) == 2 and bool(_allow_packed_mojk):
+                from asuka.integrals.df_packed_s2 import (  # noqa: PLC0415
+                    apply_Qp_to_C_block,
+                    pack_Lf_block_to_Qp,
+                    unpack_Qp_to_Qmn_block,
+                )
+                from asuka.integrals.tri_packed import ntri_from_nao  # noqa: PLC0415
+
+                _naux_B, _ntri_B = map(int, _B_g.shape)
+                _nao_B = int(_nao_C)
+                if int(_ntri_B) == int(ntri_from_nao(int(_nao_B))):
+                    _ntri_mo = int(ntri_from_nao(int(nmo)))
                     _qblk = _choose_mojk_aux_qblk(
                         _cp,
                         _os_ghop.environ,
                         naux=int(_naux_B),
-                        default_qblk=int(max(1, min(_naux_B, 96))),
+                        default_qblk=int(max(1, min(_naux_B, 32))),
                         bytes_per_q=int(
                             _estimate_mojk_precompute_bytes_per_q(
-                                mode="mnq",
+                                mode="qp",
                                 nao=int(_nao_B),
                                 nmo=int(nmo),
                                 dtype_nbytes=8,
-                                store_packed=False,
-                                use_qp_kernel=True,
+                                store_packed=True,
+                                use_qp_kernel=bool(_use_qp_apply_kernel),
                             )
                         ),
-                        label="orb_hop MO-JK precompute (mnQ)",
+                        label="orb_hop MO-JK precompute (Qp packed)",
                         debug=bool(_mojk_vram_debug),
                     )
 
-                    _L_t_gpu = _cp.empty((nmo, _naux_B, nmo), dtype=_cp.float64)
+                    _L_qp_gpu = _cp.empty((_naux_B, _ntri_mo), dtype=_cp.float64)
                     if bool(_mojk_vram_debug):
-                        _log_cuda_vram_snapshot(_cp, "orb_hop mojk precompute mnQ start", sync=False)
+                        _log_cuda_vram_snapshot(_cp, "orb_hop mojk precompute Qp start", sync=False)
                     for _q0 in range(0, _naux_B, _qblk):
                         _q1 = min(_naux_B, _q0 + _qblk)
                         _qb = int(_q1 - _q0)
                         if _qb <= 0:
                             continue
                         if bool(_mojk_vram_debug_fine):
-                            _log_cuda_vram_snapshot(_cp, f"orb_hop mojk mnQ q[{int(_q0)}:{int(_q1)}) start", sync=True)
-                        _B_blk = _B_g[:, :, _q0:_q1]
-                        _H_blk = (_C_g.T @ _B_blk.reshape(_nao_B, _nao_B * _qb)).reshape(nmo, _nao_B, _qb)
-                        _H_t_blk = _cp.ascontiguousarray(_H_blk.transpose(0, 2, 1))  # (nmo,qb,nao)
-                        _L_blk = (_H_t_blk.reshape(nmo * _qb, _nao_B) @ _C_g).reshape(nmo, _qb, nmo)
-                        _L_t_gpu[:, _q0:_q1, :] = _L_blk
-                        del _B_blk, _H_blk, _H_t_blk, _L_blk
-                        if bool(_mojk_vram_debug_fine):
-                            _log_cuda_vram_snapshot(_cp, f"orb_hop mojk mnQ q[{int(_q0)}:{int(_q1)}) done", sync=True)
-                    _L_t_gpu = _cp.ascontiguousarray(_L_t_gpu)
-                    if bool(_mojk_vram_debug):
-                        _log_cuda_vram_snapshot(_cp, "orb_hop mojk precompute mnQ done", sync=True)
-                    _use_mo_jk = True
+                            _log_cuda_vram_snapshot(_cp, f"orb_hop mojk Qp q[{int(_q0)}:{int(_q1)}) start", sync=True)
+                        if _use_qp_apply_kernel:
+                            _X_blk = apply_Qp_to_C_block(
+                                _B_g,
+                                _C_g,
+                                nao=int(_nao_B),
+                                q0=int(_q0),
+                                q_count=int(_qb),
+                            )  # (qb,nao,nmo)
+                        else:
+                            _B_qmn = unpack_Qp_to_Qmn_block(_B_g, nao=int(_nao_B), q0=int(_q0), q_count=int(_qb))
+                            _X_blk = _cp.matmul(_B_qmn, _C_g)  # (qb,nao,nmo)
+                            del _B_qmn
 
-                # Packed Qp path.
-                elif int(getattr(_B_g, "ndim", 0)) == 2 and bool(_allow_packed_mojk):
-                    from asuka.integrals.df_packed_s2 import apply_Qp_to_C_block, unpack_Qp_to_Qmn_block  # noqa: PLC0415
-                    from asuka.integrals.tri_packed import ntri_from_nao  # noqa: PLC0415
-
-                    _naux_B, _ntri_B = map(int, _B_g.shape)
-                    _nao_B = int(_nao_C)
-                    if int(_ntri_B) == int(ntri_from_nao(int(_nao_B))):
-                        _qblk = _choose_mojk_aux_qblk(
-                            _cp,
-                            _os_ghop.environ,
+                        # Build all q in one GEMM, then pack directly from the GEMM output
+                        # to avoid materializing dense (q,nmo,nmo) buffers.
+                        _X_t_blk = _cp.ascontiguousarray(_X_blk.transpose(1, 0, 2))
+                        _L_f_blk = _C_g.T @ _X_t_blk.reshape(_nao_B, _qb * nmo)  # (nmo, qb*nmo)
+                        del _X_t_blk
+                        pack_Lf_block_to_Qp(
+                            _L_f_blk,
+                            _L_qp_gpu,
                             naux=int(_naux_B),
-                            default_qblk=int(max(1, min(_naux_B, 48))),
-                            bytes_per_q=int(
-                                _estimate_mojk_precompute_bytes_per_q(
-                                    mode="qp",
-                                    nao=int(_nao_B),
-                                    nmo=int(nmo),
-                                    dtype_nbytes=8,
-                                    store_packed=False,
-                                    use_qp_kernel=bool(_use_qp_apply_kernel),
-                                )
-                            ),
-                            label="orb_hop MO-JK precompute (Qp)",
-                            debug=bool(_mojk_vram_debug),
+                            nao=int(nmo),
+                            q0=int(_q0),
+                            q_count=int(_qb),
+                            threads=256,
+                            sync=False,
                         )
+                        del _L_f_blk, _X_blk
+                        if bool(_mojk_vram_debug_fine):
+                            _log_cuda_vram_snapshot(_cp, f"orb_hop mojk Qp q[{int(_q0)}:{int(_q1)}) done", sync=True)
+                    if bool(_mojk_vram_debug):
+                        _log_cuda_vram_snapshot(_cp, "orb_hop mojk precompute Qp done", sync=True)
 
-                        _L_t_gpu = _cp.empty((nmo, _naux_B, nmo), dtype=_cp.float64)
-                        if bool(_mojk_vram_debug):
-                            _log_cuda_vram_snapshot(_cp, "orb_hop mojk precompute Qp start", sync=False)
-                        for _q0 in range(0, _naux_B, _qblk):
-                            _q1 = min(_naux_B, _q0 + _qblk)
-                            _qb = int(_q1 - _q0)
-                            if _qb <= 0:
-                                continue
-                            if bool(_mojk_vram_debug_fine):
-                                _log_cuda_vram_snapshot(_cp, f"orb_hop mojk Qp q[{int(_q0)}:{int(_q1)}) start", sync=True)
-                            if _use_qp_apply_kernel:
-                                _X_blk = apply_Qp_to_C_block(
-                                    _B_g,
-                                    _C_g,
-                                    nao=int(_nao_B),
-                                    q0=int(_q0),
-                                    q_count=int(_qb),
-                                )  # (qb,nao,nmo)
-                            else:
-                                _B_qmn = unpack_Qp_to_Qmn_block(_B_g, nao=int(_nao_B), q0=int(_q0), q_count=int(_qb))
-                                _X_blk = _cp.matmul(_B_qmn, _C_g)  # (qb,nao,nmo)
-                                del _B_qmn
-                            _X_t_blk = _cp.ascontiguousarray(_X_blk.transpose(1, 0, 2))
-                            _L_f_blk = _C_g.T @ _X_t_blk.reshape(_nao_B, _qb * nmo)
-                            _L_blk = _cp.ascontiguousarray(_L_f_blk.reshape(nmo, _qb, nmo).transpose(1, 0, 2))
-                            del _X_t_blk, _L_f_blk
-                            _L_t_gpu[:, _q0:_q1, :] = _L_blk.transpose(1, 0, 2)
-                            del _X_blk, _L_blk
-                            if bool(_mojk_vram_debug_fine):
-                                _log_cuda_vram_snapshot(_cp, f"orb_hop mojk Qp q[{int(_q0)}:{int(_q1)}) done", sync=True)
-                        _L_t_gpu = _cp.ascontiguousarray(_L_t_gpu)
-                        if bool(_mojk_vram_debug):
-                            _log_cuda_vram_snapshot(_cp, "orb_hop mojk precompute Qp done", sync=True)
-                        _use_mo_jk = True
+            # Dense mnQ path (fallback).
+            if _L_qp_gpu is None and int(getattr(_B_g, "ndim", 0)) == 3 and int(_B_g.shape[0]) == int(_B_g.shape[1]):
+                _nao_B = int(_B_g.shape[0])
+                _naux_B = int(_B_g.shape[2])
+                _qblk = _choose_mojk_aux_qblk(
+                    _cp,
+                    _os_ghop.environ,
+                    naux=int(_naux_B),
+                    default_qblk=int(max(1, min(_naux_B, 96))),
+                    bytes_per_q=int(
+                        _estimate_mojk_precompute_bytes_per_q(
+                            mode="mnq",
+                            nao=int(_nao_B),
+                            nmo=int(nmo),
+                            dtype_nbytes=8,
+                            store_packed=False,
+                            use_qp_kernel=True,
+                        )
+                    ),
+                    label="orb_hop MO-JK precompute (mnQ)",
+                    debug=bool(_mojk_vram_debug),
+                )
 
-                if _use_mo_jk and (not _canonical_mo_df_layout):
-                    _L_pq2d_act_gpu = _cp.ascontiguousarray(
-                        _L_t_gpu[ncore:nocc].transpose(0, 2, 1).reshape(ncas * nmo, _L_t_gpu.shape[1])
-                    )
-                    _L_pq2d_core_gpu = _cp.ascontiguousarray(
-                        _L_t_gpu[:ncore].transpose(0, 2, 1).reshape(ncore * nmo, _L_t_gpu.shape[1])
-                    )
-                del _B_g, _C_g
-            except Exception:
-                _use_mo_jk = False
+                _L_t_gpu = _cp.empty((nmo, _naux_B, nmo), dtype=_cp.float64)
+                if bool(_mojk_vram_debug):
+                    _log_cuda_vram_snapshot(_cp, "orb_hop mojk precompute mnQ start", sync=False)
+                for _q0 in range(0, _naux_B, _qblk):
+                    _q1 = min(_naux_B, _q0 + _qblk)
+                    _qb = int(_q1 - _q0)
+                    if _qb <= 0:
+                        continue
+                    if bool(_mojk_vram_debug_fine):
+                        _log_cuda_vram_snapshot(_cp, f"orb_hop mojk mnQ q[{int(_q0)}:{int(_q1)}) start", sync=True)
+                    _B_blk = _B_g[:, :, _q0:_q1]
+                    _H_blk = (_C_g.T @ _B_blk.reshape(_nao_B, _nao_B * _qb)).reshape(nmo, _nao_B, _qb)
+                    _H_t_blk = _cp.ascontiguousarray(_H_blk.transpose(0, 2, 1))  # (nmo,qb,nao)
+                    _L_blk = (_H_t_blk.reshape(nmo * _qb, _nao_B) @ _C_g).reshape(nmo, _qb, nmo)
+                    _L_t_gpu[:, _q0:_q1, :] = _L_blk
+                    del _B_blk, _H_blk, _H_t_blk, _L_blk
+                    if bool(_mojk_vram_debug_fine):
+                        _log_cuda_vram_snapshot(_cp, f"orb_hop mojk mnQ q[{int(_q0)}:{int(_q1)}) done", sync=True)
+                _L_t_gpu = _cp.ascontiguousarray(_L_t_gpu)
+                if bool(_mojk_vram_debug):
+                    _log_cuda_vram_snapshot(_cp, "orb_hop mojk precompute mnQ done", sync=True)
 
-    # GPU-resident copies of h_op intermediates (avoids per-call CPU→GPU transfers)
-    if _use_mo_jk:
-        _h1e_mo_g = _cp.asarray(h1e_mo, dtype=_cp.float64)
-        _dm1_full_g = _cp.asarray(dm1_full, dtype=_cp.float64)
-        _g_orb_sym_g = _cp.asarray(g_orb_mat + g_orb_mat.T, dtype=_cp.float64)
-        _vhf_ca_g = _cp.asarray(vhf_ca, dtype=_cp.float64)
-        _vhf_c_g = _cp.asarray(vhf_c_np, dtype=_cp.float64)
-        _casdm1_hop_g = _cp.asarray(casdm1, dtype=_cp.float64)
-        _hdm2_g = _cp.asarray(hdm2, dtype=_cp.float64)
+            del _B_g, _C_g
+
+            if _L_qp_gpu is None and _L_t_gpu is None:
+                return
+
+            _mojk_state["L_qp"] = _L_qp_gpu
+            _mojk_state["L_t"] = _L_t_gpu
+            if _L_t_gpu is not None and (not _canonical_mo_df_layout):
+                _mojk_state["L_pq2d_act"] = _cp.ascontiguousarray(
+                    _L_t_gpu[ncore:nocc].transpose(0, 2, 1).reshape(ncas * nmo, _L_t_gpu.shape[1])
+                )
+                _mojk_state["L_pq2d_core"] = _cp.ascontiguousarray(
+                    _L_t_gpu[:ncore].transpose(0, 2, 1).reshape(ncore * nmo, _L_t_gpu.shape[1])
+                )
+
+            # GPU-resident copies of h_op intermediates (avoids per-call CPU→GPU transfers)
+            _mojk_state["h1e_mo"] = _cp.asarray(h1e_mo, dtype=_cp.float64)
+            _mojk_state["dm1_full"] = _cp.asarray(dm1_full, dtype=_cp.float64)
+            _mojk_state["g_orb_sym"] = _cp.asarray(g_orb_mat + g_orb_mat.T, dtype=_cp.float64)
+            _mojk_state["vhf_ca"] = _cp.asarray(vhf_ca, dtype=_cp.float64)
+            _mojk_state["vhf_c"] = _cp.asarray(vhf_c_np, dtype=_cp.float64)
+            _mojk_state["casdm1"] = _cp.asarray(casdm1, dtype=_cp.float64)
+            _mojk_state["hdm2"] = _cp.asarray(hdm2, dtype=_cp.float64)
+
+            _mojk_state["use"] = True
+        except Exception:
+            _mojk_state["use"] = False
 
     # Orbital diagonal Hessian (PySCF Parts 7-6).
     h_diag = np.einsum("ii,jj->ij", h1e_mo, dm1_full) - h1e_mo * dm1_full
@@ -4352,10 +4459,19 @@ def gen_g_hop_orbital(
         x_packed = np.asarray(x_packed, dtype=np.float64).ravel()
         x1 = casscf.unpack_uniq_var(x_packed)
 
-        if _use_mo_jk:
+        _ensure_orb_mojk_precompute()
+        if bool(_mojk_state.get("use", False)):
             # ── Full GPU path: matmuls + block-selective MO-basis JK ──
             _xp = _cp
             x1_g = _xp.asarray(x1, dtype=_xp.float64)
+
+            _h1e_mo_g = _mojk_state["h1e_mo"]
+            _dm1_full_g = _mojk_state["dm1_full"]
+            _g_orb_sym_g = _mojk_state["g_orb_sym"]
+            _vhf_ca_g = _mojk_state["vhf_ca"]
+            _vhf_c_g = _mojk_state["vhf_c"]
+            _casdm1_hop_g = _mojk_state["casdm1"]
+            _hdm2_g = _mojk_state["hdm2"]
 
             # Orbital Hessian assembly (GPU)
             x2_g = (_h1e_mo_g @ x1_g) @ _dm1_full_g
@@ -4363,11 +4479,9 @@ def gen_g_hop_orbital(
             if ncore:
                 x2_g[:ncore] += (x1_g[:ncore, ncore:] @ _vhf_ca_g[ncore:]) * 2.0
             x2_g[ncore:nocc] += (_casdm1_hop_g @ x1_g[ncore:nocc]) @ _vhf_c_g
-            x2_g[:, ncore:nocc] += _xp.einsum(
-                "purv,rv->pu", _hdm2_g, x1_g[:, ncore:nocc], optimize=True,
-            )
+            x2_g[:, ncore:nocc] += _xp.einsum("purv,rv->pu", _hdm2_g, x1_g[:, ncore:nocc], optimize=True)
 
-            # Block-selective MO-basis JK with combined K GEMM
+            # Block-selective MO-basis JK
             if ncore > 0:
                 # dm3_MO: symmetric core↔rest block of x1
                 dm3 = _xp.zeros((nmo, nmo), dtype=_xp.float64)
@@ -4379,58 +4493,182 @@ def gen_g_hop_orbital(
                 dm4_h[ncore:nocc, :] = _casdm1_hop_g @ x1_g[ncore:nocc, :]
                 dm_total = dm3 * 2.0 + dm4_h + dm4_h.T
 
-                _naux = int(_L_t_gpu.shape[1])
-                L_t_2d = _L_t_gpu.reshape(nmo, _naux * nmo)
-                L_t_act_flat = _L_t_gpu[ncore:nocc].reshape(ncas * _naux, nmo)
-                L_t_core_flat = _L_t_gpu[:ncore].reshape(ncore * _naux, nmo)
+                _L_qp_gpu = _mojk_state.get("L_qp", None)
+                if _L_qp_gpu is not None:
+                    from asuka.hf import df_scf as _df_scf  # noqa: PLC0415
+                    from asuka.integrals.df_packed_s2 import extract_Qp_rows_cols_block  # noqa: PLC0415
 
-                # K Step 1: separate small GEMMs for each density
-                LDM0 = (L_t_act_flat @ dm3).reshape(ncas, _naux * nmo)
-                LDM1 = (L_t_core_flat @ dm_total).reshape(ncore, _naux * nmo)
+                    _naux_L = int(_L_qp_gpu.shape[0])
+                    try:
+                        _k_qblk = int(str(_os_ghop.environ.get("ASUKA_MO_JK_K_QBLOCK_PACKED", "")).strip() or "0")
+                    except Exception:
+                        _k_qblk = 0
+                    if _k_qblk <= 0:
+                        try:
+                            _k_qblk = int(str(_os_ghop.environ.get("ASUKA_DF_JK_K_QBLOCK_PACKED", "")).strip() or "0")
+                        except Exception:
+                            _k_qblk = 0
+                    if _k_qblk <= 0:
+                        _k_qblk = 128
+                    _k_qblk = int(max(1, min(_naux_L, _k_qblk)))
 
-                try:
-                    _k_accum_qblk = int(str(_os_ghop.environ.get("ASUKA_MO_JK_K_ACCUM_QBLOCK", "")).strip() or "0")
-                except Exception:
-                    _k_accum_qblk = 0
-                if _k_accum_qblk <= 0:
-                    _k_accum_qblk = int(max(1, min(_naux, 64)))
+                    _k_cblk = _choose_mojk_colblk(
+                        _xp,
+                        _os_ghop.environ,
+                        qblk=int(_k_qblk),
+                        nao=int(nmo),
+                        ncol_total=int(nmo),
+                        default_colblk=256,
+                        dtype_nbytes=8,
+                        label="orb_hop packed-K",
+                        debug=bool(_mojk_vram_debug and not bool(_mojk_kblk_logged["done"])),
+                    )
+                    _mojk_kblk_logged["done"] = True
+
+                    # J blocks (avoid full J build; exploit dm3/dm4 structure like the dense-L_t path).
+                    _nrest = int(nmo - ncore)
+                    _x_core_rest = x1_g[:ncore, ncore:]  # (ncore, nrest)
+                    _dm4_act = _casdm1_hop_g @ x1_g[ncore:nocc, :]  # (ncas, nmo)
+                    _J0_act = _xp.zeros((ncas, nmo), dtype=_xp.float64)
+                    _J1_core_rest = _xp.zeros((ncore, _nrest), dtype=_xp.float64)
+                    for _q0 in range(0, _naux_L, _k_qblk):
+                        _q1 = min(_naux_L, _q0 + _k_qblk)
+                        _qb = int(_q1 - _q0)
+                        if _qb <= 0:
+                            continue
+
+                        # rho0_Q = 2 * sum_{i in core, a in rest} L_{iQa} * x1[i,a]
+                        # Use rest-core orientation (a,i) from packed storage: L_{iQa} == L_{aQi}.
+                        _L_rest_core = extract_Qp_rows_cols_block(
+                            _L_qp_gpu,
+                            nao=int(nmo),
+                            q0=int(_q0),
+                            q_count=int(_qb),
+                            row0=int(ncore),
+                            row_count=int(_nrest),
+                            col0=0,
+                            col_count=int(ncore),
+                        )
+                        _rho0 = 2.0 * _xp.einsum("qai,ia->q", _L_rest_core, _x_core_rest, optimize=True)
+                        del _L_rest_core
+
+                        # Active rows for J0 and dm4 term.
+                        _L_act_all = extract_Qp_rows_cols_block(
+                            _L_qp_gpu,
+                            nao=int(nmo),
+                            q0=int(_q0),
+                            q_count=int(_qb),
+                            row0=int(ncore),
+                            row_count=int(ncas),
+                            col0=0,
+                            col_count=int(nmo),
+                        )
+                        _J0_act += _xp.einsum("q,qpm->pm", _rho0, _L_act_all, optimize=True)
+                        _rho_dm4 = 2.0 * _xp.einsum("qpm,pm->q", _L_act_all, _dm4_act, optimize=True)
+                        del _L_act_all
+
+                        # rho1 = rho(dm_total) = 2*rho0 + rho_dm4
+                        _rho1 = _rho0 * 2.0 + _rho_dm4
+                        del _rho0, _rho_dm4
+
+                        # Core rows, rest cols for J1.
+                        _L_core_rest = extract_Qp_rows_cols_block(
+                            _L_qp_gpu,
+                            nao=int(nmo),
+                            q0=int(_q0),
+                            q_count=int(_qb),
+                            row0=0,
+                            row_count=int(ncore),
+                            col0=int(ncore),
+                            col_count=int(_nrest),
+                        )
+                        _J1_core_rest += _xp.einsum("q,qim->im", _rho1, _L_core_rest, optimize=True)
+                        del _L_core_rest, _rho1
+
+                    _K0_act = _df_scf._df_K_qblocked_Qp_rows_cols(  # noqa: SLF001
+                        _L_qp_gpu,
+                        dm3,
+                        nao=int(nmo),
+                        row0=int(ncore),
+                        row_count=int(ncas),
+                        col0=0,
+                        col_count=int(nmo),
+                        q_block=int(_k_qblk),
+                        col_block=int(_k_cblk),
+                    )
+                    _K1_core_rest = _df_scf._df_K_qblocked_Qp_rows_cols(  # noqa: SLF001
+                        _L_qp_gpu,
+                        dm_total,
+                        nao=int(nmo),
+                        row0=0,
+                        row_count=int(ncore),
+                        col0=int(ncore),
+                        col_count=int(nmo - ncore),
+                        q_block=int(_k_qblk),
+                        col_block=int(_k_cblk),
+                    )
+                    x2_g[ncore:nocc] += _casdm1_hop_g @ (_J0_act * 2.0 - _K0_act)
+                    x2_g[:ncore, ncore:] += (_J1_core_rest * 2.0 - _K1_core_rest)
                 else:
-                    _k_accum_qblk = int(max(1, min(_naux, _k_accum_qblk)))
+                    # Legacy dense L_t path (fastest, higher VRAM). Kept as fallback.
+                    _L_t_gpu = _mojk_state.get("L_t", None)
+                    if _L_t_gpu is not None:
+                        _naux = int(_L_t_gpu.shape[1])
+                        L_t_act_flat = _L_t_gpu[ncore:nocc].reshape(ncas * _naux, nmo)
+                        L_t_core_flat = _L_t_gpu[:ncore].reshape(ncore * _naux, nmo)
 
-                K0_act = _xp.zeros((ncas, nmo), dtype=LDM0.dtype)
-                K1_core = _xp.zeros((ncore, nmo), dtype=LDM1.dtype)
-                for _q0 in range(0, _naux, _k_accum_qblk):
-                    _q1 = min(_naux, _q0 + _k_accum_qblk)
-                    _qb = int(_q1 - _q0)
-                    if _qb <= 0:
-                        continue
-                    _off0 = int(_q0 * nmo)
-                    _off1 = int(_q1 * nmo)
-                    _L_blk_t = _L_t_gpu[:, _q0:_q1, :].reshape(nmo, _qb * nmo).T
-                    K0_act += LDM0[:, _off0:_off1] @ _L_blk_t
-                    K1_core += LDM1[:, _off0:_off1] @ _L_blk_t
+                        # K Step 1: separate small GEMMs for each density
+                        LDM0 = (L_t_act_flat @ dm3).reshape(ncas, _naux * nmo)
+                        LDM1 = (L_t_core_flat @ dm_total).reshape(ncore, _naux * nmo)
 
-                # J0: exploit sparse dm3 (only core↔rest nonzero)
-                rho0 = 2.0 * _xp.einsum("iQa,ia->Q", _L_t_gpu[:ncore, :, ncore:], x1_g[:ncore, ncore:], optimize=True)
-                if _canonical_mo_df_layout:
-                    J0_act = _xp.einsum("pQq,Q->pq", _L_t_gpu[ncore:nocc], rho0, optimize=True)
-                else:
-                    J0_act = (_L_pq2d_act_gpu @ rho0).reshape(ncas, nmo)
+                        try:
+                            _k_accum_qblk = int(str(_os_ghop.environ.get("ASUKA_MO_JK_K_ACCUM_QBLOCK", "")).strip() or "0")
+                        except Exception:
+                            _k_accum_qblk = 0
+                        if _k_accum_qblk <= 0:
+                            _k_accum_qblk = int(max(1, min(_naux, 64)))
+                        else:
+                            _k_accum_qblk = int(max(1, min(_naux, _k_accum_qblk)))
 
-                # J1: rho1 = 2*rho0 + rho_dm4
-                dm4_act = _casdm1_hop_g @ x1_g[ncore:nocc]
-                if _canonical_mo_df_layout:
-                    rho_dm4 = 2.0 * _xp.einsum("pQq,pq->Q", _L_t_gpu[ncore:nocc], dm4_act, optimize=True)
-                else:
-                    rho_dm4 = 2.0 * (_L_pq2d_act_gpu.T @ dm4_act.ravel())
-                rho1 = 2.0 * rho0 + rho_dm4
-                if _canonical_mo_df_layout:
-                    J1_core = _xp.einsum("pQq,Q->pq", _L_t_gpu[:ncore], rho1, optimize=True)
-                else:
-                    J1_core = (_L_pq2d_core_gpu @ rho1).reshape(ncore, nmo)
+                        K0_act = _xp.zeros((ncas, nmo), dtype=LDM0.dtype)
+                        K1_core = _xp.zeros((ncore, nmo), dtype=LDM1.dtype)
+                        for _q0 in range(0, _naux, _k_accum_qblk):
+                            _q1 = min(_naux, _q0 + _k_accum_qblk)
+                            _qb = int(_q1 - _q0)
+                            if _qb <= 0:
+                                continue
+                            _off0 = int(_q0 * nmo)
+                            _off1 = int(_q1 * nmo)
+                            _L_blk_t = _L_t_gpu[:, _q0:_q1, :].reshape(nmo, _qb * nmo).T
+                            K0_act += LDM0[:, _off0:_off1] @ _L_blk_t
+                            K1_core += LDM1[:, _off0:_off1] @ _L_blk_t
 
-                x2_g[ncore:nocc] += _casdm1_hop_g @ (J0_act * 2.0 - K0_act)
-                x2_g[:ncore, ncore:] += (J1_core * 2.0 - K1_core)[:, ncore:]
+                        # J0: exploit sparse dm3 (only core↔rest nonzero)
+                        rho0 = 2.0 * _xp.einsum(
+                            "iQa,ia->Q", _L_t_gpu[:ncore, :, ncore:], x1_g[:ncore, ncore:], optimize=True
+                        )
+                        if _canonical_mo_df_layout:
+                            J0_act = _xp.einsum("pQq,Q->pq", _L_t_gpu[ncore:nocc], rho0, optimize=True)
+                        else:
+                            _L_pq2d_act_gpu = _mojk_state.get("L_pq2d_act", None)
+                            J0_act = (_L_pq2d_act_gpu @ rho0).reshape(ncas, nmo)
+
+                        # J1: rho1 = 2*rho0 + rho_dm4
+                        dm4_act = _casdm1_hop_g @ x1_g[ncore:nocc]
+                        if _canonical_mo_df_layout:
+                            rho_dm4 = 2.0 * _xp.einsum("pQq,pq->Q", _L_t_gpu[ncore:nocc], dm4_act, optimize=True)
+                        else:
+                            _L_pq2d_act_gpu = _mojk_state.get("L_pq2d_act", None)
+                            rho_dm4 = 2.0 * (_L_pq2d_act_gpu.T @ dm4_act.ravel())
+                        rho1 = 2.0 * rho0 + rho_dm4
+                        if _canonical_mo_df_layout:
+                            J1_core = _xp.einsum("pQq,Q->pq", _L_t_gpu[:ncore], rho1, optimize=True)
+                        else:
+                            _L_pq2d_core_gpu = _mojk_state.get("L_pq2d_core", None)
+                            J1_core = (_L_pq2d_core_gpu @ rho1).reshape(ncore, nmo)
+
+                        x2_g[ncore:nocc] += _casdm1_hop_g @ (J0_act * 2.0 - K0_act)
+                        x2_g[:ncore, ncore:] += (J1_core * 2.0 - K1_core)[:, ncore:]
 
             x2 = (x2_g - x2_g.T).get()
         else:

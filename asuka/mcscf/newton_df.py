@@ -341,14 +341,25 @@ def _build_df_newton_eris_blocked_qp(
         if q <= 0:
             continue
 
-        # Qp -> Qmn for the current aux block, then transpose to mnQ.
+        # Qp -> Qmn for the current aux block.
+        #
+        # Use batched GEMM for the half-transform (B_qmn @ C) and then a single
+        # large GEMM for the second half-transform, mirroring the fast mnQ path.
         B_qmn = unpack_Qp_to_Qmn_block(B_Qp, nao=int(nao), q0=int(q0), q_count=int(q))  # (q,nao,nao)
-        B_blk = xp.ascontiguousarray(xp.asarray(B_qmn, dtype=cdtype).transpose(1, 2, 0))  # (nao,nao,q)
-        del B_qmn
+        B_qmn = xp.asarray(B_qmn, dtype=cdtype)
 
-        tmp = xp.tensordot(B_blk, mo_c, axes=([1], [0]))  # (nao, q, nmo)
-        L_raw = mo_c.T @ tmp.reshape(nao, q * nmo)  # (nmo, q*nmo)
-        del tmp, B_blk
+        # Half-transform via a single GEMM (often faster than batched matmul):
+        #   X[(q,mu), p] = sum_nu B_qmn[q,mu,nu] * C[nu,p]
+        X2d = B_qmn.reshape(q * nao, nao) @ mo_c  # (q*nao, nmo)
+        del B_qmn
+        X_blk = X2d.reshape(q, nao, nmo)
+        del X2d
+
+        X_t_blk = xp.ascontiguousarray(X_blk.transpose(1, 0, 2))  # (nao,q,nmo)
+        del X_blk
+
+        L_raw = mo_c.T @ X_t_blk.reshape(nao, q * nmo)  # (nmo, q*nmo)
+        del X_t_blk
         L_blk = xp.ascontiguousarray(L_raw.reshape(nmo, q, nmo).transpose(0, 2, 1))
         del L_raw
 

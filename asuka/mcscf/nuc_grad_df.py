@@ -1263,16 +1263,41 @@ def _build_dme0_lorb_response(
 
     # AO densities and L-effective densities.
     _dml_sym_mode = str(_os.environ.get("ASUKA_CASPT2_LORB_DML_SYM_MODE", "full")).strip().lower()
-    if _dml_sym_mode not in {"full", "core_raw", "act_raw", "raw"}:
+    if _dml_sym_mode not in {
+        "full",
+        "core_raw",
+        "act_raw",
+        "raw",
+        "core_asym",
+        "act_asym",
+        "asym",
+        "core_oitd",
+        "act_oitd",
+        "molcas_oitd",
+    }:
         _dml_sym_mode = "full"
     D_L_core_raw = xp.zeros((nao, nao), dtype=xp.float64)
     D_L_core_sym = xp.zeros((nao, nao), dtype=xp.float64)
+    D_L_core_asym = xp.zeros((nao, nao), dtype=xp.float64)
+    D_L_core_oitd = xp.zeros((nao, nao), dtype=xp.float64)
     if ncore:
         D_core = 2.0 * (C_core @ C_core.T)
         D_L_core_raw = 2.0 * (C_L_core @ C_core.T)
         D_L_core_sym = D_L_core_raw + D_L_core_raw.T
+        D_L_core_asym = D_L_core_raw - D_L_core_raw.T
+        _need_core_oitd = _dml_sym_mode in {"core_oitd", "molcas_oitd"}
+        if _need_core_oitd:
+            # Molcas OITD path: D_L = D0*K^T - K^T*D0 in MO basis, then AO transform.
+            d_core_mo = xp.zeros((nmo, nmo), dtype=xp.float64)
+            d_core_mo[:ncore, :ncore] = 2.0 * xp.eye(int(ncore), dtype=xp.float64)
+            dL_core_mo = d_core_mo @ L.T - L.T @ d_core_mo
+            D_L_core_oitd = C @ dL_core_mo @ C.T
         if _dml_sym_mode in {"core_raw", "raw"}:
             D_L_core = D_L_core_raw
+        elif _dml_sym_mode in {"core_asym", "asym"}:
+            D_L_core = D_L_core_asym
+        elif _dml_sym_mode in {"core_oitd", "molcas_oitd"}:
+            D_L_core = D_L_core_oitd
         else:
             D_L_core = D_L_core_sym
     else:
@@ -1281,20 +1306,148 @@ def _build_dme0_lorb_response(
 
     D_act = C_act @ dm1 @ C_act.T
     D_L_act_raw = C_L_act @ dm1 @ C_act.T
+    D_L_act_asym = D_L_act_raw - D_L_act_raw.T
+    D_L_act_oitd = xp.zeros((nao, nao), dtype=xp.float64)
+    _need_act_oitd = _dml_sym_mode in {"act_oitd", "molcas_oitd"}
+    if _need_act_oitd:
+        d_act_mo = xp.zeros((nmo, nmo), dtype=xp.float64)
+        d_act_mo[ncore:nocc, ncore:nocc] = dm1
+        dL_act_mo = d_act_mo @ L.T - L.T @ d_act_mo
+        D_L_act_oitd = C @ dL_act_mo @ C.T
     if _dml_sym_mode in {"act_raw", "raw"}:
         D_L_act = D_L_act_raw
+    elif _dml_sym_mode in {"act_asym", "asym"}:
+        D_L_act = D_L_act_asym
+    elif _dml_sym_mode in {"act_oitd", "molcas_oitd"}:
+        D_L_act = D_L_act_oitd
     else:
         D_L_act = D_L_act_raw + D_L_act_raw.T
     D_L = D_L_core + D_L_act
     _vmix_dml_mode = str(_os.environ.get("ASUKA_CASPT2_LORB_VMIX_DML_CORE_MODE", "as_dml")).strip().lower()
-    if _vmix_dml_mode not in {"as_dml", "full", "raw"}:
+    if _vmix_dml_mode not in {"as_dml", "full", "raw", "asym", "oitd"}:
         _vmix_dml_mode = "as_dml"
     if _vmix_dml_mode == "full":
         D_L_core_vmix = D_L_core_sym
     elif _vmix_dml_mode == "raw":
         D_L_core_vmix = D_L_core_raw
+    elif _vmix_dml_mode == "asym":
+        D_L_core_vmix = D_L_core_asym
+    elif _vmix_dml_mode == "oitd":
+        D_L_core_vmix = D_L_core_oitd
     else:
         D_L_core_vmix = D_L_core
+    # Optional J/K split for the vmix core channel:
+    # keep J on the regular D_L path while allowing K to use raw D_L when
+    # debugging exchange-specific mismatches against Molcas.
+    _vmix_split_mode = str(_os.environ.get("ASUKA_CASPT2_LORB_VMIX_DML_SPLIT_MODE", "shared")).strip().lower()
+    if _vmix_split_mode not in {
+        "shared",
+        "j_dml_k_raw",
+        "j_sym_k_raw",
+        "j_dml_k_sym",
+        "j_dml_k_asym",
+        "j_sym_k_asym",
+        "j_dml_k_oitd",
+        "j_sym_k_oitd",
+    }:
+        _vmix_split_mode = "shared"
+    if _vmix_split_mode == "j_dml_k_raw":
+        D_L_core_vmix_j = D_L_core
+        D_L_core_vmix_k = D_L_core_raw
+    elif _vmix_split_mode == "j_sym_k_raw":
+        D_L_core_vmix_j = D_L_core_sym
+        D_L_core_vmix_k = D_L_core_raw
+    elif _vmix_split_mode == "j_dml_k_sym":
+        D_L_core_vmix_j = D_L_core
+        D_L_core_vmix_k = D_L_core_sym
+    elif _vmix_split_mode == "j_dml_k_asym":
+        D_L_core_vmix_j = D_L_core
+        D_L_core_vmix_k = D_L_core_asym
+    elif _vmix_split_mode == "j_sym_k_asym":
+        D_L_core_vmix_j = D_L_core_sym
+        D_L_core_vmix_k = D_L_core_asym
+    elif _vmix_split_mode == "j_dml_k_oitd":
+        D_L_core_vmix_j = D_L_core
+        D_L_core_vmix_k = D_L_core_oitd
+    elif _vmix_split_mode == "j_sym_k_oitd":
+        D_L_core_vmix_j = D_L_core_sym
+        D_L_core_vmix_k = D_L_core_oitd
+    else:
+        D_L_core_vmix_j = D_L_core_vmix
+        D_L_core_vmix_k = D_L_core_vmix
+
+    # Optional override for the active-kernel vmix J/K channels.
+    # This keeps the default Molcas-parity behavior (`as_dml`) unchanged
+    # while allowing term-isolated diagnostics for the Ka/Ja branches.
+    _vmix_j_act_mode = str(
+        _os.environ.get("ASUKA_CASPT2_LORB_VMIX_DML_J_ACT_MODE", "as_dml")
+    ).strip().lower()
+    _vmix_k_act_mode = str(
+        _os.environ.get("ASUKA_CASPT2_LORB_VMIX_DML_K_ACT_MODE", "as_dml")
+    ).strip().lower()
+    if _vmix_j_act_mode not in {"as_dml", "full", "raw", "asym", "oitd"}:
+        _vmix_j_act_mode = "as_dml"
+    if _vmix_k_act_mode not in {"as_dml", "full", "raw", "asym", "oitd"}:
+        _vmix_k_act_mode = "as_dml"
+    if _vmix_j_act_mode == "full":
+        D_L_core_vmix_j_act = D_L_core_sym
+    elif _vmix_j_act_mode == "raw":
+        D_L_core_vmix_j_act = D_L_core_raw
+    elif _vmix_j_act_mode == "asym":
+        D_L_core_vmix_j_act = D_L_core_asym
+    elif _vmix_j_act_mode == "oitd":
+        D_L_core_vmix_j_act = D_L_core_oitd
+    else:
+        D_L_core_vmix_j_act = D_L_core_vmix
+    if _vmix_k_act_mode == "full":
+        D_L_core_vmix_k_act = D_L_core_sym
+    elif _vmix_k_act_mode == "raw":
+        D_L_core_vmix_k_act = D_L_core_raw
+    elif _vmix_k_act_mode == "asym":
+        D_L_core_vmix_k_act = D_L_core_asym
+    elif _vmix_k_act_mode == "oitd":
+        D_L_core_vmix_k_act = D_L_core_oitd
+    else:
+        D_L_core_vmix_k_act = D_L_core_vmix
+
+    def _normalize_vmix_mm_mode(value: str | None) -> str:
+        mode = str(value or "left").strip().lower()
+        if mode in {"left", "dl"}:
+            return "left"
+        if mode in {"right", "dr"}:
+            return "right"
+        if mode in {"left_t", "left_transpose", "left_transposed", "dl_t"}:
+            return "left_t"
+        if mode in {"right_t", "right_transpose", "right_transposed", "dr_t"}:
+            return "right_t"
+        if mode in {"sym", "avg", "dl_dr_avg", "left_right_avg"}:
+            return "sym"
+        if mode in {"sym_t", "avg_t", "dl_drt_avg", "left_right_t_avg"}:
+            return "sym_t"
+        return "left"
+
+    def _vmix_matmul(lhs: Any, rhs: Any, mode: str):
+        mode_n = _normalize_vmix_mm_mode(mode)
+        if mode_n == "left":
+            return lhs @ rhs
+        if mode_n == "right":
+            return rhs @ lhs
+        if mode_n == "left_t":
+            return lhs @ rhs.T
+        if mode_n == "right_t":
+            return rhs.T @ lhs
+        if mode_n == "sym":
+            return 0.5 * (lhs @ rhs + rhs @ lhs)
+        if mode_n == "sym_t":
+            return 0.5 * (lhs @ rhs.T + rhs.T @ lhs)
+        return lhs @ rhs
+
+    _vmix_j_mm_mode = _normalize_vmix_mm_mode(
+        _os.environ.get("ASUKA_CASPT2_LORB_VMIX_J_MM_MODE", "left")
+    )
+    _vmix_k_mm_mode = _normalize_vmix_mm_mode(
+        _os.environ.get("ASUKA_CASPT2_LORB_VMIX_K_MM_MODE", "left")
+    )
 
     # J/K builds using DF (GPU-aware via _df_JK xp dispatch).
     # Use cached root-invariant vhf_c/vhf_a when available.
@@ -1370,10 +1523,10 @@ def _build_dme0_lorb_response(
     g_vL_c_j = g_vL_c_k = None
     g_vc_L_j = g_vc_L_k = None
     if Jc is not None and Kc is not None and Ja is not None and Ka is not None:
-        g_vmix_j_core = Jc @ D_L_core_vmix
-        g_vmix_j_act = Ja @ D_L_core_vmix
-        g_vmix_k_core = (-0.5 * Kc) @ D_L_core_vmix
-        g_vmix_k_act = (-0.5 * Ka) @ D_L_core_vmix
+        g_vmix_j_core = _vmix_matmul(Jc, D_L_core_vmix_j, _vmix_j_mm_mode)
+        g_vmix_j_act = _vmix_matmul(Ja, D_L_core_vmix_j_act, _vmix_j_mm_mode)
+        g_vmix_k_core = -0.5 * _vmix_matmul(Kc, D_L_core_vmix_k, _vmix_k_mm_mode)
+        g_vmix_k_act = -0.5 * _vmix_matmul(Ka, D_L_core_vmix_k_act, _vmix_k_mm_mode)
         if _reco_mode == "core_only":
             g_vmix_j = g_vmix_j_core
             g_vmix_k = g_vmix_k_core
@@ -1488,6 +1641,10 @@ def _build_dme0_lorb_response(
         gfock_np += g_aa2_np
         out_np = np.asarray(0.5 * (gfock_np + gfock_np.T), dtype=np.float64)
         if bool(return_parts):
+            _dump_raw_parts = _normalize_bool_env(
+                _os.environ.get("ASUKA_CASPT2_LORB_PARTS_INCLUDE_RAW"),
+                default=False,
+            )
             g_h1_np = _asnumpy_f64(g_h1)
             g_vmix_np = _asnumpy_f64(g_vmix)
             g_vLmix_np = _asnumpy_f64(g_vLmix)
@@ -1554,6 +1711,49 @@ def _build_dme0_lorb_response(
                         "dme0_mean_vc_L_k": np.asarray(0.5 * (g_vc_L_k_np + g_vc_L_k_np.T), dtype=np.float64),
                     }
                 )
+            if bool(_dump_raw_parts):
+                parts_np.update(
+                    {
+                        "raw_D_core": np.asarray(_asnumpy_f64(D_core), dtype=np.float64),
+                        "raw_D_act": np.asarray(_asnumpy_f64(D_act), dtype=np.float64),
+                        "raw_D_L_core_raw": np.asarray(_asnumpy_f64(D_L_core_raw), dtype=np.float64),
+                        "raw_D_L_core_sym": np.asarray(_asnumpy_f64(D_L_core_sym), dtype=np.float64),
+                        "raw_D_L_core_asym": np.asarray(_asnumpy_f64(D_L_core_asym), dtype=np.float64),
+                        "raw_D_L_core_oitd": np.asarray(_asnumpy_f64(D_L_core_oitd), dtype=np.float64),
+                        "raw_D_L_act_raw": np.asarray(_asnumpy_f64(D_L_act_raw), dtype=np.float64),
+                        "raw_D_L_act_sym": np.asarray(_asnumpy_f64(D_L_act_raw + D_L_act_raw.T), dtype=np.float64),
+                        "raw_D_L_act_asym": np.asarray(_asnumpy_f64(D_L_act_asym), dtype=np.float64),
+                        "raw_D_L_act_oitd": np.asarray(_asnumpy_f64(D_L_act_oitd), dtype=np.float64),
+                        "raw_D_L_core_vmix": np.asarray(_asnumpy_f64(D_L_core_vmix), dtype=np.float64),
+                        "raw_D_L_core_vmix_j": np.asarray(_asnumpy_f64(D_L_core_vmix_j), dtype=np.float64),
+                        "raw_D_L_core_vmix_k": np.asarray(_asnumpy_f64(D_L_core_vmix_k), dtype=np.float64),
+                        "raw_D_L_core_vmix_j_act": np.asarray(_asnumpy_f64(D_L_core_vmix_j_act), dtype=np.float64),
+                        "raw_D_L_core_vmix_k_act": np.asarray(_asnumpy_f64(D_L_core_vmix_k_act), dtype=np.float64),
+                        "raw_D_L_total": np.asarray(_asnumpy_f64(D_L), dtype=np.float64),
+                        "raw_g_h1": np.asarray(g_h1_np, dtype=np.float64),
+                        "raw_g_vmix": np.asarray(g_vmix_np, dtype=np.float64),
+                        "raw_g_vLmix": np.asarray(g_vLmix_np, dtype=np.float64),
+                        "raw_g_vL_c": np.asarray(g_vL_c_np, dtype=np.float64),
+                        "raw_g_vc_L": np.asarray(g_vc_L_np, dtype=np.float64),
+                    }
+                )
+                if g_vmix_j is not None:
+                    parts_np.update(
+                        {
+                            "raw_g_vmix_j": np.asarray(g_vmix_j_np, dtype=np.float64),
+                            "raw_g_vmix_k": np.asarray(g_vmix_k_np, dtype=np.float64),
+                            "raw_g_vmix_j_core": np.asarray(g_vmix_j_core_np, dtype=np.float64),
+                            "raw_g_vmix_j_act": np.asarray(g_vmix_j_act_np, dtype=np.float64),
+                            "raw_g_vmix_k_core": np.asarray(g_vmix_k_core_np, dtype=np.float64),
+                            "raw_g_vmix_k_act": np.asarray(g_vmix_k_act_np, dtype=np.float64),
+                            "raw_g_vLmix_j": np.asarray(g_vLmix_j_np, dtype=np.float64),
+                            "raw_g_vLmix_k": np.asarray(g_vLmix_k_np, dtype=np.float64),
+                            "raw_g_vL_c_j": np.asarray(g_vL_c_j_np, dtype=np.float64),
+                            "raw_g_vL_c_k": np.asarray(g_vL_c_k_np, dtype=np.float64),
+                            "raw_g_vc_L_j": np.asarray(g_vc_L_j_np, dtype=np.float64),
+                            "raw_g_vc_L_k": np.asarray(g_vc_L_k_np, dtype=np.float64),
+                        }
+                    )
             if return_xp:
                 return np.asarray(out_np, dtype=np.float64), parts_np
             return out_np, parts_np
@@ -1600,6 +1800,10 @@ def _build_dme0_lorb_response(
     gfock += g_aa2_x
     out_x = xp.asarray(0.5 * (gfock + gfock.T), dtype=xp.float64)
     if bool(return_parts):
+        _dump_raw_parts = _normalize_bool_env(
+            _os.environ.get("ASUKA_CASPT2_LORB_PARTS_INCLUDE_RAW"),
+            default=False,
+        )
         g_mean_x = g_vmix + g_vLmix + g_vL_c + g_vc_L
         parts_x: dict[str, Any] = {
             "dme0_h1": xp.asarray(0.5 * (g_h1 + g_h1.T), dtype=xp.float64),
@@ -1635,6 +1839,49 @@ def _build_dme0_lorb_response(
                     "dme0_mean_vc_L_k": xp.asarray(0.5 * (g_vc_L_k + g_vc_L_k.T), dtype=xp.float64),
                 }
             )
+        if bool(_dump_raw_parts):
+            parts_x.update(
+                {
+                    "raw_D_core": xp.asarray(D_core, dtype=xp.float64),
+                    "raw_D_act": xp.asarray(D_act, dtype=xp.float64),
+                    "raw_D_L_core_raw": xp.asarray(D_L_core_raw, dtype=xp.float64),
+                    "raw_D_L_core_sym": xp.asarray(D_L_core_sym, dtype=xp.float64),
+                    "raw_D_L_core_asym": xp.asarray(D_L_core_asym, dtype=xp.float64),
+                    "raw_D_L_core_oitd": xp.asarray(D_L_core_oitd, dtype=xp.float64),
+                    "raw_D_L_act_raw": xp.asarray(D_L_act_raw, dtype=xp.float64),
+                    "raw_D_L_act_sym": xp.asarray(D_L_act_raw + D_L_act_raw.T, dtype=xp.float64),
+                    "raw_D_L_act_asym": xp.asarray(D_L_act_asym, dtype=xp.float64),
+                    "raw_D_L_act_oitd": xp.asarray(D_L_act_oitd, dtype=xp.float64),
+                    "raw_D_L_core_vmix": xp.asarray(D_L_core_vmix, dtype=xp.float64),
+                    "raw_D_L_core_vmix_j": xp.asarray(D_L_core_vmix_j, dtype=xp.float64),
+                    "raw_D_L_core_vmix_k": xp.asarray(D_L_core_vmix_k, dtype=xp.float64),
+                    "raw_D_L_core_vmix_j_act": xp.asarray(D_L_core_vmix_j_act, dtype=xp.float64),
+                    "raw_D_L_core_vmix_k_act": xp.asarray(D_L_core_vmix_k_act, dtype=xp.float64),
+                    "raw_D_L_total": xp.asarray(D_L, dtype=xp.float64),
+                    "raw_g_h1": xp.asarray(g_h1, dtype=xp.float64),
+                    "raw_g_vmix": xp.asarray(g_vmix, dtype=xp.float64),
+                    "raw_g_vLmix": xp.asarray(g_vLmix, dtype=xp.float64),
+                    "raw_g_vL_c": xp.asarray(g_vL_c, dtype=xp.float64),
+                    "raw_g_vc_L": xp.asarray(g_vc_L, dtype=xp.float64),
+                }
+            )
+            if g_vmix_j is not None:
+                parts_x.update(
+                    {
+                        "raw_g_vmix_j": xp.asarray(g_vmix_j, dtype=xp.float64),
+                        "raw_g_vmix_k": xp.asarray(g_vmix_k, dtype=xp.float64),
+                        "raw_g_vmix_j_core": xp.asarray(g_vmix_j_core, dtype=xp.float64),
+                        "raw_g_vmix_j_act": xp.asarray(g_vmix_j_act, dtype=xp.float64),
+                        "raw_g_vmix_k_core": xp.asarray(g_vmix_k_core, dtype=xp.float64),
+                        "raw_g_vmix_k_act": xp.asarray(g_vmix_k_act, dtype=xp.float64),
+                        "raw_g_vLmix_j": xp.asarray(g_vLmix_j, dtype=xp.float64),
+                        "raw_g_vLmix_k": xp.asarray(g_vLmix_k, dtype=xp.float64),
+                        "raw_g_vL_c_j": xp.asarray(g_vL_c_j, dtype=xp.float64),
+                        "raw_g_vL_c_k": xp.asarray(g_vL_c_k, dtype=xp.float64),
+                        "raw_g_vc_L_j": xp.asarray(g_vc_L_j, dtype=xp.float64),
+                        "raw_g_vc_L_k": xp.asarray(g_vc_L_k, dtype=xp.float64),
+                    }
+                )
         if return_xp:
             return out_x, parts_x
         return _asnumpy_f64(out_x), {k: _asnumpy_f64(v) for k, v in parts_x.items()}

@@ -1626,6 +1626,23 @@ extern "C" cudaError_t cueri_df_pack_qmn_block_to_qp_launch_stream(
     cudaStream_t stream,
     int threads);
 
+// Pack an L_f block into a Qp slice.
+//
+// Input:
+//   in_Lf_block shape (nao, q_count*nao), flattened as (m*(q_count*nao) + (q*nao + n))
+// Output:
+//   out_Qp shape (naux, ntri), flattened as (Q*ntri + p)
+// Writes Q = q0..q0+q_count-1.
+extern "C" cudaError_t cueri_df_pack_lf_block_to_qp_launch_stream(
+    const double* in_Lf_block,
+    double* out_Qp,
+    int naux,
+    int nao,
+    int q0,
+    int q_count,
+    cudaStream_t stream,
+    int threads);
+
 // Unpack a Qp packed DF tensor into a Qmn block (q_count, nao, nao), symmetric.
 //
 // Input:

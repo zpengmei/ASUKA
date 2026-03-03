@@ -13,6 +13,7 @@ on-the-fly.
 """
 
 from dataclasses import dataclass
+from typing import Any
 
 import numpy as np
 
@@ -280,11 +281,11 @@ def transform_df_B_cart_to_sph(
 
 
 def transform_dense_eri_cart_to_sph(
-    eri_2d: np.ndarray,
+    eri_2d: Any,
     T: np.ndarray,
     nao_cart: int,
     nao_sph: int,
-) -> np.ndarray:
+) -> Any:
     """Transform dense ERI from Cartesian to spherical AOs.
 
     Parameters
@@ -302,11 +303,16 @@ def transform_dense_eri_cart_to_sph(
     """
     nao_cart = int(nao_cart)
     nao_sph = int(nao_sph)
-    eri_4d = np.asarray(eri_2d, dtype=np.float64).reshape(nao_cart, nao_cart, nao_cart, nao_cart)
-    T = np.asarray(T, dtype=np.float64)
+    xp = _get_array_module(eri_2d)
+    eri_4d = xp.asarray(eri_2d, dtype=xp.float64).reshape(nao_cart, nao_cart, nao_cart, nao_cart)
+    T_dev = xp.asarray(T, dtype=xp.float64)
     # Two-step transform to keep cost at O(N^5) per step instead of O(N^8).
-    tmp = np.einsum("pi,qj,pqrs->ijrs", T, T, eri_4d, optimize=True)
-    eri_sph = np.einsum("ijrs,rk,sl->ijkl", tmp, T, T, optimize=True)
+    if xp is np:
+        tmp = xp.einsum("pi,qj,pqrs->ijrs", T_dev, T_dev, eri_4d, optimize=True)
+        eri_sph = xp.einsum("ijrs,rk,sl->ijkl", tmp, T_dev, T_dev, optimize=True)
+    else:
+        tmp = xp.einsum("pi,qj,pqrs->ijrs", T_dev, T_dev, eri_4d)
+        eri_sph = xp.einsum("ijrs,rk,sl->ijkl", tmp, T_dev, T_dev)
     return eri_sph.reshape(nao_sph * nao_sph, nao_sph * nao_sph)
 
 

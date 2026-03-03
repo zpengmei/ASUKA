@@ -141,6 +141,95 @@ def pack_B_to_Qp(B: Any, *, layout: Literal["mnQ", "Qmn"], nao: int | None = Non
     return np.asarray(B_np[:, tri_i, tri_j], dtype=np.float64, order="C")
 
 
+def pack_Lf_block_to_Qp(
+    Lf_block: Any,
+    out_Qp: Any,
+    *,
+    naux: int,
+    nao: int,
+    q0: int,
+    q_count: int,
+    threads: int = 256,
+    sync: bool = False,
+) -> Any:
+    """Pack an L_f block into a Qp slice.
+
+    Parameters
+    ----------
+    Lf_block
+        Array with shape (nao, q_count*nao), holding concatenated MO blocks:
+          Lf_block[m, q*nao + n] = L[q, m, n]
+    out_Qp
+        Destination packed tensor with shape (naux, nao*(nao+1)//2).
+        This function writes rows q0..q0+q_count-1.
+    """
+
+    nao_i = int(nao)
+    naux_i = int(naux)
+    q0_i = int(q0)
+    q_count_i = int(q_count)
+    if nao_i < 0 or naux_i < 0 or q0_i < 0 or q_count_i < 0:
+        raise ValueError("invalid nao/naux/q0/q_count")
+    if q0_i > naux_i or q_count_i > (naux_i - q0_i):
+        raise ValueError("q0+q_count must be <= naux")
+    ntri = int(ntri_from_nao(int(nao_i)))
+
+    try:
+        import cupy as cp  # type: ignore
+    except Exception:
+        cp = None  # type: ignore
+
+    if cp is not None and isinstance(Lf_block, cp.ndarray):  # type: ignore[attr-defined]
+        Lf = cp.asarray(Lf_block, dtype=cp.float64)
+        if Lf.ndim != 2:
+            raise ValueError("Lf_block must be 2D (nao, q_count*nao)")
+        if tuple(map(int, Lf.shape)) != (nao_i, q_count_i * nao_i):
+            raise ValueError("Lf_block shape mismatch")
+        if not bool(getattr(Lf, "flags", None).c_contiguous):
+            Lf = cp.ascontiguousarray(Lf)
+
+        out = cp.asarray(out_Qp, dtype=cp.float64)
+        if out.ndim != 2:
+            raise ValueError("out_Qp must be 2D (naux,ntri)")
+        if tuple(map(int, out.shape)) != (naux_i, ntri):
+            raise ValueError("out_Qp shape mismatch")
+        if not bool(getattr(out, "flags", None).c_contiguous):
+            out = cp.ascontiguousarray(out)
+
+        from asuka.cueri import _cueri_cuda_ext as _ext  # noqa: PLC0415
+
+        stream_ptr = int(cp.cuda.get_current_stream().ptr)
+        _ext.df_pack_lf_block_to_qp_device(
+            Lf.reshape(-1),
+            out.reshape(-1),
+            int(naux_i),
+            int(nao_i),
+            int(q0_i),
+            int(q_count_i),
+            int(threads),
+            int(stream_ptr),
+            bool(sync),
+        )
+        return out
+
+    # NumPy fallback
+    Lf_np = np.asarray(Lf_block, dtype=np.float64, order="C")
+    out_np = np.asarray(out_Qp, dtype=np.float64, order="C")
+    if Lf_np.ndim != 2:
+        raise ValueError("Lf_block must be 2D (nao, q_count*nao)")
+    if tuple(map(int, Lf_np.shape)) != (nao_i, q_count_i * nao_i):
+        raise ValueError("Lf_block shape mismatch")
+    if out_np.ndim != 2:
+        raise ValueError("out_Qp must be 2D (naux,ntri)")
+    if tuple(map(int, out_np.shape)) != (naux_i, ntri):
+        raise ValueError("out_Qp shape mismatch")
+    tri_i, tri_j = np.tril_indices(nao_i)
+    for q_local in range(q_count_i):
+        q_abs = int(q0_i + q_local)
+        out_np[q_abs, :] = Lf_np[tri_i, int(q_local * nao_i) + tri_j]
+    return out_np
+
+
 def unpack_Qp_to_mnQ(B_Qp: Any, *, nao: int) -> Any:
     """Unpack Qp -> full symmetric mnQ (nao,nao,naux)."""
 
@@ -566,6 +655,7 @@ __all__ = [
     "apply_Qp_to_C_block",
     "extract_Qp_rows_cols_block",
     "pack_B_to_Qp",
+    "pack_Lf_block_to_Qp",
     "unpack_Qp_to_mnQ",
     "unpack_Qp_to_Qmn_block",
 ]

@@ -1018,6 +1018,32 @@ __global__ void KernelDFPackQmnBlockToQp(
   }
 }
 
+__global__ void KernelDFPackLfBlockToQp(
+    const double* in_Lf_block,  // (nao, q_count*nao), C-order (m*(q_count*nao) + (q*nao+n))
+    double* out_Qp,             // (naux, ntri), C-order (Q*ntri + p)
+    int nao,
+    int naux,
+    int q0,
+    int q_count) {
+  const int64_t stride = static_cast<int64_t>(blockDim.x) * static_cast<int64_t>(gridDim.x);
+  int64_t tid = static_cast<int64_t>(blockIdx.x) * static_cast<int64_t>(blockDim.x) + static_cast<int64_t>(threadIdx.x);
+  const int64_t ntri = static_cast<int64_t>(nao) * static_cast<int64_t>(nao + 1) / 2;
+  const int64_t total = static_cast<int64_t>(q_count) * ntri;
+  const int64_t ld = static_cast<int64_t>(q_count) * static_cast<int64_t>(nao);
+  for (; tid < total; tid += stride) {
+    const int q_local = static_cast<int>(tid / ntri);
+    const int q = static_cast<int>(q0 + q_local);
+    if (q < 0 || q >= naux) continue;
+    const int64_t p = tid - static_cast<int64_t>(q_local) * ntri;
+    int m, n;
+    TriUnpackS2Index(p, m, n);
+    const int64_t idx_in = static_cast<int64_t>(m) * ld + static_cast<int64_t>(q_local) * static_cast<int64_t>(nao) +
+                           static_cast<int64_t>(n);
+    const int64_t idx_out = static_cast<int64_t>(q) * ntri + p;
+    out_Qp[idx_out] = in_Lf_block[idx_in];
+  }
+}
+
 __global__ void KernelDFUnpackQpToQmnBlock(
     const double* in_Qp,   // (naux, ntri), C-order (q*ntri+p)
     double* out_Qmn_block, // (q_count, nao, nao), C-order ((q*nao+m)*nao+n)
@@ -1248,6 +1274,26 @@ extern "C" cudaError_t cueri_df_pack_qmn_block_to_qp_launch_stream(
   if (n == 0) return cudaSuccess;
   const int blocks = static_cast<int>((n + static_cast<int64_t>(threads) - 1) / static_cast<int64_t>(threads));
   KernelDFPackQmnBlockToQp<<<blocks, threads, 0, stream>>>(in_Qmn_block, out_Qp_block, q_count, nao);
+  return cudaGetLastError();
+}
+
+extern "C" cudaError_t cueri_df_pack_lf_block_to_qp_launch_stream(
+    const double* in_Lf_block,
+    double* out_Qp,
+    int naux,
+    int nao,
+    int q0,
+    int q_count,
+    cudaStream_t stream,
+    int threads) {
+  if (naux < 0 || nao < 0 || q0 < 0 || q_count < 0 || threads <= 0) return cudaErrorInvalidValue;
+  if (q0 > naux) return cudaErrorInvalidValue;
+  if (q_count > naux - q0) return cudaErrorInvalidValue;
+  const int64_t ntri = static_cast<int64_t>(nao) * static_cast<int64_t>(nao + 1) / 2;
+  const int64_t n = static_cast<int64_t>(q_count) * ntri;
+  if (n == 0) return cudaSuccess;
+  const int blocks = static_cast<int>((n + static_cast<int64_t>(threads) - 1) / static_cast<int64_t>(threads));
+  KernelDFPackLfBlockToQp<<<blocks, threads, 0, stream>>>(in_Lf_block, out_Qp, nao, naux, q0, q_count);
   return cudaGetLastError();
 }
 
