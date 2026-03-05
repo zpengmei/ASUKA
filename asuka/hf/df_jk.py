@@ -70,14 +70,11 @@ def release_cuda_ext_workspace_cache() -> None:
     phases (e.g. DF gradient contraction) that do not need HF DF-JK.
     """
 
-    # Drop cached BQ transforms and q-block tuning unconditionally (these are
-    # pure Python references and safe to clear even if the extension is absent).
+    # Drop cached BQ transforms unconditionally. Keep q-block tuning metadata:
+    # those are tiny host-side integers and preserving them avoids paying the
+    # cold autotune/tune miss again after workspace release.
     try:
         _HF_DF_JK_BQ_CACHE_BY_DEVICE.clear()
-    except Exception:
-        pass
-    try:
-        _HF_DF_JK_QBLOCK_TUNE_BY_DEVICE.clear()
     except Exception:
         pass
 
@@ -118,7 +115,11 @@ def _hf_k_ext_tune_enabled() -> bool:
 
 
 def _hf_k_ext_autotune_enabled() -> bool:
-    flag = str(os.environ.get("ASUKA_HF_K_EXT_AUTOTUNE_QBLOCK", "1")).strip().lower()
+    # The extension autotuner is accurate but expensive on a cold miss because
+    # it benchmarks many q-block candidates with explicit stream syncs. Keep
+    # the heuristic picker enabled by default and make the exhaustive autotune
+    # path opt-in for explicit benchmarking.
+    flag = str(os.environ.get("ASUKA_HF_K_EXT_AUTOTUNE_QBLOCK", "0")).strip().lower()
     return flag not in {"0", "false", "no", "off"}
 
 

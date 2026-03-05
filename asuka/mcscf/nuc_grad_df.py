@@ -4903,6 +4903,81 @@ def casscf_nuc_grad_df_per_root(
             dm2_sa_np = _asnumpy_f64(dm2_sa)
         return dm1_sa_np, dm2_sa_np
 
+    def _contract_response_pulay_delta(
+        *,
+        gfock_K: Any,
+        dm1_lci: Any,
+        dm2_lci: Any,
+        Lorb_mat: Any,
+        debug_root: int | None = None,
+    ) -> np.ndarray:
+        _gfock_lci_raw, _, _, _, _ = _build_gfock_casscf_df(
+            B_ao,
+            h_ao,
+            C,
+            ncore=int(ncore),
+            ncas=int(ncas),
+            dm1_act=xp.asarray(dm1_lci, dtype=xp.float64),
+            dm2_act=xp.asarray(dm2_lci, dtype=xp.float64),
+        )
+        if bool(_vram_debug_fine) and debug_root is not None:
+            _log_vram(f"root {debug_root} after gfock_lci")
+
+        if _gpu_1e_tensor_path and W_sa_xp is not None and C_occ_xp is not None:
+            with _main_stream_cm:
+                gfock_K_xp = xp.asarray(gfock_K, dtype=xp.float64)
+                _tmp_K = C @ gfock_K_xp[:, :nocc]  # (nao, nocc)
+                W_K_xp = 0.5 * (_tmp_K @ C_occ_xp.T + C_occ_xp @ _tmp_K.T)
+                _dgfock_lci = xp.asarray(_gfock_lci_raw, dtype=xp.float64) - xp.asarray(_gfock_zero_xp, dtype=xp.float64)
+                _dme0_lci = C @ (0.5 * (_dgfock_lci + _dgfock_lci.T)) @ C.T
+                _dme0_lorb = _build_dme0_lorb_response(
+                    B_ao,
+                    h_ao,
+                    C,
+                    np.asarray(Lorb_mat, dtype=np.float64),
+                    dm1_sa_xp,
+                    dm2_sa_xp,
+                    ppaa_sa,
+                    papa_sa,
+                    ncore=int(ncore),
+                    ncas=int(ncas),
+                    vhf_cache=_vhf_cache,
+                    lorb_cache=_lorb_resp_cache,
+                    return_xp=True,
+                )
+                _W_delta = W_K_xp - W_sa_xp + _dme0_lci + _dme0_lorb
+        else:
+            W_sa_h, C_occ_np_h = _ensure_sa_host_pulay_cache()
+            with _main_stream_cm:
+                gfock_K_np = _asnumpy_f64(gfock_K)
+            _tmp_K = C_np @ gfock_K_np[:, :nocc]  # (nao, nocc)
+            W_K = 0.5 * (_tmp_K @ C_occ_np_h.T + C_occ_np_h @ _tmp_K.T)
+            _dgfock_lci = _asnumpy_f64(_gfock_lci_raw) - _ensure_gfock_zero_host()
+            dm1_sa_np_h, dm2_sa_np_h = _ensure_sa_rdm_host()
+            _dme0_lci = C_np @ (0.5 * (_dgfock_lci + _dgfock_lci.T)) @ C_np.T
+            _dme0_lorb = _build_dme0_lorb_response(
+                B_ao,
+                h_ao,
+                C_np,
+                np.asarray(Lorb_mat, dtype=np.float64),
+                dm1_sa_np_h,
+                dm2_sa_np_h,
+                ppaa_sa,
+                papa_sa,
+                ncore=int(ncore),
+                ncas=int(ncas),
+                vhf_cache=_vhf_cache,
+                lorb_cache=_lorb_resp_cache,
+            )
+            _W_delta = W_K - W_sa_h + _dme0_lci + _dme0_lorb
+
+        if bool(_vram_debug_fine) and debug_root is not None:
+            _log_vram(f"root {debug_root} after response pulay pieces")
+        de_pulay_delta = _contract_pulay_fast(_W_delta)
+        if bool(_vram_debug_fine) and debug_root is not None:
+            _log_vram(f"root {debug_root} after delta pulay")
+        return np.asarray(de_pulay_delta, dtype=np.float64)
+
     def _contract_df_delta_sync(_bar_L: Any) -> np.ndarray:
         nonlocal warned_df_fd
         try:
@@ -5366,47 +5441,12 @@ def casscf_nuc_grad_df_per_root(
 
         # ── Per-root Pulay delta: -Tr((W_K - W_sa) · dS/dR) ──
         t0 = time.perf_counter()
-        _gfock_lci_raw, _, _, _, _ = _build_gfock_casscf_df(
-            B_ao, h_ao, C, ncore=int(ncore), ncas=int(ncas),
-            dm1_act=xp.asarray(dm1_lci, dtype=xp.float64),
-            dm2_act=xp.asarray(dm2_lci, dtype=xp.float64),
+        de_pulay_delta = _contract_response_pulay_delta(
+            gfock_K=gfock_K,
+            dm1_lci=dm1_lci,
+            dm2_lci=dm2_lci,
+            Lorb_mat=Lorb_mat,
         )
-        if _gpu_1e_tensor_path and W_sa_xp is not None and C_occ_xp is not None:
-            with _main_stream_cm:
-                gfock_K_xp = xp.asarray(gfock_K, dtype=xp.float64)
-                _tmp_K = C @ gfock_K_xp[:, :nocc]  # (nao, nocc)
-                W_K_xp = 0.5 * (_tmp_K @ C_occ_xp.T + C_occ_xp @ _tmp_K.T)
-                _dgfock_lci = xp.asarray(_gfock_lci_raw, dtype=xp.float64) - xp.asarray(_gfock_zero_xp, dtype=xp.float64)
-                _dme0_lci = C @ (0.5 * (_dgfock_lci + _dgfock_lci.T)) @ C.T
-                _dme0_lorb = _build_dme0_lorb_response(
-                    B_ao, h_ao, C, np.asarray(Lorb_mat, dtype=np.float64),
-                    dm1_sa_xp, dm2_sa_xp,
-                    ppaa_sa, papa_sa,
-                    ncore=int(ncore), ncas=int(ncas),
-                    vhf_cache=_vhf_cache,
-                    lorb_cache=_lorb_resp_cache,
-                    return_xp=True,
-                )
-                _W_delta = W_K_xp - W_sa_xp + _dme0_lci + _dme0_lorb
-        else:
-            W_sa_h, C_occ_np_h = _ensure_sa_host_pulay_cache()
-            with _main_stream_cm:
-                gfock_K_np = _asnumpy_f64(gfock_K)
-            _tmp_K = C_np @ gfock_K_np[:, :nocc]  # (nao, nocc)
-            W_K = 0.5 * (_tmp_K @ C_occ_np_h.T + C_occ_np_h @ _tmp_K.T)
-            _dgfock_lci = _asnumpy_f64(_gfock_lci_raw) - _ensure_gfock_zero_host()
-            dm1_sa_np_h, dm2_sa_np_h = _ensure_sa_rdm_host()
-            _dme0_lci = C_np @ (0.5 * (_dgfock_lci + _dgfock_lci.T)) @ C_np.T
-            _dme0_lorb = _build_dme0_lorb_response(
-                B_ao, h_ao, C_np, np.asarray(Lorb_mat, dtype=np.float64),
-                dm1_sa_np_h, dm2_sa_np_h,
-                ppaa_sa, papa_sa,
-                ncore=int(ncore), ncas=int(ncas),
-                vhf_cache=_vhf_cache,
-                lorb_cache=_lorb_resp_cache,
-            )
-            _W_delta = W_K - W_sa_h + _dme0_lci + _dme0_lorb
-        de_pulay_delta = _contract_pulay_fast(_W_delta)
         if _profile_df_per_root:
             _t_response_pulay += time.perf_counter() - t0
 
@@ -6170,49 +6210,12 @@ def casscf_nuc_grad_df_per_root(
 
                 # ── Per-root Pulay delta: -Tr((W_K - W_sa) · dS/dR) ──
                 # ── Response Pulay (multi-stream path) ──
-                _gfock_lci_raw, _, _, _, _ = _build_gfock_casscf_df(
-                    B_ao, h_ao, C, ncore=int(ncore), ncas=int(ncas),
-                    dm1_act=xp.asarray(dm1_lci, dtype=xp.float64),
-                    dm2_act=xp.asarray(dm2_lci, dtype=xp.float64),
+                de_pulay_delta = _contract_response_pulay_delta(
+                    gfock_K=gfock_K,
+                    dm1_lci=dm1_lci,
+                    dm2_lci=dm2_lci,
+                    Lorb_mat=Lorb_mat,
                 )
-                if _gpu_1e_tensor_path and W_sa_xp is not None and C_occ_xp is not None:
-                    with _main_stream_cm:
-                        gfock_K_xp = xp.asarray(gfock_K, dtype=xp.float64)
-                        _tmp_K = C @ gfock_K_xp[:, :nocc]  # (nao, nocc)
-                        W_K_xp = 0.5 * (_tmp_K @ C_occ_xp.T + C_occ_xp @ _tmp_K.T)
-                        _dgfock_lci = xp.asarray(_gfock_lci_raw, dtype=xp.float64) - xp.asarray(_gfock_zero_xp, dtype=xp.float64)
-                        _dme0_lci = C @ (0.5 * (_dgfock_lci + _dgfock_lci.T)) @ C.T
-                        _dme0_lorb = _build_dme0_lorb_response(
-                            B_ao, h_ao, C, np.asarray(Lorb_mat, dtype=np.float64),
-                            dm1_sa_xp, dm2_sa_xp,
-                            ppaa_sa, papa_sa,
-                            ncore=int(ncore), ncas=int(ncas),
-                            vhf_cache=_vhf_cache,
-                            lorb_cache=_lorb_resp_cache,
-                            return_xp=True,
-                        )
-                        _W_pulay_ms = W_K_xp - W_sa_xp + _dme0_lci + _dme0_lorb
-                    gfock_K_np = None
-                    W_K = None
-                else:
-                    W_sa_h, C_occ_np_h = _ensure_sa_host_pulay_cache()
-                    with _main_stream_cm:
-                        gfock_K_np = _asnumpy_f64(gfock_K)
-                    _tmp_K = C_np @ gfock_K_np[:, :nocc]  # (nao, nocc)
-                    W_K = 0.5 * (_tmp_K @ C_occ_np_h.T + C_occ_np_h @ _tmp_K.T)
-                    _dgfock_lci = _asnumpy_f64(_gfock_lci_raw) - _ensure_gfock_zero_host()
-                    dm1_sa_np_h, dm2_sa_np_h = _ensure_sa_rdm_host()
-                    _dme0_lci = C_np @ (0.5 * (_dgfock_lci + _dgfock_lci.T)) @ C_np.T
-                    _dme0_lorb = _build_dme0_lorb_response(
-                        B_ao, h_ao, C_np, np.asarray(Lorb_mat, dtype=np.float64),
-                        dm1_sa_np_h, dm2_sa_np_h,
-                        ppaa_sa, papa_sa,
-                        ncore=int(ncore), ncas=int(ncas),
-                        vhf_cache=_vhf_cache,
-                        lorb_cache=_lorb_resp_cache,
-                    )
-                    _W_pulay_ms = W_K - W_sa_h + _dme0_lci + _dme0_lorb
-                de_pulay_delta = _contract_pulay_fast(_W_pulay_ms)
 
                 _in_flight.append(
                     {
@@ -6229,8 +6232,6 @@ def casscf_nuc_grad_df_per_root(
                 del (
                     de_h1_delta, de_pulay_delta,
                     D_1e_delta,
-                    gfock_K_np, _tmp_K, W_K,
-                    _gfock_lci_raw, _dgfock_lci, _dme0_lci, _dme0_lorb, _W_pulay_ms,
                     rhs_orb, rhs_ci_K, rhs_ci, g_K,
                     Lci_list, Lorb_mat,
                     D_tot_K, D_act_lci, D_L_lorb,
@@ -6439,55 +6440,13 @@ def casscf_nuc_grad_df_per_root(
 
         # ── Per-root Pulay delta: -Tr((W_K - W_sa) · dS/dR) ──
         t0 = time.perf_counter()
-        # ── Response Pulay: energy-weighted density from CI + orbital response ──
-        # CI response: perturbation gfock from response RDMs (MO basis).
-        _gfock_lci_raw, _, _, _, _ = _build_gfock_casscf_df(
-            B_ao, h_ao, C, ncore=int(ncore), ncas=int(ncas),
-            dm1_act=xp.asarray(dm1_lci, dtype=xp.float64),
-            dm2_act=xp.asarray(dm2_lci, dtype=xp.float64),
+        de_pulay_delta = _contract_response_pulay_delta(
+            gfock_K=gfock_K,
+            dm1_lci=dm1_lci,
+            dm2_lci=dm2_lci,
+            Lorb_mat=Lorb_mat,
+            debug_root=int(K),
         )
-        if bool(_vram_debug_fine):
-            _log_vram(f"root {K} after gfock_lci")
-        if _gpu_1e_tensor_path and W_sa_xp is not None and C_occ_xp is not None:
-            with _main_stream_cm:
-                gfock_K_xp = xp.asarray(gfock_K, dtype=xp.float64)
-                _tmp_K = C @ gfock_K_xp[:, :nocc]  # (nao, nocc)
-                W_K_xp = 0.5 * (_tmp_K @ C_occ_xp.T + C_occ_xp @ _tmp_K.T)
-                _dgfock_lci = xp.asarray(_gfock_lci_raw, dtype=xp.float64) - xp.asarray(_gfock_zero_xp, dtype=xp.float64)
-                _dme0_lci = C @ (0.5 * (_dgfock_lci + _dgfock_lci.T)) @ C.T
-                _dme0_lorb = _build_dme0_lorb_response(
-                    B_ao, h_ao, C, np.asarray(Lorb_mat, dtype=np.float64),
-                    dm1_sa_xp, dm2_sa_xp,
-                    ppaa_sa, papa_sa,
-                    ncore=int(ncore), ncas=int(ncas),
-                    vhf_cache=_vhf_cache,
-                    lorb_cache=_lorb_resp_cache,
-                    return_xp=True,
-                )
-                _W_delta = W_K_xp - W_sa_xp + _dme0_lci + _dme0_lorb
-        else:
-            W_sa_h, C_occ_np_h = _ensure_sa_host_pulay_cache()
-            with _main_stream_cm:
-                gfock_K_np = _asnumpy_f64(gfock_K)
-            _tmp_K = C_np @ gfock_K_np[:, :nocc]  # (nao, nocc)
-            W_K = 0.5 * (_tmp_K @ C_occ_np_h.T + C_occ_np_h @ _tmp_K.T)
-            _dgfock_lci = _asnumpy_f64(_gfock_lci_raw) - _ensure_gfock_zero_host()
-            dm1_sa_np_h, dm2_sa_np_h = _ensure_sa_rdm_host()
-            _dme0_lci = C_np @ (0.5 * (_dgfock_lci + _dgfock_lci.T)) @ C_np.T
-            _dme0_lorb = _build_dme0_lorb_response(
-                B_ao, h_ao, C_np, np.asarray(Lorb_mat, dtype=np.float64),
-                dm1_sa_np_h, dm2_sa_np_h,
-                ppaa_sa, papa_sa,
-                ncore=int(ncore), ncas=int(ncas),
-                vhf_cache=_vhf_cache,
-                lorb_cache=_lorb_resp_cache,
-            )
-            _W_delta = W_K - W_sa_h + _dme0_lci + _dme0_lorb
-        if bool(_vram_debug_fine):
-            _log_vram(f"root {K} after response pulay pieces")
-        de_pulay_delta = _contract_pulay_fast(_W_delta)
-        if bool(_vram_debug_fine):
-            _log_vram(f"root {K} after delta pulay")
         if _profile_df_per_root:
             _t_response_pulay += time.perf_counter() - t0
 

@@ -691,13 +691,10 @@ def _gmres_solve_gpu(
     solve_time = time.perf_counter() - t_solve0
 
     # Single sync at end of entire solve.
-    x = cp.asnumpy(x_d)
-    x = np.asarray(x, dtype=np.float64).ravel()
-
-    # Compute residual on CPU.
-    r_d = mv(cp.asarray(x, dtype=cp.float64)) - b_d
+    r_d = cp.asarray(mv(x_d), dtype=cp.float64).ravel() - b_d
     resid = float(cp.linalg.norm(r_d))
     rel = resid / bnorm if bnorm > 0.0 else resid
+    x = np.asarray(cp.asnumpy(x_d), dtype=np.float64).ravel()
 
     out: dict[str, Any] = {
         "info": int(info),
@@ -1157,10 +1154,10 @@ def _gcrotmk_solve_gpu(
     )
     solve_time = time.perf_counter() - t_solve0
 
-    x = np.asarray(cp.asnumpy(x_d), dtype=np.float64).ravel()
     r_d = cp.asarray(mv(x_d), dtype=cp.float64).ravel() - b_d
     resid = float(cp.linalg.norm(r_d))
     rel = resid / bnorm if bnorm > 0.0 else resid
+    x = np.asarray(cp.asnumpy(x_d), dtype=np.float64).ravel()
 
     out: dict[str, Any] = {
         "info": int(info),
