@@ -40,6 +40,90 @@ if TYPE_CHECKING:
     from asuka.integrals.cart2sph import AOSphericalTransform
 
 
+class _SCFRunResultView:
+    """ASUKA-facing convenience view over the embedded SCFResult.
+
+    Callers should prefer these top-level properties over reaching through
+    ``result.scf`` directly.
+    """
+
+    @property
+    def method(self) -> str:
+        return str(getattr(self.scf, "method"))
+
+    @property
+    def converged(self) -> bool:
+        return bool(getattr(self.scf, "converged"))
+
+    @property
+    def niter(self) -> int:
+        return int(getattr(self.scf, "niter"))
+
+    @property
+    def e_tot(self) -> float:
+        return float(getattr(self.scf, "e_tot"))
+
+    @property
+    def e_elec(self) -> float:
+        return float(getattr(self.scf, "e_elec"))
+
+    @property
+    def e_nuc(self) -> float:
+        return float(getattr(self.scf, "e_nuc"))
+
+    @property
+    def mo_energy(self) -> Any:
+        return getattr(self.scf, "mo_energy")
+
+    @property
+    def mo_coeff(self) -> Any:
+        return getattr(self.scf, "mo_coeff")
+
+    @property
+    def mo_occ(self) -> Any:
+        return getattr(self.scf, "mo_occ")
+
+    @property
+    def scf_result(self) -> SCFResult:
+        return getattr(self, "scf")
+
+
+@dataclass(frozen=True)
+class THCRunConfig:
+    """Reproducible THC frontend settings for native downstream workflows."""
+
+    hf_method: str
+    basis: Any | None
+    auxbasis: Any
+    df_config: Any | None
+    expand_contractions: bool
+    thc_mode: str
+    thc_local_config: Any | None
+    thc_grid_spec: Any | None
+    thc_grid_kind: str
+    thc_dvr_basis: Any | None
+    thc_grid_options: Any | None
+    thc_npt: int | None
+    thc_solve_method: str
+    use_density_difference: bool
+    df_warmup_cycles: int
+    df_warmup_ediff: float | None = None
+    df_warmup_max_cycles: int | None = None
+    df_aux_block_naux: int = 256
+    df_k_q_block: int = 128
+    max_cycle: int = 50
+    conv_tol: float = 1e-10
+    conv_tol_dm: float = 1e-8
+    diis: bool = True
+    diis_start_cycle: int | None = None
+    diis_space: int = 8
+    damping: float = 0.0
+    level_shift: float = 0.0
+    q_block: int = 256
+    init_guess: str | None = None
+    init_fock_cycles: int | None = None
+
+
 def _apply_sph_transform(
     mol: Molecule,
     int1e: Int1eResult,
@@ -96,7 +180,7 @@ def _apply_sph_transform(
 
 
 @dataclass(frozen=True)
-class RHFDFRunResult:
+class RHFDFRunResult(_SCFRunResultView):
     mol: Molecule
     basis_name: str
     auxbasis_name: str
@@ -110,10 +194,11 @@ class RHFDFRunResult:
     sph_map: AOSphericalTransform | tuple[np.ndarray, int, int] | None = None
     df_L: Any | None = None  # Cholesky factor of aux metric (for deterministic gradients)
     thc_factors: Any | None = None
+    thc_run_config: THCRunConfig | None = None
 
 
 @dataclass(frozen=True)
-class UHFDFRunResult:
+class UHFDFRunResult(_SCFRunResultView):
     mol: Molecule
     basis_name: str
     auxbasis_name: str
@@ -127,10 +212,11 @@ class UHFDFRunResult:
     sph_map: AOSphericalTransform | tuple[np.ndarray, int, int] | None = None
     df_L: Any | None = None  # Cholesky factor of aux metric (for deterministic gradients)
     thc_factors: Any | None = None
+    thc_run_config: THCRunConfig | None = None
 
 
 @dataclass(frozen=True)
-class ROHFDFRunResult:
+class ROHFDFRunResult(_SCFRunResultView):
     mol: Molecule
     basis_name: str
     auxbasis_name: str
@@ -144,6 +230,7 @@ class ROHFDFRunResult:
     sph_map: AOSphericalTransform | tuple[np.ndarray, int, int] | None = None
     df_L: Any | None = None  # Cholesky factor of aux metric (for deterministic gradients)
     thc_factors: Any | None = None
+    thc_run_config: THCRunConfig | None = None
 
 
 _HF_PREP_CACHE_MAX = max(0, int(os.environ.get("ASUKA_HF_PREP_CACHE_MAX", "0")))
@@ -212,6 +299,73 @@ def _cuda_device_id_or_neg1() -> int:
         return int(cp.cuda.Device().id)
     except Exception:
         return -1
+
+
+def _make_thc_run_config(
+    *,
+    hf_method: str,
+    basis: Any | None,
+    auxbasis: Any,
+    df_config: Any | None,
+    expand_contractions: bool,
+    thc_mode: str,
+    thc_local_config: Any | None,
+    thc_grid_spec: Any | None,
+    thc_grid_kind: str,
+    thc_dvr_basis: Any | None,
+    thc_grid_options: Any | None,
+    thc_npt: int | None,
+    thc_solve_method: str,
+    use_density_difference: bool,
+    df_warmup_cycles: int,
+    df_warmup_ediff: float | None = None,
+    df_warmup_max_cycles: int | None = None,
+    df_aux_block_naux: int = 256,
+    df_k_q_block: int = 128,
+    max_cycle: int = 50,
+    conv_tol: float = 1e-10,
+    conv_tol_dm: float = 1e-8,
+    diis: bool = True,
+    diis_start_cycle: int | None = None,
+    diis_space: int = 8,
+    damping: float = 0.0,
+    level_shift: float = 0.0,
+    q_block: int = 256,
+    init_guess: str | None = None,
+    init_fock_cycles: int | None = None,
+) -> THCRunConfig:
+    return THCRunConfig(
+        hf_method=str(hf_method),
+        basis=basis,
+        auxbasis=auxbasis,
+        df_config=df_config,
+        expand_contractions=bool(expand_contractions),
+        thc_mode=str(thc_mode),
+        thc_local_config=thc_local_config,
+        thc_grid_spec=thc_grid_spec,
+        thc_grid_kind=str(thc_grid_kind),
+        thc_dvr_basis=thc_dvr_basis,
+        thc_grid_options=thc_grid_options,
+        thc_npt=None if thc_npt is None else int(thc_npt),
+        thc_solve_method=str(thc_solve_method),
+        use_density_difference=bool(use_density_difference),
+        df_warmup_cycles=int(df_warmup_cycles),
+        df_warmup_ediff=None if df_warmup_ediff is None else float(df_warmup_ediff),
+        df_warmup_max_cycles=None if df_warmup_max_cycles is None else int(df_warmup_max_cycles),
+        df_aux_block_naux=int(df_aux_block_naux),
+        df_k_q_block=int(df_k_q_block),
+        max_cycle=int(max_cycle),
+        conv_tol=float(conv_tol),
+        conv_tol_dm=float(conv_tol_dm),
+        diis=bool(diis),
+        diis_start_cycle=None if diis_start_cycle is None else int(diis_start_cycle),
+        diis_space=int(diis_space),
+        damping=float(damping),
+        level_shift=float(level_shift),
+        q_block=int(q_block),
+        init_guess=None if init_guess is None else str(init_guess),
+        init_fock_cycles=None if init_fock_cycles is None else int(init_fock_cycles),
+    )
 
 
 def _init_guess_dm_atom_hcore_cart(
@@ -1349,6 +1503,38 @@ def run_rhf_thc(
         sph_map=sph_map,
         df_L=L_metric_full,
         thc_factors=thc_factors,
+        thc_run_config=_make_thc_run_config(
+            hf_method="rhf",
+            basis=basis_in,
+            auxbasis=auxbasis,
+            df_config=cfg,
+            expand_contractions=bool(expand_contractions),
+            thc_mode=str(thc_mode),
+            thc_local_config=thc_local_config,
+            thc_grid_spec=thc_grid_spec,
+            thc_grid_kind=str(thc_grid_kind),
+            thc_dvr_basis=thc_dvr_basis,
+            thc_grid_options=thc_grid_options,
+            thc_npt=thc_npt,
+            thc_solve_method=str(thc_solve_method),
+            use_density_difference=bool(use_density_difference),
+            df_warmup_cycles=int(df_warmup_cycles),
+            df_warmup_ediff=df_warmup_ediff,
+            df_warmup_max_cycles=int(df_warmup_max_cycles),
+            df_aux_block_naux=int(df_aux_block_naux),
+            df_k_q_block=int(df_k_q_block),
+            max_cycle=int(max_cycle),
+            conv_tol=float(conv_tol),
+            conv_tol_dm=float(conv_tol_dm),
+            diis=bool(diis),
+            diis_start_cycle=diis_start_cycle_i,
+            diis_space=int(diis_space),
+            damping=float(damping),
+            level_shift=float(level_shift),
+            q_block=int(q_block),
+            init_guess=str(init_guess),
+            init_fock_cycles=init_fock_cycles_i,
+        ),
     )
 
 
@@ -1639,6 +1825,33 @@ def run_uhf_thc(
         sph_map=sph_map,
         df_L=L_metric_full,
         thc_factors=thc_factors,
+        thc_run_config=_make_thc_run_config(
+            hf_method="uhf",
+            basis=basis_in,
+            auxbasis=auxbasis,
+            df_config=cfg,
+            expand_contractions=bool(expand_contractions),
+            thc_mode=str(thc_mode),
+            thc_local_config=thc_local_config,
+            thc_grid_spec=thc_grid_spec,
+            thc_grid_kind=str(thc_grid_kind),
+            thc_dvr_basis=thc_dvr_basis,
+            thc_grid_options=thc_grid_options,
+            thc_npt=thc_npt,
+            thc_solve_method=str(thc_solve_method),
+            use_density_difference=bool(use_density_difference),
+            df_warmup_cycles=int(df_warmup_cycles),
+            df_aux_block_naux=int(df_aux_block_naux),
+            df_k_q_block=int(df_k_q_block),
+            max_cycle=int(max_cycle),
+            conv_tol=float(conv_tol),
+            conv_tol_dm=float(conv_tol_dm),
+            diis=bool(diis),
+            diis_start_cycle=diis_start_cycle_i,
+            diis_space=int(diis_space),
+            damping=float(damping),
+            q_block=int(q_block),
+        ),
     )
 
 
@@ -1932,6 +2145,33 @@ def run_rohf_thc(
         sph_map=sph_map,
         df_L=L_metric_full,
         thc_factors=thc_factors,
+        thc_run_config=_make_thc_run_config(
+            hf_method="rohf",
+            basis=basis_in,
+            auxbasis=auxbasis,
+            df_config=cfg,
+            expand_contractions=bool(expand_contractions),
+            thc_mode=str(thc_mode),
+            thc_local_config=thc_local_config,
+            thc_grid_spec=thc_grid_spec,
+            thc_grid_kind=str(thc_grid_kind),
+            thc_dvr_basis=thc_dvr_basis,
+            thc_grid_options=thc_grid_options,
+            thc_npt=thc_npt,
+            thc_solve_method=str(thc_solve_method),
+            use_density_difference=bool(use_density_difference),
+            df_warmup_cycles=int(df_warmup_cycles),
+            df_aux_block_naux=int(df_aux_block_naux),
+            df_k_q_block=int(df_k_q_block),
+            max_cycle=int(max_cycle),
+            conv_tol=float(conv_tol),
+            conv_tol_dm=float(conv_tol_dm),
+            diis=bool(diis),
+            diis_start_cycle=diis_start_cycle_i,
+            diis_space=int(diis_space),
+            damping=float(damping),
+            q_block=int(q_block),
+        ),
     )
 
 

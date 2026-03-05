@@ -2692,6 +2692,7 @@ def gen_g_hop_internal(
         # expensive operations (sigma vectors, trans-RDMs, einsums over
         # ppaa/papa) benefit hugely from running on GPU.  The parameter
         # vector upload (~25K doubles) is negligible.
+        _input_is_gpu = bool(_hop_on_gpu) and isinstance(x, _hop_xp.ndarray)
         if _HOP_PROFILE:
             _t0_hop = time.perf_counter()
         if _hop_on_gpu:
@@ -3162,8 +3163,11 @@ def gen_g_hop_internal(
         else:
             out = np.hstack((packed_orb, cache.ci.pack(hci1) * 2.0))
         out = xp.asarray(out, dtype=xp.float64).ravel()
-        # Davidson solver operates in NumPy — convert GPU result back.
-        if on_gpu and _hop_on_gpu:
+        # Legacy Davidson/Newton callers still operate in NumPy, but GPU Krylov
+        # paths (e.g. Z-vector GCROTMK/GMRES) can keep the Hessian matvec
+        # fully device-resident. Only round-trip to host when the input vector
+        # came from a NumPy caller.
+        if on_gpu and _hop_on_gpu and (not bool(_input_is_gpu)):
             out = out.get()
         if _HOP_PROFILE:
             _t7_hop = time.perf_counter()

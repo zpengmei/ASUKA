@@ -542,6 +542,13 @@ def _build_bar_L_lorb_df(
     L = xp.asarray(Lorb, dtype=_wd)
     dm1 = xp.asarray(dm1_act, dtype=_wd)
     dm2 = xp.asarray(dm2_act, dtype=_wd)
+    try:
+        _act_resp_scale = float(os.environ.get("ASUKA_CASPT2_LORB_ACTIVE_RESPONSE_SCALE", "0.0"))
+    except Exception:
+        _act_resp_scale = 0.0
+    dm1 = float(_act_resp_scale) * dm1
+    dm2 = float(_act_resp_scale) * dm2
+    nmo = int(C.shape[1])
 
     C_core = C[:, :ncore]
     C_act = C[:, ncore:nocc]
@@ -549,17 +556,66 @@ def _build_bar_L_lorb_df(
     C_L_core = C_L[:, :ncore]
     C_L_act = C_L[:, ncore:nocc]
 
+    _dml_sym_mode = str(os.environ.get("ASUKA_CASPT2_LORB_DML_SYM_MODE", "full")).strip().lower()
+    if _dml_sym_mode not in {
+        "full",
+        "core_raw",
+        "act_raw",
+        "raw",
+        "core_asym",
+        "act_asym",
+        "asym",
+        "core_oitd",
+        "act_oitd",
+        "molcas_oitd",
+    }:
+        _dml_sym_mode = "full"
+
     if ncore:
         D_core = 2.0 * (C_core @ C_core.T)
-        D_L_core = 2.0 * (C_L_core @ C_core.T)
-        D_L_core = D_L_core + D_L_core.T
+        D_L_core_raw = 2.0 * (C_L_core @ C_core.T)
+        D_L_core_sym = D_L_core_raw + D_L_core_raw.T
+        D_L_core_asym = D_L_core_raw - D_L_core_raw.T
+        _need_core_oitd = _dml_sym_mode in {"core_oitd", "molcas_oitd"}
+        if _need_core_oitd:
+            d_core_mo = xp.zeros((nmo, nmo), dtype=_wd)
+            d_core_mo[:ncore, :ncore] = 2.0 * xp.eye(int(ncore), dtype=_wd)
+            dL_core_mo = d_core_mo @ L.T - L.T @ d_core_mo
+            D_L_core_oitd = C @ dL_core_mo @ C.T
+        else:
+            D_L_core_oitd = xp.zeros((nao, nao), dtype=_wd)
+        if _dml_sym_mode in {"core_raw", "raw"}:
+            D_L_core = D_L_core_raw
+        elif _dml_sym_mode in {"core_asym", "asym"}:
+            D_L_core = D_L_core_asym
+        elif _dml_sym_mode in {"core_oitd", "molcas_oitd"}:
+            D_L_core = D_L_core_oitd
+        else:
+            D_L_core = D_L_core_sym
     else:
         D_core = xp.zeros((nao, nao), dtype=_wd)
         D_L_core = xp.zeros((nao, nao), dtype=_wd)
 
     D_act = C_act @ dm1 @ C_act.T
-    D_L_act = C_L_act @ dm1 @ C_act.T
-    D_L_act = D_L_act + D_L_act.T
+    D_L_act_raw = C_L_act @ dm1 @ C_act.T
+    D_L_act_sym = D_L_act_raw + D_L_act_raw.T
+    D_L_act_asym = D_L_act_raw - D_L_act_raw.T
+    _need_act_oitd = _dml_sym_mode in {"act_oitd", "molcas_oitd"}
+    if _need_act_oitd:
+        d_act_mo = xp.zeros((nmo, nmo), dtype=_wd)
+        d_act_mo[ncore:nocc, ncore:nocc] = dm1
+        dL_act_mo = d_act_mo @ L.T - L.T @ d_act_mo
+        D_L_act_oitd = C @ dL_act_mo @ C.T
+    else:
+        D_L_act_oitd = xp.zeros((nao, nao), dtype=_wd)
+    if _dml_sym_mode in {"act_raw", "raw"}:
+        D_L_act = D_L_act_raw
+    elif _dml_sym_mode in {"act_asym", "asym"}:
+        D_L_act = D_L_act_asym
+    elif _dml_sym_mode in {"act_oitd", "molcas_oitd"}:
+        D_L_act = D_L_act_oitd
+    else:
+        D_L_act = D_L_act_sym
     D_L = D_L_core + D_L_act
 
     # Mean-field bar_L (two _build_bar_L_df_cross calls, no _df_JK needed).
