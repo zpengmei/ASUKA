@@ -3009,6 +3009,9 @@ class DFGradContractionContext:
         precision:
             - "fp64": keep bar_X as float64
             - "fp32_acc64"/"tf32": cast bar_X to float32 after symmetrization, but keep grad accumulation in float64
+
+        Accepts B_ao / bar_L_ao in either mnQ ``(nao, nao, naux)`` or packed-Qp
+        ``(naux, ntri)`` layout.
         """
         import cupy as cp  # noqa: PLC0415
 
@@ -3021,20 +3024,41 @@ class DFGradContractionContext:
         if not bar_L.flags.c_contiguous:
             bar_L = cp.ascontiguousarray(bar_L)
 
-        if B.ndim != 3:
-            raise ValueError("B_ao must have shape (nao, nao, naux)")
-        nao0, nao1, naux = map(int, B.shape)
-        if nao0 != nao1:
-            raise ValueError("B_ao must have shape (nao, nao, naux)")
-        if nao0 != int(self.nao) or naux != int(self.naux):
-            raise ValueError("B_ao shape mismatch with context")
-        if tuple(map(int, bar_L.shape)) != (int(self.naux), int(self.nao), int(self.nao)):
-            raise ValueError("bar_L_ao must have shape (naux, nao, nao)")
+        # --- Detect packed-Qp layout and compute adjoints ---
+        if B.ndim == 2 and bar_L.ndim == 2:
+            from asuka.integrals.tri_packed import nao_from_ntri  # noqa: PLC0415
+            from asuka.integrals.df_adjoint import df_whiten_adjoint_Qp  # noqa: PLC0415
+            from asuka.integrals.df_packed_s2 import unpack_Qp_to_mnQ  # noqa: PLC0415
 
-        bar_X, bar_Lchol = df_whiten_adjoint_Qmn(B, bar_L, self.L_metric, overwrite_bar_L=True)
-        del bar_L
-        bar_V = chol_lower_adjoint(self.L_metric, bar_Lchol)
-        del bar_Lchol
+            naux, ntri = map(int, B.shape)
+            nao0 = int(nao_from_ntri(int(ntri)))
+            if nao0 != int(self.nao) or naux != int(self.naux):
+                raise ValueError("B_ao Qp shape mismatch with context")
+            if tuple(map(int, bar_L.shape)) != (int(naux), int(ntri)):
+                raise ValueError("bar_L_ao must have shape (naux, ntri) for packed-Qp tensors")
+
+            bar_X_Qp, bar_Lchol = df_whiten_adjoint_Qp(B, bar_L, self.L_metric, nao=int(nao0), overwrite_bar_L=True)
+            del bar_L
+            bar_V = chol_lower_adjoint(self.L_metric, bar_Lchol)
+            del bar_Lchol
+            # Unpack to full symmetric mnQ for downstream symmetrize + kernel loop
+            bar_X = unpack_Qp_to_mnQ(bar_X_Qp, nao=int(nao0))
+            del bar_X_Qp
+        elif B.ndim == 3:
+            nao0, nao1, naux = map(int, B.shape)
+            if nao0 != nao1:
+                raise ValueError("B_ao must have shape (nao, nao, naux)")
+            if nao0 != int(self.nao) or naux != int(self.naux):
+                raise ValueError("B_ao shape mismatch with context")
+            if tuple(map(int, bar_L.shape)) != (int(self.naux), int(self.nao), int(self.nao)):
+                raise ValueError("bar_L_ao must have shape (naux, nao, nao)")
+
+            bar_X, bar_Lchol = df_whiten_adjoint_Qmn(B, bar_L, self.L_metric, overwrite_bar_L=True)
+            del bar_L
+            bar_V = chol_lower_adjoint(self.L_metric, bar_Lchol)
+            del bar_Lchol
+        else:
+            raise ValueError("B_ao must have shape (nao, nao, naux) or (naux, ntri)")
 
         _ext = self.cuda.get("_ext") if self.cuda is not None else None
         if _ext is not None and hasattr(_ext, "df_symmetrize_qmn_to_mnq_device"):
