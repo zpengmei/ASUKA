@@ -327,3 +327,90 @@ class ICRefSinglesRDM:
             max_space=int(max_space),
             s_tol=float(s_tol),
         )
+
+
+@dataclass
+class ICDenseContractedRDM:
+    """Explicit contracted H/S backend built from any contracted workspace.
+
+    This backend materializes the contracted Hamiltonian and overlap matrices once
+    and then solves the generalized eigenproblem exactly in the contracted space.
+    It serves as a true native `backend='rdm'` path for general contracted spaces,
+    including cases not covered by the specialized `ICRefSinglesRDM` formulas.
+    """
+
+    ws: Any
+
+    _h: np.ndarray | None = None
+    _s: np.ndarray | None = None
+
+    @property
+    def nlab(self) -> int:
+        return int(self.ws.nlab)
+
+    def _ensure_dense_mats(self) -> tuple[np.ndarray, np.ndarray]:
+        if self._h is not None and self._s is not None:
+            return self._h, self._s
+
+        nlab = int(self.nlab)
+        h = np.empty((nlab, nlab), dtype=np.float64)
+        s = np.empty((nlab, nlab), dtype=np.float64)
+        for j in range(nlab):
+            ej = np.zeros((nlab,), dtype=np.float64)
+            ej[j] = 1.0
+            h[:, j] = np.asarray(self.ws.sigma(ej), dtype=np.float64).ravel()
+            s[:, j] = np.asarray(self.ws.overlap(ej), dtype=np.float64).ravel()
+
+        h = 0.5 * (h + h.T)
+        s = 0.5 * (s + s.T)
+        self._h = np.asarray(h, dtype=np.float64, order="C")
+        self._s = np.asarray(s, dtype=np.float64, order="C")
+        return self._h, self._s
+
+    def overlap(self, c: np.ndarray) -> np.ndarray:
+        c = np.asarray(c, dtype=np.float64).ravel()
+        if int(c.size) != int(self.nlab):
+            raise ValueError("c has wrong length")
+        _h, s = self._ensure_dense_mats()
+        return np.asarray(s @ c, dtype=np.float64)
+
+    def sigma(self, c: np.ndarray) -> np.ndarray:
+        c = np.asarray(c, dtype=np.float64).ravel()
+        if int(c.size) != int(self.nlab):
+            raise ValueError("c has wrong length")
+        h, _s = self._ensure_dense_mats()
+        return np.asarray(h @ c, dtype=np.float64)
+
+    def solve(
+        self,
+        *,
+        x0: np.ndarray | None = None,
+        tol: float = 1e-10,
+        max_cycle: int = 80,
+        max_space: int = 25,
+        s_tol: float = 1e-12,
+    ) -> GeneralizedDavidsonResult:
+        _ = tol, max_cycle, max_space
+        h, s = self._ensure_dense_mats()
+        evals_s, evecs_s = np.linalg.eigh(s)
+        keep = evals_s > float(s_tol)
+        if not np.any(keep):
+            raise np.linalg.LinAlgError("overlap matrix is numerically singular")
+        t = evecs_s[:, keep] @ np.diag(1.0 / np.sqrt(evals_s[keep]))
+        h_ortho = 0.5 * ((t.T @ h @ t) + (t.T @ h @ t).T)
+        evals_h, evecs_h = np.linalg.eigh(h_ortho)
+        idx = int(np.argmin(evals_h))
+        e0 = float(evals_h[idx])
+        x = np.asarray(t @ evecs_h[:, idx], dtype=np.float64).ravel()
+        snorm2 = float(np.dot(x, s @ x))
+        if snorm2 <= 0.0:
+            raise np.linalg.LinAlgError("lowest-root eigenvector has non-positive S-norm")
+        x = np.asarray(x / np.sqrt(snorm2), dtype=np.float64)
+        r = h @ x - float(e0) * (s @ x)
+        return GeneralizedDavidsonResult(
+            converged=True,
+            e=float(e0),
+            x=np.ascontiguousarray(x, dtype=np.float64),
+            niter=1,
+            residual_norm=float(np.linalg.norm(r)),
+        )

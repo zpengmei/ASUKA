@@ -5,7 +5,7 @@ from dataclasses import dataclass
 import numpy as np
 
 from asuka.integrals.df_integrals import DeviceDFMOIntegrals
-from asuka.mrci.ic_mrcisd import ICMRCISDResult
+from asuka.mrci.ic_mrcisd import ICMRCISDResult, ICMRCISDResultMulti
 from asuka.mrci.mrcisd import MRCISDResult, MRCISDResultMulti
 from asuka.soc.si import SpinFreeState
 
@@ -15,6 +15,7 @@ class MRCIResult:
     """Result container for a single-root MRCI calculation (ASUKA-native driver)."""
 
     method: str
+    integrals_backend: str
     e_ref: float
     e_tot: float
     e_corr: float
@@ -29,10 +30,11 @@ class MRCIStatesResult:
     """Result container for multi-root MRCI calculations (ASUKA-native driver)."""
 
     method: str
+    integrals_backend: str
     states: list[int]
     nroots: int
     e_ref: np.ndarray
-    mrci: MRCISDResultMulti
+    mrci: MRCISDResultMulti | ICMRCISDResultMulti
     ecore: float
     ncore: int
     n_act: int
@@ -52,4 +54,3 @@ class MRCISOCResult:
     so_vectors: np.ndarray  # (nss,nss), complex128
     so_basis: list[tuple[int, int]]  # (spinfree_state_index, tm=2M)
     h_si: np.ndarray | None = None  # (nss,nss), complex Hermitian (optional debug)
-

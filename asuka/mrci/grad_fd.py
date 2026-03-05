@@ -65,6 +65,185 @@ def _mol_with_coords_like(mol0: Any, coords_bohr: np.ndarray):
     )
 
 
+def _run_hf_like_reference(scf_out0: Any, mol: Any):
+    hf_method = _infer_hf_method(scf_out0)
+    if getattr(scf_out0, "df_B", None) is None and getattr(scf_out0, "thc_factors", None) is not None:
+        cfg = getattr(scf_out0, "thc_run_config", None)
+        if cfg is None:
+            raise ValueError("THC FD gradients require scf_out.thc_run_config")
+        if str(hf_method) == "rhf":
+            from asuka.frontend.scf import run_rhf_thc  # noqa: PLC0415
+
+            return run_rhf_thc(
+                mol,
+                basis=cfg.basis,
+                auxbasis=cfg.auxbasis,
+                df_config=cfg.df_config,
+                expand_contractions=bool(cfg.expand_contractions),
+                thc_mode=str(cfg.thc_mode),
+                thc_local_config=cfg.thc_local_config,
+                thc_grid_spec=cfg.thc_grid_spec,
+                thc_grid_kind=str(cfg.thc_grid_kind),
+                thc_dvr_basis=cfg.thc_dvr_basis,
+                thc_grid_options=cfg.thc_grid_options,
+                thc_npt=cfg.thc_npt,
+                thc_solve_method=str(cfg.thc_solve_method),
+                use_density_difference=bool(cfg.use_density_difference),
+                df_warmup_cycles=int(cfg.df_warmup_cycles),
+                df_warmup_ediff=cfg.df_warmup_ediff,
+                df_warmup_max_cycles=int(cfg.df_warmup_max_cycles if cfg.df_warmup_max_cycles is not None else 25),
+                df_aux_block_naux=int(cfg.df_aux_block_naux),
+                df_k_q_block=int(cfg.df_k_q_block),
+                max_cycle=int(cfg.max_cycle),
+                conv_tol=float(cfg.conv_tol),
+                conv_tol_dm=float(cfg.conv_tol_dm),
+                diis=bool(cfg.diis),
+                diis_start_cycle=cfg.diis_start_cycle,
+                diis_space=int(cfg.diis_space),
+                damping=float(cfg.damping),
+                level_shift=float(cfg.level_shift),
+                q_block=int(cfg.q_block),
+                init_guess="auto" if cfg.init_guess is None else str(cfg.init_guess),
+                mo_coeff0=getattr(getattr(scf_out0, "scf", None), "mo_coeff", None),
+                init_fock_cycles=cfg.init_fock_cycles,
+            )
+        if str(hf_method) == "rohf":
+            from asuka.frontend.scf import run_rohf_thc  # noqa: PLC0415
+
+            return run_rohf_thc(
+                mol,
+                basis=cfg.basis,
+                auxbasis=cfg.auxbasis,
+                df_config=cfg.df_config,
+                expand_contractions=bool(cfg.expand_contractions),
+                thc_mode=str(cfg.thc_mode),
+                thc_local_config=cfg.thc_local_config,
+                thc_grid_spec=cfg.thc_grid_spec,
+                thc_grid_kind=str(cfg.thc_grid_kind),
+                thc_dvr_basis=cfg.thc_dvr_basis,
+                thc_grid_options=cfg.thc_grid_options,
+                thc_npt=cfg.thc_npt,
+                thc_solve_method=str(cfg.thc_solve_method),
+                use_density_difference=bool(cfg.use_density_difference),
+                df_warmup_cycles=int(cfg.df_warmup_cycles),
+                df_aux_block_naux=int(cfg.df_aux_block_naux),
+                df_k_q_block=int(cfg.df_k_q_block),
+                max_cycle=int(cfg.max_cycle),
+                conv_tol=float(cfg.conv_tol),
+                conv_tol_dm=float(cfg.conv_tol_dm),
+                diis=bool(cfg.diis),
+                diis_start_cycle=cfg.diis_start_cycle,
+                diis_space=int(cfg.diis_space),
+                damping=float(cfg.damping),
+                q_block=int(cfg.q_block),
+                mo_coeff0=getattr(getattr(scf_out0, "scf", None), "mo_coeff", None),
+            )
+        from asuka.frontend.scf import run_uhf_thc  # noqa: PLC0415
+
+        return run_uhf_thc(
+            mol,
+            basis=cfg.basis,
+            auxbasis=cfg.auxbasis,
+            df_config=cfg.df_config,
+            expand_contractions=bool(cfg.expand_contractions),
+            thc_mode=str(cfg.thc_mode),
+            thc_local_config=cfg.thc_local_config,
+            thc_grid_spec=cfg.thc_grid_spec,
+            thc_grid_kind=str(cfg.thc_grid_kind),
+            thc_dvr_basis=cfg.thc_dvr_basis,
+            thc_grid_options=cfg.thc_grid_options,
+            thc_npt=cfg.thc_npt,
+            thc_solve_method=str(cfg.thc_solve_method),
+            use_density_difference=bool(cfg.use_density_difference),
+            df_warmup_cycles=int(cfg.df_warmup_cycles),
+            df_aux_block_naux=int(cfg.df_aux_block_naux),
+            df_k_q_block=int(cfg.df_k_q_block),
+            max_cycle=int(cfg.max_cycle),
+            conv_tol=float(cfg.conv_tol),
+            conv_tol_dm=float(cfg.conv_tol_dm),
+            diis=bool(cfg.diis),
+            diis_start_cycle=cfg.diis_start_cycle,
+            diis_space=int(cfg.diis_space),
+            damping=float(cfg.damping),
+            q_block=int(cfg.q_block),
+            mo_coeff0=getattr(getattr(scf_out0, "scf", None), "mo_coeff", None),
+        )
+
+    df_cfg = getattr(scf_out0, "df_run_config", None)
+    if df_cfg is not None:
+        from asuka.frontend.scf import run_hf_df  # noqa: PLC0415
+
+        return run_hf_df(
+            mol,
+            method=str(df_cfg.hf_method),
+            backend=str(df_cfg.backend),
+            basis=df_cfg.basis,
+            auxbasis=df_cfg.auxbasis,
+            df_config=df_cfg.df_config,
+            expand_contractions=bool(df_cfg.expand_contractions),
+            max_cycle=int(df_cfg.max_cycle),
+            conv_tol=float(df_cfg.conv_tol),
+            conv_tol_dm=float(df_cfg.conv_tol_dm),
+            diis=bool(df_cfg.diis),
+            diis_start_cycle=df_cfg.diis_start_cycle,
+            diis_space=int(df_cfg.diis_space),
+            damping=float(df_cfg.damping),
+            level_shift=float(df_cfg.level_shift),
+            k_q_block=int(df_cfg.k_q_block),
+            cublas_math_mode=df_cfg.cublas_math_mode,
+            mo_coeff0=getattr(getattr(scf_out0, "scf", None), "mo_coeff", None),
+            init_fock_cycles=df_cfg.init_fock_cycles,
+            guess=scf_out0,
+        )
+
+    from asuka.frontend.scf import run_hf_df  # noqa: PLC0415
+
+    return run_hf_df(
+        mol,
+        method=str(hf_method),
+        backend=str(_infer_backend_from_scf_out(scf_out0)),
+        df=True,
+        auxbasis=getattr(scf_out0, "auxbasis_name", "autoaux"),
+        guess=scf_out0,
+    )
+
+
+def _run_casscf_like_reference(scf_out: Any, ref0: Any):
+    from asuka.mcscf.casscf import run_casscf  # noqa: PLC0415
+
+    cfg = getattr(ref0, "run_config", None)
+    if cfg is not None:
+        kwargs = dict(getattr(cfg, "kwargs", {}) or {})
+        root_weights = getattr(cfg, "root_weights", None)
+        return run_casscf(
+            scf_out,
+            ncore=int(getattr(ref0, "ncore", 0)),
+            ncas=int(getattr(ref0, "ncas", 0)),
+            nelecas=getattr(ref0, "nelecas"),
+            backend=str(getattr(cfg, "backend", _infer_backend_from_scf_out(scf_out))),
+            df=bool(getattr(cfg, "df", True)),
+            guess=ref0,
+            matvec_backend=str(getattr(cfg, "matvec_backend", "cuda_eri_mat")),
+            nroots=int(getattr(cfg, "nroots", getattr(ref0, "nroots", 1))),
+            root_weights=None if root_weights is None else list(root_weights),
+            **kwargs,
+        )
+
+    return run_casscf(
+        scf_out,
+        ncore=int(getattr(ref0, "ncore", 0)),
+        ncas=int(getattr(ref0, "ncas", 0)),
+        nelecas=getattr(ref0, "nelecas"),
+        backend=str(_infer_backend_from_scf_out(scf_out)),
+        df=True,
+        guess=ref0,
+        nroots=int(getattr(ref0, "nroots", 1)),
+        root_weights=None
+        if getattr(ref0, "root_weights", None) is None
+        else np.asarray(getattr(ref0, "root_weights"), dtype=np.float64).ravel().tolist(),
+    )
+
+
 def mrci_grad_states_from_ref_fd(
     scf_out0: Any,
     ref0: Any,
@@ -74,6 +253,8 @@ def mrci_grad_states_from_ref_fd(
     states: Sequence[int],
     fd_step_bohr: float = 1e-3,
     which: Sequence[tuple[int, int]] | None = None,
+    method: str | None = None,
+    mrci_kwargs: dict[str, Any] | None = None,
     max_virt_e: int = 2,
     root_follow: Literal["hungarian", "greedy"] = "hungarian",
 ) -> list[np.ndarray]:
@@ -86,9 +267,6 @@ def mrci_grad_states_from_ref_fd(
     MRCISD run to associate roots with the requested reference states.
     """
 
-    from asuka.frontend.scf import run_hf_df  # noqa: PLC0415
-    from asuka.mcscf.casscf import run_casscf  # noqa: PLC0415
-
     states_list = [int(s) for s in states]
     roots = np.asarray(roots, dtype=np.int64).ravel()
     if roots.shape != (len(states_list),):
@@ -97,6 +275,10 @@ def mrci_grad_states_from_ref_fd(
     delta = float(fd_step_bohr)
     if delta <= 0.0:
         raise ValueError("fd_step_bohr must be > 0")
+
+    mrci_kwargs_use = {} if mrci_kwargs is None else dict(mrci_kwargs)
+    mrci_kwargs_use.pop("states", None)
+    mrci_kwargs_use.pop("nroots", None)
 
     mol0 = getattr(ref0, "mol", None)
     if mol0 is None:
@@ -108,11 +290,6 @@ def mrci_grad_states_from_ref_fd(
     natm = int(coords0.shape[0])
     if natm == 0:
         return [np.zeros((0, 3), dtype=np.float64) for _ in states_list]
-
-    hf_method = _infer_hf_method(scf_out0)
-    backend = _infer_backend_from_scf_out(scf_out0)
-    auxbasis = getattr(scf_out0, "auxbasis_name", "autoaux")
-
     ncore = int(getattr(ref0, "ncore", 0))
     ncas = int(getattr(ref0, "ncas", 0))
     nelecas = getattr(ref0, "nelecas")
@@ -122,35 +299,22 @@ def mrci_grad_states_from_ref_fd(
     # Energy evaluator returning energies for the requested state list.
     def _energies_at(coords_bohr: np.ndarray) -> np.ndarray:
         mol = _mol_with_coords_like(mol0, coords_bohr)
-        scf_out = run_hf_df(
-            mol,
-            method=str(hf_method),
-            backend=str(backend),
-            df=True,
-            auxbasis=auxbasis,
-            guess=scf_out0,
-        )
-        casscf = run_casscf(
-            scf_out,
-            ncore=int(ncore),
-            ncas=int(ncas),
-            nelecas=nelecas,
-            backend=str(backend),
-            df=True,
-            guess=ref0,
-            nroots=int(nroots_ref),
-            root_weights=None if root_weights is None else np.asarray(root_weights, dtype=np.float64).ravel().tolist(),
-        )
+        scf_out = _run_hf_like_reference(scf_out0, mol)
+        casscf = _run_casscf_like_reference(scf_out, ref0)
         mrci_disp = mrci_states_from_ref(
             casscf,
             scf_out=scf_out,
-            method="mrcisd",
+            method=str(method if method is not None else getattr(mrci_states, "method", "mrcisd")),
             states=states_list,
             max_virt_e=int(max_virt_e),
+            **mrci_kwargs_use,
         )
         ov = np.asarray(mrci_disp.mrci.overlap_ref_root, dtype=np.float64)
         roots_disp = assign_roots_by_overlap(ov, method=str(root_follow))
-        e = np.asarray(mrci_disp.mrci.e_mrci, dtype=np.float64).ravel()
+        if hasattr(mrci_disp.mrci, "e_mrci"):
+            e = np.asarray(mrci_disp.mrci.e_mrci, dtype=np.float64).ravel()
+        else:
+            e = np.asarray(mrci_disp.mrci.e_tot, dtype=np.float64).ravel()
         return np.asarray([float(e[int(roots_disp[i])]) for i in range(len(states_list))], dtype=np.float64)
 
     # Central-difference loop (optionally restricted to a subset of coordinates).

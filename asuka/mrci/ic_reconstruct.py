@@ -626,3 +626,144 @@ def ic_mrcisd_reference_ci_rhs_from_residual(
     drt_cas = build_drt(norb=n_act, nelec=int(drt_mrci.nelec), twos_target=int(drt_mrci.twos_target))
     _ci0, _psi0, ref_idx = embed_cas_ci_into_mrcisd(drt_cas=drt_cas, drt_mrci=drt_mrci, ci_cas=ci_cas_n, n_virt=n_virt)
     return np.ascontiguousarray(g_full[np.asarray(ref_idx, dtype=np.int64)], dtype=np.float64)
+
+
+def ic_mrcisd_multi_reference_ci_rhs_from_residual(
+    ic_res: Any,
+    *,
+    ci_cas: list[np.ndarray],
+    root: int,
+    h1e: Any,
+    eri: Any,
+    contract_nthreads: int = 1,
+    contract_blas_nthreads: int | None = 1,
+) -> list[np.ndarray]:
+    """Compute CAS CI RHS vectors for a shared-basis multi-root contracted state."""
+
+    from asuka.cuguga.oracle import _get_epq_action_cache  # noqa: PLC0415
+    from asuka.integrals.df_integrals import DeviceDFMOIntegrals  # noqa: PLC0415
+    from asuka.mrci.ic_mrcisd import _build_uncontracted_hop, expand_ic_mrcisd_multi_root  # noqa: PLC0415
+
+    if int(root) < 0 or int(root) >= int(len(getattr(ic_res, "c"))):
+        raise ValueError("root index out of range")
+    if int(len(ci_cas)) != int(len(getattr(ic_res, "block_slices"))):
+        raise ValueError("ci_cas must have one reference vector per basis block")
+
+    drt_mrci, ci_mrci = expand_ic_mrcisd_multi_root(ic_res, ci_cas=ci_cas, root=int(root))
+    hop = _build_uncontracted_hop(
+        drt_work=drt_mrci,
+        h1e=h1e,
+        eri=eri,
+        hop_backend_s="cuda" if isinstance(eri, DeviceDFMOIntegrals) else "fast",
+        hop_map=None,
+        contract_nthreads=max(1, int(contract_nthreads)),
+        contract_blas_nthreads=contract_blas_nthreads,
+    )
+    hy = np.asarray(hop(ci_mrci), dtype=np.float64).ravel()
+    e = float(np.asarray(getattr(ic_res, "e"), dtype=np.float64).ravel()[int(root)])
+    r = hy - e * np.asarray(ci_mrci, dtype=np.float64).ravel()
+
+    cache = _get_epq_action_cache(drt_mrci)
+    coeff = np.asarray(getattr(ic_res, "c")[int(root)], dtype=np.float64).ravel()
+    block_slices = list(getattr(ic_res, "block_slices"))
+    singles_all = list(getattr(ic_res, "singles"))
+    doubles_all = list(getattr(ic_res, "doubles"))
+    spaces_all = list(getattr(ic_res, "spaces"))
+    allow_same_internal = bool(getattr(ic_res, "allow_same_internal", True))
+
+    g_blocks_full: list[np.ndarray] = []
+    for (start, stop), singles, doubles, spaces in zip(
+        block_slices,
+        singles_all,
+        doubles_all,
+        spaces_all,
+        strict=True,
+    ):
+        c_blk = coeff[int(start) : int(stop)]
+        if int(c_blk.size) != 1 + int(getattr(singles, "nlab")) + int(getattr(doubles, "nlab")):
+            raise ValueError("block coefficient length mismatch")
+        g_full_blk = np.asarray(r, dtype=np.float64) * float(c_blk[0])
+
+        n_singles = int(getattr(singles, "nlab"))
+        n_doubles = int(getattr(doubles, "nlab"))
+        off = 1
+        if isinstance(singles, ICSingles):
+            for i in range(n_singles):
+                a = int(singles.a[i])
+                r_int = int(singles.r[i])
+                g_full_blk += float(c_blk[off + i]) * _apply_epq(drt_mrci, p=r_int, q=a, x=r, cache=cache)
+        elif isinstance(singles, SCSingles):
+            internal = np.asarray(getattr(spaces, "internal"), dtype=np.int32).ravel()
+            for i in range(n_singles):
+                a = int(singles.a[i])
+                acc = np.zeros_like(g_full)
+                for r_int in internal.tolist():
+                    acc += _apply_epq(drt_mrci, p=int(r_int), q=a, x=r, cache=cache)
+                g_full_blk += float(c_blk[off + i]) * acc
+        else:
+            raise TypeError("unknown singles label type")
+
+        off = 1 + n_singles
+        if isinstance(doubles, ICDoubles):
+            for i in range(n_doubles):
+                a = int(doubles.a[i])
+                r_int = int(doubles.r[i])
+                b = int(doubles.b[i])
+                s_int = int(doubles.s[i])
+                tmp = _apply_epq(drt_mrci, p=r_int, q=a, x=r, cache=cache)
+                vec = _apply_epq(drt_mrci, p=s_int, q=b, x=tmp, cache=cache)
+                g_full_blk += float(c_blk[off + i]) * vec
+        elif isinstance(doubles, SCDoubles):
+            internal = np.asarray(getattr(spaces, "internal"), dtype=np.int32).ravel()
+            internal_list = internal.tolist()
+            for i in range(n_doubles):
+                a = int(doubles.a[i])
+                b = int(doubles.b[i])
+                acc = np.zeros_like(g_full)
+                if a == b:
+                    for ir, r_int in enumerate(internal_list):
+                        start_s = ir if allow_same_internal else ir + 1
+                        for s_int in internal_list[start_s:]:
+                            tmp = _apply_epq(drt_mrci, p=int(r_int), q=a, x=r, cache=cache)
+                            acc += _apply_epq(drt_mrci, p=int(s_int), q=b, x=tmp, cache=cache)
+                else:
+                    for r_int in internal_list:
+                        tmp = _apply_epq(drt_mrci, p=int(r_int), q=a, x=r, cache=cache)
+                        for s_int in internal_list:
+                            if (not allow_same_internal) and int(r_int) == int(s_int):
+                                continue
+                            acc += _apply_epq(drt_mrci, p=int(s_int), q=b, x=tmp, cache=cache)
+                g_full_blk += float(c_blk[off + i]) * acc
+        else:
+            raise TypeError("unknown doubles label type")
+        g_blocks_full.append(np.asarray(g_full_blk * 2.0, dtype=np.float64))
+
+    out: list[np.ndarray] = []
+    wfnsym = None
+    try:
+        wfnsym = int(np.asarray(getattr(drt_mrci, "node_sym"))[int(drt_mrci.leaf)])
+    except Exception:
+        wfnsym = None
+    for g_full_blk, ci_ref, spaces in zip(g_blocks_full, ci_cas, spaces_all, strict=True):
+        ci_ref_n = _normalize_ci(ci_ref)
+        n_act = int(getattr(spaces, "n_internal"))
+        n_virt = int(getattr(spaces, "n_external"))
+        orbsym_act = None
+        orbsym_corr = getattr(spaces, "orbsym", None)
+        if orbsym_corr is not None:
+            orbsym_act = np.asarray(orbsym_corr, dtype=np.int32).ravel()[: int(n_act)].tolist()
+        drt_cas = build_drt(
+            norb=int(n_act),
+            nelec=int(drt_mrci.nelec),
+            twos_target=int(drt_mrci.twos_target),
+            orbsym=orbsym_act,
+            wfnsym=wfnsym,
+        )
+        _ci0, _psi0, ref_idx = embed_cas_ci_into_mrcisd(
+            drt_cas=drt_cas,
+            drt_mrci=drt_mrci,
+            ci_cas=ci_ref_n,
+            n_virt=int(n_virt),
+        )
+        out.append(np.ascontiguousarray(g_full_blk[np.asarray(ref_idx, dtype=np.int64)], dtype=np.float64))
+    return out

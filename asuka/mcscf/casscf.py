@@ -399,6 +399,19 @@ class CASSCFResult:
     mo_energy: Any | None = None
     profile: dict | None = None
     scf_out: Any | None = None
+    run_config: Any | None = None
+
+
+@dataclass(frozen=True)
+class CASSCFRunConfig:
+    """Reproducible `run_casscf(...)` settings for downstream replay workflows."""
+
+    backend: str
+    df: bool
+    matvec_backend: str
+    nroots: int
+    root_weights: tuple[float, ...] | None
+    kwargs: dict[str, Any]
 
 
 def casscf_orbital_gradient_df(
@@ -2347,10 +2360,27 @@ def run_casscf(
 ) -> CASSCFResult:
     """Unified CASSCF driver over (backend, df) switches."""
 
+    from dataclasses import replace as _dc_replace  # noqa: PLC0415
+
     backend_s = str(backend).strip().lower()
     if backend_s not in {"cpu", "cuda"}:
         raise ValueError("backend must be 'cpu' or 'cuda'")
     df_b = bool(df)
+
+    if kwargs:
+        kwargs = dict(kwargs)
+    run_kwargs = dict(kwargs)
+    run_kwargs.pop("guess", None)
+    run_kwargs.pop("mo_coeff0", None)
+    run_kwargs.pop("ci0", None)
+    run_config = CASSCFRunConfig(
+        backend=str(backend_s),
+        df=bool(df_b),
+        matvec_backend="",
+        nroots=int(run_kwargs.get("nroots", 1)),
+        root_weights=None,
+        kwargs=run_kwargs,
+    )
 
     C0 = getattr(scf_out.scf, "mo_coeff", None)
     _xp_probe = scf_out.df_B if scf_out.df_B is not None else getattr(scf_out, "ao_eri", C0)
@@ -2360,13 +2390,14 @@ def run_casscf(
 
     if matvec_backend is None:
         matvec_backend = "cuda_eri_mat" if backend_s == "cuda" else "contract"
+    run_config = _dc_replace(run_config, matvec_backend=str(matvec_backend))
+    if "root_weights" in run_kwargs and run_kwargs["root_weights"] is not None:
+        weights_obj = tuple(float(w) for w in np.asarray(run_kwargs["root_weights"], dtype=np.float64).ravel())
+        run_config = _dc_replace(run_config, root_weights=weights_obj)
 
     if guess is not None:
-        kwargs = dict(kwargs)
         kwargs.setdefault("mo_coeff0", getattr(guess, "mo_coeff", None))
         kwargs.setdefault("ci0", getattr(guess, "ci", None))
-    elif kwargs:
-        kwargs = dict(kwargs)
 
     if not df_b:
         kwargs.setdefault("dense_exact_jk", "auto")
@@ -2376,7 +2407,7 @@ def run_casscf(
             # THC-SCF outputs do not cache DF factors. Default to a gradient-only
             # orbital optimizer for now (AH/1step wiring is not implemented).
             kwargs.setdefault("orbital_optimizer", "lbfgs")
-            return run_casscf_df(
+            result = run_casscf_df(
                 scf_out,
                 ncore=int(ncore),
                 ncas=int(ncas),
@@ -2385,7 +2416,8 @@ def run_casscf(
                 matvec_backend=str(matvec_backend),
                 **kwargs,
             )
-        return run_casscf_df(
+            return _dc_replace(result, run_config=run_config)
+        result = run_casscf_df(
             scf_out,
             ncore=int(ncore),
             ncas=int(ncas),
@@ -2394,9 +2426,10 @@ def run_casscf(
             matvec_backend=str(matvec_backend),
             **kwargs,
         )
+        return _dc_replace(result, run_config=run_config)
 
     if backend_s == "cuda":
-        return run_casscf_df(
+        result = run_casscf_df(
             scf_out,
             ncore=int(ncore),
             ncas=int(ncas),
@@ -2405,8 +2438,9 @@ def run_casscf(
             matvec_backend=str(matvec_backend),
             **kwargs,
         )
+        return _dc_replace(result, run_config=run_config)
 
-    return run_casscf_df(
+    result = run_casscf_df(
         scf_out,
         ncore=int(ncore),
         ncas=int(ncas),
@@ -2415,10 +2449,12 @@ def run_casscf(
         matvec_backend=str(matvec_backend),
         **kwargs,
     )
+    return _dc_replace(result, run_config=run_config)
 
 
 __all__ = [
     "CASSCFResult",
+    "CASSCFRunConfig",
     "casscf_orbital_gradient_df",
     "casscf_orbital_gradient_dense",
     "run_casscf",

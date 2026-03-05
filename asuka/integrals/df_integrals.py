@@ -268,6 +268,8 @@ class DeviceDFMOIntegrals:
     j_ps: Any  # (norb, norb)
     pair_norm: Any | None  # (norb*norb,)
     eri_mat: Any | None  # (norb*norb, norb*norb)
+    representation: str = "df"
+    source: Any | None = None
 
 
 def build_df_mo_integrals(

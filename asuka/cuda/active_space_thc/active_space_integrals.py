@@ -31,6 +31,36 @@ from asuka.hf.local_thc_jk import local_thc_eri_apply_batched
 from asuka.integrals.df_integrals import DeviceDFMOIntegrals
 
 
+def _factorize_pair_eri_mat_psd(eri_mat, *, eig_tol: float = 1e-12):
+    """Return an exact low-rank l_full factorization of a symmetric PSD pair matrix."""
+
+    try:
+        import cupy as cp  # type: ignore[import-not-found]
+    except Exception as e:  # pragma: no cover
+        raise RuntimeError("_factorize_pair_eri_mat_psd requires CuPy") from e
+
+    eri = cp.asarray(eri_mat, dtype=cp.float64)
+    if int(getattr(eri, "ndim", 0)) != 2 or int(eri.shape[0]) != int(eri.shape[1]):
+        raise ValueError("eri_mat must be a square pair-space matrix")
+    eri = 0.5 * (eri + eri.T)
+
+    evals, evecs = cp.linalg.eigh(eri)
+    evals = cp.asarray(evals, dtype=cp.float64)
+    max_eval = float(cp.max(cp.abs(evals)).item()) if int(evals.size) else 0.0
+    thresh = max(float(eig_tol) * max(float(max_eval), 1.0), 0.0)
+    keep = evals > float(thresh)
+    if not bool(cp.any(keep)):
+        l_full = cp.zeros((int(eri.shape[0]), 0), dtype=cp.float64)
+        pair_norm = cp.zeros((int(eri.shape[0]),), dtype=cp.float64)
+        return l_full, pair_norm
+
+    vals = cp.sqrt(cp.clip(evals[keep], 0.0, None))
+    vecs = cp.asarray(evecs[:, keep], dtype=cp.float64)
+    l_full = cp.ascontiguousarray(vecs * vals[None, :], dtype=cp.float64)
+    pair_norm = cp.ascontiguousarray(cp.linalg.norm(l_full, axis=1), dtype=cp.float64)
+    return l_full, pair_norm
+
+
 def build_device_dfmo_integrals_thc(
     thc_factors: Any,
     C_active,
@@ -174,6 +204,8 @@ def build_device_dfmo_integrals_thc(
         j_ps=j_ps,
         pair_norm=pair_norm,
         eri_mat=eri_mat,
+        representation="thc_global",
+        source=thc_factors,
     )
 
 
@@ -181,25 +213,22 @@ def build_device_dfmo_integrals_local_thc(
     lthc: Any,
     C_active,
     *,
-    want_eri_mat: bool = True,
+    want_eri_mat: bool = False,
     p_block: int = 8,
     profile: dict | None = None,
 ) -> DeviceDFMOIntegrals:
     """Build active-space ERIs from LocalTHCFactors via the local AO ERI operator.
 
     This returns a `DeviceDFMOIntegrals` with:
-    - `eri_mat` materialized in ordered-pair space (required for CUDA matvec)
-    - `j_ps` computed from `eri_mat`
-    - `l_full=None` because each local block has its own aux dimension
+    - `l_full` as an exact factorization of the pair-space ERI matrix
+    - `j_ps` from the same local-THC operator
+    - optional `eri_mat` only when explicitly requested
     """
 
     try:
         import cupy as cp  # type: ignore[import-not-found]
     except Exception as e:  # pragma: no cover
         raise RuntimeError("build_device_dfmo_integrals_local_thc requires CuPy") from e
-
-    if not bool(want_eri_mat):
-        raise ValueError("LocalTHC active-space build currently requires want_eri_mat=True")
 
     if profile is not None:
         profile.clear()
@@ -263,10 +292,14 @@ def build_device_dfmo_integrals_local_thc(
         raise RuntimeError("LocalTHC active-space build produced no pair blocks")
 
     eri_mat = 0.5 * (eri_mat + eri_mat.T)
+    l_full, pair_norm = _factorize_pair_eri_mat_psd(eri_mat)
 
     # J_{ps} = sum_q (p q| q s)
-    g4 = eri_mat.reshape(int(ncas), int(ncas), int(ncas), int(ncas))
-    j_ps = cp.ascontiguousarray(cp.einsum("pqqs->ps", g4, optimize=True), dtype=cp.float64)
+    if int(getattr(l_full, "shape", (0, 0))[1]) > 0:
+        l3 = l_full.reshape(int(ncas), int(ncas), -1)
+        j_ps = cp.ascontiguousarray(cp.einsum("pql,qsl->ps", l3, l3, optimize=True), dtype=cp.float64)
+    else:
+        j_ps = cp.zeros((int(ncas), int(ncas)), dtype=cp.float64)
 
     if profile is not None:
         cp.cuda.get_current_stream().synchronize()
@@ -275,14 +308,17 @@ def build_device_dfmo_integrals_local_thc(
         profile["nao"] = int(nao)
         profile["nblocks_used"] = int(nblocks_used)
         profile["pair_p_block"] = int(pair_p_block)
+        profile["l_full_nbytes"] = int(getattr(l_full, "nbytes", 0))
         profile["eri_mat_nbytes"] = int(getattr(eri_mat, "nbytes", 0))
 
     return DeviceDFMOIntegrals(
         norb=int(ncas),
-        l_full=None,
+        l_full=l_full,
         j_ps=j_ps,
-        pair_norm=None,
-        eri_mat=eri_mat,
+        pair_norm=pair_norm,
+        eri_mat=cp.ascontiguousarray(eri_mat, dtype=cp.float64) if bool(want_eri_mat) else None,
+        representation="thc_local_factorized",
+        source=lthc,
     )
 
 

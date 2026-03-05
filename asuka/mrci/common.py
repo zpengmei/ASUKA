@@ -74,13 +74,14 @@ def compute_cas_reference_energy_df(
     orbsym_act: Sequence[int] | None = None,
     wfnsym: int | None = None,
 ) -> float:
-    """Compute E_ref (total) using DF/Cholesky vectors `l_full`.
+    """Compute E_ref (total) using DF/Cholesky vectors or pair-space ERIs.
 
     Notes
     -----
-    `l_full` is expected to store ordered-pair vectors in shape (norb*norb, naux),
-    consistent with :class:`asuka.integrals.df_integrals.DFMOIntegrals` and
-    :class:`asuka.integrals.df_integrals.DeviceDFMOIntegrals`.
+    `l_full` may be:
+    - ordered-pair vectors with shape (norb*norb, naux)
+    - a pair-space ERI matrix with shape (norb*norb, norb*norb)
+    - a DF-like object exposing `.l_full` and/or `.eri_mat`
     """
 
     n_act = int(n_act)
@@ -109,24 +110,41 @@ def compute_cas_reference_energy_df(
 
     dm2_mat = dm2.reshape(n_act * n_act, n_act * n_act)
 
+    payload = l_full
+    if getattr(payload, "l_full", None) is not None:
+        payload = getattr(payload, "l_full")
+    elif getattr(payload, "eri_mat", None) is not None:
+        payload = getattr(payload, "eri_mat")
+
     try:
         import cupy as cp  # noqa: PLC0415
 
-        if isinstance(l_full, cp.ndarray):
-            l_int = cp.take(cp.asarray(l_full, dtype=cp.float64), cp.asarray(pq_ids, dtype=cp.int64), axis=0)
-            d = cp.asarray(dm2_mat, dtype=cp.float64)
-            tmp = d @ l_int
-            e2 = 0.5 * cp.sum(l_int * tmp)
+        if isinstance(payload, cp.ndarray):
+            arr = cp.asarray(payload, dtype=cp.float64)
+            if int(arr.ndim) != 2 or int(arr.shape[0]) != int(norb) * int(norb):
+                raise ValueError("pair-space payload must have shape (norb*norb, ncol)")
+            dm2_d = cp.asarray(dm2_mat, dtype=cp.float64)
+            if int(arr.shape[1]) == int(norb) * int(norb):
+                eri_sub = cp.take(cp.take(arr, cp.asarray(pq_ids, dtype=cp.int64), axis=0), cp.asarray(pq_ids, dtype=cp.int64), axis=1)
+                e2 = 0.5 * cp.sum(dm2_d * eri_sub)
+            else:
+                l_int = cp.take(arr, cp.asarray(pq_ids, dtype=cp.int64), axis=0)
+                tmp = dm2_d @ l_int
+                e2 = 0.5 * cp.sum(l_int * tmp)
             return float(ecore + e1 + float(cp.asnumpy(e2)))
     except Exception:
         pass
 
-    l_full_np = np.asarray(l_full, dtype=np.float64, order="C")
-    if l_full_np.ndim != 2 or int(l_full_np.shape[0]) != int(norb) * int(norb):
-        raise ValueError("l_full must have shape (norb*norb, naux)")
-    l_int_np = np.asarray(l_full_np[pq_ids], dtype=np.float64, order="C")
-    tmp_np = dm2_mat @ l_int_np
-    e2 = 0.5 * float(np.einsum("pL,pL->", l_int_np, tmp_np, optimize=True))
+    arr_np = np.asarray(payload, dtype=np.float64, order="C")
+    if arr_np.ndim != 2 or int(arr_np.shape[0]) != int(norb) * int(norb):
+        raise ValueError("pair-space payload must have shape (norb*norb, ncol)")
+    if int(arr_np.shape[1]) == int(norb) * int(norb):
+        eri_sub = np.asarray(arr_np[np.ix_(pq_ids, pq_ids)], dtype=np.float64, order="C")
+        e2 = 0.5 * float(np.einsum("pq,pq->", dm2_mat, eri_sub, optimize=True))
+    else:
+        l_int_np = np.asarray(arr_np[pq_ids], dtype=np.float64, order="C")
+        tmp_np = dm2_mat @ l_int_np
+        e2 = 0.5 * float(np.einsum("pL,pL->", l_int_np, tmp_np, optimize=True))
     return float(ecore + e1 + e2)
 
 

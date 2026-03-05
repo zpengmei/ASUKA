@@ -1,17 +1,17 @@
 from __future__ import annotations
 
-"""ASUKA-native MRCISD nuclear gradients.
+"""ASUKA-native MRCI nuclear gradients.
 
 The public entry points here work with ASUKA frontend objects:
 - `scf_out`: output of :func:`asuka.frontend.scf.run_hf_df`
 - `ref`: output of :func:`asuka.mcscf.run_casscf` (or CASCI)
 
-Phase-1 scope
+Current scope
 -------------
-- Uncontracted MRCISD only (``method="mrcisd"``).
-- Analytic gradients use ASUKA's DF derivative contractions and a CP-CASSCF
-  Z-vector solve in the *reference* SA-CASSCF parameter space.
-- Finite-difference gradients are provided as a slow validation/fallback backend.
+- Analytic gradients are implemented for native `mrcisd` and `ic_mrcisd`
+  across the supported DF and THC integral backends.
+- Finite-difference gradients serve as the fallback/native validation backend
+  for both ``mrcisd`` and ``ic_mrcisd``, including THC-backed runs.
 """
 
 from dataclasses import dataclass
@@ -25,7 +25,7 @@ from asuka.mrci.result import MRCIStatesResult
 
 
 Backend = Literal["analytic", "fd"]
-Method = Literal["mrcisd"]
+Method = Literal["mrcisd", "ic_mrcisd"]
 
 
 @dataclass(frozen=True)
@@ -131,14 +131,15 @@ def mrci_grad_states_from_ref(
     df_threads: int = 0,
     z_tol: float = 1e-10,
     z_maxiter: int = 200,
+    mrci_backend: str | None = None,
     # Forwarded to mrci_states_from_ref
     **mrci_kwargs: Any,
 ) -> MRCIGradStatesResult:
-    """Compute MRCISD nuclear gradients for multiple reference states."""
+    """Compute MRCI nuclear gradients for multiple reference states."""
 
     method_s = str(method).strip().lower()
-    if method_s != "mrcisd":
-        raise NotImplementedError("ASUKA-native gradients currently support only method='mrcisd'")
+    if method_s not in ("mrcisd", "ic_mrcisd"):
+        raise ValueError("method must be 'mrcisd' or 'ic_mrcisd'")
 
     backend_s = str(backend).strip().lower()
     if backend_s not in ("analytic", "fd"):
@@ -150,6 +151,10 @@ def mrci_grad_states_from_ref(
 
     scf_out_use = _resolve_scf_out_from_ref(ref, scf_out=scf_out)
     states_list = _infer_states_from_ref(ref, states)
+    if mrci_backend is not None:
+        if "backend" in mrci_kwargs and mrci_kwargs["backend"] is not None:
+            raise ValueError("pass only one of mrci_backend or backend in mrci_kwargs")
+        mrci_kwargs["backend"] = str(mrci_backend)
 
     # Keep the limitation explicit: the ASUKA-native driver currently enforces nroots==len(states).
     if "nroots" in mrci_kwargs and mrci_kwargs["nroots"] is not None:
@@ -163,7 +168,7 @@ def mrci_grad_states_from_ref(
     mrci_states = mrci_states_from_ref(
         ref,
         scf_out=scf_out_use,
-        method="mrcisd",
+        method=method_s,
         states=states_list,
         **mrci_kwargs,
     )
@@ -200,12 +205,17 @@ def mrci_grad_states_from_ref(
             states=states_list,
             fd_step_bohr=float(fd_step_bohr),
             which=fd_which,
+            method=str(method_s),
+            mrci_kwargs=dict(mrci_kwargs),
             max_virt_e=int(mrci_kwargs.get("max_virt_e", 2)),
         )
         fd_step = float(fd_step_bohr)
 
     state_results: list[StateGrad] = []
-    e_mrci = np.asarray(mrci_states.mrci.e_mrci, dtype=np.float64).ravel()
+    if hasattr(mrci_states.mrci, "e_mrci"):
+        e_mrci = np.asarray(mrci_states.mrci.e_mrci, dtype=np.float64).ravel()
+    else:
+        e_mrci = np.asarray(mrci_states.mrci.e_tot, dtype=np.float64).ravel()
     e_ref_arr = np.asarray(mrci_states.e_ref, dtype=np.float64).ravel()
     for k, st in enumerate(states_list):
         root = int(roots[k])
@@ -244,6 +254,7 @@ def mrci_grad_from_ref(
     state: int = 0,
     root_follow: Literal["hungarian", "greedy"] = "hungarian",
     fd_step_bohr: float = 1e-3,
+    mrci_backend: str | None = None,
     **kwargs: Any,
 ) -> MRCIGradResult:
     """Compute an MRCISD nuclear gradient for a single reference state."""
@@ -263,6 +274,7 @@ def mrci_grad_from_ref(
         states=solve_states,
         root_follow=root_follow,
         fd_step_bohr=float(fd_step_bohr),
+        mrci_backend=mrci_backend,
         **kwargs,
     )
     idx = res.states.index(state_i) if state_i in res.states else None

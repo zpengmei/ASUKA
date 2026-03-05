@@ -21,13 +21,14 @@ import numpy as np
 from asuka.integrals.df_integrals import DFMOIntegrals, DeviceDFMOIntegrals
 from asuka.mcscf.state_average import ci_as_list
 from asuka.mrci.common import compute_cas_reference_energy_df, embed_ci_with_docc_prefix
+from asuka.mrci.ic_mrcisd import ICMRCISDResult, ic_mrcisd_kernel, ic_mrcisd_kernel_multi
 from asuka.mrci.mrcisd import MRCISDResult, MRCISDResultMulti, mrcisd_kernel, mrcisd_plus_q
 from asuka.mrci.result import MRCIResult, MRCIStatesResult, MRCISOCResult
 from asuka.soc.si import SOCIntegrals, SpinFreeState, soc_state_interaction
 
 
-Method = Literal["mrcisd"]
-DFIntegralsBackend = Literal["df_B"]
+Method = Literal["mrcisd", "ic_mrcisd"]
+IntegralsBackend = Literal["df_B", "thc"]
 
 
 def _nelecas_total(nelecas: int | tuple[int, int]) -> int:
@@ -109,7 +110,7 @@ def _frozen_core_h1e_ecore_df(
       - ecore = E_nuc + Tr(dm_core hcore) + 0.5 Tr(dm_core vhf_core)
     """
 
-    from asuka.hf import df_jk  # noqa: PLC0415
+    from asuka.hf import df_scf as _df_scf  # noqa: PLC0415
 
     B = getattr(scf_out, "df_B", None)
     if B is None:
@@ -142,15 +143,7 @@ def _frozen_core_h1e_ecore_df(
 
     dm_core = 2.0 * (c_core @ c_core.T)
 
-    # DF J/K requires BQ layout.
-    BQ = xp.transpose(B, (2, 0, 1))
-    try:
-        BQ = xp.ascontiguousarray(BQ)
-    except Exception:
-        pass
-
-    j = df_jk.df_J_from_BQ_D(BQ, dm_core)
-    k = df_jk.df_K_from_BQ_D(BQ, dm_core)
+    j, k = _df_scf._df_JK(B, dm_core, want_J=True, want_K=True)  # noqa: SLF001
     vhf_core = j - 0.5 * k
 
     h_eff_ao = hcore + vhf_core
@@ -177,6 +170,10 @@ def _dfmo_integrals_from_df_B(
 
     B_ao = np.asarray(B_ao) if device == "cpu" else B_ao
     C = np.asarray(C) if device == "cpu" else C
+    if int(getattr(B_ao, "ndim", 0)) == 2:
+        from asuka.integrals.df_packed_s2 import unpack_Qp_to_mnQ  # noqa: PLC0415
+
+        B_ao = unpack_Qp_to_mnQ(B_ao, nao=int(np.asarray(C).shape[0]))
 
     if device == "cpu":
         B_ao = np.asarray(B_ao, dtype=np.float64, order="C")
@@ -242,6 +239,94 @@ def _dfmo_integrals_from_df_B(
     )
 
 
+def _frozen_core_h1e_ecore_thc(
+    *,
+    scf_out: Any,
+    mo_core: Any,
+    mo_corr: Any,
+    q_block: int = 256,
+) -> tuple[np.ndarray, float]:
+    """Return (h1e_corr, ecore) using THC J/K for the frozen-core density."""
+
+    try:
+        import cupy as cp  # noqa: PLC0415
+    except Exception as e:  # pragma: no cover
+        raise RuntimeError("THC MRCI requires CuPy") from e
+
+    from asuka.hf.local_thc_factors import LocalTHCFactors  # noqa: PLC0415
+    from asuka.hf.local_thc_jk import local_thc_JK  # noqa: PLC0415
+    from asuka.hf.thc_factors import THCFactors  # noqa: PLC0415
+    from asuka.hf.thc_jk import THCJKWork, thc_JK  # noqa: PLC0415
+
+    thc = getattr(scf_out, "thc_factors", None)
+    if not isinstance(thc, (THCFactors, LocalTHCFactors)):
+        raise ValueError("integrals_backend='thc' requires scf_out.thc_factors (THCFactors or LocalTHCFactors)")
+
+    hcore = getattr(getattr(scf_out, "int1e", None), "hcore", None)
+    if hcore is None:
+        raise ValueError("scf_out.int1e.hcore is missing")
+    e_nuc = float(getattr(getattr(scf_out, "mol", None), "energy_nuc")())
+
+    c_core = cp.asarray(mo_core, dtype=cp.float64)
+    c_corr = cp.asarray(mo_corr, dtype=cp.float64)
+    hcore_d = cp.asarray(hcore, dtype=cp.float64)
+
+    ncore = int(getattr(c_core, "shape", (0, 0))[1])
+    if ncore == 0:
+        h1e_corr = c_corr.T @ hcore_d @ c_corr
+        return np.asarray(cp.asnumpy(h1e_corr), dtype=np.float64, order="C"), float(e_nuc)
+
+    dm_core = 2.0 * (c_core @ c_core.T)
+    if isinstance(thc, THCFactors):
+        j, k = thc_JK(dm_core, thc.X, thc.Z, work=THCJKWork(q_block=int(q_block)))
+    else:
+        j, k = local_thc_JK(dm_core, thc, q_block=int(q_block))
+    vhf_core = j - 0.5 * k
+
+    h_eff_ao = hcore_d + vhf_core
+    h1e_corr = c_corr.T @ h_eff_ao @ c_corr
+    e1 = cp.einsum("ij,ji->", dm_core, hcore_d, optimize=True)
+    e2 = 0.5 * cp.einsum("ij,ji->", dm_core, vhf_core, optimize=True)
+    ecore = float(e_nuc + float(cp.asnumpy(e1)) + float(cp.asnumpy(e2)))
+    return np.asarray(cp.asnumpy(h1e_corr), dtype=np.float64, order="C"), float(ecore)
+
+
+def _device_dfmo_integrals_from_thc(
+    scf_out: Any,
+    C: Any,
+    *,
+    want_pair_norm: bool = True,
+) -> DeviceDFMOIntegrals:
+    """Build correlated-space DeviceDFMOIntegrals from global or local THC factors."""
+
+    from asuka.cuda.active_space_thc import (  # noqa: PLC0415
+        build_device_dfmo_integrals_local_thc,
+        build_device_dfmo_integrals_thc,
+    )
+    from asuka.hf.local_thc_factors import LocalTHCFactors  # noqa: PLC0415
+    from asuka.hf.thc_factors import THCFactors  # noqa: PLC0415
+
+    thc = getattr(scf_out, "thc_factors", None)
+    if not isinstance(thc, (THCFactors, LocalTHCFactors)):
+        raise ValueError("integrals_backend='thc' requires scf_out.thc_factors (THCFactors or LocalTHCFactors)")
+    if isinstance(thc, THCFactors):
+        eri = build_device_dfmo_integrals_thc(
+            thc,
+            C,
+            want_eri_mat=False,
+            want_pair_norm=bool(want_pair_norm),
+        )
+    else:
+        eri = build_device_dfmo_integrals_local_thc(
+            thc,
+            C,
+            want_eri_mat=False,
+        )
+    if not isinstance(eri, DeviceDFMOIntegrals):
+        raise RuntimeError("internal error: expected DeviceDFMOIntegrals for THC backend")
+    return eri
+
+
 def mrci_states_from_ref(
     ref: Any,
     *,
@@ -255,8 +340,8 @@ def mrci_states_from_ref(
     correlate_inactive: int = 0,
     orbsym: Sequence[int] | None = None,
     wfnsym: int | None = None,
-    integrals_backend: DFIntegralsBackend = "df_B",
-    # --- uncontracted MRCISD knobs ---
+    integrals_backend: IntegralsBackend = "df_B",
+    # --- common solver knobs ---
     hop_backend: str | None = None,
     tol: float = 1e-10,
     max_cycle: int = 400,
@@ -265,17 +350,29 @@ def mrci_states_from_ref(
     contract_nthreads: int = 1,
     contract_blas_nthreads: int | None = None,
     precompute_epq: bool = True,
+    # --- contracted ic-MRCI knobs ---
+    contraction: str = "fic",
+    backend: str = "semi_direct",
+    sc_backend: str = "otf",
+    symmetry: bool = True,
+    allow_same_external: bool = True,
+    allow_same_internal: bool = True,
+    norm_min_singles: float = 0.0,
+    norm_min_doubles: float = 0.0,
+    s_tol: float = 1e-12,
+    solver: str = "auto",
+    dense_nlab_max: int = 250,
     return_integrals: bool = False,
 ) -> MRCIStatesResult:
-    """Run multi-root MRCISD on top of an ASUKA CASCI/CASSCF result."""
+    """Run multi-root MRCI on top of an ASUKA CASCI/CASSCF result."""
 
     method_s = str(method).strip().lower()
-    if method_s != "mrcisd":
-        raise NotImplementedError("ASUKA-native MRCI driver currently supports only method='mrcisd'")
+    if method_s not in ("mrcisd", "ic_mrcisd"):
+        raise ValueError("method must be 'mrcisd' or 'ic_mrcisd'")
 
     integrals_backend_s = str(integrals_backend).strip().lower()
-    if integrals_backend_s != "df_b":
-        raise ValueError("integrals_backend must be 'df_B' for ASUKA-native MRCI")
+    if integrals_backend_s not in ("df_b", "thc"):
+        raise ValueError("integrals_backend must be 'df_B' or 'thc'")
 
     scf_out_use = _resolve_scf_out_from_ref(ref, scf_out=scf_out)
 
@@ -321,31 +418,42 @@ def mrci_states_from_ref(
     mo_virt = mo[:, ncore_ref + n_act_ref : ncore_ref + n_act_ref + n_virt]
     mo_corr = np.hstack([mo_core_corr, mo_act, mo_virt])
 
-    # Frozen-core 1e integrals in the correlated space.
-    h1e_corr, ecore = _frozen_core_h1e_ecore_df(
-        scf_out=scf_out_use,
-        mo_core=mo_core_frozen,
-        mo_corr=mo_corr,
-    )
-
-    # DF integrals in the correlated MO basis.
-    B_ao = getattr(scf_out_use, "df_B", None)
-    if B_ao is None:
-        raise ValueError("scf_out.df_B is required (DF factors missing)")
-
-    want_cuda_ints = str(hop_backend).strip().lower() == "cuda"
-    if want_cuda_ints:
-        eri_payload = _dfmo_integrals_from_df_B(B_ao, mo_corr, device="cuda")
-        if not isinstance(eri_payload, DeviceDFMOIntegrals):
-            raise RuntimeError("internal error: expected DeviceDFMOIntegrals for device='cuda'")
+    hop_backend_use = None if hop_backend is None else str(hop_backend).strip().lower()
+    if integrals_backend_s == "thc":
+        if hop_backend_use is None:
+            hop_backend_use = "cuda"
+        if hop_backend_use != "cuda":
+            raise ValueError("integrals_backend='thc' currently requires hop_backend='cuda'")
+        h1e_corr, ecore = _frozen_core_h1e_ecore_thc(
+            scf_out=scf_out_use,
+            mo_core=mo_core_frozen,
+            mo_corr=mo_corr,
+        )
+        eri_payload = _device_dfmo_integrals_from_thc(scf_out_use, mo_corr, want_pair_norm=True)
         l_full = eri_payload.l_full
         df_ints_ret = eri_payload if bool(return_integrals) else None
     else:
-        eri_payload = _dfmo_integrals_from_df_B(_maybe_asnumpy(B_ao), mo_corr, device="cpu")
-        if not isinstance(eri_payload, DFMOIntegrals):
-            raise RuntimeError("internal error: expected DFMOIntegrals for device='cpu'")
-        l_full = eri_payload.l_full
-        df_ints_ret = None
+        h1e_corr, ecore = _frozen_core_h1e_ecore_df(
+            scf_out=scf_out_use,
+            mo_core=mo_core_frozen,
+            mo_corr=mo_corr,
+        )
+        B_ao = getattr(scf_out_use, "df_B", None)
+        if B_ao is None:
+            raise ValueError("scf_out.df_B is required (DF factors missing)")
+        want_cuda_ints = hop_backend_use == "cuda"
+        if want_cuda_ints:
+            eri_payload = _dfmo_integrals_from_df_B(B_ao, mo_corr, device="cuda")
+            if not isinstance(eri_payload, DeviceDFMOIntegrals):
+                raise RuntimeError("internal error: expected DeviceDFMOIntegrals for device='cuda'")
+            l_full = eri_payload.l_full
+            df_ints_ret = eri_payload if bool(return_integrals) else None
+        else:
+            eri_payload = _dfmo_integrals_from_df_B(_maybe_asnumpy(B_ao), mo_corr, device="cpu")
+            if not isinstance(eri_payload, DFMOIntegrals):
+                raise RuntimeError("internal error: expected DFMOIntegrals for device='cpu'")
+            l_full = eri_payload.l_full
+            df_ints_ret = None
 
     # Active-space electron count and spin.
     nelec_act = _nelecas_total(getattr(ref, "nelecas"))
@@ -393,7 +501,7 @@ def mrci_states_from_ref(
         e_ref_list.append(
             compute_cas_reference_energy_df(
                 h1e_corr=h1e_corr,
-                l_full=l_full,
+                l_full=eri_payload if l_full is None else l_full,
                 ecore=float(ecore),
                 ci_cas=np.asarray(ci_cas, dtype=np.float64),
                 n_act=n_act_int,
@@ -408,34 +516,69 @@ def mrci_states_from_ref(
     if nthreads < 1:
         nthreads = 1
 
-    mrci = mrcisd_kernel(
-        h1e=h1e_corr,
-        eri=eri_payload,
-        n_act=n_act_int,
-        n_virt=n_virt,
-        nelec=nelec_corr,
-        twos=twos_i,
-        ci_cas=ci_cas_list,
-        nroots=nroots_i,
-        ecore=float(ecore),
-        orbsym_act=None,
-        orbsym_corr=None,
-        wfnsym=wfnsym,
-        max_virt_e=max_virt_e,
-        hop_backend=hop_backend,
-        tol=tol,
-        max_cycle=max_cycle,
-        max_space=max_space,
-        max_memory=max_memory_mb,
-        contract_nthreads=nthreads,
-        contract_blas_nthreads=contract_blas_nthreads,
-        precompute_epq=precompute_epq,
-    )
-    if not isinstance(mrci, MRCISDResultMulti):
-        raise RuntimeError("internal error: expected a multi-root MRCISD result")
+    if method_s == "mrcisd":
+        mrci = mrcisd_kernel(
+            h1e=h1e_corr,
+            eri=eri_payload,
+            n_act=n_act_int,
+            n_virt=n_virt,
+            nelec=nelec_corr,
+            twos=twos_i,
+            ci_cas=ci_cas_list,
+            nroots=nroots_i,
+            ecore=float(ecore),
+            orbsym_act=None,
+            orbsym_corr=None,
+            wfnsym=wfnsym,
+            max_virt_e=max_virt_e,
+            hop_backend=hop_backend_use,
+            tol=tol,
+            max_cycle=max_cycle,
+            max_space=max_space,
+            max_memory=max_memory_mb,
+            contract_nthreads=nthreads,
+            contract_blas_nthreads=contract_blas_nthreads,
+            precompute_epq=precompute_epq,
+        )
+        if not isinstance(mrci, MRCISDResultMulti):
+            raise RuntimeError("internal error: expected a multi-root MRCISD result")
+    else:
+        mrci = ic_mrcisd_kernel_multi(
+            h1e=h1e_corr,
+            eri=eri_payload,
+            n_act=n_act_int,
+            n_virt=n_virt,
+            nelec=nelec_corr,
+            twos=twos_i,
+            ci_cas=ci_cas_list,
+            nroots=nroots_i,
+            ecore=float(ecore),
+            orbsym=orbsym,
+            wfnsym=wfnsym,
+            max_virt_e=max_virt_e,
+            hop_backend="cuda" if integrals_backend_s == "thc" else ("augmented" if hop_backend_use is None else hop_backend_use),
+            contraction=str(contraction),
+            backend=str(backend),
+            sc_backend=str(sc_backend),
+            symmetry=bool(symmetry),
+            allow_same_external=bool(allow_same_external),
+            allow_same_internal=bool(allow_same_internal),
+            norm_min_singles=float(norm_min_singles),
+            norm_min_doubles=float(norm_min_doubles),
+            tol=float(tol),
+            max_cycle=int(max_cycle),
+            max_space=int(max_space),
+            s_tol=float(s_tol),
+            solver=str(solver),
+            dense_nlab_max=int(dense_nlab_max),
+            contract_nthreads=nthreads,
+            contract_blas_nthreads=contract_blas_nthreads,
+            precompute_epq=precompute_epq,
+        )
 
     return MRCIStatesResult(
-        method="mrcisd",
+        method=str(method_s),
+        integrals_backend=str(integrals_backend_s),
         states=list(states_list),
         nroots=int(nroots_i),
         e_ref=np.asarray(e_ref_list, dtype=np.float64),
@@ -461,8 +604,8 @@ def mrci_from_ref(
     max_virt_e: int = 2,
     correlate_inactive: int = 0,
     wfnsym: int | None = None,
-    integrals_backend: DFIntegralsBackend = "df_B",
-    # --- uncontracted MRCISD knobs ---
+    integrals_backend: IntegralsBackend = "df_B",
+    # --- common solver knobs ---
     hop_backend: str | None = None,
     tol: float = 1e-10,
     max_cycle: int = 400,
@@ -471,6 +614,18 @@ def mrci_from_ref(
     contract_nthreads: int = 1,
     contract_blas_nthreads: int | None = None,
     precompute_epq: bool = True,
+    # --- contracted ic-MRCI knobs ---
+    contraction: str = "fic",
+    backend: str = "semi_direct",
+    sc_backend: str = "otf",
+    symmetry: bool = True,
+    allow_same_external: bool = True,
+    allow_same_internal: bool = True,
+    norm_min_singles: float = 0.0,
+    norm_min_doubles: float = 0.0,
+    s_tol: float = 1e-12,
+    solver: str = "auto",
+    dense_nlab_max: int = 250,
     # --- optional +Q ---
     plus_q: bool = False,
     plus_q_model: str = "fixed",
@@ -478,182 +633,109 @@ def mrci_from_ref(
     # --- misc ---
     return_integrals: bool = False,
 ) -> MRCIResult:
-    """Run single-root MRCISD on top of an ASUKA CASCI/CASSCF result."""
-
-    method_s = str(method).strip().lower()
-    if method_s != "mrcisd":
-        raise NotImplementedError("ASUKA-native MRCI driver currently supports only method='mrcisd'")
-
-    integrals_backend_s = str(integrals_backend).strip().lower()
-    if integrals_backend_s != "df_b":
-        raise ValueError("integrals_backend must be 'df_B' for ASUKA-native MRCI")
-
-    scf_out_use = _resolve_scf_out_from_ref(ref, scf_out=scf_out)
-
-    mo = getattr(ref, "mo_coeff", None)
-    if mo is None:
-        raise ValueError("ref.mo_coeff is required")
-    mo = _maybe_asnumpy(mo)
-
-    ncore_ref = int(getattr(ref, "ncore", 0))
-    n_act_ref = int(getattr(ref, "ncas", 0))
-    if n_act_ref <= 0:
-        raise ValueError("ref.ncas must be positive")
-
-    correlate_inactive_i = int(correlate_inactive)
-    if correlate_inactive_i < 0 or correlate_inactive_i > ncore_ref:
-        raise ValueError("correlate_inactive must satisfy 0 <= correlate_inactive <= ref.ncore")
-    ncore_frozen = ncore_ref - correlate_inactive_i
-    n_act_int = n_act_ref + correlate_inactive_i
-
-    nmo = int(mo.shape[1])
-    nvirt_all = nmo - ncore_ref - n_act_ref
-    if nvirt_all < 0:
-        raise RuntimeError("invalid orbital partition: ncore+ncas > nmo")
-
-    if n_virt is None:
-        n_virt = nvirt_all
-    n_virt = int(n_virt)
-    if n_virt < 0 or n_virt > nvirt_all:
-        raise ValueError("n_virt must satisfy 0 <= n_virt <= (nmo-ncore-ncas)")
-
+    """Run single-root MRCI on top of an ASUKA CASCI/CASSCF result."""
     state_i = int(state)
     if state_i < 0:
         raise ValueError("state must be >= 0")
-
-    # Orbital partitions in the reference MO basis.
-    mo_core_frozen = mo[:, :ncore_frozen]
-    mo_core_corr = mo[:, ncore_frozen:ncore_ref]
-    mo_act = mo[:, ncore_ref : ncore_ref + n_act_ref]
-    mo_virt = mo[:, ncore_ref + n_act_ref : ncore_ref + n_act_ref + n_virt]
-    mo_corr = np.hstack([mo_core_corr, mo_act, mo_virt])
-
-    h1e_corr, ecore = _frozen_core_h1e_ecore_df(
-        scf_out=scf_out_use,
-        mo_core=mo_core_frozen,
-        mo_corr=mo_corr,
-    )
-
-    B_ao = getattr(scf_out_use, "df_B", None)
-    if B_ao is None:
-        raise ValueError("scf_out.df_B is required (DF factors missing)")
-
-    want_cuda_ints = str(hop_backend).strip().lower() == "cuda"
-    if want_cuda_ints:
-        eri_payload = _dfmo_integrals_from_df_B(B_ao, mo_corr, device="cuda")
-        if not isinstance(eri_payload, DeviceDFMOIntegrals):
-            raise RuntimeError("internal error: expected DeviceDFMOIntegrals for device='cuda'")
-        l_full = eri_payload.l_full
-        df_ints_ret = eri_payload if bool(return_integrals) else None
-    else:
-        eri_payload = _dfmo_integrals_from_df_B(_maybe_asnumpy(B_ao), mo_corr, device="cpu")
-        if not isinstance(eri_payload, DFMOIntegrals):
-            raise RuntimeError("internal error: expected DFMOIntegrals for device='cpu'")
-        l_full = eri_payload.l_full
-        df_ints_ret = None
-
-    nelec_act = _nelecas_total(getattr(ref, "nelecas"))
-    nelec_corr = int(nelec_act) + 2 * correlate_inactive_i
-    twos_i = _get_ref_twos(ref, scf_out_use, twos=twos)
-
-    ci_obj = getattr(ref, "ci")
-    if isinstance(ci_obj, (list, tuple)):
-        nroots_ref = int(len(ci_obj))
-    else:
-        nroots_ref = int(getattr(ref, "nroots", 1))
-    ci_all = ci_as_list(ci_obj, nroots=max(1, nroots_ref))
-    if state_i >= len(ci_all):
-        raise ValueError("state index out of range for ref.ci")
-    ci_act = np.asarray(ci_all[state_i], dtype=np.float64).ravel()
-
-    from asuka.cuguga.drt import build_drt  # noqa: PLC0415
-
-    drt_act = build_drt(norb=int(n_act_ref), nelec=int(nelec_act), twos_target=int(twos_i))
-    if int(ci_act.size) != int(drt_act.ncsf):
-        raise ValueError("reference CI vector length mismatch with active DRT")
-
-    ci_cas = ci_act
-    if correlate_inactive_i > 0:
-        ci_cas = embed_ci_with_docc_prefix(
-            ci_act=ci_act,
-            n_docc=correlate_inactive_i,
-            n_act=n_act_ref,
-            nelec_act=nelec_act,
-            twos=twos_i,
-            orbsym_act=None,
-            orbsym_full=None,
-            wfnsym=wfnsym,
-        )
-
-    e_ref = compute_cas_reference_energy_df(
-        h1e_corr=h1e_corr,
-        l_full=l_full,
-        ecore=float(ecore),
-        ci_cas=np.asarray(ci_cas, dtype=np.float64),
-        n_act=n_act_int,
-        nelec=nelec_corr,
-        twos=twos_i,
-        orbsym_act=None,
-        wfnsym=wfnsym,
-    )
-
-    nthreads = int(contract_nthreads)
-    if nthreads < 1:
-        nthreads = 1
-
-    res = mrcisd_kernel(
-        h1e=h1e_corr,
-        eri=eri_payload,
-        n_act=n_act_int,
-        n_virt=n_virt,
-        nelec=nelec_corr,
-        twos=twos_i,
-        ci_cas=np.asarray(ci_cas, dtype=np.float64),
+    method_s = str(method).strip().lower()
+    mrci_states = mrci_states_from_ref(
+        ref,
+        scf_out=scf_out,
+        method=method,
+        states=[int(state_i)],
         nroots=1,
-        ecore=float(ecore),
-        orbsym_act=None,
-        orbsym_corr=None,
-        wfnsym=wfnsym,
+        n_virt=n_virt,
+        twos=twos,
         max_virt_e=max_virt_e,
+        correlate_inactive=correlate_inactive,
+        wfnsym=wfnsym,
+        integrals_backend=integrals_backend,
         hop_backend=hop_backend,
         tol=tol,
         max_cycle=max_cycle,
         max_space=max_space,
-        max_memory=max_memory_mb,
-        contract_nthreads=nthreads,
+        max_memory_mb=max_memory_mb,
+        contract_nthreads=contract_nthreads,
         contract_blas_nthreads=contract_blas_nthreads,
         precompute_epq=precompute_epq,
+        contraction=contraction,
+        backend=backend,
+        sc_backend=sc_backend,
+        symmetry=symmetry,
+        allow_same_external=allow_same_external,
+        allow_same_internal=allow_same_internal,
+        norm_min_singles=norm_min_singles,
+        norm_min_doubles=norm_min_doubles,
+        s_tol=s_tol,
+        solver=solver,
+        dense_nlab_max=dense_nlab_max,
+        return_integrals=return_integrals,
     )
-    if not isinstance(res, MRCISDResult):
-        raise RuntimeError("internal error: expected a single-root MRCISD result")
-
-    e_tot = float(res.e_mrci)
-    e_corr = float(e_tot - float(e_ref))
+    e_ref = float(np.asarray(mrci_states.e_ref, dtype=np.float64).ravel()[0])
 
     e_plus_q = None
     q_diag = None
-    if bool(plus_q):
-        e_plus_q, q_diag = mrcisd_plus_q(
-            e_mrci=e_tot,
-            e_ref=float(e_ref),
-            ci_mrci=res.ci,
-            ci_ref0=res.ci_ref0,
-            ref_idx=res.ref_idx,
-            model=str(plus_q_model),
-            min_ref=float(plus_q_min_ref),
+    if method_s == "mrcisd":
+        mrci_multi = mrci_states.mrci
+        if not isinstance(mrci_multi, MRCISDResultMulti):
+            raise RuntimeError("internal error: expected a MRCISDResultMulti payload")
+        res = MRCISDResult(
+            converged=bool(np.asarray(mrci_multi.converged, dtype=bool).ravel()[0]),
+            e_mrci=float(np.asarray(mrci_multi.e_mrci, dtype=np.float64).ravel()[0]),
+            ci=np.asarray(mrci_multi.ci[0], dtype=np.float64).ravel(),
+            drt=mrci_multi.drt,
+            ci_ref0=np.asarray(mrci_multi.ci_ref0[0], dtype=np.float64).ravel(),
+            ref_idx=np.asarray(mrci_multi.ref_idx, dtype=np.int64),
+            diagnostics=dict(mrci_multi.diagnostics[0]),
         )
-        if e_plus_q is not None:
-            e_plus_q = float(e_plus_q)
+        e_tot = float(res.e_mrci)
+        e_corr = float(e_tot - float(e_ref))
+        if bool(plus_q):
+            e_plus_q, q_diag = mrcisd_plus_q(
+                e_mrci=e_tot,
+                e_ref=float(e_ref),
+                ci_mrci=res.ci,
+                ci_ref0=res.ci_ref0,
+                ref_idx=res.ref_idx,
+                model=str(plus_q_model),
+                min_ref=float(plus_q_min_ref),
+            )
+            if e_plus_q is not None:
+                e_plus_q = float(e_plus_q)
+        result_payload = res
+    else:
+        if bool(plus_q):
+            raise NotImplementedError("+Q correction is currently supported only for uncontracted mrcisd")
+        mrci_multi = mrci_states.mrci
+        block_start, block_stop = mrci_multi.block_slices[0]
+        c0 = np.asarray(mrci_multi.c[0], dtype=np.float64).ravel()[int(block_start) : int(block_stop)].copy()
+        result_payload = ICMRCISDResult(
+            converged=bool(np.asarray(mrci_multi.converged, dtype=bool).ravel()[0]),
+            e=float(np.asarray(mrci_multi.e, dtype=np.float64).ravel()[0]),
+            e_tot=float(np.asarray(mrci_multi.e_tot, dtype=np.float64).ravel()[0]),
+            c=c0,
+            spaces=mrci_multi.spaces[0],
+            singles=mrci_multi.singles[0],
+            doubles=mrci_multi.doubles[0],
+            backend=str(mrci_multi.backend),
+            drt_work=mrci_multi.drt_work,
+            niter=int(mrci_multi.niter),
+            residual_norm=float(np.asarray(mrci_multi.residual_norm, dtype=np.float64).ravel()[0]),
+            diagnostics=dict(mrci_multi.diagnostics[0]),
+        )
+        e_tot = float(result_payload.e_tot)
+        e_corr = float(e_tot - float(e_ref))
 
     return MRCIResult(
-        method="mrcisd",
+        method=str(method_s),
+        integrals_backend=str(integrals_backend).strip().lower(),
         e_ref=float(e_ref),
         e_tot=float(e_tot),
         e_corr=float(e_corr),
         e_tot_plus_q=e_plus_q,
         plus_q_diag=q_diag,
-        result=res,
-        df_integrals=df_ints_ret,
+        result=result_payload,
+        df_integrals=mrci_states.df_integrals,
     )
 
 
@@ -679,7 +761,7 @@ def mrci_states_from_ref_soc(
     correlate_inactive: int = 0,
     orbsym: Sequence[int] | None = None,
     wfnsym: int | None = None,
-    integrals_backend: DFIntegralsBackend = "df_B",
+    integrals_backend: IntegralsBackend = "df_B",
     hop_backend: str | None = None,
     tol: float = 1e-10,
     max_cycle: int = 400,
@@ -688,6 +770,17 @@ def mrci_states_from_ref_soc(
     contract_nthreads: int = 1,
     contract_blas_nthreads: int | None = None,
     precompute_epq: bool = True,
+    contraction: str = "fic",
+    backend: str = "semi_direct",
+    sc_backend: str = "otf",
+    symmetry: bool = True,
+    allow_same_external: bool = True,
+    allow_same_internal: bool = True,
+    norm_min_singles: float = 0.0,
+    norm_min_doubles: float = 0.0,
+    s_tol: float = 1e-12,
+    solver: str = "auto",
+    dense_nlab_max: int = 250,
     return_integrals: bool = False,
     # --- SOC args ---
     soc_backend: str = "auto",
@@ -703,6 +796,8 @@ def mrci_states_from_ref_soc(
     """Run ASUKA-native MRCISD, then perform SOC-SI on the correlated roots."""
 
     scf_out_use = _resolve_scf_out_from_ref(ref, scf_out=scf_out)
+    if str(method).strip().lower() != "mrcisd":
+        raise NotImplementedError("SOC-SI currently supports only method='mrcisd'")
 
     mrci = mrci_states_from_ref(
         ref,
@@ -725,6 +820,17 @@ def mrci_states_from_ref_soc(
         contract_nthreads=contract_nthreads,
         contract_blas_nthreads=contract_blas_nthreads,
         precompute_epq=precompute_epq,
+        contraction=contraction,
+        backend=backend,
+        sc_backend=sc_backend,
+        symmetry=symmetry,
+        allow_same_external=allow_same_external,
+        allow_same_internal=allow_same_internal,
+        norm_min_singles=norm_min_singles,
+        norm_min_doubles=norm_min_doubles,
+        s_tol=s_tol,
+        solver=solver,
+        dense_nlab_max=dense_nlab_max,
         return_integrals=return_integrals,
     )
 
