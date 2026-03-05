@@ -5,7 +5,9 @@ from __future__ import annotations
 Scope (initial implementation)
 ------------------------------
 - Global THC (`asuka.hf.thc_factors.THCFactors`) only.
-- `solve_method='inv_metric'` only (Z = X_aux V^{-1} X_aux^T via aux-metric Cholesky).
+- Analytic THC factor gradients currently support:
+  - `solve_method='inv_metric'` (Y = X_aux @ L^{-T})
+  - `solve_method='fit_metric_gram'` (Y = X_aux @ solve(X_aux^T X_aux, L))
 - GPU-first: requires CuPy + orbitals CUDA extension + cuERI CUDA extension.
 
 Notes
@@ -372,8 +374,17 @@ def rhf_nuc_grad_thc(
 
     meta = {} if thc.meta is None else dict(thc.meta)
     solve_method = str(meta.get("solve_method", "fit_metric_qr")).strip().lower()
-    if solve_method not in {"inv_metric", "inv", "metric_inv", "vinv", "v_inv"}:
-        raise NotImplementedError("analytic gradients currently require solve_method='inv_metric'")
+    inv_metric_methods = {"inv_metric", "inv", "metric_inv", "vinv", "v_inv"}
+    fit_metric_gram_methods = {"fit_metric_gram", "gram"}
+    if solve_method in inv_metric_methods:
+        solve_kind = "inv_metric"
+    elif solve_method in fit_metric_gram_methods:
+        solve_kind = "fit_metric_gram"
+    else:
+        raise NotImplementedError(
+            "analytic gradients currently support solve_method in {'inv_metric','fit_metric_gram'} "
+            f"(got {solve_method!r})"
+        )
 
     point_atom = meta.get("point_atom", None)
     if point_atom is None:
@@ -482,28 +493,7 @@ def rhf_nuc_grad_thc(
     # bar_X, bar_Y from the THC 2e energy.
     bar_X, bar_Y = _thc_energy_adjoint_rhf(D, thc.X, thc.Z, thc.Y, q_block=int(q_block))
 
-    # Backprop through inv_metric Y build: Y^T = L^{-1} X_aux^T, with L = chol(V).
     L = cp.asarray(thc.L_metric, dtype=cp.float64)
-
-    bar_Xw_T = bar_Y.T  # (naux,npt)
-    try:
-        import cupyx.scipy.linalg as cpx_linalg  # noqa: PLC0415
-
-        bar_S = cpx_linalg.solve_triangular(L, bar_Xw_T, lower=True, trans="T")
-    except Exception:
-        bar_S = cp.linalg.solve(L.T, bar_Xw_T)
-
-    # bar_L = -tril( Xw_T @ bar_S^T ), with Xw_T = Y^T.
-    # NOTE: This mirrors `asuka.integrals.df_adjoint.df_whiten_adjoint`:
-    # if S = L^{-1} X^T then bar_L = -tril( (L^{-T} bar_S) @ S^T ).
-    bar_L = -(bar_S @ cp.asarray(thc.Y, dtype=cp.float64))
-    bar_L = cp.tril(bar_L)
-
-    from asuka.integrals.df_adjoint import chol_lower_adjoint  # noqa: PLC0415
-
-    bar_V = chol_lower_adjoint(L, bar_L)
-
-    bar_X_aux_p = bar_S.T  # (npt,naux)
 
     # Accumulate atom gradients from AO/aux collocation and Becke weights.
     from asuka.orbitals.eval_basis_device import (
@@ -512,6 +502,7 @@ def rhf_nuc_grad_thc(
         eval_aos_cart_value_on_points_device,
     )  # noqa: PLC0415
     from asuka.integrals.int1e_cart import shell_to_atom_map  # noqa: PLC0415
+    from asuka.integrals.df_adjoint import chol_lower_adjoint  # noqa: PLC0415
 
     pts = cp.asarray(thc.points, dtype=cp.float64)
     w = cp.asarray(thc.weights, dtype=cp.float64).ravel()
@@ -523,15 +514,61 @@ def rhf_nuc_grad_thc(
     w_quart = cp.sqrt(cp.sqrt(w))
     w_sqrt = cp.sqrt(w)
 
+    # Aux collocation X_aux_p = w^(1/2) * chi(r).
+    aux_basis_cart = getattr(scf_out, "aux_basis")
+    aux_cart = eval_aos_cart_value_on_points_device(aux_basis_cart, pts, threads=256, sync=True)
+    X_aux_p_val = cp.ascontiguousarray(aux_cart * w_sqrt[:, None])  # (npt,naux)
+    del aux_cart
+
+    if solve_kind == "inv_metric":
+        # Backprop inv_metric: Y^T = L^{-1} X_aux^T.
+        bar_Xw_T = bar_Y.T  # (naux,npt)
+        try:
+            import cupyx.scipy.linalg as cpx_linalg  # noqa: PLC0415
+
+            bar_S = cpx_linalg.solve_triangular(L, bar_Xw_T, lower=True, trans="T")
+        except Exception:
+            bar_S = cp.linalg.solve(L.T, bar_Xw_T)
+
+        # bar_L = -tril( bar_S @ Y )
+        bar_L = -(bar_S @ cp.asarray(thc.Y, dtype=cp.float64))
+        bar_L = cp.tril(bar_L)
+
+        bar_V = chol_lower_adjoint(L, bar_L)
+        bar_X_aux_p = bar_S.T  # (npt,naux)
+        del bar_S
+    else:
+        # fit_metric_gram: Y = X_aux_p @ G, where (X_aux_p^T X_aux_p + lam I) G = L.
+        Gm = cp.ascontiguousarray(X_aux_p_val.T @ X_aux_p_val)
+        rcond = float(meta.get("solve_rcond", 1e-12))
+        try:
+            smax = float(cp.linalg.norm(Gm, ord=2).item())
+        except Exception:
+            smax = 0.0
+        lam = (float(rcond) ** 2) * max(float(smax), 1.0)
+        if lam != 0.0:
+            Gm = Gm + float(lam) * cp.eye(int(Gm.shape[0]), dtype=cp.float64)
+
+        G = cp.linalg.solve(Gm, L)  # (naux,naux)
+
+        bar_X_aux_p = bar_Y @ G.T
+        bar_G = X_aux_p_val.T @ bar_Y
+
+        U = cp.linalg.solve(Gm.T, bar_G)  # A^{-T} bar_G
+        bar_L = cp.tril(U)
+        bar_V = chol_lower_adjoint(L, bar_L)
+
+        bar_Gm = -(U @ G.T)
+        bar_X_aux_p = bar_X_aux_p + X_aux_p_val @ (bar_Gm + bar_Gm.T)
+
+        del Gm, G, bar_G, U, bar_L, bar_Gm
+
     # bar_w from AO collocation: (1/(4w)) * sum_mu bar_X*X
     bar_w = (0.25 / w) * cp.sum(bar_X * cp.asarray(thc.X, dtype=cp.float64), axis=1)
 
-    # bar_w from aux collocation requires X_aux_p (evaluate aux basis values).
-    aux_basis_cart = getattr(scf_out, "aux_basis")
-    aux_cart = eval_aos_cart_value_on_points_device(aux_basis_cart, pts, threads=256, sync=True)
-    X_aux_p_val = aux_cart * w_sqrt[:, None]
+    # bar_w from aux collocation requires X_aux_p.
     bar_w += (0.5 / w) * cp.sum(bar_X_aux_p * X_aux_p_val, axis=1)
-    del aux_cart, X_aux_p_val
+    del X_aux_p_val
 
     grad_thc = cp.zeros((natm, 3), dtype=cp.float64)
 

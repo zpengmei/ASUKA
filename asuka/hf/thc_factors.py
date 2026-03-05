@@ -213,6 +213,7 @@ def build_thc_factors(
             pass
 
     point_atom = None
+    downselected = False
 
     t_grid = time.perf_counter() if prof is not None else None
     if grid_kind_s in {"becke", "becke_grid", "atom", "atom-centered"}:
@@ -256,6 +257,7 @@ def build_thc_factors(
                 npt_req = int(npt)
                 if npt_req <= 0:
                     raise ValueError("npt must be > 0")
+                downselected = int(npt_req) < int(grid_npt_full_override)
                 base = int(npt_req // natm)
                 rem = int(npt_req - base * natm)
                 alloc = [base + (1 if i < rem else 0) for i in range(natm)]
@@ -325,6 +327,7 @@ def build_thc_factors(
             npt_req = int(npt)
             if npt_req <= 0:
                 raise ValueError("npt must be > 0")
+            downselected = int(npt_req) < int(grid_npt_full_override)
 
             point_select_req = str(grid_opts.get("rdvr_point_select", "auto")).strip().lower()
             pivot_keys = {"pivot_qr", "qr_pivot", "rrqr", "pivot", "pivoted_qr"}
@@ -518,6 +521,12 @@ def build_thc_factors(
 
     t_down = time.perf_counter() if prof is not None else None
     if npt is not None:
+        # Typically only used for non-atom-centered grids (fdvr); record it so
+        # gradient code can fail fast on non-differentiable point selection.
+        try:
+            downselected = bool(downselected) or (int(npt) < int(w_all.shape[0]))
+        except Exception:  # pragma: no cover
+            downselected = True
         pts, w = _downselect_by_weight(cp, pts_all, w_all, npt=int(npt))
     else:
         pts, w = pts_all, w_all
@@ -703,6 +712,8 @@ def build_thc_factors(
         "prune_tol": float(getattr(grid_spec, "prune_tol", 1e-16)),
         "grid_options": dict(grid_opts),
         "solve_method": str(solve_method),
+        "solve_rcond": float(rcond),
+        "downselected": bool(downselected),
     }
     if point_atom is not None:
         meta["point_atom"] = point_atom

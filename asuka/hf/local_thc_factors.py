@@ -71,7 +71,7 @@ def _require_cupy():
     return cp
 
 
-def _downselect_by_weight(cp, points, weights, *, npt: int):
+def _downselect_by_weight(cp, points, weights, *, npt: int, return_idx: bool = False):
     points = cp.asarray(points, dtype=cp.float64)
     weights = cp.asarray(weights, dtype=cp.float64).ravel()
     if points.ndim != 2 or int(points.shape[1]) != 3:
@@ -84,7 +84,12 @@ def _downselect_by_weight(cp, points, weights, *, npt: int):
     if npt <= 0:
         raise ValueError("npt must be > 0")
     if npt >= n_all:
-        return cp.ascontiguousarray(points), cp.ascontiguousarray(weights)
+        pts = cp.ascontiguousarray(points)
+        w = cp.ascontiguousarray(weights)
+        if return_idx:
+            idx = cp.arange(int(n_all), dtype=cp.int64)
+            return pts, w, cp.ascontiguousarray(idx)
+        return pts, w
 
     w_all_sum = cp.sum(weights)
     idx = cp.argpartition(weights, int(n_all - npt))[int(n_all - npt) :]
@@ -103,7 +108,11 @@ def _downselect_by_weight(cp, points, weights, *, npt: int):
     w_sum = cp.sum(w)
     if float(w_sum) != 0.0:
         w = w * (w_all_sum / w_sum)
-    return cp.ascontiguousarray(pts), cp.ascontiguousarray(w)
+    pts = cp.ascontiguousarray(pts)
+    w = cp.ascontiguousarray(w)
+    if return_idx:
+        return pts, w, cp.ascontiguousarray(idx)
+    return pts, w
 
 
 def _make_atom_grids_device(
@@ -486,6 +495,7 @@ def build_local_thc_factors(
     naux_atom_cache: dict[int, int] = {}  # atom -> naux (cart)
 
     blocks_out: list[LocalTHCBlock] = []
+    downselected_any = False
 
     for bid, block_atoms in enumerate(blocks.blocks):
         # Auxiliary atoms for the fitting region.
@@ -577,11 +587,14 @@ def build_local_thc_factors(
         aux_atoms = list(map(int, aux_atoms_sorted))
         pts_list = [pts_atoms[int(a)] for a in aux_atoms]
         w_list = [w_atoms[int(a)] for a in aux_atoms]
+        a_list = [cp.full((int(wi.shape[0]),), int(a), dtype=cp.int32) for a, wi in zip(aux_atoms, w_list)]
         npt_avail = int(sum(int(wi.shape[0]) for wi in w_list))
         if npt_avail <= 0:
             raise RuntimeError("local-THC block has no grid points (check prune_tol / grid spec)")
 
-        if thc_npt is not None:
+        if bool(getattr(cfg, "no_point_downselect", False)):
+            npt_target = int(npt_avail)
+        elif thc_npt is not None:
             npt_target = int(max(1, int(thc_npt)))
         else:
             npt_target = int(cfg.npt_factor) * int(max(1, int(n_primary)))
@@ -618,6 +631,8 @@ def build_local_thc_factors(
                     )
                 npt_target = max(int(npt_target), int(naux_total))
         npt_target = min(int(npt_target), int(npt_avail))
+        downselected = (not bool(getattr(cfg, "no_point_downselect", False))) and (int(npt_target) < int(npt_avail))
+        downselected_any = bool(downselected_any) or bool(downselected)
 
         # Downselect points.
         #
@@ -625,7 +640,13 @@ def build_local_thc_factors(
         # basis to improve conditioning of the fit-metric solve.
         pts = None
         w = None
-        if bool(use_pivot) and solve_s in fit_metric_methods and int(npt_target) < int(npt_avail):
+        p_atom = None
+
+        if bool(getattr(cfg, "no_point_downselect", False)):
+            pts = cp.ascontiguousarray(cp.concatenate(pts_list, axis=0))
+            w = cp.ascontiguousarray(cp.concatenate(w_list, axis=0)).ravel()
+            p_atom = cp.ascontiguousarray(cp.concatenate(a_list, axis=0)).ravel()
+        elif bool(use_pivot) and solve_s in fit_metric_methods and int(npt_target) < int(npt_avail):
             try:
                 import scipy.linalg as sp_linalg  # noqa: PLC0415
 
@@ -667,6 +688,7 @@ def build_local_thc_factors(
 
                 pts_sel: list[Any] = []
                 w_sel: list[Any] = []
+                a_sel: list[Any] = []
                 for a, pts_i, w_i, k in zip(aux_atoms, pts_list, w_list, alloc.tolist()):
                     k = int(k)
                     if k <= 0:
@@ -704,20 +726,25 @@ def build_local_thc_factors(
                         w_j = w_j * (w_sum_all / w_sum_sel)
                     pts_sel.append(pts_j)
                     w_sel.append(w_j)
+                    a_sel.append(cp.full((int(w_j.shape[0]),), int(a), dtype=cp.int32))
 
                 if len(pts_sel) == 0:
                     raise RuntimeError("pivot selection produced no grid points")
                 pts = cp.ascontiguousarray(cp.concatenate(pts_sel, axis=0))
                 w = cp.ascontiguousarray(cp.concatenate(w_sel, axis=0)).ravel()
+                p_atom = cp.ascontiguousarray(cp.concatenate(a_sel, axis=0)).ravel()
             except Exception:
                 pts = None
                 w = None
+                p_atom = None
 
-        if pts is None or w is None:
+        if pts is None or w is None or p_atom is None:
             # Fallback: weight-based downselect from all available points.
             pts_all = cp.concatenate(pts_list, axis=0) if pts_list else cp.zeros((0, 3), dtype=cp.float64)
             w_all = cp.concatenate(w_list, axis=0) if w_list else cp.zeros((0,), dtype=cp.float64)
-            pts, w = _downselect_by_weight(cp, pts_all, w_all, npt=int(npt_target))
+            a_all = cp.concatenate(a_list, axis=0) if a_list else cp.zeros((0,), dtype=cp.int32)
+            pts, w, idx = _downselect_by_weight(cp, pts_all, w_all, npt=int(npt_target), return_idx=True)
+            p_atom = a_all[idx]
             del pts_all, w_all
 
         # AO collocation: X_cart = w^(1/4) * phi_cart(r)
@@ -777,6 +804,18 @@ def build_local_thc_factors(
         if int(X.shape[1]) != int(ao_idx_global_np.size):
             raise RuntimeError("local-THC X column count mismatch with ao_idx_global")
 
+        blk_meta: dict[str, Any] = {
+            "grid_kind": str(grid_kind_s),
+            "becke_n": int(getattr(grid_spec, "becke_n", 3)),
+            "prune_tol": float(getattr(grid_spec, "prune_tol", 1e-16)),
+            "grid_options": dict(grid_opts),
+            "solve_method": str(solve_method),
+            "downselected": bool(downselected),
+            "point_atom": cp.ascontiguousarray(cp.asarray(p_atom, dtype=cp.int32).ravel()),
+            "ao_shells": tuple(int(s) for s in ao_shells),
+            "aux_shells": tuple(int(s) for s in aux_shells),
+        }
+
         blocks_out.append(
             LocalTHCBlock(
                 block_id=int(bid),
@@ -793,16 +832,25 @@ def build_local_thc_factors(
                 points=pts,
                 weights=w,
                 L_metric=L,
-                meta=None,
+                meta=blk_meta,
             )
         )
+
+    meta: dict[str, Any] = {
+        "grid_kind": str(grid_kind_s),
+        "becke_n": int(getattr(grid_spec, "becke_n", 3)),
+        "prune_tol": float(getattr(grid_spec, "prune_tol", 1e-16)),
+        "grid_options": dict(grid_opts),
+        "solve_method": str(solve_method),
+        "downselected": bool(downselected_any),
+    }
 
     return LocalTHCFactors(
         blocks=tuple(blocks_out),
         nao=int(nao_scf),
         ao_rep=str(ao_rep),
         L_metric_full=None,
-        meta=None,
+        meta=meta,
     )
 
 

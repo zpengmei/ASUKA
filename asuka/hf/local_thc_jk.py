@@ -20,50 +20,102 @@ from .local_thc_factors import LocalTHCFactors
 from .thc_jk import THCJKWork, thc_J, thc_JK, thc_K_blocked
 
 
-def local_thc_J(D, lthc: LocalTHCFactors):
-    """Assemble global Coulomb matrix J[D] from LocalTHCFactors."""
-
+def _require_cupy():
     try:
         import cupy as cp
     except Exception as e:  # pragma: no cover
-        raise RuntimeError("local_thc_J requires CuPy") from e
+        raise RuntimeError("local-THC CUDA contractions require CuPy") from e
+    return cp
 
-    D = cp.asarray(D, dtype=cp.float64)
-    nao = int(D.shape[0])
-    if D.ndim != 2 or int(D.shape[1]) != nao:
-        raise ValueError("D must be (nao,nao)")
+
+def _validate_local_thc_matrix(mat, lthc: LocalTHCFactors, *, name: str):
+    cp = _require_cupy()
+
+    arr = cp.asarray(mat, dtype=cp.float64)
+    nao = int(arr.shape[-1])
+    if int(arr.ndim) != 2 or int(arr.shape[0]) != int(nao):
+        raise ValueError(f"{name} must be (nao,nao)")
     if int(lthc.nao) != int(nao):
-        raise ValueError("lthc.nao mismatch with D")
+        raise ValueError(f"lthc.nao mismatch with {name}")
+    return arr, nao
 
-    J = cp.zeros((nao, nao), dtype=cp.float64)
+
+def _mask_owned_outputs_inplace(mat_sub, *, n_early: int, n_primary: int) -> None:
+    nloc = int(mat_sub.shape[0])
+    n_early = int(n_early)
+    n_primary = int(n_primary)
+    if n_early < 0 or n_early > nloc:
+        raise ValueError("invalid blk.n_early")
+    if n_primary < 0 or (n_early + n_primary) > nloc:
+        raise ValueError("invalid blk.n_primary")
+
+    if n_early > 0:
+        mat_sub[:n_early, :] = 0.0
+        mat_sub[:, :n_early] = 0.0
+    tail = int(n_early + n_primary)
+    if tail < nloc:
+        mat_sub[tail:, tail:] = 0.0
+
+
+def local_thc_eri_apply(D, lthc: LocalTHCFactors, *, symmetrize: bool = False):
+    """Apply the local-THC Coulomb-like AO operator to an arbitrary AO pair density.
+
+    This contracts
+
+      V[p,q] = sum_{r,s} (p q | r s)_local * D[r,s]
+
+    using the same block ownership rules as `local_thc_J`.
+    """
+
+    cp = _require_cupy()
+    D, nao = _validate_local_thc_matrix(D, lthc, name="D")
+
+    V = cp.zeros((nao, nao), dtype=cp.float64)
 
     for blk in lthc.blocks:
         idx_np = np.asarray(blk.ao_idx_global, dtype=np.int32).ravel()
         if int(idx_np.size) == 0:
             continue
+
         idx = cp.asarray(idx_np, dtype=cp.int32)
         D_sub = D[idx[:, None], idx[None, :]]
+        V_sub = thc_J(D_sub, blk.X, blk.Z)
 
-        J_sub = thc_J(D_sub, blk.X, blk.Z)
+        _mask_owned_outputs_inplace(
+            V_sub,
+            n_early=int(getattr(blk, "n_early", 0)),
+            n_primary=int(blk.n_primary),
+        )
+        V[idx[:, None], idx[None, :]] += V_sub
 
-        n_early = int(getattr(blk, "n_early", 0))
-        nprim = int(blk.n_primary)
-        nloc = int(idx_np.size)
-        if n_early < 0 or n_early > nloc:
-            raise ValueError("invalid blk.n_early")
-        if nprim < 0 or (n_early + nprim) > nloc:
-            raise ValueError("invalid blk.n_primary")
+    if bool(symmetrize):
+        V = 0.5 * (V + V.T)
+    return V
 
-        if n_early > 0:
-            J_sub[:n_early, :] = 0.0
-            J_sub[:, :n_early] = 0.0
-        tail = int(n_early + nprim)
-        if tail < nloc:
-            J_sub[tail:, tail:] = 0.0
 
-        J[idx[:, None], idx[None, :]] += J_sub
+def local_thc_eri_apply_batched(D_batch, lthc: LocalTHCFactors, *, symmetrize: bool = False):
+    """Batched version of `local_thc_eri_apply` over the leading batch dimension."""
 
-    return 0.5 * (J + J.T)
+    cp = _require_cupy()
+    D_batch = cp.asarray(D_batch, dtype=cp.float64)
+    if int(D_batch.ndim) != 3:
+        raise ValueError("D_batch must have shape (nbatch,nao,nao)")
+
+    nbatch, nao, nao2 = map(int, D_batch.shape)
+    if int(nao2) != int(nao):
+        raise ValueError("D_batch must have square trailing dimensions")
+    if int(lthc.nao) != int(nao):
+        raise ValueError("lthc.nao mismatch with D_batch")
+
+    out = cp.empty((nbatch, nao, nao), dtype=cp.float64)
+    for ib in range(int(nbatch)):
+        out[int(ib)] = local_thc_eri_apply(D_batch[int(ib)], lthc, symmetrize=bool(symmetrize))
+    return out
+
+
+def local_thc_J(D, lthc: LocalTHCFactors):
+    """Assemble global Coulomb matrix J[D] from LocalTHCFactors."""
+    return local_thc_eri_apply(D, lthc, symmetrize=True)
 
 
 def local_thc_K_blocked(D, lthc: LocalTHCFactors, *, q_block: int = 256, work: THCJKWork | None = None):
@@ -95,20 +147,11 @@ def local_thc_K_blocked(D, lthc: LocalTHCFactors, *, q_block: int = 256, work: T
 
         K_sub = thc_K_blocked(D_sub, blk.X, blk.Z, q_block=int(work.q_block))
 
-        n_early = int(getattr(blk, "n_early", 0))
-        nprim = int(blk.n_primary)
-        nloc = int(idx_np.size)
-        if n_early < 0 or n_early > nloc:
-            raise ValueError("invalid blk.n_early")
-        if nprim < 0 or (n_early + nprim) > nloc:
-            raise ValueError("invalid blk.n_primary")
-
-        if n_early > 0:
-            K_sub[:n_early, :] = 0.0
-            K_sub[:, :n_early] = 0.0
-        tail = int(n_early + nprim)
-        if tail < nloc:
-            K_sub[tail:, tail:] = 0.0
+        _mask_owned_outputs_inplace(
+            K_sub,
+            n_early=int(getattr(blk, "n_early", 0)),
+            n_primary=int(blk.n_primary),
+        )
 
         K[idx[:, None], idx[None, :]] += K_sub
 
@@ -144,30 +187,19 @@ def local_thc_JK(D, lthc: LocalTHCFactors, *, q_block: int = 256, work: THCJKWor
 
         J_sub, K_sub = thc_JK(D_sub, blk.X, blk.Z, work=work)
 
-        n_early = int(getattr(blk, "n_early", 0))
-        nprim = int(blk.n_primary)
-        nloc = int(idx_np.size)
-        if n_early < 0 or n_early > nloc:
-            raise ValueError("invalid blk.n_early")
-        if nprim < 0 or (n_early + nprim) > nloc:
-            raise ValueError("invalid blk.n_primary")
-
         # Ownership mask (Song & Martinez-style ordering):
         # local AO order is [early secondary][primary][late secondary], and this
         # block owns output elements where min(owner(i), owner(j)) == block_id.
-        #
-        # This corresponds to:
-        # - drop any output involving early secondaries (owned by earlier blocks)
-        # - drop late-secondary x late-secondary outputs (owned by later blocks)
-        if n_early > 0:
-            J_sub[:n_early, :] = 0.0
-            J_sub[:, :n_early] = 0.0
-            K_sub[:n_early, :] = 0.0
-            K_sub[:, :n_early] = 0.0
-        tail = int(n_early + nprim)
-        if tail < nloc:
-            J_sub[tail:, tail:] = 0.0
-            K_sub[tail:, tail:] = 0.0
+        _mask_owned_outputs_inplace(
+            J_sub,
+            n_early=int(getattr(blk, "n_early", 0)),
+            n_primary=int(blk.n_primary),
+        )
+        _mask_owned_outputs_inplace(
+            K_sub,
+            n_early=int(getattr(blk, "n_early", 0)),
+            n_primary=int(blk.n_primary),
+        )
 
         # Scatter-add into global matrices.
         J[idx[:, None], idx[None, :]] += J_sub
@@ -179,4 +211,10 @@ def local_thc_JK(D, lthc: LocalTHCFactors, *, q_block: int = 256, work: THCJKWor
     return J, K
 
 
-__all__ = ["local_thc_J", "local_thc_JK", "local_thc_K_blocked"]
+__all__ = [
+    "local_thc_eri_apply",
+    "local_thc_eri_apply_batched",
+    "local_thc_J",
+    "local_thc_JK",
+    "local_thc_K_blocked",
+]

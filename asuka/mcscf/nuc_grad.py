@@ -17,6 +17,7 @@ from .nuc_grad_df import (
     casci_nuc_grad_df_relaxed,
     casci_nuc_grad_df_unrelaxed,
 )
+from .nuc_grad_thc import casscf_nuc_grad_thc
 
 
 @dataclass(frozen=True)
@@ -122,6 +123,21 @@ def casscf_nuc_grad(*args: Any, **kwargs: Any) -> NucGradResult:
 
     if len(args) == 2:
         scf_out, casscf = args
+        backend = str(kwargs.pop("backend", "auto")).strip().lower()
+        if backend not in {"auto", "df", "thc"}:
+            raise ValueError("backend must be one of: 'auto', 'df', 'thc'")
+
+        use_thc = bool(backend == "thc")
+        if backend == "auto":
+            # THC-SCF runs do not cache DF factors; default to THC gradients in that case.
+            use_thc = getattr(scf_out, "df_B", None) is None and getattr(scf_out, "thc_factors", None) is not None
+
+        if use_thc:
+            res = casscf_nuc_grad_thc(scf_out, casscf, **kwargs)
+            if isinstance(res, tuple):
+                res = res[0]
+            return _from_df(res)
+
         return _from_df(casscf_nuc_grad_df(scf_out, casscf, **kwargs))
 
     if len(args) == 1:

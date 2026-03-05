@@ -27,6 +27,7 @@ from typing import Any
 
 import numpy as np
 
+from asuka.hf.local_thc_jk import local_thc_eri_apply_batched
 from asuka.integrals.df_integrals import DeviceDFMOIntegrals
 
 
@@ -184,7 +185,7 @@ def build_device_dfmo_integrals_local_thc(
     p_block: int = 8,
     profile: dict | None = None,
 ) -> DeviceDFMOIntegrals:
-    """Build active-space ERIs from LocalTHCFactors blocks (ownership-masked).
+    """Build active-space ERIs from LocalTHCFactors via the local AO ERI operator.
 
     This returns a `DeviceDFMOIntegrals` with:
     - `eri_mat` materialized in ordered-pair space (required for CUDA matvec)
@@ -220,107 +221,46 @@ def build_device_dfmo_integrals_local_thc(
     if ncas <= 0:
         raise ValueError("C_active must have ncas > 0")
 
-    p_block = int(p_block)
-    if p_block <= 0:
+    pair_p_block = int(p_block)
+    if pair_p_block <= 0:
         raise ValueError("p_block must be > 0")
-    p_block = min(int(p_block), int(ncas))
+    pair_p_block = min(int(pair_p_block), int(ncas))
 
-    # Accumulate the full ordered-pair ERI matrix in active space.
     nops = int(ncas) * int(ncas)
     eri_mat = cp.zeros((nops, nops), dtype=cp.float64)
 
     nblocks_used = 0
-    for blk in blocks:
-        X_blk = getattr(blk, "X", None)
-        Y_blk = getattr(blk, "Y", None)
-        if X_blk is None or Y_blk is None:
-            raise ValueError("LocalTHCBlock must provide .X and .Y (Z factor)")
-
-        X_blk = cp.asarray(X_blk, dtype=cp.float64)
-        Y_blk = cp.asarray(Y_blk, dtype=cp.float64)
-        if int(getattr(X_blk, "ndim", 0)) != 2:
-            raise ValueError("LocalTHCBlock.X must be 2D (npt,nloc_ao)")
-        if int(getattr(Y_blk, "ndim", 0)) != 2:
-            raise ValueError("LocalTHCBlock.Y must be 2D (npt,naux_blk)")
-
-        npt, nloc = map(int, X_blk.shape)
-        npt_y, naux_blk = map(int, Y_blk.shape)
-        if int(npt_y) != int(npt):
-            raise ValueError("LocalTHCBlock.X/Y npt mismatch")
-
-        ao_idx_global = getattr(blk, "ao_idx_global", None)
-        if ao_idx_global is None:
-            raise ValueError("LocalTHCBlock.ao_idx_global is missing")
-        idx_np = np.asarray(ao_idx_global, dtype=np.int32).ravel()
-        if int(idx_np.size) != int(nloc):
-            raise ValueError("LocalTHCBlock.ao_idx_global size mismatch with X columns")
-
-        n_early = int(getattr(blk, "n_early", 0))
-        n_primary = int(getattr(blk, "n_primary", 0))
-        if n_early < 0 or n_early > nloc:
-            raise ValueError("invalid blk.n_early")
-        if n_primary < 0 or (n_early + n_primary) > nloc:
-            raise ValueError("invalid blk.n_primary")
-        tail = int(n_early + n_primary)
-
-        # Local AO slices:
-        # - non-early: [primary][late]
-        # - late only: [late]
-        idx_nonE = idx_np[int(n_early) :]
-        idx_late = idx_np[int(tail) :]
-        if int(idx_nonE.size) == 0:
+    for r0 in range(0, int(ncas), int(pair_p_block)):
+        r1 = min(int(ncas), int(r0) + int(pair_p_block))
+        rb = int(r1 - r0)
+        if rb <= 0:
             continue
 
-        C_nonE = C_act[idx_nonE, :]  # (n_nonE_ao, ncas)
-        X_nonE_act = X_blk[:, int(n_early) :] @ C_nonE  # (npt,ncas)
+        nbatch = int(rb) * int(ncas)
+        D_batch = cp.empty((nbatch, int(nao), int(nao)), dtype=cp.float64)
 
-        have_late = bool(int(idx_late.size) > 0)
-        if have_late:
-            C_late = C_act[idx_late, :]
-            X_late_act = X_blk[:, int(tail) :] @ C_late  # (npt,ncas)
-        else:
-            X_late_act = None
+        ib = 0
+        for r in range(int(r0), int(r1)):
+            cr = C_act[:, int(r)]
+            for s in range(int(ncas)):
+                cs = C_act[:, int(s)]
+                D_batch[int(ib)] = 0.5 * (
+                    cr[:, None] * cs[None, :] + cs[:, None] * cr[None, :]
+                )
+                ib += 1
 
-        # Build block pair vectors d_blk[pq,L] = sum_P (X_full[p]X_full[q] - X_late[p]X_late[q]) Y[P,L]
-        l_full_blk = cp.empty((nops, int(naux_blk)), dtype=cp.float64)
+        V_batch = local_thc_eri_apply_batched(D_batch, lthc, symmetrize=True)
+        eri_blk = cp.einsum("mp,bmn,nq->pqb", C_act, V_batch, C_act, optimize=True)
+        eri_mat[:, int(r0) * int(ncas) : int(r1) * int(ncas)] = eri_blk.reshape(int(nops), int(nbatch))
 
-        for p0 in range(0, int(ncas), int(p_block)):
-            p1 = min(int(ncas), int(p0) + int(p_block))
-            pb = int(p1 - p0)
-            if pb <= 0:
-                continue
-
-            U = X_nonE_act[:, int(p0) : int(p1)]  # (npt,pb)
-            pairs_full = U[:, :, None] * X_nonE_act[:, None, :]  # (npt,pb,ncas)
-            if have_late and X_late_act is not None:
-                Ul = X_late_act[:, int(p0) : int(p1)]
-                pairs_late = Ul[:, :, None] * X_late_act[:, None, :]
-                pairs_full = pairs_full - pairs_late
-                pairs_late = None
-                Ul = None
-            pairs2 = pairs_full.reshape(int(npt), int(pb) * int(ncas))
-            block_l = pairs2.T @ Y_blk  # (pb*ncas,naux_blk)
-
-            for i in range(int(pb)):
-                p = int(p0) + int(i)
-                rows = slice(int(p) * int(ncas), (int(p) + 1) * int(ncas))
-                l_full_blk[rows, :] = block_l[int(i) * int(ncas) : (int(i) + 1) * int(ncas), :]
-
-            pairs_full = None
-            pairs2 = None
-            block_l = None
-
-        # Accumulate symmetric contribution to ERI matrix.
-        eri_mat += l_full_blk @ l_full_blk.T
         nblocks_used += 1
 
-        # Help the CuPy memory pool.
-        l_full_blk = None
-        X_nonE_act = None
-        X_late_act = None
+        D_batch = None
+        V_batch = None
+        eri_blk = None
 
     if nblocks_used <= 0:
-        raise RuntimeError("LocalTHC active-space build produced no block contributions")
+        raise RuntimeError("LocalTHC active-space build produced no pair blocks")
 
     eri_mat = 0.5 * (eri_mat + eri_mat.T)
 
@@ -334,6 +274,7 @@ def build_device_dfmo_integrals_local_thc(
         profile["norb"] = int(ncas)
         profile["nao"] = int(nao)
         profile["nblocks_used"] = int(nblocks_used)
+        profile["pair_p_block"] = int(pair_p_block)
         profile["eri_mat_nbytes"] = int(getattr(eri_mat, "nbytes", 0))
 
     return DeviceDFMOIntegrals(

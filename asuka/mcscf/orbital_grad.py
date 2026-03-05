@@ -991,138 +991,56 @@ def orbital_gradient_thc(
         # g_dm2[p,v] = sum_P X_mo[P,p] * t[P,v]
         g_dm2 = X_mo.T @ t_pv  # (nmo,ncas)
     else:
-        # Local-THC: sum block contributions with an ownership mask that keeps
-        # (primary,*) and (*,primary) pairs but excludes early-* and late-late.
+        from asuka.hf.local_thc_jk import local_thc_eri_apply_batched  # noqa: PLC0415
+
+        if dm2_arr.shape == (ncas, ncas, ncas, ncas):
+            dm2_wxuv = _as_xp_f64(xp, dm2_arr)
+        else:
+            dm2_wxuv = _as_xp_f64(xp, dm2_arr.reshape(ncas, ncas, ncas, ncas))
+
         g_dm2 = xp.zeros((nmo, ncas), dtype=xp.float64)
-        nblocks_total = int(len(thc.blocks))
-        nblocks_used = 0
-        npt_sum = 0
-        naux_sum = 0
-        npt_max = 0
-        naux_max = 0
-
+        npt = 0
+        naux = 0
+        if profile is not None:
+            profile["lthc_nblocks_total"] = int(len(thc.blocks))
+            profile["lthc_pair_p_block"] = int(pair_p_block)
         for blk in thc.blocks:
-            X_blk = _as_xp_f64(xp, getattr(blk, "X"))
-            Y_blk = _as_xp_f64(xp, getattr(blk, "Y"))
+            X_blk = getattr(blk, "X", None)
+            Y_blk = getattr(blk, "Y", None)
+            if X_blk is None or Y_blk is None:
+                continue
+            npt += int(getattr(X_blk, "shape", (0, 0))[0])
+            naux += int(getattr(Y_blk, "shape", (0, 0))[1])
 
-            if int(X_blk.ndim) != 2:
-                raise ValueError("LocalTHCBlock.X must be 2D")
-            if int(Y_blk.ndim) != 2:
-                raise ValueError("LocalTHCBlock.Y must be 2D")
-
-            npt_blk, nloc = map(int, X_blk.shape)
-            npt_y, naux_blk = map(int, Y_blk.shape)
-            if int(npt_y) != int(npt_blk):
-                raise ValueError("LocalTHCBlock.X/Y npt mismatch")
-
-            idx_np = np.asarray(getattr(blk, "ao_idx_global"), dtype=np.int32).ravel()
-            if int(idx_np.size) != int(nloc):
-                raise ValueError("LocalTHCBlock.ao_idx_global size mismatch with X columns")
-
-            n_early = int(getattr(blk, "n_early", 0))
-            n_primary = int(getattr(blk, "n_primary", 0))
-            if n_early < 0 or n_early > nloc:
-                raise ValueError("invalid blk.n_early")
-            if n_primary < 0 or (n_early + n_primary) > nloc:
-                raise ValueError("invalid blk.n_primary")
-            tail = int(n_early + n_primary)
-
-            idx_nonE = idx_np[int(n_early) :]
-            idx_late = idx_np[int(tail) :]
-            if int(idx_nonE.size) == 0:
+        for w0 in range(0, int(ncas), int(pair_p_block)):
+            w1 = min(int(ncas), int(w0) + int(pair_p_block))
+            wb = int(w1 - w0)
+            if wb <= 0:
                 continue
 
-            idx_nonE_xp = xp.asarray(idx_nonE, dtype=xp.int32)
-            C_nonE = C[idx_nonE_xp, :]  # (n_nonE_ao,nmo)
-            X_nonE = X_blk[:, int(n_early) :]  # (npt, n_nonE_ao)
-            X_nonE_act = X_nonE @ C_nonE[:, ncore:nocc]  # (npt,ncas)
+            nbatch = int(wb) * int(ncas)
+            D_batch = xp.empty((nbatch, int(nao), int(nao)), dtype=xp.float64)
+            dm2_batch = xp.empty((nbatch, int(ncas), int(ncas)), dtype=xp.float64)
 
-            have_late = bool(int(idx_late.size) > 0)
-            if have_late:
-                idx_late_xp = xp.asarray(idx_late, dtype=xp.int32)
-                C_late = C[idx_late_xp, :]  # (n_late_ao,nmo)
-                X_late = X_blk[:, int(tail) :]  # (npt,n_late_ao)
-                X_late_act = X_late @ C_late[:, ncore:nocc]  # (npt,ncas)
-            else:
-                C_late = None
-                X_late = None
-                X_late_act = None
+            ib = 0
+            for w in range(int(w0), int(w1)):
+                cw = C_act[:, int(w)]
+                for x in range(int(ncas)):
+                    cx = C_act[:, int(x)]
+                    D_batch[int(ib)] = 0.5 * (
+                        cw[:, None] * cx[None, :] + cx[:, None] * cw[None, :]
+                    )
+                    dm2_batch[int(ib)] = dm2_wxuv[int(w), int(x)]
+                    ib += 1
 
-            # Build block active-pair vectors d_blk[wx,L].
-            L_act_full = xp.empty((int(ncas) * int(ncas), int(naux_blk)), dtype=xp.float64)
-            for p0 in range(0, int(ncas), int(pair_p_block)):
-                p1 = min(int(ncas), int(p0) + int(pair_p_block))
-                pb = int(p1 - p0)
-                if pb <= 0:
-                    continue
-                U = X_nonE_act[:, int(p0) : int(p1)]  # (npt,pb)
-                pairs_full = U[:, :, None] * X_nonE_act[:, None, :]  # (npt,pb,ncas)
-                if have_late and X_late_act is not None:
-                    Ul = X_late_act[:, int(p0) : int(p1)]
-                    pairs_full = pairs_full - (Ul[:, :, None] * X_late_act[:, None, :])
-                    Ul = None
-                pairs2 = pairs_full.reshape(int(npt_blk), int(pb) * int(ncas))
-                block_l = pairs2.T @ Y_blk  # (pb*ncas,naux_blk)
-                for i in range(int(pb)):
-                    p = int(p0) + int(i)
-                    rows = slice(int(p) * int(ncas), (int(p) + 1) * int(ncas))
-                    L_act_full[rows, :] = block_l[int(i) * int(ncas) : (int(i) + 1) * int(ncas), :]
-                pairs_full = None
-                pairs2 = None
-                block_l = None
+            V_batch = local_thc_eri_apply_batched(D_batch, thc, symmetrize=True)
+            pu_batch = cached_einsum("mp,bmn,nu->bpu", C, V_batch, C_act, xp=xp)
+            g_dm2 += cached_einsum("bpu,buv->pv", pu_batch, dm2_batch, xp=xp)
 
-            T_flat = L_act_full.T @ dm2_act_xp  # (naux_blk,ncas^2)
-            S_flat = Y_blk @ T_flat  # (npt_blk,ncas^2)
-            S = S_flat.reshape(int(npt_blk), int(ncas), int(ncas))  # (P,u,v)
-
-            # Non-early contribution.
-            t_nonE = cached_einsum("Pu,Puv->Pv", X_nonE_act, S, xp=xp)  # (npt_blk,ncas)
-            M_nonE = X_nonE.T @ t_nonE  # (n_nonE_ao,ncas)
-            g_blk = C_nonE.T @ M_nonE  # (nmo,ncas)
-
-            # Subtract late-late contribution.
-            if have_late and C_late is not None and X_late is not None and X_late_act is not None:
-                t_late = cached_einsum("Pu,Puv->Pv", X_late_act, S, xp=xp)
-                M_late = X_late.T @ t_late
-                g_blk = g_blk - (C_late.T @ M_late)
-
-            g_dm2 += g_blk
-            nblocks_used += 1
-            npt_sum += int(npt_blk)
-            naux_sum += int(naux_blk)
-            npt_max = max(int(npt_max), int(npt_blk))
-            naux_max = max(int(naux_max), int(naux_blk))
-
-            # Help CuPy reuse the pool.
-            idx_nonE_xp = None
-            idx_late_xp = None
-            C_nonE = None
-            X_nonE = None
-            X_nonE_act = None
-            C_late = None
-            X_late = None
-            X_late_act = None
-            L_act_full = None
-            T_flat = None
-            S_flat = None
-            S = None
-            t_nonE = None
-            M_nonE = None
-            g_blk = None
-
-        if nblocks_used <= 0:
-            raise RuntimeError("local-THC g_dm2 build produced no block contributions")
-
-        # For profiling parity with global THC, store aggregate point/aux counts.
-        npt = int(npt_sum)
-        naux = int(naux_sum)
-        if profile is not None:
-            profile["lthc_nblocks_total"] = int(nblocks_total)
-            profile["lthc_nblocks_used"] = int(nblocks_used)
-            profile["lthc_sum_npt"] = int(npt_sum)
-            profile["lthc_sum_naux"] = int(naux_sum)
-            profile["lthc_max_npt_block"] = int(npt_max)
-            profile["lthc_max_naux_block"] = int(naux_max)
+            D_batch = None
+            dm2_batch = None
+            V_batch = None
+            pu_batch = None
 
     t_gdm2 = time.perf_counter() if profile is not None else 0.0
 

@@ -17,7 +17,7 @@ def kernel_report() -> dict[str, Any]:
     """Return a JSON-serializable report of native extension availability."""
 
     # Local imports to keep the module lightweight at import time.
-    from . import cueri, guga, hf_df_jk, orbitals
+    from . import caspt2, cueri, guga, hf_df_jk, hf_thc, orbitals
 
     return {
         "timestamp_utc": datetime.now(timezone.utc).isoformat(),
@@ -26,7 +26,9 @@ def kernel_report() -> dict[str, Any]:
         "extensions": {
             "cueri": cueri.probe(),
             "hf_df_jk": hf_df_jk.probe(),
+            "hf_thc": hf_thc.probe(),
             "orbitals": orbitals.probe(),
+            "caspt2": caspt2.probe(),
             "guga": guga.probe(),
         },
     }
@@ -103,7 +105,7 @@ def print_kernel_report(
                 print(f"  - {s}: {mark}", file=out)
 
     # Top-level extensions.
-    for key in ("cueri", "hf_df_jk", "orbitals"):
+    for key in ("cueri", "hf_df_jk", "hf_thc", "orbitals", "caspt2"):
         ext = exts.get(key, {})
         if isinstance(ext, dict):
             _print_one(key, ext)
@@ -123,4 +125,3 @@ __all__ = [
     "kernel_report",
     "print_kernel_report",
 ]
-

@@ -33,6 +33,10 @@ class LocalTHCConfig:
     npt_factor: int = 8
     npt_min: int = 512
     npt_max: int = 2048
+    # If True, disable any point downselect and keep all available per-block
+    # atom-centered grid points. This is required for analytic nuclear
+    # gradients (downselect changes discretely with geometry).
+    no_point_downselect: bool = False
 
     # Central metric storage dtype: 'float64' or 'float32'
     z_dtype: str = "float64"
