@@ -181,4 +181,243 @@ def eval_aos_cart_value_on_points_device(
     return ao
 
 
-__all__ = ["eval_aos_cart_value_on_points_device"]
+def eval_aos_cart_value_grad_on_points_device(
+    basis: Any,
+    points: Any,
+    *,
+    out: Any | None = None,
+    out_grad: Any | None = None,
+    threads: int = 256,
+    stream: Any = None,
+    sync: bool = True,
+) -> tuple["cp.ndarray", "cp.ndarray"]:
+    """Evaluate cartesian AO values + gradients on points (GPU).
+
+    Returns
+    -------
+    ao : cupy.ndarray
+        (npt, nbf) float64, C-contiguous.
+    ao_grad : cupy.ndarray
+        (npt, nbf, 3) float64, C-contiguous.
+    """
+
+    cp_mod, ext = _require_cuda_stack()
+
+    pts = cp_mod.ascontiguousarray(cp_mod.asarray(points, dtype=cp_mod.float64).reshape((-1, 3)))
+    npt = int(pts.shape[0])
+
+    dev = _get_device_basis(basis)
+    nbf = int(dev.nbf)
+
+    if out is None:
+        ao = cp_mod.empty((npt, nbf), dtype=cp_mod.float64)
+    else:
+        ao = out
+        if not isinstance(ao, cp_mod.ndarray):
+            raise TypeError("out must be a CuPy array when provided")
+        if ao.dtype != cp_mod.float64:
+            raise TypeError("out must have dtype float64")
+        if ao.shape != (npt, nbf):
+            raise ValueError(f"out must have shape ({npt},{nbf}); got {tuple(map(int, ao.shape))}")
+        if hasattr(ao, "flags") and not bool(ao.flags.c_contiguous):
+            raise ValueError("out must be C-contiguous")
+
+    if out_grad is None:
+        ao_grad = cp_mod.empty((npt, nbf, 3), dtype=cp_mod.float64)
+    else:
+        ao_grad = out_grad
+        if not isinstance(ao_grad, cp_mod.ndarray):
+            raise TypeError("out_grad must be a CuPy array when provided")
+        if ao_grad.dtype != cp_mod.float64:
+            raise TypeError("out_grad must have dtype float64")
+        if ao_grad.shape != (npt, nbf, 3):
+            raise ValueError(f"out_grad must have shape ({npt},{nbf},3); got {tuple(map(int, ao_grad.shape))}")
+        if hasattr(ao_grad, "flags") and not bool(ao_grad.flags.c_contiguous):
+            raise ValueError("out_grad must be C-contiguous")
+
+    stream_ptr = _stream_ptr(stream)
+
+    ext.eval_aos_cart_value_grad_f64_inplace_device(
+        dev.shell_cxyz,
+        dev.shell_prim_start,
+        dev.shell_nprim,
+        dev.shell_l,
+        dev.shell_ao_start,
+        dev.prim_exp,
+        dev.prim_coef,
+        pts,
+        ao,
+        ao_grad,
+        threads=int(threads),
+        stream_ptr=int(stream_ptr),
+        sync=bool(sync),
+    )
+    return ao, ao_grad
+
+
+def contract_aos_cart_value_grad_vjp_atomgrad_device(
+    basis: Any,
+    points: Any,
+    *,
+    point_atom: Any,
+    w_pow: Any,
+    bar_ao: Any,
+    shell_atom: Any,
+    natm: int,
+    out: Any | None = None,
+    threads: int = 256,
+    stream: Any = None,
+    sync: bool = True,
+) -> "cp.ndarray":
+    """Accumulate VJP of weighted AO collocation into per-atom gradients (GPU).
+
+    Computes the moving-grid contributions for atom-centered point clouds.
+    See the CUDA kernel docstring in `orbitals_cuda_kernels_api.h`.
+    """
+
+    cp_mod, ext = _require_cuda_stack()
+
+    natm = int(natm)
+    if natm <= 0:
+        raise ValueError("natm must be > 0")
+
+    pts = cp_mod.ascontiguousarray(cp_mod.asarray(points, dtype=cp_mod.float64).reshape((-1, 3)))
+    npt = int(pts.shape[0])
+
+    dev = _get_device_basis(basis)
+    nbf = int(dev.nbf)
+
+    p_atom = cp_mod.ascontiguousarray(cp_mod.asarray(point_atom, dtype=cp_mod.int32).ravel())
+    if p_atom.shape != (npt,):
+        raise ValueError(f"point_atom must have shape ({npt},)")
+
+    w = cp_mod.ascontiguousarray(cp_mod.asarray(w_pow, dtype=cp_mod.float64).ravel())
+    if w.shape != (npt,):
+        raise ValueError(f"w_pow must have shape ({npt},)")
+
+    bar = cp_mod.ascontiguousarray(cp_mod.asarray(bar_ao, dtype=cp_mod.float64))
+    if bar.shape != (npt, nbf):
+        raise ValueError(f"bar_ao must have shape ({npt},{nbf}); got {tuple(map(int, bar.shape))}")
+
+    sh_atom = cp_mod.ascontiguousarray(cp_mod.asarray(shell_atom, dtype=cp_mod.int32).ravel())
+    if sh_atom.shape != (int(dev.shell_l.shape[0]),):
+        raise ValueError(f"shell_atom must have shape ({int(dev.shell_l.shape[0])},)")
+
+    if out is None:
+        gout = cp_mod.zeros((natm, 3), dtype=cp_mod.float64)
+    else:
+        gout = out
+        if not isinstance(gout, cp_mod.ndarray):
+            raise TypeError("out must be a CuPy array when provided")
+        if gout.dtype != cp_mod.float64:
+            raise TypeError("out must have dtype float64")
+        if gout.shape != (natm, 3):
+            raise ValueError(f"out must have shape ({natm},3); got {tuple(map(int, gout.shape))}")
+        if hasattr(gout, "flags") and not bool(gout.flags.c_contiguous):
+            raise ValueError("out must be C-contiguous")
+
+    stream_ptr = _stream_ptr(stream)
+
+    ext.contract_aos_cart_value_grad_vjp_atomgrad_f64_inplace_device(
+        dev.shell_cxyz,
+        dev.shell_prim_start,
+        dev.shell_nprim,
+        dev.shell_l,
+        dev.shell_ao_start,
+        dev.prim_exp,
+        dev.prim_coef,
+        pts,
+        p_atom,
+        w,
+        bar,
+        sh_atom,
+        gout,
+        threads=int(threads),
+        stream_ptr=int(stream_ptr),
+        sync=bool(sync),
+    )
+    return gout
+
+
+def becke_weight_vjp_atomgrad_device(
+    points: Any,
+    weights: Any,
+    *,
+    bar_w: Any,
+    point_atom: Any,
+    atom_coords: Any,
+    becke_n: int,
+    RAB: Any | None = None,
+    out: Any | None = None,
+    threads: int = 256,
+    stream: Any = None,
+    sync: bool = True,
+) -> "cp.ndarray":
+    """Accumulate VJP of Becke partition weights into per-atom gradients (GPU)."""
+
+    cp_mod, ext = _require_cuda_stack()
+
+    pts = cp_mod.ascontiguousarray(cp_mod.asarray(points, dtype=cp_mod.float64).reshape((-1, 3)))
+    npt = int(pts.shape[0])
+
+    w = cp_mod.ascontiguousarray(cp_mod.asarray(weights, dtype=cp_mod.float64).ravel())
+    if w.shape != (npt,):
+        raise ValueError(f"weights must have shape ({npt},)")
+
+    bw = cp_mod.ascontiguousarray(cp_mod.asarray(bar_w, dtype=cp_mod.float64).ravel())
+    if bw.shape != (npt,):
+        raise ValueError(f"bar_w must have shape ({npt},)")
+
+    p_atom = cp_mod.ascontiguousarray(cp_mod.asarray(point_atom, dtype=cp_mod.int32).ravel())
+    if p_atom.shape != (npt,):
+        raise ValueError(f"point_atom must have shape ({npt},)")
+
+    R = cp_mod.ascontiguousarray(cp_mod.asarray(atom_coords, dtype=cp_mod.float64).reshape((-1, 3)))
+    natm = int(R.shape[0])
+    if natm <= 0:
+        raise ValueError("atom_coords must be non-empty")
+
+    if out is None:
+        gout = cp_mod.zeros((natm, 3), dtype=cp_mod.float64)
+    else:
+        gout = out
+        if not isinstance(gout, cp_mod.ndarray):
+            raise TypeError("out must be a CuPy array when provided")
+        if gout.dtype != cp_mod.float64:
+            raise TypeError("out must have dtype float64")
+        if gout.shape != (natm, 3):
+            raise ValueError(f"out must have shape ({natm},3); got {tuple(map(int, gout.shape))}")
+        if hasattr(gout, "flags") and not bool(gout.flags.c_contiguous):
+            raise ValueError("out must be C-contiguous")
+
+    if RAB is None:
+        dAB = R[:, None, :] - R[None, :, :]
+        RAB_dev = cp_mod.ascontiguousarray(cp_mod.linalg.norm(dAB, axis=2))
+    else:
+        RAB_dev = cp_mod.ascontiguousarray(cp_mod.asarray(RAB, dtype=cp_mod.float64))
+        if RAB_dev.shape != (natm, natm):
+            raise ValueError(f"RAB must have shape ({natm},{natm})")
+
+    stream_ptr = _stream_ptr(stream)
+    ext.becke_weight_vjp_atomgrad_f64_inplace_device(
+        pts,
+        w,
+        bw,
+        p_atom,
+        R,
+        RAB_dev,
+        int(becke_n),
+        gout,
+        threads=int(threads),
+        stream_ptr=int(stream_ptr),
+        sync=bool(sync),
+    )
+    return gout
+
+
+__all__ = [
+    "becke_weight_vjp_atomgrad_device",
+    "contract_aos_cart_value_grad_vjp_atomgrad_device",
+    "eval_aos_cart_value_on_points_device",
+    "eval_aos_cart_value_grad_on_points_device",
+]

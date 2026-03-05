@@ -54,6 +54,72 @@ void orbitals_eval_aos_cart_value_f64(
     double* ao,
     cudaStream_t stream);
 
+void orbitals_eval_aos_cart_value_grad_f64(
+    const double* shell_cxyz,
+    const int32_t* shell_prim_start,
+    const int32_t* shell_nprim,
+    const int32_t* shell_l,
+    const int32_t* shell_ao_start,
+    const double* prim_exp,
+    const double* prim_coef,
+    int32_t nshell,
+    int32_t nao,
+    const double* points,
+    int32_t npt,
+    double* ao,
+    double* ao_grad,  // (npt,nao,3)
+    cudaStream_t stream);
+
+// Contract d( w^pow * AO(points) )/dR contributions for moving atom-centered grids.
+//
+// Given the adjoint bar_ao w.r.t. the weighted AO collocation matrix
+//   X[p,mu] = w_pow[p] * ao_mu(r_p),
+// this kernel accumulates:
+//   grad[point_atom[p]] += sum_mu bar_ao[p,mu] * w_pow[p] * d ao_mu / d r
+//   grad[shell_atom[sh]] -= same (basis center shift)
+//
+// where r_p translates with point_atom[p]. This matches the "moving grid"
+// convention for atom-centered Becke/R-DVR grids.
+void orbitals_contract_aos_cart_value_grad_vjp_atomgrad_f64(
+    const double* shell_cxyz,
+    const int32_t* shell_prim_start,
+    const int32_t* shell_nprim,
+    const int32_t* shell_l,
+    const int32_t* shell_ao_start,
+    const double* prim_exp,
+    const double* prim_coef,
+    int32_t nshell,
+    int32_t nao,
+    const double* points,
+    int32_t npt,
+    const int32_t* point_atom,  // (npt,)
+    const double* w_pow,        // (npt,)
+    const double* bar_ao,       // (npt,nao)
+    const int32_t* shell_atom,  // (nshell,)
+    int32_t natm,
+    double* grad_out,           // (natm,3) flattened
+    cudaStream_t stream);
+
+// Contract d(w_P)/dR contributions for atom-centered Becke partition weights.
+//
+// This computes:
+//   grad += sum_P bar_w[P] * d w[P] / d R
+// for weights w[P] that were constructed with Becke partitioning and with points
+// translating with point_atom[P].
+void orbitals_becke_weight_vjp_atomgrad_f64(
+    const double* points,       // (npt,3)
+    const double* weights,      // (npt,)
+    const double* bar_w,        // (npt,)
+    int32_t npt,
+    const int32_t* point_atom,  // (npt,)
+    const double* atom_coords,  // (natm,3)
+    const double* RAB,          // (natm,natm)
+    int32_t natm,
+    int32_t becke_n,
+    double* grad_out,  // (natm,3) flattened
+    cudaStream_t stream,
+    int32_t threads);
+
 // --- MO evaluation ---
 
 void orbitals_eval_mos_cart_value_f64(

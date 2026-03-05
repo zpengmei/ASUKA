@@ -21,8 +21,8 @@ optimizer:
 - projects gradients and step directions into the manifold tangent space
 """
 
-from dataclasses import dataclass
-from typing import Callable, Sequence
+from dataclasses import dataclass, field
+from typing import Any, Callable, Sequence
 
 import numpy as np
 
@@ -220,6 +220,9 @@ class GeomOptSettings:
     store_trajectory: bool = False
     verbose: int = 0
 
+    # Optional per-iteration callback: fn(iter, energy, gmax, grms, max_steps)
+    callback: Any = field(default=None, compare=False, repr=False)
+
 
 @dataclass(frozen=True)
 class GeomOptResult:
@@ -390,6 +393,12 @@ def optimize_cartesian(
         if int(st.verbose) >= 1:
             tag = "constrained" if constraints_use else "free"
             print(f"[geomopt:{tag}] iter={it:3d}  E={E:+.12f}  gmax={gmax:.3e}  grms={grms:.3e}")
+
+        if st.callback is not None:
+            try:
+                st.callback(it, float(E), float(gmax), float(grms), int(st.max_steps))
+            except Exception:
+                pass
 
         if (gmax <= float(st.gmax_tol)) and (grms <= float(st.grms_tol)):
             return GeomOptResult(

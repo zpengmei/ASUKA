@@ -259,6 +259,415 @@ __global__ void aos_cart_value_kernel(
   }
 }
 
+__global__ void aos_cart_value_grad_kernel(
+    const double* shell_cxyz,
+    const int32_t* shell_prim_start,
+    const int32_t* shell_nprim,
+    const int32_t* shell_l,
+    const int32_t* shell_ao_start,
+    const double* prim_exp,
+    const double* prim_coef,
+    int32_t nshell,
+    int32_t nao,
+    const double* points,
+    int32_t npt,
+    double* ao_out,
+    double* ao_grad_out) {
+  const int32_t sh = int32_t(blockIdx.x);
+  const int pt_lane = int(threadIdx.y);
+  const int p = int(blockIdx.y) * PT_TILE + pt_lane;
+  const int ic = int(threadIdx.x);
+
+  if (sh >= nshell) return;
+  if (p >= npt) return;
+
+  const int l = int(shell_l[sh]);
+  const int nbf = ncart(l);
+  const int ao0 = int(shell_ao_start[sh]);
+
+  if (l > LMAX || nbf > NBF_MAX) return;
+  if (ao0 < 0 || ao0 + nbf > nao) return;
+
+  __shared__ double sh_ao[PT_TILE][NBF_MAX];
+  __shared__ double sh_gx[PT_TILE][NBF_MAX];
+  __shared__ double sh_gy[PT_TILE][NBF_MAX];
+  __shared__ double sh_gz[PT_TILE][NBF_MAX];
+
+  if (ic == 0) {
+    const double cx = shell_cxyz[int(sh) * 3 + 0];
+    const double cy = shell_cxyz[int(sh) * 3 + 1];
+    const double cz = shell_cxyz[int(sh) * 3 + 2];
+
+    const double x = points[int(p) * 3 + 0];
+    const double y = points[int(p) * 3 + 1];
+    const double z = points[int(p) * 3 + 2];
+
+    const double dx = x - cx;
+    const double dy = y - cy;
+    const double dz = z - cz;
+    const double r2 = dx * dx + dy * dy + dz * dz;
+
+    const int32_t p0 = shell_prim_start[sh];
+    const int32_t npg = shell_nprim[sh];
+
+    double rad0 = 0.0;
+    double rad1 = 0.0;
+    for (int32_t ip = 0; ip < npg; ++ip) {
+      const double aa = prim_exp[int(p0 + ip)];
+      const double cc = prim_coef[int(p0 + ip)];
+      const double e = exp(-aa * r2);
+      const double t = cc * e;
+      rad0 += t;
+      rad1 += aa * t;
+    }
+
+    eval_shell_cart_components<true, false>(
+        l,
+        dx,
+        dy,
+        dz,
+        rad0,
+        rad1,
+        0.0,
+        sh_ao[pt_lane],
+        sh_gx[pt_lane],
+        sh_gy[pt_lane],
+        sh_gz[pt_lane],
+        nullptr);
+  }
+
+  __syncthreads();
+
+  if (ic < nbf) {
+    const int64_t idx = int64_t(p) * int64_t(nao) + int64_t(ao0 + ic);
+    ao_out[idx] = sh_ao[pt_lane][ic];
+    const int64_t gbase = idx * 3;
+    ao_grad_out[gbase + 0] = sh_gx[pt_lane][ic];
+    ao_grad_out[gbase + 1] = sh_gy[pt_lane][ic];
+    ao_grad_out[gbase + 2] = sh_gz[pt_lane][ic];
+  }
+}
+
+__global__ void contract_aos_cart_value_grad_vjp_atomgrad_kernel(
+    const double* shell_cxyz,
+    const int32_t* shell_prim_start,
+    const int32_t* shell_nprim,
+    const int32_t* shell_l,
+    const int32_t* shell_ao_start,
+    const double* prim_exp,
+    const double* prim_coef,
+    int32_t nshell,
+    int32_t nao,
+    const double* points,
+    int32_t npt,
+    const int32_t* point_atom,
+    const double* w_pow,
+    const double* bar_ao,
+    const int32_t* shell_atom,
+    int32_t natm,
+    double* grad_out) {
+  const int32_t sh = int32_t(blockIdx.x);
+  const int pt_lane = int(threadIdx.y);
+  const int p = int(blockIdx.y) * PT_TILE + pt_lane;
+  const int ic = int(threadIdx.x);
+
+  if (sh >= nshell) return;
+  if (p >= npt) return;
+
+  const int l = int(shell_l[sh]);
+  const int nbf = ncart(l);
+  const int ao0 = int(shell_ao_start[sh]);
+
+  if (l > LMAX || nbf > NBF_MAX) return;
+  if (ao0 < 0 || ao0 + nbf > nao) return;
+
+  const int32_t ia_pt = point_atom ? point_atom[p] : -1;
+  const int32_t ia_sh = shell_atom ? shell_atom[sh] : -1;
+  if (ia_pt < 0 || ia_pt >= natm) return;
+  if (ia_sh < 0 || ia_sh >= natm) return;
+
+  __shared__ double sh_gx[PT_TILE][NBF_MAX];
+  __shared__ double sh_gy[PT_TILE][NBF_MAX];
+  __shared__ double sh_gz[PT_TILE][NBF_MAX];
+
+  // Partial sums for this shell + point lane (per AO component).
+  __shared__ double sh_sumx[PT_TILE][NBF_MAX];
+  __shared__ double sh_sumy[PT_TILE][NBF_MAX];
+  __shared__ double sh_sumz[PT_TILE][NBF_MAX];
+
+  if (ic == 0) {
+    const double cx = shell_cxyz[int(sh) * 3 + 0];
+    const double cy = shell_cxyz[int(sh) * 3 + 1];
+    const double cz = shell_cxyz[int(sh) * 3 + 2];
+
+    const double x = points[int(p) * 3 + 0];
+    const double y = points[int(p) * 3 + 1];
+    const double z = points[int(p) * 3 + 2];
+
+    const double dx = x - cx;
+    const double dy = y - cy;
+    const double dz = z - cz;
+    const double r2 = dx * dx + dy * dy + dz * dz;
+
+    const int32_t p0 = shell_prim_start[sh];
+    const int32_t npg = shell_nprim[sh];
+
+    double rad0 = 0.0;
+    double rad1 = 0.0;
+    for (int32_t ip = 0; ip < npg; ++ip) {
+      const double aa = prim_exp[int(p0 + ip)];
+      const double cc = prim_coef[int(p0 + ip)];
+      const double e = exp(-aa * r2);
+      const double t = cc * e;
+      rad0 += t;
+      rad1 += aa * t;
+    }
+
+    eval_shell_cart_components<true, false>(
+        l,
+        dx,
+        dy,
+        dz,
+        rad0,
+        rad1,
+        0.0,
+        nullptr,
+        sh_gx[pt_lane],
+        sh_gy[pt_lane],
+        sh_gz[pt_lane],
+        nullptr);
+  }
+
+  // Ensure gradients ready before we use them.
+  __syncthreads();
+
+  double px = 0.0;
+  double py = 0.0;
+  double pz = 0.0;
+  if (ic < nbf) {
+    const double bw = w_pow ? w_pow[p] : 1.0;
+    const double b = bar_ao[int64_t(p) * int64_t(nao) + int64_t(ao0 + ic)];
+    const double fac = bw * b;
+    px = fac * sh_gx[pt_lane][ic];
+    py = fac * sh_gy[pt_lane][ic];
+    pz = fac * sh_gz[pt_lane][ic];
+  }
+  sh_sumx[pt_lane][ic] = px;
+  sh_sumy[pt_lane][ic] = py;
+  sh_sumz[pt_lane][ic] = pz;
+
+  __syncthreads();
+
+  // Reduce across ic within each point lane. Use a power-of-two reduction
+  // starting from 64 (largest pow2 <= NBF_MAX) and guard by nbf so we handle
+  // the non-power-of-two shell sizes correctly.
+  for (int stride = 64; stride > 0; stride >>= 1) {
+    if (ic < stride) {
+      const int j = ic + stride;
+      if (j < nbf) {
+        sh_sumx[pt_lane][ic] += sh_sumx[pt_lane][j];
+        sh_sumy[pt_lane][ic] += sh_sumy[pt_lane][j];
+        sh_sumz[pt_lane][ic] += sh_sumz[pt_lane][j];
+      }
+    }
+    __syncthreads();
+  }
+
+  if (ic == 0) {
+    const double gx = sh_sumx[pt_lane][0];
+    const double gy = sh_sumy[pt_lane][0];
+    const double gz = sh_sumz[pt_lane][0];
+
+    // Point translation contribution (+) and basis-center contribution (-).
+    const int64_t pbase = int64_t(ia_pt) * 3;
+    atomicAdd(&grad_out[pbase + 0], gx);
+    atomicAdd(&grad_out[pbase + 1], gy);
+    atomicAdd(&grad_out[pbase + 2], gz);
+
+    const int64_t sbase = int64_t(ia_sh) * 3;
+    atomicAdd(&grad_out[sbase + 0], -gx);
+    atomicAdd(&grad_out[sbase + 1], -gy);
+    atomicAdd(&grad_out[sbase + 2], -gz);
+  }
+}
+
+constexpr int BECKE_NATM_MAX = 128;
+
+__global__ void becke_weight_vjp_atomgrad_kernel(
+    const double* points,
+    const double* weights,
+    const double* bar_w,
+    int32_t npt,
+    const int32_t* point_atom,
+    const double* atom_coords,
+    const double* RAB,
+    int32_t natm,
+    int32_t becke_n,
+    double* grad_out) {
+  const int32_t p = int32_t(blockIdx.x) * int32_t(blockDim.x) + int32_t(threadIdx.x);
+  if (p >= npt) return;
+  if (natm <= 0 || natm > BECKE_NATM_MAX) return;
+
+  const int32_t ia_pt = point_atom ? point_atom[p] : -1;
+  if (ia_pt < 0 || ia_pt >= natm) return;
+
+  const double bw = bar_w ? bar_w[p] : 0.0;
+  if (bw == 0.0) return;
+
+  const double x = points[int64_t(p) * 3 + 0];
+  const double y = points[int64_t(p) * 3 + 1];
+  const double z = points[int64_t(p) * 3 + 2];
+
+  double rA[BECKE_NATM_MAX];
+  double wx[BECKE_NATM_MAX];
+
+  // Distances + initialize raw weights.
+  for (int32_t A = 0; A < natm; ++A) {
+    const double ax = atom_coords[int64_t(A) * 3 + 0];
+    const double ay = atom_coords[int64_t(A) * 3 + 1];
+    const double az = atom_coords[int64_t(A) * 3 + 2];
+    const double dx = x - ax;
+    const double dy = y - ay;
+    const double dz = z - az;
+    rA[A] = sqrt(dx * dx + dy * dy + dz * dz);
+    wx[A] = 1.0;
+  }
+
+  // Forward Becke raw weight products.
+  for (int32_t A = 0; A < natm; ++A) {
+    for (int32_t B = A + 1; B < natm; ++B) {
+      const double Rab = RAB[int64_t(A) * int64_t(natm) + int64_t(B)];
+      if (Rab <= 1e-14) continue;
+      double mu = (rA[A] - rA[B]) / Rab;
+      if (mu < -1.0) mu = -1.0;
+      if (mu > 1.0) mu = 1.0;
+
+      double pp = mu;
+      for (int32_t it = 0; it < becke_n; ++it) {
+        pp = 0.5 * (3.0 * pp - pp * pp * pp);
+      }
+
+      const double sA = 0.5 * (1.0 - pp);
+      const double sB = 1.0 - sA;
+      wx[A] *= sA;
+      wx[B] *= sB;
+    }
+  }
+
+  double wsum = 0.0;
+  for (int32_t A = 0; A < natm; ++A) wsum += wx[A];
+  if (wsum == 0.0) wsum = 1.0;
+
+  const double wi = wx[ia_pt];
+  const double g = wi / wsum;
+  if (g == 0.0) return;
+
+  const double w_base = weights[p] / g;
+  const double bar_g = bw * w_base;
+
+  const double inv_wsum = 1.0 / wsum;
+  const double inv_wsum2 = inv_wsum * inv_wsum;
+
+  // Pairwise derivative contributions.
+  for (int32_t A = 0; A < natm; ++A) {
+    for (int32_t B = A + 1; B < natm; ++B) {
+      const double Rab = RAB[int64_t(A) * int64_t(natm) + int64_t(B)];
+      if (Rab <= 1e-14) continue;
+
+      const double rAi = rA[A];
+      const double rBi = rA[B];
+
+      double mu_raw = (rAi - rBi) / Rab;
+      double mu = mu_raw;
+      if (mu < -1.0) mu = -1.0;
+      if (mu > 1.0) mu = 1.0;
+
+      // If clamped, derivative is zero (piecewise-constant outside [-1,1]).
+      double dpp_dmu = (mu_raw == mu) ? 1.0 : 0.0;
+      double pp = mu;
+      for (int32_t it = 0; it < becke_n; ++it) {
+        const double gprime = 1.5 * (1.0 - pp * pp);
+        dpp_dmu *= gprime;
+        pp = 0.5 * (3.0 * pp - pp * pp * pp);
+      }
+
+      const double sA = 0.5 * (1.0 - pp);
+      const double sB = 1.0 - sA;
+
+      const double wA = wx[A];
+      const double wB = wx[B];
+
+      double bar_wA = -bar_g * wi * inv_wsum2;
+      double bar_wB = bar_wA;
+      if (A == ia_pt) bar_wA += bar_g * inv_wsum;
+      if (B == ia_pt) bar_wB += bar_g * inv_wsum;
+
+      // Avoid division by zero on pathological points.
+      const double inv_sA = (sA != 0.0) ? (1.0 / sA) : 0.0;
+      const double inv_sB = (sB != 0.0) ? (1.0 / sB) : 0.0;
+
+      const double bar_sA = bar_wA * wA * inv_sA;
+      const double bar_sB = bar_wB * wB * inv_sB;
+
+      // bar_mu = dE/dmu.
+      const double bar_mu = 0.5 * dpp_dmu * (bar_sB - bar_sA);
+      if (bar_mu == 0.0) continue;
+
+      // Unit vectors uA, uB, vAB.
+      double uAx = 0.0, uAy = 0.0, uAz = 0.0;
+      if (rAi > 1e-16) {
+        const double ax = atom_coords[int64_t(A) * 3 + 0];
+        const double ay = atom_coords[int64_t(A) * 3 + 1];
+        const double az = atom_coords[int64_t(A) * 3 + 2];
+        uAx = (x - ax) / rAi;
+        uAy = (y - ay) / rAi;
+        uAz = (z - az) / rAi;
+      }
+      double uBx = 0.0, uBy = 0.0, uBz = 0.0;
+      if (rBi > 1e-16) {
+        const double bx = atom_coords[int64_t(B) * 3 + 0];
+        const double by = atom_coords[int64_t(B) * 3 + 1];
+        const double bz = atom_coords[int64_t(B) * 3 + 2];
+        uBx = (x - bx) / rBi;
+        uBy = (y - by) / rBi;
+        uBz = (z - bz) / rBi;
+      }
+
+      const double Ax = atom_coords[int64_t(A) * 3 + 0];
+      const double Ay = atom_coords[int64_t(A) * 3 + 1];
+      const double Az = atom_coords[int64_t(A) * 3 + 2];
+      const double Bx = atom_coords[int64_t(B) * 3 + 0];
+      const double By = atom_coords[int64_t(B) * 3 + 1];
+      const double Bz = atom_coords[int64_t(B) * 3 + 2];
+
+      const double vABx = (Ax - Bx) / Rab;
+      const double vABy = (Ay - By) / Rab;
+      const double vABz = (Az - Bz) / Rab;
+
+      const double coef = bar_mu / Rab;
+      const double coef_rab = bar_mu * (rAi - rBi) / (Rab * Rab);
+
+      // Point translation contribution: point moves with ia_pt.
+      const int64_t pbase = int64_t(ia_pt) * 3;
+      atomicAdd(&grad_out[pbase + 0], coef * (uAx - uBx));
+      atomicAdd(&grad_out[pbase + 1], coef * (uAy - uBy));
+      atomicAdd(&grad_out[pbase + 2], coef * (uAz - uBz));
+
+      // Atom A contribution.
+      const int64_t abase = int64_t(A) * 3;
+      atomicAdd(&grad_out[abase + 0], -coef * uAx - coef_rab * vABx);
+      atomicAdd(&grad_out[abase + 1], -coef * uAy - coef_rab * vABy);
+      atomicAdd(&grad_out[abase + 2], -coef * uAz - coef_rab * vABz);
+
+      // Atom B contribution.
+      const int64_t bbase = int64_t(B) * 3;
+      atomicAdd(&grad_out[bbase + 0], coef * uBx + coef_rab * vABx);
+      atomicAdd(&grad_out[bbase + 1], coef * uBy + coef_rab * vABy);
+      atomicAdd(&grad_out[bbase + 2], coef * uBz + coef_rab * vABz);
+    }
+  }
+}
+
 template <bool WANT_GRAD, bool WANT_LAPL>
 __global__ void mos_cart_kernel(
     const double* shell_cxyz,
@@ -868,6 +1277,120 @@ void orbitals_eval_aos_cart_value_f64(
       points,
       npt,
       ao);
+}
+
+void orbitals_eval_aos_cart_value_grad_f64(
+    const double* shell_cxyz,
+    const int32_t* shell_prim_start,
+    const int32_t* shell_nprim,
+    const int32_t* shell_l,
+    const int32_t* shell_ao_start,
+    const double* prim_exp,
+    const double* prim_coef,
+    int32_t nshell,
+    int32_t nao,
+    const double* points,
+    int32_t npt,
+    double* ao,
+    double* ao_grad,
+    cudaStream_t stream) {
+  if (!shell_cxyz || !shell_prim_start || !shell_nprim || !shell_l || !shell_ao_start || !prim_exp || !prim_coef || !points || !ao ||
+      !ao_grad)
+    return;
+  if (nshell <= 0 || nao <= 0 || npt <= 0) return;
+
+  dim3 block(NBF_MAX, PT_TILE, 1);
+  dim3 grid(nshell, (npt + PT_TILE - 1) / PT_TILE, 1);
+  aos_cart_value_grad_kernel<<<grid, block, 0, stream>>>(
+      shell_cxyz,
+      shell_prim_start,
+      shell_nprim,
+      shell_l,
+      shell_ao_start,
+      prim_exp,
+      prim_coef,
+      nshell,
+      nao,
+      points,
+      npt,
+      ao,
+      ao_grad);
+}
+
+void orbitals_contract_aos_cart_value_grad_vjp_atomgrad_f64(
+    const double* shell_cxyz,
+    const int32_t* shell_prim_start,
+    const int32_t* shell_nprim,
+    const int32_t* shell_l,
+    const int32_t* shell_ao_start,
+    const double* prim_exp,
+    const double* prim_coef,
+    int32_t nshell,
+    int32_t nao,
+    const double* points,
+    int32_t npt,
+    const int32_t* point_atom,
+    const double* w_pow,
+    const double* bar_ao,
+    const int32_t* shell_atom,
+    int32_t natm,
+    double* grad_out,
+    cudaStream_t stream) {
+  if (!shell_cxyz || !shell_prim_start || !shell_nprim || !shell_l || !shell_ao_start || !prim_exp || !prim_coef || !points || !bar_ao ||
+      !shell_atom || !grad_out)
+    return;
+  if (nshell <= 0 || nao <= 0 || npt <= 0 || natm <= 0) return;
+
+  dim3 block(NBF_MAX, PT_TILE, 1);
+  dim3 grid(nshell, (npt + PT_TILE - 1) / PT_TILE, 1);
+  contract_aos_cart_value_grad_vjp_atomgrad_kernel<<<grid, block, 0, stream>>>(
+      shell_cxyz,
+      shell_prim_start,
+      shell_nprim,
+      shell_l,
+      shell_ao_start,
+      prim_exp,
+      prim_coef,
+      nshell,
+      nao,
+      points,
+      npt,
+      point_atom,
+      w_pow,
+      bar_ao,
+      shell_atom,
+      natm,
+      grad_out);
+}
+
+void orbitals_becke_weight_vjp_atomgrad_f64(
+    const double* points,
+    const double* weights,
+    const double* bar_w,
+    int32_t npt,
+    const int32_t* point_atom,
+    const double* atom_coords,
+    const double* RAB,
+    int32_t natm,
+    int32_t becke_n,
+    double* grad_out,
+    cudaStream_t stream,
+    int32_t threads) {
+  if (!points || !weights || !bar_w || !point_atom || !atom_coords || !RAB || !grad_out) return;
+  if (npt <= 0 || natm <= 0) return;
+  const int32_t block = (threads > 0) ? threads : 256;
+  const int32_t grid = (npt + block - 1) / block;
+  becke_weight_vjp_atomgrad_kernel<<<grid, block, 0, stream>>>(
+      points,
+      weights,
+      bar_w,
+      npt,
+      point_atom,
+      atom_coords,
+      RAB,
+      natm,
+      becke_n,
+      grad_out);
 }
 
 void orbitals_eval_mos_cart_value_f64(

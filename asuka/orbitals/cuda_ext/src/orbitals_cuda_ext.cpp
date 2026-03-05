@@ -572,6 +572,338 @@ void eval_aos_cart_value_f64_inplace_device(
   }
 }
 
+void eval_aos_cart_value_grad_f64_inplace_device(
+    const py::object& shell_cxyz_obj,
+    const py::object& shell_prim_start_obj,
+    const py::object& shell_nprim_obj,
+    const py::object& shell_l_obj,
+    const py::object& shell_ao_start_obj,
+    const py::object& prim_exp_obj,
+    const py::object& prim_coef_obj,
+    const py::object& points_obj,
+    const py::object& ao_obj,
+    const py::object& ao_grad_obj,
+    int32_t threads,
+    uint64_t stream_ptr,
+    bool sync) {
+  (void)threads;
+
+  const CudaArrayView shell_cxyz = cuda_array_view_from_object(shell_cxyz_obj, "shell_cxyz");
+  const CudaArrayView shell_prim_start = cuda_array_view_from_object(shell_prim_start_obj, "shell_prim_start");
+  const CudaArrayView shell_nprim = cuda_array_view_from_object(shell_nprim_obj, "shell_nprim");
+  const CudaArrayView shell_l = cuda_array_view_from_object(shell_l_obj, "shell_l");
+  const CudaArrayView shell_ao_start = cuda_array_view_from_object(shell_ao_start_obj, "shell_ao_start");
+  const CudaArrayView prim_exp = cuda_array_view_from_object(prim_exp_obj, "prim_exp");
+  const CudaArrayView prim_coef = cuda_array_view_from_object(prim_coef_obj, "prim_coef");
+  const CudaArrayView points = cuda_array_view_from_object(points_obj, "points");
+  const CudaArrayView ao = cuda_array_view_from_object(ao_obj, "ao");
+  const CudaArrayView ao_grad = cuda_array_view_from_object(ao_grad_obj, "ao_grad");
+
+  const int64_t nshell = shell_l.shape.empty() ? 0 : shell_l.shape[0];
+  if (nshell <= 0) throw std::invalid_argument("shell arrays must be non-empty");
+
+  require_typestr(shell_cxyz, "shell_cxyz", "<f8");
+  require_typestr(shell_prim_start, "shell_prim_start", "<i4");
+  require_typestr(shell_nprim, "shell_nprim", "<i4");
+  require_typestr(shell_l, "shell_l", "<i4");
+  require_typestr(shell_ao_start, "shell_ao_start", "<i4");
+  require_typestr(prim_exp, "prim_exp", "<f8");
+  require_typestr(prim_coef, "prim_coef", "<f8");
+  require_typestr(points, "points", "<f8");
+  require_typestr(ao, "ao", "<f8");
+  require_typestr(ao_grad, "ao_grad", "<f8");
+
+  require_c_contiguous(shell_cxyz, "shell_cxyz", 8);
+  require_c_contiguous(shell_prim_start, "shell_prim_start", 4);
+  require_c_contiguous(shell_nprim, "shell_nprim", 4);
+  require_c_contiguous(shell_l, "shell_l", 4);
+  require_c_contiguous(shell_ao_start, "shell_ao_start", 4);
+  require_c_contiguous(prim_exp, "prim_exp", 8);
+  require_c_contiguous(prim_coef, "prim_coef", 8);
+  require_c_contiguous(points, "points", 8);
+  require_c_contiguous(ao, "ao", 8);
+  require_c_contiguous(ao_grad, "ao_grad", 8);
+
+  if (shell_cxyz.shape.size() != 2 || shell_cxyz.shape[0] != nshell || shell_cxyz.shape[1] != 3) {
+    throw std::invalid_argument("shell_cxyz must have shape (nshell,3)");
+  }
+  if (shell_prim_start.shape.size() != 1 || shell_prim_start.shape[0] != nshell) {
+    throw std::invalid_argument("shell_prim_start must have shape (nshell,)");
+  }
+  if (shell_nprim.shape.size() != 1 || shell_nprim.shape[0] != nshell) {
+    throw std::invalid_argument("shell_nprim must have shape (nshell,)");
+  }
+  if (shell_l.shape.size() != 1 || shell_l.shape[0] != nshell) {
+    throw std::invalid_argument("shell_l must have shape (nshell,)");
+  }
+  if (shell_ao_start.shape.size() != 1 || shell_ao_start.shape[0] != nshell) {
+    throw std::invalid_argument("shell_ao_start must have shape (nshell,)");
+  }
+
+  if (prim_exp.shape.size() != 1) throw std::invalid_argument("prim_exp must be 1D");
+  if (prim_coef.shape.size() != 1) throw std::invalid_argument("prim_coef must be 1D");
+  if (prim_coef.shape[0] != prim_exp.shape[0]) throw std::invalid_argument("prim_exp/prim_coef length mismatch");
+
+  if (points.shape.size() != 2 || points.shape[1] != 3) {
+    throw std::invalid_argument("points must have shape (npt,3)");
+  }
+  const int32_t npt = int32_t(points.shape[0]);
+
+  if (ao.read_only) throw std::invalid_argument("ao output must be writable");
+  if (ao.shape.size() != 2) throw std::invalid_argument("ao must be 2D (npt,nao)");
+  if (ao.shape[0] != npt) throw std::invalid_argument("ao must have shape (npt,nao)");
+  const int32_t nao = int32_t(ao.shape[1]);
+
+  if (ao_grad.read_only) throw std::invalid_argument("ao_grad output must be writable");
+  if (ao_grad.shape.size() != 3) throw std::invalid_argument("ao_grad must be 3D (npt,nao,3)");
+  if (ao_grad.shape[0] != npt || ao_grad.shape[1] != nao || ao_grad.shape[2] != 3) {
+    throw std::invalid_argument("ao_grad must have shape (npt,nao,3) matching ao");
+  }
+
+  const cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
+
+  if (npt > 0 && nao > 0) {
+    orbitals_eval_aos_cart_value_grad_f64(
+        static_cast<const double*>(shell_cxyz.ptr),
+        static_cast<const int32_t*>(shell_prim_start.ptr),
+        static_cast<const int32_t*>(shell_nprim.ptr),
+        static_cast<const int32_t*>(shell_l.ptr),
+        static_cast<const int32_t*>(shell_ao_start.ptr),
+        static_cast<const double*>(prim_exp.ptr),
+        static_cast<const double*>(prim_coef.ptr),
+        int32_t(nshell),
+        nao,
+        static_cast<const double*>(points.ptr),
+        npt,
+        static_cast<double*>(ao.ptr),
+        static_cast<double*>(ao_grad.ptr),
+        stream);
+    throw_on_cuda_error(cudaGetLastError(), "orbitals_eval_aos_cart_value_grad_f64 kernel launch");
+  }
+
+  if (sync) {
+    throw_on_cuda_error(cudaStreamSynchronize(stream), "cudaStreamSynchronize");
+  }
+}
+
+void contract_aos_cart_value_grad_vjp_atomgrad_f64_inplace_device(
+    const py::object& shell_cxyz_obj,
+    const py::object& shell_prim_start_obj,
+    const py::object& shell_nprim_obj,
+    const py::object& shell_l_obj,
+    const py::object& shell_ao_start_obj,
+    const py::object& prim_exp_obj,
+    const py::object& prim_coef_obj,
+    const py::object& points_obj,
+    const py::object& point_atom_obj,
+    const py::object& w_pow_obj,
+    const py::object& bar_ao_obj,
+    const py::object& shell_atom_obj,
+    const py::object& grad_out_obj,
+    int32_t threads,
+    uint64_t stream_ptr,
+    bool sync) {
+  (void)threads;
+
+  const CudaArrayView shell_cxyz = cuda_array_view_from_object(shell_cxyz_obj, "shell_cxyz");
+  const CudaArrayView shell_prim_start = cuda_array_view_from_object(shell_prim_start_obj, "shell_prim_start");
+  const CudaArrayView shell_nprim = cuda_array_view_from_object(shell_nprim_obj, "shell_nprim");
+  const CudaArrayView shell_l = cuda_array_view_from_object(shell_l_obj, "shell_l");
+  const CudaArrayView shell_ao_start = cuda_array_view_from_object(shell_ao_start_obj, "shell_ao_start");
+  const CudaArrayView prim_exp = cuda_array_view_from_object(prim_exp_obj, "prim_exp");
+  const CudaArrayView prim_coef = cuda_array_view_from_object(prim_coef_obj, "prim_coef");
+  const CudaArrayView points = cuda_array_view_from_object(points_obj, "points");
+  const CudaArrayView point_atom = cuda_array_view_from_object(point_atom_obj, "point_atom");
+  const CudaArrayView w_pow = cuda_array_view_from_object(w_pow_obj, "w_pow");
+  const CudaArrayView bar_ao = cuda_array_view_from_object(bar_ao_obj, "bar_ao");
+  const CudaArrayView shell_atom = cuda_array_view_from_object(shell_atom_obj, "shell_atom");
+  const CudaArrayView grad_out = cuda_array_view_from_object(grad_out_obj, "grad_out");
+
+  const int64_t nshell = shell_l.shape.empty() ? 0 : shell_l.shape[0];
+  if (nshell <= 0) throw std::invalid_argument("shell arrays must be non-empty");
+
+  require_typestr(shell_cxyz, "shell_cxyz", "<f8");
+  require_typestr(shell_prim_start, "shell_prim_start", "<i4");
+  require_typestr(shell_nprim, "shell_nprim", "<i4");
+  require_typestr(shell_l, "shell_l", "<i4");
+  require_typestr(shell_ao_start, "shell_ao_start", "<i4");
+  require_typestr(prim_exp, "prim_exp", "<f8");
+  require_typestr(prim_coef, "prim_coef", "<f8");
+  require_typestr(points, "points", "<f8");
+  require_typestr(point_atom, "point_atom", "<i4");
+  require_typestr(w_pow, "w_pow", "<f8");
+  require_typestr(bar_ao, "bar_ao", "<f8");
+  require_typestr(shell_atom, "shell_atom", "<i4");
+  require_typestr(grad_out, "grad_out", "<f8");
+
+  require_c_contiguous(shell_cxyz, "shell_cxyz", 8);
+  require_c_contiguous(shell_prim_start, "shell_prim_start", 4);
+  require_c_contiguous(shell_nprim, "shell_nprim", 4);
+  require_c_contiguous(shell_l, "shell_l", 4);
+  require_c_contiguous(shell_ao_start, "shell_ao_start", 4);
+  require_c_contiguous(prim_exp, "prim_exp", 8);
+  require_c_contiguous(prim_coef, "prim_coef", 8);
+  require_c_contiguous(points, "points", 8);
+  require_c_contiguous(point_atom, "point_atom", 4);
+  require_c_contiguous(w_pow, "w_pow", 8);
+  require_c_contiguous(bar_ao, "bar_ao", 8);
+  require_c_contiguous(shell_atom, "shell_atom", 4);
+  require_c_contiguous(grad_out, "grad_out", 8);
+
+  if (shell_cxyz.shape.size() != 2 || shell_cxyz.shape[0] != nshell || shell_cxyz.shape[1] != 3) {
+    throw std::invalid_argument("shell_cxyz must have shape (nshell,3)");
+  }
+  if (shell_prim_start.shape.size() != 1 || shell_prim_start.shape[0] != nshell) {
+    throw std::invalid_argument("shell_prim_start must have shape (nshell,)");
+  }
+  if (shell_nprim.shape.size() != 1 || shell_nprim.shape[0] != nshell) {
+    throw std::invalid_argument("shell_nprim must have shape (nshell,)");
+  }
+  if (shell_l.shape.size() != 1 || shell_l.shape[0] != nshell) {
+    throw std::invalid_argument("shell_l must have shape (nshell,)");
+  }
+  if (shell_ao_start.shape.size() != 1 || shell_ao_start.shape[0] != nshell) {
+    throw std::invalid_argument("shell_ao_start must have shape (nshell,)");
+  }
+
+  if (prim_exp.shape.size() != 1) throw std::invalid_argument("prim_exp must be 1D");
+  if (prim_coef.shape.size() != 1) throw std::invalid_argument("prim_coef must be 1D");
+  if (prim_coef.shape[0] != prim_exp.shape[0]) throw std::invalid_argument("prim_exp/prim_coef length mismatch");
+
+  if (points.shape.size() != 2 || points.shape[1] != 3) {
+    throw std::invalid_argument("points must have shape (npt,3)");
+  }
+  const int32_t npt = int32_t(points.shape[0]);
+  if (point_atom.shape.size() != 1 || point_atom.shape[0] != npt) {
+    throw std::invalid_argument("point_atom must have shape (npt,) matching points");
+  }
+  if (w_pow.shape.size() != 1 || w_pow.shape[0] != npt) {
+    throw std::invalid_argument("w_pow must have shape (npt,) matching points");
+  }
+
+  if (bar_ao.shape.size() != 2) throw std::invalid_argument("bar_ao must be 2D (npt,nao)");
+  if (bar_ao.shape[0] != npt) throw std::invalid_argument("bar_ao must have shape (npt,nao)");
+  const int32_t nao = int32_t(bar_ao.shape[1]);
+
+  if (shell_atom.shape.size() != 1 || shell_atom.shape[0] != nshell) {
+    throw std::invalid_argument("shell_atom must have shape (nshell,)");
+  }
+
+  if (grad_out.read_only) throw std::invalid_argument("grad_out must be writable");
+  if (grad_out.shape.size() != 2 || grad_out.shape[1] != 3) {
+    throw std::invalid_argument("grad_out must have shape (natm,3)");
+  }
+  const int32_t natm = int32_t(grad_out.shape[0]);
+
+  const cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
+
+  if (npt > 0 && nao > 0 && natm > 0) {
+    orbitals_contract_aos_cart_value_grad_vjp_atomgrad_f64(
+        static_cast<const double*>(shell_cxyz.ptr),
+        static_cast<const int32_t*>(shell_prim_start.ptr),
+        static_cast<const int32_t*>(shell_nprim.ptr),
+        static_cast<const int32_t*>(shell_l.ptr),
+        static_cast<const int32_t*>(shell_ao_start.ptr),
+        static_cast<const double*>(prim_exp.ptr),
+        static_cast<const double*>(prim_coef.ptr),
+        int32_t(nshell),
+        nao,
+        static_cast<const double*>(points.ptr),
+        npt,
+        static_cast<const int32_t*>(point_atom.ptr),
+        static_cast<const double*>(w_pow.ptr),
+        static_cast<const double*>(bar_ao.ptr),
+        static_cast<const int32_t*>(shell_atom.ptr),
+        natm,
+        static_cast<double*>(grad_out.ptr),
+        stream);
+    throw_on_cuda_error(cudaGetLastError(), "orbitals_contract_aos_cart_value_grad_vjp_atomgrad_f64 kernel launch");
+  }
+
+  if (sync) {
+    throw_on_cuda_error(cudaStreamSynchronize(stream), "cudaStreamSynchronize");
+  }
+}
+
+void becke_weight_vjp_atomgrad_f64_inplace_device(
+    const py::object& points_obj,
+    const py::object& weights_obj,
+    const py::object& bar_w_obj,
+    const py::object& point_atom_obj,
+    const py::object& atom_coords_obj,
+    const py::object& RAB_obj,
+    int32_t becke_n,
+    const py::object& grad_out_obj,
+    int32_t threads,
+    uint64_t stream_ptr,
+    bool sync) {
+  const CudaArrayView points = cuda_array_view_from_object(points_obj, "points");
+  const CudaArrayView weights = cuda_array_view_from_object(weights_obj, "weights");
+  const CudaArrayView bar_w = cuda_array_view_from_object(bar_w_obj, "bar_w");
+  const CudaArrayView point_atom = cuda_array_view_from_object(point_atom_obj, "point_atom");
+  const CudaArrayView atom_coords = cuda_array_view_from_object(atom_coords_obj, "atom_coords");
+  const CudaArrayView RAB = cuda_array_view_from_object(RAB_obj, "RAB");
+  const CudaArrayView grad_out = cuda_array_view_from_object(grad_out_obj, "grad_out");
+
+  require_typestr(points, "points", "<f8");
+  require_typestr(weights, "weights", "<f8");
+  require_typestr(bar_w, "bar_w", "<f8");
+  require_typestr(point_atom, "point_atom", "<i4");
+  require_typestr(atom_coords, "atom_coords", "<f8");
+  require_typestr(RAB, "RAB", "<f8");
+  require_typestr(grad_out, "grad_out", "<f8");
+
+  require_c_contiguous(points, "points", 8);
+  require_c_contiguous(weights, "weights", 8);
+  require_c_contiguous(bar_w, "bar_w", 8);
+  require_c_contiguous(point_atom, "point_atom", 4);
+  require_c_contiguous(atom_coords, "atom_coords", 8);
+  require_c_contiguous(RAB, "RAB", 8);
+  require_c_contiguous(grad_out, "grad_out", 8);
+
+  if (points.shape.size() != 2 || points.shape[1] != 3) throw std::invalid_argument("points must have shape (npt,3)");
+  const int32_t npt = int32_t(points.shape[0]);
+
+  if (weights.shape.size() != 1 || weights.shape[0] != npt) throw std::invalid_argument("weights must have shape (npt,) matching points");
+  if (bar_w.shape.size() != 1 || bar_w.shape[0] != npt) throw std::invalid_argument("bar_w must have shape (npt,) matching points");
+  if (point_atom.shape.size() != 1 || point_atom.shape[0] != npt)
+    throw std::invalid_argument("point_atom must have shape (npt,) matching points");
+
+  if (atom_coords.shape.size() != 2 || atom_coords.shape[1] != 3)
+    throw std::invalid_argument("atom_coords must have shape (natm,3)");
+  const int32_t natm = int32_t(atom_coords.shape[0]);
+
+  if (RAB.shape.size() != 2 || RAB.shape[0] != natm || RAB.shape[1] != natm)
+    throw std::invalid_argument("RAB must have shape (natm,natm) matching atom_coords");
+
+  if (grad_out.read_only) throw std::invalid_argument("grad_out must be writable");
+  if (grad_out.shape.size() != 2 || grad_out.shape[0] != natm || grad_out.shape[1] != 3)
+    throw std::invalid_argument("grad_out must have shape (natm,3)");
+
+  // Keep kernel constraints explicit for clearer error messages.
+  if (natm > 128) throw std::invalid_argument("becke_weight_vjp_atomgrad supports natm <= 128");
+
+  const cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
+  orbitals_becke_weight_vjp_atomgrad_f64(
+      static_cast<const double*>(points.ptr),
+      static_cast<const double*>(weights.ptr),
+      static_cast<const double*>(bar_w.ptr),
+      npt,
+      static_cast<const int32_t*>(point_atom.ptr),
+      static_cast<const double*>(atom_coords.ptr),
+      static_cast<const double*>(RAB.ptr),
+      natm,
+      becke_n,
+      static_cast<double*>(grad_out.ptr),
+      stream,
+      threads);
+  throw_on_cuda_error(cudaGetLastError(), "orbitals_becke_weight_vjp_atomgrad_f64 kernel launch");
+
+  if (sync) {
+    throw_on_cuda_error(cudaStreamSynchronize(stream), "cudaStreamSynchronize");
+  }
+}
+
 void eval_density_otpd_f64_inplace_device(
     const py::object& shell_cxyz_obj,
     const py::object& shell_prim_start_obj,
@@ -964,6 +1296,58 @@ PYBIND11_MODULE(_orbitals_cuda_ext, m) {
       py::arg("prim_coef"),
       py::arg("points"),
       py::arg("ao"),
+      py::arg("threads") = 256,
+      py::arg("stream_ptr") = uint64_t(0),
+      py::arg("sync") = true);
+
+  m.def(
+      "eval_aos_cart_value_grad_f64_inplace_device",
+      &eval_aos_cart_value_grad_f64_inplace_device,
+      py::arg("shell_cxyz"),
+      py::arg("shell_prim_start"),
+      py::arg("shell_nprim"),
+      py::arg("shell_l"),
+      py::arg("shell_ao_start"),
+      py::arg("prim_exp"),
+      py::arg("prim_coef"),
+      py::arg("points"),
+      py::arg("ao"),
+      py::arg("ao_grad"),
+      py::arg("threads") = 256,
+      py::arg("stream_ptr") = uint64_t(0),
+      py::arg("sync") = true);
+
+  m.def(
+      "contract_aos_cart_value_grad_vjp_atomgrad_f64_inplace_device",
+      &contract_aos_cart_value_grad_vjp_atomgrad_f64_inplace_device,
+      py::arg("shell_cxyz"),
+      py::arg("shell_prim_start"),
+      py::arg("shell_nprim"),
+      py::arg("shell_l"),
+      py::arg("shell_ao_start"),
+      py::arg("prim_exp"),
+      py::arg("prim_coef"),
+      py::arg("points"),
+      py::arg("point_atom"),
+      py::arg("w_pow"),
+      py::arg("bar_ao"),
+      py::arg("shell_atom"),
+      py::arg("grad_out"),
+      py::arg("threads") = 256,
+      py::arg("stream_ptr") = uint64_t(0),
+      py::arg("sync") = true);
+
+  m.def(
+      "becke_weight_vjp_atomgrad_f64_inplace_device",
+      &becke_weight_vjp_atomgrad_f64_inplace_device,
+      py::arg("points"),
+      py::arg("weights"),
+      py::arg("bar_w"),
+      py::arg("point_atom"),
+      py::arg("atom_coords"),
+      py::arg("RAB"),
+      py::arg("becke_n"),
+      py::arg("grad_out"),
       py::arg("threads") = 256,
       py::arg("stream_ptr") = uint64_t(0),
       py::arg("sync") = true);

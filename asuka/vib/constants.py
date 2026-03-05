@@ -36,6 +36,11 @@ CM1_TO_AU = 1.0 / AU_TO_CM1
 # Boltzmann constant in Hartree/K.
 KB_HARTREE_PER_K = 3.166811563e-6
 
+# Time conversion
+# 1 a.u. of time (hbar/Eh) in femtoseconds.
+AU_TIME_TO_FS = 0.024188843265857
+FS_TO_AU_TIME = 1.0 / AU_TIME_TO_FS
+
 TWOPI = 2.0 * math.pi
 
 __all__ = [
@@ -45,5 +50,7 @@ __all__ = [
     "AU_TO_CM1",
     "CM1_TO_AU",
     "KB_HARTREE_PER_K",
+    "AU_TIME_TO_FS",
+    "FS_TO_AU_TIME",
     "TWOPI",
 ]

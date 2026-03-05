@@ -3,11 +3,14 @@ from __future__ import annotations
 """Harmonic vibrational frequency analysis and normal modes."""
 
 from dataclasses import dataclass
-from typing import Any, Sequence
+from typing import Any, Sequence, TYPE_CHECKING
 
 import numpy as np
 
 from .constants import AMU_TO_AU, AU_TO_CM1
+
+if TYPE_CHECKING:
+    from .sampling import WignerSample
 
 
 @dataclass(frozen=True)
@@ -66,7 +69,8 @@ class NormalModes:
         scale: float = 1.0,
         seed: int | None = None,
         unit: str = "Bohr",
-    ) -> np.ndarray:
+        return_velocities: bool = False,
+    ) -> "np.ndarray | WignerSample":
         from .sampling import sample_normal_modes as _sample  # noqa: PLC0415
 
         return _sample(
@@ -78,6 +82,7 @@ class NormalModes:
             scale=float(scale),
             seed=None if seed is None else int(seed),
             unit=str(unit),
+            return_velocities=bool(return_velocities),
         )
 
 

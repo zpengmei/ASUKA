@@ -2,14 +2,23 @@ from __future__ import annotations
 
 """Normal mode displacements and sampling."""
 
+from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 import numpy as np
 
-from .constants import AMU_TO_AU, ANGSTROM_TO_BOHR, BOHR_TO_ANGSTROM, KB_HARTREE_PER_K
+from .constants import AMU_TO_AU, ANGSTROM_TO_BOHR, AU_TIME_TO_FS, BOHR_TO_ANGSTROM, KB_HARTREE_PER_K
 
 if TYPE_CHECKING:
     from .frequency import NormalModes
+
+
+@dataclass(frozen=True)
+class WignerSample:
+    """Sampled initial conditions (positions and velocities)."""
+
+    coords: np.ndarray       # (n_samples, natm, 3)
+    velocities: np.ndarray   # (n_samples, natm, 3)
 
 
 def displace_along_mode(
@@ -77,8 +86,14 @@ def sample_normal_modes(
     scale: float = 1.0,
     seed: int | None = None,
     unit: str = "Bohr",
-) -> np.ndarray:
-    """Sample geometries from a harmonic normal mode model."""
+    return_velocities: bool = False,
+) -> np.ndarray | WignerSample:
+    """Sample geometries (and optionally velocities) from a harmonic normal mode model.
+
+    When *return_velocities* is False (default) a bare coordinate array is
+    returned for backward compatibility.  When True a :class:`WignerSample`
+    with both ``coords`` and ``velocities`` is returned.
+    """
 
     natm = int(modes.coords_bohr.shape[0])
     if int(n_samples) <= 0:
@@ -103,21 +118,22 @@ def sample_normal_modes(
 
     omega = np.sqrt(np.abs(lam_k))
 
+    # --- position variance (mass-weighted normal-mode coordinate Q) ---
     if method_s == "classical":
         if T == 0.0:
-            sigma2 = np.zeros_like(omega)
+            sigma2_q = np.zeros_like(omega)
         else:
-            sigma2 = float(KB_HARTREE_PER_K) * T / (omega**2)
+            sigma2_q = float(KB_HARTREE_PER_K) * T / (omega**2)
     else:
         if T == 0.0:
-            sigma2 = 1.0 / (2.0 * omega)
+            sigma2_q = 1.0 / (2.0 * omega)
         else:
             beta = 1.0 / (float(KB_HARTREE_PER_K) * T)
             x = 0.5 * beta * omega
-            sigma2 = (0.5 * _coth(x)) / omega
+            sigma2_q = (0.5 * _coth(x)) / omega
 
     rng = np.random.default_rng(None if seed is None else int(seed))
-    q = rng.normal(loc=0.0, scale=np.sqrt(sigma2), size=(int(n_samples), lam_k.size))
+    q = rng.normal(loc=0.0, scale=np.sqrt(sigma2_q), size=(int(n_samples), lam_k.size))
     q *= float(scale)
 
     dq_flat = q @ Vmw_k.T
@@ -129,15 +145,42 @@ def sample_normal_modes(
 
     coords = modes.coords_bohr[None, :, :] + dR
 
+    # --- momentum / velocity sampling (only when requested) ---
+    if return_velocities:
+        if method_s == "classical":
+            if T == 0.0:
+                sigma2_p = np.zeros_like(omega)
+            else:
+                sigma2_p = np.full_like(omega, float(KB_HARTREE_PER_K) * T)
+        else:
+            if T == 0.0:
+                sigma2_p = omega / 2.0
+            else:
+                sigma2_p = (omega / 2.0) * _coth(x)
+
+        p = rng.normal(loc=0.0, scale=np.sqrt(sigma2_p), size=(int(n_samples), lam_k.size))
+        p *= float(scale)
+
+        dp_flat = p @ Vmw_k.T
+        v_flat = dp_flat * inv_sqrt_m[None, :]
+        velocities = v_flat.reshape((int(n_samples), natm, 3))
+
     unit_s = str(unit).strip().lower()
     if unit_s in ("bohr", "a0", "au"):
+        if return_velocities:
+            return WignerSample(coords=coords, velocities=velocities)
         return coords
     if unit_s in ("angstrom", "ang", "a"):
-        return coords * float(BOHR_TO_ANGSTROM)
+        coords_out = coords * float(BOHR_TO_ANGSTROM)
+        if return_velocities:
+            vel_out = velocities * (float(BOHR_TO_ANGSTROM) / float(AU_TIME_TO_FS))
+            return WignerSample(coords=coords_out, velocities=vel_out)
+        return coords_out
     raise ValueError("unit must be 'Bohr' or 'Angstrom'")
 
 
 __all__ = [
+    "WignerSample",
     "displace_along_mode",
     "sample_normal_modes",
 ]

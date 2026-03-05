@@ -68,6 +68,27 @@ KERNELS: list[KernelSymbol] = [
     ),
     KernelSymbol(
         EXT_MODULE,
+        "eval_aos_cart_value_grad_f64_inplace_device",
+        category="orbitals_aos",
+        purpose="Evaluate cartesian AO values + gradients on points (float64).",
+        io="in: packed shell arrays + points -> out: ao (npt,nao_cart), ao_grad (npt,nao_cart,3)",
+    ),
+    KernelSymbol(
+        EXT_MODULE,
+        "contract_aos_cart_value_grad_vjp_atomgrad_f64_inplace_device",
+        category="orbitals_grad",
+        purpose="Contract weighted AO collocation adjoint into per-atom gradients (moving-grid aware).",
+        io="in: packed shell arrays + points + point_atom + w_pow + bar_ao + shell_atom -> out: grad_out (natm,3)",
+    ),
+    KernelSymbol(
+        EXT_MODULE,
+        "becke_weight_vjp_atomgrad_f64_inplace_device",
+        category="orbitals_grad",
+        purpose="Contract Becke partition weight adjoint into per-atom gradients (moving-grid aware).",
+        io="in: points/weights + bar_w + point_atom + atom_coords + RAB -> out: grad_out (natm,3)",
+    ),
+    KernelSymbol(
+        EXT_MODULE,
         "eval_density_otpd_f64_inplace_device",
         category="orbitals_density",
         purpose="Evaluate core/active density ingredients (float64).",

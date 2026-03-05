@@ -190,7 +190,7 @@ def build_thc_factors(
     from asuka.orbitals.eval_basis_device import (  # noqa: PLC0415
         eval_aos_cart_value_on_points_device,
     )
-    from asuka.density import DeviceGridSpec, make_becke_grid_device  # noqa: PLC0415
+    from asuka.density import DeviceGridSpec  # noqa: PLC0415
 
     grid_spec = DeviceGridSpec() if grid_spec is None else grid_spec
 
@@ -212,50 +212,48 @@ def build_thc_factors(
             # Best-effort profiling only.
             pass
 
+    point_atom = None
+
     t_grid = time.perf_counter() if prof is not None else None
     if grid_kind_s in {"becke", "becke_grid", "atom", "atom-centered"}:
+        from asuka.density.grids_device import iter_becke_grid_device  # noqa: PLC0415
+
         # If the caller requests a reduced point count, avoid a global
         # weight-based downselect that can accidentally starve some atoms of
         # grid coverage for larger molecules. Instead, downselect per-atom
         # (using the Becke atom ordering) and then concatenate.
-        if npt is None:
-            pts_all, w_all = make_becke_grid_device(
-                mol_or_coords,
-                radial_n=int(getattr(grid_spec, "radial_n", 50)),
-                angular_n=int(getattr(grid_spec, "angular_n", 302)),
-                angular_kind=str(getattr(grid_spec, "angular_kind", "auto")),
-                rmax=float(getattr(grid_spec, "rmax", 20.0)),
-                becke_n=int(getattr(grid_spec, "becke_n", 3)),
-                prune_tol=float(getattr(grid_spec, "prune_tol", 1e-16)),
-                threads=int(getattr(grid_spec, "threads", 256)),
-                stream=stream,
-            )
+        pts_atoms: list[Any] = []
+        w_atoms: list[Any] = []
+        for pts_i, w_i in iter_becke_grid_device(
+            mol_or_coords,
+            radial_n=int(getattr(grid_spec, "radial_n", 50)),
+            angular_n=int(getattr(grid_spec, "angular_n", 302)),
+            angular_kind=str(getattr(grid_spec, "angular_kind", "auto")),
+            rmax=float(getattr(grid_spec, "rmax", 20.0)),
+            becke_n=int(getattr(grid_spec, "becke_n", 3)),
+            block_size=10**9,  # one block per atom
+            prune_tol=float(getattr(grid_spec, "prune_tol", 1e-16)),
+            threads=int(getattr(grid_spec, "threads", 256)),
+            stream=stream,
+        ):
+            pts_atoms.append(cp.ascontiguousarray(cp.asarray(pts_i, dtype=cp.float64)))
+            w_atoms.append(cp.ascontiguousarray(cp.asarray(w_i, dtype=cp.float64).ravel()))
+
+        grid_npt_full_override = int(sum(int(wi.shape[0]) for wi in w_atoms))
+        natm = int(len(pts_atoms))
+        if natm <= 0:
+            pts_all, w_all = cp.zeros((0, 3), dtype=cp.float64), cp.zeros((0,), dtype=cp.float64)
+            point_atom = cp.zeros((0,), dtype=cp.int32)
+            npt = None
         else:
-            from asuka.density.grids_device import iter_becke_grid_device  # noqa: PLC0415
-
-            pts_atoms: list[Any] = []
-            w_atoms: list[Any] = []
-            for pts_i, w_i in iter_becke_grid_device(
-                mol_or_coords,
-                radial_n=int(getattr(grid_spec, "radial_n", 50)),
-                angular_n=int(getattr(grid_spec, "angular_n", 302)),
-                angular_kind=str(getattr(grid_spec, "angular_kind", "auto")),
-                rmax=float(getattr(grid_spec, "rmax", 20.0)),
-                becke_n=int(getattr(grid_spec, "becke_n", 3)),
-                block_size=10**9,  # one block per atom
-                prune_tol=float(getattr(grid_spec, "prune_tol", 1e-16)),
-                threads=int(getattr(grid_spec, "threads", 256)),
-                stream=stream,
-            ):
-                pts_atoms.append(cp.ascontiguousarray(cp.asarray(pts_i, dtype=cp.float64)))
-                w_atoms.append(cp.ascontiguousarray(cp.asarray(w_i, dtype=cp.float64).ravel()))
-
-            grid_npt_full_override = int(sum(int(wi.shape[0]) for wi in w_atoms))
-            natm = int(len(pts_atoms))
-            npt_req = int(npt)
-            if natm <= 0:
-                pts_all, w_all = cp.zeros((0, 3), dtype=cp.float64), cp.zeros((0,), dtype=cp.float64)
+            if npt is None:
+                pts_all = cp.ascontiguousarray(cp.concatenate(pts_atoms, axis=0))
+                w_all = cp.ascontiguousarray(cp.concatenate(w_atoms, axis=0))
+                point_atom = cp.ascontiguousarray(
+                    cp.concatenate([cp.full((int(wi.shape[0]),), int(ia), dtype=cp.int32) for ia, wi in enumerate(w_atoms)], axis=0)
+                )
             else:
+                npt_req = int(npt)
                 if npt_req <= 0:
                     raise ValueError("npt must be > 0")
                 base = int(npt_req // natm)
@@ -263,43 +261,62 @@ def build_thc_factors(
                 alloc = [base + (1 if i < rem else 0) for i in range(natm)]
                 pts_sel: list[Any] = []
                 w_sel: list[Any] = []
-                for pts_i, w_i, ni in zip(pts_atoms, w_atoms, alloc):
+                a_sel: list[Any] = []
+                for ia, (pts_i, w_i, ni) in enumerate(zip(pts_atoms, w_atoms, alloc)):
                     if int(ni) <= 0:
                         continue
                     pts_j, w_j = _downselect_by_weight(cp, pts_i, w_i, npt=int(ni))
                     pts_sel.append(pts_j)
                     w_sel.append(w_j)
+                    a_sel.append(cp.full((int(w_j.shape[0]),), int(ia), dtype=cp.int32))
                 if len(pts_sel) == 0:
                     pts_all, w_all = cp.zeros((0, 3), dtype=cp.float64), cp.zeros((0,), dtype=cp.float64)
+                    point_atom = cp.zeros((0,), dtype=cp.int32)
                 else:
                     pts_all = cp.ascontiguousarray(cp.concatenate(pts_sel, axis=0))
                     w_all = cp.ascontiguousarray(cp.concatenate(w_sel, axis=0))
+                    point_atom = cp.ascontiguousarray(cp.concatenate(a_sel, axis=0))
 
-            # Mark as already downselected.
-            npt = None
+                # Mark as already downselected.
+                npt = None
     elif grid_kind_s in {"rdvr", "r-dvr", "r_dvr"}:
         if dvr_basis is None:
             raise ValueError("grid_kind='rdvr' requires dvr_basis (use aux_basis or provide a separate DVR basis)")
         # Prefer the CUDA-backed R-DVR grid generator to keep Becke partitioning
         # on the GPU (paper-faithful / apple-to-apple).
-        from asuka.density.dvr_grids_device import (  # noqa: PLC0415
-            iter_rdvr_grid_device,
-            make_rdvr_grid_device,
-        )
+        from asuka.density.dvr_grids_device import iter_rdvr_grid_device  # noqa: PLC0415
 
-        if npt is None:
-            pts_all, w_all = make_rdvr_grid_device(
-                mol_or_coords,
-                dvr_basis,
-                angular_n=int(getattr(grid_spec, "angular_n", 302)),
-                angular_kind=str(getattr(grid_spec, "angular_kind", "auto")),
-                radial_rmax=float(grid_opts.get("radial_rmax", getattr(grid_spec, "rmax", 20.0))),
-                becke_n=int(getattr(grid_spec, "becke_n", 3)),
-                angular_prune=bool(grid_opts.get("angular_prune", True)),
-                prune_tol=float(getattr(grid_spec, "prune_tol", 1e-16)),
-                ortho_cutoff=float(grid_opts.get("ortho_cutoff", 1e-10)),
-                threads=int(getattr(grid_spec, "threads", 256)),
-                stream=stream,
+        # Build full per-atom R-DVR grids on the GPU (one block per atom).
+        pts_atoms: list[Any] = []
+        w_atoms: list[Any] = []
+        for pts_i, w_i in iter_rdvr_grid_device(
+            mol_or_coords,
+            dvr_basis,
+            angular_n=int(getattr(grid_spec, "angular_n", 302)),
+            angular_kind=str(getattr(grid_spec, "angular_kind", "auto")),
+            radial_rmax=float(grid_opts.get("radial_rmax", getattr(grid_spec, "rmax", 20.0))),
+            becke_n=int(getattr(grid_spec, "becke_n", 3)),
+            block_size=10**9,  # one block per atom
+            angular_prune=bool(grid_opts.get("angular_prune", True)),
+            prune_tol=float(getattr(grid_spec, "prune_tol", 1e-16)),
+            ortho_cutoff=float(grid_opts.get("ortho_cutoff", 1e-10)),
+            threads=int(getattr(grid_spec, "threads", 256)),
+            stream=stream,
+        ):
+            pts_atoms.append(cp.ascontiguousarray(cp.asarray(pts_i, dtype=cp.float64)))
+            w_atoms.append(cp.ascontiguousarray(cp.asarray(w_i, dtype=cp.float64).ravel()))
+
+        grid_npt_full_override = int(sum(int(wi.size) for wi in w_atoms))
+        natm = int(len(pts_atoms))
+        if natm <= 0:
+            pts_all, w_all = cp.zeros((0, 3), dtype=cp.float64), cp.zeros((0,), dtype=cp.float64)
+            point_atom = cp.zeros((0,), dtype=cp.int32)
+            npt = None
+        elif npt is None:
+            pts_all = cp.ascontiguousarray(cp.concatenate(pts_atoms, axis=0))
+            w_all = cp.ascontiguousarray(cp.concatenate(w_atoms, axis=0))
+            point_atom = cp.ascontiguousarray(
+                cp.concatenate([cp.full((int(wi.shape[0]),), int(ia), dtype=cp.int32) for ia, wi in enumerate(w_atoms)], axis=0)
             )
         else:
             # Same rationale as Becke: a global weight-based downselect can starve
@@ -321,32 +338,7 @@ def build_thc_factors(
                 point_select = point_select_req
             explicit_pivot = point_select_req in pivot_keys
 
-            # Build full per-atom R-DVR grids on the GPU (one block per atom).
-            pts_atoms: list[Any] = []
-            w_atoms: list[Any] = []
-            for pts_i, w_i in iter_rdvr_grid_device(
-                mol_or_coords,
-                dvr_basis,
-                angular_n=int(getattr(grid_spec, "angular_n", 302)),
-                angular_kind=str(getattr(grid_spec, "angular_kind", "auto")),
-                radial_rmax=float(grid_opts.get("radial_rmax", getattr(grid_spec, "rmax", 20.0))),
-                becke_n=int(getattr(grid_spec, "becke_n", 3)),
-                block_size=10**9,  # one block per atom
-                angular_prune=bool(grid_opts.get("angular_prune", True)),
-                prune_tol=float(getattr(grid_spec, "prune_tol", 1e-16)),
-                ortho_cutoff=float(grid_opts.get("ortho_cutoff", 1e-10)),
-                threads=int(getattr(grid_spec, "threads", 256)),
-                stream=stream,
-            ):
-                pts_atoms.append(cp.ascontiguousarray(cp.asarray(pts_i, dtype=cp.float64)))
-                w_atoms.append(cp.ascontiguousarray(cp.asarray(w_i, dtype=cp.float64).ravel()))
-
-            grid_npt_full_override = int(sum(int(wi.size) for wi in w_atoms))
-            natm = int(len(pts_atoms))
-            if natm <= 0:
-                pts_all, w_all = cp.zeros((0, 3), dtype=cp.float64), cp.zeros((0,), dtype=cp.float64)
-                npt = None
-            elif point_select in pivot_keys:
+            if point_select in pivot_keys:
                 # Pivoted QR selection (rank-revealing QR) using GPU aux basis
                 # evaluation. Only the QR pivoting itself is done on CPU (SciPy).
                 try:
@@ -420,6 +412,7 @@ def build_thc_factors(
 
                     pts_sel: list[Any] = []
                     w_sel: list[Any] = []
+                    a_sel: list[Any] = []
                     for ia in range(natm):
                         k = int(alloc[int(ia)])
                         if k <= 0:
@@ -457,12 +450,15 @@ def build_thc_factors(
 
                         pts_sel.append(cp.ascontiguousarray(pts_j))
                         w_sel.append(cp.ascontiguousarray(w_j))
+                        a_sel.append(cp.full((int(w_j.size),), int(ia), dtype=cp.int32))
 
                     if len(pts_sel) == 0:
                         pts_all, w_all = cp.zeros((0, 3), dtype=cp.float64), cp.zeros((0,), dtype=cp.float64)
+                        point_atom = cp.zeros((0,), dtype=cp.int32)
                     else:
                         pts_all = cp.ascontiguousarray(cp.concatenate(pts_sel, axis=0))
                         w_all = cp.ascontiguousarray(cp.concatenate(w_sel, axis=0))
+                        point_atom = cp.ascontiguousarray(cp.concatenate(a_sel, axis=0))
                     npt = None
                 except Exception:
                     if explicit_pivot:
@@ -477,17 +473,21 @@ def build_thc_factors(
                 alloc = [base + (1 if i < rem else 0) for i in range(natm)]
                 pts_sel = []
                 w_sel = []
-                for pts_i, w_i, ni in zip(pts_atoms, w_atoms, alloc):
+                a_sel: list[Any] = []
+                for ia, (pts_i, w_i, ni) in enumerate(zip(pts_atoms, w_atoms, alloc)):
                     if int(ni) <= 0:
                         continue
                     pts_j, w_j = _downselect_by_weight(cp, pts_i, w_i, npt=int(ni))
                     pts_sel.append(pts_j)
                     w_sel.append(w_j)
+                    a_sel.append(cp.full((int(w_j.size),), int(ia), dtype=cp.int32))
                 if len(pts_sel) == 0:
                     pts_all, w_all = cp.zeros((0, 3), dtype=cp.float64), cp.zeros((0,), dtype=cp.float64)
+                    point_atom = cp.zeros((0,), dtype=cp.int32)
                 else:
                     pts_all = cp.ascontiguousarray(cp.concatenate(pts_sel, axis=0))
                     w_all = cp.ascontiguousarray(cp.concatenate(w_sel, axis=0))
+                    point_atom = cp.ascontiguousarray(cp.concatenate(a_sel, axis=0))
 
                 npt = None
     elif grid_kind_s in {"fdvr", "f-dvr", "f_dvr"}:
@@ -508,6 +508,8 @@ def build_thc_factors(
         raise ValueError("grid_kind must be one of: 'becke', 'rdvr', 'fdvr'")
     pts_all = cp.ascontiguousarray(cp.asarray(pts_all, dtype=cp.float64))
     w_all = cp.ascontiguousarray(cp.asarray(w_all, dtype=cp.float64).ravel())
+    if point_atom is not None:
+        point_atom = cp.ascontiguousarray(cp.asarray(point_atom, dtype=cp.int32).ravel())
 
     _sync_if_profile()
     if prof is not None and t_grid is not None:
@@ -695,9 +697,18 @@ def build_thc_factors(
                 "and/or increase thc_npt / angular_n."
             )
 
-    meta = None
+    meta: dict[str, Any] = {
+        "grid_kind": str(grid_kind_s),
+        "becke_n": int(getattr(grid_spec, "becke_n", 3)),
+        "prune_tol": float(getattr(grid_spec, "prune_tol", 1e-16)),
+        "grid_options": dict(grid_opts),
+        "solve_method": str(solve_method),
+    }
+    if point_atom is not None:
+        meta["point_atom"] = point_atom
+
     if prof is not None:
-        meta = {"profile_key": "thc_factors"}
+        meta["profile_key"] = "thc_factors"
         try:
             prof["nao"] = int(X.shape[1])
             prof["naux"] = int(naux)

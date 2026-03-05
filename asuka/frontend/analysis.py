@@ -29,6 +29,15 @@ class DFMethodEvalArtifacts:
     grad: Any | None
 
 
+def _to_numpy(x: Any) -> Any:
+    """Convert a CuPy array to NumPy if needed; pass through NumPy/None unchanged."""
+    if x is None:
+        return None
+    if hasattr(x, "get"):
+        return x.get()
+    return x
+
+
 def _clone_molecule_with_coords(mol: Molecule, coords_bohr: np.ndarray) -> Molecule:
     coords = np.asarray(coords_bohr, dtype=np.float64).reshape((-1, 3))
     if coords.shape[0] != int(mol.natm):
@@ -264,9 +273,9 @@ def make_df_casscf_energy_grad(
                         )
                     S_cross = build_S_cross(basis_prev, basis_new, T_bra=T_prev, T_ket=T_new)
 
-                    # Get new SCF orbitals
+                    # Get new SCF orbitals (handle CuPy arrays)
                     scf_mo_coeff = np.asarray(
-                        getattr(getattr(scf_out, "scf", None), "mo_coeff", None),
+                        _to_numpy(getattr(getattr(scf_out, "scf", None), "mo_coeff", None)),
                         dtype=np.float64,
                     )
 
@@ -312,10 +321,10 @@ def make_df_casscf_energy_grad(
             mol.results[str(save_key)] = DFMethodEvalArtifacts(scf_out=scf_out, mc=mc, grad=g)
 
         if bool(warm_start) and bool(getattr(getattr(scf_out, "scf", None), "converged", False)):
-            prev_scf_mo_coeff = getattr(getattr(scf_out, "scf", None), "mo_coeff", None)
+            prev_scf_mo_coeff = _to_numpy(getattr(getattr(scf_out, "scf", None), "mo_coeff", None))
         if bool(warm_start) and bool(getattr(mc, "converged", False)):
-            prev_casscf_mo_coeff = getattr(mc, "mo_coeff", None)
-            prev_ci = getattr(mc, "ci", None)
+            prev_casscf_mo_coeff = _to_numpy(getattr(mc, "mo_coeff", None))
+            prev_ci = _to_numpy(getattr(mc, "ci", None))
             # Store geometry and active space info for orbital tracking
             if bool(orbital_tracking):
                 prev_mol = mol_eval
@@ -416,9 +425,9 @@ def make_df_casci_energy_grad(
             mol.results[str(save_key)] = DFMethodEvalArtifacts(scf_out=scf_out, mc=mc, grad=g)
 
         if bool(warm_start) and bool(getattr(getattr(scf_out, "scf", None), "converged", False)):
-            prev_scf_mo_coeff = getattr(getattr(scf_out, "scf", None), "mo_coeff", None)
+            prev_scf_mo_coeff = _to_numpy(getattr(getattr(scf_out, "scf", None), "mo_coeff", None))
         # CASCI result carries CI, and we can use it as a CI solver initial guess next time.
-        prev_ci = getattr(mc, "ci", None) if bool(warm_start) else prev_ci
+        prev_ci = _to_numpy(getattr(mc, "ci", None)) if bool(warm_start) else prev_ci
 
         return float(g.e_tot), np.asarray(g.grad, dtype=np.float64)
 
@@ -613,7 +622,7 @@ def make_df_casscf_multiroot_energy_grad(
                     S_cross = build_S_cross(basis_prev, basis_new, T_bra=T_prev, T_ket=T_new)
 
                     scf_mo_coeff = np.asarray(
-                        getattr(getattr(scf_out, "scf", None), "mo_coeff", None),
+                        _to_numpy(getattr(getattr(scf_out, "scf", None), "mo_coeff", None)),
                         dtype=np.float64,
                     )
 
@@ -653,10 +662,10 @@ def make_df_casscf_multiroot_energy_grad(
             mol.results[str(save_key)] = DFMethodEvalArtifacts(scf_out=scf_out, mc=mc, grad=g)
 
         if bool(warm_start) and bool(getattr(getattr(scf_out, "scf", None), "converged", False)):
-            prev_scf_mo_coeff = getattr(getattr(scf_out, "scf", None), "mo_coeff", None)
+            prev_scf_mo_coeff = _to_numpy(getattr(getattr(scf_out, "scf", None), "mo_coeff", None))
         if bool(warm_start) and bool(getattr(mc, "converged", False)):
-            prev_casscf_mo_coeff = getattr(mc, "mo_coeff", None)
-            prev_ci = getattr(mc, "ci", None)
+            prev_casscf_mo_coeff = _to_numpy(getattr(mc, "mo_coeff", None))
+            prev_ci = _to_numpy(getattr(mc, "ci", None))
             if bool(orbital_tracking):
                 prev_mol = mol_eval
                 prev_ncore = ncore
