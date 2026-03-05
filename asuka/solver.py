@@ -842,6 +842,41 @@ class GUGAFCISolver(_StreamObject):
         self._matvec_cuda_ws_cache_touch(key)
         self._matvec_cuda_ws_cache_enforce_budget(keep_keys=tuple(keep_keys))
 
+    def release_matvec_cuda_ws_cache(self) -> int:
+        """Release cached CUDA matvec workspaces (to reduce peak VRAM).
+
+        This drops entries from the internal `_matvec_cuda_ws_cache` and calls
+        the best-effort release hook on each workspace. The next CUDA matvec
+        will rebuild workspaces on demand.
+
+        Returns
+        -------
+        int
+            Best-effort estimate of bytes held by the cache before release.
+        """
+
+        total = 0
+        try:
+            for ws in list(getattr(self, "_matvec_cuda_ws_cache", {}).values()):
+                total += int(self._estimate_matvec_cuda_workspace_bytes(ws))
+        except Exception:
+            total = 0
+        try:
+            for k in list(getattr(self, "_matvec_cuda_ws_cache", {}).keys()):
+                self._matvec_cuda_ws_cache_drop(k)
+        except Exception:
+            # Best-effort: if the cache structure isn't as expected, fall back
+            # to clearing references without raising.
+            try:
+                cache = getattr(self, "_matvec_cuda_ws_cache", None)
+                if isinstance(cache, dict):
+                    for ws in list(cache.values()):
+                        self._release_matvec_cuda_workspace(ws)
+                    cache.clear()
+            except Exception:
+                pass
+        return int(max(0, total))
+
     def _configure_matvec_cuda_ws_cache(
         self,
         *,

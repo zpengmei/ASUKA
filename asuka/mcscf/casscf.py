@@ -35,8 +35,14 @@ from asuka.solver import GUGAFCISolver
 from asuka.frontend.molecule import Molecule
 from asuka.frontend.scf import RHFDFRunResult, ROHFDFRunResult, UHFDFRunResult
 
-from .casci import CASCIResult, run_casci_df, eval_casci_energy_df
-from .orbital_grad import allowed_rotation_mask, cayley_update, orbital_gradient_dense, orbital_gradient_df
+from .casci import CASCIResult, run_casci_df, run_casci_thc, eval_casci_energy_df
+from .orbital_grad import (
+    allowed_rotation_mask,
+    cayley_update,
+    orbital_gradient_dense,
+    orbital_gradient_df,
+    orbital_gradient_thc,
+)
 from .state_average import (
     ci_as_list,
     fix_ci_phases,
@@ -517,7 +523,7 @@ def run_casscf_df(
     nroots: int = 1,
     root_weights: Sequence[float] | None = None,
     casci_backend: str = "df",
-    matvec_backend: str = "cuda_eri_mat",
+    matvec_backend: str = "cuda",
     want_eri_mat: bool = True,
     aux_block_naux: int = 256,
     max_tile_bytes: int = 256 * 1024 * 1024,
@@ -605,6 +611,10 @@ def run_casscf_df(
     if not bool(getattr(scf_out.scf, "converged", False)):
         raise RuntimeError("SCF must be converged before CASSCF")
 
+    casci_backend_s = str(casci_backend).strip().lower()
+    if casci_backend_s not in {"df", "dense_cpu", "dense_gpu", "thc"}:
+        raise ValueError("casci_backend must be one of: 'df', 'dense_cpu', 'dense_gpu', 'thc'")
+
     # Keep the incoming SCF object unchanged in the returned result.
     # CASSCF now accepts both DF layouts directly:
     # - mnQ: (nao, nao, naux)
@@ -613,38 +623,41 @@ def run_casscf_df(
     packed_qp_input = False
 
     B = getattr(scf_out_in, "df_B", None)
-    if B is None:
-        raise ValueError("DF-CASSCF requires scf_out.df_B (cached DF factors)")
-    B_shape = getattr(B, "shape", None)
     nao_work = int(getattr(getattr(scf_out_in, "int1e"), "S").shape[0])
-    if B_shape is None:
-        raise ValueError("scf_out.df_B must have a shape")
+    naux_df_work = 0
 
-    if len(B_shape) == 2:
-        packed_qp_input = True
-        from asuka.integrals.tri_packed import ntri_from_nao  # noqa: PLC0415
+    if casci_backend_s == "df":
+        if B is None:
+            raise ValueError("casci_backend='df' requires scf_out.df_B (cached DF factors)")
+        B_shape = getattr(B, "shape", None)
+        if B_shape is None:
+            raise ValueError("scf_out.df_B must have a shape")
 
-        naux, ntri = map(int, B_shape)
-        expected_ntri = int(ntri_from_nao(int(nao_work)))
-        if int(ntri) != int(expected_ntri):
-            raise ValueError(
-                "Packed DF factors must have shape (naux, nao*(nao+1)/2). "
-                f"Got df_B.shape={tuple(map(int, B_shape))} but expected ntri={int(expected_ntri)} for nao={int(nao_work)}."
-            )
-        naux_df_work = int(naux)
-    elif len(B_shape) == 3:
-        if int(B_shape[0]) != int(nao_work) or int(B_shape[1]) != int(nao_work):
+        if len(B_shape) == 2:
+            packed_qp_input = True
+            from asuka.integrals.tri_packed import ntri_from_nao  # noqa: PLC0415
+
+            naux, ntri = map(int, B_shape)
+            expected_ntri = int(ntri_from_nao(int(nao_work)))
+            if int(ntri) != int(expected_ntri):
+                raise ValueError(
+                    "Packed DF factors must have shape (naux, nao*(nao+1)/2). "
+                    f"Got df_B.shape={tuple(map(int, B_shape))} but expected ntri={int(expected_ntri)} for nao={int(nao_work)}."
+                )
+            naux_df_work = int(naux)
+        elif len(B_shape) == 3:
+            if int(B_shape[0]) != int(nao_work) or int(B_shape[1]) != int(nao_work):
+                raise ValueError(
+                    "DF-CASSCF requires scf_out.df_B in mnQ layout (nao,nao,naux) "
+                    f"or packed Qp layout (naux,ntri). Got df_B.shape={tuple(map(int, B_shape))} for nao={int(nao_work)}."
+                )
+            naux_df_work = int(B_shape[2])
+        else:
             raise ValueError(
                 "DF-CASSCF requires scf_out.df_B in mnQ layout (nao,nao,naux) "
-                f"or packed Qp layout (naux,ntri). Got df_B.shape={tuple(map(int, B_shape))} for nao={int(nao_work)}."
+                "or packed Qp layout (naux,ntri). "
+                f"Got df_B.shape={tuple(map(int, B_shape))}."
             )
-        naux_df_work = int(B_shape[2])
-    else:
-        raise ValueError(
-            "DF-CASSCF requires scf_out.df_B in mnQ layout (nao,nao,naux) "
-            "or packed Qp layout (naux,ntri). "
-            f"Got df_B.shape={tuple(map(int, B_shape))}."
-        )
 
     ncore = int(ncore)
     ncas = int(ncas)
@@ -687,6 +700,11 @@ def run_casscf_df(
     orbital_optimizer = str(orbital_optimizer).strip().lower()
     if orbital_optimizer not in {"jacobi", "lbfgs", "ah", "1step"}:
         raise ValueError("orbital_optimizer must be one of: 'jacobi', 'lbfgs', 'ah', '1step'")
+    if casci_backend_s == "thc" and orbital_optimizer in {"ah", "1step"}:
+        raise NotImplementedError(
+            "casci_backend='thc' currently supports orbital_optimizer in {'jacobi','lbfgs'} "
+            "(THC AH/1step wiring is not implemented yet)."
+        )
     newton_aux_block_naux = int(newton_aux_block_naux)
     if newton_aux_block_naux < 0:
         raise ValueError("newton_aux_block_naux must be >= 0")
@@ -787,9 +805,7 @@ def run_casscf_df(
         if adaptive_max_stepsize <= 0.0:
             raise ValueError("adaptive_max_stepsize must be > 0")
 
-    casci_backend_s = str(casci_backend).strip().lower()
-    if casci_backend_s not in {"df", "dense_cpu", "dense_gpu"}:
-        raise ValueError("casci_backend must be one of: 'df', 'dense_cpu', 'dense_gpu'")
+    # `casci_backend_s` was normalized/validated above (needed before DF-factor guards).
 
     _newton_aux_block_env = os.environ.get("ASUKA_NEWTON_AUX_BLOCK_NAUX")
     if _newton_aux_block_env not in (None, ""):
@@ -810,7 +826,35 @@ def run_casscf_df(
         and int(newton_aux_block_naux) <= 0
         and int(naux_df_work) > 0
     ):
-        auto_block = min(int(naux_df_work), 128)
+        # Auto-pick an aux block size that bounds the unpacked (q,nao,nao) tile
+        # while keeping q reasonably large for GEMM efficiency.
+        try:
+            _target_mb = int(os.environ.get("ASUKA_NEWTON_QP_AUX_BLOCK_TARGET_MB", "384"))
+        except Exception:
+            _target_mb = 384
+        _target_mb = max(32, int(_target_mb))
+        # Heuristic for the *peak* fp64 working-set per aux index Q in the packed-Qp
+        # Newton AO2MO build.
+        #
+        # In `_build_df_newton_eris_blocked_qp` we transiently hold several
+        # O(q*nao^2) (or O(q*nao*nmo), O(q*nmo^2)) blocks at once: the unpacked
+        # B_qmn tile, the half-transform X, and the MO-MO DF factors L.  Using only
+        # the unpacked (q,nao,nao) tile size underestimates the true peak by ~5x
+        # for typical nmo≈nao cases and can lead to multi-GB spikes.
+        try:
+            _nmo_work = int(getattr(C, "shape", (0, 0))[1])
+        except Exception:
+            _nmo_work = int(nao_work)
+        _nmo_work = int(_nmo_work) if int(_nmo_work) > 0 else int(nao_work)
+        _bytes_per_q = (
+            int(nao_work) * int(nao_work)  # B_qmn
+            + 2 * int(nao_work) * int(_nmo_work)  # X2d + X_t
+            + 2 * int(_nmo_work) * int(_nmo_work)  # L_raw + L_blk
+        ) * 8
+        _q_guess = int((_target_mb * 1024 * 1024) // max(1, int(_bytes_per_q)))
+        _q_guess = max(64, min(512, int(_q_guess)))
+        _q_guess = max(16, (int(_q_guess) // 16) * 16)
+        auto_block = min(int(naux_df_work), int(_q_guess))
         if auto_block >= 1:
             newton_aux_block_naux = int(auto_block)
             if _normalize_bool_env(os.environ.get("ASUKA_VRAM_DEBUG"), default=False):
@@ -885,6 +929,13 @@ def run_casscf_df(
                 raise ValueError("matvec_backend='cuda' requires scf_out with GPU DF factors (CuPy arrays)")
         elif matvec_backend_s not in {"contract", "row_oracle_df"}:
             raise ValueError("casci_backend='df' requires matvec_backend in {'contract','row_oracle_df','cuda','cuda_eri_mat'}")
+    elif casci_backend_s == "thc":
+        if getattr(scf_out, "thc_factors", None) is None:
+            raise ValueError("casci_backend='thc' requires scf_out.thc_factors (cached THC factors)")
+        if matvec_backend_s not in {"cuda_eri_mat", "cuda"}:
+            raise ValueError("casci_backend='thc' currently requires matvec_backend in {'cuda','cuda_eri_mat'}")
+        if not bool(_is_gpu):
+            raise ValueError("casci_backend='thc' requires scf_out with GPU arrays (CuPy)")
 
     nmo = int(C.shape[1])
     nocc = ncore + ncas
@@ -945,10 +996,16 @@ def run_casscf_df(
             except Exception:
                 pass
 
-    # Enable kernel profiling on the solver when CASSCF profiling is active
+    # Enable kernel profiling on the solver when CASSCF profiling is active.
+    #
+    # Default keeps historical behavior (profiling enabled when `profile` is
+    # provided) but allows callers to request a lightweight profile (CASSCF
+    # iteration timing only) by setting `profile["solver_kernel_profile"]=False`.
     if profile is not None:
-        fcisolver_use.kernel_profile = True
-        fcisolver_use.kernel_profile_cuda_sync = True
+        solver_kprof = bool(profile.get("solver_kernel_profile", True))
+        solver_kprof_sync = bool(profile.get("solver_kernel_profile_cuda_sync", True))
+        fcisolver_use.kernel_profile = bool(solver_kprof)
+        fcisolver_use.kernel_profile_cuda_sync = bool(solver_kprof_sync)
 
     # Dense CPU eigh fast-path for tiny CI spaces (avoids CUDA Davidson overhead)
     fcisolver_use.dense_eigh_ncsf_threshold = int(dense_eigh_ncsf_threshold)
@@ -1144,6 +1201,24 @@ def run_casscf_df(
                     profile=casci_profile,
                     **_casci_kwargs,
                 )
+        elif casci_backend_s == "thc":
+            casci_out = run_casci_thc(
+                scf_out,
+                ncore=int(ncore),
+                ncas=int(ncas),
+                nelecas=nelecas,
+                mo_coeff=C,
+                ci0=prev_ci_list,
+                fcisolver=fcisolver_use,
+                twos=twos,
+                nroots=int(nroots),
+                matvec_backend=str(matvec_backend_s),
+                want_eri_mat=bool(want_eri_mat),
+                aux_block_naux=int(aux_block_naux),
+                max_tile_bytes=int(max_tile_bytes),
+                profile=casci_profile,
+                **_casci_kwargs,
+            )
         elif casci_backend_s == "dense_cpu":
             from .casci import run_casci_dense_cpu  # noqa: PLC0415
 
@@ -1837,6 +1912,17 @@ def run_casscf_df(
                 allowed=allowed,
                 profile=orbgrad_profile,
             )
+        elif casci_backend_s == "thc":
+            gmat, grad_norm, eps = orbital_gradient_thc(
+                scf_out,
+                C=C,
+                ncore=int(ncore),
+                ncas=int(ncas),
+                dm1_act=dm1_act,
+                dm2_act=dm2_act,
+                allowed=allowed,
+                profile=orbgrad_profile,
+            )
         else:
             eps_ao_use = float(dense_cpu_eps_ao) if casci_backend_s == "dense_cpu" else float(dense_gpu_eps_ao)
             threads_use = int(dense_cpu_threads) if casci_backend_s == "dense_cpu" else int(dense_gpu_threads)
@@ -2286,6 +2372,19 @@ def run_casscf(
         kwargs.setdefault("dense_exact_jk", "auto")
 
     if df_b:
+        if scf_out.df_B is None and getattr(scf_out, "thc_factors", None) is not None:
+            # THC-SCF outputs do not cache DF factors. Default to a gradient-only
+            # orbital optimizer for now (AH/1step wiring is not implemented).
+            kwargs.setdefault("orbital_optimizer", "lbfgs")
+            return run_casscf_df(
+                scf_out,
+                ncore=int(ncore),
+                ncas=int(ncas),
+                nelecas=nelecas,
+                casci_backend="thc",
+                matvec_backend=str(matvec_backend),
+                **kwargs,
+            )
         return run_casscf_df(
             scf_out,
             ncore=int(ncore),

@@ -109,6 +109,7 @@ class RHFDFRunResult:
     ao_eri: Any | None = None
     sph_map: AOSphericalTransform | tuple[np.ndarray, int, int] | None = None
     df_L: Any | None = None  # Cholesky factor of aux metric (for deterministic gradients)
+    thc_factors: Any | None = None
 
 
 @dataclass(frozen=True)
@@ -125,6 +126,7 @@ class UHFDFRunResult:
     ao_eri: Any | None = None
     sph_map: AOSphericalTransform | tuple[np.ndarray, int, int] | None = None
     df_L: Any | None = None  # Cholesky factor of aux metric (for deterministic gradients)
+    thc_factors: Any | None = None
 
 
 @dataclass(frozen=True)
@@ -141,6 +143,7 @@ class ROHFDFRunResult:
     ao_eri: Any | None = None
     sph_map: AOSphericalTransform | tuple[np.ndarray, int, int] | None = None
     df_L: Any | None = None  # Cholesky factor of aux metric (for deterministic gradients)
+    thc_factors: Any | None = None
 
 
 _HF_PREP_CACHE_MAX = max(0, int(os.environ.get("ASUKA_HF_PREP_CACHE_MAX", "0")))
@@ -205,6 +208,118 @@ def _cuda_device_id_or_neg1() -> int:
         import cupy as cp  # noqa: PLC0415
     except Exception:
         return -1
+    try:
+        return int(cp.cuda.Device().id)
+    except Exception:
+        return -1
+
+
+def _init_guess_dm_atom_hcore_cart(
+    mol: Molecule,
+    *,
+    ao_basis,
+    int1e_cart: Int1eResult,
+) -> np.ndarray:
+    """Build a SAD-like initial density from per-atom core-Hamiltonian blocks.
+
+    This is not a full SAD (which typically uses pretabulated atomic HF/DFT
+    densities). Instead, we:
+    - partition AOs by atom (shell centers)
+    - diagonalize the per-atom (hcore, S) blocks
+    - fill the lowest-energy atomic orbitals globally to match nelec
+
+    The resulting density is block-diagonal in the AO ordering and provides a
+    more localized starting guess than a full-molecule hcore diagonalization.
+    """
+
+    from asuka.cueri.cart import ncart  # noqa: PLC0415
+    from asuka.hf.local_thc_partition import map_shells_to_atoms  # noqa: PLC0415
+
+    S = np.asarray(int1e_cart.S, dtype=np.float64)
+    h = np.asarray(int1e_cart.hcore, dtype=np.float64)
+    nao = int(S.shape[0])
+    if S.shape != (nao, nao) or h.shape != (nao, nao):
+        raise ValueError("int1e_cart must have (nao,nao) S/hcore")
+
+    coords, _charges = _atom_coords_charges_bohr(mol)
+    _sh2a, atom_to_shells = map_shells_to_atoms(np.asarray(ao_basis.shell_cxyz), coords)
+
+    shell_l = np.asarray(ao_basis.shell_l, dtype=np.int32).ravel()
+    shell_start = np.asarray(ao_basis.shell_ao_start, dtype=np.int32).ravel()
+    if shell_l.shape != shell_start.shape:
+        raise ValueError("ao_basis.shell_l and shell_ao_start must have identical shape")
+    if int(shell_l.size) == 0:
+        return np.zeros((nao, nao), dtype=np.float64)
+
+    nfn_shell = np.asarray([ncart(int(l)) for l in shell_l.tolist()], dtype=np.int32)
+
+    # Collect per-atom eigenpairs (eps, idx_global, coeff_vector).
+    orb_eps: list[float] = []
+    orb_idx: list[np.ndarray] = []
+    orb_c: list[np.ndarray] = []
+
+    # Symmetrize inputs (defensive; should already be symmetric).
+    S = 0.5 * (S + S.T)
+    h = 0.5 * (h + h.T)
+
+    for ia in range(int(mol.natm)):
+        shells = atom_to_shells[int(ia)]
+        if not shells:
+            continue
+        idx: list[int] = []
+        for sh in shells:
+            s0 = int(shell_start[int(sh)])
+            n = int(nfn_shell[int(sh)])
+            idx.extend(range(s0, s0 + n))
+        if not idx:
+            continue
+        idx_np = np.asarray(idx, dtype=np.int32)
+
+        Sblk = np.asarray(S[np.ix_(idx_np, idx_np)], dtype=np.float64)
+        hblk = np.asarray(h[np.ix_(idx_np, idx_np)], dtype=np.float64)
+        Sblk = 0.5 * (Sblk + Sblk.T)
+        hblk = 0.5 * (hblk + hblk.T)
+
+        # Symmetric orthogonalization for this atom block.
+        w, U = np.linalg.eigh(Sblk)
+        w = np.asarray(w, dtype=np.float64)
+        U = np.asarray(U, dtype=np.float64)
+        wmax = float(np.max(w)) if int(w.size) else 0.0
+        if wmax <= 0.0:
+            continue
+        keep = w > (1e-12 * wmax)
+        if not bool(np.any(keep)):
+            continue
+        wk = w[keep]
+        Uk = U[:, keep]
+        Xk = Uk / np.sqrt(wk)[None, :]  # (n, m), with Xk.T S Xk = I
+        Fp = Xk.T @ hblk @ Xk
+        Fp = 0.5 * (Fp + Fp.T)
+        e, Cp = np.linalg.eigh(Fp)
+        e = np.asarray(e, dtype=np.float64).ravel()
+        Cp = np.asarray(Cp, dtype=np.float64)
+        C = Xk @ Cp  # (n, m), S-orthonormal columns
+
+        for j in range(int(C.shape[1])):
+            orb_eps.append(float(e[int(j)]))
+            orb_idx.append(idx_np)
+            orb_c.append(np.ascontiguousarray(C[:, int(j)], dtype=np.float64))
+
+    nelec = int(mol.nelectron)
+    if nelec <= 0 or nelec % 2 != 0:
+        raise ValueError("RHF requires an even, positive electron count")
+    nocc = int(nelec // 2)
+    if int(len(orb_eps)) < int(nocc):
+        raise RuntimeError("atom-hcore guess produced too few orbitals to fill nelec")
+
+    order = np.argsort(np.asarray(orb_eps, dtype=np.float64), kind="stable")
+    D = np.zeros((nao, nao), dtype=np.float64)
+    for k in range(int(nocc)):
+        j = int(order[int(k)])
+        idx_np = orb_idx[j]
+        c = orb_c[j]
+        D[np.ix_(idx_np, idx_np)] += 2.0 * np.outer(c, c)
+    return 0.5 * (D + D.T)
     try:
         return int(cp.cuda.Device().id)
     except Exception:
@@ -812,11 +927,18 @@ def run_rhf_df(
     )
 
     # Optional: pack DF factors to unique AO-pair triangle (Qp layout) to reduce VRAM.
+    #
+    # Default behavior (CUDA): pack unless explicitly disabled via ASUKA_DF_AO_PACKED_S2=0.
+    # CPU behavior: preserve the historical full mnQ/Qmn tensor unless explicitly enabled.
     if B_scf is not None:
         try:  # pragma: no cover (best-effort: keep legacy behavior if something goes wrong)
+            import os as _os_dfpack  # noqa: PLC0415
+            import cupy as _cp_dfpack  # noqa: PLC0415
             from asuka.integrals.df_packed_s2 import ao_packed_s2_enabled, pack_B_to_Qp  # noqa: PLC0415
 
-            if bool(ao_packed_s2_enabled()):
+            _explicit = "ASUKA_DF_AO_PACKED_S2" in _os_dfpack.environ
+            _want_pack = bool(ao_packed_s2_enabled()) if _explicit else isinstance(B_scf, _cp_dfpack.ndarray)
+            if bool(_want_pack) and int(getattr(B_scf, "ndim", 0)) == 3:
                 layout = "mnQ" if str(df_layout_s) == "mnq" else "Qmn"
                 B_scf = pack_B_to_Qp(B_scf, layout=layout, nao=int(int1e_scf.S.shape[0]))
         except Exception:
@@ -851,23 +973,988 @@ def run_rhf_df(
     )
 
 
+def run_rhf_thc(
+    mol: Molecule,
+    *,
+    basis: Any | None = None,
+    auxbasis: Any = "autoaux",
+    df_config: CuERIDFConfig | None = None,
+    expand_contractions: bool = True,
+    # THC build
+    thc_mode: str = "global",
+    thc_local_config: Any | None = None,
+    thc_grid_spec: Any | None = None,
+    thc_grid_kind: str = "rdvr",
+    thc_dvr_basis: Any | None = None,
+    thc_grid_options: Any | None = None,
+    thc_npt: int | None = None,
+    thc_solve_method: str = "fit_metric_qr",
+    # Density-difference reference
+    use_density_difference: bool = True,
+    df_warmup_cycles: int = 2,
+    df_warmup_ediff: float | None = None,
+    df_warmup_max_cycles: int = 25,
+    df_aux_block_naux: int = 256,
+    df_k_q_block: int = 128,
+    # SCF solve
+    max_cycle: int = 50,
+    conv_tol: float = 1e-10,
+    conv_tol_dm: float = 1e-8,
+    diis: bool = True,
+    diis_start_cycle: int | None = None,
+    diis_space: int = 8,
+    damping: float = 0.0,
+    level_shift: float = 0.0,
+    q_block: int = 256,
+    init_guess: str = "auto",
+    dm0: Any | None = None,
+    mo_coeff0: Any | None = None,
+    init_fock_cycles: int | None = None,
+    profile: dict | None = None,
+) -> RHFDFRunResult:
+    """Run RHF with THC J/K.
+
+    Notes
+    -----
+    - THC factor construction requires CUDA (CuPy + `asuka._orbitals_cuda_ext`).
+    - Density-difference warmup uses streamed DF (no materialized B tensor).
+    """
+
+    if int(mol.spin) != 0:
+        raise NotImplementedError("run_rhf_thc supports only closed-shell molecules (spin=0)")
+
+    nelec = int(mol.nelectron)
+    if nelec <= 0 or nelec % 2 != 0:
+        raise ValueError("RHF requires an even, positive electron count")
+
+    basis_in = mol.basis if basis is None else basis
+    cfg = CuERIDFConfig() if df_config is None else df_config
+
+    # AO basis + 1e integrals (cart)
+    ao_basis, basis_name = build_ao_basis_cart(mol, basis=basis_in, expand_contractions=bool(expand_contractions))
+    coords, charges = _atom_coords_charges_bohr(mol)
+    int1e = build_int1e_cart(ao_basis, atom_coords_bohr=coords, atom_charges=charges)
+
+    # Aux basis (cart)
+    aux_basis, auxbasis_name = _build_aux_basis_cart(
+        mol,
+        basis_in=basis_in,
+        auxbasis=auxbasis,
+        expand_contractions=bool(expand_contractions),
+    )
+
+    # SCF AO representation: cart or sph
+    int1e_scf, _B_unused, sph_map = _apply_sph_transform(mol, int1e, None, ao_basis, df_B_layout="mnQ")
+    df_ao_rep = "cart" if bool(mol.cart) else "sph"
+
+    # Optional guess reuse (RHF cache)
+    init_guess_s = str(init_guess).strip().lower()
+    if mo_coeff0 is None and dm0 is None and init_guess_s in {"auto", "cache", "cache_or_core"}:
+        guess_key = _rhf_guess_key(
+            mol,
+            basis_in=basis_in,
+            auxbasis=auxbasis,
+            expand_contractions=bool(expand_contractions),
+        )
+        guess_hit = _cache_get(_RHF_GUESS_CACHE, guess_key)
+        if guess_hit is not None:
+            mo_coeff0 = _copy_mo_coeff_for_cache(guess_hit)
+            if profile is not None:
+                profile.setdefault("scf_guess", {})["cache_hit"] = True
+        elif profile is not None:
+            profile.setdefault("scf_guess", {})["cache_hit"] = False
+
+    # SAD-like initial guess for density-difference runs (paper-faithful default).
+    #
+    # This uses an atom-block hcore diagonalization (no 2e integrals) to produce
+    # a localized density guess.  It is intentionally optional so callers can
+    # still provide dm0/mo_coeff0 or rely on cached guesses.
+    if dm0 is None and mo_coeff0 is None and init_guess_s in {"sad", "atom", "atom_hcore", "atom-hcore"}:
+        try:
+            D_cart = _init_guess_dm_atom_hcore_cart(mol, ao_basis=ao_basis, int1e_cart=int1e)
+            if bool(mol.cart):
+                dm0 = D_cart
+            else:
+                if sph_map is None:
+                    raise RuntimeError("expected sph_map for mol.cart=False")
+                T_c2s = np.asarray(sph_map.T_c2s, dtype=np.float64)
+                dm0 = T_c2s.T @ D_cart @ T_c2s
+                dm0 = 0.5 * (dm0 + dm0.T)
+            if profile is not None:
+                profile.setdefault("scf_guess", {})["init_guess"] = "atom_hcore"
+        except Exception:
+            # Best-effort: fall back to the default core-H guess if something
+            # goes wrong (unexpected basis centers, etc).
+            if profile is not None:
+                profile.setdefault("scf_guess", {})["init_guess"] = "core_fallback"
+
+    # Grid kind selection (Becke vs DVR).
+    grid_kind_s = str(thc_grid_kind).strip().lower()
+    dvr_basis_cart = None
+    if grid_kind_s in {"rdvr", "r-dvr", "r_dvr", "fdvr", "f-dvr", "f_dvr"}:
+        if thc_dvr_basis is None:
+            dvr_basis_cart = aux_basis
+        elif isinstance(thc_dvr_basis, str) and str(thc_dvr_basis).strip().lower() in {"aux", "auxbasis"}:
+            dvr_basis_cart = aux_basis
+        else:
+            dvr_basis_cart, _dvr_name_unused = build_ao_basis_cart(
+                mol,
+                basis=thc_dvr_basis,
+                expand_contractions=bool(expand_contractions),
+            )
+
+    # Build THC factors (global THC or local-THC/LS-THC-style blocks).
+    thc_mode_s = str(thc_mode).strip().lower()
+    thc_prof = profile.setdefault("thc_build", {}) if profile is not None else None
+
+    thc_factors = None
+    L_metric_full = None
+
+    if thc_mode_s in {"global", "thc", "full"}:
+        from asuka.hf.thc_factors import build_thc_factors  # noqa: PLC0415
+
+        thc = build_thc_factors(
+            mol,
+            ao_basis,
+            aux_basis,
+            sph_map=sph_map,
+            grid_spec=thc_grid_spec,
+            grid_kind=str(thc_grid_kind),
+            dvr_basis=dvr_basis_cart,
+            grid_options=thc_grid_options,
+            npt=thc_npt,
+            metric_backend=str(cfg.backend),
+            metric_mode=str(cfg.mode),
+            metric_threads=int(cfg.threads),
+            solve_method=str(thc_solve_method),
+            stream=cfg.stream,
+            profile=thc_prof,
+        )
+        thc_factors = thc
+        L_metric_full = thc.L_metric
+    elif thc_mode_s in {"local", "lthc", "local-thc", "local_thc", "ls-thc", "ls_thc"}:
+        from asuka.hf.local_thc_config import LocalTHCConfig  # noqa: PLC0415
+        from asuka.hf.local_thc_factors import build_local_thc_factors  # noqa: PLC0415
+
+        if thc_local_config is None:
+            lcfg = LocalTHCConfig()
+        elif isinstance(thc_local_config, LocalTHCConfig):
+            lcfg = thc_local_config
+        elif isinstance(thc_local_config, dict):
+            lcfg = LocalTHCConfig(**thc_local_config)
+        else:
+            raise TypeError("thc_local_config must be a LocalTHCConfig or a dict")
+
+        if bool(use_density_difference):
+            from asuka.cueri import df as cueri_df  # noqa: PLC0415
+
+            V_full = cueri_df.metric_2c2e_basis(
+                aux_basis,
+                stream=cfg.stream,
+                backend=str(cfg.backend),
+                mode=str(cfg.mode),
+                threads=int(cfg.threads),
+            )
+            L_metric_full = cueri_df.cholesky_metric(V_full)
+
+        lthc = build_local_thc_factors(
+            mol,
+            ao_basis,
+            aux_basis,
+            S_scf=int1e_scf.S,
+            grid_kind=str(thc_grid_kind),
+            dvr_basis=dvr_basis_cart,
+            grid_options=thc_grid_options,
+            grid_spec=thc_grid_spec,
+            thc_npt=thc_npt,
+            config=lcfg,
+            metric_backend=str(cfg.backend),
+            metric_mode=str(cfg.mode),
+            metric_threads=int(cfg.threads),
+            solve_method=str(thc_solve_method),
+            stream=cfg.stream,
+            profile=thc_prof,
+        )
+        thc_factors = lthc
+    else:
+        raise ValueError("thc_mode must be one of: 'global', 'local'")
+
+    # Optional density-difference reference via streamed DF warmup
+    ref = None
+    mo_coeff_thc0 = mo_coeff0
+    if bool(use_density_difference):
+        from asuka.hf import df_jk_streamed  # noqa: PLC0415
+        from asuka.hf import df_scf as hf_df_scf  # noqa: PLC0415
+        from asuka.hf.local_thc_scf import LocalTHCReferenceRHF  # noqa: PLC0415
+        from asuka.hf.thc_scf import THCReferenceRHF  # noqa: PLC0415
+
+        warm_ediff = None if df_warmup_ediff is None else float(df_warmup_ediff)
+        if warm_ediff is not None and (not np.isfinite(warm_ediff) or warm_ediff <= 0.0):
+            raise ValueError("df_warmup_ediff must be a finite, positive float or None")
+        warm_max = max(1, int(df_warmup_max_cycles))
+        n_warm = max(1, int(df_warmup_cycles)) if warm_ediff is None else int(warm_max)
+        warm_prof = profile.setdefault("df_warmup", {}) if profile is not None else None
+        warm = hf_df_scf.rhf_df(
+            int1e_scf.S,
+            int1e_scf.hcore,
+            None,
+            nelec=int(nelec),
+            enuc=float(mol.energy_nuc()),
+            max_cycle=int(n_warm),
+            conv_tol=0.0 if warm_ediff is None else float(warm_ediff),
+            conv_tol_dm=0.0 if warm_ediff is None else 1e9,
+            # Paper-faithful: these are "conventional iterations" to refine the
+            # density before switching to THC on ΔD, so use DIIS.
+            diis=True,
+            damping=0.0,
+            level_shift=0.0,
+            jk_mode="streamed",
+            k_engine="from_Cocc",
+            k_q_block=int(df_k_q_block),
+            ao_basis=ao_basis,
+            aux_basis=aux_basis,
+            df_backend=str(cfg.backend),
+            df_ao_rep=str(df_ao_rep),
+            df_threads=int(cfg.threads),
+            df_mode=str(cfg.mode),
+            df_aux_block_naux=int(df_aux_block_naux),
+            L_metric=L_metric_full,
+            dm0=dm0,
+            mo_coeff0=mo_coeff0,
+            init_fock_cycles=0,
+            profile=warm_prof,
+        )
+        C_ref = warm.mo_coeff
+        occ_ref = warm.mo_occ
+
+        xp, _ = hf_df_scf._get_xp(C_ref, occ_ref)
+        D_ref = hf_df_scf._symmetrize(xp, hf_df_scf._density_from_C_occ(C_ref, occ_ref))
+
+        # Build accurate J/K once at D_ref (same streamed DF context as warmup).
+        ctx = df_jk_streamed.make_streamed_df_jk_context(
+            ao_basis,
+            aux_basis,
+            L_metric=L_metric_full,
+            backend=str(cfg.backend),
+            threads=int(cfg.threads),
+            mode=str(cfg.mode),
+            ao_rep=str(df_ao_rep),
+            aux_block_naux=int(df_aux_block_naux),
+            profile=None,
+        )
+        nocc = int(nelec // 2)
+        C_occ = xp.ascontiguousarray(C_ref[:, :nocc])
+        occ_vals = occ_ref[:nocc]
+        J_ref, K_ref = df_jk_streamed.df_JK_streamed(
+            ctx,
+            D_ref,
+            C_occ,
+            occ_vals,
+            k_q_block=int(df_k_q_block),
+            cublas_math_mode=None,
+            work={},
+            profile=None,
+        )
+        if thc_mode_s in {"global", "thc", "full"}:
+            ref = THCReferenceRHF(D_ref=D_ref, J_ref=J_ref, K_ref=K_ref)
+        else:
+            ref = LocalTHCReferenceRHF(D_ref=D_ref, J_ref=J_ref, K_ref=K_ref)
+
+        if mo_coeff_thc0 is None:
+            mo_coeff_thc0 = C_ref
+
+    # If we performed a warmup/reference build, start the THC iterations from
+    # the refined MO coefficients rather than the original dm0 guess.
+    dm0_thc = None if bool(use_density_difference) else dm0
+
+    init_fock_cycles_i = int(_HF_INIT_FOCK_CYCLES) if init_fock_cycles is None else max(0, int(init_fock_cycles))
+    diis_start_cycle_i = (
+        int(diis_start_cycle) if diis_start_cycle is not None else (1 if int(init_fock_cycles_i) > 0 else 2)
+    )
+    scf_prof = profile if profile is not None else None
+    if thc_mode_s in {"global", "thc", "full"}:
+        # THC-SCF solve
+        from asuka.hf.thc_scf import rhf_thc  # noqa: PLC0415
+
+        scf = rhf_thc(
+            int1e_scf.S,
+            int1e_scf.hcore,
+            thc_factors,
+            nelec=int(nelec),
+            enuc=float(mol.energy_nuc()),
+            max_cycle=int(max_cycle),
+            conv_tol=float(conv_tol),
+            conv_tol_dm=float(conv_tol_dm),
+            diis=bool(diis),
+            diis_start_cycle=int(diis_start_cycle_i),
+            diis_space=int(diis_space),
+            damping=float(damping),
+            level_shift=float(level_shift),
+            q_block=int(q_block),
+            dm0=dm0_thc,
+            mo_coeff0=mo_coeff_thc0,
+            init_fock_cycles=int(init_fock_cycles_i),
+            reference=ref,
+            profile=scf_prof,
+        )
+    else:
+        from asuka.hf.local_thc_scf import rhf_local_thc  # noqa: PLC0415
+
+        scf = rhf_local_thc(
+            int1e_scf.S,
+            int1e_scf.hcore,
+            thc_factors,
+            nelec=int(nelec),
+            enuc=float(mol.energy_nuc()),
+            max_cycle=int(max_cycle),
+            conv_tol=float(conv_tol),
+            conv_tol_dm=float(conv_tol_dm),
+            diis=bool(diis),
+            diis_start_cycle=int(diis_start_cycle_i),
+            diis_space=int(diis_space),
+            damping=float(damping),
+            level_shift=float(level_shift),
+            q_block=int(q_block),
+            dm0=dm0_thc,
+            mo_coeff0=mo_coeff_thc0,
+            init_fock_cycles=int(init_fock_cycles_i),
+            reference=ref,
+            profile=scf_prof,
+        )
+
+    if bool(getattr(scf, "converged", False)):
+        guess_key = _rhf_guess_key(
+            mol,
+            basis_in=basis_in,
+            auxbasis=auxbasis,
+            expand_contractions=bool(expand_contractions),
+        )
+        _cache_put(
+            _RHF_GUESS_CACHE,
+            guess_key,
+            _copy_mo_coeff_for_cache(scf.mo_coeff),
+            max_size=int(_HF_GUESS_CACHE_MAX),
+        )
+
+    return RHFDFRunResult(
+        mol=mol,
+        basis_name=str(basis_name),
+        auxbasis_name=str(auxbasis_name),
+        ao_basis=ao_basis,
+        aux_basis=aux_basis,
+        int1e=int1e_scf,
+        df_B=None,
+        scf=scf,
+        profile=profile,
+        sph_map=sph_map,
+        df_L=L_metric_full,
+        thc_factors=thc_factors,
+    )
+
+
+def run_uhf_thc(
+    mol: Molecule,
+    *,
+    basis: Any | None = None,
+    auxbasis: Any = "autoaux",
+    df_config: CuERIDFConfig | None = None,
+    expand_contractions: bool = True,
+    # THC build
+    thc_grid_spec: Any | None = None,
+    thc_grid_kind: str = "rdvr",
+    thc_dvr_basis: Any | None = None,
+    thc_grid_options: Any | None = None,
+    thc_mode: str = "global",
+    thc_local_config: Any | None = None,
+    thc_npt: int | None = None,
+    thc_solve_method: str = "fit_metric_qr",
+    # Density-difference reference
+    use_density_difference: bool = True,
+    df_warmup_cycles: int = 2,
+    df_aux_block_naux: int = 256,
+    df_k_q_block: int = 128,
+    # SCF solve
+    max_cycle: int = 50,
+    conv_tol: float = 1e-10,
+    conv_tol_dm: float = 1e-8,
+    diis: bool = True,
+    diis_start_cycle: int | None = None,
+    diis_space: int = 8,
+    damping: float = 0.0,
+    q_block: int = 256,
+    dm0: Any | None = None,
+    mo_coeff0: Any | None = None,
+    profile: dict | None = None,
+) -> UHFDFRunResult:
+    """Run UHF with THC J/K."""
+
+    nalpha, nbeta = _nalpha_nbeta_from_mol(mol)
+    basis_in = mol.basis if basis is None else basis
+    cfg = CuERIDFConfig() if df_config is None else df_config
+
+    ao_basis, basis_name = build_ao_basis_cart(mol, basis=basis_in, expand_contractions=bool(expand_contractions))
+    coords, charges = _atom_coords_charges_bohr(mol)
+    int1e = build_int1e_cart(ao_basis, atom_coords_bohr=coords, atom_charges=charges)
+
+    aux_basis, auxbasis_name = _build_aux_basis_cart(
+        mol,
+        basis_in=basis_in,
+        auxbasis=auxbasis,
+        expand_contractions=bool(expand_contractions),
+    )
+
+    int1e_scf, _B_unused, sph_map = _apply_sph_transform(mol, int1e, None, ao_basis, df_B_layout="mnQ")
+    df_ao_rep = "cart" if bool(mol.cart) else "sph"
+
+    # Grid kind selection (Becke vs DVR).
+    grid_kind_s = str(thc_grid_kind).strip().lower()
+    dvr_basis_cart = None
+    if grid_kind_s in {"rdvr", "r-dvr", "r_dvr", "fdvr", "f-dvr", "f_dvr"}:
+        if thc_dvr_basis is None:
+            dvr_basis_cart = aux_basis
+        elif isinstance(thc_dvr_basis, str) and str(thc_dvr_basis).strip().lower() in {"aux", "auxbasis"}:
+            dvr_basis_cart = aux_basis
+        else:
+            dvr_basis_cart, _dvr_name_unused = build_ao_basis_cart(
+                mol,
+                basis=thc_dvr_basis,
+                expand_contractions=bool(expand_contractions),
+            )
+
+    # Build THC factors (global THC or local-THC/LS-THC-style blocks).
+    thc_mode_s = str(thc_mode).strip().lower()
+    thc_prof = profile.setdefault("thc_build", {}) if profile is not None else None
+    thc_factors = None
+    L_metric_full = None
+
+    if thc_mode_s in {"global", "thc", "full"}:
+        from asuka.hf.thc_factors import build_thc_factors  # noqa: PLC0415
+
+        thc = build_thc_factors(
+            mol,
+            ao_basis,
+            aux_basis,
+            sph_map=sph_map,
+            grid_spec=thc_grid_spec,
+            grid_kind=str(thc_grid_kind),
+            dvr_basis=dvr_basis_cart,
+            grid_options=thc_grid_options,
+            npt=thc_npt,
+            metric_backend=str(cfg.backend),
+            metric_mode=str(cfg.mode),
+            metric_threads=int(cfg.threads),
+            solve_method=str(thc_solve_method),
+            stream=cfg.stream,
+            profile=thc_prof,
+        )
+        thc_factors = thc
+        L_metric_full = thc.L_metric
+    elif thc_mode_s in {"local", "lthc", "local-thc", "local_thc", "ls-thc", "ls_thc"}:
+        from asuka.hf.local_thc_config import LocalTHCConfig  # noqa: PLC0415
+        from asuka.hf.local_thc_factors import build_local_thc_factors  # noqa: PLC0415
+
+        if thc_local_config is None:
+            lcfg = LocalTHCConfig()
+        elif isinstance(thc_local_config, LocalTHCConfig):
+            lcfg = thc_local_config
+        elif isinstance(thc_local_config, dict):
+            lcfg = LocalTHCConfig(**thc_local_config)
+        else:
+            raise TypeError("thc_local_config must be a LocalTHCConfig or a dict")
+
+        if bool(use_density_difference):
+            from asuka.cueri import df as cueri_df  # noqa: PLC0415
+
+            V_full = cueri_df.metric_2c2e_basis(
+                aux_basis,
+                stream=cfg.stream,
+                backend=str(cfg.backend),
+                mode=str(cfg.mode),
+                threads=int(cfg.threads),
+            )
+            L_metric_full = cueri_df.cholesky_metric(V_full)
+
+        lthc = build_local_thc_factors(
+            mol,
+            ao_basis,
+            aux_basis,
+            S_scf=int1e_scf.S,
+            grid_kind=str(thc_grid_kind),
+            dvr_basis=dvr_basis_cart,
+            grid_options=thc_grid_options,
+            grid_spec=thc_grid_spec,
+            thc_npt=thc_npt,
+            config=lcfg,
+            metric_backend=str(cfg.backend),
+            metric_mode=str(cfg.mode),
+            metric_threads=int(cfg.threads),
+            solve_method=str(thc_solve_method),
+            stream=cfg.stream,
+            profile=thc_prof,
+        )
+        thc_factors = lthc
+    else:
+        raise ValueError("thc_mode must be one of: 'global', 'local'")
+
+    ref = None
+    mo_coeff_thc0 = mo_coeff0
+    if bool(use_density_difference):
+        if dm0 is not None:
+            raise NotImplementedError("density-difference warmup currently does not support dm0 (streamed DF requires mo_coeff)")
+
+        from asuka.hf import df_jk_streamed  # noqa: PLC0415
+        from asuka.hf import df_scf as hf_df_scf  # noqa: PLC0415
+        from asuka.hf.local_thc_scf import LocalTHCReferenceUHF  # noqa: PLC0415
+        from asuka.hf.thc_scf import THCReferenceUHF  # noqa: PLC0415
+
+        n_warm = max(1, int(df_warmup_cycles))
+        warm_prof = profile.setdefault("df_warmup", {}) if profile is not None else None
+        warm = hf_df_scf.uhf_df(
+            int1e_scf.S,
+            int1e_scf.hcore,
+            None,
+            nalpha=int(nalpha),
+            nbeta=int(nbeta),
+            enuc=float(mol.energy_nuc()),
+            max_cycle=int(n_warm),
+            conv_tol=0.0,
+            conv_tol_dm=0.0,
+            # Conventional refinement iterations before switching to THC on ΔD.
+            diis=True,
+            damping=0.0,
+            jk_mode="streamed",
+            k_engine="from_Cocc",
+            k_q_block=int(df_k_q_block),
+            ao_basis=ao_basis,
+            aux_basis=aux_basis,
+            df_backend=str(cfg.backend),
+            df_ao_rep=str(df_ao_rep),
+            df_threads=int(cfg.threads),
+            df_mode=str(cfg.mode),
+            df_aux_block_naux=int(df_aux_block_naux),
+            L_metric=L_metric_full,
+            mo_coeff0=mo_coeff0,
+            profile=warm_prof,
+        )
+        Ca_ref, Cb_ref = warm.mo_coeff
+        occ_a_ref, occ_b_ref = warm.mo_occ
+
+        xp, _ = hf_df_scf._get_xp(Ca_ref, occ_a_ref)
+        Da_ref = hf_df_scf._symmetrize(xp, hf_df_scf._density_from_C_occ(Ca_ref, occ_a_ref))
+        Db_ref = hf_df_scf._symmetrize(xp, hf_df_scf._density_from_C_occ(Cb_ref, occ_b_ref))
+        Dtot_ref = Da_ref + Db_ref
+
+        ctx = df_jk_streamed.make_streamed_df_jk_context(
+            ao_basis,
+            aux_basis,
+            L_metric=L_metric_full,
+            backend=str(cfg.backend),
+            threads=int(cfg.threads),
+            mode=str(cfg.mode),
+            ao_rep=str(df_ao_rep),
+            aux_block_naux=int(df_aux_block_naux),
+            profile=None,
+        )
+        Ca_occ = xp.ascontiguousarray(Ca_ref[:, : int(nalpha)])
+        Cb_occ = xp.ascontiguousarray(Cb_ref[:, : int(nbeta)])
+        occ_a_vals = occ_a_ref[: int(nalpha)]
+        occ_b_vals = occ_b_ref[: int(nbeta)]
+        J_ref, Ks = df_jk_streamed.df_JKs_streamed(
+            ctx,
+            Dtot_ref,
+            [Ca_occ, Cb_occ],
+            [occ_a_vals, occ_b_vals],
+            k_q_block=int(df_k_q_block),
+            cublas_math_mode=None,
+            work={},
+            profile=None,
+        )
+        Ka_ref, Kb_ref = Ks
+        if thc_mode_s in {"global", "thc", "full"}:
+            ref = THCReferenceUHF(Da_ref=Da_ref, Db_ref=Db_ref, J_ref=J_ref, Ka_ref=Ka_ref, Kb_ref=Kb_ref)
+        else:
+            ref = LocalTHCReferenceUHF(Da_ref=Da_ref, Db_ref=Db_ref, J_ref=J_ref, Ka_ref=Ka_ref, Kb_ref=Kb_ref)
+
+        if mo_coeff_thc0 is None:
+            mo_coeff_thc0 = (Ca_ref, Cb_ref)
+
+    diis_start_cycle_i = int(diis_start_cycle) if diis_start_cycle is not None else 2
+    if thc_mode_s in {"global", "thc", "full"}:
+        from asuka.hf.thc_scf import uhf_thc  # noqa: PLC0415
+
+        scf = uhf_thc(
+            int1e_scf.S,
+            int1e_scf.hcore,
+            thc_factors,
+            nalpha=int(nalpha),
+            nbeta=int(nbeta),
+            enuc=float(mol.energy_nuc()),
+            max_cycle=int(max_cycle),
+            conv_tol=float(conv_tol),
+            conv_tol_dm=float(conv_tol_dm),
+            diis=bool(diis),
+            diis_start_cycle=int(diis_start_cycle_i),
+            diis_space=int(diis_space),
+            damping=float(damping),
+            q_block=int(q_block),
+            dm0=dm0,
+            mo_coeff0=mo_coeff_thc0,
+            reference=ref,
+            profile=profile,
+        )
+    else:
+        from asuka.hf.local_thc_scf import uhf_local_thc  # noqa: PLC0415
+
+        scf = uhf_local_thc(
+            int1e_scf.S,
+            int1e_scf.hcore,
+            thc_factors,
+            nalpha=int(nalpha),
+            nbeta=int(nbeta),
+            enuc=float(mol.energy_nuc()),
+            max_cycle=int(max_cycle),
+            conv_tol=float(conv_tol),
+            conv_tol_dm=float(conv_tol_dm),
+            diis=bool(diis),
+            diis_start_cycle=int(diis_start_cycle_i),
+            diis_space=int(diis_space),
+            damping=float(damping),
+            q_block=int(q_block),
+            dm0=dm0,
+            mo_coeff0=mo_coeff_thc0,
+            reference=ref,
+            profile=profile,
+        )
+
+    return UHFDFRunResult(
+        mol=mol,
+        basis_name=str(basis_name),
+        auxbasis_name=str(auxbasis_name),
+        ao_basis=ao_basis,
+        aux_basis=aux_basis,
+        int1e=int1e_scf,
+        df_B=None,
+        scf=scf,
+        profile=profile,
+        sph_map=sph_map,
+        df_L=L_metric_full,
+        thc_factors=thc_factors,
+    )
+
+
+def run_rohf_thc(
+    mol: Molecule,
+    *,
+    basis: Any | None = None,
+    auxbasis: Any = "autoaux",
+    df_config: CuERIDFConfig | None = None,
+    expand_contractions: bool = True,
+    # THC build
+    thc_grid_spec: Any | None = None,
+    thc_grid_kind: str = "rdvr",
+    thc_dvr_basis: Any | None = None,
+    thc_grid_options: Any | None = None,
+    thc_mode: str = "global",
+    thc_local_config: Any | None = None,
+    thc_npt: int | None = None,
+    thc_solve_method: str = "fit_metric_qr",
+    # Density-difference reference
+    use_density_difference: bool = True,
+    df_warmup_cycles: int = 2,
+    df_aux_block_naux: int = 256,
+    df_k_q_block: int = 128,
+    # SCF solve
+    max_cycle: int = 50,
+    conv_tol: float = 1e-10,
+    conv_tol_dm: float = 1e-8,
+    diis: bool = True,
+    diis_start_cycle: int | None = None,
+    diis_space: int = 8,
+    damping: float = 0.0,
+    q_block: int = 256,
+    dm0: Any | None = None,
+    mo_coeff0: Any | None = None,
+    profile: dict | None = None,
+) -> ROHFDFRunResult:
+    """Run ROHF with THC J/K."""
+
+    nalpha, nbeta = _nalpha_nbeta_from_mol(mol)
+    if int(nalpha) < int(nbeta):
+        raise ValueError("ROHF requires nalpha>=nbeta")
+
+    basis_in = mol.basis if basis is None else basis
+    cfg = CuERIDFConfig() if df_config is None else df_config
+
+    ao_basis, basis_name = build_ao_basis_cart(mol, basis=basis_in, expand_contractions=bool(expand_contractions))
+    coords, charges = _atom_coords_charges_bohr(mol)
+    int1e = build_int1e_cart(ao_basis, atom_coords_bohr=coords, atom_charges=charges)
+
+    aux_basis, auxbasis_name = _build_aux_basis_cart(
+        mol,
+        basis_in=basis_in,
+        auxbasis=auxbasis,
+        expand_contractions=bool(expand_contractions),
+    )
+
+    int1e_scf, _B_unused, sph_map = _apply_sph_transform(mol, int1e, None, ao_basis, df_B_layout="mnQ")
+    df_ao_rep = "cart" if bool(mol.cart) else "sph"
+
+    # Grid kind selection (Becke vs DVR).
+    grid_kind_s = str(thc_grid_kind).strip().lower()
+    dvr_basis_cart = None
+    if grid_kind_s in {"rdvr", "r-dvr", "r_dvr", "fdvr", "f-dvr", "f_dvr"}:
+        if thc_dvr_basis is None:
+            dvr_basis_cart = aux_basis
+        elif isinstance(thc_dvr_basis, str) and str(thc_dvr_basis).strip().lower() in {"aux", "auxbasis"}:
+            dvr_basis_cart = aux_basis
+        else:
+            dvr_basis_cart, _dvr_name_unused = build_ao_basis_cart(
+                mol,
+                basis=thc_dvr_basis,
+                expand_contractions=bool(expand_contractions),
+            )
+
+    # Build THC factors (global THC or local-THC/LS-THC-style blocks).
+    thc_mode_s = str(thc_mode).strip().lower()
+    thc_prof = profile.setdefault("thc_build", {}) if profile is not None else None
+    thc_factors = None
+    L_metric_full = None
+
+    if thc_mode_s in {"global", "thc", "full"}:
+        from asuka.hf.thc_factors import build_thc_factors  # noqa: PLC0415
+
+        thc = build_thc_factors(
+            mol,
+            ao_basis,
+            aux_basis,
+            sph_map=sph_map,
+            grid_spec=thc_grid_spec,
+            grid_kind=str(thc_grid_kind),
+            dvr_basis=dvr_basis_cart,
+            grid_options=thc_grid_options,
+            npt=thc_npt,
+            metric_backend=str(cfg.backend),
+            metric_mode=str(cfg.mode),
+            metric_threads=int(cfg.threads),
+            solve_method=str(thc_solve_method),
+            stream=cfg.stream,
+            profile=thc_prof,
+        )
+        thc_factors = thc
+        L_metric_full = thc.L_metric
+    elif thc_mode_s in {"local", "lthc", "local-thc", "local_thc", "ls-thc", "ls_thc"}:
+        from asuka.hf.local_thc_config import LocalTHCConfig  # noqa: PLC0415
+        from asuka.hf.local_thc_factors import build_local_thc_factors  # noqa: PLC0415
+
+        if thc_local_config is None:
+            lcfg = LocalTHCConfig()
+        elif isinstance(thc_local_config, LocalTHCConfig):
+            lcfg = thc_local_config
+        elif isinstance(thc_local_config, dict):
+            lcfg = LocalTHCConfig(**thc_local_config)
+        else:
+            raise TypeError("thc_local_config must be a LocalTHCConfig or a dict")
+
+        if bool(use_density_difference):
+            from asuka.cueri import df as cueri_df  # noqa: PLC0415
+
+            V_full = cueri_df.metric_2c2e_basis(
+                aux_basis,
+                stream=cfg.stream,
+                backend=str(cfg.backend),
+                mode=str(cfg.mode),
+                threads=int(cfg.threads),
+            )
+            L_metric_full = cueri_df.cholesky_metric(V_full)
+
+        lthc = build_local_thc_factors(
+            mol,
+            ao_basis,
+            aux_basis,
+            S_scf=int1e_scf.S,
+            grid_kind=str(thc_grid_kind),
+            dvr_basis=dvr_basis_cart,
+            grid_options=thc_grid_options,
+            grid_spec=thc_grid_spec,
+            thc_npt=thc_npt,
+            config=lcfg,
+            metric_backend=str(cfg.backend),
+            metric_mode=str(cfg.mode),
+            metric_threads=int(cfg.threads),
+            solve_method=str(thc_solve_method),
+            stream=cfg.stream,
+            profile=thc_prof,
+        )
+        thc_factors = lthc
+    else:
+        raise ValueError("thc_mode must be one of: 'global', 'local'")
+
+    ref = None
+    mo_coeff_thc0 = mo_coeff0
+    if bool(use_density_difference):
+        if dm0 is not None:
+            raise NotImplementedError("density-difference warmup currently does not support dm0 (streamed DF requires mo_coeff)")
+
+        from asuka.hf import df_jk_streamed  # noqa: PLC0415
+        from asuka.hf import df_scf as hf_df_scf  # noqa: PLC0415
+        from asuka.hf.local_thc_scf import LocalTHCReferenceUHF  # noqa: PLC0415
+        from asuka.hf.thc_scf import THCReferenceUHF  # noqa: PLC0415
+
+        n_warm = max(1, int(df_warmup_cycles))
+        warm_prof = profile.setdefault("df_warmup", {}) if profile is not None else None
+        warm = hf_df_scf.rohf_df(
+            int1e_scf.S,
+            int1e_scf.hcore,
+            None,
+            nalpha=int(nalpha),
+            nbeta=int(nbeta),
+            enuc=float(mol.energy_nuc()),
+            max_cycle=int(n_warm),
+            conv_tol=0.0,
+            conv_tol_dm=0.0,
+            # Conventional refinement iterations before switching to THC on ΔD.
+            diis=True,
+            damping=0.0,
+            jk_mode="streamed",
+            k_engine="from_Cocc",
+            k_q_block=int(df_k_q_block),
+            ao_basis=ao_basis,
+            aux_basis=aux_basis,
+            df_backend=str(cfg.backend),
+            df_ao_rep=str(df_ao_rep),
+            df_threads=int(cfg.threads),
+            df_mode=str(cfg.mode),
+            df_aux_block_naux=int(df_aux_block_naux),
+            L_metric=L_metric_full,
+            mo_coeff0=mo_coeff0,
+            profile=warm_prof,
+        )
+        C_ref = warm.mo_coeff
+        occ_a_ref, occ_b_ref = warm.mo_occ
+
+        xp, _ = hf_df_scf._get_xp(C_ref, occ_a_ref)
+        Da_ref = hf_df_scf._symmetrize(xp, hf_df_scf._density_from_C_occ(C_ref, occ_a_ref))
+        Db_ref = hf_df_scf._symmetrize(xp, hf_df_scf._density_from_C_occ(C_ref, occ_b_ref))
+        Dtot_ref = Da_ref + Db_ref
+
+        ctx = df_jk_streamed.make_streamed_df_jk_context(
+            ao_basis,
+            aux_basis,
+            L_metric=L_metric_full,
+            backend=str(cfg.backend),
+            threads=int(cfg.threads),
+            mode=str(cfg.mode),
+            ao_rep=str(df_ao_rep),
+            aux_block_naux=int(df_aux_block_naux),
+            profile=None,
+        )
+        Ca_occ = xp.ascontiguousarray(C_ref[:, : int(nalpha)])
+        Cb_occ = xp.ascontiguousarray(C_ref[:, : int(nbeta)])
+        occ_a_vals = occ_a_ref[: int(nalpha)]
+        occ_b_vals = occ_b_ref[: int(nbeta)]
+        J_ref, Ks = df_jk_streamed.df_JKs_streamed(
+            ctx,
+            Dtot_ref,
+            [Ca_occ, Cb_occ],
+            [occ_a_vals, occ_b_vals],
+            k_q_block=int(df_k_q_block),
+            cublas_math_mode=None,
+            work={},
+            profile=None,
+        )
+        Ka_ref, Kb_ref = Ks
+        if thc_mode_s in {"global", "thc", "full"}:
+            ref = THCReferenceUHF(Da_ref=Da_ref, Db_ref=Db_ref, J_ref=J_ref, Ka_ref=Ka_ref, Kb_ref=Kb_ref)
+        else:
+            ref = LocalTHCReferenceUHF(Da_ref=Da_ref, Db_ref=Db_ref, J_ref=J_ref, Ka_ref=Ka_ref, Kb_ref=Kb_ref)
+
+        if mo_coeff_thc0 is None:
+            mo_coeff_thc0 = C_ref
+
+    diis_start_cycle_i = int(diis_start_cycle) if diis_start_cycle is not None else 2
+    if thc_mode_s in {"global", "thc", "full"}:
+        from asuka.hf.thc_scf import rohf_thc  # noqa: PLC0415
+
+        scf = rohf_thc(
+            int1e_scf.S,
+            int1e_scf.hcore,
+            thc_factors,
+            nalpha=int(nalpha),
+            nbeta=int(nbeta),
+            enuc=float(mol.energy_nuc()),
+            max_cycle=int(max_cycle),
+            conv_tol=float(conv_tol),
+            conv_tol_dm=float(conv_tol_dm),
+            diis=bool(diis),
+            diis_start_cycle=int(diis_start_cycle_i),
+            diis_space=int(diis_space),
+            damping=float(damping),
+            q_block=int(q_block),
+            dm0=dm0,
+            mo_coeff0=mo_coeff_thc0,
+            reference=ref,
+            profile=profile,
+        )
+    else:
+        from asuka.hf.local_thc_scf import rohf_local_thc  # noqa: PLC0415
+
+        scf = rohf_local_thc(
+            int1e_scf.S,
+            int1e_scf.hcore,
+            thc_factors,
+            nalpha=int(nalpha),
+            nbeta=int(nbeta),
+            enuc=float(mol.energy_nuc()),
+            max_cycle=int(max_cycle),
+            conv_tol=float(conv_tol),
+            conv_tol_dm=float(conv_tol_dm),
+            diis=bool(diis),
+            diis_start_cycle=int(diis_start_cycle_i),
+            diis_space=int(diis_space),
+            damping=float(damping),
+            q_block=int(q_block),
+            dm0=dm0,
+            mo_coeff0=mo_coeff_thc0,
+            reference=ref,
+            profile=profile,
+        )
+
+    return ROHFDFRunResult(
+        mol=mol,
+        basis_name=str(basis_name),
+        auxbasis_name=str(auxbasis_name),
+        ao_basis=ao_basis,
+        aux_basis=aux_basis,
+        int1e=int1e_scf,
+        df_B=None,
+        scf=scf,
+        profile=profile,
+        sph_map=sph_map,
+        df_L=L_metric_full,
+        thc_factors=thc_factors,
+    )
+
+
 def run_hf_df(
     mol: Molecule,
     *,
     method: str = "rhf",
     backend: str = "cuda",
     df: bool = True,
+    two_e_backend: str | None = None,
     guess: Any | None = None,
     dm0: Any | None = None,
     mo_coeff0: Any | None = None,
     **kwargs,
 ) -> RHFDFRunResult | UHFDFRunResult | ROHFDFRunResult:
-    """Unified HF driver (RHF/UHF/ROHF) over (backend, df) switches.
+    """Unified HF driver (RHF/UHF/ROHF) over (backend, 2e-backend) switches.
 
     Notes
     -----
-    - `df=True`: DF-HF via whitened DF factors `B[μ,ν,Q]`.
-    - `df=False`: dense AO-ERI HF (`ao_eri` is populated in the result; `df_B=None`).
+    - If `two_e_backend` is provided, it overrides the legacy `df` flag.
+    - `two_e_backend="df"`: DF-HF via whitened DF factors `B[μ,ν,Q]`.
+    - `two_e_backend="dense"`: dense AO-ERI HF (`ao_eri` is populated in the result; `df_B=None`).
+    - `two_e_backend="thc"`: THC-HF (GPU-only).
     - `backend="cuda"`: build DF factors on GPU (CuPy).
     - `backend="cpu"`: build DF factors on CPU (requires `asuka.cueri._eri_rys_cpu`).
     """
@@ -886,7 +1973,14 @@ def run_hf_df(
         except Exception:
             mo_coeff0 = None
 
-    if not bool(df):
+    if two_e_backend is None:
+        two_e = "df" if bool(df) else "dense"
+    else:
+        two_e = str(two_e_backend).strip().lower()
+        if two_e not in {"df", "dense", "thc"}:
+            raise ValueError("two_e_backend must be one of: 'df', 'dense', 'thc'")
+
+    if two_e == "dense":
         dense_kwargs = dict(kwargs)
         # Ignore DF-only knobs if users pass them through generic wrappers.
         for key in (
@@ -911,12 +2005,59 @@ def run_hf_df(
             return run_uhf_dense(mol, backend=backend_s, dm0=dm0, mo_coeff0=mo_coeff0, **dense_kwargs)
         return run_rohf_dense(mol, backend=backend_s, dm0=dm0, mo_coeff0=mo_coeff0, **dense_kwargs)
 
+    if two_e == "thc":
+        if backend_s != "cuda":
+            raise NotImplementedError("THC backend currently requires backend='cuda'")
+        if method_s == "rhf":
+            return run_rhf_thc(mol, dm0=dm0, mo_coeff0=mo_coeff0, **kwargs)
+        if method_s == "uhf":
+            return run_uhf_thc(mol, dm0=dm0, mo_coeff0=mo_coeff0, **kwargs)
+        return run_rohf_thc(mol, dm0=dm0, mo_coeff0=mo_coeff0, **kwargs)
+
     if backend_s == "cuda":
         if method_s == "rhf":
-            return run_rhf_df(mol, dm0=dm0, mo_coeff0=mo_coeff0, **kwargs)
-        if method_s == "uhf":
-            return run_uhf_df(mol, dm0=dm0, mo_coeff0=mo_coeff0, **kwargs)
-        return run_rohf_df(mol, dm0=dm0, mo_coeff0=mo_coeff0, **kwargs)
+            out = run_rhf_df(mol, dm0=dm0, mo_coeff0=mo_coeff0, **kwargs)
+        elif method_s == "uhf":
+            out = run_uhf_df(mol, dm0=dm0, mo_coeff0=mo_coeff0, **kwargs)
+        else:
+            out = run_rohf_df(mol, dm0=dm0, mo_coeff0=mo_coeff0, **kwargs)
+
+        # Optional post-SCF cleanup: reduce driver-visible peak VRAM by releasing
+        # cached CUDA workspaces and returning unused CuPy pool blocks.
+        #
+        # Default heuristic: enable when VRAM telemetry is on (benchmarking /
+        # debugging) or when a GPU memory cap is set.
+        try:
+            import os as _os_scf  # noqa: PLC0415
+
+            _flag = _os_scf.environ.get("ASUKA_FLUSH_GPU_POOL_AFTER_SCF")
+            if _flag is None:
+                def _env_true(name: str) -> bool:
+                    v = _os_scf.environ.get(name)
+                    if v is None:
+                        return False
+                    return str(v).strip().lower() not in ("0", "false", "no", "off", "")
+
+                _flag = "1" if (_env_true("ASUKA_VRAM_DEBUG") or _env_true("ASUKA_GPU_MEM_CAP_GB")) else "0"
+            _v = str(_flag).strip().lower()
+            if _v not in ("0", "false", "no", "off", ""):
+                import cupy as _cp_scf  # noqa: PLC0415
+                from asuka.hf import df_jk as _df_jk  # noqa: PLC0415
+
+                _cp_scf.cuda.Device().synchronize()
+                try:
+                    _df_jk.release_cuda_ext_workspace_cache()
+                except Exception:
+                    pass
+                _cp_scf.get_default_memory_pool().free_all_blocks()
+                try:
+                    _cp_scf.get_default_pinned_memory_pool().free_all_blocks()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+        return out
 
     if method_s == "rhf":
         return run_rhf_df_cpu(mol, dm0=dm0, mo_coeff0=mo_coeff0, **kwargs)
@@ -931,6 +2072,7 @@ def run_hf(
     method: str = "rhf",
     backend: str = "cuda",
     df: bool = True,
+    two_e_backend: str | None = None,
     guess: Any | None = None,
     dm0: Any | None = None,
     mo_coeff0: Any | None = None,
@@ -946,6 +2088,7 @@ def run_hf(
         method=str(method),
         backend=str(backend),
         df=bool(df),
+        two_e_backend=two_e_backend,
         guess=guess,
         dm0=dm0,
         mo_coeff0=mo_coeff0,
@@ -1379,9 +2522,13 @@ def run_uhf_df(
 
     if B_scf is not None:
         try:  # pragma: no cover
+            import os as _os_dfpack  # noqa: PLC0415
+            import cupy as _cp_dfpack  # noqa: PLC0415
             from asuka.integrals.df_packed_s2 import ao_packed_s2_enabled, pack_B_to_Qp  # noqa: PLC0415
 
-            if bool(ao_packed_s2_enabled()):
+            _explicit = "ASUKA_DF_AO_PACKED_S2" in _os_dfpack.environ
+            _want_pack = bool(ao_packed_s2_enabled()) if _explicit else isinstance(B_scf, _cp_dfpack.ndarray)
+            if bool(_want_pack) and int(getattr(B_scf, "ndim", 0)) == 3:
                 layout = "mnQ" if str(df_layout_s) == "mnq" else "Qmn"
                 B_scf = pack_B_to_Qp(B_scf, layout=layout, nao=int(int1e_scf.S.shape[0]))
         except Exception:
@@ -1493,9 +2640,13 @@ def run_rohf_df(
 
     if B_scf is not None:
         try:  # pragma: no cover
+            import os as _os_dfpack  # noqa: PLC0415
+            import cupy as _cp_dfpack  # noqa: PLC0415
             from asuka.integrals.df_packed_s2 import ao_packed_s2_enabled, pack_B_to_Qp  # noqa: PLC0415
 
-            if bool(ao_packed_s2_enabled()):
+            _explicit = "ASUKA_DF_AO_PACKED_S2" in _os_dfpack.environ
+            _want_pack = bool(ao_packed_s2_enabled()) if _explicit else isinstance(B_scf, _cp_dfpack.ndarray)
+            if bool(_want_pack) and int(getattr(B_scf, "ndim", 0)) == 3:
                 layout = "mnQ" if str(df_layout_s) == "mnq" else "Qmn"
                 B_scf = pack_B_to_Qp(B_scf, layout=layout, nao=int(int1e_scf.S.shape[0]))
         except Exception:

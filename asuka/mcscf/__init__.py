@@ -20,6 +20,7 @@ from .casci import (
     run_casci_dense_gpu,
     run_casci_df,
     run_casci_df_cpu,
+    run_casci_thc,
 )
 from .casscf import (
     CASSCFResult,
@@ -36,7 +37,7 @@ from .nac import (
     sacasscf_nonadiabatic_couplings_df_densez,
     sacasscf_nonadiabatic_couplings_dense,
 )
-from .orbital_grad import allowed_rotation_mask, orbital_gradient_dense, orbital_gradient_df
+from .orbital_grad import allowed_rotation_mask, orbital_gradient_dense, orbital_gradient_df, orbital_gradient_thc
 from .orbital_tracking import (
     align_orbital_phases,
     assign_active_orbitals_by_overlap,
@@ -70,6 +71,7 @@ __all__ = [
     "run_casci_dense_gpu",
     "run_casci_df",
     "run_casci_df_cpu",
+    "run_casci_thc",
     "casci_orbital_gradient_df",
     "casci_orbital_gradient_dense",
     "run_casscf",
@@ -91,6 +93,7 @@ __all__ = [
     "casci_nuc_grad_df_unrelaxed",
     "allowed_rotation_mask",
     "orbital_gradient_df",
+    "orbital_gradient_thc",
     "orbital_gradient_dense",
     "align_orbital_phases",
     "assign_active_orbitals_by_overlap",

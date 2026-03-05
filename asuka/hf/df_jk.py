@@ -59,6 +59,43 @@ _HF_DF_JK_BQ_CACHE_BY_DEVICE: dict[int, tuple[tuple[int, int, int, int], Any]] =
 _HF_DF_JK_QBLOCK_TUNE_BY_DEVICE: dict[int, dict[tuple[Any, ...], int]] = {}
 
 
+def release_cuda_ext_workspace_cache() -> None:
+    """Release cached CUDA-ext workspaces and BQ caches.
+
+    Motivation
+    ----------
+    The CUDA extension allocates several persistent work buffers via raw
+    `cudaMalloc` (not the CuPy pool). These are great for performance across
+    repeated J/K builds, but they can inflate driver-visible VRAM for later
+    phases (e.g. DF gradient contraction) that do not need HF DF-JK.
+    """
+
+    # Drop cached BQ transforms and q-block tuning unconditionally (these are
+    # pure Python references and safe to clear even if the extension is absent).
+    try:
+        _HF_DF_JK_BQ_CACHE_BY_DEVICE.clear()
+    except Exception:
+        pass
+    try:
+        _HF_DF_JK_QBLOCK_TUNE_BY_DEVICE.clear()
+    except Exception:
+        pass
+
+    # Release extension workspaces (raw cudaMalloc buffers).
+    try:
+        for _dev, _ws in list(_HF_DF_JK_WS_BY_DEVICE.items()):
+            try:
+                if _ws is not None:
+                    _ws.release()
+            except Exception:
+                pass
+    finally:
+        try:
+            _HF_DF_JK_WS_BY_DEVICE.clear()
+        except Exception:
+            pass
+
+
 def _get_hf_df_jk_workspace(cp):
     dev = int(cp.cuda.runtime.getDevice())
     ws = _HF_DF_JK_WS_BY_DEVICE.get(dev)
@@ -218,6 +255,16 @@ def _autotune_q_block_ext(
             )
         elif str(mode) == "bq_cached":
             ws.k_from_bq_cw(
+                in_arr,
+                Cw,
+                Ktmp,
+                q_block=int(q),
+                stream=int(stream_ptr),
+                math_mode=int(math_mode),
+                sync=False,
+            )
+        elif str(mode) == "qp":
+            ws.k_from_qp_cw(
                 in_arr,
                 Cw,
                 Ktmp,
@@ -678,16 +725,79 @@ def df_K_from_BmnQ_Cocc(
     if q_block <= 0:
         raise ValueError("q_block must be > 0")
 
-    # Packed-Qp path: no CUDA extension fast path yet (would require materializing BQ).
+    # Packed-Qp path.
     if bool(is_qp):
-        from asuka.integrals.df_packed_s2 import unpack_Qp_to_Qmn_block  # noqa: PLC0415
-
         q_block_eff = max(1, min(int(naux), int(q_block)))
         # Weight occupied orbitals by sqrt(occ) so K becomes a simple sum of outer products.
         sqrt_occ = xp.sqrt(occ_vals)
         Cw = C_occ * sqrt_occ[None, :]
         if hasattr(Cw, "flags") and not bool(Cw.flags.c_contiguous):
             Cw = xp.ascontiguousarray(Cw)
+
+        pref = _hf_k_impl_pref()
+        if pref not in {"auto", "cupy", "cuda_ext"}:
+            raise ValueError("ASUKA_HF_K_IMPL must be one of: 'auto', 'cupy', 'cuda_ext'")
+
+        use_ext = False
+        if xp is not np and pref in {"auto", "cuda_ext"}:
+            use_ext = bool(_load_hf_df_jk_cuda_ext() is not None)
+            if pref == "cuda_ext" and not use_ext:
+                raise RuntimeError(
+                    "ASUKA_HF_K_IMPL='cuda_ext' was set but asuka._hf_df_jk_cuda_ext is not available. "
+                    "Reinstall ASUKA with a CUDA toolkit available (nvcc)."
+                )
+
+        if use_ext:
+            if hasattr(B_mnQ, "flags") and not bool(B_mnQ.flags.c_contiguous):
+                B_mnQ = xp.ascontiguousarray(B_mnQ)
+
+            ws = _get_hf_df_jk_workspace(xp)
+            stream_ptr = int(xp.cuda.get_current_stream().ptr)
+            math_mode = _cublas_math_mode_to_int(xp, cublas_math_mode)
+
+            q_block_ext = int(q_block_eff)
+            q_guess_qp = int(q_block_ext)
+            if _hf_k_ext_tune_enabled():
+                q_guess_qp = _pick_ext_q_block(
+                    xp, layout="mnq", naux=int(naux), nao=int(nao), nocc=int(nocc), requested=int(q_block_eff)
+                )
+                q_block_ext = int(q_guess_qp)
+
+            if _hf_k_ext_tune_enabled():
+                q_block_ext = _autotune_q_block_ext(
+                    xp,
+                    ws,
+                    mode="qp",
+                    in_arr=B_mnQ,
+                    Cw=Cw,
+                    q_req=int(q_block_eff),
+                    q_guess=int(q_block_ext),
+                    naux=int(naux),
+                    nao=int(nao),
+                    nocc=int(nocc),
+                    math_mode=int(math_mode),
+                )
+
+            K = xp.empty((nao, nao), dtype=xp.float64)
+            ws.k_from_qp_cw(
+                B_mnQ,
+                Cw,
+                K,
+                q_block=int(q_block_ext),
+                stream=int(stream_ptr),
+                math_mode=int(math_mode),
+                sync=False,
+            )
+            if profile is not None:
+                jk_prof = profile.setdefault("jk", {})
+                jk_prof["k_impl"] = "cocc_cuda_ext_qp_unpack_bq_gemm_transpose_gemm"
+                jk_prof["k_q_block"] = int(q_block_ext)
+                jk_prof["k_q_block_req"] = int(q_block_eff)
+                jk_prof["k_nocc"] = int(nocc)
+            return K
+
+        # CuPy fallback: unpack to Qmn and flatten GEMM.
+        from asuka.integrals.df_packed_s2 import unpack_Qp_to_Qmn_block  # noqa: PLC0415
 
         K = xp.zeros((nao, nao), dtype=xp.float64)
         for q0 in range(0, int(naux), int(q_block_eff)):
@@ -697,18 +807,20 @@ def df_K_from_BmnQ_Cocc(
                 continue
             BQc = unpack_Qp_to_Qmn_block(B_mnQ, nao=int(nao), q0=int(q0), q_count=int(q))  # (q,nao,nao)
 
-            # (q, μ, ν) x (ν, i) -> (μ, q, i)
-            tmp = xp.einsum("qmn,ni->mqi", BQc, Cw, optimize=True)
-            if hasattr(tmp, "flags") and not bool(tmp.flags.c_contiguous):
-                tmp = xp.ascontiguousarray(tmp)
-            U = tmp.reshape((nao, q * nocc))
+            # Avoid einsum (often allocates large workspaces).  Flatten the
+            # batched matmul into a single GEMM:
+            #   Y[(q,mu), i] = sum_nu B[q,mu,nu] * Cw[nu,i]
+            Y2d = BQc.reshape(q * nao, nao) @ Cw  # (q*nao, nocc)
+            del BQc
+            # U[mu, q*nocc + i] = Y[q, mu, i]
+            U = xp.ascontiguousarray(Y2d.reshape(q, nao, nocc).transpose(1, 0, 2)).reshape(nao, q * nocc)
+            del Y2d
             K += U @ U.T
-
-            del BQc, tmp, U
+            del U
 
         if profile is not None:
             jk_prof = profile.setdefault("jk", {})
-            jk_prof["k_impl"] = "cocc_qp_unpack_qmn_einsum"
+            jk_prof["k_impl"] = "cocc_qp_unpack_qmn_gemm"
             jk_prof["k_q_block"] = int(q_block_eff)
             jk_prof["k_nocc"] = int(nocc)
 

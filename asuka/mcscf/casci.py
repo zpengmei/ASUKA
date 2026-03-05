@@ -23,6 +23,10 @@ from asuka.cuda.active_space_df.active_space_integrals import (
     build_device_dfmo_integrals_cueri_dense_rys,
     build_device_dfmo_integrals_cueri_df,
 )
+from asuka.cuda.active_space_thc.active_space_integrals import (
+    build_device_dfmo_integrals_local_thc,
+    build_device_dfmo_integrals_thc,
+)
 from asuka.hf import df_scf as _df_scf
 from asuka.hf import df_jk
 from asuka.solver import GUGAFCISolver
@@ -484,6 +488,123 @@ def _build_casci_df_integrals(
     return _CASCIDFIntegrals(h1eff=h1eff, eri=eri, ecore=ecore, mo_coeff=C, C_cas=C_cas)
 
 
+def _build_casci_thc_integrals(
+    scf_out: RHFDFRunResult | ROHFDFRunResult | UHFDFRunResult,
+    *,
+    ncore: int,
+    ncas: int,
+    mo_coeff: Any | None = None,
+    want_eri_mat: bool = True,
+    q_block: int = 256,
+    profile: dict | None = None,
+) -> _CASCIDFIntegrals:
+    """Build effective 1-electron, 2-electron integrals, and core energy for THC-CASCI.
+
+    This mirrors `_build_casci_df_integrals` but uses cached THC factors from
+    `scf_out.thc_factors` for both the core JK potential and active-space 2e integrals.
+
+    Notes
+    -----
+    - Supports both global THC (`THCFactors`) and local-THC (`LocalTHCFactors`).
+      The local-THC active-space build materializes the ERI matrix directly
+      (pair-space) because each block has its own auxiliary dimension.
+    """
+
+    if not bool(getattr(scf_out.scf, "converged", False)):
+        raise RuntimeError("SCF must be converged before CASCI")
+
+    ncore = int(ncore)
+    ncas = int(ncas)
+    if ncore < 0:
+        raise ValueError("ncore must be >= 0")
+    if ncas <= 0:
+        raise ValueError("ncas must be > 0")
+
+    C = mo_coeff if mo_coeff is not None else getattr(scf_out.scf, "mo_coeff", None)
+    if C is None:
+        raise ValueError("scf_out.scf.mo_coeff is missing")
+    if isinstance(C, tuple):
+        mo_occ = getattr(scf_out.scf, "mo_occ", None)
+        if not isinstance(mo_occ, tuple) or len(mo_occ) != 2:
+            raise ValueError("UHF mo_coeff=(Ca,Cb) requires scf_out.scf.mo_occ=(occ_a,occ_b)")
+        C, _occ_no = spatialize_uhf_mo_coeff(S_ao=scf_out.int1e.S, mo_coeff=C, mo_occ=mo_occ)
+
+    C = C.astype(C.dtype, copy=False)
+    if C.ndim != 2:
+        raise ValueError("mo_coeff must be 2D")
+    nao, nmo = map(int, C.shape)
+    if ncore + ncas > nmo:
+        raise ValueError("ncore+ncas exceeds number of MOs")
+
+    C_core = C[:, :ncore]
+    C_cas = C[:, ncore : ncore + ncas]
+
+    thc = getattr(scf_out, "thc_factors", None)
+    if thc is None:
+        raise ValueError("scf_out.thc_factors is missing (THC CASCI requires cached THC factors)")
+    from asuka.hf.thc_factors import THCFactors  # noqa: PLC0415
+    from asuka.hf.local_thc_factors import LocalTHCFactors  # noqa: PLC0415
+
+    if not isinstance(thc, (THCFactors, LocalTHCFactors)):
+        raise TypeError("scf_out.thc_factors must be THCFactors or LocalTHCFactors")
+
+    if isinstance(thc, THCFactors):
+        _xp_probe = thc.X
+    else:
+        if len(thc.blocks) == 0:
+            raise ValueError("LocalTHCFactors.blocks is empty")
+        _xp_probe = thc.blocks[0].X
+    xp, _is_gpu = _df_scf._get_xp(_xp_probe, C_cas)  # noqa: SLF001
+    h_ao = xp.asarray(scf_out.int1e.hcore, dtype=xp.float64)
+
+    _t_core_start = time.perf_counter() if profile is not None else 0.0
+    if ncore == 0:
+        vhf_core = xp.zeros((nao, nao), dtype=xp.float64)
+        ecore = float(scf_out.mol.energy_nuc())
+    else:
+        D_core = 2.0 * (C_core @ C_core.T)
+        if isinstance(thc, THCFactors):
+            from asuka.hf.thc_jk import THCJKWork, thc_JK  # noqa: PLC0415
+
+            Jc, Kc = thc_JK(D_core, thc.X, thc.Z, work=THCJKWork(q_block=int(q_block)))
+        else:
+            from asuka.hf.local_thc_jk import local_thc_JK  # noqa: PLC0415
+
+            Jc, Kc = local_thc_JK(D_core, thc, q_block=int(q_block))
+        vhf_core = Jc - 0.5 * Kc
+        e_one = xp.sum(D_core * h_ao)
+        e_two = 0.5 * xp.sum(D_core * vhf_core)
+        ecore = float(float(scf_out.mol.energy_nuc()) + float(e_one.item()) + float(e_two.item()))
+
+    if profile is not None:
+        profile["t_core_fock_s"] = profile.get("t_core_fock_s", 0.0) + float(time.perf_counter() - _t_core_start)
+
+    h1eff_dev = C_cas.T @ (h_ao + vhf_core) @ C_cas
+    h1eff = _asnumpy_f64(h1eff_dev)
+
+    eri_prof = None
+    if profile is not None:
+        eri_prof = profile.setdefault("active_thc", {})
+
+    if isinstance(thc, THCFactors):
+        eri = build_device_dfmo_integrals_thc(
+            thc,
+            C_cas,
+            want_eri_mat=bool(want_eri_mat),
+            want_pair_norm=False,
+            profile=eri_prof,
+        )
+    else:
+        eri = build_device_dfmo_integrals_local_thc(
+            thc,
+            C_cas,
+            want_eri_mat=bool(want_eri_mat),
+            profile=eri_prof,
+        )
+
+    return _CASCIDFIntegrals(h1eff=h1eff, eri=eri, ecore=ecore, mo_coeff=C, C_cas=C_cas)
+
+
 def eval_casci_energy_df(
     scf_out: RHFDFRunResult | ROHFDFRunResult | UHFDFRunResult,
     *,
@@ -700,6 +821,122 @@ def run_casci_df(
                 if _k in kprof:
                     pk = f"solver_{_k}"
                     profile[pk] = profile.get(pk, 0.0) + float(kprof[_k])
+
+    e_tot_val: float | np.ndarray
+    if int(nroots) == 1:
+        e_tot_val = float(e_tot)
+    else:
+        e_tot_val = np.asarray(e_tot, dtype=np.float64).ravel()
+
+    return CASCIResult(
+        mol=scf_out.mol,
+        basis_name=str(scf_out.basis_name),
+        auxbasis_name=str(scf_out.auxbasis_name),
+        ncore=int(ncore),
+        ncas=int(ncas),
+        nelecas=nelecas,
+        nroots=int(nroots),
+        ecore=float(ecore),
+        e_tot=e_tot_val,
+        ci=ci,
+        mo_coeff=C,
+        h1eff=h1eff,
+        eri=eri,
+        scf=scf_out.scf,
+        profile=profile,
+        scf_out=scf_out,
+    )
+
+
+def run_casci_thc(
+    scf_out: RHFDFRunResult | ROHFDFRunResult | UHFDFRunResult,
+    *,
+    ncore: int,
+    ncas: int,
+    nelecas: int | tuple[int, int],
+    mo_coeff: Any | None = None,
+    ci0: Any | None = None,
+    fcisolver: GUGAFCISolver | None = None,
+    twos: int | None = None,
+    nroots: int = 1,
+    matvec_backend: str = "cuda_eri_mat",
+    want_eri_mat: bool = True,
+    q_block: int = 256,
+    aux_block_naux: int = 0,
+    max_tile_bytes: int = 0,
+    profile: dict | None = None,
+    cached_b_whitened: Any | None = None,
+    cache_out: dict | None = None,
+    **solver_kwargs,
+) -> CASCIResult:
+    """Run CASCI using cached THC factors for the active-space integrals (GPU).
+
+    This is the CASCI analog of `run_casci_df`, but builds active-space DF-like
+    vectors from THC factors. It currently supports only CUDA matvec backends.
+    """
+
+    # Keep signature compatible with DF entrypoints (ignore DF-specific knobs).
+    _ = aux_block_naux, max_tile_bytes, cached_b_whitened, cache_out
+
+    validate_active_space_configuration(
+        scf_out,
+        ncore=int(ncore),
+        ncas=int(ncas),
+        nelecas=nelecas,
+        mo_coeff=mo_coeff,
+        context="run_casci_thc",
+    )
+
+    matvec_backend_s = str(matvec_backend).strip().lower()
+    if matvec_backend_s not in {"cuda_eri_mat", "cuda"}:
+        raise ValueError("run_casci_thc currently requires matvec_backend in {'cuda_eri_mat','cuda'}")
+    if not bool(want_eri_mat):
+        raise ValueError("run_casci_thc requires want_eri_mat=True for CUDA matvec backends")
+
+    integrals = _build_casci_thc_integrals(
+        scf_out,
+        ncore=ncore,
+        ncas=ncas,
+        mo_coeff=mo_coeff,
+        want_eri_mat=True,
+        q_block=int(q_block),
+        profile=profile,
+    )
+    h1eff = integrals.h1eff
+    eri = integrals.eri
+    ecore = integrals.ecore
+    C = integrals.mo_coeff
+
+    if fcisolver is None:
+        if twos is None:
+            twos = int(getattr(scf_out.mol, "spin", 0))
+        fcisolver = GUGAFCISolver(twos=int(twos), nroots=int(nroots))
+    else:
+        if getattr(fcisolver, "nroots", None) != int(nroots):
+            try:
+                fcisolver.nroots = int(nroots)
+            except Exception:
+                pass
+
+    t0_ci = time.perf_counter() if profile is not None else 0.0
+    e_tot, ci = fcisolver.kernel(
+        h1eff,
+        eri,
+        int(ncas),
+        nelecas,
+        ci0=ci0,
+        ecore=float(ecore),
+        nroots=int(nroots),
+        matvec_backend=str(matvec_backend_s),
+        **solver_kwargs,
+    )
+    if profile is not None:
+        profile["t_ci_solve_s"] = profile.get("t_ci_solve_s", 0.0) + float(time.perf_counter() - float(t0_ci))
+        kprof = getattr(fcisolver, "_last_kernel_profile", None)
+        if kprof is not None:
+            dav_stats = kprof.get("davidson_stats", None)
+            if dav_stats is not None:
+                profile["davidson_stats"] = dict(dav_stats)
 
     e_tot_val: float | np.ndarray
     if int(nroots) == 1:
@@ -1587,6 +1824,10 @@ def run_casci(
         raise ValueError("backend='cuda' requires scf_out with GPU arrays")
 
     if backend_s == "cuda" and df_b:
+        if scf_out.df_B is None and getattr(scf_out, "thc_factors", None) is not None:
+            return run_casci_thc(
+                scf_out, ncore=int(ncore), ncas=int(ncas), nelecas=nelecas, mo_coeff=mo_coeff, **kwargs
+            )
         return run_casci_df(scf_out, ncore=int(ncore), ncas=int(ncas), nelecas=nelecas, mo_coeff=mo_coeff, **kwargs)
     if backend_s == "cpu" and df_b:
         return run_casci_df_cpu(scf_out, ncore=int(ncore), ncas=int(ncas), nelecas=nelecas, mo_coeff=mo_coeff, **kwargs)

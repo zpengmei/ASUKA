@@ -15,6 +15,30 @@ namespace py = pybind11;
 extern "C" void hf_df_jk_fill_lower_from_upper_f64(double* a, int n, cudaStream_t stream);
 extern "C" void hf_df_jk_pack_bmnq_to_bq_f64(
     const double* b_mnq, int nao, int naux, int q0, int q, double* out_bq, cudaStream_t stream);
+extern "C" void hf_df_jk_unpack_qp_to_bq_f64(
+    const double* b_qp, int nao, int naux, int q0, int q, double* out_bq, cudaStream_t stream);
+extern "C" void hf_df_jk_extract_qp_rows_fullcols_f64(
+    const double* b_qp,
+    int nao,
+    int naux,
+    int q0,
+    int q,
+    int row0,
+    int row_count,
+    double* out_rows,
+    cudaStream_t stream);
+extern "C" void hf_df_jk_repack_y2d_to_yflat_f64(
+    const double* y2d, int q, int row_count, int nao, double* out_yflat, cudaStream_t stream);
+extern "C" void hf_df_jk_extract_qp_cols_to_zflat_t_f64(
+    const double* b_qp,
+    int nao,
+    int naux,
+    int q0,
+    int q,
+    int col0,
+    int col_count,
+    double* out_zflat_t,
+    cudaStream_t stream);
 
 namespace {
 
@@ -186,6 +210,21 @@ class DFJKWorkspace {
       bq_buf_ = nullptr;
     }
     bq_elems_ = 0;
+    if (a_buf_) {
+      cudaFree(a_buf_);
+      a_buf_ = nullptr;
+    }
+    a_elems_ = 0;
+    if (y_buf_) {
+      cudaFree(y_buf_);
+      y_buf_ = nullptr;
+    }
+    y_elems_ = 0;
+    if (z_buf_) {
+      cudaFree(z_buf_);
+      z_buf_ = nullptr;
+    }
+    z_elems_ = 0;
   }
 
   void k_from_bq_cw(
@@ -326,6 +365,318 @@ class DFJKWorkspace {
 
     // Fill the remaining triangle in the Python row-major view so out_k is fully symmetric.
     hf_df_jk_fill_lower_from_upper_f64(k_ptr, nao_i, stream);
+
+    if (sync) throw_on_cuda_error(cudaStreamSynchronize(stream), "cudaStreamSynchronize");
+  }
+
+  void k_from_qp_cw(
+      const py::object& b_qp,
+      const py::object& cw,
+      const py::object& out_k,
+      int q_block,
+      uint64_t stream_ptr,
+      int math_mode,
+      bool sync) {
+    const CudaArrayView bqp_v = cuda_array_view_from_object(b_qp, "B_Qp");
+    const CudaArrayView cw_v = cuda_array_view_from_object(cw, "Cw");
+    const CudaArrayView k_v = cuda_array_view_from_object(out_k, "out");
+
+    require_typestr_f64(bqp_v, "B_Qp");
+    require_typestr_f64(cw_v, "Cw");
+    require_typestr_f64(k_v, "out");
+
+    if (k_v.read_only) {
+      throw std::invalid_argument("out must be a writable CUDA array");
+    }
+    if (bqp_v.shape.size() != 2) {
+      throw std::invalid_argument("B_Qp must have shape (naux, ntri)");
+    }
+    if (cw_v.shape.size() != 2) {
+      throw std::invalid_argument("Cw must have shape (nao, nocc)");
+    }
+    if (k_v.shape.size() != 2) {
+      throw std::invalid_argument("out must have shape (nao, nao)");
+    }
+
+    const int64_t naux = bqp_v.shape[0];
+    const int64_t ntri = bqp_v.shape[1];
+    const int64_t nao = cw_v.shape[0];
+    const int64_t nocc = cw_v.shape[1];
+    if (k_v.shape[0] != nao || k_v.shape[1] != nao) {
+      throw std::invalid_argument("out must have shape (nao, nao)");
+    }
+
+    const int64_t expected_ntri = (nao * (nao + 1)) / 2;
+    if (ntri != expected_ntri) {
+      throw std::invalid_argument("B_Qp must have ntri=nao*(nao+1)//2");
+    }
+    if (q_block <= 0) {
+      throw std::invalid_argument("q_block must be > 0");
+    }
+
+    constexpr int64_t itemsize = (int64_t)sizeof(double);
+    require_c_contiguous(bqp_v, "B_Qp", itemsize);
+    require_c_contiguous(cw_v, "Cw", itemsize);
+    require_c_contiguous(k_v, "out", itemsize);
+
+    auto* bqp_ptr = reinterpret_cast<const double*>(bqp_v.ptr);
+    auto* cw_ptr = reinterpret_cast<const double*>(cw_v.ptr);
+    auto* k_ptr = reinterpret_cast<double*>(k_v.ptr);
+
+    cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
+    throw_on_cublas_error(cublasSetStream(cublas_.h, stream), "cublasSetStream");
+    const ScopedCublasMathMode math_ctx(cublas_.h, math_mode);
+
+    if (naux > (int64_t)std::numeric_limits<int>::max() || nao > (int64_t)std::numeric_limits<int>::max() ||
+        nocc > (int64_t)std::numeric_limits<int>::max()) {
+      throw std::invalid_argument("dimensions exceed int32 limits for cuBLAS");
+    }
+    const int naux_i = (int)naux;
+    const int nao_i = (int)nao;
+    const int nocc_i = (int)nocc;
+    if (naux_i < 0 || nao_i <= 0 || nocc_i < 0) throw std::invalid_argument("invalid dimensions");
+
+    const int64_t k_elems = nao * nao;
+    throw_on_cuda_error(cudaMemsetAsync(k_ptr, 0, (size_t)k_elems * sizeof(double), stream), "cudaMemsetAsync(out)");
+    if (naux_i == 0 || nocc_i == 0) {
+      if (sync) throw_on_cuda_error(cudaStreamSynchronize(stream), "cudaStreamSynchronize");
+      return;
+    }
+
+    const int q_block_i = std::min(q_block, naux_i);
+    const int64_t max_cols = (int64_t)q_block_i * (int64_t)nocc_i;
+    ensure_v_capacity((size_t)(max_cols * nao));
+    ensure_bq_capacity((size_t)((int64_t)q_block_i * nao * nao));
+
+    const double alpha = 1.0;
+    const double beta0 = 0.0;
+    const double beta = 1.0;
+
+    for (int q0 = 0; q0 < naux_i; q0 += q_block_i) {
+      const int q = std::min(q_block_i, naux_i - q0);
+      const int64_t cols = (int64_t)q * (int64_t)nocc_i;
+      if (cols <= 0) continue;
+
+      hf_df_jk_unpack_qp_to_bq_f64(bqp_ptr, nao_i, naux_i, q0, q, bq_buf_, stream);
+
+      const int n_flat = q * nao_i;
+      const double* B = bq_buf_;
+      double* U = v_buf_;
+
+      throw_on_cublas_error(
+          gemm_f64(
+              CUBLAS_OP_T,
+              CUBLAS_OP_T,
+              /*m=*/n_flat,
+              /*n=*/nocc_i,
+              /*k=*/nao_i,
+              &alpha,
+              B,
+              /*lda=*/nao_i,
+              cw_ptr,
+              /*ldb=*/nocc_i,
+              &beta0,
+              U,
+              /*ldc=*/n_flat),
+          "gemm_f64(U)");
+
+      throw_on_cublas_error(
+          gemm_f64(
+              CUBLAS_OP_N,
+              CUBLAS_OP_T,
+              /*m=*/nao_i,
+              /*n=*/nao_i,
+              /*k=*/(int)cols,
+              &alpha,
+              U,
+              /*lda=*/nao_i,
+              U,
+              /*ldb=*/nao_i,
+              &beta,
+              k_ptr,
+              /*ldc=*/nao_i),
+          "gemm_f64(K)");
+    }
+
+    hf_df_jk_fill_lower_from_upper_f64(k_ptr, nao_i, stream);
+
+    if (sync) throw_on_cuda_error(cudaStreamSynchronize(stream), "cudaStreamSynchronize");
+  }
+
+  void k_block_from_qp_d(
+      const py::object& b_qp,
+      const py::object& d,
+      const py::object& out,
+      int nao,
+      int row0,
+      int row_count,
+      int col0,
+      int col_count,
+      int q_block,
+      int col_block,
+      uint64_t stream_ptr,
+      int math_mode,
+      bool sync) {
+    const CudaArrayView bqp_v = cuda_array_view_from_object(b_qp, "B_Qp");
+    const CudaArrayView d_v = cuda_array_view_from_object(d, "D");
+    const CudaArrayView out_v = cuda_array_view_from_object(out, "out");
+
+    require_typestr_f64(bqp_v, "B_Qp");
+    require_typestr_f64(d_v, "D");
+    require_typestr_f64(out_v, "out");
+
+    if (out_v.read_only) {
+      throw std::invalid_argument("out must be a writable CUDA array");
+    }
+    if (bqp_v.shape.size() != 2) {
+      throw std::invalid_argument("B_Qp must have shape (naux, ntri)");
+    }
+    if (d_v.shape.size() != 2 || d_v.shape[0] != d_v.shape[1]) {
+      throw std::invalid_argument("D must have shape (nao, nao)");
+    }
+    if (out_v.shape.size() != 2) {
+      throw std::invalid_argument("out must have shape (row_count, col_count)");
+    }
+
+    const int64_t naux = bqp_v.shape[0];
+    const int64_t ntri = bqp_v.shape[1];
+    const int64_t nao0 = d_v.shape[0];
+    if ((int64_t)nao != nao0) {
+      throw std::invalid_argument("nao mismatch between provided nao and D");
+    }
+    if (row0 < 0 || row_count < 0 || col0 < 0 || col_count < 0) {
+      throw std::invalid_argument("invalid row/col arguments");
+    }
+    if (row0 > nao || row_count > (nao - row0)) {
+      throw std::invalid_argument("row range out of bounds");
+    }
+    if (col0 > nao || col_count > (nao - col0)) {
+      throw std::invalid_argument("col range out of bounds");
+    }
+    if ((int64_t)out_v.shape[0] != (int64_t)row_count || (int64_t)out_v.shape[1] != (int64_t)col_count) {
+      throw std::invalid_argument("out shape mismatch with row_count/col_count");
+    }
+
+    const int64_t expected_ntri = (nao0 * (nao0 + 1)) / 2;
+    if (ntri != expected_ntri) {
+      throw std::invalid_argument("B_Qp must have ntri=nao*(nao+1)//2");
+    }
+    if (q_block <= 0) {
+      throw std::invalid_argument("q_block must be > 0");
+    }
+    if (col_block <= 0) {
+      throw std::invalid_argument("col_block must be > 0");
+    }
+
+    constexpr int64_t itemsize = (int64_t)sizeof(double);
+    require_c_contiguous(bqp_v, "B_Qp", itemsize);
+    require_c_contiguous(d_v, "D", itemsize);
+    require_c_contiguous(out_v, "out", itemsize);
+
+    auto* bqp_ptr = reinterpret_cast<const double*>(bqp_v.ptr);
+    auto* d_ptr = reinterpret_cast<const double*>(d_v.ptr);
+    auto* out_ptr = reinterpret_cast<double*>(out_v.ptr);
+
+    cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
+    throw_on_cublas_error(cublasSetStream(cublas_.h, stream), "cublasSetStream");
+    const ScopedCublasMathMode math_ctx(cublas_.h, math_mode);
+
+    if (naux > (int64_t)std::numeric_limits<int>::max() || nao > (int64_t)std::numeric_limits<int>::max()) {
+      throw std::invalid_argument("dimensions exceed int32 limits for cuBLAS");
+    }
+    const int naux_i = (int)naux;
+    const int nao_i = (int)nao;
+    const int row_count_i = (int)row_count;
+    const int col_count_i = (int)col_count;
+    if (naux_i < 0 || nao_i <= 0 || row_count_i < 0 || col_count_i < 0) throw std::invalid_argument("invalid dimensions");
+
+    // Empty cases: always zero out for predictable semantics.
+    const int64_t out_elems = (int64_t)row_count_i * (int64_t)col_count_i;
+    throw_on_cuda_error(
+        cudaMemsetAsync(out_ptr, 0, (size_t)out_elems * sizeof(double), stream), "cudaMemsetAsync(out)");
+    if (naux_i == 0 || row_count_i == 0 || col_count_i == 0) {
+      if (sync) throw_on_cuda_error(cudaStreamSynchronize(stream), "cudaStreamSynchronize");
+      return;
+    }
+
+    const int q_block_i = std::min(q_block, naux_i);
+    const int col_block_i = std::min(col_block, col_count_i);
+
+    // Work buffers:
+    //   a_buf_: rows (q*row_count, nao) then yflat (row_count, q*nao)
+    //   y_buf_: y2d (q*row_count, nao)
+    //   z_buf_: zflat_t (q*nao, cb)
+    ensure_a_capacity((size_t)((int64_t)q_block_i * (int64_t)row_count_i * (int64_t)nao_i));
+    ensure_y_capacity((size_t)((int64_t)q_block_i * (int64_t)row_count_i * (int64_t)nao_i));
+    ensure_z_capacity((size_t)((int64_t)q_block_i * (int64_t)nao_i * (int64_t)col_block_i));
+
+    const double alpha = 1.0;
+    const double beta0 = 0.0;
+    const double beta = 1.0;
+
+    for (int q0 = 0; q0 < naux_i; q0 += q_block_i) {
+      const int q = std::min(q_block_i, naux_i - q0);
+      if (q <= 0) continue;
+      const int64_t m_rows64 = (int64_t)q * (int64_t)row_count_i;
+      const int64_t k64 = (int64_t)q * (int64_t)nao_i;
+      if (m_rows64 > (int64_t)std::numeric_limits<int>::max() || k64 > (int64_t)std::numeric_limits<int>::max()) {
+        throw std::invalid_argument("block sizes exceed int32 limits for cuBLAS");
+      }
+      const int m_rows = (int)m_rows64;
+      const int k = (int)k64;
+
+      hf_df_jk_extract_qp_rows_fullcols_f64(bqp_ptr, nao_i, naux_i, q0, q, row0, row_count_i, a_buf_, stream);
+
+      // GEMM1: y2d (m_rows x nao) = rows (m_rows x nao) @ D (nao x nao).
+      // We compute the transpose in column-major space to avoid a transpose kernel:
+      //   (y2d)^T (nao x m_rows) = D^T (nao x nao) @ (rows)^T (nao x m_rows).
+      throw_on_cublas_error(
+          gemm_f64(
+              CUBLAS_OP_N,
+              CUBLAS_OP_N,
+              /*m=*/nao_i,
+              /*n=*/m_rows,
+              /*k=*/nao_i,
+              &alpha,
+              d_ptr,
+              /*lda=*/nao_i,
+              a_buf_,
+              /*ldb=*/nao_i,
+              &beta0,
+              y_buf_,
+              /*ldc=*/nao_i),
+          "gemm_f64(y2d)");
+
+      hf_df_jk_repack_y2d_to_yflat_f64(y_buf_, q, row_count_i, nao_i, a_buf_, stream);
+
+      for (int c_off = 0; c_off < col_count_i; c_off += col_block_i) {
+        const int cb = std::min(col_block_i, col_count_i - c_off);
+        if (cb <= 0) continue;
+        const int c_abs = col0 + c_off;
+        hf_df_jk_extract_qp_cols_to_zflat_t_f64(bqp_ptr, nao_i, naux_i, q0, q, c_abs, cb, z_buf_, stream);
+
+        // GEMM2: out[:, c_off:c_off+cb] += yflat (row_count x k) @ zflat_t (k x cb)
+        // by writing its transpose into the column-major reinterpretation of out:
+        //   out_cm[c_off:c_off+cb, :] (cb x row_count) += z_cm (cb x k) @ y_cm (k x row_count)
+        double* out_block = out_ptr + (int64_t)c_off;
+        throw_on_cublas_error(
+            gemm_f64(
+                CUBLAS_OP_N,
+                CUBLAS_OP_N,
+                /*m=*/cb,
+                /*n=*/row_count_i,
+                /*k=*/k,
+                &alpha,
+                z_buf_,
+                /*lda=*/cb,
+                a_buf_,
+                /*ldb=*/k,
+                &beta,
+                out_block,
+                /*ldc=*/col_count_i),
+            "gemm_f64(out_block)");
+      }
+    }
 
     if (sync) throw_on_cuda_error(cudaStreamSynchronize(stream), "cudaStreamSynchronize");
   }
@@ -513,11 +864,56 @@ class DFJKWorkspace {
     bq_elems_ = need_elems;
   }
 
+  void ensure_a_capacity(size_t need_elems) {
+    if (need_elems <= a_elems_) return;
+    if (a_buf_) {
+      cudaFree(a_buf_);
+      a_buf_ = nullptr;
+    }
+    a_elems_ = 0;
+    double* ptr = nullptr;
+    throw_on_cuda_error(cudaMalloc(&ptr, need_elems * sizeof(double)), "cudaMalloc(A)");
+    a_buf_ = ptr;
+    a_elems_ = need_elems;
+  }
+
+  void ensure_y_capacity(size_t need_elems) {
+    if (need_elems <= y_elems_) return;
+    if (y_buf_) {
+      cudaFree(y_buf_);
+      y_buf_ = nullptr;
+    }
+    y_elems_ = 0;
+    double* ptr = nullptr;
+    throw_on_cuda_error(cudaMalloc(&ptr, need_elems * sizeof(double)), "cudaMalloc(Y)");
+    y_buf_ = ptr;
+    y_elems_ = need_elems;
+  }
+
+  void ensure_z_capacity(size_t need_elems) {
+    if (need_elems <= z_elems_) return;
+    if (z_buf_) {
+      cudaFree(z_buf_);
+      z_buf_ = nullptr;
+    }
+    z_elems_ = 0;
+    double* ptr = nullptr;
+    throw_on_cuda_error(cudaMalloc(&ptr, need_elems * sizeof(double)), "cudaMalloc(Z)");
+    z_buf_ = ptr;
+    z_elems_ = need_elems;
+  }
+
   CublasHandle cublas_;
   double* v_buf_ = nullptr;
   size_t v_elems_ = 0;
   double* bq_buf_ = nullptr;
   size_t bq_elems_ = 0;
+  double* a_buf_ = nullptr;
+  size_t a_elems_ = 0;
+  double* y_buf_ = nullptr;
+  size_t y_elems_ = 0;
+  double* z_buf_ = nullptr;
+  size_t z_elems_ = 0;
 };
 
 }  // namespace
@@ -564,6 +960,57 @@ PYBIND11_MODULE(_hf_df_jk_cuda_ext, m) {
       py::arg("Cw"),
       py::arg("out"),
       py::arg("q_block") = 128,
+      py::arg("stream") = 0,
+      py::arg("math_mode") = -1,
+      py::arg("sync") = false);
+
+  cls.def(
+      "k_from_qp_cw",
+      [](DFJKWorkspace& self,
+         const py::object& b_qp,
+         const py::object& cw,
+         const py::object& out_k,
+         int q_block,
+         uint64_t stream,
+         int math_mode,
+         bool sync) { self.k_from_qp_cw(b_qp, cw, out_k, q_block, stream, math_mode, sync); },
+      py::arg("B_Qp"),
+      py::arg("Cw"),
+      py::arg("out"),
+      py::arg("q_block") = 128,
+      py::arg("stream") = 0,
+      py::arg("math_mode") = -1,
+      py::arg("sync") = false);
+
+  cls.def(
+      "k_block_from_qp_d",
+      [](DFJKWorkspace& self,
+         const py::object& b_qp,
+         const py::object& d,
+         const py::object& out,
+         int nao,
+         int row0,
+         int row_count,
+         int col0,
+         int col_count,
+         int q_block,
+         int col_block,
+         uint64_t stream,
+         int math_mode,
+         bool sync) {
+        self.k_block_from_qp_d(
+            b_qp, d, out, nao, row0, row_count, col0, col_count, q_block, col_block, stream, math_mode, sync);
+      },
+      py::arg("B_Qp"),
+      py::arg("D"),
+      py::arg("out"),
+      py::arg("nao"),
+      py::arg("row0"),
+      py::arg("row_count"),
+      py::arg("col0"),
+      py::arg("col_count"),
+      py::arg("q_block") = 128,
+      py::arg("col_block") = 64,
       py::arg("stream") = 0,
       py::arg("math_mode") = -1,
       py::arg("sync") = false);

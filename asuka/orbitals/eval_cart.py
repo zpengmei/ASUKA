@@ -106,6 +106,35 @@ def eval_shell_cart(ao_basis: Any, shell: int, points: np.ndarray) -> np.ndarray
     return out
 
 
+def eval_basis_cart_value_on_points(ao_basis: Any, points: np.ndarray) -> np.ndarray:
+    """Evaluate all contracted Cartesian basis functions on points (CPU).
+
+    Returns
+    -------
+    phi : (npt, nao_cart)
+        AO values in PySCF cart=True ordering.
+    """
+
+    pts = np.asarray(points, dtype=np.float64).reshape((-1, 3))
+    shell_l = np.asarray(getattr(ao_basis, "shell_l"), dtype=np.int32).ravel()
+    shell_ao_start = np.asarray(getattr(ao_basis, "shell_ao_start"), dtype=np.int32).ravel()
+    nshell = int(shell_l.size)
+
+    nao = 0
+    for sh in range(nshell):
+        ao0 = int(shell_ao_start[sh])
+        l = int(shell_l[sh])
+        nao = max(int(nao), int(ao0 + ncart(l)))
+
+    phi = np.zeros((int(pts.shape[0]), int(nao)), dtype=np.float64)
+    for sh in range(nshell):
+        ao0 = int(shell_ao_start[sh])
+        l = int(shell_l[sh])
+        nbf = int(ncart(l))
+        phi[:, ao0 : ao0 + nbf] = eval_shell_cart(ao_basis, int(sh), pts)
+    return phi
+
+
 def eval_mos_cart_on_points(
     ao_basis: Any,
     C: Any,
@@ -159,6 +188,7 @@ def eval_mos_cart_on_points(
 
 __all__ = [
     "CubeGrid",
+    "eval_basis_cart_value_on_points",
     "eval_mos_cart_on_points",
     "eval_shell_cart",
     "make_cube_grid_from_atoms",

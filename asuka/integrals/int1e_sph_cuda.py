@@ -12,11 +12,9 @@ def _import_cupy():
 
 
 def _import_ext():
-    try:
-        from asuka.cueri import _cueri_cuda_ext as _ext  # noqa: PLC0415
-    except Exception as e:  # pragma: no cover
-        raise RuntimeError("cuERI CUDA extension is unavailable") from e
-    return _ext
+    from asuka.kernels.cueri import require_ext  # noqa: PLC0415
+
+    return require_ext()
 
 
 def has_int1e_sph_cuda_kernels() -> bool:

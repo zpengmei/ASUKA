@@ -50,6 +50,12 @@ def infer_nao_from_Qp(B_Qp: Any) -> int:
     return int(nao_from_ntri(int(sh[1])))
 
 
+def _require_cueri_ext():
+    from asuka.kernels.cueri import require_ext  # local import: optional extension
+
+    return require_ext()
+
+
 def pack_B_to_Qp(B: Any, *, layout: Literal["mnQ", "Qmn"], nao: int | None = None) -> Any:
     """Pack a symmetrized DF tensor into Qp.
 
@@ -95,7 +101,7 @@ def pack_B_to_Qp(B: Any, *, layout: Literal["mnQ", "Qmn"], nao: int | None = Non
 
         ntri = ntri_from_nao(int(nao_i))
         out = cp.empty((int(naux), int(ntri)), dtype=cp.float64)
-        from asuka.cueri import _cueri_cuda_ext as _ext  # noqa: PLC0415
+        _ext = _require_cueri_ext()
 
         threads = 256
         stream_ptr = int(cp.cuda.get_current_stream().ptr)
@@ -196,7 +202,7 @@ def pack_Lf_block_to_Qp(
         if not bool(getattr(out, "flags", None).c_contiguous):
             out = cp.ascontiguousarray(out)
 
-        from asuka.cueri import _cueri_cuda_ext as _ext  # noqa: PLC0415
+        _ext = _require_cueri_ext()
 
         stream_ptr = int(cp.cuda.get_current_stream().ptr)
         _ext.df_pack_lf_block_to_qp_device(
@@ -253,7 +259,7 @@ def unpack_Qp_to_mnQ(B_Qp: Any, *, nao: int) -> Any:
         if int(ntri_in) != int(ntri):
             raise ValueError("B_Qp ntri mismatch")
         out = cp.empty((nao_i, nao_i, naux), dtype=cp.float64)
-        from asuka.cueri import _cueri_cuda_ext as _ext  # noqa: PLC0415
+        _ext = _require_cueri_ext()
 
         threads = 256
         stream_ptr = int(cp.cuda.get_current_stream().ptr)
@@ -318,7 +324,7 @@ def unpack_Qp_to_Qmn_block(B_Qp: Any, *, nao: int, q0: int, q_count: int, out: A
             if not bool(getattr(out_dev, "flags", None).c_contiguous):
                 out_dev = cp.ascontiguousarray(out_dev)
 
-        from asuka.cueri import _cueri_cuda_ext as _ext  # noqa: PLC0415
+        _ext = _require_cueri_ext()
 
         threads = 256
         stream_ptr = int(cp.cuda.get_current_stream().ptr)

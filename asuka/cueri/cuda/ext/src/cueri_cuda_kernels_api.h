@@ -995,6 +995,455 @@ extern "C" cudaError_t cueri_df_int3c2e_deriv_contracted_cart_allsp_atomgrad_sph
     cudaStream_t stream,
     int threads);
 
+// Batched spherical-bar_X variant with packed-Qp storage (AO-pair "s2" lower-triangle).
+//
+// Inputs:
+// - bar_X_sph_Qp: [naux, ntri] flattened, where ntri = nao_sph*(nao_sph+1)/2.
+extern "C" cudaError_t cueri_df_int3c2e_deriv_contracted_cart_allsp_atomgrad_sphbar_qp_launch_stream(
+    const int32_t* spAB_arr,           // [n_spAB]
+    int n_spAB,
+    const int32_t* spCD,               // [ntasks]
+    int ntasks,
+    const int32_t* sp_A,
+    const int32_t* sp_B,
+    const int32_t* sp_pair_start,
+    const int32_t* sp_npair,
+    const double* shell_cx,
+    const double* shell_cy,
+    const double* shell_cz,
+    const int32_t* shell_prim_start,
+    const int32_t* shell_nprim,
+    const int32_t* shell_ao_start,
+    const double* prim_exp,
+    const double* pair_eta,
+    const double* pair_Px,
+    const double* pair_Py,
+    const double* pair_Pz,
+    const double* pair_cK,
+    int nao,
+    int naux,
+    int nao_sph,
+    int la,
+    int lb,
+    int lc,
+    const double* bar_X_sph_Qp,        // [naux*ntri]
+    const int32_t* shell_ao_start_sph, // [nShellTotal]
+    const int32_t* shell_atom,         // [nAOshells+nAuxShells]
+    double* grad_dev,                  // [natm*3]
+    cudaStream_t stream,
+    int threads);
+
+// Packed-Qp spherical-bar_X variant with float32 bar_X.
+extern "C" cudaError_t cueri_df_int3c2e_deriv_contracted_cart_allsp_atomgrad_sphbar_qp_f32bar_launch_stream(
+    const int32_t* spAB_arr,           // [n_spAB]
+    int n_spAB,
+    const int32_t* spCD,               // [ntasks]
+    int ntasks,
+    const int32_t* sp_A,
+    const int32_t* sp_B,
+    const int32_t* sp_pair_start,
+    const int32_t* sp_npair,
+    const double* shell_cx,
+    const double* shell_cy,
+    const double* shell_cz,
+    const int32_t* shell_prim_start,
+    const int32_t* shell_nprim,
+    const int32_t* shell_ao_start,
+    const double* prim_exp,
+    const double* pair_eta,
+    const double* pair_Px,
+    const double* pair_Py,
+    const double* pair_Pz,
+    const double* pair_cK,
+    int nao,
+    int naux,
+    int nao_sph,
+    int la,
+    int lb,
+    int lc,
+    const float* bar_X_sph_Qp,         // [naux*ntri]
+    const int32_t* shell_ao_start_sph, // [nShellTotal]
+    const int32_t* shell_atom,         // [nAOshells+nAuxShells]
+    double* grad_dev,                  // [natm*3]
+    cudaStream_t stream,
+    int threads);
+
+// AB-tiled packed-Qp spherical-bar_X variant.
+extern "C" cudaError_t cueri_df_int3c2e_deriv_contracted_cart_allsp_atomgrad_sphbar_qp_abtile_launch_stream(
+    const int32_t* spAB_arr,           // [n_spAB]
+    int n_spAB,
+    const int32_t* spCD,               // [ntasks]
+    int ntasks,
+    const int32_t* sp_A,
+    const int32_t* sp_B,
+    const int32_t* sp_pair_start,
+    const int32_t* sp_npair,
+    const double* shell_cx,
+    const double* shell_cy,
+    const double* shell_cz,
+    const int32_t* shell_prim_start,
+    const int32_t* shell_nprim,
+    const int32_t* shell_ao_start,
+    const double* prim_exp,
+    const double* pair_eta,
+    const double* pair_Px,
+    const double* pair_Py,
+    const double* pair_Pz,
+    const double* pair_cK,
+    int nao,
+    int naux,
+    int nao_sph,
+    int la,
+    int lb,
+    int lc,
+    const double* bar_X_sph_Qp,        // [naux*ntri]
+    const int32_t* shell_ao_start_sph, // [nShellTotal]
+    const int32_t* shell_atom,         // [nAOshells+nAuxShells]
+    int cd_tile,                       // 1..16
+    double* grad_dev,                  // [natm*3]
+    cudaStream_t stream,
+    int threads);
+
+// AB-tiled packed-Qp spherical-bar_X variant with float32 bar_X.
+extern "C" cudaError_t cueri_df_int3c2e_deriv_contracted_cart_allsp_atomgrad_sphbar_qp_abtile_f32bar_launch_stream(
+    const int32_t* spAB_arr,           // [n_spAB]
+    int n_spAB,
+    const int32_t* spCD,               // [ntasks]
+    int ntasks,
+    const int32_t* sp_A,
+    const int32_t* sp_B,
+    const int32_t* sp_pair_start,
+    const int32_t* sp_npair,
+    const double* shell_cx,
+    const double* shell_cy,
+    const double* shell_cz,
+    const int32_t* shell_prim_start,
+    const int32_t* shell_nprim,
+    const int32_t* shell_ao_start,
+    const double* prim_exp,
+    const double* pair_eta,
+    const double* pair_Px,
+    const double* pair_Py,
+    const double* pair_Pz,
+    const double* pair_cK,
+    int nao,
+    int naux,
+    int nao_sph,
+    int la,
+    int lb,
+    int lc,
+    const float* bar_X_sph_Qp,         // [naux*ntri]
+    const int32_t* shell_ao_start_sph, // [nShellTotal]
+    const int32_t* shell_atom,         // [nAOshells+nAuxShells]
+    int cd_tile,                       // 1..16
+    double* grad_dev,                  // [natm*3]
+    cudaStream_t stream,
+    int threads);
+
+// Packed-Qp multi-bar variant specialized for nbar=2 (two independent bar buffers, one fused pass).
+extern "C" cudaError_t cueri_df_int3c2e_deriv_contracted_cart_allsp_atomgrad_sphbar_qp_multibar2_launch_stream(
+    const int32_t* spAB_arr,           // [n_spAB]
+    int n_spAB,
+    const int32_t* spCD,               // [ntasks]
+    int ntasks,
+    const int32_t* sp_A,
+    const int32_t* sp_B,
+    const int32_t* sp_pair_start,
+    const int32_t* sp_npair,
+    const double* shell_cx,
+    const double* shell_cy,
+    const double* shell_cz,
+    const int32_t* shell_prim_start,
+    const int32_t* shell_nprim,
+    const int32_t* shell_ao_start,
+    const double* prim_exp,
+    const double* pair_eta,
+    const double* pair_Px,
+    const double* pair_Py,
+    const double* pair_Pz,
+    const double* pair_cK,
+    int nao,
+    int naux,
+    int nao_sph,
+    int la,
+    int lb,
+    int lc,
+    const double* bar_X_sph_Qp0,       // [naux*ntri]
+    const double* bar_X_sph_Qp1,       // [naux*ntri]
+    const int32_t* shell_ao_start_sph, // [nShellTotal]
+    const int32_t* shell_atom,         // [nAOshells+nAuxShells]
+    double* grad_dev_multi,            // [2*grad_stride]
+    int64_t grad_stride,               // elements between gradients
+    cudaStream_t stream,
+    int threads);
+
+// Packed-Qp multi-bar variant specialized for nbar=2 with float32 bar buffers.
+extern "C" cudaError_t cueri_df_int3c2e_deriv_contracted_cart_allsp_atomgrad_sphbar_qp_multibar2_f32bar_launch_stream(
+    const int32_t* spAB_arr,           // [n_spAB]
+    int n_spAB,
+    const int32_t* spCD,               // [ntasks]
+    int ntasks,
+    const int32_t* sp_A,
+    const int32_t* sp_B,
+    const int32_t* sp_pair_start,
+    const int32_t* sp_npair,
+    const double* shell_cx,
+    const double* shell_cy,
+    const double* shell_cz,
+    const int32_t* shell_prim_start,
+    const int32_t* shell_nprim,
+    const int32_t* shell_ao_start,
+    const double* prim_exp,
+    const double* pair_eta,
+    const double* pair_Px,
+    const double* pair_Py,
+    const double* pair_Pz,
+    const double* pair_cK,
+    int nao,
+    int naux,
+    int nao_sph,
+    int la,
+    int lb,
+    int lc,
+    const float* bar_X_sph_Qp0,        // [naux*ntri]
+    const float* bar_X_sph_Qp1,        // [naux*ntri]
+    const int32_t* shell_ao_start_sph, // [nShellTotal]
+    const int32_t* shell_atom,         // [nAOshells+nAuxShells]
+    double* grad_dev_multi,            // [2*grad_stride]
+    int64_t grad_stride,               // elements between gradients
+    cudaStream_t stream,
+    int threads);
+
+// AB-tiled packed-Qp multi-bar variant specialized for nbar=2.
+extern "C" cudaError_t cueri_df_int3c2e_deriv_contracted_cart_allsp_atomgrad_sphbar_qp_abtile_multibar2_launch_stream(
+    const int32_t* spAB_arr,           // [n_spAB]
+    int n_spAB,
+    const int32_t* spCD,               // [ntasks]
+    int ntasks,
+    const int32_t* sp_A,
+    const int32_t* sp_B,
+    const int32_t* sp_pair_start,
+    const int32_t* sp_npair,
+    const double* shell_cx,
+    const double* shell_cy,
+    const double* shell_cz,
+    const int32_t* shell_prim_start,
+    const int32_t* shell_nprim,
+    const int32_t* shell_ao_start,
+    const double* prim_exp,
+    const double* pair_eta,
+    const double* pair_Px,
+    const double* pair_Py,
+    const double* pair_Pz,
+    const double* pair_cK,
+    int nao,
+    int naux,
+    int nao_sph,
+    int la,
+    int lb,
+    int lc,
+    const double* bar_X_sph_Qp0,       // [naux*ntri]
+    const double* bar_X_sph_Qp1,       // [naux*ntri]
+    const int32_t* shell_ao_start_sph, // [nShellTotal]
+    const int32_t* shell_atom,         // [nAOshells+nAuxShells]
+    int cd_tile,                       // 1..16
+    double* grad_dev_multi,            // [2*grad_stride]
+    int64_t grad_stride,               // elements between gradients
+    cudaStream_t stream,
+    int threads);
+
+// AB-tiled packed-Qp multi-bar variant specialized for nbar=2 with float32 bar buffers.
+extern "C" cudaError_t cueri_df_int3c2e_deriv_contracted_cart_allsp_atomgrad_sphbar_qp_abtile_multibar2_f32bar_launch_stream(
+    const int32_t* spAB_arr,           // [n_spAB]
+    int n_spAB,
+    const int32_t* spCD,               // [ntasks]
+    int ntasks,
+    const int32_t* sp_A,
+    const int32_t* sp_B,
+    const int32_t* sp_pair_start,
+    const int32_t* sp_npair,
+    const double* shell_cx,
+    const double* shell_cy,
+    const double* shell_cz,
+    const int32_t* shell_prim_start,
+    const int32_t* shell_nprim,
+    const int32_t* shell_ao_start,
+    const double* prim_exp,
+    const double* pair_eta,
+    const double* pair_Px,
+    const double* pair_Py,
+    const double* pair_Pz,
+    const double* pair_cK,
+    int nao,
+    int naux,
+    int nao_sph,
+    int la,
+    int lb,
+    int lc,
+    const float* bar_X_sph_Qp0,        // [naux*ntri]
+    const float* bar_X_sph_Qp1,        // [naux*ntri]
+    const int32_t* shell_ao_start_sph, // [nShellTotal]
+    const int32_t* shell_atom,         // [nAOshells+nAuxShells]
+    int cd_tile,                       // 1..16
+    double* grad_dev_multi,            // [2*grad_stride]
+    int64_t grad_stride,               // elements between gradients
+    cudaStream_t stream,
+    int threads);
+
+// Packed-Qp multi-bar variant specialized for nbar=3 (three independent bar buffers, one fused pass).
+extern "C" cudaError_t cueri_df_int3c2e_deriv_contracted_cart_allsp_atomgrad_sphbar_qp_multibar3_launch_stream(
+    const int32_t* spAB_arr,           // [n_spAB]
+    int n_spAB,
+    const int32_t* spCD,               // [ntasks]
+    int ntasks,
+    const int32_t* sp_A,
+    const int32_t* sp_B,
+    const int32_t* sp_pair_start,
+    const int32_t* sp_npair,
+    const double* shell_cx,
+    const double* shell_cy,
+    const double* shell_cz,
+    const int32_t* shell_prim_start,
+    const int32_t* shell_nprim,
+    const int32_t* shell_ao_start,
+    const double* prim_exp,
+    const double* pair_eta,
+    const double* pair_Px,
+    const double* pair_Py,
+    const double* pair_Pz,
+    const double* pair_cK,
+    int nao,
+    int naux,
+    int nao_sph,
+    int la,
+    int lb,
+    int lc,
+    const double* bar_X_sph_Qp0,       // [naux*ntri]
+    const double* bar_X_sph_Qp1,       // [naux*ntri]
+    const double* bar_X_sph_Qp2,       // [naux*ntri]
+    const int32_t* shell_ao_start_sph, // [nShellTotal]
+    const int32_t* shell_atom,         // [nAOshells+nAuxShells]
+    double* grad_dev_multi,            // [3*grad_stride]
+    int64_t grad_stride,               // elements between gradients
+    cudaStream_t stream,
+    int threads);
+
+// Packed-Qp multi-bar variant specialized for nbar=3 with float32 bar buffers.
+extern "C" cudaError_t cueri_df_int3c2e_deriv_contracted_cart_allsp_atomgrad_sphbar_qp_multibar3_f32bar_launch_stream(
+    const int32_t* spAB_arr,           // [n_spAB]
+    int n_spAB,
+    const int32_t* spCD,               // [ntasks]
+    int ntasks,
+    const int32_t* sp_A,
+    const int32_t* sp_B,
+    const int32_t* sp_pair_start,
+    const int32_t* sp_npair,
+    const double* shell_cx,
+    const double* shell_cy,
+    const double* shell_cz,
+    const int32_t* shell_prim_start,
+    const int32_t* shell_nprim,
+    const int32_t* shell_ao_start,
+    const double* prim_exp,
+    const double* pair_eta,
+    const double* pair_Px,
+    const double* pair_Py,
+    const double* pair_Pz,
+    const double* pair_cK,
+    int nao,
+    int naux,
+    int nao_sph,
+    int la,
+    int lb,
+    int lc,
+    const float* bar_X_sph_Qp0,        // [naux*ntri]
+    const float* bar_X_sph_Qp1,        // [naux*ntri]
+    const float* bar_X_sph_Qp2,        // [naux*ntri]
+    const int32_t* shell_ao_start_sph, // [nShellTotal]
+    const int32_t* shell_atom,         // [nAOshells+nAuxShells]
+    double* grad_dev_multi,            // [3*grad_stride]
+    int64_t grad_stride,               // elements between gradients
+    cudaStream_t stream,
+    int threads);
+
+// AB-tiled packed-Qp multi-bar variant specialized for nbar=3.
+extern "C" cudaError_t cueri_df_int3c2e_deriv_contracted_cart_allsp_atomgrad_sphbar_qp_abtile_multibar3_launch_stream(
+    const int32_t* spAB_arr,           // [n_spAB]
+    int n_spAB,
+    const int32_t* spCD,               // [ntasks]
+    int ntasks,
+    const int32_t* sp_A,
+    const int32_t* sp_B,
+    const int32_t* sp_pair_start,
+    const int32_t* sp_npair,
+    const double* shell_cx,
+    const double* shell_cy,
+    const double* shell_cz,
+    const int32_t* shell_prim_start,
+    const int32_t* shell_nprim,
+    const int32_t* shell_ao_start,
+    const double* prim_exp,
+    const double* pair_eta,
+    const double* pair_Px,
+    const double* pair_Py,
+    const double* pair_Pz,
+    const double* pair_cK,
+    int nao,
+    int naux,
+    int nao_sph,
+    int la,
+    int lb,
+    int lc,
+    const double* bar_X_sph_Qp0,       // [naux*ntri]
+    const double* bar_X_sph_Qp1,       // [naux*ntri]
+    const double* bar_X_sph_Qp2,       // [naux*ntri]
+    const int32_t* shell_ao_start_sph, // [nShellTotal]
+    const int32_t* shell_atom,         // [nAOshells+nAuxShells]
+    int cd_tile,                       // 1..16
+    double* grad_dev_multi,            // [3*grad_stride]
+    int64_t grad_stride,               // elements between gradients
+    cudaStream_t stream,
+    int threads);
+
+// AB-tiled packed-Qp multi-bar variant specialized for nbar=3 with float32 bar buffers.
+extern "C" cudaError_t cueri_df_int3c2e_deriv_contracted_cart_allsp_atomgrad_sphbar_qp_abtile_multibar3_f32bar_launch_stream(
+    const int32_t* spAB_arr,           // [n_spAB]
+    int n_spAB,
+    const int32_t* spCD,               // [ntasks]
+    int ntasks,
+    const int32_t* sp_A,
+    const int32_t* sp_B,
+    const int32_t* sp_pair_start,
+    const int32_t* sp_npair,
+    const double* shell_cx,
+    const double* shell_cy,
+    const double* shell_cz,
+    const int32_t* shell_prim_start,
+    const int32_t* shell_nprim,
+    const int32_t* shell_ao_start,
+    const double* prim_exp,
+    const double* pair_eta,
+    const double* pair_Px,
+    const double* pair_Py,
+    const double* pair_Pz,
+    const double* pair_cK,
+    int nao,
+    int naux,
+    int nao_sph,
+    int la,
+    int lb,
+    int lc,
+    const float* bar_X_sph_Qp0,        // [naux*ntri]
+    const float* bar_X_sph_Qp1,        // [naux*ntri]
+    const float* bar_X_sph_Qp2,        // [naux*ntri]
+    const int32_t* shell_ao_start_sph, // [nShellTotal]
+    const int32_t* shell_atom,         // [nAOshells+nAuxShells]
+    int cd_tile,                       // 1..16
+    double* grad_dev_multi,            // [3*grad_stride]
+    int64_t grad_stride,               // elements between gradients
+    cudaStream_t stream,
+    int threads);
+
 // Streamed-QAB spherical-bar_X variant.
 //
 // The input bar_X is a Q-slice chunk [q_count, nao_sph, nao_sph] corresponding
@@ -1036,6 +1485,50 @@ extern "C" cudaError_t cueri_df_int3c2e_deriv_contracted_cart_allsp_atomgrad_sph
     cudaStream_t stream,
     int threads);
 
+// Streamed-QAB multi-bar spherical-bar_X variant.
+//
+// Like `*_sphbar_qmn_streamed_launch_stream`, but `bar_X_sph_Qmn_chunk_multi` stores `nbar` independent
+// bar buffers, each separated by `bar_stride` elements (padding allowed). The output gradient buffer
+// `grad_dev_multi` stores `nbar` gradients separated by `grad_stride` elements.
+extern "C" cudaError_t cueri_df_int3c2e_deriv_contracted_cart_allsp_atomgrad_sphbar_qmn_streamed_multibar_launch_stream(
+    const int32_t* spAB_arr,                 // [n_spAB]
+    int n_spAB,
+    const int32_t* spCD,                     // [ntasks]
+    int ntasks,
+    const int32_t* sp_A,
+    const int32_t* sp_B,
+    const int32_t* sp_pair_start,
+    const int32_t* sp_npair,
+    const double* shell_cx,
+    const double* shell_cy,
+    const double* shell_cz,
+    const int32_t* shell_prim_start,
+    const int32_t* shell_nprim,
+    const int32_t* shell_ao_start,
+    const double* prim_exp,
+    const double* pair_eta,
+    const double* pair_Px,
+    const double* pair_Py,
+    const double* pair_Pz,
+    const double* pair_cK,
+    int nao,
+    int naux,
+    int nao_sph,
+    int la,
+    int lb,
+    int lc,
+    const double* bar_X_sph_Qmn_chunk_multi,  // [nbar*bar_stride] (each chunk is [q_count*nao_sph*nao_sph] used)
+    int64_t bar_stride,                       // elements between bar chunks
+    int nbar,
+    const int32_t* shell_ao_start_sph,        // [nShellTotal]
+    const int32_t* shell_atom,                // [nAOshells+nAuxShells]
+    int q_offset,                             // absolute aux AO start of this chunk
+    int q_count,                              // number of aux AO rows in this chunk
+    double* grad_dev_multi,                   // [nbar*grad_stride]
+    int64_t grad_stride,                      // elements between grad chunks
+    cudaStream_t stream,
+    int threads);
+
 // Streamed-QAB + AB-tiled spherical-bar_X variant.
 extern "C" cudaError_t cueri_df_int3c2e_deriv_contracted_cart_allsp_atomgrad_sphbar_qmn_streamed_abtile_launch_stream(
     const int32_t* spAB_arr,                 // [n_spAB]
@@ -1071,6 +1564,47 @@ extern "C" cudaError_t cueri_df_int3c2e_deriv_contracted_cart_allsp_atomgrad_sph
     int q_count,                             // number of aux AO rows in this chunk
     int cd_tile,                             // 1..16
     double* grad_dev,                        // [natm*3] — atomicAdd target
+    cudaStream_t stream,
+    int threads);
+
+// Streamed-QAB + AB-tiled multi-bar spherical-bar_X variant.
+extern "C" cudaError_t cueri_df_int3c2e_deriv_contracted_cart_allsp_atomgrad_sphbar_qmn_streamed_abtile_multibar_launch_stream(
+    const int32_t* spAB_arr,                 // [n_spAB]
+    int n_spAB,
+    const int32_t* spCD,                     // [ntasks]
+    int ntasks,
+    const int32_t* sp_A,
+    const int32_t* sp_B,
+    const int32_t* sp_pair_start,
+    const int32_t* sp_npair,
+    const double* shell_cx,
+    const double* shell_cy,
+    const double* shell_cz,
+    const int32_t* shell_prim_start,
+    const int32_t* shell_nprim,
+    const int32_t* shell_ao_start,
+    const double* prim_exp,
+    const double* pair_eta,
+    const double* pair_Px,
+    const double* pair_Py,
+    const double* pair_Pz,
+    const double* pair_cK,
+    int nao,
+    int naux,
+    int nao_sph,
+    int la,
+    int lb,
+    int lc,
+    const double* bar_X_sph_Qmn_chunk_multi,  // [nbar*bar_stride] (each chunk is [q_count*nao_sph*nao_sph] used)
+    int64_t bar_stride,                       // elements between bar chunks
+    int nbar,
+    const int32_t* shell_ao_start_sph,        // [nShellTotal]
+    const int32_t* shell_atom,                // [nAOshells+nAuxShells]
+    int q_offset,                             // absolute aux AO start of this chunk
+    int q_count,                              // number of aux AO rows in this chunk
+    int cd_tile,                              // 1..16
+    double* grad_dev_multi,                   // [nbar*grad_stride]
+    int64_t grad_stride,                      // elements between grad chunks
     cudaStream_t stream,
     int threads);
 

@@ -335,6 +335,26 @@ def _build_df_newton_eris_blocked_qp(
     L_pi_full = xp.zeros((nmo, ncore, naux), dtype=xp.float64) if ncore else None
     L_act_full = xp.zeros((ncas, ncas, naux), dtype=xp.float64)
 
+    # Reuse large temporaries within the AO2MO aux-block loop. This reduces CuPy
+    # allocator churn and prevents transient VRAM spikes from repeated large
+    # allocations when `build_df_newton_eris()` is called many times in AH/1step.
+    #
+    # Only enable the workspace on GPU (CuPy). CPU runs typically have much
+    # smaller `block_size` and should avoid multi-GB staging buffers.
+    _use_ws = xp is not np
+    B_qmn_buf = None
+    X2d_buf = None
+    X_t_buf = None
+    L_raw_buf = None
+    L_blk_buf = None
+    if bool(_use_ws):
+        # Unpack output is always FP64 from cuERI.
+        B_qmn_buf = xp.empty((int(block_size), int(nao), int(nao)), dtype=xp.float64)
+        X2d_buf = xp.empty((int(block_size) * int(nao), int(nmo)), dtype=cdtype)
+        X_t_buf = xp.empty((int(nao), int(block_size), int(nmo)), dtype=cdtype)
+        L_raw_buf = xp.empty((int(nmo), int(block_size) * int(nmo)), dtype=cdtype)
+        L_blk_buf = xp.empty((int(nmo), int(nmo), int(block_size)), dtype=cdtype)
+
     for q0 in range(0, naux, block_size):
         q1 = min(q0 + block_size, naux)
         q = int(q1 - q0)
@@ -345,26 +365,47 @@ def _build_df_newton_eris_blocked_qp(
         #
         # Use batched GEMM for the half-transform (B_qmn @ C) and then a single
         # large GEMM for the second half-transform, mirroring the fast mnQ path.
-        B_qmn = unpack_Qp_to_Qmn_block(B_Qp, nao=int(nao), q0=int(q0), q_count=int(q))  # (q,nao,nao)
+        if B_qmn_buf is not None:
+            B_qmn = unpack_Qp_to_Qmn_block(
+                B_Qp, nao=int(nao), q0=int(q0), q_count=int(q), out=B_qmn_buf[: int(q)]
+            )  # (q,nao,nao)
+        else:
+            B_qmn = unpack_Qp_to_Qmn_block(B_Qp, nao=int(nao), q0=int(q0), q_count=int(q))  # (q,nao,nao)
         B_qmn = xp.asarray(B_qmn, dtype=cdtype)
 
         # Half-transform via a single GEMM (often faster than batched matmul):
         #   X[(q,mu), p] = sum_nu B_qmn[q,mu,nu] * C[nu,p]
-        X2d = B_qmn.reshape(q * nao, nao) @ mo_c  # (q*nao, nmo)
+        if X2d_buf is not None:
+            X2d = X2d_buf[: int(q) * int(nao)]
+            xp.matmul(B_qmn.reshape(int(q) * int(nao), int(nao)), mo_c, out=X2d)  # (q*nao, nmo)
+        else:
+            X2d = B_qmn.reshape(int(q) * int(nao), int(nao)) @ mo_c  # (q*nao, nmo)
         del B_qmn
-        X_blk = X2d.reshape(q, nao, nmo)
-        del X2d
+        X_blk = X2d.reshape(int(q), int(nao), int(nmo))
 
-        X_t_blk = xp.ascontiguousarray(X_blk.transpose(1, 0, 2))  # (nao,q,nmo)
+        if X_t_buf is not None:
+            X_t_blk = X_t_buf[:, : int(q)]
+            xp.copyto(X_t_blk, X_blk.transpose(1, 0, 2))  # (nao,q,nmo)
+        else:
+            X_t_blk = xp.ascontiguousarray(X_blk.transpose(1, 0, 2))  # (nao,q,nmo)
         del X_blk
 
-        L_raw = mo_c.T @ X_t_blk.reshape(nao, q * nmo)  # (nmo, q*nmo)
-        del X_t_blk
-        L_blk = xp.ascontiguousarray(L_raw.reshape(nmo, q, nmo).transpose(0, 2, 1))
+        if L_raw_buf is not None:
+            L_raw = L_raw_buf[:, : int(q) * int(nmo)]
+            xp.matmul(mo_c.T, X_t_blk.reshape(int(nao), int(q) * int(nmo)), out=L_raw)  # (nmo, q*nmo)
+        else:
+            L_raw = mo_c.T @ X_t_blk.reshape(int(nao), int(q) * int(nmo))  # (nmo, q*nmo)
+
+        if L_blk_buf is not None:
+            L_blk = L_blk_buf[:, :, : int(q)]
+            xp.copyto(L_blk, L_raw.reshape(int(nmo), int(q), int(nmo)).transpose(0, 2, 1))
+        else:
+            L_blk = xp.ascontiguousarray(L_raw.reshape(int(nmo), int(q), int(nmo)).transpose(0, 2, 1))
         del L_raw
+        if X_t_buf is None:
+            del X_t_blk
 
         L_blk_f64 = xp.asarray(L_blk, dtype=xp.float64)
-        del L_blk
 
         L_act_blk = xp.ascontiguousarray(L_blk_f64[act, act])  # (ncas,ncas,q)
         L_pu_blk = xp.ascontiguousarray(L_blk_f64[:, act])  # (nmo,ncas,q)

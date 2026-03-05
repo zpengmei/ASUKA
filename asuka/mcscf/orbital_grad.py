@@ -294,6 +294,164 @@ def _g_dm2_df_blocked(
     return g_dm2
 
 
+def _g_dm2_df_blocked_qp(
+    xp: Any,
+    *,
+    B_Qp: Any,
+    C: Any,
+    C_act: Any,
+    dm2_flat: Any,
+    aux_block_naux: int,
+    mo_block_nmo: int,
+    use_batched_matmul: bool,
+    profile: dict | None = None,
+) -> Any:
+    """Streamed build of g_dm2 for packed-Qp DF factors (naux, ntri).
+
+    Unpacks one aux tile at a time to Qmn (qb,nao,nao) and uses batched GEMM
+    to form X/L_act/T without materializing full-size (nao,nao,naux) tensors.
+    """
+
+    t0 = time.perf_counter() if profile is not None else 0.0
+    if profile is not None:
+        profile.clear()
+
+    B_Qp = _as_xp_f64(xp, B_Qp)
+    C = _as_xp_f64(xp, C)
+    C_act = _as_xp_f64(xp, C_act)
+    dm2_flat = _as_xp_f64(xp, dm2_flat)
+
+    if int(getattr(B_Qp, "ndim", 0)) != 2:
+        raise ValueError("B_Qp must be 2D (naux,ntri)")
+    if int(getattr(C, "ndim", 0)) != 2:
+        raise ValueError("C must be 2D")
+    if int(getattr(C_act, "ndim", 0)) != 2:
+        raise ValueError("C_act must be 2D")
+
+    nao, nmo = map(int, C.shape)
+    nao2, ncas = map(int, C_act.shape)
+    if int(nao2) != int(nao):
+        raise ValueError("C_act nao mismatch")
+    naux = int(B_Qp.shape[0])
+    if dm2_flat.shape != (ncas * ncas, ncas * ncas):
+        raise ValueError("dm2_flat shape mismatch")
+
+    aux_block_naux = max(1, int(aux_block_naux))
+    mo_block_nmo = max(1, int(mo_block_nmo))
+    use_batched_matmul = bool(use_batched_matmul)
+
+    from asuka.integrals.df_packed_s2 import unpack_Qp_to_Qmn_block  # noqa: PLC0415
+
+    # Contiguous operands help cuBLAS avoid implicit copies.
+    try:
+        if hasattr(C_act, "flags") and not bool(C_act.flags.c_contiguous):
+            C_act = xp.ascontiguousarray(C_act)
+    except Exception:
+        pass
+
+    g_dm2 = xp.zeros((nmo, ncas), dtype=xp.float64)
+
+    t_unpack = 0.0
+    t_x = 0.0
+    t_lact = 0.0
+    t_t = 0.0
+    t_mo = 0.0
+
+    for q0 in range(0, int(naux), int(aux_block_naux)):
+        q1 = min(int(naux), int(q0) + int(aux_block_naux))
+        qb = int(q1 - q0)
+        if qb <= 0:
+            continue
+
+        tt = time.perf_counter() if profile is not None else 0.0
+        B_qmn = unpack_Qp_to_Qmn_block(B_Qp, nao=int(nao), q0=int(q0), q_count=int(qb))  # (qb,nao,nao)
+        if profile is not None:
+            t_unpack += time.perf_counter() - tt
+
+        # X[q,mu,u] = sum_nu B[q,mu,nu] * C_act[nu,u]
+        tt = time.perf_counter() if profile is not None else 0.0
+        if use_batched_matmul and hasattr(xp, "matmul"):
+            X = xp.matmul(B_qmn, C_act)  # (qb,nao,ncas)
+        else:
+            # Flatten the batched matmul into a single GEMM. This is typically
+            # faster and uses less temporary workspace for small ncas (e.g. CAS(2,2)).
+            X2d = B_qmn.reshape(qb * nao, nao) @ C_act  # (qb*nao,ncas)
+            X = X2d.reshape(qb, nao, ncas)
+            del X2d
+        del B_qmn
+        if profile is not None:
+            t_x += time.perf_counter() - tt
+
+        # L_act[q,u,v] = C_act^T @ X[q]
+        tt = time.perf_counter() if profile is not None else 0.0
+        if use_batched_matmul and hasattr(xp, "matmul"):
+            L_act = xp.matmul(C_act.T[None, :, :], X)  # (qb,ncas,ncas)
+            X_t = None
+        else:
+            # One GEMM for all q: (ncas,nao) @ (nao,qb*ncas) -> (ncas,qb*ncas)
+            X_t = xp.ascontiguousarray(X.transpose(1, 0, 2))  # (nao,qb,ncas)
+            L_raw = C_act.T @ X_t.reshape(nao, qb * ncas)  # (ncas,qb*ncas)
+            L_act = xp.ascontiguousarray(L_raw.reshape(ncas, qb, ncas).transpose(1, 0, 2))  # (qb,ncas,ncas)
+            del L_raw
+        if profile is not None:
+            t_lact += time.perf_counter() - tt
+
+        # T[q,u,v] = sum_{w,x} L_act[q,w,x] * dm2[w x, u v]
+        tt = time.perf_counter() if profile is not None else 0.0
+        L2t = L_act.reshape(qb, ncas * ncas)  # (qb,ncas^2)
+        T2t = L2t @ dm2_flat  # (qb,ncas^2)
+        T = T2t.reshape(qb, ncas, ncas)  # (qb,u,v)
+        if profile is not None:
+            t_t += time.perf_counter() - tt
+
+        tt_mo = time.perf_counter() if profile is not None else 0.0
+        for p0 in range(0, int(nmo), int(mo_block_nmo)):
+            p1 = min(int(nmo), int(p0) + int(mo_block_nmo))
+            pb = int(p1 - p0)
+            if pb <= 0:
+                continue
+            Cp = C[:, int(p0) : int(p1)]  # (nao,pb)
+            # Lp[q,p,u] = Cp^T @ X[q]
+            if use_batched_matmul and hasattr(xp, "matmul"):
+                Lp = xp.matmul(Cp.T[None, :, :], X)  # (qb,pb,ncas)
+            else:
+                if X_t is None:
+                    X_t = xp.ascontiguousarray(X.transpose(1, 0, 2))
+                Lp_raw = Cp.T @ X_t.reshape(nao, qb * ncas)  # (pb,qb*ncas)
+                Lp = xp.ascontiguousarray(Lp_raw.reshape(pb, qb, ncas).transpose(1, 0, 2))  # (qb,pb,ncas)
+                del Lp_raw
+            g_dm2[int(p0) : int(p1), :] += xp.sum(xp.matmul(Lp, T), axis=0)
+            del Lp
+        if profile is not None:
+            t_mo += time.perf_counter() - tt_mo
+
+        # Help reuse the array pool (CuPy) / reduce peak live tensors.
+        X = None
+        X_t = None
+        L_act = None
+        L2t = None
+        T2t = None
+        T = None
+
+    if profile is not None:
+        profile["is_gpu"] = bool(xp is not np)
+        profile["nao"] = int(nao)
+        profile["nmo"] = int(nmo)
+        profile["ncas"] = int(ncas)
+        profile["naux"] = int(naux)
+        profile["aux_block_naux"] = int(aux_block_naux)
+        profile["mo_block_nmo"] = int(mo_block_nmo)
+        profile["use_batched_matmul"] = bool(use_batched_matmul)
+        profile["t_unpack_s"] = float(t_unpack)
+        profile["t_build_X_s"] = float(t_x)
+        profile["t_build_L_act_s"] = float(t_lact)
+        profile["t_build_T_s"] = float(t_t)
+        profile["t_mo_blocks_s"] = float(t_mo)
+        profile["t_total_s"] = float(time.perf_counter() - t0)
+
+    return g_dm2
+
+
 def orbital_gradient_df(
     scf_out: Any,
     *,
@@ -424,6 +582,9 @@ def orbital_gradient_df(
     D_act_ao = C_act @ dm1_act_xp @ C_act.T
     D_tot_ao = D_core_ao + D_act_ao
 
+    is_qp = int(getattr(B, "ndim", 0)) == 2
+    naux = int(B.shape[0]) if bool(is_qp) else int(B.shape[2])
+
     t_density = time.perf_counter() if profile is not None else 0.0
 
     # GPU event timing setup (only when profiling on GPU)
@@ -445,7 +606,7 @@ def orbital_gradient_df(
     use_cocc_k = (xp is not np) and _bool_env("ASUKA_MCSCF_DF_K_COCC", True)
     if use_cocc_k:
         q_block = _df_scf._env_int("ASUKA_DF_JK_K_QBLOCK", 128)  # noqa: SLF001
-        q_block = max(1, min(int(B.shape[2]), int(q_block)))
+        q_block = max(1, min(int(naux), int(q_block)))
 
         if ncore:
             Jc, _ = _df_scf._df_JK(B, D_core_ao, want_J=True, want_K=False)  # noqa: SLF001
@@ -471,7 +632,7 @@ def orbital_gradient_df(
         use_cocc_k = (xp is not np) and _bool_env("ASUKA_MCSCF_DF_K_COCC", True)
         if use_cocc_k:
             q_block = _df_scf._env_int("ASUKA_DF_JK_K_QBLOCK", 128)  # noqa: SLF001
-            q_block = max(1, min(int(B.shape[2]), int(q_block)))
+            q_block = max(1, min(int(naux), int(q_block)))
 
             if ncore:
                 Jc, _ = _df_scf._df_JK(B, D_core_ao, want_J=True, want_K=False)  # noqa: SLF001
@@ -534,8 +695,6 @@ def orbital_gradient_df(
     # g_dm2: DF contraction of the active 2-RDM term.
     # For large systems, materializing X(nao,ncas,naux) and L_pact(nmo,ncas,naux)
     # can OOM. Use a blocked build in that case.
-    naux = int(B.shape[2])
-
     if aux_block_naux is None or mo_block_nmo is None:
         d_aux, d_mo = _default_gdm2_blocks(xp, naux=naux, nmo=nmo)
         if aux_block_naux is None:
@@ -544,11 +703,13 @@ def orbital_gradient_df(
             mo_block_nmo = d_mo
 
     if use_batched_matmul is None:
-        use_batched_matmul = xp is not np
+        # Packed-Qp blocked path benefits from explicit GEMMs (less overhead /
+        # workspace) vs strided-batched matmul, especially for small ncas.
+        use_batched_matmul = (xp is not np) and (not bool(is_qp))
 
     bytes_l_pact = int(nmo) * int(ncas) * int(naux) * 8
     bytes_x = int(nao) * int(ncas) * int(naux) * 8
-    use_blocked = bool(force_blocked) or (bytes_l_pact >= 128 * 1024 * 1024) or (bytes_x >= 128 * 1024 * 1024)
+    use_blocked = bool(is_qp) or bool(force_blocked) or (bytes_l_pact >= 128 * 1024 * 1024) or (bytes_x >= 128 * 1024 * 1024)
 
     if not use_blocked:
         X = cached_einsum("mnQ,nv->mvQ", B, C_act, xp=xp)
@@ -561,17 +722,30 @@ def orbital_gradient_df(
         g_dm2 = cached_einsum("puQ,Quv->pv", L_pact, T, xp=xp)  # (nmo,ncas)
     else:
         gdm2_prof = profile.setdefault("g_dm2_blocked", {}) if profile is not None else None
-        g_dm2 = _g_dm2_df_blocked(
-            xp,
-            B=B,
-            C=C,
-            C_act=C_act,
-            dm2_flat=dm2_act_xp,
-            aux_block_naux=int(aux_block_naux),
-            mo_block_nmo=int(mo_block_nmo),
-            use_batched_matmul=bool(use_batched_matmul),
-            profile=gdm2_prof,
-        )
+        if bool(is_qp):
+            g_dm2 = _g_dm2_df_blocked_qp(
+                xp,
+                B_Qp=B,
+                C=C,
+                C_act=C_act,
+                dm2_flat=dm2_act_xp,
+                aux_block_naux=int(aux_block_naux),
+                mo_block_nmo=int(mo_block_nmo),
+                use_batched_matmul=bool(use_batched_matmul),
+                profile=gdm2_prof,
+            )
+        else:
+            g_dm2 = _g_dm2_df_blocked(
+                xp,
+                B=B,
+                C=C,
+                C_act=C_act,
+                dm2_flat=dm2_act_xp,
+                aux_block_naux=int(aux_block_naux),
+                mo_block_nmo=int(mo_block_nmo),
+                use_batched_matmul=bool(use_batched_matmul),
+                profile=gdm2_prof,
+            )
 
     t_gdm2 = time.perf_counter() if profile is not None else 0.0
     if _gpu_gdm2_ev_end is not None:
@@ -633,6 +807,355 @@ def orbital_gradient_df(
                 )
             except Exception:
                 pass
+
+    return G, grad_norm, eps
+
+
+def orbital_gradient_thc(
+    scf_out: Any,
+    *,
+    C: Any,
+    ncore: int,
+    ncas: int,
+    dm1_act: Any,
+    dm2_act: Any,
+    allowed: np.ndarray | None = None,
+    q_block: int = 256,
+    pair_p_block: int = 8,
+    profile: dict | None = None,
+) -> tuple[Any, float, Any]:
+    """Compute the THC-based orbital gradient for a CASCI/CASSCF wavefunction.
+
+    Requires cached THC factors on `scf_out.thc_factors`.
+
+    Notes
+    -----
+    This implements the same generalized-Fock gradient construction as
+    :func:`orbital_gradient_df`, but replaces DF contractions with the THC
+    factorization. The 2-RDM term uses the factorized Z metric via `Y` such that
+    `Z = Y @ Y.T`.
+    """
+
+    if profile is not None:
+        profile.clear()
+        t0_total = time.perf_counter()
+    else:
+        t0_total = 0.0
+
+    ncore = int(ncore)
+    ncas = int(ncas)
+    if ncore < 0:
+        raise ValueError("ncore must be >= 0")
+    if ncas <= 0:
+        raise ValueError("ncas must be > 0")
+
+    thc = getattr(scf_out, "thc_factors", None)
+    if thc is None:
+        raise ValueError("scf_out.thc_factors is missing")
+
+    from asuka.hf.thc_factors import THCFactors  # noqa: PLC0415
+    from asuka.hf.local_thc_factors import LocalTHCFactors  # noqa: PLC0415
+
+    if not isinstance(thc, (THCFactors, LocalTHCFactors)):
+        raise TypeError("scf_out.thc_factors must be THCFactors or LocalTHCFactors")
+
+    int1e = getattr(scf_out, "int1e", None)
+    if int1e is None:
+        raise ValueError("scf_out.int1e is missing")
+    hcore = getattr(int1e, "hcore", None)
+    if hcore is None:
+        raise ValueError("scf_out.int1e.hcore is missing")
+
+    if isinstance(thc, THCFactors):
+        _xp_probe = thc.X
+        xp, _is_gpu = _df_scf._get_xp(C, thc.X, thc.Z, thc.Y)  # noqa: SLF001
+    else:
+        if len(thc.blocks) == 0:
+            raise ValueError("LocalTHCFactors.blocks is empty")
+        _xp_probe = thc.blocks[0].X
+        xp, _is_gpu = _df_scf._get_xp(C, _xp_probe)  # noqa: SLF001
+    C = _as_xp_f64(xp, C)
+    h_ao = _as_xp_f64(xp, hcore)
+
+    if C.ndim != 2:
+        raise ValueError("C must be 2D (nao,nmo)")
+    nao, nmo = map(int, C.shape)
+    nocc = ncore + ncas
+    if nocc > nmo:
+        raise ValueError("ncore+ncas exceeds number of MOs")
+
+    dm1_act = np.asarray(dm1_act, dtype=np.float64)
+    if dm1_act.shape != (ncas, ncas):
+        raise ValueError(f"dm1_act must have shape {(ncas, ncas)}, got {tuple(dm1_act.shape)}")
+    dm1_act = 0.5 * (dm1_act + dm1_act.T)
+
+    dm2_arr = np.asarray(dm2_act, dtype=np.float64)
+    if dm2_arr.shape == (ncas, ncas, ncas, ncas):
+        dm2_flat = dm2_arr.reshape(ncas * ncas, ncas * ncas)
+    elif dm2_arr.shape == (ncas * ncas, ncas * ncas):
+        dm2_flat = dm2_arr
+    else:
+        raise ValueError(
+            "dm2_act must have shape (ncas,ncas,ncas,ncas) or (ncas^2,ncas^2), "
+            f"got {tuple(dm2_arr.shape)}"
+        )
+
+    dm1_act_xp = _as_xp_f64(xp, dm1_act)
+    dm2_act_xp = _as_xp_f64(xp, dm2_flat)
+
+    # Core + active AO densities
+    C_core = C[:, :ncore]
+    C_act = C[:, ncore:nocc]
+    if ncore:
+        D_core_ao = 2.0 * (C_core @ C_core.T)
+    else:
+        D_core_ao = xp.zeros((nao, nao), dtype=xp.float64)
+    D_act_ao = C_act @ dm1_act_xp @ C_act.T
+    D_tot_ao = D_core_ao + D_act_ao
+
+    t_density = time.perf_counter() if profile is not None else 0.0
+
+    if isinstance(thc, THCFactors):
+        from asuka.hf.thc_jk import THCJKWork, thc_JK  # noqa: PLC0415
+
+        Jc, Kc = thc_JK(D_core_ao, thc.X, thc.Z, work=THCJKWork(q_block=int(q_block)))
+        Ja, Ka = thc_JK(D_act_ao, thc.X, thc.Z, work=THCJKWork(q_block=int(q_block)))
+    else:
+        from asuka.hf.local_thc_jk import local_thc_JK  # noqa: PLC0415
+
+        Jc, Kc = local_thc_JK(D_core_ao, thc, q_block=int(q_block))
+        Ja, Ka = local_thc_JK(D_act_ao, thc, q_block=int(q_block))
+
+    vhf_c_ao = Jc - 0.5 * Kc
+    vhf_a_ao = Ja - 0.5 * Ka
+    vhf_ca_ao = vhf_c_ao + vhf_a_ao
+
+    # Mean-field Fock (for diagonal energy preconditioner).
+    f_ao = h_ao + ((Jc + Ja) - 0.5 * (Kc + Ka))
+
+    t_jk = time.perf_counter() if profile is not None else 0.0
+
+    # Transform AO matrices to MO
+    h_mo = C.T @ h_ao @ C
+    vhf_c_mo = C.T @ vhf_c_ao @ C
+    vhf_ca_mo = C.T @ vhf_ca_ao @ C
+    f_mo = C.T @ f_ao @ C
+    eps = xp.diag(f_mo)
+
+    t_transform = time.perf_counter() if profile is not None else 0.0
+
+    # g_dm2: THC contraction of the active 2-RDM term.
+    pair_p_block = int(pair_p_block)
+    if pair_p_block <= 0:
+        raise ValueError("pair_p_block must be > 0")
+    pair_p_block = min(int(pair_p_block), int(ncas))
+
+    if isinstance(thc, THCFactors):
+        # Global THC: build X_mo and X_act once.
+        X = _as_xp_f64(xp, thc.X)  # (npt,nao)
+        Y = _as_xp_f64(xp, thc.Y)  # (npt,naux)
+        X_mo = X @ C  # (npt,nmo)
+        X_act = X_mo[:, ncore:nocc]  # (npt,ncas)
+        npt = int(X_mo.shape[0])
+        naux = int(Y.shape[1])
+
+        # L_act_full[wx,L] = sum_P (X_act[P,w] X_act[P,x]) Y[P,L]
+        L_act_full = xp.empty((int(ncas) * int(ncas), int(naux)), dtype=xp.float64)
+        for p0 in range(0, int(ncas), int(pair_p_block)):
+            p1 = min(int(ncas), int(p0) + int(pair_p_block))
+            pb = int(p1 - p0)
+            if pb <= 0:
+                continue
+            U = X_act[:, int(p0) : int(p1)]  # (npt,pb)
+            pairs = U[:, :, None] * X_act[:, None, :]  # (npt,pb,ncas)
+            pairs2 = pairs.reshape(int(npt), int(pb) * int(ncas))  # (npt,pb*ncas)
+            block_l = pairs2.T @ Y  # (pb*ncas,naux)
+            for i in range(int(pb)):
+                p = int(p0) + int(i)
+                rows = slice(int(p) * int(ncas), (int(p) + 1) * int(ncas))
+                L_act_full[rows, :] = block_l[int(i) * int(ncas) : (int(i) + 1) * int(ncas), :]
+            pairs = None
+            pairs2 = None
+            block_l = None
+
+        # T[L,uv] = sum_wx L_act[wx,L] * dm2[wx,uv]
+        T_flat = L_act_full.T @ dm2_act_xp  # (naux,ncas^2)
+
+        # S[P,uv] = sum_L Y[P,L] * T[L,uv]
+        S_flat = Y @ T_flat  # (npt,ncas^2)
+        S = S_flat.reshape(int(npt), int(ncas), int(ncas))  # (P,u,v)
+
+        # t[P,v] = sum_u X_act[P,u] * S[P,u,v]
+        t_pv = cached_einsum("Pu,Puv->Pv", X_act, S, xp=xp)
+
+        # g_dm2[p,v] = sum_P X_mo[P,p] * t[P,v]
+        g_dm2 = X_mo.T @ t_pv  # (nmo,ncas)
+    else:
+        # Local-THC: sum block contributions with an ownership mask that keeps
+        # (primary,*) and (*,primary) pairs but excludes early-* and late-late.
+        g_dm2 = xp.zeros((nmo, ncas), dtype=xp.float64)
+        nblocks_total = int(len(thc.blocks))
+        nblocks_used = 0
+        npt_sum = 0
+        naux_sum = 0
+        npt_max = 0
+        naux_max = 0
+
+        for blk in thc.blocks:
+            X_blk = _as_xp_f64(xp, getattr(blk, "X"))
+            Y_blk = _as_xp_f64(xp, getattr(blk, "Y"))
+
+            if int(X_blk.ndim) != 2:
+                raise ValueError("LocalTHCBlock.X must be 2D")
+            if int(Y_blk.ndim) != 2:
+                raise ValueError("LocalTHCBlock.Y must be 2D")
+
+            npt_blk, nloc = map(int, X_blk.shape)
+            npt_y, naux_blk = map(int, Y_blk.shape)
+            if int(npt_y) != int(npt_blk):
+                raise ValueError("LocalTHCBlock.X/Y npt mismatch")
+
+            idx_np = np.asarray(getattr(blk, "ao_idx_global"), dtype=np.int32).ravel()
+            if int(idx_np.size) != int(nloc):
+                raise ValueError("LocalTHCBlock.ao_idx_global size mismatch with X columns")
+
+            n_early = int(getattr(blk, "n_early", 0))
+            n_primary = int(getattr(blk, "n_primary", 0))
+            if n_early < 0 or n_early > nloc:
+                raise ValueError("invalid blk.n_early")
+            if n_primary < 0 or (n_early + n_primary) > nloc:
+                raise ValueError("invalid blk.n_primary")
+            tail = int(n_early + n_primary)
+
+            idx_nonE = idx_np[int(n_early) :]
+            idx_late = idx_np[int(tail) :]
+            if int(idx_nonE.size) == 0:
+                continue
+
+            idx_nonE_xp = xp.asarray(idx_nonE, dtype=xp.int32)
+            C_nonE = C[idx_nonE_xp, :]  # (n_nonE_ao,nmo)
+            X_nonE = X_blk[:, int(n_early) :]  # (npt, n_nonE_ao)
+            X_nonE_act = X_nonE @ C_nonE[:, ncore:nocc]  # (npt,ncas)
+
+            have_late = bool(int(idx_late.size) > 0)
+            if have_late:
+                idx_late_xp = xp.asarray(idx_late, dtype=xp.int32)
+                C_late = C[idx_late_xp, :]  # (n_late_ao,nmo)
+                X_late = X_blk[:, int(tail) :]  # (npt,n_late_ao)
+                X_late_act = X_late @ C_late[:, ncore:nocc]  # (npt,ncas)
+            else:
+                C_late = None
+                X_late = None
+                X_late_act = None
+
+            # Build block active-pair vectors d_blk[wx,L].
+            L_act_full = xp.empty((int(ncas) * int(ncas), int(naux_blk)), dtype=xp.float64)
+            for p0 in range(0, int(ncas), int(pair_p_block)):
+                p1 = min(int(ncas), int(p0) + int(pair_p_block))
+                pb = int(p1 - p0)
+                if pb <= 0:
+                    continue
+                U = X_nonE_act[:, int(p0) : int(p1)]  # (npt,pb)
+                pairs_full = U[:, :, None] * X_nonE_act[:, None, :]  # (npt,pb,ncas)
+                if have_late and X_late_act is not None:
+                    Ul = X_late_act[:, int(p0) : int(p1)]
+                    pairs_full = pairs_full - (Ul[:, :, None] * X_late_act[:, None, :])
+                    Ul = None
+                pairs2 = pairs_full.reshape(int(npt_blk), int(pb) * int(ncas))
+                block_l = pairs2.T @ Y_blk  # (pb*ncas,naux_blk)
+                for i in range(int(pb)):
+                    p = int(p0) + int(i)
+                    rows = slice(int(p) * int(ncas), (int(p) + 1) * int(ncas))
+                    L_act_full[rows, :] = block_l[int(i) * int(ncas) : (int(i) + 1) * int(ncas), :]
+                pairs_full = None
+                pairs2 = None
+                block_l = None
+
+            T_flat = L_act_full.T @ dm2_act_xp  # (naux_blk,ncas^2)
+            S_flat = Y_blk @ T_flat  # (npt_blk,ncas^2)
+            S = S_flat.reshape(int(npt_blk), int(ncas), int(ncas))  # (P,u,v)
+
+            # Non-early contribution.
+            t_nonE = cached_einsum("Pu,Puv->Pv", X_nonE_act, S, xp=xp)  # (npt_blk,ncas)
+            M_nonE = X_nonE.T @ t_nonE  # (n_nonE_ao,ncas)
+            g_blk = C_nonE.T @ M_nonE  # (nmo,ncas)
+
+            # Subtract late-late contribution.
+            if have_late and C_late is not None and X_late is not None and X_late_act is not None:
+                t_late = cached_einsum("Pu,Puv->Pv", X_late_act, S, xp=xp)
+                M_late = X_late.T @ t_late
+                g_blk = g_blk - (C_late.T @ M_late)
+
+            g_dm2 += g_blk
+            nblocks_used += 1
+            npt_sum += int(npt_blk)
+            naux_sum += int(naux_blk)
+            npt_max = max(int(npt_max), int(npt_blk))
+            naux_max = max(int(naux_max), int(naux_blk))
+
+            # Help CuPy reuse the pool.
+            idx_nonE_xp = None
+            idx_late_xp = None
+            C_nonE = None
+            X_nonE = None
+            X_nonE_act = None
+            C_late = None
+            X_late = None
+            X_late_act = None
+            L_act_full = None
+            T_flat = None
+            S_flat = None
+            S = None
+            t_nonE = None
+            M_nonE = None
+            g_blk = None
+
+        if nblocks_used <= 0:
+            raise RuntimeError("local-THC g_dm2 build produced no block contributions")
+
+        # For profiling parity with global THC, store aggregate point/aux counts.
+        npt = int(npt_sum)
+        naux = int(naux_sum)
+        if profile is not None:
+            profile["lthc_nblocks_total"] = int(nblocks_total)
+            profile["lthc_nblocks_used"] = int(nblocks_used)
+            profile["lthc_sum_npt"] = int(npt_sum)
+            profile["lthc_sum_naux"] = int(naux_sum)
+            profile["lthc_max_npt_block"] = int(npt_max)
+            profile["lthc_max_naux_block"] = int(naux_max)
+
+    t_gdm2 = time.perf_counter() if profile is not None else 0.0
+
+    # gpq columns for core + active only (virtual columns are 0)
+    gpq = xp.zeros((nmo, nmo), dtype=xp.float64)
+    if ncore:
+        gpq[:, :ncore] = 2.0 * (h_mo + vhf_ca_mo)[:, :ncore]
+    gpq[:, ncore:nocc] = (h_mo + vhf_c_mo)[:, ncore:nocc] @ dm1_act_xp + g_dm2
+
+    G = gpq - gpq.T
+
+    if allowed is None:
+        allowed = allowed_rotation_mask(nmo, ncore, ncas)
+    allowed_xp = xp.asarray(allowed)
+    g_vec = G[allowed_xp].ravel()
+    grad_norm = float(xp.linalg.norm(g_vec).item())
+
+    if profile is not None:
+        t_end = time.perf_counter()
+        profile["is_gpu"] = bool(xp is not np)
+        profile["nao"] = int(nao)
+        profile["nmo"] = int(nmo)
+        profile["ncas"] = int(ncas)
+        profile["npt"] = int(npt)
+        profile["naux"] = int(naux)
+        profile["q_block"] = int(q_block)
+        profile["pair_p_block"] = int(pair_p_block)
+        profile["t_density_s"] = float(t_density - t0_total)
+        profile["t_jk_s"] = float(t_jk - t_density)
+        profile["t_transform_s"] = float(t_transform - t_jk)
+        profile["t_gdm2_s"] = float(t_gdm2 - t_transform)
+        profile["t_gpq_s"] = float(t_end - t_gdm2)
+        profile["t_total_s"] = float(t_end - t0_total)
 
     return G, grad_norm, eps
 
@@ -1128,7 +1651,9 @@ def orbital_gradient_dense(
         use_cocc_k = (xp is not np) and _bool_env("ASUKA_MCSCF_DF_K_COCC", True)
         if use_cocc_k:
             q_block = _df_scf._env_int("ASUKA_DF_JK_K_QBLOCK", 128)  # noqa: SLF001
-            q_block = max(1, min(int(B.shape[2]), int(q_block)))
+            is_qp = int(getattr(B, "ndim", 0)) == 2
+            naux_k = int(B.shape[0]) if bool(is_qp) else int(B.shape[2])
+            q_block = max(1, min(int(naux_k), int(q_block)))
 
             if ncore:
                 Jc, _ = _df_scf._df_JK(B, D_core_ao, want_J=True, want_K=False)  # noqa: SLF001
@@ -1241,4 +1766,10 @@ def orbital_gradient_dense(
     return G, grad_norm, eps
 
 
-__all__ = ["allowed_rotation_mask", "cayley_update", "orbital_gradient_df", "orbital_gradient_dense"]
+__all__ = [
+    "allowed_rotation_mask",
+    "cayley_update",
+    "orbital_gradient_df",
+    "orbital_gradient_thc",
+    "orbital_gradient_dense",
+]

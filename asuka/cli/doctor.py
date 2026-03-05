@@ -75,6 +75,8 @@ def main() -> None:
         print(f"- cuda linalg ext (_guga_cuda_linalg_ext): MISSING ({type(linalg_err).__name__}: {linalg_err})")
         print("  hint: build with `python -m asuka.build.guga_cuda_linalg_ext` once nvcc is available")
 
+    print("- native kernel inventory: run `python -m asuka.cli.kernels --full`")
+
 
 if __name__ == "__main__":  # pragma: no cover
     main()

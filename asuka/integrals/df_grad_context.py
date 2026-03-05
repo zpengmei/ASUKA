@@ -102,6 +102,122 @@ def _env_flag_enabled(name: str, *, default: bool = False) -> bool:
     return bool(default)
 
 
+def _df_grad_path_log_enabled() -> bool:
+    return _env_flag_enabled("ASUKA_DF_GRAD_PATH_LOG", default=False)
+
+
+def _df3c_common_cuda_args(cuda: dict[str, Any]) -> tuple[Any, ...]:
+    """Return the common argument tuple for cuERI DF 3c derivative kernels.
+
+    The cuERI CUDA extension DF kernels share a long prefix of static buffers
+    (pair tables + shell data). Centralizing the argument order makes call
+    sites shorter and less error-prone.
+    """
+
+    return (
+        cuda["sp_A"],
+        cuda["sp_B"],
+        cuda["sp_pair_start"],
+        cuda["sp_npair"],
+        cuda["shell_cx"],
+        cuda["shell_cy"],
+        cuda["shell_cz"],
+        cuda["shell_prim_start"],
+        cuda["shell_nprim"],
+        cuda["shell_ao_start"],
+        cuda["prim_exp"],
+        cuda["pair_eta"],
+        cuda["pair_Px"],
+        cuda["pair_Py"],
+        cuda["pair_Pz"],
+        cuda["pair_cK"],
+    )
+
+
+def _round_cuda_threads(value: int | None, *, default: int = 256) -> int:
+    t = int(default) if value is None else int(value)
+    if t <= 0:
+        t = int(default)
+    t = min(256, max(32, int(t)))
+    # Kernels assume warp-multiple thread blocks.
+    return int((int(t) // 32) * 32)
+
+
+def _resolve_streamed_qblock(naux: int, *, nbar: int = 1) -> int:
+    """Resolve Q-block size for streamed Qp->Qmn unpack + streamed contraction.
+
+    For multibar contractions we scale qblock down by nbar to keep the unpack
+    buffer roughly constant in memory.
+    """
+    try:
+        qblock_env = int(str(os.environ.get("ASUKA_DF_STREAMED_QAB_QBLOCK", "")).strip() or "0")
+    except Exception:
+        qblock_env = 0
+    if qblock_env > 0:
+        qblock_base = int(max(1, min(int(naux), int(qblock_env))))
+    else:
+        qblock_base = int(max(1, min(int(naux), max(1, int(naux) // 8))))
+
+    nb = max(1, int(nbar))
+    if nb > 1:
+        qblock_base = max(1, int(qblock_base // nb))
+    return int(max(1, min(int(naux), int(qblock_base))))
+
+
+def _plan_qp_multibar_chunks(
+    nbar: int,
+    *,
+    have1: bool,
+    have2: bool,
+    have3: bool,
+) -> list[tuple[int, int]] | None:
+    """Return a chunk plan [(bar_start, chunk_size), ...] for Qp kernels (sizes 3/2/1).
+
+    The plan is deterministic and avoids decompositions that are known to be
+    suboptimal (e.g. prefer 2+2 over 3+1 when possible).
+    """
+    sizes: list[int] = []
+    if have3:
+        b, r = divmod(int(nbar), 3)
+        if r == 0:
+            sizes = [3] * int(b)
+        elif r == 1:
+            # Prefer 2+2 over a trailing 1, even if the single-bar kernel exists.
+            if have2 and int(nbar) >= 4:
+                sizes = [3] * int(max(0, int(b) - 1)) + [2, 2]
+            elif have1:
+                sizes = [3] * int(b) + [1]
+            else:
+                return None
+        else:  # r == 2
+            if have2:
+                sizes = [3] * int(b) + [2]
+            elif have1:
+                sizes = [3] * int(b) + [1, 1]
+            else:
+                return None
+    elif have2:
+        if int(nbar) % 2 == 0:
+            sizes = [2] * int(int(nbar) // 2)
+        elif have1:
+            sizes = [2] * int(int(nbar) // 2) + [1]
+        else:
+            return None
+    elif have1:
+        sizes = [1] * int(nbar)
+    else:
+        return None
+
+    out: list[tuple[int, int]] = []
+    br0 = 0
+    for sz in sizes:
+        out.append((int(br0), int(sz)))
+        br0 += int(sz)
+    if int(br0) != int(nbar):
+        return None
+    return out
+
+
 _DF_3C_SCHED_CACHE_MAX = 16
 _DF_3C_SCHED_CACHE: dict[tuple[Any, ...], list[dict[str, Any]]] = {}
 _DF_3C_SCHED_CACHE_ORDER: list[tuple[Any, ...]] = []
@@ -541,6 +657,27 @@ class DFGradContractionContext:
     # Cached spherical AO layout (computed once, reused in contract_sph).
     _shell_ao_start_sph: np.ndarray | None = None
     _nao_sph: int | None = None
+
+    def ensure_cuda(self) -> None:
+        """Ensure CUDA static buffers are initialized (backend='cuda' only).
+
+        Some long workflows (SCF -> CASSCF -> gradient) benefit from releasing
+        CUDA-resident static buffers (pair tables, job lists) between phases to
+        reduce peak VRAM. Callers may then lazily re-initialize before the next
+        contraction.
+        """
+        if str(self.backend).strip().lower() != "cuda":
+            return
+        if self.cuda is None:
+            self._init_cuda()
+
+    def release_cuda(self) -> None:
+        """Drop CUDA static buffers to free GPU memory (backend='cuda' only)."""
+        if str(self.backend).strip().lower() != "cuda":
+            return
+        # Clearing the dict releases references to device arrays and lets CuPy
+        # return the blocks to its pool (callers may free_all_blocks()).
+        self.cuda = None
 
     @staticmethod
     def build(
@@ -1034,6 +1171,34 @@ class DFGradContractionContext:
         B = np.asarray(B_ao, dtype=np.float64, order="C")
         bar_L = np.asarray(bar_L_ao, dtype=np.float64, order="C")
 
+        # Packed-Qp CPU path: accept (naux, ntri) tensors and unpack for the legacy CPU contraction kernels.
+        if B.ndim == 2 and bar_L.ndim == 2:
+            naux, ntri = map(int, B.shape)
+            if naux != int(self.naux):
+                raise ValueError("B_ao shape mismatch with context naux")
+            if tuple(map(int, bar_L.shape)) != (int(naux), int(ntri)):
+                raise ValueError("bar_L_ao must have shape (naux, ntri) for packed-Qp tensors")
+
+            from asuka.integrals.tri_packed import nao_from_ntri  # noqa: PLC0415
+
+            nao0 = int(nao_from_ntri(int(ntri)))
+            if nao0 != int(self.nao):
+                raise ValueError("B_ao shape mismatch with context nao")
+
+            from asuka.integrals.df_adjoint import df_whiten_adjoint_Qp  # noqa: PLC0415
+            from asuka.integrals.df_packed_s2 import unpack_Qp_to_mnQ  # noqa: PLC0415
+
+            bar_L_c = np.asarray(bar_L, dtype=np.float64, order="C")
+            bar_X_Qp, bar_Lchol = df_whiten_adjoint_Qp(
+                B, bar_L_c, self.L_metric, nao=int(nao0), overwrite_bar_L=True
+            )
+            bar_V = chol_lower_adjoint(self.L_metric, bar_Lchol)
+            bar_V = np.asarray(bar_V, dtype=np.float64, order="C")
+            bar_X_mnQ = unpack_Qp_to_mnQ(bar_X_Qp, nao=int(nao0))
+            bar_X_mnQ = np.asarray(bar_X_mnQ, dtype=np.float64, order="C")
+            bar_X_flat = bar_X_mnQ.reshape((int(nao0) * int(nao0), int(naux)))
+            return self._contract_cpu_from_adjoints(bar_X_flat, bar_V)
+
         if B.ndim != 3:
             raise ValueError("B_ao must have shape (nao, nao, naux)")
         nao0, nao1, naux = map(int, B.shape)
@@ -1087,33 +1252,6 @@ class DFGradContractionContext:
         B = np.asarray(B_sph, dtype=np.float64, order="C")
         bar_L = np.asarray(bar_L_sph, dtype=np.float64, order="C")
 
-        if B.ndim != 3:
-            raise ValueError("B_sph must have shape (nao_sph, nao_sph, naux)")
-        nao_sph0, nao_sph1, naux = map(int, B.shape)
-        if nao_sph0 != nao_sph1:
-            raise ValueError("B_sph must have shape (nao_sph, nao_sph, naux)")
-        if naux != int(self.naux):
-            raise ValueError("B_sph shape mismatch with context naux")
-        if tuple(map(int, bar_L.shape)) != (int(self.naux), int(nao_sph0), int(nao_sph0)):
-            raise ValueError("bar_L_sph must have shape (naux, nao_sph, nao_sph)")
-
-        # Legacy path: materialize bar_X_cart using an explicit transform matrix.
-        if T_c2s is not None:
-            T = np.asarray(T_c2s, dtype=np.float64)
-
-            # 1. Compute adjoints in spherical basis (smaller, faster)
-            bar_X_sph, bar_Lchol = df_whiten_adjoint_Qmn(B, bar_L, self.L_metric)
-            bar_V = chol_lower_adjoint(self.L_metric, bar_Lchol)
-
-            # 2. Transform bar_X to Cartesian for 3c kernel: bar_X_cart[mu,nu,Q] = T @ bar_X_sph @ T^T
-            bar_X_cart = np.einsum("mi,ijQ,nj->mnQ", T, bar_X_sph, T, optimize=True)
-            bar_X_cart = 0.5 * (bar_X_cart + bar_X_cart.transpose((1, 0, 2)))
-            bar_X_flat = np.asarray(bar_X_cart.reshape((self.nao * self.nao, self.naux)), dtype=np.float64, order="C")
-            bar_V = np.asarray(bar_V, dtype=np.float64, order="C")
-
-            # 3. Reuse existing kernel loops
-            return self._contract_cpu_from_adjoints(bar_X_flat, bar_V)
-
         # Preferred spherical path: avoid materializing bar_X_cart.
         if self.cpu is None:  # pragma: no cover
             raise RuntimeError("internal error: CPU function table missing")
@@ -1127,32 +1265,88 @@ class DFGradContractionContext:
         if fn_2c is None:  # pragma: no cover
             raise RuntimeError("internal error: CPU DF 2c kernel entry point missing")
 
-        # Whitening adjoint in spherical AO space.
-        #
-        # SciPy's `solve_triangular(..., overwrite_b=True)` only overwrites Fortran-contiguous
-        # RHS buffers, so we cannot reliably reuse `bar_L_c` as the TRSM output buffer.
-        # Instead, compute `bar_X` (mnQ) and then reuse `bar_L_c`'s memory to hold a
-        # contiguous Qmn view for the downstream Cython contraction kernel.
-        bar_L_c = np.asarray(bar_L, dtype=np.float64, order="C")
-        bar_X_sph_mnQ, bar_Lchol = df_whiten_adjoint_Qmn(B, bar_L_c, self.L_metric, overwrite_bar_L=False)
-        bar_V = chol_lower_adjoint(self.L_metric, bar_Lchol)
-        bar_V = np.asarray(bar_V, dtype=np.float64, order="C")
+        if B.ndim == 2 and bar_L.ndim == 2:
+            if T_c2s is not None:
+                raise ValueError("Packed-Qp CPU spherical contraction does not support T_c2s fallback")
+            naux, ntri = map(int, B.shape)
+            if naux != int(self.naux):
+                raise ValueError("B_sph shape mismatch with context naux")
+            if tuple(map(int, bar_L.shape)) != (int(naux), int(ntri)):
+                raise ValueError("bar_L_sph must have shape (naux, ntri) for packed-Qp tensors")
 
-        # Repack bar_X into a contiguous Qmn tensor using the existing `bar_L_c` buffer.
-        bar_L_c[...] = np.transpose(bar_X_sph_mnQ, (2, 0, 1))
-        del bar_X_sph_mnQ
+            from asuka.integrals.tri_packed import nao_from_ntri  # noqa: PLC0415
+            from asuka.integrals.df_adjoint import df_whiten_adjoint_Qp  # noqa: PLC0415
+            from asuka.integrals.df_packed_s2 import unpack_Qp_to_Qmn_block  # noqa: PLC0415
 
-        # bar_L_c now holds bar_X in Qmn layout (naux, nao_sph, nao_sph), contiguous.
-        if fn_sym_qmn is not None:
-            fn_sym_qmn(bar_L_c.reshape(-1), int(self.naux), int(nao_sph0))
+            nao_sph0 = int(nao_from_ntri(int(ntri)))
+
+            bar_L_c = np.asarray(bar_L, dtype=np.float64, order="C")
+            bar_X_Qp, bar_Lchol = df_whiten_adjoint_Qp(
+                B, bar_L_c, self.L_metric, nao=int(nao_sph0), overwrite_bar_L=True
+            )
+            bar_V = chol_lower_adjoint(self.L_metric, bar_Lchol)
+            bar_V = np.asarray(bar_V, dtype=np.float64, order="C")
+
+            bar_X_Qmn = unpack_Qp_to_Qmn_block(bar_X_Qp, nao=int(nao_sph0), q0=0, q_count=int(naux))
+            if fn_sym_qmn is not None:
+                fn_sym_qmn(bar_X_Qmn.reshape(-1), int(naux), int(nao_sph0))
+            bar_X_sph_Qmn_flat = np.asarray(bar_X_Qmn.reshape(-1), dtype=np.float64, order="C")
         else:
-            # Slow fallback: symmetrize each Qmn slice in-place (avoid allocating a full transpose).
-            for q in range(int(self.naux)):
-                tmp = bar_L_c[int(q)].copy()
-                bar_L_c[int(q)] += tmp.T
-                bar_L_c[int(q)] *= 0.5
+            if B.ndim != 3:
+                raise ValueError("B_sph must have shape (nao_sph, nao_sph, naux)")
+            nao_sph0, nao_sph1, naux = map(int, B.shape)
+            if nao_sph0 != nao_sph1:
+                raise ValueError("B_sph must have shape (nao_sph, nao_sph, naux)")
+            if naux != int(self.naux):
+                raise ValueError("B_sph shape mismatch with context naux")
+            if tuple(map(int, bar_L.shape)) != (int(self.naux), int(nao_sph0), int(nao_sph0)):
+                raise ValueError("bar_L_sph must have shape (naux, nao_sph, nao_sph)")
 
-        bar_X_sph_Qmn_flat = bar_L_c.reshape(-1)
+            # Legacy path: materialize bar_X_cart using an explicit transform matrix.
+            if T_c2s is not None:
+                T = np.asarray(T_c2s, dtype=np.float64)
+
+                # 1. Compute adjoints in spherical basis (smaller, faster)
+                bar_X_sph, bar_Lchol = df_whiten_adjoint_Qmn(B, bar_L, self.L_metric)
+                bar_V = chol_lower_adjoint(self.L_metric, bar_Lchol)
+
+                # 2. Transform bar_X to Cartesian for 3c kernel: bar_X_cart[mu,nu,Q] = T @ bar_X_sph @ T^T
+                bar_X_cart = np.einsum("mi,ijQ,nj->mnQ", T, bar_X_sph, T, optimize=True)
+                bar_X_cart = 0.5 * (bar_X_cart + bar_X_cart.transpose((1, 0, 2)))
+                bar_X_flat = np.asarray(
+                    bar_X_cart.reshape((self.nao * self.nao, self.naux)), dtype=np.float64, order="C"
+                )
+                bar_V = np.asarray(bar_V, dtype=np.float64, order="C")
+
+                # 3. Reuse existing kernel loops
+                return self._contract_cpu_from_adjoints(bar_X_flat, bar_V)
+
+            # Whitening adjoint in spherical AO space.
+            #
+            # SciPy's `solve_triangular(..., overwrite_b=True)` only overwrites Fortran-contiguous
+            # RHS buffers, so we cannot reliably reuse `bar_L_c` as the TRSM output buffer.
+            # Instead, compute `bar_X` (mnQ) and then reuse `bar_L_c`'s memory to hold a
+            # contiguous Qmn view for the downstream Cython contraction kernel.
+            bar_L_c = np.asarray(bar_L, dtype=np.float64, order="C")
+            bar_X_sph_mnQ, bar_Lchol = df_whiten_adjoint_Qmn(B, bar_L_c, self.L_metric, overwrite_bar_L=False)
+            bar_V = chol_lower_adjoint(self.L_metric, bar_Lchol)
+            bar_V = np.asarray(bar_V, dtype=np.float64, order="C")
+
+            # Repack bar_X into a contiguous Qmn tensor using the existing `bar_L_c` buffer.
+            bar_L_c[...] = np.transpose(bar_X_sph_mnQ, (2, 0, 1))
+            del bar_X_sph_mnQ
+
+            # bar_L_c now holds bar_X in Qmn layout (naux, nao_sph, nao_sph), contiguous.
+            if fn_sym_qmn is not None:
+                fn_sym_qmn(bar_L_c.reshape(-1), int(self.naux), int(nao_sph0))
+            else:
+                # Slow fallback: symmetrize each Qmn slice in-place (avoid allocating a full transpose).
+                for q in range(int(self.naux)):
+                    tmp = bar_L_c[int(q)].copy()
+                    bar_L_c[int(q)] += tmp.T
+                    bar_L_c[int(q)] *= 0.5
+
+            bar_X_sph_Qmn_flat = bar_L_c.reshape(-1)
 
         # Use cached spherical AO shell layout; pack into the combined shell list.
         shell_ao_start_sph_host = self._shell_ao_start_sph
@@ -2025,21 +2219,40 @@ class DFGradContractionContext:
             raise RuntimeError("CUDA static context is not initialized")
         cuda = self.cuda
         _ext = cuda["_ext"]
+        common_3c = _df3c_common_cuda_args(cuda)
+        nao = int(self.nao)
+        naux = int(self.naux)
+        shell_ao_start_sph = cuda["shell_ao_start_sph"]
+        shell_atom = cuda["shell_atom"]
 
-        fn_stream = getattr(
+        fn_qp = getattr(
             _ext,
-            "df_int3c2e_deriv_contracted_cart_allsp_atomgrad_sphbar_qmn_streamed_inplace_device",
+            "df_int3c2e_deriv_contracted_cart_allsp_atomgrad_sphbar_qp_inplace_device",
             None,
         )
-        if fn_stream is None:
-            raise RuntimeError("CUDA extension missing streamed sphbar-qmn DF 3c derivative contraction kernel")
-        fn_stream_abtile = getattr(
+        fn_qp_abtile = getattr(
             _ext,
-            "df_int3c2e_deriv_contracted_cart_allsp_atomgrad_sphbar_qmn_streamed_abtile_inplace_device",
+            "df_int3c2e_deriv_contracted_cart_allsp_atomgrad_sphbar_qp_abtile_inplace_device",
             None,
         )
-        if not hasattr(_ext, "df_unpack_qp_to_qmn_block_device"):
-            raise RuntimeError("CUDA extension missing Qp->Qmn unpack kernel for packed sphbar-qmn contraction")
+
+        fn_stream = None
+        fn_stream_abtile = None
+        if fn_qp is None:
+            fn_stream = getattr(
+                _ext,
+                "df_int3c2e_deriv_contracted_cart_allsp_atomgrad_sphbar_qmn_streamed_inplace_device",
+                None,
+            )
+            if fn_stream is None:
+                raise RuntimeError("CUDA extension missing streamed sphbar-qmn DF 3c derivative contraction kernel")
+            fn_stream_abtile = getattr(
+                _ext,
+                "df_int3c2e_deriv_contracted_cart_allsp_atomgrad_sphbar_qmn_streamed_abtile_inplace_device",
+                None,
+            )
+            if not hasattr(_ext, "df_unpack_qp_to_qmn_block_device"):
+                raise RuntimeError("CUDA extension missing Qp->Qmn unpack kernel for packed sphbar-qmn contraction")
 
         if grad_dev is None:
             grad_dev = cp.zeros((self.natm, 3), dtype=cp.float64)
@@ -2081,43 +2294,12 @@ class DFGradContractionContext:
                         }
                     )
 
-        # Choose streamed aux block size.
-        try:
-            qblock_env = int(str(os.environ.get("ASUKA_DF_STREAMED_QAB_QBLOCK", "")).strip() or "0")
-        except Exception:
-            qblock_env = 0
-        if qblock_env > 0:
-            qblock = int(max(1, min(int(self.naux), qblock_env)))
-        else:
-            qblock = int(max(1, min(int(self.naux), max(1, int(self.naux) // 8))))
-
         nao_sph = int(nao_sph)
         if nao_sph <= 0:
             return grad_dev
-        qstride = int(nao_sph) * int(nao_sph)
-        buf = cp.empty((int(qblock) * int(qstride),), dtype=cp.float64)
-
-        # Outer loop over aux blocks: unpack once per block, reuse across all (la,lb,lq) jobs.
-        for q0 in range(0, int(self.naux), int(qblock)):
-            q_count = int(min(int(qblock), int(self.naux) - int(q0)))
-            if q_count <= 0:
-                continue
-            qbeg = 0
-            qend = int(q_count) * int(qstride)
-            bar_chunk = buf[qbeg:qend]
-
-            _ext.df_unpack_qp_to_qmn_block_device(
-                bar_X_sph_Qp_dev,
-                bar_chunk,
-                int(self.naux),
-                int(nao_sph),
-                int(q0),
-                int(q_count),
-                int(threads),
-                int(stream_ptr),
-                False,
-            )
-
+        if fn_qp is not None:
+            cuda["_last_df_grad_3c_path"] = "qp_direct"
+            # Direct packed-Qp kernel: avoids Qp->Qmn unpack buffers and avoids streamed-Q replays.
             for job in jobs_3c:
                 la_ = int(job["la"])
                 lb_ = int(job["lb"])
@@ -2128,87 +2310,135 @@ class DFGradContractionContext:
                 nt = int(job.get("n_spCD", int(spCD_dev.shape[0])))
                 if nt == 0 or n_spAB == 0:
                     continue
-                threads_job = int(job.get("threads", threads))
-                if threads_job <= 0:
-                    threads_job = int(threads)
-                threads_job = min(256, max(32, int(threads_job)))
-                threads_job = int((threads_job // 32) * 32)
+                threads_job = _round_cuda_threads(job.get("threads"), default=int(threads))
                 cd_tile = max(1, min(int(job.get("cd_tile", 1)), nt))
-                use_abtile = bool(job.get("use_abtile", False)) and (fn_stream_abtile is not None) and cd_tile > 1
+                use_abtile = bool(job.get("use_abtile", False)) and (fn_qp_abtile is not None) and cd_tile > 1
 
                 if use_abtile:
-                    fn_stream_abtile(
+                    fn_qp_abtile(
                         spAB_class_dev,
                         spCD_dev,
-                        cuda["sp_A"],
-                        cuda["sp_B"],
-                        cuda["sp_pair_start"],
-                        cuda["sp_npair"],
-                        cuda["shell_cx"],
-                        cuda["shell_cy"],
-                        cuda["shell_cz"],
-                        cuda["shell_prim_start"],
-                        cuda["shell_nprim"],
-                        cuda["shell_ao_start"],
-                        cuda["prim_exp"],
-                        cuda["pair_eta"],
-                        cuda["pair_Px"],
-                        cuda["pair_Py"],
-                        cuda["pair_Pz"],
-                        cuda["pair_cK"],
-                        int(self.nao),
-                        int(self.naux),
+                        *common_3c,
+                        int(nao),
+                        int(naux),
                         int(nao_sph),
                         int(la_),
                         int(lb_),
                         int(lq),
-                        bar_chunk,
-                        cuda["shell_ao_start_sph"],
-                        cuda["shell_atom"],
-                        int(q0),
-                        int(q_count),
-                        grad_dev_flat,
+                        bar_X_sph_Qp_dev,
+                        shell_ao_start_sph,
+                        shell_atom,
                         int(cd_tile),
+                        grad_dev_flat,
                         int(threads_job),
                         int(stream_ptr),
                         False,
                     )
                 else:
-                    fn_stream(
+                    fn_qp(
                         spAB_class_dev,
                         spCD_dev,
-                        cuda["sp_A"],
-                        cuda["sp_B"],
-                        cuda["sp_pair_start"],
-                        cuda["sp_npair"],
-                        cuda["shell_cx"],
-                        cuda["shell_cy"],
-                        cuda["shell_cz"],
-                        cuda["shell_prim_start"],
-                        cuda["shell_nprim"],
-                        cuda["shell_ao_start"],
-                        cuda["prim_exp"],
-                        cuda["pair_eta"],
-                        cuda["pair_Px"],
-                        cuda["pair_Py"],
-                        cuda["pair_Pz"],
-                        cuda["pair_cK"],
-                        int(self.nao),
-                        int(self.naux),
+                        *common_3c,
+                        int(nao),
+                        int(naux),
                         int(nao_sph),
                         int(la_),
                         int(lb_),
                         int(lq),
-                        bar_chunk,
-                        cuda["shell_ao_start_sph"],
-                        cuda["shell_atom"],
-                        int(q0),
-                        int(q_count),
+                        bar_X_sph_Qp_dev,
+                        shell_ao_start_sph,
+                        shell_atom,
                         grad_dev_flat,
                         int(threads_job),
                         int(stream_ptr),
                         False,
                     )
+        else:
+            cuda["_last_df_grad_3c_path"] = "qmn_streamed_unpack_qp"
+            # Choose streamed aux block size.
+            qblock = _resolve_streamed_qblock(int(naux), nbar=1)
+
+            qstride = int(nao_sph) * int(nao_sph)
+            buf = cp.empty((int(qblock) * int(qstride),), dtype=cp.float64)
+
+            # Outer loop over aux blocks: unpack once per block, reuse across all (la,lb,lq) jobs.
+            for q0 in range(0, int(naux), int(qblock)):
+                q_count = int(min(int(qblock), int(naux) - int(q0)))
+                if q_count <= 0:
+                    continue
+                qbeg = 0
+                qend = int(q_count) * int(qstride)
+                bar_chunk = buf[qbeg:qend]
+
+                _ext.df_unpack_qp_to_qmn_block_device(
+                    bar_X_sph_Qp_dev,
+                    bar_chunk,
+                    int(naux),
+                    int(nao_sph),
+                    int(q0),
+                    int(q_count),
+                    int(threads),
+                    int(stream_ptr),
+                    False,
+                )
+
+                for job in jobs_3c:
+                    la_ = int(job["la"])
+                    lb_ = int(job["lb"])
+                    lq = int(job["lq"])
+                    spAB_class_dev = job["spAB"]
+                    spCD_dev = job["spCD"]
+                    n_spAB = int(job.get("n_spAB", int(spAB_class_dev.shape[0])))
+                    nt = int(job.get("n_spCD", int(spCD_dev.shape[0])))
+                    if nt == 0 or n_spAB == 0:
+                        continue
+                    threads_job = _round_cuda_threads(job.get("threads"), default=int(threads))
+                    cd_tile = max(1, min(int(job.get("cd_tile", 1)), nt))
+                    use_abtile = bool(job.get("use_abtile", False)) and (fn_stream_abtile is not None) and cd_tile > 1
+
+                    if use_abtile:
+                        fn_stream_abtile(
+                            spAB_class_dev,
+                            spCD_dev,
+                            *common_3c,
+                            int(nao),
+                            int(naux),
+                            int(nao_sph),
+                            int(la_),
+                            int(lb_),
+                            int(lq),
+                            bar_chunk,
+                            shell_ao_start_sph,
+                            shell_atom,
+                            int(q0),
+                            int(q_count),
+                            grad_dev_flat,
+                            int(cd_tile),
+                            int(threads_job),
+                            int(stream_ptr),
+                            False,
+                        )
+                    else:
+                        fn_stream(
+                            spAB_class_dev,
+                            spCD_dev,
+                            *common_3c,
+                            int(nao),
+                            int(naux),
+                            int(nao_sph),
+                            int(la_),
+                            int(lb_),
+                            int(lq),
+                            bar_chunk,
+                            shell_ao_start_sph,
+                            shell_atom,
+                            int(q0),
+                            int(q_count),
+                            grad_dev_flat,
+                            int(threads_job),
+                            int(stream_ptr),
+                            False,
+                        )
 
         # Metric 2c contribution (unchanged): reuse existing implementation on full bar_V_dev.
         metric_mode = str(os.environ.get("ASUKA_DF_METRIC_2C_KERNEL", "auto")).strip().lower()
@@ -2221,6 +2451,7 @@ class DFGradContractionContext:
                 None,
             )
         if fn_2c_tril is not None:
+            cuda["_last_df_grad_metric2c_path"] = "2c_tril"
             for lp, spAB_class_dev in cuda["spCD_by_l"].items():
                 n_spAB = int(spAB_class_dev.shape[0])
                 if n_spAB == 0:
@@ -2232,34 +2463,20 @@ class DFGradContractionContext:
                     fn_2c_tril(
                         spAB_class_dev,
                         spCD_class_dev,
-                        cuda["sp_A"],
-                        cuda["sp_B"],
-                        cuda["sp_pair_start"],
-                        cuda["sp_npair"],
-                        cuda["shell_cx"],
-                        cuda["shell_cy"],
-                        cuda["shell_cz"],
-                        cuda["shell_prim_start"],
-                        cuda["shell_nprim"],
-                        cuda["shell_ao_start"],
-                        cuda["prim_exp"],
-                        cuda["pair_eta"],
-                        cuda["pair_Px"],
-                        cuda["pair_Py"],
-                        cuda["pair_Pz"],
-                        cuda["pair_cK"],
-                        int(self.nao),
-                        int(self.naux),
+                        *common_3c,
+                        int(nao),
+                        int(naux),
                         int(lp),
                         int(lq),
                         bar_V_dev,
-                        cuda["shell_atom"],
+                        shell_atom,
                         grad_dev_flat,
                         int(threads),
                         int(stream_ptr),
                         False,
                     )
         else:
+            cuda["_last_df_grad_metric2c_path"] = "2c_sp_batch"
             work_2c = cuda.get("work_2c_cache")
             if not isinstance(work_2c, dict):
                 work_2c = {}
@@ -2275,24 +2492,9 @@ class DFGradContractionContext:
                 _ext.df_metric_2c2e_deriv_contracted_cart_sp_batch_inplace_device(
                     int(spAB),
                     spCD_dev,
-                    cuda["sp_A"],
-                    cuda["sp_B"],
-                    cuda["sp_pair_start"],
-                    cuda["sp_npair"],
-                    cuda["shell_cx"],
-                    cuda["shell_cy"],
-                    cuda["shell_cz"],
-                    cuda["shell_prim_start"],
-                    cuda["shell_nprim"],
-                    cuda["shell_ao_start"],
-                    cuda["prim_exp"],
-                    cuda["pair_eta"],
-                    cuda["pair_Px"],
-                    cuda["pair_Py"],
-                    cuda["pair_Pz"],
-                    cuda["pair_cK"],
-                    int(self.nao),
-                    int(self.naux),
+                    *common_3c,
+                    int(nao),
+                    int(naux),
                     int(lp),
                     int(lq),
                     bar_V_dev,
@@ -2307,6 +2509,462 @@ class DFGradContractionContext:
                 cp.add.at(grad_dev[:, 0], atomQ_dev, valsQ[:, 0])
                 cp.add.at(grad_dev[:, 1], atomQ_dev, valsQ[:, 1])
                 cp.add.at(grad_dev[:, 2], atomQ_dev, valsQ[:, 2])
+
+        if _df_grad_path_log_enabled():
+            path3c = str(cuda.get("_last_df_grad_3c_path", "unknown"))
+            path2c = str(cuda.get("_last_df_grad_metric2c_path", "unknown"))
+            print(f"[ASUKA_DF_GRAD_PATH] 3c={path3c} metric2c={path2c} nbar=1")
+
+        return grad_dev
+
+    def _contract_device_from_adjoints_sph_qp_multibar(
+        self,
+        bar_X_sph_Qp_devs: list[Any],
+        bar_V_devs: list[Any],
+        *,
+        nao_sph: int,
+    ) -> Any:
+        """Like :meth:`_contract_device_from_adjoints_sph_qp`, but contracts multiple bar_X tensors in one pass.
+
+        Requires CUDA extension multi-bar streamed kernels. Returns a device array with shape (nbar, natm, 3).
+        """
+        import cupy as cp  # noqa: PLC0415
+
+        if self.cuda is None:
+            raise RuntimeError("CUDA static context is not initialized")
+        cuda = self.cuda
+        _ext = cuda["_ext"]
+        common_3c = _df3c_common_cuda_args(cuda)
+        nao = int(self.nao)
+        naux = int(self.naux)
+        shell_ao_start_sph = cuda["shell_ao_start_sph"]
+        shell_atom = cuda["shell_atom"]
+
+        nbar = int(len(bar_X_sph_Qp_devs))
+        if nbar <= 0:
+            raise ValueError("bar_X_sph_Qp_devs must contain at least one tensor")
+        if int(len(bar_V_devs)) != int(nbar):
+            raise ValueError("bar_V_devs length mismatch")
+        if nbar == 1:
+            grad1 = self._contract_device_from_adjoints_sph_qp(
+                bar_X_sph_Qp_devs[0], bar_V_devs[0], nao_sph=int(nao_sph), grad_dev=None
+            )
+            return grad1[None, :, :]
+
+        # Direct packed-Qp fused kernels (fastest when available).
+        fn_qp_1 = getattr(_ext, "df_int3c2e_deriv_contracted_cart_allsp_atomgrad_sphbar_qp_inplace_device", None)
+        fn_qp_1_abtile = getattr(
+            _ext, "df_int3c2e_deriv_contracted_cart_allsp_atomgrad_sphbar_qp_abtile_inplace_device", None
+        )
+        fn_qp_multi2 = getattr(
+            _ext, "df_int3c2e_deriv_contracted_cart_allsp_atomgrad_sphbar_qp_multibar2_inplace_device", None
+        )
+        fn_qp_multi2_abtile = getattr(
+            _ext, "df_int3c2e_deriv_contracted_cart_allsp_atomgrad_sphbar_qp_abtile_multibar2_inplace_device", None
+        )
+        fn_qp_multi3 = getattr(
+            _ext, "df_int3c2e_deriv_contracted_cart_allsp_atomgrad_sphbar_qp_multibar3_inplace_device", None
+        )
+        fn_qp_multi3_abtile = getattr(
+            _ext, "df_int3c2e_deriv_contracted_cart_allsp_atomgrad_sphbar_qp_abtile_multibar3_inplace_device", None
+        )
+
+        fn_stream_multi = getattr(
+            _ext,
+            "df_int3c2e_deriv_contracted_cart_allsp_atomgrad_sphbar_qmn_streamed_multibar_inplace_device",
+            None,
+        )
+        fn_stream_multi_abtile = getattr(
+            _ext,
+            "df_int3c2e_deriv_contracted_cart_allsp_atomgrad_sphbar_qmn_streamed_abtile_multibar_inplace_device",
+            None,
+        )
+        if fn_qp_1 is None and fn_qp_multi2 is None and fn_qp_multi3 is None:
+            if fn_stream_multi is None:
+                raise RuntimeError(
+                    "CUDA extension missing streamed multibar sphbar-qmn DF 3c derivative contraction kernel"
+                )
+            if not hasattr(_ext, "df_unpack_qp_to_qmn_block_device"):
+                raise RuntimeError("CUDA extension missing Qp->Qmn unpack kernel for packed sphbar-qmn contraction")
+
+        # Output gradient buffer: (nbar, natm, 3)
+        grad_dev = cp.zeros((int(nbar), int(self.natm), 3), dtype=cp.float64)
+        grad_stride = int(self.natm) * 3
+        grad_dev_flat = grad_dev.reshape(-1)
+
+        threads = 256
+        stream_ptr = int(cp.cuda.get_current_stream().ptr)
+
+        jobs_3c = cuda.get("jobs_3c")
+        if not isinstance(jobs_3c, list) or len(jobs_3c) == 0:
+            raise RuntimeError("internal error: CUDA 3c job list missing from DFGradContractionContext")
+
+        nao_sph = int(nao_sph)
+        if nao_sph <= 0:
+            return grad_dev
+
+        qp_chunks = _plan_qp_multibar_chunks(
+            int(nbar),
+            have1=(fn_qp_1 is not None),
+            have2=(fn_qp_multi2 is not None),
+            have3=(fn_qp_multi3 is not None),
+        )
+        if qp_chunks is not None:
+            cuda["_last_df_grad_3c_path"] = "qp_direct_multibar"
+            cuda["_last_df_grad_qp_chunks"] = tuple(int(sz) for _br0, sz in qp_chunks)
+        else:
+            cuda["_last_df_grad_3c_path"] = "qmn_streamed_unpack_qp_multibar"
+            try:
+                cuda.pop("_last_df_grad_qp_chunks", None)
+            except Exception:
+                pass
+
+        if qp_chunks is not None:
+            # Direct packed-Qp fused multibar (chunked): no Q-block streaming or Qmn buffers.
+            for job in jobs_3c:
+                la_ = int(job["la"])
+                lb_ = int(job["lb"])
+                lq = int(job["lq"])
+                spAB_class_dev = job["spAB"]
+                spCD_dev = job["spCD"]
+                n_spAB = int(job.get("n_spAB", int(getattr(spAB_class_dev, "shape", (0,))[0])))
+                nt = int(job.get("n_spCD", int(getattr(spCD_dev, "shape", (0,))[0])))
+                if nt == 0 or n_spAB == 0:
+                    continue
+                threads_job = _round_cuda_threads(job.get("threads"), default=int(threads))
+
+                cd_tile = max(1, min(int(job.get("cd_tile", 1)), int(nt)))
+
+                for br0, sz in qp_chunks:
+                    grad_chunk_flat = grad_dev_flat[
+                        int(br0) * int(grad_stride) : (int(br0) + int(sz)) * int(grad_stride)
+                    ]
+                    if int(sz) == 3:
+                        use_abtile = (
+                            bool(job.get("use_abtile", False))
+                            and (fn_qp_multi3_abtile is not None)
+                            and cd_tile > 1
+                        )
+                        if use_abtile:
+                            fn_qp_multi3_abtile(
+                                spAB_class_dev,
+                                spCD_dev,
+                                *common_3c,
+                                int(nao),
+                                int(naux),
+                                int(nao_sph),
+                                int(la_),
+                                int(lb_),
+                                int(lq),
+                                bar_X_sph_Qp_devs[int(br0) + 0],
+                                bar_X_sph_Qp_devs[int(br0) + 1],
+                                bar_X_sph_Qp_devs[int(br0) + 2],
+                                shell_ao_start_sph,
+                                shell_atom,
+                                int(cd_tile),
+                                grad_chunk_flat,
+                                int(grad_stride),
+                                int(threads_job),
+                                int(stream_ptr),
+                                False,
+                            )
+                        else:
+                            fn_qp_multi3(
+                                spAB_class_dev,
+                                spCD_dev,
+                                *common_3c,
+                                int(nao),
+                                int(naux),
+                                int(nao_sph),
+                                int(la_),
+                                int(lb_),
+                                int(lq),
+                                bar_X_sph_Qp_devs[int(br0) + 0],
+                                bar_X_sph_Qp_devs[int(br0) + 1],
+                                bar_X_sph_Qp_devs[int(br0) + 2],
+                                shell_ao_start_sph,
+                                shell_atom,
+                                grad_chunk_flat,
+                                int(grad_stride),
+                                int(threads_job),
+                                int(stream_ptr),
+                                False,
+                            )
+                    elif int(sz) == 2:
+                        use_abtile = (
+                            bool(job.get("use_abtile", False))
+                            and (fn_qp_multi2_abtile is not None)
+                            and cd_tile > 1
+                        )
+                        if use_abtile:
+                            fn_qp_multi2_abtile(
+                                spAB_class_dev,
+                                spCD_dev,
+                                *common_3c,
+                                int(nao),
+                                int(naux),
+                                int(nao_sph),
+                                int(la_),
+                                int(lb_),
+                                int(lq),
+                                bar_X_sph_Qp_devs[int(br0) + 0],
+                                bar_X_sph_Qp_devs[int(br0) + 1],
+                                shell_ao_start_sph,
+                                shell_atom,
+                                int(cd_tile),
+                                grad_chunk_flat,
+                                int(grad_stride),
+                                int(threads_job),
+                                int(stream_ptr),
+                                False,
+                            )
+                        else:
+                            fn_qp_multi2(
+                                spAB_class_dev,
+                                spCD_dev,
+                                *common_3c,
+                                int(nao),
+                                int(naux),
+                                int(nao_sph),
+                                int(la_),
+                                int(lb_),
+                                int(lq),
+                                bar_X_sph_Qp_devs[int(br0) + 0],
+                                bar_X_sph_Qp_devs[int(br0) + 1],
+                                shell_ao_start_sph,
+                                shell_atom,
+                                grad_chunk_flat,
+                                int(grad_stride),
+                                int(threads_job),
+                                int(stream_ptr),
+                                False,
+                            )
+                    else:
+                        # sz == 1
+                        use_abtile = (
+                            bool(job.get("use_abtile", False)) and (fn_qp_1_abtile is not None) and cd_tile > 1
+                        )
+                        if use_abtile:
+                            fn_qp_1_abtile(
+                                spAB_class_dev,
+                                spCD_dev,
+                                *common_3c,
+                                int(nao),
+                                int(naux),
+                                int(nao_sph),
+                                int(la_),
+                                int(lb_),
+                                int(lq),
+                                bar_X_sph_Qp_devs[int(br0)],
+                                shell_ao_start_sph,
+                                shell_atom,
+                                int(cd_tile),
+                                grad_chunk_flat,
+                                int(threads_job),
+                                int(stream_ptr),
+                                False,
+                            )
+                        else:
+                            fn_qp_1(
+                                spAB_class_dev,
+                                spCD_dev,
+                                *common_3c,
+                                int(nao),
+                                int(naux),
+                                int(nao_sph),
+                                int(la_),
+                                int(lb_),
+                                int(lq),
+                                bar_X_sph_Qp_devs[int(br0)],
+                                shell_ao_start_sph,
+                                shell_atom,
+                                grad_chunk_flat,
+                                int(threads_job),
+                                int(stream_ptr),
+                                False,
+                            )
+        else:
+            # Choose streamed aux block size (scaled down by nbar to bound Qmn unpack buffer size).
+            qblock = _resolve_streamed_qblock(int(naux), nbar=int(nbar))
+
+            qstride = int(nao_sph) * int(nao_sph)
+            bar_stride = int(qblock) * int(qstride)
+            buf_multi = cp.empty((int(nbar) * int(bar_stride),), dtype=cp.float64)
+
+            # Outer loop over aux blocks: unpack each bar_X(Qp) into its own Qmn chunk, then run fused multibar kernels.
+            for q0 in range(0, int(naux), int(qblock)):
+                q_count = int(min(int(qblock), int(naux) - int(q0)))
+                if q_count <= 0:
+                    continue
+                qend = int(q_count) * int(qstride)
+                for br in range(int(nbar)):
+                    bar_chunk = buf_multi[int(br) * int(bar_stride) : int(br) * int(bar_stride) + int(qend)]
+                    _ext.df_unpack_qp_to_qmn_block_device(
+                        bar_X_sph_Qp_devs[int(br)],
+                        bar_chunk,
+                        int(naux),
+                        int(nao_sph),
+                        int(q0),
+                        int(q_count),
+                        int(threads),
+                        int(stream_ptr),
+                        False,
+                    )
+
+                for job in jobs_3c:
+                    la_ = int(job["la"])
+                    lb_ = int(job["lb"])
+                    lq = int(job["lq"])
+                    spAB_class_dev = job["spAB"]
+                    spCD_dev = job["spCD"]
+                    n_spAB = int(job.get("n_spAB", int(getattr(spAB_class_dev, "shape", (0,))[0])))
+                    nt = int(job.get("n_spCD", int(getattr(spCD_dev, "shape", (0,))[0])))
+                    if nt == 0 or n_spAB == 0:
+                        continue
+                    threads_job = _round_cuda_threads(job.get("threads"), default=int(threads))
+                    cd_tile = max(1, min(int(job.get("cd_tile", 1)), nt))
+                    use_abtile = (
+                        bool(job.get("use_abtile", False)) and (fn_stream_multi_abtile is not None) and cd_tile > 1
+                    )
+
+                    if use_abtile:
+                        fn_stream_multi_abtile(
+                            spAB_class_dev,
+                            spCD_dev,
+                            *common_3c,
+                            int(nao),
+                            int(naux),
+                            int(nao_sph),
+                            int(la_),
+                            int(lb_),
+                            int(lq),
+                            buf_multi,
+                            int(bar_stride),
+                            int(nbar),
+                            shell_ao_start_sph,
+                            shell_atom,
+                            int(q0),
+                            int(q_count),
+                            int(cd_tile),
+                            grad_dev_flat,
+                            int(grad_stride),
+                            int(threads_job),
+                            int(stream_ptr),
+                            False,
+                        )
+                    else:
+                        fn_stream_multi(
+                            spAB_class_dev,
+                            spCD_dev,
+                            *common_3c,
+                            int(nao),
+                            int(naux),
+                            int(nao_sph),
+                            int(la_),
+                            int(lb_),
+                            int(lq),
+                            buf_multi,
+                            int(bar_stride),
+                            int(nbar),
+                            shell_ao_start_sph,
+                            shell_atom,
+                            int(q0),
+                            int(q_count),
+                            grad_dev_flat,
+                            int(grad_stride),
+                            int(threads_job),
+                            int(stream_ptr),
+                            False,
+                        )
+
+        # Metric 2c contribution: run per-bar using existing kernel(s).
+        metric_mode = str(os.environ.get("ASUKA_DF_METRIC_2C_KERNEL", "auto")).strip().lower()
+        if metric_mode in ("legacy", "batch", "sp_batch", "off", "0", "false", "no", "disable", "disabled"):
+            fn_2c_tril = None
+        else:
+            fn_2c_tril = getattr(
+                _ext,
+                "df_metric_2c2e_deriv_contracted_cart_allsp_atomgrad_tril_inplace_device",
+                None,
+            )
+        if fn_2c_tril is not None:
+            cuda["_last_df_grad_metric2c_path"] = "2c_tril"
+            for br in range(int(nbar)):
+                grad_br_flat = grad_dev[int(br)].reshape(-1)
+                bar_V_dev = bar_V_devs[int(br)]
+                for lp, spAB_class_dev in cuda["spCD_by_l"].items():
+                    n_spAB = int(spAB_class_dev.shape[0])
+                    if n_spAB == 0:
+                        continue
+                    for lq, spCD_class_dev in cuda["spCD_by_l"].items():
+                        ntasks = int(spCD_class_dev.shape[0])
+                        if ntasks == 0:
+                            continue
+                        fn_2c_tril(
+                            spAB_class_dev,
+                            spCD_class_dev,
+                            *common_3c,
+                            int(nao),
+                            int(naux),
+                            int(lp),
+                            int(lq),
+                            bar_V_dev,
+                            shell_atom,
+                            grad_br_flat,
+                            int(threads),
+                            int(stream_ptr),
+                            False,
+                        )
+        else:
+            cuda["_last_df_grad_metric2c_path"] = "2c_sp_batch"
+            # Fallback: reuse existing sp-batch implementation per bar.
+            work_2c = cuda.get("work_2c_cache")
+            if not isinstance(work_2c, dict):
+                work_2c = {}
+                cuda["work_2c_cache"] = work_2c
+            for br in range(int(nbar)):
+                grad_br = grad_dev[int(br)]
+                bar_V_dev = bar_V_devs[int(br)]
+                for spAB, lp, atomP, lq, spCD_dev, atomQ_dev, fac_dev in cuda["metric_batches"]:
+                    nt = int(spCD_dev.shape[0])
+                    if nt == 0:
+                        continue
+                    out_dev = work_2c.get(nt)
+                    if out_dev is None or int(getattr(out_dev, "size", 0)) < int(nt * 6):
+                        out_dev = cp.empty((nt * 6,), dtype=cp.float64)
+                        work_2c[nt] = out_dev
+                    _ext.df_metric_2c2e_deriv_contracted_cart_sp_batch_inplace_device(
+                        int(spAB),
+                        spCD_dev,
+                        *common_3c,
+                        int(nao),
+                        int(naux),
+                        int(lp),
+                        int(lq),
+                        bar_V_dev,
+                        out_dev,
+                        int(threads),
+                        int(stream_ptr),
+                        False,
+                    )
+                    out_batch_dev = out_dev.reshape((nt, 2, 3))
+                    grad_br[int(atomP)] += cp.sum(out_batch_dev[:, 0, :] * fac_dev[:, None], axis=0)
+                    valsQ = out_batch_dev[:, 1, :] * fac_dev[:, None]
+                    cp.add.at(grad_br[:, 0], atomQ_dev, valsQ[:, 0])
+                    cp.add.at(grad_br[:, 1], atomQ_dev, valsQ[:, 1])
+                    cp.add.at(grad_br[:, 2], atomQ_dev, valsQ[:, 2])
+
+        if _df_grad_path_log_enabled():
+            path3c = str(cuda.get("_last_df_grad_3c_path", "unknown"))
+            path2c = str(cuda.get("_last_df_grad_metric2c_path", "unknown"))
+            chunks = cuda.get("_last_df_grad_qp_chunks")
+            chunks_s = ""
+            if chunks:
+                try:
+                    chunks_s = " chunks=" + "+".join(str(int(x)) for x in chunks)
+                except Exception:
+                    chunks_s = ""
+            print(f"[ASUKA_DF_GRAD_PATH] 3c={path3c} metric2c={path2c} nbar={int(nbar)}{chunks_s}")
 
         return grad_dev
 
@@ -2698,15 +3356,15 @@ class DFGradContractionContext:
 
         Returns
         -------
-        bar_X_sph_Qp_dev : cupy.ndarray, shape (naux*ntri,), float64
+        bar_X_sph_Qp_dev : cupy.ndarray, shape (naux*ntri,), float64 or float32 (see precision)
         bar_V_dev : cupy.ndarray, shape (naux*naux,), float64
         nao_sph : int
         """
         import cupy as cp  # noqa: PLC0415
 
         prec = _normalize_fused_precision(precision)
-        if prec != "fp64":
-            raise RuntimeError("Packed-Qp spherical adjoints require precision='fp64' (streamed kernels expect fp64)")
+        if prec not in ("fp64", "fp32_acc64", "tf32"):
+            raise RuntimeError(f"Unsupported precision={prec!r} for packed-Qp spherical adjoints")
 
         if self.cuda is None:
             raise RuntimeError("CUDA static context is not initialized")
@@ -2744,6 +3402,17 @@ class DFGradContractionContext:
         if not bool(getattr(bar_X_sph_Qp_dev, "flags", None).c_contiguous):
             bar_X_sph_Qp_dev = cp.ascontiguousarray(bar_X_sph_Qp_dev, dtype=cp.float64)
 
+        if prec in ("fp32_acc64", "tf32"):
+            # Mixed-precision contraction: keep grad accumulation in fp64, but store bar_X in fp32 to reduce bandwidth/VRAM.
+            bar_X_sph_Qp_dev = cp.asarray(bar_X_sph_Qp_dev, dtype=cp.float32)
+            if not bool(getattr(bar_X_sph_Qp_dev, "flags", None).c_contiguous):
+                bar_X_sph_Qp_dev = cp.ascontiguousarray(bar_X_sph_Qp_dev, dtype=cp.float32)
+            # Free the fp64 buffer early under VRAM pressure.
+            try:
+                del bar_X_Qp, bar_L
+            except Exception:
+                pass
+
         bar_V_dev = bar_V.reshape(-1)
         if not bool(getattr(bar_V_dev, "flags", None).c_contiguous):
             bar_V_dev = cp.ascontiguousarray(bar_V_dev, dtype=cp.float64)
@@ -2761,6 +3430,7 @@ class DFGradContractionContext:
         """
         if self.backend != "cuda":
             raise NotImplementedError("contract_device is only available for backend='cuda'")
+        self.ensure_cuda()
         import cupy as cp  # noqa: PLC0415
         _prof = os.environ.get("ASUKA_PROFILE_DF_CONTRACT", "0") == "1"
         if _prof:
@@ -2803,6 +3473,7 @@ class DFGradContractionContext:
         """
         if self.backend != "cuda":
             raise NotImplementedError("contract_device_sph is only available for backend='cuda'")
+        self.ensure_cuda()
         import cupy as cp  # noqa: PLC0415
         _prof = os.environ.get("ASUKA_PROFILE_DF_CONTRACT", "0") == "1"
         mode = str(os.environ.get("ASUKA_DF_3C_SPH_KERNEL", "auto")).strip().lower()
@@ -2817,20 +3488,30 @@ class DFGradContractionContext:
         # Packed-Qp spherical path: avoid materializing full bar_X(Qmn) by streaming aux blocks.
         try:
             if int(getattr(B_sph, "ndim", 0)) == 2 and int(getattr(bar_L_sph, "ndim", 0)) == 2:
-                if prec != "fp64":
-                    raise RuntimeError(
-                        "Packed-Qp spherical DF contraction requires precision='fp64' "
-                        "(streamed sphbar-qmn kernels are fp64-only)"
-                    )
+                if _prof:
+                    import time as _time  # noqa: PLC0415
+
+                    cp.cuda.Device().synchronize()
+                    _t0 = _time.perf_counter()
                 bar_X_sph_Qp_dev, bar_V_dev, nao_sph = self._adjoints_device_from_sph_qp(
                     B_sph=B_sph, bar_L_sph=bar_L_sph, precision=prec
                 )
+                if _prof:
+                    cp.cuda.Device().synchronize()
+                    _t1 = _time.perf_counter()
                 grad_dev = self._contract_device_from_adjoints_sph_qp(
                     bar_X_sph_Qp_dev,
                     bar_V_dev,
                     nao_sph=int(nao_sph),
                     grad_dev=grad_dev,
                 )
+                if _prof:
+                    cp.cuda.Device().synchronize()
+                    _t2 = _time.perf_counter()
+                    print(
+                        "[DF_CONTRACT_SPH_QP] "
+                        f"adjoint={_t1-_t0:.3f}s kernels={_t2-_t1:.3f}s total={_t2-_t0:.3f}s"
+                    )
                 del bar_X_sph_Qp_dev, bar_V_dev
                 return grad_dev
         except Exception:
@@ -2874,6 +3555,108 @@ class DFGradContractionContext:
             precision=prec,
         )
         return self._contract_device_from_adjoints(bar_X_dev, bar_V_dev, grad_dev=grad_dev)
+
+    def contract_device_sph_batched(
+        self,
+        *,
+        B_sph: Any,
+        bar_L_sph_list: Any,
+        T_c2s: Any | None = None,
+        precision: str = "fp64",
+    ) -> Any:
+        """CUDA spherical DF contraction for multiple bar_L tensors.
+
+        Returns
+        -------
+        cupy.ndarray
+            Gradient on device with shape (nbar, natm, 3), dtype float64.
+        """
+        if self.backend != "cuda":
+            raise NotImplementedError("contract_device_sph_batched is only available for backend='cuda'")
+        self.ensure_cuda()
+        import cupy as cp  # noqa: PLC0415
+
+        prec = _normalize_fused_precision(precision)
+        terms = list(bar_L_sph_list or [])
+        if len(terms) == 0:
+            raise ValueError("bar_L_sph_list must contain at least one tensor")
+        _prof = os.environ.get("ASUKA_PROFILE_DF_CONTRACT", "0") == "1"
+
+        # Fast path: packed-Qp spherical contraction with multi-bar streamed kernels.
+        try:
+            if int(getattr(B_sph, "ndim", 0)) == 2 and all(int(getattr(t, "ndim", 0)) == 2 for t in terms):
+                if _prof:
+                    import time as _time  # noqa: PLC0415
+
+                    cp.cuda.Device().synchronize()
+                    _t0 = _time.perf_counter()
+                # To keep VRAM bounded for large nbar, process in small chunks (direct Qp kernels are fast for nbar<=3).
+                try:
+                    chunk_env = int(str(os.environ.get("ASUKA_DF_QP_MULTIBAR_CHUNK", "")).strip() or "0")
+                except Exception:
+                    chunk_env = 0
+                chunk_size = int(chunk_env) if chunk_env > 0 else 3
+                chunk_size = max(1, min(int(chunk_size), int(len(terms))))
+
+                grad_out = cp.empty((int(len(terms)), int(self.natm), 3), dtype=cp.float64)
+                nao_sph_val: int | None = None
+                for i0 in range(0, int(len(terms)), int(chunk_size)):
+                    chunk_terms = terms[int(i0) : int(min(int(len(terms)), int(i0) + int(chunk_size)))]
+                    bar_X_list: list[Any] = []
+                    bar_V_list: list[Any] = []
+                    for t in chunk_terms:
+                        bar_X_dev, bar_V_dev, nao_sph_i = self._adjoints_device_from_sph_qp(
+                            B_sph=B_sph, bar_L_sph=t, precision=prec
+                        )
+                        bar_X_list.append(bar_X_dev)
+                        bar_V_list.append(bar_V_dev)
+                        if nao_sph_val is None:
+                            nao_sph_val = int(nao_sph_i)
+                        elif int(nao_sph_val) != int(nao_sph_i):
+                            raise ValueError("inconsistent nao_sph across batched packed-Qp adjoints")
+                    grad_multi_chunk = self._contract_device_from_adjoints_sph_qp_multibar(
+                        bar_X_list, bar_V_list, nao_sph=int(nao_sph_val or 0)
+                    )
+                    grad_out[int(i0) : int(i0) + int(len(chunk_terms))] = grad_multi_chunk
+                    del bar_X_list, bar_V_list, grad_multi_chunk
+                if _prof:
+                    cp.cuda.Device().synchronize()
+                    _t2 = _time.perf_counter()
+                    print(f"[DF_CONTRACT_SPH_QP_BATCH] nbar={int(len(terms))} total={_t2-_t0:.3f}s")
+                return grad_out
+        except Exception:
+            pass
+
+        # Fallback: sequentially contract each bar_L on device.
+        grads = []
+        for t in terms:
+            g = self.contract_device_sph(B_sph=B_sph, bar_L_sph=t, T_c2s=T_c2s, precision=prec)
+            grads.append(cp.asarray(g, dtype=cp.float64))
+        return cp.stack(grads, axis=0)
+
+    def contract_sph_batched(
+        self,
+        *,
+        B_sph: Any,
+        bar_L_sph_list: Any,
+        T_c2s: Any | None = None,
+        precision: str = "fp64",
+    ) -> np.ndarray:
+        """Host-return wrapper for batched spherical DF contraction."""
+        terms = list(bar_L_sph_list or [])
+        if len(terms) == 0:
+            raise ValueError("bar_L_sph_list must contain at least one tensor")
+
+        if self.backend == "cuda":
+            import cupy as cp  # noqa: PLC0415
+
+            grad_dev = self.contract_device_sph_batched(
+                B_sph=B_sph, bar_L_sph_list=terms, T_c2s=T_c2s, precision=precision
+            )
+            return np.asarray(cp.asnumpy(grad_dev), dtype=np.float64)
+
+        grads = [np.asarray(self.contract_sph(B_sph=B_sph, bar_L_sph=t, T_c2s=T_c2s), dtype=np.float64) for t in terms]
+        return np.stack(grads, axis=0)
 
     def contract_device_fused_terms(self, *, B_ao: Any, bar_L_terms: Iterable[Any], precision: str = "fp64") -> Any:
         """CUDA fused-term contraction: sum bar_L terms in-place, then run a single adjoint+kernel cycle.

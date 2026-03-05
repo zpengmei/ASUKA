@@ -244,7 +244,7 @@ def _df_B_dims(df_B: Any, *, nao: int, where: str = "") -> tuple[bool, int, int,
 
 def _log_vram(label: str) -> None:
     """Print current GPU VRAM usage (for debugging). Controlled by ASUKA_VRAM_DEBUG=1."""
-    if not _os.environ.get("ASUKA_VRAM_DEBUG"):
+    if not _normalize_bool_env(_os.environ.get("ASUKA_VRAM_DEBUG"), default=False):
         return
     try:
         import cupy as cp  # noqa: PLC0415
@@ -260,11 +260,124 @@ def _log_vram(label: str) -> None:
 
 def _flush_gpu_pool() -> None:
     """Return all freed CuPy pool blocks to the GPU driver to reduce memory high-water mark."""
+    # Flushing the whole pool is a strong measure: it can reduce driver-visible VRAM
+    # peaks, but also destroys allocator reuse (more cudaMalloc/cudaFree traffic).
+    #
+    # Default behavior:
+    # - enabled when VRAM debug is on (benchmarking/debugging), or when a memory
+    #   cap is set (attempting to run in tight VRAM).
+    # - disabled otherwise for performance.
+    if not _normalize_bool_env(
+        _os.environ.get("ASUKA_FLUSH_GPU_POOL"),
+        default=(
+            _normalize_bool_env(_os.environ.get("ASUKA_VRAM_DEBUG"), default=False)
+            or _normalize_bool_env(_os.environ.get("ASUKA_DF_TIGHT_VRAM"), default=False)
+            or (_os.environ.get("ASUKA_GPU_MEM_CAP_GB") not in (None, ""))
+        ),
+    ):
+        return
     try:
         import cupy as cp  # noqa: PLC0415
         cp.get_default_memory_pool().free_all_blocks()
     except Exception:
         pass
+
+
+def _dump_cupy_arrays(label: str, *, min_mb: float = 64.0, max_items: int = 24) -> None:
+    """Debug helper: list the largest live CuPy arrays.
+
+    Enabled by `ASUKA_VRAM_ACCOUNTING=1`. This is intentionally expensive and
+    should only be used for debugging transient VRAM spikes.
+    """
+
+    if not _normalize_bool_env(_os.environ.get("ASUKA_VRAM_ACCOUNTING"), default=False):
+        return
+    try:
+        import cupy as cp  # noqa: PLC0415
+    except Exception:
+        return
+    try:
+        import gc as _gc  # noqa: PLC0415
+    except Exception:
+        return
+
+    try:
+        thresh_b = int(float(min_mb) * 1024.0 * 1024.0)
+    except Exception:
+        thresh_b = 64 * 1024 * 1024
+    thresh_b = max(0, int(thresh_b))
+
+    # Optionally trace Python referrers for the largest arrays to locate which
+    # cache/object is keeping them alive (very expensive).
+    _want_refs = _normalize_bool_env(_os.environ.get("ASUKA_VRAM_ACCOUNTING_REFERRERS"), default=False)
+    try:
+        _max_ref_hints = int(str(_os.environ.get("ASUKA_VRAM_ACCOUNTING_REFERRERS_MAX", "")).strip() or "8")
+    except Exception:
+        _max_ref_hints = 8
+    _max_ref_hints = max(0, min(32, int(_max_ref_hints)))
+
+    items: list[tuple[int, int, tuple[int, ...], str, str, Any]] = []
+    for obj in _gc.get_objects():
+        try:
+            if not isinstance(obj, cp.ndarray):
+                continue
+            nbytes = int(getattr(obj, "nbytes", 0) or 0)
+            if nbytes < int(thresh_b):
+                continue
+            ptr = int(getattr(getattr(obj, "data", None), "ptr", 0) or 0)
+            shape = tuple(int(x) for x in getattr(obj, "shape", ()) or ())
+            dtype_s = str(getattr(obj, "dtype", ""))
+            flags = getattr(obj, "flags", None)
+            if flags is not None and bool(getattr(flags, "c_contiguous", False)):
+                order = "C"
+            elif flags is not None and bool(getattr(flags, "f_contiguous", False)):
+                order = "F"
+            else:
+                order = "?"
+            items.append((nbytes, ptr, shape, dtype_s, order, obj))
+        except Exception:
+            continue
+
+    items.sort(key=lambda t: int(t[0]), reverse=True)
+    print(
+        f"[VRAM_ACCT] {label}: arrays>={thresh_b/1e6:.0f}MB count={len(items)} top={min(len(items), int(max_items))}"
+    )
+    _ignore_ids = {id(items)}
+    for nbytes, ptr, shape, dtype_s, order, arr in items[: int(max_items)]:
+        print(f"  {nbytes/1e9:.3f}GB ptr=0x{ptr:x} shape={shape} dtype={dtype_s} order={order}")
+        if not _want_refs or _max_ref_hints <= 0:
+            continue
+        try:
+            hints: list[str] = []
+            for ref in _gc.get_referrers(arr):
+                if id(ref) in _ignore_ids:
+                    continue
+                # Dict: try to recover key names for common caches (cuda dicts, module globals, etc.)
+                if isinstance(ref, dict):
+                    try:
+                        for k, v in ref.items():
+                            if v is arr:
+                                hints.append(f"dict[{k!r}]")
+                                break
+                    except Exception:
+                        pass
+                # Object attributes.
+                else:
+                    try:
+                        d = getattr(ref, "__dict__", None)
+                        if isinstance(d, dict):
+                            for k, v in d.items():
+                                if v is arr:
+                                    hints.append(f"{type(ref).__name__}.{k}")
+                                    break
+                    except Exception:
+                        pass
+                if len(hints) >= int(_max_ref_hints):
+                    break
+            if hints:
+                print("    refs: " + ", ".join(hints[: int(_max_ref_hints)]))
+        except Exception:
+            pass
 
 
 def _normalize_df_vram_policy(value: str | None) -> str:
@@ -329,7 +442,7 @@ def _apply_df_pool_policy(B_ao: Any, *, label: str = ""):
 
         if limit_b > 0:
             pool.set_limit(size=int(limit_b))
-            if _os.environ.get("ASUKA_VRAM_DEBUG"):
+            if _normalize_bool_env(_os.environ.get("ASUKA_VRAM_DEBUG"), default=False):
                 print(f"[VRAM_POLICY] {label}: policy={policy} limit={limit_b/1e9:.2f}GB")
 
     except Exception:
@@ -408,7 +521,9 @@ def _apply_df_grad_optimal_defaults() -> dict[str, Any]:
     _setdefault_env("ASUKA_DF_3C_SCHED_MODE", "on")
     _setdefault_env("ASUKA_DF_3C_AB_TILE", "8")
 
-    if _os.environ.get("ASUKA_VRAM_DEBUG") or _os.environ.get("ASUKA_PROFILE_DF_PER_ROOT"):
+    if _normalize_bool_env(_os.environ.get("ASUKA_VRAM_DEBUG"), default=False) or _normalize_bool_env(
+        _os.environ.get("ASUKA_PROFILE_DF_PER_ROOT"), default=False
+    ):
         applied_s = "none"
         if applied:
             applied_s = ",".join(f"{k}={v}" for k, v in sorted(applied.items()))
@@ -1003,7 +1118,9 @@ def _apply_gpu_runtime_config_to_solver(fcisolver: Any, cfg: GpuRuntimeConfig) -
         setattr(fcisolver, "matvec_cuda_mixed_threshold", 1e-6)
         setattr(fcisolver, "matvec_cuda_mixed_low_precision_max_iter", 4)
         setattr(fcisolver, "matvec_cuda_mixed_force_final_full_hop", True)
-        setattr(fcisolver, "matvec_cuda_gemm_backend", "cublaslt_tf32")
+        # Keep the full-hop workspace in fp64 for stability; mixed mode already
+        # uses float32 approximations internally via approx_cuda_dtype.
+        setattr(fcisolver, "matvec_cuda_gemm_backend", "cublaslt_fp64")
 
 @dataclass(frozen=True)
 class DFNucGradResult:
@@ -1033,6 +1150,7 @@ def _build_gfock_casscf_df(
     ncas: int,
     dm1_act: np.ndarray,
     dm2_act: np.ndarray,
+    vhf_cache_out: dict[str, Any] | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """Return (gfock_mo, D_core_ao, D_act_ao, D_tot_ao, C_act) for DF-CASSCF.
 
@@ -1135,7 +1253,11 @@ def _build_gfock_casscf_df(
         Jc, Kc = _df_scf._df_JK(B_ao, D_core_ao, want_J=True, want_K=True)  # noqa: SLF001
         Ja, Ka = _df_scf._df_JK(B_ao, D_act_ao, want_J=True, want_K=True)  # noqa: SLF001
     vhf_c_ao = Jc - 0.5 * Kc
+    vhf_a_ao = Ja - 0.5 * Ka
     vhf_ca_ao = (Jc + Ja) - 0.5 * (Kc + Ka)
+    if vhf_cache_out is not None:
+        vhf_cache_out["vhf_c"] = vhf_c_ao
+        vhf_cache_out["vhf_a"] = vhf_a_ao
 
     # Transform AO matrices to MO
     h_mo = C.T @ h_ao @ C
@@ -1276,6 +1398,45 @@ def _build_dme0_lorb_response(
         "molcas_oitd",
     }:
         _dml_sym_mode = "full"
+    _vmix_dml_mode = str(_os.environ.get("ASUKA_CASPT2_LORB_VMIX_DML_CORE_MODE", "as_dml")).strip().lower()
+    if _vmix_dml_mode not in {"as_dml", "full", "raw", "asym", "oitd"}:
+        _vmix_dml_mode = "as_dml"
+    # Optional J/K split for the vmix core channel:
+    # keep J on the regular D_L path while allowing K to use raw D_L when
+    # debugging exchange-specific mismatches against Molcas.
+    _vmix_split_mode = str(_os.environ.get("ASUKA_CASPT2_LORB_VMIX_DML_SPLIT_MODE", "shared")).strip().lower()
+    if _vmix_split_mode not in {
+        "shared",
+        "j_dml_k_raw",
+        "j_sym_k_raw",
+        "j_dml_k_sym",
+        "j_dml_k_asym",
+        "j_sym_k_asym",
+        "j_dml_k_oitd",
+        "j_sym_k_oitd",
+    }:
+        _vmix_split_mode = "shared"
+    # Optional override for the active-kernel vmix J/K channels.
+    # This keeps the default Molcas-parity behavior (`as_dml`) unchanged
+    # while allowing term-isolated diagnostics for the Ka/Ja branches.
+    _vmix_j_act_mode = str(
+        _os.environ.get("ASUKA_CASPT2_LORB_VMIX_DML_J_ACT_MODE", "as_dml")
+    ).strip().lower()
+    _vmix_k_act_mode = str(
+        _os.environ.get("ASUKA_CASPT2_LORB_VMIX_DML_K_ACT_MODE", "as_dml")
+    ).strip().lower()
+    if _vmix_j_act_mode not in {"as_dml", "full", "raw", "asym", "oitd", "none"}:
+        _vmix_j_act_mode = "as_dml"
+    if _vmix_k_act_mode not in {"as_dml", "full", "raw", "asym", "oitd", "none"}:
+        _vmix_k_act_mode = "as_dml"
+    # Build OITD intermediates whenever any downstream mode requests them.
+    _need_core_oitd = (
+        _dml_sym_mode in {"core_oitd", "molcas_oitd"}
+        or _vmix_dml_mode == "oitd"
+        or _vmix_split_mode in {"j_dml_k_oitd", "j_sym_k_oitd"}
+        or _vmix_j_act_mode == "oitd"
+        or _vmix_k_act_mode == "oitd"
+    )
     D_L_core_raw = xp.zeros((nao, nao), dtype=xp.float64)
     D_L_core_sym = xp.zeros((nao, nao), dtype=xp.float64)
     D_L_core_asym = xp.zeros((nao, nao), dtype=xp.float64)
@@ -1285,7 +1446,6 @@ def _build_dme0_lorb_response(
         D_L_core_raw = 2.0 * (C_L_core @ C_core.T)
         D_L_core_sym = D_L_core_raw + D_L_core_raw.T
         D_L_core_asym = D_L_core_raw - D_L_core_raw.T
-        _need_core_oitd = _dml_sym_mode in {"core_oitd", "molcas_oitd"}
         if _need_core_oitd:
             # Molcas OITD path: D_L = D0*K^T - K^T*D0 in MO basis, then AO transform.
             d_core_mo = xp.zeros((nmo, nmo), dtype=xp.float64)
@@ -1323,9 +1483,6 @@ def _build_dme0_lorb_response(
     else:
         D_L_act = D_L_act_raw + D_L_act_raw.T
     D_L = D_L_core + D_L_act
-    _vmix_dml_mode = str(_os.environ.get("ASUKA_CASPT2_LORB_VMIX_DML_CORE_MODE", "as_dml")).strip().lower()
-    if _vmix_dml_mode not in {"as_dml", "full", "raw", "asym", "oitd"}:
-        _vmix_dml_mode = "as_dml"
     if _vmix_dml_mode == "full":
         D_L_core_vmix = D_L_core_sym
     elif _vmix_dml_mode == "raw":
@@ -1336,21 +1493,6 @@ def _build_dme0_lorb_response(
         D_L_core_vmix = D_L_core_oitd
     else:
         D_L_core_vmix = D_L_core
-    # Optional J/K split for the vmix core channel:
-    # keep J on the regular D_L path while allowing K to use raw D_L when
-    # debugging exchange-specific mismatches against Molcas.
-    _vmix_split_mode = str(_os.environ.get("ASUKA_CASPT2_LORB_VMIX_DML_SPLIT_MODE", "shared")).strip().lower()
-    if _vmix_split_mode not in {
-        "shared",
-        "j_dml_k_raw",
-        "j_sym_k_raw",
-        "j_dml_k_sym",
-        "j_dml_k_asym",
-        "j_sym_k_asym",
-        "j_dml_k_oitd",
-        "j_sym_k_oitd",
-    }:
-        _vmix_split_mode = "shared"
     if _vmix_split_mode == "j_dml_k_raw":
         D_L_core_vmix_j = D_L_core
         D_L_core_vmix_k = D_L_core_raw
@@ -1375,20 +1517,6 @@ def _build_dme0_lorb_response(
     else:
         D_L_core_vmix_j = D_L_core_vmix
         D_L_core_vmix_k = D_L_core_vmix
-
-    # Optional override for the active-kernel vmix J/K channels.
-    # This keeps the default Molcas-parity behavior (`as_dml`) unchanged
-    # while allowing term-isolated diagnostics for the Ka/Ja branches.
-    _vmix_j_act_mode = str(
-        _os.environ.get("ASUKA_CASPT2_LORB_VMIX_DML_J_ACT_MODE", "as_dml")
-    ).strip().lower()
-    _vmix_k_act_mode = str(
-        _os.environ.get("ASUKA_CASPT2_LORB_VMIX_DML_K_ACT_MODE", "as_dml")
-    ).strip().lower()
-    if _vmix_j_act_mode not in {"as_dml", "full", "raw", "asym", "oitd"}:
-        _vmix_j_act_mode = "as_dml"
-    if _vmix_k_act_mode not in {"as_dml", "full", "raw", "asym", "oitd"}:
-        _vmix_k_act_mode = "as_dml"
     if _vmix_j_act_mode == "full":
         D_L_core_vmix_j_act = D_L_core_sym
     elif _vmix_j_act_mode == "raw":
@@ -1397,6 +1525,8 @@ def _build_dme0_lorb_response(
         D_L_core_vmix_j_act = D_L_core_asym
     elif _vmix_j_act_mode == "oitd":
         D_L_core_vmix_j_act = D_L_core_oitd
+    elif _vmix_j_act_mode == "none":
+        D_L_core_vmix_j_act = xp.zeros_like(D_L_core)
     else:
         D_L_core_vmix_j_act = D_L_core_vmix
     if _vmix_k_act_mode == "full":
@@ -1407,6 +1537,8 @@ def _build_dme0_lorb_response(
         D_L_core_vmix_k_act = D_L_core_asym
     elif _vmix_k_act_mode == "oitd":
         D_L_core_vmix_k_act = D_L_core_oitd
+    elif _vmix_k_act_mode == "none":
+        D_L_core_vmix_k_act = xp.zeros_like(D_L_core)
     else:
         D_L_core_vmix_k_act = D_L_core_vmix
 
@@ -1711,6 +1843,74 @@ def _build_dme0_lorb_response(
                         "dme0_mean_vc_L_k": np.asarray(0.5 * (g_vc_L_k_np + g_vc_L_k_np.T), dtype=np.float64),
                     }
                 )
+                # Diagnostic K-channel algebra variants (Molcas commutator style).
+                Kc_np = _asnumpy_f64(Kc)
+                Ka_np = _asnumpy_f64(Ka)
+                Dk_core_np = _asnumpy_f64(D_L_core_vmix_k)
+                Dk_act_np = _asnumpy_f64(D_L_core_vmix_k_act)
+                g_vmix_k_core_left_np = g_vmix_k_core_np
+                g_vmix_k_act_left_np = g_vmix_k_act_np
+                g_vmix_k_core_right_np = np.asarray(-0.5 * (Dk_core_np @ Kc_np), dtype=np.float64)
+                g_vmix_k_act_right_np = np.asarray(-0.5 * (Dk_act_np @ Ka_np), dtype=np.float64)
+                g_vmix_k_core_lr_avg_np = np.asarray(
+                    0.5 * (g_vmix_k_core_left_np + g_vmix_k_core_right_np), dtype=np.float64
+                )
+                g_vmix_k_act_lr_avg_np = np.asarray(
+                    0.5 * (g_vmix_k_act_left_np + g_vmix_k_act_right_np), dtype=np.float64
+                )
+                g_vmix_k_core_lr_comm_np = np.asarray(
+                    g_vmix_k_core_left_np - g_vmix_k_core_right_np, dtype=np.float64
+                )
+                g_vmix_k_act_lr_comm_np = np.asarray(
+                    g_vmix_k_act_left_np - g_vmix_k_act_right_np, dtype=np.float64
+                )
+                if _reco_mode == "core_only":
+                    g_vmix_k_right_np = g_vmix_k_core_right_np
+                    g_vmix_k_lr_avg_np = g_vmix_k_core_lr_avg_np
+                    g_vmix_k_lr_comm_np = g_vmix_k_core_lr_comm_np
+                elif _reco_mode == "core_minus_active":
+                    g_vmix_k_right_np = np.asarray(g_vmix_k_core_right_np - g_vmix_k_act_right_np, dtype=np.float64)
+                    g_vmix_k_lr_avg_np = np.asarray(g_vmix_k_core_lr_avg_np - g_vmix_k_act_lr_avg_np, dtype=np.float64)
+                    g_vmix_k_lr_comm_np = np.asarray(
+                        g_vmix_k_core_lr_comm_np - g_vmix_k_act_lr_comm_np, dtype=np.float64
+                    )
+                else:
+                    g_vmix_k_right_np = np.asarray(g_vmix_k_core_right_np + g_vmix_k_act_right_np, dtype=np.float64)
+                    g_vmix_k_lr_avg_np = np.asarray(g_vmix_k_core_lr_avg_np + g_vmix_k_act_lr_avg_np, dtype=np.float64)
+                    g_vmix_k_lr_comm_np = np.asarray(
+                        g_vmix_k_core_lr_comm_np + g_vmix_k_act_lr_comm_np, dtype=np.float64
+                    )
+                parts_np.update(
+                    {
+                        "dme0_mean_vmix_k_right": np.asarray(
+                            0.5 * (g_vmix_k_right_np + g_vmix_k_right_np.T), dtype=np.float64
+                        ),
+                        "dme0_mean_vmix_k_lr_avg": np.asarray(
+                            0.5 * (g_vmix_k_lr_avg_np + g_vmix_k_lr_avg_np.T), dtype=np.float64
+                        ),
+                        "dme0_mean_vmix_k_lr_comm": np.asarray(
+                            0.5 * (g_vmix_k_lr_comm_np + g_vmix_k_lr_comm_np.T), dtype=np.float64
+                        ),
+                        "dme0_mean_vmix_k_core_right": np.asarray(
+                            0.5 * (g_vmix_k_core_right_np + g_vmix_k_core_right_np.T), dtype=np.float64
+                        ),
+                        "dme0_mean_vmix_k_core_lr_avg": np.asarray(
+                            0.5 * (g_vmix_k_core_lr_avg_np + g_vmix_k_core_lr_avg_np.T), dtype=np.float64
+                        ),
+                        "dme0_mean_vmix_k_core_lr_comm": np.asarray(
+                            0.5 * (g_vmix_k_core_lr_comm_np + g_vmix_k_core_lr_comm_np.T), dtype=np.float64
+                        ),
+                        "dme0_mean_vmix_k_act_right": np.asarray(
+                            0.5 * (g_vmix_k_act_right_np + g_vmix_k_act_right_np.T), dtype=np.float64
+                        ),
+                        "dme0_mean_vmix_k_act_lr_avg": np.asarray(
+                            0.5 * (g_vmix_k_act_lr_avg_np + g_vmix_k_act_lr_avg_np.T), dtype=np.float64
+                        ),
+                        "dme0_mean_vmix_k_act_lr_comm": np.asarray(
+                            0.5 * (g_vmix_k_act_lr_comm_np + g_vmix_k_act_lr_comm_np.T), dtype=np.float64
+                        ),
+                    }
+                )
             if bool(_dump_raw_parts):
                 parts_np.update(
                     {
@@ -1752,6 +1952,19 @@ def _build_dme0_lorb_response(
                             "raw_g_vL_c_k": np.asarray(g_vL_c_k_np, dtype=np.float64),
                             "raw_g_vc_L_j": np.asarray(g_vc_L_j_np, dtype=np.float64),
                             "raw_g_vc_L_k": np.asarray(g_vc_L_k_np, dtype=np.float64),
+                        }
+                    )
+                    parts_np.update(
+                        {
+                            "raw_g_vmix_k_right": np.asarray(g_vmix_k_right_np, dtype=np.float64),
+                            "raw_g_vmix_k_lr_avg": np.asarray(g_vmix_k_lr_avg_np, dtype=np.float64),
+                            "raw_g_vmix_k_lr_comm": np.asarray(g_vmix_k_lr_comm_np, dtype=np.float64),
+                            "raw_g_vmix_k_core_right": np.asarray(g_vmix_k_core_right_np, dtype=np.float64),
+                            "raw_g_vmix_k_core_lr_avg": np.asarray(g_vmix_k_core_lr_avg_np, dtype=np.float64),
+                            "raw_g_vmix_k_core_lr_comm": np.asarray(g_vmix_k_core_lr_comm_np, dtype=np.float64),
+                            "raw_g_vmix_k_act_right": np.asarray(g_vmix_k_act_right_np, dtype=np.float64),
+                            "raw_g_vmix_k_act_lr_avg": np.asarray(g_vmix_k_act_lr_avg_np, dtype=np.float64),
+                            "raw_g_vmix_k_act_lr_comm": np.asarray(g_vmix_k_act_lr_comm_np, dtype=np.float64),
                         }
                     )
             if return_xp:
@@ -1839,6 +2052,58 @@ def _build_dme0_lorb_response(
                     "dme0_mean_vc_L_k": xp.asarray(0.5 * (g_vc_L_k + g_vc_L_k.T), dtype=xp.float64),
                 }
             )
+            # Diagnostic K-channel algebra variants (Molcas commutator style).
+            g_vmix_k_core_left_x = g_vmix_k_core
+            g_vmix_k_act_left_x = g_vmix_k_act
+            g_vmix_k_core_right_x = -0.5 * (D_L_core_vmix_k @ Kc)
+            g_vmix_k_act_right_x = -0.5 * (D_L_core_vmix_k_act @ Ka)
+            g_vmix_k_core_lr_avg_x = 0.5 * (g_vmix_k_core_left_x + g_vmix_k_core_right_x)
+            g_vmix_k_act_lr_avg_x = 0.5 * (g_vmix_k_act_left_x + g_vmix_k_act_right_x)
+            g_vmix_k_core_lr_comm_x = g_vmix_k_core_left_x - g_vmix_k_core_right_x
+            g_vmix_k_act_lr_comm_x = g_vmix_k_act_left_x - g_vmix_k_act_right_x
+            if _reco_mode == "core_only":
+                g_vmix_k_right_x = g_vmix_k_core_right_x
+                g_vmix_k_lr_avg_x = g_vmix_k_core_lr_avg_x
+                g_vmix_k_lr_comm_x = g_vmix_k_core_lr_comm_x
+            elif _reco_mode == "core_minus_active":
+                g_vmix_k_right_x = g_vmix_k_core_right_x - g_vmix_k_act_right_x
+                g_vmix_k_lr_avg_x = g_vmix_k_core_lr_avg_x - g_vmix_k_act_lr_avg_x
+                g_vmix_k_lr_comm_x = g_vmix_k_core_lr_comm_x - g_vmix_k_act_lr_comm_x
+            else:
+                g_vmix_k_right_x = g_vmix_k_core_right_x + g_vmix_k_act_right_x
+                g_vmix_k_lr_avg_x = g_vmix_k_core_lr_avg_x + g_vmix_k_act_lr_avg_x
+                g_vmix_k_lr_comm_x = g_vmix_k_core_lr_comm_x + g_vmix_k_act_lr_comm_x
+            parts_x.update(
+                {
+                    "dme0_mean_vmix_k_right": xp.asarray(
+                        0.5 * (g_vmix_k_right_x + g_vmix_k_right_x.T), dtype=xp.float64
+                    ),
+                    "dme0_mean_vmix_k_lr_avg": xp.asarray(
+                        0.5 * (g_vmix_k_lr_avg_x + g_vmix_k_lr_avg_x.T), dtype=xp.float64
+                    ),
+                    "dme0_mean_vmix_k_lr_comm": xp.asarray(
+                        0.5 * (g_vmix_k_lr_comm_x + g_vmix_k_lr_comm_x.T), dtype=xp.float64
+                    ),
+                    "dme0_mean_vmix_k_core_right": xp.asarray(
+                        0.5 * (g_vmix_k_core_right_x + g_vmix_k_core_right_x.T), dtype=xp.float64
+                    ),
+                    "dme0_mean_vmix_k_core_lr_avg": xp.asarray(
+                        0.5 * (g_vmix_k_core_lr_avg_x + g_vmix_k_core_lr_avg_x.T), dtype=xp.float64
+                    ),
+                    "dme0_mean_vmix_k_core_lr_comm": xp.asarray(
+                        0.5 * (g_vmix_k_core_lr_comm_x + g_vmix_k_core_lr_comm_x.T), dtype=xp.float64
+                    ),
+                    "dme0_mean_vmix_k_act_right": xp.asarray(
+                        0.5 * (g_vmix_k_act_right_x + g_vmix_k_act_right_x.T), dtype=xp.float64
+                    ),
+                    "dme0_mean_vmix_k_act_lr_avg": xp.asarray(
+                        0.5 * (g_vmix_k_act_lr_avg_x + g_vmix_k_act_lr_avg_x.T), dtype=xp.float64
+                    ),
+                    "dme0_mean_vmix_k_act_lr_comm": xp.asarray(
+                        0.5 * (g_vmix_k_act_lr_comm_x + g_vmix_k_act_lr_comm_x.T), dtype=xp.float64
+                    ),
+                }
+            )
         if bool(_dump_raw_parts):
             parts_x.update(
                 {
@@ -1880,6 +2145,19 @@ def _build_dme0_lorb_response(
                         "raw_g_vL_c_k": xp.asarray(g_vL_c_k, dtype=xp.float64),
                         "raw_g_vc_L_j": xp.asarray(g_vc_L_j, dtype=xp.float64),
                         "raw_g_vc_L_k": xp.asarray(g_vc_L_k, dtype=xp.float64),
+                    }
+                )
+                parts_x.update(
+                    {
+                        "raw_g_vmix_k_right": xp.asarray(g_vmix_k_right_x, dtype=xp.float64),
+                        "raw_g_vmix_k_lr_avg": xp.asarray(g_vmix_k_lr_avg_x, dtype=xp.float64),
+                        "raw_g_vmix_k_lr_comm": xp.asarray(g_vmix_k_lr_comm_x, dtype=xp.float64),
+                        "raw_g_vmix_k_core_right": xp.asarray(g_vmix_k_core_right_x, dtype=xp.float64),
+                        "raw_g_vmix_k_core_lr_avg": xp.asarray(g_vmix_k_core_lr_avg_x, dtype=xp.float64),
+                        "raw_g_vmix_k_core_lr_comm": xp.asarray(g_vmix_k_core_lr_comm_x, dtype=xp.float64),
+                        "raw_g_vmix_k_act_right": xp.asarray(g_vmix_k_act_right_x, dtype=xp.float64),
+                        "raw_g_vmix_k_act_lr_avg": xp.asarray(g_vmix_k_act_lr_avg_x, dtype=xp.float64),
+                        "raw_g_vmix_k_act_lr_comm": xp.asarray(g_vmix_k_act_lr_comm_x, dtype=xp.float64),
                     }
                 )
         if return_xp:
@@ -3693,7 +3971,10 @@ def casscf_nuc_grad_df_per_root(
     if bool(_is_gpu):
         _apply_gpu_runtime_config_to_solver(fcisolver_use, _gpu_runtime_cfg)
     _restore_pool = _apply_df_pool_policy(B_ao, label="casscf_nuc_grad_df_per_root")
-    _preflush_grad_pool = _normalize_bool_env(_os.environ.get("ASUKA_DF_GRAD_PRE_FLUSH"), default=True)
+    _vram_debug = _normalize_bool_env(_os.environ.get("ASUKA_VRAM_DEBUG"), default=False)
+    _tight_vram_default = bool(_vram_debug or (_os.environ.get("ASUKA_GPU_MEM_CAP_GB") not in (None, "")))
+    _tight_vram = _normalize_bool_env(_os.environ.get("ASUKA_DF_TIGHT_VRAM"), default=_tight_vram_default)
+    _preflush_grad_pool = _normalize_bool_env(_os.environ.get("ASUKA_DF_GRAD_PRE_FLUSH"), default=bool(_tight_vram))
     _vram_debug_fine = _normalize_bool_env(_os.environ.get("ASUKA_VRAM_DEBUG_FINE"), default=False)
     if bool(_is_gpu) and bool(_preflush_grad_pool):
         _flush_gpu_pool()
@@ -3751,9 +4032,9 @@ def casscf_nuc_grad_df_per_root(
     except Exception:
         de_nuc = np.zeros((natm, 3), dtype=np.float64)
 
-    # Build SA adapter and Hessian operator (shared across all roots).
-    # For packed-Qp DF factors, Newton AO2MO can run in aux-blocked mode
-    # directly from Qp (no full Qp->mnQ materialization).
+    # Newton-CASSCF SA adapter and Hessian operator are built later (after the
+    # SA DF contraction) to avoid overlapping large ERI/DF factors (notably
+    # `eris_sa.L_pi`) with the bar_L+B plateau, which would inflate peak VRAM.
     _newton_aux_block_naux = 0
     try:
         _newton_aux_block_naux = int(_os.environ.get("ASUKA_NEWTON_AUX_BLOCK_NAUX", "0"))
@@ -3761,29 +4042,9 @@ def casscf_nuc_grad_df_per_root(
         _newton_aux_block_naux = 0
     if bool(is_qp) and int(_newton_aux_block_naux) <= 0:
         _newton_aux_block_naux = min(int(naux), 128)
-
-    mc_sa = DFNewtonCASSCFAdapter(
-        df_B=B_ao,
-        hcore_ao=h_ao,
-        ncore=int(ncore),
-        ncas=int(ncas),
-        nelecas=nelecas,
-        mo_coeff=C,
-        fcisolver=fcisolver_use,
-        weights=[float(w) for w in np.asarray(weights, dtype=np.float64).ravel().tolist()],
-        frozen=getattr(casscf, "frozen", None),
-        internal_rotation=bool(getattr(casscf, "internal_rotation", False)),
-        extrasym=getattr(casscf, "extrasym", None),
-        aux_block_naux=int(_newton_aux_block_naux),
-    )
-    eris_sa = mc_sa.ao2mo(C)
-    if bool(_is_gpu):
-        _flush_gpu_pool()
-        _log_vram("casscf_nuc_grad_df_per_root.after_drop_full_B_newton")
-    with _force_internal_newton():
-        hess_op = build_mcscf_hessian_operator(
-            mc_sa, mo_coeff=C, ci=ci_list, eris=eris_sa, use_newton_hessian=True,
-        )
+    mc_sa = None
+    eris_sa = None
+    hess_op = None
 
     # Prepare DF gradient contraction context (reuse across roots)
     from asuka.integrals.df_grad_context import DFGradContractionContext  # noqa: PLC0415
@@ -3800,6 +4061,27 @@ def casscf_nuc_grad_df_per_root(
         )
     except (NotImplementedError, RuntimeError):
         df_grad_ctx = None
+
+    # cuERI caches integral "plans" (pair tables, shell-pair groupings, etc.)
+    # which can keep hundreds of MB alive after SCF/CASSCF have already built B.
+    # This gradient path does not reuse those plans (it contracts dB/dR via
+    # DFGradContractionContext), so clearing them reduces baseline VRAM.
+    if _normalize_bool_env(_os.environ.get("ASUKA_CUERI_CLEAR_PLAN_CACHES"), default=bool(_tight_vram)):
+        try:
+            from asuka.cueri import gpu as _cueri_gpu  # noqa: PLC0415
+
+            if hasattr(_cueri_gpu, "clear_plan_caches"):
+                _cueri_gpu.clear_plan_caches()
+        except Exception:
+            pass
+        try:
+            from asuka.cueri import df as _cueri_df  # noqa: PLC0415
+
+            if hasattr(_cueri_df, "clear_df_caches"):
+                _cueri_df.clear_df_caches()
+        except Exception:
+            pass
+        _flush_gpu_pool()
 
     _fused_contract_requested = _normalize_bool_env(_os.environ.get("ASUKA_DF_FUSED_CONTRACT"), default=False)
     if _gpu_runtime_cfg.fused_df is not None:
@@ -3985,7 +4267,8 @@ def casscf_nuc_grad_df_per_root(
         gn = np.einsum("axij,ij->ax", _dS_pre, Wn, optimize=True)
         return -np.asarray(gn, dtype=np.float64)
 
-    n_orb = int(hess_op.n_orb)
+    # Set after we build the Newton Hessian operator (hess_op) later.
+    n_orb = 0
     w_arr = np.asarray(weights, dtype=np.float64).ravel()
     warned_df_fd = False
 
@@ -3994,6 +4277,7 @@ def casscf_nuc_grad_df_per_root(
     # ------------------------------------------------------------------
     _prof_env = str(os.environ.get("ASUKA_PROFILE_DF_PER_ROOT", "")).strip().lower()
     _profile_df_per_root = _prof_env not in ("", "0", "false", "no", "off")
+    _df_grad_path_log = _normalize_bool_env(os.environ.get("ASUKA_DF_GRAD_PATH_LOG"), default=False)
     _t_bar_L_sa = 0.0
     _t_contract_sa = 0.0
     _t_bar_L_delta = 0.0
@@ -4004,6 +4288,12 @@ def casscf_nuc_grad_df_per_root(
     _t_gfock = 0.0
     _t_1e_pulay = 0.0
     _t_response_pulay = 0.0
+    _t_vhf_cache = 0.0
+    _t_gfock_zero = 0.0
+    _t_newton_ao2mo = 0.0
+    _t_newton_hess = 0.0
+    _t_sa_prep = 0.0
+    _t_rhs_build = 0.0
     _z_solver: str | None = None
     _z_solver_detail: str | None = None
     _z_backend: str | None = None
@@ -4013,6 +4303,52 @@ def casscf_nuc_grad_df_per_root(
     _barl_ab_diff_max = 0.0
     _barl_fallback = False
     _barl_ab_checked = False
+
+    # Batched per-root DF delta contraction (CUDA only, packed-Qp spherical).
+    # This reduces DF 3c derivative work by contracting multiple roots' delta bar_X in one pass.
+    _use_batched_delta_contract = False
+    _delta_batch_nbar = 1
+    _delta_batch_precision = "fp64"
+    _delta_batch_reason: str | None = None
+    _batched_pending: list[dict[str, Any]] = []
+
+    def _delta_batch_ineligible_reason() -> str | None:
+        if str(df_backend).strip().lower() != "cuda":
+            return "df_backend!=cuda"
+        if not bool(is_spherical):
+            return "cartesian"
+        if not bool(is_qp):
+            return "df_layout!=packed-Qp"
+        if df_grad_ctx is None or str(getattr(df_grad_ctx, "backend", "")).strip().lower() != "cuda":
+            return "df_grad_ctx missing/not cuda"
+        if int(nroots) <= 1:
+            return "nroots<=1"
+        if not hasattr(df_grad_ctx, "contract_sph_batched"):
+            return "missing df_grad_ctx.contract_sph_batched"
+        return None
+
+    _delta_batch_reason = _delta_batch_ineligible_reason()
+    _delta_batch_env = _normalize_bool_env(
+        os.environ.get("ASUKA_DF_DELTA_BATCH_CONTRACT"),
+        default=(not bool(_tight_vram)),
+    )
+    if _delta_batch_reason is None and bool(_delta_batch_env):
+        try:
+            _nb_raw = str(os.environ.get("ASUKA_DF_DELTA_BATCH_NBAR", "")).strip()
+            _nb = int(_nb_raw) if _nb_raw else 2
+        except Exception:
+            _nb = 2
+        _delta_batch_nbar = max(1, min(int(nroots), int(_nb)))
+        _use_batched_delta_contract = int(_delta_batch_nbar) > 1
+        if not bool(_use_batched_delta_contract):
+            _delta_batch_reason = "ASUKA_DF_DELTA_BATCH_NBAR<=1"
+        # Default to mixed fp32 bar_X storage to keep the pending queue cheap in VRAM.
+        _delta_batch_precision = _normalize_fused_contract_precision(
+            os.environ.get("ASUKA_DF_DELTA_BATCH_PRECISION") or "fp32_acc64"
+        )
+    else:
+        if _delta_batch_reason is None and not bool(_delta_batch_env):
+            _delta_batch_reason = "ASUKA_DF_DELTA_BATCH_CONTRACT=0"
 
     # Multi-stream DF contraction (CUDA only). Escape hatch: ASUKA_DF_CONTRACT_STREAMS=1.
     _use_multistream_contract = False
@@ -4025,6 +4361,7 @@ def casscf_nuc_grad_df_per_root(
     if (
         not bool(_barl_hybrid_enabled)
         and not bool(_fused_contract_enabled)
+        and not bool(_use_batched_delta_contract)
         and
         str(df_backend).strip().lower() == "cuda"
         and df_grad_ctx is not None
@@ -4067,6 +4404,26 @@ def casscf_nuc_grad_df_per_root(
                 _main_stream_cm = _main_stream
                 _contract_streams = [cp.cuda.Stream() for _ in range(int(_n_streams))]
                 _use_multistream_contract = True
+
+    if _df_grad_path_log:
+        import sys  # noqa: PLC0415
+
+        layout_s = "Qp" if bool(is_qp) else "mnQ"
+        nstreams = int(_n_streams) if bool(_use_multistream_contract) else 1
+        delta_reason = "enabled" if bool(_use_batched_delta_contract) else str(_delta_batch_reason or "disabled")
+        print(
+            "[ASUKA_DF_GRAD_PATH] "
+            f"backend={str(df_backend).strip().lower()} spherical={int(bool(is_spherical))} layout={layout_s} "
+            f"tight_vram={int(bool(_tight_vram))} "
+            f"barL_hybrid={int(bool(_barl_hybrid_enabled))} "
+            f"fused_contract={int(bool(_fused_contract_enabled))} "
+            f"delta_batch={int(bool(_use_batched_delta_contract))} "
+            f"delta_batch_nbar={int(_delta_batch_nbar)} "
+            f"delta_batch_prec={str(_delta_batch_precision)} "
+            f"streams={int(nstreams)} "
+            f"delta_batch_reason={delta_reason}",
+            file=sys.stderr,
+        )
 
     # ------------------------------------------------------------------
     # Z-vector + CI-response CUDA configuration
@@ -4111,106 +4468,49 @@ def casscf_nuc_grad_df_per_root(
                 else:
                     setattr(obj, key, old)
 
-    # Per-root CI-response transition RDM accumulation: optionally keep on GPU.
-    _ci_rdm_device_env = str(os.environ.get("ASUKA_PER_ROOT_CI_RDM_DEVICE", "auto")).strip().lower()
-    try:
-        _ci_rdm_thresh = int(os.environ.get("ASUKA_PER_ROOT_CI_RDM_CUDA_THRESHOLD_NCSF", "4096"))
-    except Exception:
-        _ci_rdm_thresh = 4096
-
+    # These are initialized later (after the SA DF contraction) once we have
+    # built the Newton Hessian operator + ERI container. Keeping them out of
+    # scope during the SA contraction avoids overlapping `eris_sa.L_pi` with
+    # the bar_L+B plateau and reduces peak VRAM.
     _use_ci_rdm_device = False
     _cp_ci = None  # type: ignore[assignment]
     ci_list_dev: list[Any] | None = None
 
-    if str(df_backend).strip().lower() == "cuda":
-        if _ci_rdm_device_env in ("1", "true", "yes", "on", "enable", "enabled"):
-            _use_ci_rdm_device = True
-        elif _ci_rdm_device_env in ("0", "false", "no", "off", "disable", "disabled"):
-            _use_ci_rdm_device = False
-        else:
-            ncsf_hint = int(getattr(hess_op, "n_ci", 0)) // max(int(nroots), 1)
-            _use_ci_rdm_device = int(ncsf_hint) >= int(_ci_rdm_thresh)
-
-        if _use_ci_rdm_device:
-            try:
-                from asuka.cuda.cuda_backend import has_cuda_ext  # noqa: PLC0415
-
-                if not has_cuda_ext():
-                    _use_ci_rdm_device = False
-            except Exception:
-                _use_ci_rdm_device = False
-
-        if _use_ci_rdm_device:
-            try:
-                import cupy as cp  # type: ignore[import-not-found]  # noqa: PLC0415
-            except Exception:
-                _use_ci_rdm_device = False
-            else:
-                _cp_ci = cp
-                # Pre-upload ket CI vectors once. Keep on the same "main" stream used elsewhere.
-                with _main_stream_cm:
-                    ci_list_dev = [cp.asarray(ci, dtype=cp.float64).ravel() for ci in ci_list]
-
-    # ------------------------------------------------------------------
-    # Precompute shared quantities for lightweight Z-vector RHS
-    # ------------------------------------------------------------------
     nmo = int(C.shape[1])
-    nocc = ncore + ncas
-    ppaa_sa_np = _asnumpy_f64(getattr(eris_sa, "ppaa"))  # (nmo,nmo,ncas,ncas)
-    papa_sa_np = _asnumpy_f64(getattr(eris_sa, "papa"))  # (nmo,ncas,nmo,ncas)
-    ppaa_sa = _as_xp_f64(xp, ppaa_sa_np) if _gpu_1e_tensor_path else np.asarray(ppaa_sa_np, dtype=np.float64)
-    papa_sa = _as_xp_f64(xp, papa_sa_np) if _gpu_1e_tensor_path else np.asarray(papa_sa_np, dtype=np.float64)
-    _lorb_resp_cache: dict[str, Any] = {
-        "ppaa_np": np.asarray(ppaa_sa_np, dtype=np.float64),
-        "papa_np": np.asarray(papa_sa_np, dtype=np.float64),
-    }
-    _lorb_resp_cache["aapa"] = np.asarray(
-        _lorb_resp_cache["ppaa_np"][:, ncore:nocc, :, :].transpose(2, 3, 0, 1),
-        dtype=np.float64,
-    )
-    if _gpu_1e_tensor_path:
-        _lorb_resp_cache["ppaa_xp"] = _as_xp_f64(xp, ppaa_sa)
-        _lorb_resp_cache["papa_xp"] = _as_xp_f64(xp, papa_sa)
-        _lorb_resp_cache["aapa_xp"] = _as_xp_f64(
-            xp,
-            _lorb_resp_cache["ppaa_xp"][:, ncore:nocc, :, :].transpose(2, 3, 0, 1),
-        )
-    vhf_c_sa = _asnumpy_f64(getattr(eris_sa, "vhf_c"))  # (nmo,nmo)
-    h1e_mo_sa = _asnumpy_f64(C).T @ _asnumpy_f64(h_ao) @ _asnumpy_f64(C)
-    h1cas_0 = h1e_mo_sa[ncore:nocc, ncore:nocc] + vhf_c_sa[ncore:nocc, ncore:nocc]
-    eri_cas_sa = ppaa_sa_np[ncore:nocc, ncore:nocc]
-
-    # Precompute hci0, eci0 (root-independent: H_act |ci_r> for each root)
-    _linkstrl_rhs = _newton_casscf._maybe_gen_linkstr(fcisolver_use, ncas, nelecas, True)
-    _hci0_all = _newton_casscf._ci_h_op(
-        fcisolver_use,
-        h1cas=h1cas_0,
-        eri_cas=eri_cas_sa,
-        ncas=ncas,
-        nelecas=nelecas,
-        ci_list=ci_list,
-        link_index=_linkstrl_rhs,
-    )
-    _eci0_all = np.array(
-        [float(np.dot(np.asarray(c).ravel(), np.asarray(hc).ravel())) for c, hc in zip(ci_list, _hci0_all)],
-        dtype=np.float64,
-    )
-    # Pre-reshape ppaa for GEMM in orbital gradient
-    _ppaa_2d = ppaa_sa_np.reshape(nmo * nmo, ncas * ncas)
+    nocc = int(ncore + ncas)
+    ppaa_sa_np = None
+    papa_sa_np = None
+    ppaa_sa = None
+    papa_sa = None
+    _lorb_resp_cache: dict[str, Any] = {}
+    vhf_c_sa = None
+    h1cas_0 = None
+    eri_cas_sa = None
+    _ppaa_2d = None
 
     # ------------------------------------------------------------------
     # SA base gradient (shared across all roots, includes Pulay term)
     # This is the correct SA-CASSCF gradient (variational w.r.t. SA energy).
     # Per-root gradients are expressed as: grad_K = grad_sa_base + delta_K
     # ------------------------------------------------------------------
+    # Optional: stash SA DF adjoints (bar_X/bar_V) to fuse SA + delta contractions in a single 3c pass.
+    de_df_sa_np: np.ndarray | None = None
+    _sa_bar_X_dev: Any | None = None
+    _sa_bar_V_dev: Any | None = None
+    _sa_nao_sph: int | None = None
+    _sa_df_deferred = False
+    _sa_df_fused = False
     # Drain CASSCF pool residue — the optimizer leaves ~10 GB in the CuPy
     # pool that is no longer referenced.  Flushing here reduces the peak
     # driver-visible VRAM for the entire gradient phase.
     _flush_gpu_pool()
+    t_prep0 = time.perf_counter()
     with _main_stream_cm:
+        _vhf_cache: dict[str, Any] = {}
         C_np = _asnumpy_f64(C)
         gfock_sa, D_core_sa, D_act_sa, D_tot_sa, C_act_sa = _build_gfock_casscf_df(
             B_ao, h_ao, C, ncore=int(ncore), ncas=int(ncas), dm1_act=dm1_sa, dm2_act=dm2_sa,
+            vhf_cache_out=_vhf_cache,
         )
 
         # Precompute root-invariant DF intermediates for active contractions.
@@ -4252,7 +4552,11 @@ def casscf_nuc_grad_df_per_root(
                 del _bq, _x, _l
             L2 = L_act.reshape(int(ncas) * int(ncas), int(naux))  # (ncas^2,naux)
 
+        if _profile_df_per_root:
+            _t_sa_prep += time.perf_counter() - t_prep0
         t0 = time.perf_counter()
+        _qblk_sa_raw = int(_barl_policy.get("qblock", 0) or 0)
+        _qblk_sa = None if _qblk_sa_raw <= 0 else int(max(1, min(int(naux), int(_qblk_sa_raw))))
         bar_L_sa = _build_bar_L_casscf_df(
             B_ao,
             D_core_ao=D_core_sa,
@@ -4261,40 +4565,150 @@ def casscf_nuc_grad_df_per_root(
             dm2_act=dm2_sa,
             L_act=L_act,
             rho_core=rho_core,
+            qblock=_qblk_sa,
         )
         if _profile_df_per_root:
             _t_bar_L_sa += time.perf_counter() - t0
 
         try:
+            # Drop HF DF-JK CUDA extension work buffers before entering the DF
+            # contraction kernels. These are `cudaMalloc`-backed and do not
+            # participate in the CuPy pool, but can inflate peak VRAM when
+            # bar_L and B are simultaneously live.
+            if (
+                xp is not np
+                and _normalize_bool_env(
+                    _os.environ.get("ASUKA_RELEASE_HF_DFJK_WS_BEFORE_CONTRACT"),
+                    default=True,
+                )
+            ):
+                try:
+                    _df_jk.release_cuda_ext_workspace_cache()
+                except Exception:
+                    pass
+                _flush_gpu_pool()
             if bool(_vram_debug_fine):
                 _log_vram("sa contract start")
-            if bool(is_spherical):
-                if df_grad_ctx is not None:
-                    de_df_sa = df_grad_ctx.contract_sph(B_sph=B_ao, bar_L_sph=bar_L_sa, T_c2s=None)
-                else:
-                    de_df_sa = compute_df_gradient_contributions_analytic_sph(
-                        ao_basis,
-                        aux_basis,
-                        atom_coords_bohr=coords,
+            _fuse_sa_df = (
+                bool(_use_batched_delta_contract)
+                and int(_delta_batch_nbar) == 2
+                and int(nroots) > 1
+                and bool(is_spherical)
+                and bool(is_qp)
+                and (df_grad_ctx is not None)
+                and str(getattr(df_grad_ctx, "backend", "")).strip().lower() == "cuda"
+            )
+            if bool(_fuse_sa_df):
+                try:
+                    df_grad_ctx.ensure_cuda()
+                    _sa_bar_X_dev, _sa_bar_V_dev, _sa_nao_sph = df_grad_ctx._adjoints_device_from_sph_qp(  # noqa: SLF001
                         B_sph=B_ao,
                         bar_L_sph=bar_L_sa,
-                        T_c2s=None,
-                        L_chol=getattr(scf_out, "df_L", None),
-                        backend=str(df_backend),
-                        df_threads=int(df_threads),
-                        profile=None,
+                        precision=str(_delta_batch_precision),
                     )
-            else:
-                if df_grad_ctx is not None:
-                    de_df_sa = df_grad_ctx.contract(B_ao=B_ao, bar_L_ao=bar_L_sa)
+                    # SA DF contribution will be contracted together with the first delta batch.
+                    de_df_sa = None
+                    _sa_df_deferred = True
+                except Exception:
+                    _sa_bar_X_dev = None
+                    _sa_bar_V_dev = None
+                    _sa_nao_sph = None
+                    _fuse_sa_df = False
+
+            if not bool(_fuse_sa_df):
+                if bool(is_spherical):
+                    if df_grad_ctx is not None:
+                        de_df_sa = df_grad_ctx.contract_sph(B_sph=B_ao, bar_L_sph=bar_L_sa, T_c2s=None)
+                    else:
+                        de_df_sa = compute_df_gradient_contributions_analytic_sph(
+                            ao_basis,
+                            aux_basis,
+                            atom_coords_bohr=coords,
+                            B_sph=B_ao,
+                            bar_L_sph=bar_L_sa,
+                            T_c2s=None,
+                            L_chol=getattr(scf_out, "df_L", None),
+                            backend=str(df_backend),
+                            df_threads=int(df_threads),
+                            profile=None,
+                        )
                 else:
-                    de_df_sa = compute_df_gradient_contributions_analytic_packed_bases(
-                        ao_basis, aux_basis, atom_coords_bohr=coords, B_ao=B_ao, bar_L_ao=bar_L_sa,
-                        L_chol=getattr(scf_out, "df_L", None),
-                        backend=str(df_backend), df_threads=int(df_threads), profile=None,
-                    )
+                    if df_grad_ctx is not None:
+                        de_df_sa = df_grad_ctx.contract(B_ao=B_ao, bar_L_ao=bar_L_sa)
+                    else:
+                        de_df_sa = compute_df_gradient_contributions_analytic_packed_bases(
+                            ao_basis, aux_basis, atom_coords_bohr=coords, B_ao=B_ao, bar_L_ao=bar_L_sa,
+                            L_chol=getattr(scf_out, "df_L", None),
+                            backend=str(df_backend), df_threads=int(df_threads), profile=None,
+                        )
             if bool(_vram_debug_fine):
                 _log_vram("sa contract done")
+                if _os.environ.get("ASUKA_VRAM_ACCOUNTING"):
+                    try:
+                        import cupy as _cp  # noqa: PLC0415
+
+                        def _ptr(x: Any) -> int:
+                            try:
+                                return int(getattr(getattr(x, "data", None), "ptr", 0) or 0)
+                            except Exception:
+                                return 0
+
+                        _p_B = _ptr(B_ao)
+                        _p_B0 = _ptr(getattr(scf_out, "df_B", None))
+                        _p_bar = _ptr(bar_L_sa)
+                        _p_L = _ptr(getattr(scf_out, "df_L", None))
+                        print(
+                            f"[VRAM_PTR] B_ao=0x{_p_B:x} scf.df_B=0x{_p_B0:x} bar_L_sa=0x{_p_bar:x} df_L=0x{_p_L:x}"
+                        )
+                        # Try to identify any *extra* B-sized (naux,ntri) buffer and print its owner path.
+                        _p_extra = 0
+                        try:
+                            import gc as _gc  # noqa: PLC0415
+
+                            _sh_B = tuple(map(int, getattr(B_ao, "shape", ()) or ()))
+                            for _obj in _gc.get_objects():
+                                try:
+                                    if not isinstance(_obj, _cp.ndarray):
+                                        continue
+                                    if tuple(map(int, getattr(_obj, "shape", ()) or ())) != _sh_B:
+                                        continue
+                                    _p = _ptr(_obj)
+                                    if _p not in (int(_p_B), int(_p_bar)) and _p != 0:
+                                        _p_extra = int(_p)
+                                        break
+                                except Exception:
+                                    continue
+                        except Exception:
+                            _p_extra = 0
+                        if int(_p_extra):
+                            print(f"[VRAM_PTR] extra_B_sized=0x{int(_p_extra):x} shape={tuple(map(int, B_ao.shape))}")
+                            # Best-effort referrer count for the extra B-sized array.
+                            try:
+                                import gc as _gc_ref  # noqa: PLC0415
+
+                                _extra_obj = None
+                                for _obj in _gc_ref.get_objects():
+                                    try:
+                                        if isinstance(_obj, _cp.ndarray) and int(_ptr(_obj)) == int(_p_extra):
+                                            _extra_obj = _obj
+                                            break
+                                    except Exception:
+                                        continue
+                                if _extra_obj is not None:
+                                    _refs = list(_gc_ref.get_referrers(_extra_obj))
+                                    print(f"[VRAM_REFS] extra_B_sized referrers={len(_refs)}")
+                            except Exception:
+                                pass
+
+                        try:
+                            _Lpi = getattr(eris_sa, "L_pi", None)
+                            if _Lpi is not None and isinstance(_Lpi, _cp.ndarray):
+                                print(f"[VRAM_PTR] eris_sa.L_pi=0x{_ptr(_Lpi):x} shape={tuple(map(int, _Lpi.shape))}")
+                        except Exception:
+                            pass
+                    except Exception:
+                        pass
+                _dump_cupy_arrays("sa contract done", min_mb=32.0, max_items=24)
             if _profile_df_per_root:
                 _t_contract_sa += time.perf_counter() - t0
         except (NotImplementedError, RuntimeError) as e:
@@ -4315,8 +4729,10 @@ def casscf_nuc_grad_df_per_root(
             )
 
     # ── 1e and Pulay contractions ──
-    de_df_sa_np = np.asarray(_asnumpy_f64(de_df_sa), dtype=np.float64)
-    del bar_L_sa, de_df_sa
+    if de_df_sa is not None:
+        de_df_sa_np = np.asarray(_asnumpy_f64(de_df_sa), dtype=np.float64)
+        del de_df_sa
+    del bar_L_sa
     _flush_gpu_pool()
     if bool(_vram_debug_fine):
         _log_vram("sa contract released")
@@ -4347,11 +4763,25 @@ def casscf_nuc_grad_df_per_root(
         de_pulay_sa = _contract_pulay_fast(W_sa)
 
     # SA base gradient: de_h1_sa + de_df_sa + de_nuc + de_pulay_sa.
-    grad_sa_base = np.asarray(
-        de_h1_sa + de_df_sa_np + de_nuc + de_pulay_sa, dtype=np.float64,
-    )
+    # If we fused SA DF contraction with the first delta batch, de_df_sa_np will be filled later.
+    grad_sa_base = np.asarray(de_h1_sa + de_nuc + de_pulay_sa, dtype=np.float64)
+    if de_df_sa_np is not None:
+        grad_sa_base += de_df_sa_np
     _log_vram("after SA base gradient")
     _flush_gpu_pool()
+
+    # The per-root bar_L build phase does not need the heavy CUDA static buffers
+    # owned by DFGradContractionContext (pair tables, job lists). Releasing them
+    # here reduces the "before lorb" peak significantly; the context will
+    # lazily re-init right before the next contraction.
+    if df_grad_ctx is not None and _normalize_bool_env(_os.environ.get("ASUKA_DF_GRAD_CTX_RELEASE_CUDA"), default=True):
+        try:
+            df_grad_ctx.release_cuda()
+        except Exception:
+            pass
+        _flush_gpu_pool()
+        if bool(_vram_debug_fine):
+            _log_vram("after df_grad_ctx.release_cuda")
 
     # ------------------------------------------------------------------
     # Per-root gradient loop
@@ -4359,62 +4789,78 @@ def casscf_nuc_grad_df_per_root(
     grads_out: list[np.ndarray | None] = [None] * int(nroots)
     _in_flight: list[dict[str, Any]] = []
 
-    # Precompute root-invariant vhf_c/vhf_a from SA-averaged densities.
-    # These are reused by _build_dme0_lorb_response every root, avoiding 2
-    # redundant _df_JK calls per root (~3s each on cc-pVDZ).
-    with _main_stream_cm:
-        use_cocc_k = (xp is not np) and _normalize_bool_env(_os.environ.get("ASUKA_MCSCF_DF_K_COCC"), default=True)
-        try:
-            q_block = int(_os.environ.get("ASUKA_DF_JK_K_QBLOCK", "128"))
-        except Exception:
-            q_block = 128
-        _nao_jk = int(C.shape[0])
-        _naux_jk = int(B_ao.shape[0]) if bool(is_qp) else int(B_ao.shape[2])
-        q_block = max(1, min(int(_naux_jk), int(q_block)))
+    # Root-invariant mean-field potentials (vhf_c/vhf_a) are computed during the
+    # SA generalized Fock build via `_build_gfock_casscf_df(vhf_cache_out=...)`.
+    #
+    # Keep a conservative fallback to the legacy recompute path in case that
+    # call-site changes (should be rare).
+    if not (isinstance(_vhf_cache, dict) and ("vhf_c" in _vhf_cache) and ("vhf_a" in _vhf_cache)):
+        t0 = time.perf_counter()
+        with _main_stream_cm:
+            use_cocc_k = (xp is not np) and _normalize_bool_env(_os.environ.get("ASUKA_MCSCF_DF_K_COCC"), default=True)
+            try:
+                q_block = int(_os.environ.get("ASUKA_DF_JK_K_QBLOCK", "128"))
+            except Exception:
+                q_block = 128
+            _nao_jk = int(C.shape[0])
+            _naux_jk = int(B_ao.shape[0]) if bool(is_qp) else int(B_ao.shape[2])
+            q_block = max(1, min(int(_naux_jk), int(q_block)))
 
-        _D_core_cached = (
-            2.0 * (C[:, :ncore] @ C[:, :ncore].T)
-            if ncore
-            else xp.zeros((int(_nao_jk), int(_nao_jk)), dtype=xp.float64)
-        )
-        _D_act_sa_cached = C_act_sa @ xp.asarray(dm1_sa, dtype=xp.float64) @ C_act_sa.T
+            _D_core_cached = (
+                2.0 * (C[:, :ncore] @ C[:, :ncore].T)
+                if ncore
+                else xp.zeros((int(_nao_jk), int(_nao_jk)), dtype=xp.float64)
+            )
+            _D_act_sa_cached = C_act_sa @ xp.asarray(dm1_sa, dtype=xp.float64) @ C_act_sa.T
 
-        if use_cocc_k:
-            _Jc_cached, _ = _df_scf._df_JK(B_ao, _D_core_cached, want_J=True, want_K=False)  # noqa: SLF001
-            if ncore:
-                _occ_core = xp.full((int(ncore),), 2.0, dtype=xp.float64)
-                _Kc_cached = _df_jk.df_K_from_BmnQ_Cocc(B_ao, C[:, :ncore], _occ_core, q_block=int(q_block))
+            if use_cocc_k:
+                _Jc_cached, _ = _df_scf._df_JK(B_ao, _D_core_cached, want_J=True, want_K=False)  # noqa: SLF001
+                if ncore:
+                    _occ_core = xp.full((int(ncore),), 2.0, dtype=xp.float64)
+                    _Kc_cached = _df_jk.df_K_from_BmnQ_Cocc(B_ao, C[:, :ncore], _occ_core, q_block=int(q_block))
+                else:
+                    _Kc_cached = xp.zeros_like(_Jc_cached)
+
+                _Ja_cached, _ = _df_scf._df_JK(B_ao, _D_act_sa_cached, want_J=True, want_K=False)  # noqa: SLF001
+                _dm1_h = np.asarray(dm1_sa, dtype=np.float64)
+                _dm1_h = 0.5 * (_dm1_h + _dm1_h.T)
+                _w_h, _U_h = np.linalg.eigh(_dm1_h)
+                if float(np.min(_w_h)) < -1e-8:
+                    _, _Ka_cached = _df_scf._df_JK(B_ao, _D_act_sa_cached, want_J=False, want_K=True)  # noqa: SLF001
+                else:
+                    _w_h = np.clip(_w_h, 0.0, None)
+                    _w = xp.asarray(_w_h, dtype=xp.float64)
+                    _U = xp.asarray(_U_h, dtype=xp.float64)
+                    _C_no = C_act_sa @ _U
+                    _Ka_cached = _df_jk.df_K_from_BmnQ_Cocc(B_ao, _C_no, _w, q_block=int(q_block))
             else:
-                _Kc_cached = xp.zeros_like(_Jc_cached)
+                _Jc_cached, _Kc_cached = _df_scf._df_JK(B_ao, _D_core_cached, want_J=True, want_K=True)  # noqa: SLF001
+                _Ja_cached, _Ka_cached = _df_scf._df_JK(B_ao, _D_act_sa_cached, want_J=True, want_K=True)  # noqa: SLF001
 
-            _Ja_cached, _ = _df_scf._df_JK(B_ao, _D_act_sa_cached, want_J=True, want_K=False)  # noqa: SLF001
-            _dm1_h = np.asarray(dm1_sa, dtype=np.float64)
-            _dm1_h = 0.5 * (_dm1_h + _dm1_h.T)
-            _w_h, _U_h = np.linalg.eigh(_dm1_h)
-            if float(np.min(_w_h)) < -1e-8:
-                _, _Ka_cached = _df_scf._df_JK(B_ao, _D_act_sa_cached, want_J=False, want_K=True)  # noqa: SLF001
-            else:
-                _w_h = np.clip(_w_h, 0.0, None)
-                _w = xp.asarray(_w_h, dtype=xp.float64)
-                _U = xp.asarray(_U_h, dtype=xp.float64)
-                _C_no = C_act_sa @ _U
-                _Ka_cached = _df_jk.df_K_from_BmnQ_Cocc(B_ao, _C_no, _w, q_block=int(q_block))
-        else:
-            _Jc_cached, _Kc_cached = _df_scf._df_JK(B_ao, _D_core_cached, want_J=True, want_K=True)  # noqa: SLF001
-            _Ja_cached, _Ka_cached = _df_scf._df_JK(B_ao, _D_act_sa_cached, want_J=True, want_K=True)  # noqa: SLF001
-    _vhf_cache = {
-        "vhf_c": _Jc_cached - 0.5 * _Kc_cached,
-        "vhf_a": _Ja_cached - 0.5 * _Ka_cached,
-    }
-    del _D_core_cached, _D_act_sa_cached, _Jc_cached, _Kc_cached, _Ja_cached, _Ka_cached
+        _vhf_cache = {
+            "vhf_c": _Jc_cached - 0.5 * _Kc_cached,
+            "vhf_a": _Ja_cached - 0.5 * _Ka_cached,
+        }
+        del _D_core_cached, _D_act_sa_cached, _Jc_cached, _Kc_cached, _Ja_cached, _Ka_cached
+        if _profile_df_per_root:
+            _t_vhf_cache += time.perf_counter() - t0
 
     # Precompute gfock with zero active density (for CI response Pulay subtraction).
-    _dm1_zero = xp.zeros((int(ncas), int(ncas)), dtype=xp.float64)
-    _dm2_zero = xp.zeros((int(ncas), int(ncas), int(ncas), int(ncas)), dtype=xp.float64)
-    _gfock_zero, _, _, _, _ = _build_gfock_casscf_df(
-        B_ao, h_ao, C, ncore=int(ncore), ncas=int(ncas),
-        dm1_act=_dm1_zero, dm2_act=_dm2_zero,
-    )
+    # Avoid an expensive DF J/K rebuild: with dm1_act=dm2_act=0, the generalized
+    # Fock reduces to core-only mean-field, which we can assemble from cached
+    # vhf_c and hcore.
+    t0 = time.perf_counter()
+    with _main_stream_cm:
+        nmo = int(C.shape[1])
+        h_mo = C.T @ h_ao @ C
+        vhf_c_ao = xp.asarray(_vhf_cache["vhf_c"], dtype=xp.float64)
+        vhf_c_mo = C.T @ vhf_c_ao @ C
+        _gfock_zero = xp.zeros((int(nmo), int(nmo)), dtype=xp.float64)
+        if int(ncore) > 0:
+            _gfock_zero[:, : int(ncore)] = 2.0 * (h_mo + vhf_c_mo)[:, : int(ncore)]
+        del h_mo, vhf_c_ao, vhf_c_mo
+    if _profile_df_per_root:
+        _t_gfock_zero += time.perf_counter() - t0
     _gfock_zero_xp = xp.asarray(_gfock_zero, dtype=xp.float64) if _gpu_1e_tensor_path else None
     _gfock_zero_np = _asnumpy_f64(_gfock_zero)
 
@@ -4477,6 +4923,121 @@ def casscf_nuc_grad_df_per_root(
                 profile=None,
             )
             return np.asarray(_asnumpy_f64(_de), dtype=np.float64)
+
+    # ------------------------------------------------------------------
+    # Build Newton Hessian Operator (Z-Vector) + Shared RHS Caches
+    # ------------------------------------------------------------------
+    mc_sa = DFNewtonCASSCFAdapter(
+        df_B=B_ao,
+        hcore_ao=h_ao,
+        ncore=int(ncore),
+        ncas=int(ncas),
+        nelecas=nelecas,
+        mo_coeff=C,
+        fcisolver=fcisolver_use,
+        weights=[float(w) for w in np.asarray(weights, dtype=np.float64).ravel().tolist()],
+        frozen=getattr(casscf, "frozen", None),
+        internal_rotation=bool(getattr(casscf, "internal_rotation", False)),
+        extrasym=getattr(casscf, "extrasym", None),
+        aux_block_naux=int(_newton_aux_block_naux),
+    )
+    t0 = time.perf_counter()
+    eris_sa = mc_sa.ao2mo(C)
+    if _profile_df_per_root:
+        _t_newton_ao2mo += time.perf_counter() - t0
+    if bool(_is_gpu):
+        _flush_gpu_pool()
+        _log_vram("casscf_nuc_grad_df_per_root.after_build_newton_eris_sa")
+    t0 = time.perf_counter()
+    with _force_internal_newton():
+        hess_op = build_mcscf_hessian_operator(
+            mc_sa, mo_coeff=C, ci=ci_list, eris=eris_sa, use_newton_hessian=True,
+        )
+    if _profile_df_per_root:
+        _t_newton_hess += time.perf_counter() - t0
+    n_orb = int(hess_op.n_orb)
+
+    # Per-root CI-response transition RDM accumulation: optionally keep on GPU.
+    _ci_rdm_device_env = str(os.environ.get("ASUKA_PER_ROOT_CI_RDM_DEVICE", "auto")).strip().lower()
+    try:
+        _ci_rdm_thresh = int(os.environ.get("ASUKA_PER_ROOT_CI_RDM_CUDA_THRESHOLD_NCSF", "4096"))
+    except Exception:
+        _ci_rdm_thresh = 4096
+
+    if str(df_backend).strip().lower() == "cuda":
+        if _ci_rdm_device_env in ("1", "true", "yes", "on", "enable", "enabled"):
+            _use_ci_rdm_device = True
+        elif _ci_rdm_device_env in ("0", "false", "no", "off", "disable", "disabled"):
+            _use_ci_rdm_device = False
+        else:
+            ncsf_hint = int(getattr(hess_op, "n_ci", 0)) // max(int(nroots), 1)
+            _use_ci_rdm_device = int(ncsf_hint) >= int(_ci_rdm_thresh)
+
+        if _use_ci_rdm_device:
+            try:
+                from asuka.cuda.cuda_backend import has_cuda_ext  # noqa: PLC0415
+
+                if not has_cuda_ext():
+                    _use_ci_rdm_device = False
+            except Exception:
+                _use_ci_rdm_device = False
+
+        if _use_ci_rdm_device:
+            try:
+                import cupy as cp  # type: ignore[import-not-found]  # noqa: PLC0415
+            except Exception:
+                _use_ci_rdm_device = False
+            else:
+                _cp_ci = cp
+                # Pre-upload ket CI vectors once. Keep on the same "main" stream used elsewhere.
+                with _main_stream_cm:
+                    ci_list_dev = [cp.asarray(ci, dtype=cp.float64).ravel() for ci in ci_list]
+
+    # Precompute shared quantities for lightweight Z-vector RHS / response Pulay.
+    #
+    # Note: keep `ppaa_sa_np/papa_sa_np` as host arrays for the RHS builder;
+    # if 1e contributions are on GPU, also provide xp copies for the lorb cache.
+    ppaa_sa_np = _asnumpy_f64(getattr(eris_sa, "ppaa"))  # (nmo,nmo,ncas,ncas)
+    papa_sa_np = _asnumpy_f64(getattr(eris_sa, "papa"))  # (nmo,ncas,nmo,ncas)
+    ppaa_sa = _as_xp_f64(xp, ppaa_sa_np) if _gpu_1e_tensor_path else np.asarray(ppaa_sa_np, dtype=np.float64)
+    papa_sa = _as_xp_f64(xp, papa_sa_np) if _gpu_1e_tensor_path else np.asarray(papa_sa_np, dtype=np.float64)
+    _lorb_resp_cache = {
+        "ppaa_np": np.asarray(ppaa_sa_np, dtype=np.float64),
+        "papa_np": np.asarray(papa_sa_np, dtype=np.float64),
+    }
+    _lorb_resp_cache["aapa"] = np.asarray(
+        _lorb_resp_cache["ppaa_np"][:, ncore:nocc, :, :].transpose(2, 3, 0, 1),
+        dtype=np.float64,
+    )
+    if _gpu_1e_tensor_path:
+        _lorb_resp_cache["ppaa_xp"] = _as_xp_f64(xp, ppaa_sa)
+        _lorb_resp_cache["papa_xp"] = _as_xp_f64(xp, papa_sa)
+        _lorb_resp_cache["aapa_xp"] = _as_xp_f64(
+            xp,
+            _lorb_resp_cache["ppaa_xp"][:, ncore:nocc, :, :].transpose(2, 3, 0, 1),
+        )
+    vhf_c_sa = _asnumpy_f64(getattr(eris_sa, "vhf_c"))  # (nmo,nmo)
+    h1e_mo_sa = _asnumpy_f64(C).T @ _asnumpy_f64(h_ao) @ _asnumpy_f64(C)
+    h1cas_0 = h1e_mo_sa[ncore:nocc, ncore:nocc] + vhf_c_sa[ncore:nocc, ncore:nocc]
+    eri_cas_sa = ppaa_sa_np[ncore:nocc, ncore:nocc]
+
+    # Precompute hci0, eci0 (root-independent: H_act |ci_r> for each root).
+    # Used by some RHS builders / diagnostics (cheap for small ncas).
+    _linkstrl_rhs = _newton_casscf._maybe_gen_linkstr(fcisolver_use, ncas, nelecas, True)
+    _hci0_all = _newton_casscf._ci_h_op(
+        fcisolver_use,
+        h1cas=h1cas_0,
+        eri_cas=eri_cas_sa,
+        ncas=ncas,
+        nelecas=nelecas,
+        ci_list=ci_list,
+        link_index=_linkstrl_rhs,
+    )
+    _eci0_all = np.array(
+        [float(np.dot(np.asarray(c).ravel(), np.asarray(hc).ravel())) for c, hc in zip(ci_list, _hci0_all)],
+        dtype=np.float64,
+    )
+    _ppaa_2d = ppaa_sa_np.reshape(nmo * nmo, ncas * ncas)
 
     _z_results_by_root: list[Any] | None = None
     _z_batch_enabled = bool(int(nroots) > 1) and _normalize_bool_env(_os.environ.get("ASUKA_ZVECTOR_BATCH_SOLVE"), default=True)
@@ -4629,6 +5190,416 @@ def casscf_nuc_grad_df_per_root(
         if _z_use_x0 and _z_results_by_root:
             _z_prev_x0 = np.asarray(_z_results_by_root[-1].z_packed, dtype=np.float64).ravel().copy()
 
+        # Debug: identify large live CuPy arrays *before* releasing Z-solve caches.
+        # This helps track transient VRAM spikes caused by persistent work buffers.
+        _dump_cupy_arrays("z_solve batch pre cleanup", min_mb=32.0, max_items=24)
+
+        # Release any GPU MO-JK precompute buffers captured by the Newton Hessian
+        # matvec closure. These can be ~sizeof(B) and would otherwise inflate peak
+        # VRAM during the subsequent per-root DF contraction phase.
+        try:
+            _rel = getattr(hess_op, "release_mo_jk", None)
+            if callable(_rel):
+                _rel()
+        except Exception:
+            pass
+        _flush_gpu_pool()
+
+        _dump_cupy_arrays("z_solve after release_mo_jk", min_mb=32.0, max_items=24)
+
+        # Release cached CUDA matvec workspaces (GUGA) allocated during the Z-vector solve.
+        # These include large persistent buffers like `_g_buf` / `_w_block` that are not
+        # needed for the subsequent per-root DF gradient contraction and would otherwise
+        # inflate peak VRAM.
+        try:
+            _fcis = fcisolver_use
+            _release_ws = getattr(_fcis, "release_matvec_cuda_ws_cache", None)
+            if callable(_release_ws):
+                _release_ws()
+            else:
+                # Common wrappers (PySCF state-average, adapters) may hold the real solver on an attribute.
+                for _name in ("base_solver", "base", "solver", "_solver", "_base", "fcisolver"):
+                    _base = getattr(_fcis, _name, None)
+                    if _base is None or _base is _fcis:
+                        continue
+                    _release_ws2 = getattr(_base, "release_matvec_cuda_ws_cache", None)
+                    if callable(_release_ws2):
+                        _release_ws2()
+                        break
+        except Exception:
+            pass
+        _flush_gpu_pool()
+
+        _dump_cupy_arrays("z_solve after release_matvec_ws", min_mb=32.0, max_items=24)
+
+        # HF DF-JK CUDA extension workspaces are raw-cudaMalloc-backed and can
+        # persist across phases. After the Z-vector solve, we no longer need
+        # them until later contractions; releasing here avoids a driver-visible
+        # high-water mark that can otherwise dominate the global VRAM peak.
+        try:
+            if (
+                xp is not np
+                and _normalize_bool_env(
+                    _os.environ.get("ASUKA_RELEASE_HF_DFJK_WS_BEFORE_CONTRACT"),
+                    default=True,
+                )
+            ):
+                try:
+                    _df_jk.release_cuda_ext_workspace_cache()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        _flush_gpu_pool()
+
+        # The batched solve is the last place we need the full Hessian matvec
+        # closure (and thus any GPU-resident MO-DF intermediates captured by
+        # newton_casscf's h_op).  Keeping it alive across the subsequent per-root
+        # gradient loop can inflate peak VRAM by ~O(sizeof(eris/Lpq)).  Strip the
+        # operator down to the lightweight metadata we still need (CI unflatten,
+        # sizes, gpu_mode flag).
+        if _normalize_bool_env(_os.environ.get("ASUKA_ZVECTOR_STRIP_HESS_OP"), default=True):
+            try:
+                from asuka.mcscf.zvector import MCSCFHessianOp as _MCSCFHessianOp  # noqa: PLC0415
+
+                def _mv_stripped(_x: np.ndarray) -> np.ndarray:
+                    raise RuntimeError("Hessian operator matvec was stripped after batched Z-vector solve")
+
+                hess_op = _MCSCFHessianOp(
+                    mv=_mv_stripped,
+                    diag=None,
+                    n_orb=int(hess_op.n_orb),
+                    n_ci=int(hess_op.n_ci),
+                    ci_template=hess_op.ci_template,
+                    ci_unflatten=hess_op.ci_unflatten,
+                    orb_only=bool(hess_op.orb_only),
+                    is_sa=bool(hess_op.is_sa),
+                    ci_ref_list=hess_op.ci_ref_list,
+                    sa_gram_inv=hess_op.sa_gram_inv,
+                    gpu_mode=bool(getattr(hess_op, "gpu_mode", False)),
+                )
+            except Exception:
+                # Best-effort: keep legacy behavior if anything goes wrong.
+                pass
+
+            # eris_sa is only used to build the Hessian op / RHS for Z-vector.
+            # Once Z is solved (batched path), freeing it reduces baseline VRAM
+            # for the rest of the gradient phase.
+            try:
+                # Be robust against lingering references to `eris_sa` (e.g. via
+                # matvec closures): proactively clear the largest GPU arrays so
+                # they can be freed even if the container object itself is kept
+                # alive by some other referrer.
+                for _name in ("L_pi", "L_pu", "L_uv", "ppaa", "papa", "vhf_c", "j_pc", "k_pc"):
+                    try:
+                        if hasattr(eris_sa, _name):
+                            setattr(eris_sa, _name, None)
+                    except Exception:
+                        pass
+                del eris_sa
+            except Exception:
+                pass
+            _flush_gpu_pool()
+
+    def _finalize_root_after_df_delta(
+        *,
+        K: int,
+        de_df_delta_np: np.ndarray,
+        gfock_K: Any,
+        D_tot_K: Any,
+        D_act_lci: Any,
+        D_L_lorb: Any,
+        Lorb_mat: Any,
+        dm1_lci: Any,
+        dm2_lci: Any,
+    ) -> None:
+        """Finish per-root gradient once DF 2e delta (de_df_delta_np) is available."""
+        nonlocal _t_1e_pulay, _t_response_pulay
+
+        # ── Single fused 1e call: delta from SA + lci + lorb ──
+        if _gpu_1e_tensor_path:
+            with _main_stream_cm:
+                D_1e_delta = xp.asarray(D_tot_K - D_tot_sa + D_act_lci + D_L_lorb, dtype=xp.float64)
+        else:
+            with _main_stream_cm:
+                D_1e_delta = _asnumpy_f64(D_tot_K - D_tot_sa + D_act_lci + D_L_lorb)
+        de_h1_delta = _contract_hcore_fast(D_1e_delta)
+
+        # ── Per-root Pulay delta: -Tr((W_K - W_sa) · dS/dR) ──
+        t0 = time.perf_counter()
+        _gfock_lci_raw, _, _, _, _ = _build_gfock_casscf_df(
+            B_ao, h_ao, C, ncore=int(ncore), ncas=int(ncas),
+            dm1_act=xp.asarray(dm1_lci, dtype=xp.float64),
+            dm2_act=xp.asarray(dm2_lci, dtype=xp.float64),
+        )
+        if _gpu_1e_tensor_path and W_sa_xp is not None and C_occ_xp is not None:
+            with _main_stream_cm:
+                gfock_K_xp = xp.asarray(gfock_K, dtype=xp.float64)
+                _tmp_K = C @ gfock_K_xp[:, :nocc]  # (nao, nocc)
+                W_K_xp = 0.5 * (_tmp_K @ C_occ_xp.T + C_occ_xp @ _tmp_K.T)
+                _dgfock_lci = xp.asarray(_gfock_lci_raw, dtype=xp.float64) - xp.asarray(_gfock_zero_xp, dtype=xp.float64)
+                _dme0_lci = C @ (0.5 * (_dgfock_lci + _dgfock_lci.T)) @ C.T
+                _dme0_lorb = _build_dme0_lorb_response(
+                    B_ao, h_ao, C, np.asarray(Lorb_mat, dtype=np.float64),
+                    dm1_sa_xp, dm2_sa_xp,
+                    ppaa_sa, papa_sa,
+                    ncore=int(ncore), ncas=int(ncas),
+                    vhf_cache=_vhf_cache,
+                    lorb_cache=_lorb_resp_cache,
+                    return_xp=True,
+                )
+                _W_delta = W_K_xp - W_sa_xp + _dme0_lci + _dme0_lorb
+        else:
+            with _main_stream_cm:
+                gfock_K_np = _asnumpy_f64(gfock_K)
+            _tmp_K = C_np @ gfock_K_np[:, :nocc]  # (nao, nocc)
+            W_K = 0.5 * (_tmp_K @ C_occ_np.T + C_occ_np @ _tmp_K.T)
+            _dgfock_lci = _asnumpy_f64(_gfock_lci_raw) - _gfock_zero_np
+            _dme0_lci = C_np @ (0.5 * (_dgfock_lci + _dgfock_lci.T)) @ C_np.T
+            _dme0_lorb = _build_dme0_lorb_response(
+                B_ao, h_ao, C_np, np.asarray(Lorb_mat, dtype=np.float64),
+                _asnumpy_f64(dm1_sa), _asnumpy_f64(dm2_sa),
+                ppaa_sa, papa_sa,
+                ncore=int(ncore), ncas=int(ncas),
+                vhf_cache=_vhf_cache,
+                lorb_cache=_lorb_resp_cache,
+            )
+            _W_delta = W_K - W_sa + _dme0_lci + _dme0_lorb
+        de_pulay_delta = _contract_pulay_fast(_W_delta)
+        if _profile_df_per_root:
+            _t_response_pulay += time.perf_counter() - t0
+
+        grad_K = np.asarray(
+            grad_sa_base + de_df_delta_np + de_h1_delta + de_pulay_delta,
+            dtype=np.float64,
+        )
+        grads_out[int(K)] = grad_K
+        _log_vram(f"root {K} done")
+        _flush_gpu_pool()
+
+    def _maybe_release_hf_dfjk_ws_before_contract() -> None:
+        """Release HF DF-JK cached CUDA work buffers before launching DF contraction kernels.
+
+        The HF DF-JK CUDA extension keeps some workspaces backed by raw
+        ``cudaMalloc`` (not the CuPy pool). Dropping them right before the DF
+        derivative contraction reduces peak driver-visible VRAM without
+        affecting numerical results.
+        """
+        if xp is np:
+            return
+        if not _normalize_bool_env(_os.environ.get("ASUKA_RELEASE_HF_DFJK_WS_BEFORE_CONTRACT"), default=True):
+            return
+        try:
+            _df_jk.release_cuda_ext_workspace_cache()
+        except Exception:
+            return
+        _flush_gpu_pool()
+
+    def _contract_df_delta_batch_from_pending(pending_batch: list[dict[str, Any]]) -> np.ndarray:
+        """Contract a pending delta batch from (preferred) adjoints or (fallback) bar_L.
+
+        Side-effects:
+        - If SA DF contraction was deferred, this function may fuse SA into the first batch.
+          It updates `grad_sa_base` and fills `de_df_sa_np` in that case.
+        - Drops large temporary adjoint buffers stored in the pending items.
+        """
+        nonlocal de_df_sa_np, grad_sa_base, _sa_bar_X_dev, _sa_bar_V_dev, _sa_nao_sph, _sa_df_fused
+        import cupy as cp  # noqa: PLC0415
+
+        if df_grad_ctx is None:
+            raise RuntimeError("internal error: df_grad_ctx is required for batched delta contraction")
+
+        df_grad_ctx.ensure_cuda()
+
+        bar_X_list: list[Any] = []
+        bar_V_list: list[Any] = []
+        nao_sph_val: int | None = None
+        for item in pending_batch:
+            if ("_bar_X" in item) and ("_bar_V" in item) and ("_nao_sph" in item):
+                bar_X_dev = item["_bar_X"]
+                bar_V_dev = item["_bar_V"]
+                nao_sph_i = int(item["_nao_sph"])
+            else:
+                bar_L = item.get("bar_L")
+                if bar_L is None:
+                    raise RuntimeError("internal error: pending delta batch item missing bar_L/adjoints")
+                bar_X_dev, bar_V_dev, nao_sph_i = df_grad_ctx._adjoints_device_from_sph_qp(  # noqa: SLF001
+                    B_sph=B_ao,
+                    bar_L_sph=bar_L,
+                    precision=str(_delta_batch_precision),
+                )
+                item["_bar_X"] = bar_X_dev
+                item["_bar_V"] = bar_V_dev
+                item["_nao_sph"] = int(nao_sph_i)
+                try:
+                    del item["bar_L"]
+                except Exception:
+                    pass
+
+            bar_X_list.append(bar_X_dev)
+            bar_V_list.append(bar_V_dev)
+            if nao_sph_val is None:
+                nao_sph_val = int(nao_sph_i)
+            elif int(nao_sph_val) != int(nao_sph_i):
+                raise RuntimeError("inconsistent nao_sph across pending delta batch items")
+
+        sa_included = False
+        if (
+            de_df_sa_np is None
+            and (_sa_bar_X_dev is not None)
+            and (_sa_bar_V_dev is not None)
+            and (_sa_nao_sph is not None)
+        ):
+            if nao_sph_val is None:
+                nao_sph_val = int(_sa_nao_sph)
+            elif int(nao_sph_val) != int(_sa_nao_sph):
+                raise RuntimeError("inconsistent nao_sph between SA and delta adjoints")
+            bar_X_list = [_sa_bar_X_dev] + bar_X_list
+            bar_V_list = [_sa_bar_V_dev] + bar_V_list
+            sa_included = True
+
+        _maybe_release_hf_dfjk_ws_before_contract()
+
+        used_fused_multibar = False
+        try:
+            grad_multi_dev = df_grad_ctx._contract_device_from_adjoints_sph_qp_multibar(  # noqa: SLF001
+                bar_X_list,
+                bar_V_list,
+                nao_sph=int(nao_sph_val or 0),
+            )
+            out = np.asarray(cp.asnumpy(grad_multi_dev), dtype=np.float64)
+            used_fused_multibar = True
+        except Exception:
+            out_list: list[np.ndarray] = []
+            for bx, bv in zip(bar_X_list, bar_V_list):
+                g_dev = df_grad_ctx._contract_device_from_adjoints_sph_qp(  # noqa: SLF001
+                    bx,
+                    bv,
+                    nao_sph=int(nao_sph_val or 0),
+                    grad_dev=None,
+                )
+                out_list.append(np.asarray(cp.asnumpy(g_dev), dtype=np.float64))
+            out = np.stack(out_list, axis=0)
+
+        expected = int(len(pending_batch)) + (1 if bool(sa_included) else 0)
+        if int(out.shape[0]) != int(expected):
+            raise RuntimeError(
+                "batched DF delta contraction returned unexpected shape "
+                f"{tuple(map(int, out.shape))} for nbar={int(expected)}"
+            )
+
+        if bool(sa_included):
+            de_df_sa_np = np.asarray(out[0], dtype=np.float64)
+            grad_sa_base += de_df_sa_np
+            out = np.asarray(out[1:], dtype=np.float64)
+            if bool(used_fused_multibar):
+                _sa_df_fused = True
+            _sa_bar_X_dev = None
+            _sa_bar_V_dev = None
+            _sa_nao_sph = None
+
+        # Drop large adjoint buffers before response/Pulay work to reduce peak VRAM.
+        for item in pending_batch:
+            for k in ("_bar_X", "_bar_V", "_nao_sph"):
+                try:
+                    del item[k]
+                except Exception:
+                    pass
+
+        return np.asarray(out, dtype=np.float64)
+
+    def _finalize_pending_batch_with_df_deltas(pending_batch: list[dict[str, Any]], de_df_delta_multi: np.ndarray) -> None:
+        for _i, _item in enumerate(pending_batch):
+            _finalize_root_after_df_delta(
+                K=int(_item["K"]),
+                de_df_delta_np=np.asarray(de_df_delta_multi[int(_i)], dtype=np.float64),
+                gfock_K=_item["gfock_K"],
+                D_tot_K=_item["D_tot_K"],
+                D_act_lci=_item["D_act_lci"],
+                D_L_lorb=_item["D_L_lorb"],
+                Lorb_mat=_item["Lorb_mat"],
+                dm1_lci=_item["dm1_lci"],
+                dm2_lci=_item["dm2_lci"],
+            )
+            try:
+                del _item["Lorb_mat"]
+            except Exception:
+                pass
+
+    def _finalize_pending_batch_sequential(pending_batch: list[dict[str, Any]]) -> None:
+        """Hard fallback: sequentially contract each pending root and finalize."""
+        nonlocal de_df_sa_np, grad_sa_base, _sa_bar_X_dev, _sa_bar_V_dev, _sa_nao_sph
+
+        if df_grad_ctx is None:
+            raise RuntimeError("internal error: df_grad_ctx is required for sequential delta finalize")
+
+        df_grad_ctx.ensure_cuda()
+        _maybe_release_hf_dfjk_ws_before_contract()
+
+        # If SA DF contraction was deferred, do it now (single-bar path).
+        if (
+            de_df_sa_np is None
+            and (_sa_bar_X_dev is not None)
+            and (_sa_bar_V_dev is not None)
+            and (_sa_nao_sph is not None)
+        ):
+            import cupy as cp  # noqa: PLC0415
+
+            df_grad_ctx.ensure_cuda()
+            g_sa_dev = df_grad_ctx._contract_device_from_adjoints_sph_qp(  # noqa: SLF001
+                _sa_bar_X_dev,
+                _sa_bar_V_dev,
+                nao_sph=int(_sa_nao_sph),
+                grad_dev=None,
+            )
+            de_df_sa_np = np.asarray(cp.asnumpy(g_sa_dev), dtype=np.float64)
+            grad_sa_base += de_df_sa_np
+            _sa_bar_X_dev = None
+            _sa_bar_V_dev = None
+            _sa_nao_sph = None
+
+        for _item in pending_batch:
+            if ("_bar_X" in _item) and ("_bar_V" in _item) and ("_nao_sph" in _item):
+                import cupy as cp  # noqa: PLC0415
+
+                try:
+                    g_dev = df_grad_ctx._contract_device_from_adjoints_sph_qp(  # noqa: SLF001
+                        _item["_bar_X"],
+                        _item["_bar_V"],
+                        nao_sph=int(_item["_nao_sph"]),
+                        grad_dev=None,
+                    )
+                    de_df_i = np.asarray(cp.asnumpy(g_dev), dtype=np.float64)
+                except Exception:
+                    _bar_L = _item.get("bar_L")
+                    if _bar_L is None:
+                        raise
+                    de_df_i = np.asarray(_contract_df_delta_sync(_bar_L), dtype=np.float64)
+            else:
+                _bar_L = _item.get("bar_L")
+                if _bar_L is None:
+                    raise RuntimeError("internal error: pending delta item missing bar_L/adjoints")
+                de_df_i = np.asarray(_contract_df_delta_sync(_bar_L), dtype=np.float64)
+
+            _finalize_root_after_df_delta(
+                K=int(_item["K"]),
+                de_df_delta_np=np.asarray(de_df_i, dtype=np.float64),
+                gfock_K=_item["gfock_K"],
+                D_tot_K=_item["D_tot_K"],
+                D_act_lci=_item["D_act_lci"],
+                D_L_lorb=_item["D_L_lorb"],
+                Lorb_mat=_item["Lorb_mat"],
+                dm1_lci=_item["dm1_lci"],
+                dm2_lci=_item["dm2_lci"],
+            )
+
+            # Drop large buffers as soon as each root is finalized.
+            for _k in ("_bar_X", "_bar_V", "_nao_sph", "bar_L", "Lorb_mat"):
+                try:
+                    del _item[_k]
+                except Exception:
+                    pass
+
     for K in range(nroots):
         # Drain free CuPy blocks between roots so pool caching does not inflate
         # driver-visible VRAM and trigger avoidable OOM on small GPUs.
@@ -4656,6 +5627,8 @@ def casscf_nuc_grad_df_per_root(
             _flush_gpu_pool()
         if _profile_df_per_root:
             _t_gfock += time.perf_counter() - t0
+
+        t_rhs_start = time.perf_counter()
 
         # Step B/C: Z-vector RHS + solve (legacy) or batched pre-solved path.
         rhs_orb = None
@@ -4722,6 +5695,9 @@ def casscf_nuc_grad_df_per_root(
                 rhs_ci.append(np.zeros_like(np.asarray(ci_list[r], dtype=np.float64).ravel()))
             ndet_K = int(np.asarray(ci_list[K]).size)
             rhs_ci[K] = rhs_ci_K[:ndet_K]
+
+            if _profile_df_per_root:
+                _t_rhs_build += time.perf_counter() - t_rhs_start
 
             t0 = time.perf_counter()
             _x0_use = _z_prev_x0 if (_z_use_x0 and _z_prev_x0 is not None) else None
@@ -5262,10 +6238,64 @@ def casscf_nuc_grad_df_per_root(
                 continue
 
         # Synchronous contraction (CPU / single-stream CUDA fallback)
+        if bool(_use_batched_delta_contract) and bool(is_spherical) and bool(is_qp) and df_grad_ctx is not None:
+            # Enqueue this root and flush in batches to reuse the expensive 3c derivative integral work.
+            _pending_item: dict[str, Any] = {
+                "K": int(K),
+                "gfock_K": gfock_K,
+                "D_tot_K": D_tot_K,
+                "D_act_lci": D_act_lci,
+                "D_L_lorb": D_L_lorb,
+                # Needed for response Pulay (-Tr(W_delta dS/dR)); must be root-specific.
+                "Lorb_mat": np.asarray(Lorb_mat, dtype=np.float64),
+                "dm1_lci": dm1_lci,
+                "dm2_lci": dm2_lci,
+            }
+            # Prefer stashing adjoints instead of bar_L to keep the pending queue cheap in VRAM.
+            try:
+                df_grad_ctx.ensure_cuda()
+                bar_X_dev, bar_V_dev, nao_sph_i = df_grad_ctx._adjoints_device_from_sph_qp(  # noqa: SLF001
+                    B_sph=B_ao,
+                    bar_L_sph=bar_L_contract,
+                    precision=str(_delta_batch_precision),
+                )
+                _pending_item["_bar_X"] = bar_X_dev
+                _pending_item["_bar_V"] = bar_V_dev
+                _pending_item["_nao_sph"] = int(nao_sph_i)
+            except Exception:
+                # If adjoint build fails, keep bar_L and build adjoints during flush.
+                _pending_item["bar_L"] = bar_L_contract
+            _batched_pending.append(_pending_item)
+            # Drop local refs that are no longer needed until the batch is contracted/finalized.
+            bar_L_delta_total = None
+            bar_L_contract = None
+            bar_L_terms_contract = None
+            de_df_delta_precomputed = None
+
+            # If the batch isn't full yet and we are not on the last root, continue building the next root.
+            if int(len(_batched_pending)) < int(_delta_batch_nbar) and int(K) < int(nroots) - 1:
+                continue
+
+            _pending_batch = list(_batched_pending)
+            _batched_pending.clear()
+
+            try:
+                t0 = time.perf_counter()
+                de_df_delta_multi = _contract_df_delta_batch_from_pending(_pending_batch)
+                if _profile_df_per_root:
+                    _t_contract_delta += time.perf_counter() - t0
+            except Exception:
+                _finalize_pending_batch_sequential(_pending_batch)
+                continue
+
+            _finalize_pending_batch_with_df_deltas(_pending_batch, de_df_delta_multi)
+            continue
+
         if de_df_delta_precomputed is not None:
             de_df_delta = np.asarray(de_df_delta_precomputed, dtype=np.float64)
         else:
             try:
+                _maybe_release_hf_dfjk_ws_before_contract()
                 if bool(_vram_debug_fine):
                     _log_vram(f"root {K} delta2e contract start")
                 t0 = time.perf_counter()
@@ -5304,6 +6334,7 @@ def casscf_nuc_grad_df_per_root(
                             )
                 if bool(_vram_debug_fine):
                     _log_vram(f"root {K} delta2e contract done")
+                    _dump_cupy_arrays(f"root {K} delta2e contract done", min_mb=32.0, max_items=24)
                 if _profile_df_per_root:
                     _t_contract_delta += time.perf_counter() - t0
             except (NotImplementedError, RuntimeError, ValueError) as e:
@@ -5490,6 +6521,14 @@ def casscf_nuc_grad_df_per_root(
             f"nroots={int(nroots)} streams={nstreams} "
             f"bar_L_sa={_t_bar_L_sa:.3f}s contract_sa={_t_contract_sa:.3f}s "
             f"bar_L_delta={_t_bar_L_delta:.3f}s contract_delta={_t_contract_delta:.3f}s "
+            f"delta_batch={int(bool(_use_batched_delta_contract))} "
+            f"delta_batch_nbar={int(_delta_batch_nbar)} "
+            f"delta_batch_prec={str(_delta_batch_precision)} "
+            f"sa_df_deferred={int(bool(_sa_df_deferred))} "
+            f"sa_df_fused={int(bool(_sa_df_fused))} "
+            f"t_vhf_cache={_t_vhf_cache:.3f}s t_gfock_zero={_t_gfock_zero:.3f}s "
+            f"t_newton_ao2mo={_t_newton_ao2mo:.3f}s t_newton_hess={_t_newton_hess:.3f}s "
+            f"t_sa_prep={_t_sa_prep:.3f}s t_rhs_build={_t_rhs_build:.3f}s "
             f"barL_hybrid={int(bool(_barl_hybrid_enabled))} "
             f"barL_stage={_barl_stage_effective} "
             f"barL_ab_checked={int(bool(_barl_ab_checked))} "

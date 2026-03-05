@@ -144,6 +144,84 @@ __device__ __forceinline__ double df_bar_cart_from_sph_qmn_stream(
       nao_sph);
 }
 
+// Packed-Qp bar_X variant: bar_X stored in packed AO-pair ("s2") layout per Q:
+//   bar_X_sph_Qp[q, p] where p indexes (i>=j) pairs in row-major lower triangle.
+__device__ __forceinline__ int64_t tri_index_s2(int i, int j) {
+  if (j > i) {
+    const int tmp = i;
+    i = j;
+    j = tmp;
+  }
+  return (static_cast<int64_t>(i) * (static_cast<int64_t>(i) + 1)) / 2 + static_cast<int64_t>(j);
+}
+
+template <typename T>
+__device__ __forceinline__ double df_bar_cart_from_sph_qp_t(
+    const T* __restrict__ bar_X_sph_Qp,  // [naux, ntri] C-order
+    int q,
+    int ia_cart,
+    int ib_cart,
+    int la,
+    int lb,
+    int a0_sph,
+    int b0_sph,
+    int nao_sph) {
+  const int nA_sph = nsph(la);
+  const int nB_sph = nsph(lb);
+  const int64_t ntri = (static_cast<int64_t>(nao_sph) * static_cast<int64_t>(nao_sph + 1)) / 2;
+  const int64_t base_q = static_cast<int64_t>(q) * ntri;
+  double acc = 0.0;
+#pragma unroll
+  for (int isA = 0; isA < 11; ++isA) {
+    if (isA >= nA_sph) break;
+    const double ta = cart2sph_coeff(la, ia_cart, isA);
+    if (ta == 0.0) continue;
+    const int i = a0_sph + isA;
+#pragma unroll
+    for (int isB = 0; isB < 11; ++isB) {
+      if (isB >= nB_sph) break;
+      const double tb = cart2sph_coeff(lb, ib_cart, isB);
+      if (tb == 0.0) continue;
+      const int j = b0_sph + isB;
+      const int64_t p = tri_index_s2(i, j);
+      acc += (ta * tb) * static_cast<double>(bar_X_sph_Qp[base_q + p]);
+    }
+  }
+  return acc;
+}
+
+__device__ __forceinline__ double df_bar_cart_from_sph_qp(
+    const double* __restrict__ bar_X_sph_Qp,  // [naux, ntri] C-order
+    int q,
+    int ia_cart,
+    int ib_cart,
+    int la,
+    int lb,
+    int a0_sph,
+    int b0_sph,
+    int nao_sph) {
+  return df_bar_cart_from_sph_qp_t<double>(bar_X_sph_Qp, q, ia_cart, ib_cart, la, lb, a0_sph, b0_sph, nao_sph);
+}
+
+template <typename T>
+__device__ __forceinline__ double df_bar_cart_from_sph_qp_stream(
+    const T* __restrict__ bar_X_sph_Qp,  // [naux, ntri] C-order
+    int q_abs,
+    int q_offset,
+    int q_count,
+    int ia_cart,
+    int ib_cart,
+    int la,
+    int lb,
+    int a0_sph,
+    int b0_sph,
+    int nao_sph) {
+  const int q_rel = q_abs - q_offset;
+  if (q_rel < 0 || q_rel >= q_count) return 0.0;
+  // bar_X_sph_Qp is stored as a full [naux, ntri] tensor; keep absolute indexing (q_abs).
+  return df_bar_cart_from_sph_qp_t<T>(bar_X_sph_Qp, q_abs, ia_cart, ib_cart, la, lb, a0_sph, b0_sph, nao_sph);
+}
+
 __device__ __forceinline__ void fill_cart_comp(int l, int8_t* lx, int8_t* ly, int8_t* lz) {
   int idx = 0;
   for (int x = l; x >= 0; --x) {
@@ -260,6 +338,18 @@ __device__ __forceinline__ double warp_reduce_sum(double x) {
 
 template <int N>
 __device__ __forceinline__ void warp_reduce_sum_arr(double (&v)[N]) {
+  for (int offset = 16; offset > 0; offset >>= 1) {
+#pragma unroll
+    for (int i = 0; i < N; ++i) {
+      v[i] += __shfl_down_sync(0xffffffff, v[i], offset);
+    }
+  }
+}
+
+// Pointer overload for cases where the reduced segment is a slice of a larger
+// array and `N` cannot be deduced from the argument type.
+template <int N>
+__device__ __forceinline__ void warp_reduce_sum_arr(double* v) {
   for (int offset = 16; offset > 0; offset >>= 1) {
 #pragma unroll
     for (int i = 0; i < N; ++i) {
@@ -1654,6 +1744,785 @@ __global__ void KernelDFInt3c2eDerivContractedCartAllSPAtomGradSphBarQmn(
   }
 }
 
+// Packed-Qp spherical bar_X variant: consumes bar_X in packed Qp layout (s2 packed AO pairs) in spherical AO basis
+// and applies the cart<-sph transforms inside the contraction kernel.
+template <int NROOTS, typename TBar>
+__global__ void KernelDFInt3c2eDerivContractedCartAllSPAtomGradSphBarQp(
+    const int32_t* spAB_arr,   // [n_spAB] AO shell-pair indices in this (la,lb) class
+    int n_spAB,
+    const int32_t* spCD,       // [ntasks] aux shell-pair indices
+    int ntasks,
+    const int32_t* sp_A,
+    const int32_t* sp_B,
+    const int32_t* sp_pair_start,
+    const int32_t* sp_npair,
+    const double* shell_cx,
+    const double* shell_cy,
+    const double* shell_cz,
+    const int32_t* shell_prim_start,
+    const int32_t* shell_nprim,
+    const int32_t* shell_ao_start,
+    const double* prim_exp,
+    const double* pair_eta,
+    const double* pair_Px,
+    const double* pair_Py,
+    const double* pair_Pz,
+    const double* pair_cK,
+    int nao,
+    int naux,
+    int nao_sph,
+    int la,
+    int lb,
+    int lc,
+    const TBar* bar_X_sph_Qp,          // [naux*ntri] (Q,p) packed lower-triangle in spherical AO basis
+    const int32_t* shell_ao_start_sph, // spherical AO start offset per AO shell
+    const int32_t* shell_atom,         // combined AO+aux shell->atom map (length: nAOshells+nAuxShells)
+    int q_offset,                      // absolute aux AO start index for streamed bar_X
+    int q_count,                       // number of aux AO rows in streamed bar_X
+    double* grad_dev) {                // [natm*3] gradient accumulator (atomicAdd target)
+  const int t   = static_cast<int>(blockIdx.x);  // CD task index
+  const int iAB = static_cast<int>(blockIdx.y);  // AB class index
+  if (t >= ntasks || iAB >= n_spAB) return;
+
+  const int spAB   = static_cast<int>(spAB_arr[iAB]);
+  const int spCD_i = static_cast<int>(spCD[t]);
+
+  // --- Shared memory (identical layout to KernelDFInt3c2eDerivContractedCartBatch) ---
+  __shared__ int8_t shA_lx[kNcartMax], shA_ly[kNcartMax], shA_lz[kNcartMax];
+  __shared__ int8_t shB_lx[kNcartMax], shB_ly[kNcartMax], shB_lz[kNcartMax];
+  __shared__ int8_t shC_lx[kNcartMax], shC_ly[kNcartMax], shC_lz[kNcartMax];
+  __shared__ double sh_xij_pow[kLMaxD + 1], sh_yij_pow[kLMaxD + 1], sh_zij_pow[kLMaxD + 1];
+
+  __shared__ double sh_Gx[kMaxWarpsPerBlock][kGSizeD];
+  __shared__ double sh_Gy[kMaxWarpsPerBlock][kGSizeD];
+  __shared__ double sh_Gz[kMaxWarpsPerBlock][kGSizeD];
+
+  __shared__ double sh_warp_sum[kMaxWarpsPerBlock][9];
+  __shared__ double sh_bar[kBarCacheMax];
+
+  const int shellA = static_cast<int>(sp_A[spAB]);
+  const int shellB = static_cast<int>(sp_B[spAB]);
+  const int shellC = static_cast<int>(sp_A[spCD_i]);
+
+  const int nA = ncart(la);
+  const int nB = ncart(lb);
+  const int nC = ncart(lc);
+  const int nElem = nA * nB * nC;
+
+  const int c0 = static_cast<int>(shell_ao_start[shellC]) - nao;
+
+  const int a0_sph = static_cast<int>(shell_ao_start_sph[shellA]);
+  const int b0_sph = static_cast<int>(shell_ao_start_sph[shellB]);
+
+  const int baseAB = static_cast<int>(sp_pair_start[spAB]);
+  const int baseCD = static_cast<int>(sp_pair_start[spCD_i]);
+  const int nprimAB = static_cast<int>(sp_npair[spAB]);
+  const int nprimCD = static_cast<int>(sp_npair[spCD_i]);
+
+  const int nprimB = static_cast<int>(shell_nprim[shellB]);
+  const int sA = static_cast<int>(shell_prim_start[shellA]);
+  const int sB = static_cast<int>(shell_prim_start[shellB]);
+  const int sC = static_cast<int>(shell_prim_start[shellC]);
+
+  const double Ax = shell_cx[shellA];
+  const double Ay = shell_cy[shellA];
+  const double Az = shell_cz[shellA];
+  const double Bx = shell_cx[shellB];
+  const double By = shell_cy[shellB];
+  const double Bz = shell_cz[shellB];
+  const double Cx = shell_cx[shellC];
+  const double Cy = shell_cy[shellC];
+  const double Cz = shell_cz[shellC];
+
+  if (threadIdx.x == 0) {
+    fill_cart_comp(la, shA_lx, shA_ly, shA_lz);
+    fill_cart_comp(lb, shB_lx, shB_ly, shB_lz);
+    fill_cart_comp(lc, shC_lx, shC_ly, shC_lz);
+
+    const double ABx = Ax - Bx;
+    const double ABy = Ay - By;
+    const double ABz = Az - Bz;
+    sh_xij_pow[0] = 1.0;
+    sh_yij_pow[0] = 1.0;
+    sh_zij_pow[0] = 1.0;
+    for (int p = 1; p <= kLMaxD; ++p) {
+      sh_xij_pow[p] = sh_xij_pow[p - 1] * ABx;
+      sh_yij_pow[p] = sh_yij_pow[p - 1] * ABy;
+      sh_zij_pow[p] = sh_zij_pow[p - 1] * ABz;
+    }
+  }
+
+  const bool cache_bar = (nElem > 0 && nElem <= kBarCacheMax);
+  if (cache_bar) {
+    for (int idx = static_cast<int>(threadIdx.x); idx < nElem; idx += static_cast<int>(blockDim.x)) {
+      const int ia = idx / (nB * nC);
+      const int rem = idx - ia * (nB * nC);
+      const int ib = rem / nC;
+      const int ic = rem - ib * nC;
+      const int q = c0 + ic;
+      sh_bar[idx] = df_bar_cart_from_sph_qp_stream(
+          bar_X_sph_Qp,
+          q,
+          q_offset,
+          q_count,
+          ia,
+          ib,
+          la,
+          lb,
+          a0_sph,
+          b0_sph,
+          nao_sph);
+    }
+  }
+
+  __syncthreads();
+
+  // Block-level bar_X early-exit: skip block if max|sh_bar| < threshold.
+  if (cache_bar) {
+    double tmax = 0.0;
+    for (int idx = static_cast<int>(threadIdx.x); idx < nElem; idx += static_cast<int>(blockDim.x)) {
+      double v = static_cast<double>(sh_bar[idx]);
+      if (v < 0.0) v = -v;
+      if (v > tmax) tmax = v;
+    }
+    for (int offset = 16; offset > 0; offset >>= 1) {
+      double other = __shfl_down_sync(0xffffffff, tmax, offset);
+      if (other > tmax) tmax = other;
+    }
+    {
+      const int lane_ = static_cast<int>(threadIdx.x) & 31;
+      const int warp_ = static_cast<int>(threadIdx.x) >> 5;
+      if (lane_ == 0) sh_warp_sum[warp_][0] = tmax;
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+      double bmax = sh_warp_sum[0][0];
+      const int nw = static_cast<int>(blockDim.x) >> 5;
+      for (int w = 1; w < nw; ++w) {
+        if (sh_warp_sum[w][0] > bmax) bmax = sh_warp_sum[w][0];
+      }
+      sh_warp_sum[0][0] = bmax;
+    }
+    __syncthreads();
+    if (sh_warp_sum[0][0] < 1e-14) return;
+  }
+
+  const int lane = static_cast<int>(threadIdx.x) & 31;
+  const int warp_id = static_cast<int>(threadIdx.x) >> 5;
+  const int warps = static_cast<int>(blockDim.x) >> 5;
+
+  double acc[9];
+#pragma unroll
+  for (int i = 0; i < 9; ++i) acc[i] = 0.0;
+
+  const int nmax = la + lb + 1;
+  const int mmax = lc + 1;
+  const int64_t nTot = static_cast<int64_t>(nprimAB) * static_cast<int64_t>(nprimCD);
+
+  for (int64_t u = static_cast<int64_t>(warp_id); u < nTot; u += static_cast<int64_t>(warps)) {
+    const int iAB_prim = static_cast<int>(u / static_cast<int64_t>(nprimCD));
+    const int iCD = static_cast<int>(u - static_cast<int64_t>(iAB_prim) * static_cast<int64_t>(nprimCD));
+    const int ki = baseAB + iAB_prim;
+    const int kj = baseCD + iCD;
+
+    const double p = pair_eta[ki];
+    const double q = pair_eta[kj];
+    const double Px = pair_Px[ki];
+    const double Py = pair_Py[ki];
+    const double Pz = pair_Pz[ki];
+    const double Qx = pair_Px[kj];
+    const double Qy = pair_Py[kj];
+    const double Qz = pair_Pz[kj];
+    const double cKab = pair_cK[ki];
+    const double cKcd = pair_cK[kj];
+
+    const int ia_prim = iAB_prim / nprimB;
+    const int ib_prim = iAB_prim - ia_prim * nprimB;
+    const double aexp = prim_exp[sA + ia_prim];
+    const double bexp = prim_exp[sB + ib_prim];
+    const double cexp = prim_exp[sC + iCD];
+
+    const double denom = p + q;
+    const double inv_denom = 1.0 / denom;
+    const double dx = Px - Qx;
+    const double dy = Py - Qy;
+    const double dz = Pz - Qz;
+    const double PQ2 = dx * dx + dy * dy + dz * dz;
+    const double omega = p * q * inv_denom;
+    const double T = omega * PQ2;
+
+    const double base = kTwoPiToFiveHalves / (p * q * ::sqrt(denom)) * cKab * cKcd;
+
+    double roots[NROOTS];
+    double weights[NROOTS];
+    if (lane == 0) {
+      cueri_rys::rys_roots_weights<NROOTS>(T, roots, weights);
+    }
+
+    for (int r = 0; r < NROOTS; ++r) {
+      double x = (lane == 0) ? roots[r] : 0.0;
+      double w = (lane == 0) ? weights[r] : 0.0;
+      x = __shfl_sync(0xffffffff, x, 0);
+      w = __shfl_sync(0xffffffff, w, 0);
+
+      {
+        const double B0 = x * 0.5 * inv_denom;
+        const double B1 = (1.0 - x) * 0.5 / p + B0;
+        const double B1p = (1.0 - x) * 0.5 / q + B0;
+        const double q_over = q * inv_denom;
+        const double p_over = p * inv_denom;
+        if (lane < 3) {
+          double PA, QC, PQd;
+          double* G_target;
+          if (lane == 0) { PA = Px - Ax; QC = Qx - Cx; PQd = Qx - Px; G_target = sh_Gx[warp_id]; }
+          else if (lane == 1) { PA = Py - Ay; QC = Qy - Cy; PQd = Qy - Py; G_target = sh_Gy[warp_id]; }
+          else { PA = Pz - Az; QC = Qz - Cz; PQd = Qz - Pz; G_target = sh_Gz[warp_id]; }
+          compute_G_d(G_target, nmax, mmax, PA + q_over * x * PQd, QC - p_over * x * PQd, B0, B1, B1p);
+        }
+      }
+
+      const double scale = base * w;
+      __syncwarp();
+
+      for (int idx = lane; idx < nElem; idx += 32) {
+        const int ia = idx / (nB * nC);
+        const int rem = idx - ia * (nB * nC);
+        const int ib = rem / nC;
+        const int ic = rem - ib * nC;
+
+        double bar = 0.0;
+        if (cache_bar) {
+          bar = sh_bar[idx];
+        } else {
+          const int q_idx = c0 + ic;
+          bar = df_bar_cart_from_sph_qp_stream(
+              bar_X_sph_Qp,
+              q_idx,
+              q_offset,
+              q_count,
+              ia,
+              ib,
+              la,
+              lb,
+              a0_sph,
+              b0_sph,
+              nao_sph);
+        }
+        if (bar == 0.0) continue;
+
+        const int iax = static_cast<int>(shA_lx[ia]);
+        const int iay = static_cast<int>(shA_ly[ia]);
+        const int iaz = static_cast<int>(shA_lz[ia]);
+        const int ibx = static_cast<int>(shB_lx[ib]);
+        const int iby = static_cast<int>(shB_ly[ib]);
+        const int ibz = static_cast<int>(shB_lz[ib]);
+        const int icx = static_cast<int>(shC_lx[ic]);
+        const int icy = static_cast<int>(shC_ly[ic]);
+        const int icz = static_cast<int>(shC_lz[ic]);
+
+        const double Ix = shift_from_G_ld0_d(sh_Gx[warp_id], iax, ibx, icx, sh_xij_pow);
+        const double Iy = shift_from_G_ld0_d(sh_Gy[warp_id], iay, iby, icy, sh_yij_pow);
+        const double Iz = shift_from_G_ld0_d(sh_Gz[warp_id], iaz, ibz, icz, sh_zij_pow);
+
+        const double bar_scale = bar * scale;
+
+        // Center A derivatives.
+        const double Ix_m_A = (iax > 0) ? shift_from_G_ld0_d(sh_Gx[warp_id], iax - 1, ibx, icx, sh_xij_pow) : 0.0;
+        const double Ix_p_A = shift_from_G_ld0_d(sh_Gx[warp_id], iax + 1, ibx, icx, sh_xij_pow);
+        const double dIx_A = (-static_cast<double>(iax)) * Ix_m_A + (2.0 * aexp) * Ix_p_A;
+        acc[0] += bar_scale * (dIx_A * Iy * Iz);
+
+        const double Iy_m_A = (iay > 0) ? shift_from_G_ld0_d(sh_Gy[warp_id], iay - 1, iby, icy, sh_yij_pow) : 0.0;
+        const double Iy_p_A = shift_from_G_ld0_d(sh_Gy[warp_id], iay + 1, iby, icy, sh_yij_pow);
+        const double dIy_A = (-static_cast<double>(iay)) * Iy_m_A + (2.0 * aexp) * Iy_p_A;
+        acc[1] += bar_scale * (Ix * dIy_A * Iz);
+
+        const double Iz_m_A = (iaz > 0) ? shift_from_G_ld0_d(sh_Gz[warp_id], iaz - 1, ibz, icz, sh_zij_pow) : 0.0;
+        const double Iz_p_A = shift_from_G_ld0_d(sh_Gz[warp_id], iaz + 1, ibz, icz, sh_zij_pow);
+        const double dIz_A = (-static_cast<double>(iaz)) * Iz_m_A + (2.0 * aexp) * Iz_p_A;
+        acc[2] += bar_scale * (Ix * Iy * dIz_A);
+
+        // Center B derivatives.
+        const double Ix_m_B = (ibx > 0) ? shift_from_G_ld0_d(sh_Gx[warp_id], iax, ibx - 1, icx, sh_xij_pow) : 0.0;
+        const double Ix_p_B = shift_from_G_ld0_d(sh_Gx[warp_id], iax, ibx + 1, icx, sh_xij_pow);
+        const double dIx_B = (-static_cast<double>(ibx)) * Ix_m_B + (2.0 * bexp) * Ix_p_B;
+        acc[3] += bar_scale * (dIx_B * Iy * Iz);
+
+        const double Iy_m_B = (iby > 0) ? shift_from_G_ld0_d(sh_Gy[warp_id], iay, iby - 1, icy, sh_yij_pow) : 0.0;
+        const double Iy_p_B = shift_from_G_ld0_d(sh_Gy[warp_id], iay, iby + 1, icy, sh_yij_pow);
+        const double dIy_B = (-static_cast<double>(iby)) * Iy_m_B + (2.0 * bexp) * Iy_p_B;
+        acc[4] += bar_scale * (Ix * dIy_B * Iz);
+
+        const double Iz_m_B = (ibz > 0) ? shift_from_G_ld0_d(sh_Gz[warp_id], iaz, ibz - 1, icz, sh_zij_pow) : 0.0;
+        const double Iz_p_B = shift_from_G_ld0_d(sh_Gz[warp_id], iaz, ibz + 1, icz, sh_zij_pow);
+        const double dIz_B = (-static_cast<double>(ibz)) * Iz_m_B + (2.0 * bexp) * Iz_p_B;
+        acc[5] += bar_scale * (Ix * Iy * dIz_B);
+
+        // Center C derivatives (aux).
+        const double Ix_m_C = (icx > 0) ? shift_from_G_ld0_d(sh_Gx[warp_id], iax, ibx, icx - 1, sh_xij_pow) : 0.0;
+        const double Ix_p_C = shift_from_G_ld0_d(sh_Gx[warp_id], iax, ibx, icx + 1, sh_xij_pow);
+        const double dIx_C = (-static_cast<double>(icx)) * Ix_m_C + (2.0 * cexp) * Ix_p_C;
+        acc[6] += bar_scale * (dIx_C * Iy * Iz);
+
+        const double Iy_m_C = (icy > 0) ? shift_from_G_ld0_d(sh_Gy[warp_id], iay, iby, icy - 1, sh_yij_pow) : 0.0;
+        const double Iy_p_C = shift_from_G_ld0_d(sh_Gy[warp_id], iay, iby, icy + 1, sh_yij_pow);
+        const double dIy_C = (-static_cast<double>(icy)) * Iy_m_C + (2.0 * cexp) * Iy_p_C;
+        acc[7] += bar_scale * (Ix * dIy_C * Iz);
+
+        const double Iz_m_C = (icz > 0) ? shift_from_G_ld0_d(sh_Gz[warp_id], iaz, ibz, icz - 1, sh_zij_pow) : 0.0;
+        const double Iz_p_C = shift_from_G_ld0_d(sh_Gz[warp_id], iaz, ibz, icz + 1, sh_zij_pow);
+        const double dIz_C = (-static_cast<double>(icz)) * Iz_m_C + (2.0 * cexp) * Iz_p_C;
+        acc[8] += bar_scale * (Ix * Iy * dIz_C);
+      }
+
+      __syncwarp();
+    }
+  }
+
+  // Warp reduction then block reduction over warps (lane 0 only).
+  warp_reduce_sum_arr(acc);
+  if (lane == 0) {
+#pragma unroll
+    for (int i = 0; i < 9; ++i) sh_warp_sum[warp_id][i] = acc[i];
+  }
+  __syncthreads();
+
+  if (threadIdx.x == 0) {
+    double sum[9];
+#pragma unroll
+    for (int i = 0; i < 9; ++i) sum[i] = 0.0;
+    for (int w = 0; w < warps; ++w) {
+#pragma unroll
+      for (int i = 0; i < 9; ++i) sum[i] += sh_warp_sum[w][i];
+    }
+    const double fac = (shellA != shellB) ? 2.0 : 1.0;
+    const int atomA = static_cast<int>(shell_atom[shellA]);
+    const int atomB = static_cast<int>(shell_atom[shellB]);
+    const int atomC = static_cast<int>(shell_atom[shellC]);
+    atomicAdd(&grad_dev[atomA * 3 + 0], fac * sum[0]);
+    atomicAdd(&grad_dev[atomA * 3 + 1], fac * sum[1]);
+    atomicAdd(&grad_dev[atomA * 3 + 2], fac * sum[2]);
+    atomicAdd(&grad_dev[atomB * 3 + 0], fac * sum[3]);
+    atomicAdd(&grad_dev[atomB * 3 + 1], fac * sum[4]);
+    atomicAdd(&grad_dev[atomB * 3 + 2], fac * sum[5]);
+    atomicAdd(&grad_dev[atomC * 3 + 0], fac * sum[6]);
+    atomicAdd(&grad_dev[atomC * 3 + 1], fac * sum[7]);
+    atomicAdd(&grad_dev[atomC * 3 + 2], fac * sum[8]);
+  }
+}
+
+
+// Multi-bar (multi-state) spherical bar_X streamed variant.
+//
+// This kernel evaluates the 3c derivative integrals once per block and applies them to
+// `NBAR` independent bar_X tensors, accumulating `NBAR` gradients in one pass.
+//
+// `bar_X_sph_Qmn_multi` stores `NBAR` chunks of shape [bar_stride] each, where the first
+// `q_count*nao_sph*nao_sph` elements of each chunk are a (Q,m,n) buffer for Q in
+// [q_offset, q_offset+q_count). `bar_stride` may be >= q_count*nao_sph*nao_sph (padding).
+template <int NROOTS, int NBAR>
+__global__ void KernelDFInt3c2eDerivContractedCartAllSPAtomGradSphBarQmnMultiBar(
+    const int32_t* spAB_arr,   // [n_spAB] AO shell-pair indices in this (la,lb) class
+    int n_spAB,
+    const int32_t* spCD,       // [ntasks] aux shell-pair indices
+    int ntasks,
+    const int32_t* sp_A,
+    const int32_t* sp_B,
+    const int32_t* sp_pair_start,
+    const int32_t* sp_npair,
+    const double* shell_cx,
+    const double* shell_cy,
+    const double* shell_cz,
+    const int32_t* shell_prim_start,
+    const int32_t* shell_nprim,
+    const int32_t* shell_ao_start,
+    const double* prim_exp,
+    const double* pair_eta,
+    const double* pair_Px,
+    const double* pair_Py,
+    const double* pair_Pz,
+    const double* pair_cK,
+    int nao,
+    int naux,
+    int nao_sph,
+    int la,
+    int lb,
+    int lc,
+    const double* bar_X_sph_Qmn_multi,  // [NBAR*bar_stride] packed as NBAR chunks
+    int64_t bar_stride,                // stride (elements) between bar chunks
+    const int32_t* shell_ao_start_sph, // spherical AO start offset per AO shell
+    const int32_t* shell_atom,         // combined AO+aux shell->atom map (length: nAOshells+nAuxShells)
+    int q_offset,                      // absolute aux AO start index for streamed bar_X
+    int q_count,                       // number of aux AO rows in streamed bar_X
+    double* grad_dev_multi,            // [NBAR*grad_stride] atomicAdd target
+    int64_t grad_stride) {             // stride (elements) between grad buffers (typically natm*3)
+  const int t   = static_cast<int>(blockIdx.x);  // CD task index
+  const int iAB = static_cast<int>(blockIdx.y);  // AB class index
+  if (t >= ntasks || iAB >= n_spAB) return;
+
+  const int spAB   = static_cast<int>(spAB_arr[iAB]);
+  const int spCD_i = static_cast<int>(spCD[t]);
+
+  // --- Shared memory (identical layout to KernelDFInt3c2eDerivContractedCartAllSPAtomGradSphBarQmn) ---
+  __shared__ int8_t shA_lx[kNcartMax], shA_ly[kNcartMax], shA_lz[kNcartMax];
+  __shared__ int8_t shB_lx[kNcartMax], shB_ly[kNcartMax], shB_lz[kNcartMax];
+  __shared__ int8_t shC_lx[kNcartMax], shC_ly[kNcartMax], shC_lz[kNcartMax];
+  __shared__ double sh_xij_pow[kLMaxD + 1], sh_yij_pow[kLMaxD + 1], sh_zij_pow[kLMaxD + 1];
+
+  __shared__ double sh_Gx[kMaxWarpsPerBlock][kGSizeD];
+  __shared__ double sh_Gy[kMaxWarpsPerBlock][kGSizeD];
+  __shared__ double sh_Gz[kMaxWarpsPerBlock][kGSizeD];
+
+  __shared__ double sh_warp_sum[kMaxWarpsPerBlock][9 * NBAR];
+  __shared__ double sh_bar[NBAR * kBarCacheMax];
+
+  const int shellA = static_cast<int>(sp_A[spAB]);
+  const int shellB = static_cast<int>(sp_B[spAB]);
+  const int shellC = static_cast<int>(sp_A[spCD_i]);
+
+  const int nA = ncart(la);
+  const int nB = ncart(lb);
+  const int nC = ncart(lc);
+  const int nElem = nA * nB * nC;
+
+  const int c0 = static_cast<int>(shell_ao_start[shellC]) - nao;
+
+  const int a0_sph = static_cast<int>(shell_ao_start_sph[shellA]);
+  const int b0_sph = static_cast<int>(shell_ao_start_sph[shellB]);
+
+  const int baseAB = static_cast<int>(sp_pair_start[spAB]);
+  const int baseCD = static_cast<int>(sp_pair_start[spCD_i]);
+  const int nprimAB = static_cast<int>(sp_npair[spAB]);
+  const int nprimCD = static_cast<int>(sp_npair[spCD_i]);
+
+  const int nprimB = static_cast<int>(shell_nprim[shellB]);
+  const int sA = static_cast<int>(shell_prim_start[shellA]);
+  const int sB = static_cast<int>(shell_prim_start[shellB]);
+  const int sC = static_cast<int>(shell_prim_start[shellC]);
+
+  const double Ax = shell_cx[shellA];
+  const double Ay = shell_cy[shellA];
+  const double Az = shell_cz[shellA];
+  const double Bx = shell_cx[shellB];
+  const double By = shell_cy[shellB];
+  const double Bz = shell_cz[shellB];
+  const double Cx = shell_cx[shellC];
+  const double Cy = shell_cy[shellC];
+  const double Cz = shell_cz[shellC];
+
+  if (threadIdx.x == 0) {
+    fill_cart_comp(la, shA_lx, shA_ly, shA_lz);
+    fill_cart_comp(lb, shB_lx, shB_ly, shB_lz);
+    fill_cart_comp(lc, shC_lx, shC_ly, shC_lz);
+
+    const double ABx = Ax - Bx;
+    const double ABy = Ay - By;
+    const double ABz = Az - Bz;
+    sh_xij_pow[0] = 1.0;
+    sh_yij_pow[0] = 1.0;
+    sh_zij_pow[0] = 1.0;
+    for (int p = 1; p <= kLMaxD; ++p) {
+      sh_xij_pow[p] = sh_xij_pow[p - 1] * ABx;
+      sh_yij_pow[p] = sh_yij_pow[p - 1] * ABy;
+      sh_zij_pow[p] = sh_zij_pow[p - 1] * ABz;
+    }
+  }
+
+  const bool cache_bar = (nElem > 0 && nElem <= kBarCacheMax);
+  if (cache_bar) {
+    for (int idx = static_cast<int>(threadIdx.x); idx < nElem; idx += static_cast<int>(blockDim.x)) {
+      const int ia = idx / (nB * nC);
+      const int rem = idx - ia * (nB * nC);
+      const int ib = rem / nC;
+      const int ic = rem - ib * nC;
+      const int q = c0 + ic;
+#pragma unroll
+      for (int r = 0; r < NBAR; ++r) {
+        const double* bar_r = bar_X_sph_Qmn_multi + static_cast<int64_t>(r) * bar_stride;
+        sh_bar[r * kBarCacheMax + idx] = df_bar_cart_from_sph_qmn_stream(
+            bar_r,
+            q,
+            q_offset,
+            q_count,
+            ia,
+            ib,
+            la,
+            lb,
+            a0_sph,
+            b0_sph,
+            nao_sph);
+      }
+    }
+  }
+
+  __syncthreads();
+
+  // Block-level bar_X early-exit: skip block if max|sh_bar| < threshold across all bars.
+  if (cache_bar) {
+    double tmax = 0.0;
+    for (int idx = static_cast<int>(threadIdx.x); idx < nElem; idx += static_cast<int>(blockDim.x)) {
+#pragma unroll
+      for (int r = 0; r < NBAR; ++r) {
+        double v = static_cast<double>(sh_bar[r * kBarCacheMax + idx]);
+        if (v < 0.0) v = -v;
+        if (v > tmax) tmax = v;
+      }
+    }
+    for (int offset = 16; offset > 0; offset >>= 1) {
+      double other = __shfl_down_sync(0xffffffff, tmax, offset);
+      if (other > tmax) tmax = other;
+    }
+    {
+      const int lane_ = static_cast<int>(threadIdx.x) & 31;
+      const int warp_ = static_cast<int>(threadIdx.x) >> 5;
+      if (lane_ == 0) sh_warp_sum[warp_][0] = tmax;
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+      double bmax = sh_warp_sum[0][0];
+      const int nw = static_cast<int>(blockDim.x) >> 5;
+      for (int w = 1; w < nw; ++w) {
+        if (sh_warp_sum[w][0] > bmax) bmax = sh_warp_sum[w][0];
+      }
+      sh_warp_sum[0][0] = bmax;
+    }
+    __syncthreads();
+    if (sh_warp_sum[0][0] < 1e-14) return;
+  }
+
+  const int lane = static_cast<int>(threadIdx.x) & 31;
+  const int warp_id = static_cast<int>(threadIdx.x) >> 5;
+  const int warps = static_cast<int>(blockDim.x) >> 5;
+
+  double acc[9 * NBAR];
+#pragma unroll
+  for (int i = 0; i < 9 * NBAR; ++i) acc[i] = 0.0;
+
+  const int nmax = la + lb + 1;
+  const int mmax = lc + 1;
+  const int64_t nTot = static_cast<int64_t>(nprimAB) * static_cast<int64_t>(nprimCD);
+
+  for (int64_t u = static_cast<int64_t>(warp_id); u < nTot; u += static_cast<int64_t>(warps)) {
+    const int iAB_prim = static_cast<int>(u / static_cast<int64_t>(nprimCD));
+    const int iCD = static_cast<int>(u - static_cast<int64_t>(iAB_prim) * static_cast<int64_t>(nprimCD));
+    const int ki = baseAB + iAB_prim;
+    const int kj = baseCD + iCD;
+
+    const double p = pair_eta[ki];
+    const double q = pair_eta[kj];
+    const double Px = pair_Px[ki];
+    const double Py = pair_Py[ki];
+    const double Pz = pair_Pz[ki];
+    const double Qx = pair_Px[kj];
+    const double Qy = pair_Py[kj];
+    const double Qz = pair_Pz[kj];
+    const double cKab = pair_cK[ki];
+    const double cKcd = pair_cK[kj];
+
+    const int ia_prim = iAB_prim / nprimB;
+    const int ib_prim = iAB_prim - ia_prim * nprimB;
+    const double aexp = prim_exp[sA + ia_prim];
+    const double bexp = prim_exp[sB + ib_prim];
+    const double cexp = prim_exp[sC + iCD];
+
+    const double denom = p + q;
+    const double inv_denom = 1.0 / denom;
+    const double dx = Px - Qx;
+    const double dy = Py - Qy;
+    const double dz = Pz - Qz;
+    const double PQ2 = dx * dx + dy * dy + dz * dz;
+    const double omega = p * q * inv_denom;
+    const double T = omega * PQ2;
+
+    const double base = kTwoPiToFiveHalves / (p * q * ::sqrt(denom)) * cKab * cKcd;
+
+    double roots[NROOTS];
+    double weights[NROOTS];
+    if (lane == 0) {
+      cueri_rys::rys_roots_weights<NROOTS>(T, roots, weights);
+    }
+
+    for (int r = 0; r < NROOTS; ++r) {
+      double x = (lane == 0) ? roots[r] : 0.0;
+      double w = (lane == 0) ? weights[r] : 0.0;
+      x = __shfl_sync(0xffffffff, x, 0);
+      w = __shfl_sync(0xffffffff, w, 0);
+
+      {
+        const double B0 = x * 0.5 * inv_denom;
+        const double B1 = (1.0 - x) * 0.5 / p + B0;
+        const double B1p = (1.0 - x) * 0.5 / q + B0;
+        const double q_over = q * inv_denom;
+        const double p_over = p * inv_denom;
+        if (lane < 3) {
+          double PA, QC, PQd;
+          double* G_target;
+          if (lane == 0) { PA = Px - Ax; QC = Qx - Cx; PQd = Qx - Px; G_target = sh_Gx[warp_id]; }
+          else if (lane == 1) { PA = Py - Ay; QC = Qy - Cy; PQd = Qy - Py; G_target = sh_Gy[warp_id]; }
+          else { PA = Pz - Az; QC = Qz - Cz; PQd = Qz - Pz; G_target = sh_Gz[warp_id]; }
+          compute_G_d(G_target, nmax, mmax, PA + q_over * x * PQd, QC - p_over * x * PQd, B0, B1, B1p);
+        }
+      }
+
+      const double scale = base * w;
+      __syncwarp();
+
+      for (int idx = lane; idx < nElem; idx += 32) {
+        const int ia = idx / (nB * nC);
+        const int rem = idx - ia * (nB * nC);
+        const int ib = rem / nC;
+        const int ic = rem - ib * nC;
+
+        double bars[NBAR];
+        bool any_bar = false;
+#pragma unroll
+        for (int br = 0; br < NBAR; ++br) {
+          double bar = 0.0;
+          if (cache_bar) {
+            bar = sh_bar[br * kBarCacheMax + idx];
+          } else {
+            const int q_idx = c0 + ic;
+            const double* bar_ptr = bar_X_sph_Qmn_multi + static_cast<int64_t>(br) * bar_stride;
+            bar = df_bar_cart_from_sph_qmn_stream(
+                bar_ptr,
+                q_idx,
+                q_offset,
+                q_count,
+                ia,
+                ib,
+                la,
+                lb,
+                a0_sph,
+                b0_sph,
+                nao_sph);
+          }
+          bars[br] = bar;
+          any_bar = any_bar || (bar != 0.0);
+        }
+        if (!any_bar) continue;
+
+        const int iax = static_cast<int>(shA_lx[ia]);
+        const int iay = static_cast<int>(shA_ly[ia]);
+        const int iaz = static_cast<int>(shA_lz[ia]);
+        const int ibx = static_cast<int>(shB_lx[ib]);
+        const int iby = static_cast<int>(shB_ly[ib]);
+        const int ibz = static_cast<int>(shB_lz[ib]);
+        const int icx = static_cast<int>(shC_lx[ic]);
+        const int icy = static_cast<int>(shC_ly[ic]);
+        const int icz = static_cast<int>(shC_lz[ic]);
+
+        const double Ix = shift_from_G_ld0_d(sh_Gx[warp_id], iax, ibx, icx, sh_xij_pow);
+        const double Iy = shift_from_G_ld0_d(sh_Gy[warp_id], iay, iby, icy, sh_yij_pow);
+        const double Iz = shift_from_G_ld0_d(sh_Gz[warp_id], iaz, ibz, icz, sh_zij_pow);
+
+        // Precompute the 9 derivative "basis" terms once.
+        const double Ix_m_A = (iax > 0) ? shift_from_G_ld0_d(sh_Gx[warp_id], iax - 1, ibx, icx, sh_xij_pow) : 0.0;
+        const double Ix_p_A = shift_from_G_ld0_d(sh_Gx[warp_id], iax + 1, ibx, icx, sh_xij_pow);
+        const double dIx_A = (-static_cast<double>(iax)) * Ix_m_A + (2.0 * aexp) * Ix_p_A;
+        const double t0 = (dIx_A * Iy * Iz);
+
+        const double Iy_m_A = (iay > 0) ? shift_from_G_ld0_d(sh_Gy[warp_id], iay - 1, iby, icy, sh_yij_pow) : 0.0;
+        const double Iy_p_A = shift_from_G_ld0_d(sh_Gy[warp_id], iay + 1, iby, icy, sh_yij_pow);
+        const double dIy_A = (-static_cast<double>(iay)) * Iy_m_A + (2.0 * aexp) * Iy_p_A;
+        const double t1 = (Ix * dIy_A * Iz);
+
+        const double Iz_m_A = (iaz > 0) ? shift_from_G_ld0_d(sh_Gz[warp_id], iaz - 1, ibz, icz, sh_zij_pow) : 0.0;
+        const double Iz_p_A = shift_from_G_ld0_d(sh_Gz[warp_id], iaz + 1, ibz, icz, sh_zij_pow);
+        const double dIz_A = (-static_cast<double>(iaz)) * Iz_m_A + (2.0 * aexp) * Iz_p_A;
+        const double t2 = (Ix * Iy * dIz_A);
+
+        const double Ix_m_B = (ibx > 0) ? shift_from_G_ld0_d(sh_Gx[warp_id], iax, ibx - 1, icx, sh_xij_pow) : 0.0;
+        const double Ix_p_B = shift_from_G_ld0_d(sh_Gx[warp_id], iax, ibx + 1, icx, sh_xij_pow);
+        const double dIx_B = (-static_cast<double>(ibx)) * Ix_m_B + (2.0 * bexp) * Ix_p_B;
+        const double t3 = (dIx_B * Iy * Iz);
+
+        const double Iy_m_B = (iby > 0) ? shift_from_G_ld0_d(sh_Gy[warp_id], iay, iby - 1, icy, sh_yij_pow) : 0.0;
+        const double Iy_p_B = shift_from_G_ld0_d(sh_Gy[warp_id], iay, iby + 1, icy, sh_yij_pow);
+        const double dIy_B = (-static_cast<double>(iby)) * Iy_m_B + (2.0 * bexp) * Iy_p_B;
+        const double t4 = (Ix * dIy_B * Iz);
+
+        const double Iz_m_B = (ibz > 0) ? shift_from_G_ld0_d(sh_Gz[warp_id], iaz, ibz - 1, icz, sh_zij_pow) : 0.0;
+        const double Iz_p_B = shift_from_G_ld0_d(sh_Gz[warp_id], iaz, ibz + 1, icz, sh_zij_pow);
+        const double dIz_B = (-static_cast<double>(ibz)) * Iz_m_B + (2.0 * bexp) * Iz_p_B;
+        const double t5 = (Ix * Iy * dIz_B);
+
+        const double Ix_m_C = (icx > 0) ? shift_from_G_ld0_d(sh_Gx[warp_id], iax, ibx, icx - 1, sh_xij_pow) : 0.0;
+        const double Ix_p_C = shift_from_G_ld0_d(sh_Gx[warp_id], iax, ibx, icx + 1, sh_xij_pow);
+        const double dIx_C = (-static_cast<double>(icx)) * Ix_m_C + (2.0 * cexp) * Ix_p_C;
+        const double t6 = (dIx_C * Iy * Iz);
+
+        const double Iy_m_C = (icy > 0) ? shift_from_G_ld0_d(sh_Gy[warp_id], iay, iby, icy - 1, sh_yij_pow) : 0.0;
+        const double Iy_p_C = shift_from_G_ld0_d(sh_Gy[warp_id], iay, iby, icy + 1, sh_yij_pow);
+        const double dIy_C = (-static_cast<double>(icy)) * Iy_m_C + (2.0 * cexp) * Iy_p_C;
+        const double t7 = (Ix * dIy_C * Iz);
+
+        const double Iz_m_C = (icz > 0) ? shift_from_G_ld0_d(sh_Gz[warp_id], iaz, ibz, icz - 1, sh_zij_pow) : 0.0;
+        const double Iz_p_C = shift_from_G_ld0_d(sh_Gz[warp_id], iaz, ibz, icz + 1, sh_zij_pow);
+        const double dIz_C = (-static_cast<double>(icz)) * Iz_m_C + (2.0 * cexp) * Iz_p_C;
+        const double t8 = (Ix * Iy * dIz_C);
+
+#pragma unroll
+        for (int br = 0; br < NBAR; ++br) {
+          const double bar = bars[br];
+          if (bar == 0.0) continue;
+          const double bar_scale = bar * scale;
+          acc[br * 9 + 0] += bar_scale * t0;
+          acc[br * 9 + 1] += bar_scale * t1;
+          acc[br * 9 + 2] += bar_scale * t2;
+          acc[br * 9 + 3] += bar_scale * t3;
+          acc[br * 9 + 4] += bar_scale * t4;
+          acc[br * 9 + 5] += bar_scale * t5;
+          acc[br * 9 + 6] += bar_scale * t6;
+          acc[br * 9 + 7] += bar_scale * t7;
+          acc[br * 9 + 8] += bar_scale * t8;
+        }
+      }
+
+      __syncwarp();
+    }
+  }
+
+  // Warp reduction then block reduction over warps (lane 0 only) for each bar.
+#pragma unroll
+  for (int br = 0; br < NBAR; ++br) {
+    warp_reduce_sum_arr<9>(&acc[br * 9]);
+  }
+  if (lane == 0) {
+#pragma unroll
+    for (int br = 0; br < NBAR; ++br) {
+#pragma unroll
+      for (int i = 0; i < 9; ++i) sh_warp_sum[warp_id][br * 9 + i] = acc[br * 9 + i];
+    }
+  }
+  __syncthreads();
+
+  if (threadIdx.x == 0) {
+    const double fac = (shellA != shellB) ? 2.0 : 1.0;
+    const int atomA = static_cast<int>(shell_atom[shellA]);
+    const int atomB = static_cast<int>(shell_atom[shellB]);
+    const int atomC = static_cast<int>(shell_atom[shellC]);
+    for (int br = 0; br < NBAR; ++br) {
+      double sum[9];
+#pragma unroll
+      for (int i = 0; i < 9; ++i) sum[i] = 0.0;
+      for (int w = 0; w < warps; ++w) {
+#pragma unroll
+        for (int i = 0; i < 9; ++i) sum[i] += sh_warp_sum[w][br * 9 + i];
+      }
+      double* grad_dev = grad_dev_multi + static_cast<int64_t>(br) * grad_stride;
+      atomicAdd(&grad_dev[atomA * 3 + 0], fac * sum[0]);
+      atomicAdd(&grad_dev[atomA * 3 + 1], fac * sum[1]);
+      atomicAdd(&grad_dev[atomA * 3 + 2], fac * sum[2]);
+      atomicAdd(&grad_dev[atomB * 3 + 0], fac * sum[3]);
+      atomicAdd(&grad_dev[atomB * 3 + 1], fac * sum[4]);
+      atomicAdd(&grad_dev[atomB * 3 + 2], fac * sum[5]);
+      atomicAdd(&grad_dev[atomC * 3 + 0], fac * sum[6]);
+      atomicAdd(&grad_dev[atomC * 3 + 1], fac * sum[7]);
+      atomicAdd(&grad_dev[atomC * 3 + 2], fac * sum[8]);
+    }
+  }
+}
+
 // AB-tiled variant: each block processes one spAB and up to `cd_tile` spCD tasks.
 // A/B-center derivatives are accumulated across tile tasks and atomically flushed once,
 // while C-center derivatives are still emitted per task.
@@ -2047,6 +2916,371 @@ __global__ void KernelDFInt3c2eDerivContractedCartAllSPAtomGradABTile(
       atomicAdd(&grad_dev[atomC * 3 + 0], sh_sumC_agg[u][0]);
       atomicAdd(&grad_dev[atomC * 3 + 1], sh_sumC_agg[u][1]);
       atomicAdd(&grad_dev[atomC * 3 + 2], sh_sumC_agg[u][2]);
+    }
+  }
+}
+
+// Packed-Qp multi-bar variant: consumes multiple independent packed-Qp bar_X tensors directly
+// (no Qmn chunk staging) and accumulates NBAR gradients in one kernel pass.
+template <int NROOTS, typename TBar, int NBAR>
+__global__ void KernelDFInt3c2eDerivContractedCartAllSPAtomGradSphBarQpMultiBar(
+    const int32_t* spAB_arr,   // [n_spAB] AO shell-pair indices in this (la,lb) class
+    int n_spAB,
+    const int32_t* spCD,       // [ntasks] aux shell-pair indices
+    int ntasks,
+    const int32_t* sp_A,
+    const int32_t* sp_B,
+    const int32_t* sp_pair_start,
+    const int32_t* sp_npair,
+    const double* shell_cx,
+    const double* shell_cy,
+    const double* shell_cz,
+    const int32_t* shell_prim_start,
+    const int32_t* shell_nprim,
+    const int32_t* shell_ao_start,
+    const double* prim_exp,
+    const double* pair_eta,
+    const double* pair_Px,
+    const double* pair_Py,
+    const double* pair_Pz,
+    const double* pair_cK,
+    int nao,
+    int naux,
+    int nao_sph,
+    int la,
+    int lb,
+    int lc,
+    const TBar* bar_X_sph_Qp0,          // [naux*ntri]
+    const TBar* bar_X_sph_Qp1,          // [naux*ntri]
+    const TBar* bar_X_sph_Qp2,          // [naux*ntri] (ignored when NBAR<3)
+    const int32_t* shell_ao_start_sph, // spherical AO start offset per AO shell
+    const int32_t* shell_atom,         // combined AO+aux shell->atom map (length: nAOshells+nAuxShells)
+    int q_offset,                      // absolute aux AO start index for streamed bar_X window
+    int q_count,                       // number of aux AO rows in streamed bar_X window
+    double* grad_dev_multi,            // [NBAR*grad_stride]
+    int64_t grad_stride) {             // stride (elements) between gradients (typically natm*3)
+  const int t   = static_cast<int>(blockIdx.x);  // CD task index
+  const int iAB = static_cast<int>(blockIdx.y);  // AB class index
+  if (t >= ntasks || iAB >= n_spAB) return;
+
+  const int spAB   = static_cast<int>(spAB_arr[iAB]);
+  const int spCD_i = static_cast<int>(spCD[t]);
+
+  // --- Shared memory (identical layout to KernelDFInt3c2eDerivContractedCartAllSPAtomGradSphBarQmnMultiBar) ---
+  __shared__ int8_t shA_lx[kNcartMax], shA_ly[kNcartMax], shA_lz[kNcartMax];
+  __shared__ int8_t shB_lx[kNcartMax], shB_ly[kNcartMax], shB_lz[kNcartMax];
+  __shared__ int8_t shC_lx[kNcartMax], shC_ly[kNcartMax], shC_lz[kNcartMax];
+  __shared__ double sh_xij_pow[kLMaxD + 1], sh_yij_pow[kLMaxD + 1], sh_zij_pow[kLMaxD + 1];
+
+  __shared__ double sh_Gx[kMaxWarpsPerBlock][kGSizeD];
+  __shared__ double sh_Gy[kMaxWarpsPerBlock][kGSizeD];
+  __shared__ double sh_Gz[kMaxWarpsPerBlock][kGSizeD];
+
+  __shared__ double sh_warp_sum[kMaxWarpsPerBlock][9 * NBAR];
+  __shared__ double sh_bar[NBAR * kBarCacheMax];
+
+  const int shellA = static_cast<int>(sp_A[spAB]);
+  const int shellB = static_cast<int>(sp_B[spAB]);
+  const int shellC = static_cast<int>(sp_A[spCD_i]);
+
+  const int nA = ncart(la);
+  const int nB = ncart(lb);
+  const int nC = ncart(lc);
+  const int nElem = nA * nB * nC;
+
+  const int c0 = static_cast<int>(shell_ao_start[shellC]) - nao;
+
+  const int a0_sph = static_cast<int>(shell_ao_start_sph[shellA]);
+  const int b0_sph = static_cast<int>(shell_ao_start_sph[shellB]);
+
+  const int baseAB = static_cast<int>(sp_pair_start[spAB]);
+  const int baseCD = static_cast<int>(sp_pair_start[spCD_i]);
+  const int nprimAB = static_cast<int>(sp_npair[spAB]);
+  const int nprimCD = static_cast<int>(sp_npair[spCD_i]);
+
+  const int nprimB = static_cast<int>(shell_nprim[shellB]);
+  const int sA = static_cast<int>(shell_prim_start[shellA]);
+  const int sB = static_cast<int>(shell_prim_start[shellB]);
+  const int sC = static_cast<int>(shell_prim_start[shellC]);
+
+  const double Ax = shell_cx[shellA];
+  const double Ay = shell_cy[shellA];
+  const double Az = shell_cz[shellA];
+  const double Bx = shell_cx[shellB];
+  const double By = shell_cy[shellB];
+  const double Bz = shell_cz[shellB];
+  const double Cx = shell_cx[shellC];
+  const double Cy = shell_cy[shellC];
+  const double Cz = shell_cz[shellC];
+
+  if (threadIdx.x == 0) {
+    fill_cart_comp(la, shA_lx, shA_ly, shA_lz);
+    fill_cart_comp(lb, shB_lx, shB_ly, shB_lz);
+    fill_cart_comp(lc, shC_lx, shC_ly, shC_lz);
+
+    const double ABx = Ax - Bx;
+    const double ABy = Ay - By;
+    const double ABz = Az - Bz;
+    sh_xij_pow[0] = 1.0;
+    sh_yij_pow[0] = 1.0;
+    sh_zij_pow[0] = 1.0;
+    for (int p = 1; p <= kLMaxD; ++p) {
+      sh_xij_pow[p] = sh_xij_pow[p - 1] * ABx;
+      sh_yij_pow[p] = sh_yij_pow[p - 1] * ABy;
+      sh_zij_pow[p] = sh_zij_pow[p - 1] * ABz;
+    }
+  }
+
+  const bool cache_bar = (nElem > 0 && nElem <= kBarCacheMax);
+  const TBar* bar_ptrs[3] = {bar_X_sph_Qp0, bar_X_sph_Qp1, bar_X_sph_Qp2};
+
+  if (cache_bar) {
+    for (int idx = static_cast<int>(threadIdx.x); idx < nElem; idx += static_cast<int>(blockDim.x)) {
+      const int ia = idx / (nB * nC);
+      const int rem = idx - ia * (nB * nC);
+      const int ib = rem / nC;
+      const int ic = rem - ib * nC;
+      const int q = c0 + ic;
+#pragma unroll
+      for (int r = 0; r < NBAR; ++r) {
+        sh_bar[r * kBarCacheMax + idx] = df_bar_cart_from_sph_qp_stream(
+            bar_ptrs[r], q, q_offset, q_count, ia, ib, la, lb, a0_sph, b0_sph, nao_sph);
+      }
+    }
+  }
+
+  __syncthreads();
+
+  // Block-level bar_X early-exit: skip block if max|sh_bar| < threshold across both bars.
+  if (cache_bar) {
+    double tmax = 0.0;
+    for (int idx = static_cast<int>(threadIdx.x); idx < nElem; idx += static_cast<int>(blockDim.x)) {
+#pragma unroll
+      for (int r = 0; r < NBAR; ++r) {
+        double v = static_cast<double>(sh_bar[r * kBarCacheMax + idx]);
+        if (v < 0.0) v = -v;
+        if (v > tmax) tmax = v;
+      }
+    }
+    for (int offset = 16; offset > 0; offset >>= 1) {
+      double other = __shfl_down_sync(0xffffffff, tmax, offset);
+      if (other > tmax) tmax = other;
+    }
+    {
+      const int lane_ = static_cast<int>(threadIdx.x) & 31;
+      const int warp_ = static_cast<int>(threadIdx.x) >> 5;
+      if (lane_ == 0) sh_warp_sum[warp_][0] = tmax;
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+      double bmax = sh_warp_sum[0][0];
+      const int nw = static_cast<int>(blockDim.x) >> 5;
+      for (int w = 1; w < nw; ++w) {
+        if (sh_warp_sum[w][0] > bmax) bmax = sh_warp_sum[w][0];
+      }
+      sh_warp_sum[0][0] = bmax;
+    }
+    __syncthreads();
+    if (sh_warp_sum[0][0] < 1e-14) return;
+  }
+
+  const int lane = static_cast<int>(threadIdx.x) & 31;
+  const int warp_id = static_cast<int>(threadIdx.x) >> 5;
+  const int warps = static_cast<int>(blockDim.x) >> 5;
+
+  double acc[9 * NBAR];
+#pragma unroll
+  for (int i = 0; i < 9 * NBAR; ++i) acc[i] = 0.0;
+
+  const int nmax = la + lb + 1;
+  const int mmax = lc + 1;
+  const int64_t nTot = static_cast<int64_t>(nprimAB) * static_cast<int64_t>(nprimCD);
+
+  for (int64_t u = static_cast<int64_t>(warp_id); u < nTot; u += static_cast<int64_t>(warps)) {
+    const int iAB_prim = static_cast<int>(u / static_cast<int64_t>(nprimCD));
+    const int iCD = static_cast<int>(u - static_cast<int64_t>(iAB_prim) * static_cast<int64_t>(nprimCD));
+    const int ki = baseAB + iAB_prim;
+    const int kj = baseCD + iCD;
+
+    const double p = pair_eta[ki];
+    const double q = pair_eta[kj];
+    const double Px = pair_Px[ki];
+    const double Py = pair_Py[ki];
+    const double Pz = pair_Pz[ki];
+    const double Qx = pair_Px[kj];
+    const double Qy = pair_Py[kj];
+    const double Qz = pair_Pz[kj];
+    const double cKab = pair_cK[ki];
+    const double cKcd = pair_cK[kj];
+
+    const int ia_prim = iAB_prim / nprimB;
+    const int ib_prim = iAB_prim - ia_prim * nprimB;
+    const double aexp = prim_exp[sA + ia_prim];
+    const double bexp = prim_exp[sB + ib_prim];
+    const double cexp = prim_exp[sC + iCD];
+
+    const double denom = p + q;
+    const double inv_denom = 1.0 / denom;
+    const double dx = Px - Qx;
+    const double dy = Py - Qy;
+    const double dz = Pz - Qz;
+    const double PQ2 = dx * dx + dy * dy + dz * dz;
+    const double omega = p * q * inv_denom;
+    const double T = omega * PQ2;
+
+    const double base = kTwoPiToFiveHalves / (p * q * ::sqrt(denom)) * cKab * cKcd;
+
+    double roots[NROOTS];
+    double weights[NROOTS];
+    if (lane == 0) {
+      cueri_rys::rys_roots_weights<NROOTS>(T, roots, weights);
+    }
+
+    for (int rrt = 0; rrt < NROOTS; ++rrt) {
+      double x = (lane == 0) ? roots[rrt] : 0.0;
+      double w = (lane == 0) ? weights[rrt] : 0.0;
+      x = __shfl_sync(0xffffffff, x, 0);
+      w = __shfl_sync(0xffffffff, w, 0);
+
+      {
+        const double B0 = x * 0.5 * inv_denom;
+        const double B1 = (1.0 - x) * 0.5 / p + B0;
+        const double B1p = (1.0 - x) * 0.5 / q + B0;
+        const double q_over = q * inv_denom;
+        const double p_over = p * inv_denom;
+        if (lane < 3) {
+          double PA, QC, PQd;
+          double* G_target;
+          if (lane == 0) { PA = Px - Ax; QC = Qx - Cx; PQd = Qx - Px; G_target = sh_Gx[warp_id]; }
+          else if (lane == 1) { PA = Py - Ay; QC = Qy - Cy; PQd = Qy - Py; G_target = sh_Gy[warp_id]; }
+          else { PA = Pz - Az; QC = Qz - Cz; PQd = Qz - Pz; G_target = sh_Gz[warp_id]; }
+          compute_G_d(G_target, nmax, mmax, PA + q_over * x * PQd, QC - p_over * x * PQd, B0, B1, B1p);
+        }
+      }
+
+      const double scale = base * w;
+      __syncwarp();
+
+      for (int idx = lane; idx < nElem; idx += 32) {
+        const int ia = idx / (nB * nC);
+        const int rem = idx - ia * (nB * nC);
+        const int ib = rem / nC;
+        const int ic = rem - ib * nC;
+        const int q_idx = c0 + ic;
+
+        const int iax = static_cast<int>(shA_lx[ia]);
+        const int iay = static_cast<int>(shA_ly[ia]);
+        const int iaz = static_cast<int>(shA_lz[ia]);
+        const int ibx = static_cast<int>(shB_lx[ib]);
+        const int iby = static_cast<int>(shB_ly[ib]);
+        const int ibz = static_cast<int>(shB_lz[ib]);
+        const int icx = static_cast<int>(shC_lx[ic]);
+        const int icy = static_cast<int>(shC_ly[ic]);
+        const int icz = static_cast<int>(shC_lz[ic]);
+
+        const double Ix = shift_from_G_ld0_d(sh_Gx[warp_id], iax, ibx, icx, sh_xij_pow);
+        const double Iy = shift_from_G_ld0_d(sh_Gy[warp_id], iay, iby, icy, sh_yij_pow);
+        const double Iz = shift_from_G_ld0_d(sh_Gz[warp_id], iaz, ibz, icz, sh_zij_pow);
+
+#pragma unroll
+        for (int br = 0; br < NBAR; ++br) {
+          double bar = 0.0;
+          if (cache_bar) {
+            bar = sh_bar[br * kBarCacheMax + idx];
+          } else {
+            const TBar* bar_r = (br == 0) ? bar_X_sph_Qp0 : bar_X_sph_Qp1;
+            bar = df_bar_cart_from_sph_qp_stream(
+                bar_r, q_idx, q_offset, q_count, ia, ib, la, lb, a0_sph, b0_sph, nao_sph);
+          }
+          if (bar == 0.0) continue;
+          const double bar_scale = bar * scale;
+
+          // Center A derivatives.
+          const double Ix_m_A = (iax > 0) ? shift_from_G_ld0_d(sh_Gx[warp_id], iax - 1, ibx, icx, sh_xij_pow) : 0.0;
+          const double Ix_p_A = shift_from_G_ld0_d(sh_Gx[warp_id], iax + 1, ibx, icx, sh_xij_pow);
+          const double dIx_A = (-static_cast<double>(iax)) * Ix_m_A + (2.0 * aexp) * Ix_p_A;
+          acc[br * 9 + 0] += bar_scale * (dIx_A * Iy * Iz);
+
+          const double Iy_m_A = (iay > 0) ? shift_from_G_ld0_d(sh_Gy[warp_id], iay - 1, iby, icy, sh_yij_pow) : 0.0;
+          const double Iy_p_A = shift_from_G_ld0_d(sh_Gy[warp_id], iay + 1, iby, icy, sh_yij_pow);
+          const double dIy_A = (-static_cast<double>(iay)) * Iy_m_A + (2.0 * aexp) * Iy_p_A;
+          acc[br * 9 + 1] += bar_scale * (Ix * dIy_A * Iz);
+
+          const double Iz_m_A = (iaz > 0) ? shift_from_G_ld0_d(sh_Gz[warp_id], iaz - 1, ibz, icz, sh_zij_pow) : 0.0;
+          const double Iz_p_A = shift_from_G_ld0_d(sh_Gz[warp_id], iaz + 1, ibz, icz, sh_zij_pow);
+          const double dIz_A = (-static_cast<double>(iaz)) * Iz_m_A + (2.0 * aexp) * Iz_p_A;
+          acc[br * 9 + 2] += bar_scale * (Ix * Iy * dIz_A);
+
+          // Center B derivatives.
+          const double Ix_m_B = (ibx > 0) ? shift_from_G_ld0_d(sh_Gx[warp_id], iax, ibx - 1, icx, sh_xij_pow) : 0.0;
+          const double Ix_p_B = shift_from_G_ld0_d(sh_Gx[warp_id], iax, ibx + 1, icx, sh_xij_pow);
+          const double dIx_B = (-static_cast<double>(ibx)) * Ix_m_B + (2.0 * bexp) * Ix_p_B;
+          acc[br * 9 + 3] += bar_scale * (dIx_B * Iy * Iz);
+
+          const double Iy_m_B = (iby > 0) ? shift_from_G_ld0_d(sh_Gy[warp_id], iay, iby - 1, icy, sh_yij_pow) : 0.0;
+          const double Iy_p_B = shift_from_G_ld0_d(sh_Gy[warp_id], iay, iby + 1, icy, sh_yij_pow);
+          const double dIy_B = (-static_cast<double>(iby)) * Iy_m_B + (2.0 * bexp) * Iy_p_B;
+          acc[br * 9 + 4] += bar_scale * (Ix * dIy_B * Iz);
+
+          const double Iz_m_B = (ibz > 0) ? shift_from_G_ld0_d(sh_Gz[warp_id], iaz, ibz - 1, icz, sh_zij_pow) : 0.0;
+          const double Iz_p_B = shift_from_G_ld0_d(sh_Gz[warp_id], iaz, ibz + 1, icz, sh_zij_pow);
+          const double dIz_B = (-static_cast<double>(ibz)) * Iz_m_B + (2.0 * bexp) * Iz_p_B;
+          acc[br * 9 + 5] += bar_scale * (Ix * Iy * dIz_B);
+
+          // Center C derivatives (aux).
+          const double Ix_m_C = (icx > 0) ? shift_from_G_ld0_d(sh_Gx[warp_id], iax, ibx, icx - 1, sh_xij_pow) : 0.0;
+          const double Ix_p_C = shift_from_G_ld0_d(sh_Gx[warp_id], iax, ibx, icx + 1, sh_xij_pow);
+          const double dIx_C = (-static_cast<double>(icx)) * Ix_m_C + (2.0 * cexp) * Ix_p_C;
+          acc[br * 9 + 6] += bar_scale * (dIx_C * Iy * Iz);
+
+          const double Iy_m_C = (icy > 0) ? shift_from_G_ld0_d(sh_Gy[warp_id], iay, iby, icy - 1, sh_yij_pow) : 0.0;
+          const double Iy_p_C = shift_from_G_ld0_d(sh_Gy[warp_id], iay, iby, icy + 1, sh_yij_pow);
+          const double dIy_C = (-static_cast<double>(icy)) * Iy_m_C + (2.0 * cexp) * Iy_p_C;
+          acc[br * 9 + 7] += bar_scale * (Ix * dIy_C * Iz);
+
+          const double Iz_m_C = (icz > 0) ? shift_from_G_ld0_d(sh_Gz[warp_id], iaz, ibz, icz - 1, sh_zij_pow) : 0.0;
+          const double Iz_p_C = shift_from_G_ld0_d(sh_Gz[warp_id], iaz, ibz, icz + 1, sh_zij_pow);
+          const double dIz_C = (-static_cast<double>(icz)) * Iz_m_C + (2.0 * cexp) * Iz_p_C;
+          acc[br * 9 + 8] += bar_scale * (Ix * Iy * dIz_C);
+        }
+      }
+
+      __syncwarp();
+    }
+  }
+
+  // Warp reduction then block reduction over warps (lane 0 only).
+  warp_reduce_sum_arr(acc);
+  if (lane == 0) {
+#pragma unroll
+    for (int i = 0; i < 9 * NBAR; ++i) sh_warp_sum[warp_id][i] = acc[i];
+  }
+  __syncthreads();
+
+  if (threadIdx.x == 0) {
+    double sum[9 * NBAR];
+#pragma unroll
+    for (int i = 0; i < 9 * NBAR; ++i) sum[i] = 0.0;
+    for (int w = 0; w < warps; ++w) {
+#pragma unroll
+      for (int i = 0; i < 9 * NBAR; ++i) sum[i] += sh_warp_sum[w][i];
+    }
+    const double fac = (shellA != shellB) ? 2.0 : 1.0;
+    const int atomA = static_cast<int>(shell_atom[shellA]);
+    const int atomB = static_cast<int>(shell_atom[shellB]);
+    const int atomC = static_cast<int>(shell_atom[shellC]);
+
+    for (int br = 0; br < NBAR; ++br) {
+      double* g = grad_dev_multi + static_cast<int64_t>(br) * grad_stride;
+      atomicAdd(&g[atomA * 3 + 0], fac * sum[br * 9 + 0]);
+      atomicAdd(&g[atomA * 3 + 1], fac * sum[br * 9 + 1]);
+      atomicAdd(&g[atomA * 3 + 2], fac * sum[br * 9 + 2]);
+      atomicAdd(&g[atomB * 3 + 0], fac * sum[br * 9 + 3]);
+      atomicAdd(&g[atomB * 3 + 1], fac * sum[br * 9 + 4]);
+      atomicAdd(&g[atomB * 3 + 2], fac * sum[br * 9 + 5]);
+      atomicAdd(&g[atomC * 3 + 0], fac * sum[br * 9 + 6]);
+      atomicAdd(&g[atomC * 3 + 1], fac * sum[br * 9 + 7]);
+      atomicAdd(&g[atomC * 3 + 2], fac * sum[br * 9 + 8]);
     }
   }
 }
@@ -2462,6 +3696,1358 @@ __global__ void KernelDFInt3c2eDerivContractedCartAllSPAtomGradSphBarQmnABTile(
       atomicAdd(&grad_dev[atomC * 3 + 0], sh_sumC_agg[u][0]);
       atomicAdd(&grad_dev[atomC * 3 + 1], sh_sumC_agg[u][1]);
       atomicAdd(&grad_dev[atomC * 3 + 2], sh_sumC_agg[u][2]);
+    }
+  }
+}
+
+// Packed-Qp + AB-tiled spherical-bar_X variant: packed Qp bar_X in spherical AO basis (no Qmn unpack).
+template <int NROOTS, typename TBar>
+__global__ void KernelDFInt3c2eDerivContractedCartAllSPAtomGradSphBarQpABTile(
+    const int32_t* spAB_arr,
+    int n_spAB,
+    const int32_t* spCD,
+    int ntasks,
+    const int32_t* sp_A,
+    const int32_t* sp_B,
+    const int32_t* sp_pair_start,
+    const int32_t* sp_npair,
+    const double* shell_cx,
+    const double* shell_cy,
+    const double* shell_cz,
+    const int32_t* shell_prim_start,
+    const int32_t* shell_nprim,
+    const int32_t* shell_ao_start,
+    const double* prim_exp,
+    const double* pair_eta,
+    const double* pair_Px,
+    const double* pair_Py,
+    const double* pair_Pz,
+    const double* pair_cK,
+    int nao,
+    int naux,
+    int nao_sph,
+    int la,
+    int lb,
+    int lc,
+    const TBar* bar_X_sph_Qp,
+    const int32_t* shell_ao_start_sph,
+    const int32_t* shell_atom,
+    int cd_tile,
+    int q_offset,
+    int q_count,
+    double* grad_dev) {
+  const int t0 = static_cast<int>(blockIdx.x) * cd_tile;
+  const int iAB = static_cast<int>(blockIdx.y);
+  if (iAB >= n_spAB || cd_tile <= 0 || t0 >= ntasks) return;
+
+  const int spAB = static_cast<int>(spAB_arr[iAB]);
+  const int shellA = static_cast<int>(sp_A[spAB]);
+  const int shellB = static_cast<int>(sp_B[spAB]);
+
+  __shared__ int8_t shA_lx[kNcartMax], shA_ly[kNcartMax], shA_lz[kNcartMax];
+  __shared__ int8_t shB_lx[kNcartMax], shB_ly[kNcartMax], shB_lz[kNcartMax];
+  __shared__ int8_t shC_lx[kNcartMax], shC_ly[kNcartMax], shC_lz[kNcartMax];
+  __shared__ double sh_xij_pow[kLMaxD + 1], sh_yij_pow[kLMaxD + 1], sh_zij_pow[kLMaxD + 1];
+  __shared__ double sh_Gx[kMaxWarpsPerBlock][kGSizeD];
+  __shared__ double sh_Gy[kMaxWarpsPerBlock][kGSizeD];
+  __shared__ double sh_Gz[kMaxWarpsPerBlock][kGSizeD];
+  __shared__ double sh_warp_sum[kMaxWarpsPerBlock][9];
+  __shared__ double sh_bar[kBarCacheMax];
+  __shared__ int sh_atomC_agg[kAtomAggMax];
+  __shared__ double sh_sumC_agg[kAtomAggMax][3];
+  __shared__ int sh_n_atomC_agg;
+
+  const int nA = ncart(la);
+  const int nB = ncart(lb);
+  const int nC = ncart(lc);
+  const int nElem = nA * nB * nC;
+  const int baseAB = static_cast<int>(sp_pair_start[spAB]);
+  const int nprimAB = static_cast<int>(sp_npair[spAB]);
+  const int nprimB = static_cast<int>(shell_nprim[shellB]);
+  const int sA = static_cast<int>(shell_prim_start[shellA]);
+  const int sB = static_cast<int>(shell_prim_start[shellB]);
+  const int a0_sph = static_cast<int>(shell_ao_start_sph[shellA]);
+  const int b0_sph = static_cast<int>(shell_ao_start_sph[shellB]);
+
+  const double Ax = shell_cx[shellA];
+  const double Ay = shell_cy[shellA];
+  const double Az = shell_cz[shellA];
+  const double Bx = shell_cx[shellB];
+  const double By = shell_cy[shellB];
+  const double Bz = shell_cz[shellB];
+  const double fac = (shellA != shellB) ? 2.0 : 1.0;
+  const int atomA = static_cast<int>(shell_atom[shellA]);
+  const int atomB = static_cast<int>(shell_atom[shellB]);
+
+  if (threadIdx.x == 0) {
+    fill_cart_comp(la, shA_lx, shA_ly, shA_lz);
+    fill_cart_comp(lb, shB_lx, shB_ly, shB_lz);
+    fill_cart_comp(lc, shC_lx, shC_ly, shC_lz);
+    const double ABx = Ax - Bx;
+    const double ABy = Ay - By;
+    const double ABz = Az - Bz;
+    sh_xij_pow[0] = 1.0;
+    sh_yij_pow[0] = 1.0;
+    sh_zij_pow[0] = 1.0;
+    for (int p = 1; p <= kLMaxD; ++p) {
+      sh_xij_pow[p] = sh_xij_pow[p - 1] * ABx;
+      sh_yij_pow[p] = sh_yij_pow[p - 1] * ABy;
+      sh_zij_pow[p] = sh_zij_pow[p - 1] * ABz;
+    }
+  }
+  __syncthreads();
+
+  const bool cache_bar = (nElem > 0 && nElem <= kBarCacheMax);
+  const int lane = static_cast<int>(threadIdx.x) & 31;
+  const int warp_id = static_cast<int>(threadIdx.x) >> 5;
+  const int warps = static_cast<int>(blockDim.x) >> 5;
+  const int nmax = la + lb + 1;
+  const int mmax = lc + 1;
+
+  double sumA_blk[3];
+  double sumB_blk[3];
+  if (threadIdx.x == 0) {
+    sumA_blk[0] = 0.0;
+    sumA_blk[1] = 0.0;
+    sumA_blk[2] = 0.0;
+    sumB_blk[0] = 0.0;
+    sumB_blk[1] = 0.0;
+    sumB_blk[2] = 0.0;
+    sh_n_atomC_agg = 0;
+  }
+  __syncthreads();
+
+  for (int tt = 0; tt < cd_tile; ++tt) {
+    const int t = t0 + tt;
+    const bool active = (t < ntasks);
+    const int spCD_i = active ? static_cast<int>(spCD[t]) : 0;
+    const int shellC = active ? static_cast<int>(sp_A[spCD_i]) : 0;
+    const int c0 = active ? (static_cast<int>(shell_ao_start[shellC]) - nao) : 0;
+    const int baseCD = active ? static_cast<int>(sp_pair_start[spCD_i]) : 0;
+    const int nprimCD = active ? static_cast<int>(sp_npair[spCD_i]) : 0;
+    const int sC = active ? static_cast<int>(shell_prim_start[shellC]) : 0;
+    const double Cx = active ? shell_cx[shellC] : 0.0;
+    const double Cy = active ? shell_cy[shellC] : 0.0;
+    const double Cz = active ? shell_cz[shellC] : 0.0;
+
+    if (cache_bar) {
+      for (int idx = static_cast<int>(threadIdx.x); idx < nElem; idx += static_cast<int>(blockDim.x)) {
+        if (active) {
+          const int ia = idx / (nB * nC);
+          const int rem = idx - ia * (nB * nC);
+          const int ib = rem / nC;
+          const int ic = rem - ib * nC;
+          const int q = c0 + ic;
+          sh_bar[idx] = df_bar_cart_from_sph_qp_stream(
+              bar_X_sph_Qp,
+              q,
+              q_offset,
+              q_count,
+              ia,
+              ib,
+              la,
+              lb,
+              a0_sph,
+              b0_sph,
+              nao_sph);
+        } else {
+          sh_bar[idx] = 0.0;
+        }
+      }
+    }
+    __syncthreads();
+
+    // Block-level bar_X early-exit: skip tile if max|sh_bar| < threshold.
+    if (cache_bar) {
+      double tmax = 0.0;
+      for (int idx = static_cast<int>(threadIdx.x); idx < nElem; idx += static_cast<int>(blockDim.x)) {
+        double v = static_cast<double>(sh_bar[idx]);
+        if (v < 0.0) v = -v;
+        if (v > tmax) tmax = v;
+      }
+      for (int offset = 16; offset > 0; offset >>= 1) {
+        double other = __shfl_down_sync(0xffffffff, tmax, offset);
+        if (other > tmax) tmax = other;
+      }
+      {
+        const int lane_ = static_cast<int>(threadIdx.x) & 31;
+        const int warp_ = static_cast<int>(threadIdx.x) >> 5;
+        if (lane_ == 0) sh_warp_sum[warp_][0] = tmax;
+      }
+      __syncthreads();
+      if (threadIdx.x == 0) {
+        double bmax = sh_warp_sum[0][0];
+        const int nw = static_cast<int>(blockDim.x) >> 5;
+        for (int w = 1; w < nw; ++w) {
+          if (sh_warp_sum[w][0] > bmax) bmax = sh_warp_sum[w][0];
+        }
+        sh_warp_sum[0][0] = bmax;
+      }
+      __syncthreads();
+      if (sh_warp_sum[0][0] < 1e-14) continue;
+    }
+
+    double acc[9];
+#pragma unroll
+    for (int i = 0; i < 9; ++i) acc[i] = 0.0;
+
+    if (active) {
+      const int64_t nTot = static_cast<int64_t>(nprimAB) * static_cast<int64_t>(nprimCD);
+      for (int64_t u = static_cast<int64_t>(warp_id); u < nTot; u += static_cast<int64_t>(warps)) {
+        const int iAB_prim = static_cast<int>(u / static_cast<int64_t>(nprimCD));
+        const int iCD = static_cast<int>(u - static_cast<int64_t>(iAB_prim) * static_cast<int64_t>(nprimCD));
+        const int ki = baseAB + iAB_prim;
+        const int kj = baseCD + iCD;
+
+        const double p = pair_eta[ki];
+        const double q = pair_eta[kj];
+        const double Px = pair_Px[ki];
+        const double Py = pair_Py[ki];
+        const double Pz = pair_Pz[ki];
+        const double Qx = pair_Px[kj];
+        const double Qy = pair_Py[kj];
+        const double Qz = pair_Pz[kj];
+        const double cKab = pair_cK[ki];
+        const double cKcd = pair_cK[kj];
+
+        const int ia_prim = iAB_prim / nprimB;
+        const int ib_prim = iAB_prim - ia_prim * nprimB;
+        const double aexp = prim_exp[sA + ia_prim];
+        const double bexp = prim_exp[sB + ib_prim];
+        const double cexp = prim_exp[sC + iCD];
+
+        const double denom = p + q;
+        const double inv_denom = 1.0 / denom;
+        const double dx = Px - Qx;
+        const double dy = Py - Qy;
+        const double dz = Pz - Qz;
+        const double PQ2 = dx * dx + dy * dy + dz * dz;
+        const double omega = p * q * inv_denom;
+        const double T = omega * PQ2;
+        const double base = kTwoPiToFiveHalves / (p * q * ::sqrt(denom)) * cKab * cKcd;
+
+        double roots[NROOTS];
+        double weights[NROOTS];
+        if (lane == 0) {
+          cueri_rys::rys_roots_weights<NROOTS>(T, roots, weights);
+        }
+
+        for (int r = 0; r < NROOTS; ++r) {
+          double x = (lane == 0) ? roots[r] : 0.0;
+          double w = (lane == 0) ? weights[r] : 0.0;
+          x = __shfl_sync(0xffffffff, x, 0);
+          w = __shfl_sync(0xffffffff, w, 0);
+
+          {
+            const double B0 = x * 0.5 * inv_denom;
+            const double B1 = (1.0 - x) * 0.5 / p + B0;
+            const double B1p = (1.0 - x) * 0.5 / q + B0;
+            const double q_over = q * inv_denom;
+            const double p_over = p * inv_denom;
+            if (lane < 3) {
+              double PA, QC, PQd;
+              double* G_target;
+              if (lane == 0) { PA = Px - Ax; QC = Qx - Cx; PQd = Qx - Px; G_target = sh_Gx[warp_id]; }
+              else if (lane == 1) { PA = Py - Ay; QC = Qy - Cy; PQd = Qy - Py; G_target = sh_Gy[warp_id]; }
+              else { PA = Pz - Az; QC = Qz - Cz; PQd = Qz - Pz; G_target = sh_Gz[warp_id]; }
+              compute_G_d(G_target, nmax, mmax, PA + q_over * x * PQd, QC - p_over * x * PQd, B0, B1, B1p);
+            }
+          }
+
+          const double scale = base * w;
+          __syncwarp();
+
+          for (int idx = lane; idx < nElem; idx += 32) {
+            const int ia = idx / (nB * nC);
+            const int rem = idx - ia * (nB * nC);
+            const int ib = rem / nC;
+            const int ic = rem - ib * nC;
+
+            double bar = 0.0;
+            if (cache_bar) {
+              bar = sh_bar[idx];
+            } else {
+              const int q_idx = c0 + ic;
+              bar = df_bar_cart_from_sph_qp_stream(
+                  bar_X_sph_Qp,
+                  q_idx,
+                  q_offset,
+                  q_count,
+                  ia,
+                  ib,
+                  la,
+                  lb,
+                  a0_sph,
+                  b0_sph,
+                  nao_sph);
+            }
+            if (bar == 0.0) continue;
+
+            const int iax = static_cast<int>(shA_lx[ia]);
+            const int iay = static_cast<int>(shA_ly[ia]);
+            const int iaz = static_cast<int>(shA_lz[ia]);
+            const int ibx = static_cast<int>(shB_lx[ib]);
+            const int iby = static_cast<int>(shB_ly[ib]);
+            const int ibz = static_cast<int>(shB_lz[ib]);
+            const int icx = static_cast<int>(shC_lx[ic]);
+            const int icy = static_cast<int>(shC_ly[ic]);
+            const int icz = static_cast<int>(shC_lz[ic]);
+
+            const double Ix = shift_from_G_ld0_d(sh_Gx[warp_id], iax, ibx, icx, sh_xij_pow);
+            const double Iy = shift_from_G_ld0_d(sh_Gy[warp_id], iay, iby, icy, sh_yij_pow);
+            const double Iz = shift_from_G_ld0_d(sh_Gz[warp_id], iaz, ibz, icz, sh_zij_pow);
+            const double bar_scale = bar * scale;
+
+            const double Ix_m_A = (iax > 0) ? shift_from_G_ld0_d(sh_Gx[warp_id], iax - 1, ibx, icx, sh_xij_pow) : 0.0;
+            const double Ix_p_A = shift_from_G_ld0_d(sh_Gx[warp_id], iax + 1, ibx, icx, sh_xij_pow);
+            const double dIx_A = (-static_cast<double>(iax)) * Ix_m_A + (2.0 * aexp) * Ix_p_A;
+            acc[0] += bar_scale * (dIx_A * Iy * Iz);
+
+            const double Iy_m_A = (iay > 0) ? shift_from_G_ld0_d(sh_Gy[warp_id], iay - 1, iby, icy, sh_yij_pow) : 0.0;
+            const double Iy_p_A = shift_from_G_ld0_d(sh_Gy[warp_id], iay + 1, iby, icy, sh_yij_pow);
+            const double dIy_A = (-static_cast<double>(iay)) * Iy_m_A + (2.0 * aexp) * Iy_p_A;
+            acc[1] += bar_scale * (Ix * dIy_A * Iz);
+
+            const double Iz_m_A = (iaz > 0) ? shift_from_G_ld0_d(sh_Gz[warp_id], iaz - 1, ibz, icz, sh_zij_pow) : 0.0;
+            const double Iz_p_A = shift_from_G_ld0_d(sh_Gz[warp_id], iaz + 1, ibz, icz, sh_zij_pow);
+            const double dIz_A = (-static_cast<double>(iaz)) * Iz_m_A + (2.0 * aexp) * Iz_p_A;
+            acc[2] += bar_scale * (Ix * Iy * dIz_A);
+
+            const double Ix_m_B = (ibx > 0) ? shift_from_G_ld0_d(sh_Gx[warp_id], iax, ibx - 1, icx, sh_xij_pow) : 0.0;
+            const double Ix_p_B = shift_from_G_ld0_d(sh_Gx[warp_id], iax, ibx + 1, icx, sh_xij_pow);
+            const double dIx_B = (-static_cast<double>(ibx)) * Ix_m_B + (2.0 * bexp) * Ix_p_B;
+            acc[3] += bar_scale * (dIx_B * Iy * Iz);
+
+            const double Iy_m_B = (iby > 0) ? shift_from_G_ld0_d(sh_Gy[warp_id], iay, iby - 1, icy, sh_yij_pow) : 0.0;
+            const double Iy_p_B = shift_from_G_ld0_d(sh_Gy[warp_id], iay, iby + 1, icy, sh_yij_pow);
+            const double dIy_B = (-static_cast<double>(iby)) * Iy_m_B + (2.0 * bexp) * Iy_p_B;
+            acc[4] += bar_scale * (Ix * dIy_B * Iz);
+
+            const double Iz_m_B = (ibz > 0) ? shift_from_G_ld0_d(sh_Gz[warp_id], iaz, ibz - 1, icz, sh_zij_pow) : 0.0;
+            const double Iz_p_B = shift_from_G_ld0_d(sh_Gz[warp_id], iaz, ibz + 1, icz, sh_zij_pow);
+            const double dIz_B = (-static_cast<double>(ibz)) * Iz_m_B + (2.0 * bexp) * Iz_p_B;
+            acc[5] += bar_scale * (Ix * Iy * dIz_B);
+
+            const double Ix_m_C = (icx > 0) ? shift_from_G_ld0_d(sh_Gx[warp_id], iax, ibx, icx - 1, sh_xij_pow) : 0.0;
+            const double Ix_p_C = shift_from_G_ld0_d(sh_Gx[warp_id], iax, ibx, icx + 1, sh_xij_pow);
+            const double dIx_C = (-static_cast<double>(icx)) * Ix_m_C + (2.0 * cexp) * Ix_p_C;
+            acc[6] += bar_scale * (dIx_C * Iy * Iz);
+
+            const double Iy_m_C = (icy > 0) ? shift_from_G_ld0_d(sh_Gy[warp_id], iay, iby, icy - 1, sh_yij_pow) : 0.0;
+            const double Iy_p_C = shift_from_G_ld0_d(sh_Gy[warp_id], iay, iby, icy + 1, sh_yij_pow);
+            const double dIy_C = (-static_cast<double>(icy)) * Iy_m_C + (2.0 * cexp) * Iy_p_C;
+            acc[7] += bar_scale * (Ix * dIy_C * Iz);
+
+            const double Iz_m_C = (icz > 0) ? shift_from_G_ld0_d(sh_Gz[warp_id], iaz, ibz, icz - 1, sh_zij_pow) : 0.0;
+            const double Iz_p_C = shift_from_G_ld0_d(sh_Gz[warp_id], iaz, ibz, icz + 1, sh_zij_pow);
+            const double dIz_C = (-static_cast<double>(icz)) * Iz_m_C + (2.0 * cexp) * Iz_p_C;
+            acc[8] += bar_scale * (Ix * Iy * dIz_C);
+          }
+          __syncwarp();
+        }
+      }
+    }
+
+    warp_reduce_sum_arr(acc);
+    if (lane == 0) {
+#pragma unroll
+      for (int i = 0; i < 9; ++i) sh_warp_sum[warp_id][i] = acc[i];
+    }
+    __syncthreads();
+
+    if (threadIdx.x == 0 && active) {
+      double sum[9];
+#pragma unroll
+      for (int i = 0; i < 9; ++i) sum[i] = 0.0;
+      for (int w = 0; w < warps; ++w) {
+#pragma unroll
+        for (int i = 0; i < 9; ++i) sum[i] += sh_warp_sum[w][i];
+      }
+      sumA_blk[0] += fac * sum[0];
+      sumA_blk[1] += fac * sum[1];
+      sumA_blk[2] += fac * sum[2];
+      sumB_blk[0] += fac * sum[3];
+      sumB_blk[1] += fac * sum[4];
+      sumB_blk[2] += fac * sum[5];
+      const int atomC = static_cast<int>(shell_atom[shellC]);
+      int slot = -1;
+#pragma unroll
+      for (int u = 0; u < kAtomAggMax; ++u) {
+        if (u >= sh_n_atomC_agg) break;
+        if (sh_atomC_agg[u] == atomC) {
+          slot = u;
+          break;
+        }
+      }
+      if (slot < 0 && sh_n_atomC_agg < kAtomAggMax) {
+        slot = sh_n_atomC_agg;
+        sh_atomC_agg[slot] = atomC;
+        sh_sumC_agg[slot][0] = 0.0;
+        sh_sumC_agg[slot][1] = 0.0;
+        sh_sumC_agg[slot][2] = 0.0;
+        ++sh_n_atomC_agg;
+      }
+      if (slot >= 0) {
+        sh_sumC_agg[slot][0] += fac * sum[6];
+        sh_sumC_agg[slot][1] += fac * sum[7];
+        sh_sumC_agg[slot][2] += fac * sum[8];
+      } else {
+        atomicAdd(&grad_dev[atomC * 3 + 0], fac * sum[6]);
+        atomicAdd(&grad_dev[atomC * 3 + 1], fac * sum[7]);
+        atomicAdd(&grad_dev[atomC * 3 + 2], fac * sum[8]);
+      }
+    }
+    __syncthreads();
+  }
+
+  if (threadIdx.x == 0) {
+    atomicAdd(&grad_dev[atomA * 3 + 0], sumA_blk[0]);
+    atomicAdd(&grad_dev[atomA * 3 + 1], sumA_blk[1]);
+    atomicAdd(&grad_dev[atomA * 3 + 2], sumA_blk[2]);
+    atomicAdd(&grad_dev[atomB * 3 + 0], sumB_blk[0]);
+    atomicAdd(&grad_dev[atomB * 3 + 1], sumB_blk[1]);
+    atomicAdd(&grad_dev[atomB * 3 + 2], sumB_blk[2]);
+    for (int u = 0; u < sh_n_atomC_agg; ++u) {
+      const int atomC = sh_atomC_agg[u];
+      atomicAdd(&grad_dev[atomC * 3 + 0], sh_sumC_agg[u][0]);
+      atomicAdd(&grad_dev[atomC * 3 + 1], sh_sumC_agg[u][1]);
+      atomicAdd(&grad_dev[atomC * 3 + 2], sh_sumC_agg[u][2]);
+    }
+  }
+}
+
+
+// Multi-bar (multi-state) streamed-QAB + AB-tiled spherical-bar_X variant.
+template <int NROOTS, int NBAR>
+__global__ void KernelDFInt3c2eDerivContractedCartAllSPAtomGradSphBarQmnABTileMultiBar(
+    const int32_t* spAB_arr,
+    int n_spAB,
+    const int32_t* spCD,
+    int ntasks,
+    const int32_t* sp_A,
+    const int32_t* sp_B,
+    const int32_t* sp_pair_start,
+    const int32_t* sp_npair,
+    const double* shell_cx,
+    const double* shell_cy,
+    const double* shell_cz,
+    const int32_t* shell_prim_start,
+    const int32_t* shell_nprim,
+    const int32_t* shell_ao_start,
+    const double* prim_exp,
+    const double* pair_eta,
+    const double* pair_Px,
+    const double* pair_Py,
+    const double* pair_Pz,
+    const double* pair_cK,
+    int nao,
+    int naux,
+    int nao_sph,
+    int la,
+    int lb,
+    int lc,
+    const double* bar_X_sph_Qmn_multi,
+    int64_t bar_stride,
+    const int32_t* shell_ao_start_sph,
+    const int32_t* shell_atom,
+    int cd_tile,
+    int q_offset,
+    int q_count,
+    double* grad_dev_multi,
+    int64_t grad_stride) {
+  const int t0 = static_cast<int>(blockIdx.x) * cd_tile;
+  const int iAB = static_cast<int>(blockIdx.y);
+  if (iAB >= n_spAB || cd_tile <= 0 || t0 >= ntasks) return;
+
+  const int spAB = static_cast<int>(spAB_arr[iAB]);
+  const int shellA = static_cast<int>(sp_A[spAB]);
+  const int shellB = static_cast<int>(sp_B[spAB]);
+
+  __shared__ int8_t shA_lx[kNcartMax], shA_ly[kNcartMax], shA_lz[kNcartMax];
+  __shared__ int8_t shB_lx[kNcartMax], shB_ly[kNcartMax], shB_lz[kNcartMax];
+  __shared__ int8_t shC_lx[kNcartMax], shC_ly[kNcartMax], shC_lz[kNcartMax];
+  __shared__ double sh_xij_pow[kLMaxD + 1], sh_yij_pow[kLMaxD + 1], sh_zij_pow[kLMaxD + 1];
+  __shared__ double sh_Gx[kMaxWarpsPerBlock][kGSizeD];
+  __shared__ double sh_Gy[kMaxWarpsPerBlock][kGSizeD];
+  __shared__ double sh_Gz[kMaxWarpsPerBlock][kGSizeD];
+  __shared__ double sh_warp_sum[kMaxWarpsPerBlock][9 * NBAR];
+  __shared__ double sh_bar[NBAR * kBarCacheMax];
+  __shared__ int sh_atomC_agg[kAtomAggMax];
+  __shared__ double sh_sumC_agg[NBAR][kAtomAggMax][3];
+  __shared__ int sh_n_atomC_agg;
+
+  const int nA = ncart(la);
+  const int nB = ncart(lb);
+  const int nC = ncart(lc);
+  const int nElem = nA * nB * nC;
+  const int baseAB = static_cast<int>(sp_pair_start[spAB]);
+  const int nprimAB = static_cast<int>(sp_npair[spAB]);
+  const int nprimB = static_cast<int>(shell_nprim[shellB]);
+  const int sA = static_cast<int>(shell_prim_start[shellA]);
+  const int sB = static_cast<int>(shell_prim_start[shellB]);
+  const int a0_sph = static_cast<int>(shell_ao_start_sph[shellA]);
+  const int b0_sph = static_cast<int>(shell_ao_start_sph[shellB]);
+
+  const double Ax = shell_cx[shellA];
+  const double Ay = shell_cy[shellA];
+  const double Az = shell_cz[shellA];
+  const double Bx = shell_cx[shellB];
+  const double By = shell_cy[shellB];
+  const double Bz = shell_cz[shellB];
+  const double fac = (shellA != shellB) ? 2.0 : 1.0;
+  const int atomA = static_cast<int>(shell_atom[shellA]);
+  const int atomB = static_cast<int>(shell_atom[shellB]);
+
+  if (threadIdx.x == 0) {
+    fill_cart_comp(la, shA_lx, shA_ly, shA_lz);
+    fill_cart_comp(lb, shB_lx, shB_ly, shB_lz);
+    fill_cart_comp(lc, shC_lx, shC_ly, shC_lz);
+    const double ABx = Ax - Bx;
+    const double ABy = Ay - By;
+    const double ABz = Az - Bz;
+    sh_xij_pow[0] = 1.0;
+    sh_yij_pow[0] = 1.0;
+    sh_zij_pow[0] = 1.0;
+    for (int p = 1; p <= kLMaxD; ++p) {
+      sh_xij_pow[p] = sh_xij_pow[p - 1] * ABx;
+      sh_yij_pow[p] = sh_yij_pow[p - 1] * ABy;
+      sh_zij_pow[p] = sh_zij_pow[p - 1] * ABz;
+    }
+  }
+  __syncthreads();
+
+  const bool cache_bar = (nElem > 0 && nElem <= kBarCacheMax);
+  const int lane = static_cast<int>(threadIdx.x) & 31;
+  const int warp_id = static_cast<int>(threadIdx.x) >> 5;
+  const int warps = static_cast<int>(blockDim.x) >> 5;
+  const int nmax = la + lb + 1;
+  const int mmax = lc + 1;
+
+  double sumA_blk[3 * NBAR];
+  double sumB_blk[3 * NBAR];
+  if (threadIdx.x == 0) {
+#pragma unroll
+    for (int br = 0; br < NBAR; ++br) {
+      sumA_blk[br * 3 + 0] = 0.0;
+      sumA_blk[br * 3 + 1] = 0.0;
+      sumA_blk[br * 3 + 2] = 0.0;
+      sumB_blk[br * 3 + 0] = 0.0;
+      sumB_blk[br * 3 + 1] = 0.0;
+      sumB_blk[br * 3 + 2] = 0.0;
+    }
+    sh_n_atomC_agg = 0;
+  }
+  __syncthreads();
+
+  for (int tt = 0; tt < cd_tile; ++tt) {
+    const int t = t0 + tt;
+    const bool active = (t < ntasks);
+    const int spCD_i = active ? static_cast<int>(spCD[t]) : 0;
+    const int shellC = active ? static_cast<int>(sp_A[spCD_i]) : 0;
+    const int c0 = active ? (static_cast<int>(shell_ao_start[shellC]) - nao) : 0;
+    const int baseCD = active ? static_cast<int>(sp_pair_start[spCD_i]) : 0;
+    const int nprimCD = active ? static_cast<int>(sp_npair[spCD_i]) : 0;
+    const int sC = active ? static_cast<int>(shell_prim_start[shellC]) : 0;
+    const double Cx = active ? shell_cx[shellC] : 0.0;
+    const double Cy = active ? shell_cy[shellC] : 0.0;
+    const double Cz = active ? shell_cz[shellC] : 0.0;
+
+    if (cache_bar) {
+      for (int idx = static_cast<int>(threadIdx.x); idx < nElem; idx += static_cast<int>(blockDim.x)) {
+        if (active) {
+          const int ia = idx / (nB * nC);
+          const int rem = idx - ia * (nB * nC);
+          const int ib = rem / nC;
+          const int ic = rem - ib * nC;
+          const int q_idx = c0 + ic;
+#pragma unroll
+          for (int br = 0; br < NBAR; ++br) {
+            const double* bar_ptr = bar_X_sph_Qmn_multi + static_cast<int64_t>(br) * bar_stride;
+            sh_bar[br * kBarCacheMax + idx] = df_bar_cart_from_sph_qmn_stream(
+                bar_ptr,
+                q_idx,
+                q_offset,
+                q_count,
+                ia,
+                ib,
+                la,
+                lb,
+                a0_sph,
+                b0_sph,
+                nao_sph);
+          }
+        } else {
+#pragma unroll
+          for (int br = 0; br < NBAR; ++br) sh_bar[br * kBarCacheMax + idx] = 0.0;
+        }
+      }
+    }
+    __syncthreads();
+
+    // Block-level bar_X early-exit: skip tile if max|sh_bar| < threshold across all bars.
+    if (cache_bar) {
+      double tmax = 0.0;
+      for (int idx = static_cast<int>(threadIdx.x); idx < nElem; idx += static_cast<int>(blockDim.x)) {
+#pragma unroll
+        for (int br = 0; br < NBAR; ++br) {
+          double v = static_cast<double>(sh_bar[br * kBarCacheMax + idx]);
+          if (v < 0.0) v = -v;
+          if (v > tmax) tmax = v;
+        }
+      }
+      for (int offset = 16; offset > 0; offset >>= 1) {
+        double other = __shfl_down_sync(0xffffffff, tmax, offset);
+        if (other > tmax) tmax = other;
+      }
+      {
+        const int lane_ = static_cast<int>(threadIdx.x) & 31;
+        const int warp_ = static_cast<int>(threadIdx.x) >> 5;
+        if (lane_ == 0) sh_warp_sum[warp_][0] = tmax;
+      }
+      __syncthreads();
+      if (threadIdx.x == 0) {
+        double bmax = sh_warp_sum[0][0];
+        const int nw = static_cast<int>(blockDim.x) >> 5;
+        for (int w = 1; w < nw; ++w) {
+          if (sh_warp_sum[w][0] > bmax) bmax = sh_warp_sum[w][0];
+        }
+        sh_warp_sum[0][0] = bmax;
+      }
+      __syncthreads();
+      if (sh_warp_sum[0][0] < 1e-14) continue;
+    }
+
+    double acc[9 * NBAR];
+#pragma unroll
+    for (int i = 0; i < 9 * NBAR; ++i) acc[i] = 0.0;
+
+    const int64_t nTot = static_cast<int64_t>(nprimAB) * static_cast<int64_t>(nprimCD);
+    for (int64_t u = static_cast<int64_t>(warp_id); u < nTot; u += static_cast<int64_t>(warps)) {
+      const int iAB_prim = static_cast<int>(u / static_cast<int64_t>(nprimCD));
+      const int iCD = static_cast<int>(u - static_cast<int64_t>(iAB_prim) * static_cast<int64_t>(nprimCD));
+      const int ki = baseAB + iAB_prim;
+      const int kj = baseCD + iCD;
+
+      const double p = pair_eta[ki];
+      const double q = pair_eta[kj];
+      const double Px = pair_Px[ki];
+      const double Py = pair_Py[ki];
+      const double Pz = pair_Pz[ki];
+      const double Qx = pair_Px[kj];
+      const double Qy = pair_Py[kj];
+      const double Qz = pair_Pz[kj];
+      const double cKab = pair_cK[ki];
+      const double cKcd = pair_cK[kj];
+
+      const int ia_prim = iAB_prim / nprimB;
+      const int ib_prim = iAB_prim - ia_prim * nprimB;
+      const double aexp = prim_exp[sA + ia_prim];
+      const double bexp = prim_exp[sB + ib_prim];
+      const double cexp = prim_exp[sC + iCD];
+
+      const double denom = p + q;
+      const double inv_denom = 1.0 / denom;
+      const double dx = Px - Qx;
+      const double dy = Py - Qy;
+      const double dz = Pz - Qz;
+      const double PQ2 = dx * dx + dy * dy + dz * dz;
+      const double omega = p * q * inv_denom;
+      const double T = omega * PQ2;
+      const double base = kTwoPiToFiveHalves / (p * q * ::sqrt(denom)) * cKab * cKcd;
+
+      double roots[NROOTS];
+      double weights[NROOTS];
+      if (lane == 0) {
+        cueri_rys::rys_roots_weights<NROOTS>(T, roots, weights);
+      }
+
+      for (int r = 0; r < NROOTS; ++r) {
+        double x = (lane == 0) ? roots[r] : 0.0;
+        double w = (lane == 0) ? weights[r] : 0.0;
+        x = __shfl_sync(0xffffffff, x, 0);
+        w = __shfl_sync(0xffffffff, w, 0);
+
+        {
+          const double B0 = x * 0.5 * inv_denom;
+          const double B1 = (1.0 - x) * 0.5 / p + B0;
+          const double B1p = (1.0 - x) * 0.5 / q + B0;
+          const double q_over = q * inv_denom;
+          const double p_over = p * inv_denom;
+          if (lane < 3) {
+            double PA, QC, PQd;
+            double* G_target;
+            if (lane == 0) { PA = Px - Ax; QC = Qx - Cx; PQd = Qx - Px; G_target = sh_Gx[warp_id]; }
+            else if (lane == 1) { PA = Py - Ay; QC = Qy - Cy; PQd = Qy - Py; G_target = sh_Gy[warp_id]; }
+            else { PA = Pz - Az; QC = Qz - Cz; PQd = Qz - Pz; G_target = sh_Gz[warp_id]; }
+            compute_G_d(G_target, nmax, mmax, PA + q_over * x * PQd, QC - p_over * x * PQd, B0, B1, B1p);
+          }
+        }
+
+        const double scale = base * w;
+        __syncwarp();
+
+        for (int idx = lane; idx < nElem; idx += 32) {
+          const int ia = idx / (nB * nC);
+          const int rem = idx - ia * (nB * nC);
+          const int ib = rem / nC;
+          const int ic = rem - ib * nC;
+
+          double bars[NBAR];
+          bool any_bar = false;
+#pragma unroll
+          for (int br = 0; br < NBAR; ++br) {
+            double bar = 0.0;
+            if (cache_bar) {
+              bar = sh_bar[br * kBarCacheMax + idx];
+            } else {
+              const int q_idx = c0 + ic;
+              const double* bar_ptr = bar_X_sph_Qmn_multi + static_cast<int64_t>(br) * bar_stride;
+              bar = df_bar_cart_from_sph_qmn_stream(
+                  bar_ptr,
+                  q_idx,
+                  q_offset,
+                  q_count,
+                  ia,
+                  ib,
+                  la,
+                  lb,
+                  a0_sph,
+                  b0_sph,
+                  nao_sph);
+            }
+            bars[br] = bar;
+            any_bar = any_bar || (bar != 0.0);
+          }
+          if (!any_bar) continue;
+
+          const int iax = static_cast<int>(shA_lx[ia]);
+          const int iay = static_cast<int>(shA_ly[ia]);
+          const int iaz = static_cast<int>(shA_lz[ia]);
+          const int ibx = static_cast<int>(shB_lx[ib]);
+          const int iby = static_cast<int>(shB_ly[ib]);
+          const int ibz = static_cast<int>(shB_lz[ib]);
+          const int icx = static_cast<int>(shC_lx[ic]);
+          const int icy = static_cast<int>(shC_ly[ic]);
+          const int icz = static_cast<int>(shC_lz[ic]);
+
+          const double Ix = shift_from_G_ld0_d(sh_Gx[warp_id], iax, ibx, icx, sh_xij_pow);
+          const double Iy = shift_from_G_ld0_d(sh_Gy[warp_id], iay, iby, icy, sh_yij_pow);
+          const double Iz = shift_from_G_ld0_d(sh_Gz[warp_id], iaz, ibz, icz, sh_zij_pow);
+
+          const double Ix_m_A = (iax > 0) ? shift_from_G_ld0_d(sh_Gx[warp_id], iax - 1, ibx, icx, sh_xij_pow) : 0.0;
+          const double Ix_p_A = shift_from_G_ld0_d(sh_Gx[warp_id], iax + 1, ibx, icx, sh_xij_pow);
+          const double dIx_A = (-static_cast<double>(iax)) * Ix_m_A + (2.0 * aexp) * Ix_p_A;
+          const double t0v = (dIx_A * Iy * Iz);
+
+          const double Iy_m_A = (iay > 0) ? shift_from_G_ld0_d(sh_Gy[warp_id], iay - 1, iby, icy, sh_yij_pow) : 0.0;
+          const double Iy_p_A = shift_from_G_ld0_d(sh_Gy[warp_id], iay + 1, iby, icy, sh_yij_pow);
+          const double dIy_A = (-static_cast<double>(iay)) * Iy_m_A + (2.0 * aexp) * Iy_p_A;
+          const double t1v = (Ix * dIy_A * Iz);
+
+          const double Iz_m_A = (iaz > 0) ? shift_from_G_ld0_d(sh_Gz[warp_id], iaz - 1, ibz, icz, sh_zij_pow) : 0.0;
+          const double Iz_p_A = shift_from_G_ld0_d(sh_Gz[warp_id], iaz + 1, ibz, icz, sh_zij_pow);
+          const double dIz_A = (-static_cast<double>(iaz)) * Iz_m_A + (2.0 * aexp) * Iz_p_A;
+          const double t2v = (Ix * Iy * dIz_A);
+
+          const double Ix_m_B = (ibx > 0) ? shift_from_G_ld0_d(sh_Gx[warp_id], iax, ibx - 1, icx, sh_xij_pow) : 0.0;
+          const double Ix_p_B = shift_from_G_ld0_d(sh_Gx[warp_id], iax, ibx + 1, icx, sh_xij_pow);
+          const double dIx_B = (-static_cast<double>(ibx)) * Ix_m_B + (2.0 * bexp) * Ix_p_B;
+          const double t3v = (dIx_B * Iy * Iz);
+
+          const double Iy_m_B = (iby > 0) ? shift_from_G_ld0_d(sh_Gy[warp_id], iay, iby - 1, icy, sh_yij_pow) : 0.0;
+          const double Iy_p_B = shift_from_G_ld0_d(sh_Gy[warp_id], iay, iby + 1, icy, sh_yij_pow);
+          const double dIy_B = (-static_cast<double>(iby)) * Iy_m_B + (2.0 * bexp) * Iy_p_B;
+          const double t4v = (Ix * dIy_B * Iz);
+
+          const double Iz_m_B = (ibz > 0) ? shift_from_G_ld0_d(sh_Gz[warp_id], iaz, ibz - 1, icz, sh_zij_pow) : 0.0;
+          const double Iz_p_B = shift_from_G_ld0_d(sh_Gz[warp_id], iaz, ibz + 1, icz, sh_zij_pow);
+          const double dIz_B = (-static_cast<double>(ibz)) * Iz_m_B + (2.0 * bexp) * Iz_p_B;
+          const double t5v = (Ix * Iy * dIz_B);
+
+          const double Ix_m_C = (icx > 0) ? shift_from_G_ld0_d(sh_Gx[warp_id], iax, ibx, icx - 1, sh_xij_pow) : 0.0;
+          const double Ix_p_C = shift_from_G_ld0_d(sh_Gx[warp_id], iax, ibx, icx + 1, sh_xij_pow);
+          const double dIx_C = (-static_cast<double>(icx)) * Ix_m_C + (2.0 * cexp) * Ix_p_C;
+          const double t6v = (dIx_C * Iy * Iz);
+
+          const double Iy_m_C = (icy > 0) ? shift_from_G_ld0_d(sh_Gy[warp_id], iay, iby, icy - 1, sh_yij_pow) : 0.0;
+          const double Iy_p_C = shift_from_G_ld0_d(sh_Gy[warp_id], iay, iby, icy + 1, sh_yij_pow);
+          const double dIy_C = (-static_cast<double>(icy)) * Iy_m_C + (2.0 * cexp) * Iy_p_C;
+          const double t7v = (Ix * dIy_C * Iz);
+
+          const double Iz_m_C = (icz > 0) ? shift_from_G_ld0_d(sh_Gz[warp_id], iaz, ibz, icz - 1, sh_zij_pow) : 0.0;
+          const double Iz_p_C = shift_from_G_ld0_d(sh_Gz[warp_id], iaz, ibz, icz + 1, sh_zij_pow);
+          const double dIz_C = (-static_cast<double>(icz)) * Iz_m_C + (2.0 * cexp) * Iz_p_C;
+          const double t8v = (Ix * Iy * dIz_C);
+
+#pragma unroll
+          for (int br = 0; br < NBAR; ++br) {
+            const double bar = bars[br];
+            if (bar == 0.0) continue;
+            const double bar_scale = bar * scale;
+            acc[br * 9 + 0] += bar_scale * t0v;
+            acc[br * 9 + 1] += bar_scale * t1v;
+            acc[br * 9 + 2] += bar_scale * t2v;
+            acc[br * 9 + 3] += bar_scale * t3v;
+            acc[br * 9 + 4] += bar_scale * t4v;
+            acc[br * 9 + 5] += bar_scale * t5v;
+            acc[br * 9 + 6] += bar_scale * t6v;
+            acc[br * 9 + 7] += bar_scale * t7v;
+            acc[br * 9 + 8] += bar_scale * t8v;
+          }
+        }
+        __syncwarp();
+      }
+    }
+
+#pragma unroll
+    for (int br = 0; br < NBAR; ++br) {
+      warp_reduce_sum_arr<9>(&acc[br * 9]);
+    }
+    if (lane == 0) {
+#pragma unroll
+      for (int br = 0; br < NBAR; ++br) {
+#pragma unroll
+        for (int i = 0; i < 9; ++i) sh_warp_sum[warp_id][br * 9 + i] = acc[br * 9 + i];
+      }
+    }
+    __syncthreads();
+
+    if (threadIdx.x == 0 && active) {
+      const int atomC = static_cast<int>(shell_atom[shellC]);
+      int slot = -1;
+#pragma unroll
+      for (int u = 0; u < kAtomAggMax; ++u) {
+        if (u >= sh_n_atomC_agg) break;
+        if (sh_atomC_agg[u] == atomC) {
+          slot = u;
+          break;
+        }
+      }
+      if (slot < 0 && sh_n_atomC_agg < kAtomAggMax) {
+        slot = sh_n_atomC_agg;
+        sh_atomC_agg[slot] = atomC;
+#pragma unroll
+        for (int br = 0; br < NBAR; ++br) {
+          sh_sumC_agg[br][slot][0] = 0.0;
+          sh_sumC_agg[br][slot][1] = 0.0;
+          sh_sumC_agg[br][slot][2] = 0.0;
+        }
+        ++sh_n_atomC_agg;
+      }
+
+      for (int br = 0; br < NBAR; ++br) {
+        double sum[9];
+#pragma unroll
+        for (int i = 0; i < 9; ++i) sum[i] = 0.0;
+        for (int w = 0; w < warps; ++w) {
+#pragma unroll
+          for (int i = 0; i < 9; ++i) sum[i] += sh_warp_sum[w][br * 9 + i];
+        }
+        sumA_blk[br * 3 + 0] += fac * sum[0];
+        sumA_blk[br * 3 + 1] += fac * sum[1];
+        sumA_blk[br * 3 + 2] += fac * sum[2];
+        sumB_blk[br * 3 + 0] += fac * sum[3];
+        sumB_blk[br * 3 + 1] += fac * sum[4];
+        sumB_blk[br * 3 + 2] += fac * sum[5];
+
+        if (slot >= 0) {
+          sh_sumC_agg[br][slot][0] += fac * sum[6];
+          sh_sumC_agg[br][slot][1] += fac * sum[7];
+          sh_sumC_agg[br][slot][2] += fac * sum[8];
+        } else {
+          double* grad_dev = grad_dev_multi + static_cast<int64_t>(br) * grad_stride;
+          atomicAdd(&grad_dev[atomC * 3 + 0], fac * sum[6]);
+          atomicAdd(&grad_dev[atomC * 3 + 1], fac * sum[7]);
+          atomicAdd(&grad_dev[atomC * 3 + 2], fac * sum[8]);
+        }
+      }
+    }
+    __syncthreads();
+  }
+
+  if (threadIdx.x == 0) {
+    for (int br = 0; br < NBAR; ++br) {
+      double* grad_dev = grad_dev_multi + static_cast<int64_t>(br) * grad_stride;
+      atomicAdd(&grad_dev[atomA * 3 + 0], sumA_blk[br * 3 + 0]);
+      atomicAdd(&grad_dev[atomA * 3 + 1], sumA_blk[br * 3 + 1]);
+      atomicAdd(&grad_dev[atomA * 3 + 2], sumA_blk[br * 3 + 2]);
+      atomicAdd(&grad_dev[atomB * 3 + 0], sumB_blk[br * 3 + 0]);
+      atomicAdd(&grad_dev[atomB * 3 + 1], sumB_blk[br * 3 + 1]);
+      atomicAdd(&grad_dev[atomB * 3 + 2], sumB_blk[br * 3 + 2]);
+      for (int u = 0; u < sh_n_atomC_agg; ++u) {
+        const int atomC = sh_atomC_agg[u];
+        atomicAdd(&grad_dev[atomC * 3 + 0], sh_sumC_agg[br][u][0]);
+        atomicAdd(&grad_dev[atomC * 3 + 1], sh_sumC_agg[br][u][1]);
+        atomicAdd(&grad_dev[atomC * 3 + 2], sh_sumC_agg[br][u][2]);
+      }
+    }
+  }
+}
+
+template <int NROOTS, typename TBar, int NBAR>
+__global__ void KernelDFInt3c2eDerivContractedCartAllSPAtomGradSphBarQpABTileMultiBar(
+    const int32_t* spAB_arr,
+    int n_spAB,
+    const int32_t* spCD,
+    int ntasks,
+    const int32_t* sp_A,
+    const int32_t* sp_B,
+    const int32_t* sp_pair_start,
+    const int32_t* sp_npair,
+    const double* shell_cx,
+    const double* shell_cy,
+    const double* shell_cz,
+    const int32_t* shell_prim_start,
+    const int32_t* shell_nprim,
+    const int32_t* shell_ao_start,
+    const double* prim_exp,
+    const double* pair_eta,
+    const double* pair_Px,
+    const double* pair_Py,
+    const double* pair_Pz,
+    const double* pair_cK,
+    int nao,
+    int naux,
+    int nao_sph,
+    int la,
+    int lb,
+    int lc,
+    const TBar* bar_X_sph_Qp0,
+    const TBar* bar_X_sph_Qp1,
+    const TBar* bar_X_sph_Qp2,  // ignored when NBAR<3
+    const int32_t* shell_ao_start_sph,
+    const int32_t* shell_atom,
+    int cd_tile,
+    int q_offset,
+    int q_count,
+    double* grad_dev_multi,
+    int64_t grad_stride) {
+  const int t0 = static_cast<int>(blockIdx.x) * cd_tile;
+  const int iAB = static_cast<int>(blockIdx.y);
+  if (iAB >= n_spAB || cd_tile <= 0 || t0 >= ntasks) return;
+
+  const int spAB = static_cast<int>(spAB_arr[iAB]);
+  const int shellA = static_cast<int>(sp_A[spAB]);
+  const int shellB = static_cast<int>(sp_B[spAB]);
+
+  __shared__ int8_t shA_lx[kNcartMax], shA_ly[kNcartMax], shA_lz[kNcartMax];
+  __shared__ int8_t shB_lx[kNcartMax], shB_ly[kNcartMax], shB_lz[kNcartMax];
+  __shared__ int8_t shC_lx[kNcartMax], shC_ly[kNcartMax], shC_lz[kNcartMax];
+  __shared__ double sh_xij_pow[kLMaxD + 1], sh_yij_pow[kLMaxD + 1], sh_zij_pow[kLMaxD + 1];
+  __shared__ double sh_Gx[kMaxWarpsPerBlock][kGSizeD];
+  __shared__ double sh_Gy[kMaxWarpsPerBlock][kGSizeD];
+  __shared__ double sh_Gz[kMaxWarpsPerBlock][kGSizeD];
+  __shared__ double sh_warp_sum[kMaxWarpsPerBlock][9 * NBAR];
+  __shared__ double sh_bar[NBAR * kBarCacheMax];
+  __shared__ int sh_atomC_agg[kAtomAggMax];
+  __shared__ double sh_sumC_agg[NBAR][kAtomAggMax][3];
+  __shared__ int sh_n_atomC_agg;
+
+  const int nA = ncart(la);
+  const int nB = ncart(lb);
+  const int nC = ncart(lc);
+  const int nElem = nA * nB * nC;
+  const int baseAB = static_cast<int>(sp_pair_start[spAB]);
+  const int nprimAB = static_cast<int>(sp_npair[spAB]);
+  const int nprimB = static_cast<int>(shell_nprim[shellB]);
+  const int sA = static_cast<int>(shell_prim_start[shellA]);
+  const int sB = static_cast<int>(shell_prim_start[shellB]);
+  const int a0_sph = static_cast<int>(shell_ao_start_sph[shellA]);
+  const int b0_sph = static_cast<int>(shell_ao_start_sph[shellB]);
+
+  const double Ax = shell_cx[shellA];
+  const double Ay = shell_cy[shellA];
+  const double Az = shell_cz[shellA];
+  const double Bx = shell_cx[shellB];
+  const double By = shell_cy[shellB];
+  const double Bz = shell_cz[shellB];
+  const double fac = (shellA != shellB) ? 2.0 : 1.0;
+  const int atomA = static_cast<int>(shell_atom[shellA]);
+  const int atomB = static_cast<int>(shell_atom[shellB]);
+
+  const TBar* bar_ptrs[3] = {bar_X_sph_Qp0, bar_X_sph_Qp1, bar_X_sph_Qp2};
+
+  if (threadIdx.x == 0) {
+    fill_cart_comp(la, shA_lx, shA_ly, shA_lz);
+    fill_cart_comp(lb, shB_lx, shB_ly, shB_lz);
+    fill_cart_comp(lc, shC_lx, shC_ly, shC_lz);
+    const double ABx = Ax - Bx;
+    const double ABy = Ay - By;
+    const double ABz = Az - Bz;
+    sh_xij_pow[0] = 1.0;
+    sh_yij_pow[0] = 1.0;
+    sh_zij_pow[0] = 1.0;
+    for (int p = 1; p <= kLMaxD; ++p) {
+      sh_xij_pow[p] = sh_xij_pow[p - 1] * ABx;
+      sh_yij_pow[p] = sh_yij_pow[p - 1] * ABy;
+      sh_zij_pow[p] = sh_zij_pow[p - 1] * ABz;
+    }
+  }
+  __syncthreads();
+
+  const bool cache_bar = (nElem > 0 && nElem <= kBarCacheMax);
+  const int lane = static_cast<int>(threadIdx.x) & 31;
+  const int warp_id = static_cast<int>(threadIdx.x) >> 5;
+  const int warps = static_cast<int>(blockDim.x) >> 5;
+  const int nmax = la + lb + 1;
+  const int mmax = lc + 1;
+
+  double sumA_blk[3 * NBAR];
+  double sumB_blk[3 * NBAR];
+  if (threadIdx.x == 0) {
+#pragma unroll
+    for (int br = 0; br < NBAR; ++br) {
+      sumA_blk[br * 3 + 0] = 0.0;
+      sumA_blk[br * 3 + 1] = 0.0;
+      sumA_blk[br * 3 + 2] = 0.0;
+      sumB_blk[br * 3 + 0] = 0.0;
+      sumB_blk[br * 3 + 1] = 0.0;
+      sumB_blk[br * 3 + 2] = 0.0;
+    }
+    sh_n_atomC_agg = 0;
+  }
+  __syncthreads();
+
+  for (int tt = 0; tt < cd_tile; ++tt) {
+    const int t = t0 + tt;
+    const bool active = (t < ntasks);
+    const int spCD_i = active ? static_cast<int>(spCD[t]) : 0;
+    const int shellC = active ? static_cast<int>(sp_A[spCD_i]) : 0;
+    const int c0 = active ? (static_cast<int>(shell_ao_start[shellC]) - nao) : 0;
+    const int baseCD = active ? static_cast<int>(sp_pair_start[spCD_i]) : 0;
+    const int nprimCD = active ? static_cast<int>(sp_npair[spCD_i]) : 0;
+    const int sC = active ? static_cast<int>(shell_prim_start[shellC]) : 0;
+    const double Cx = active ? shell_cx[shellC] : 0.0;
+    const double Cy = active ? shell_cy[shellC] : 0.0;
+    const double Cz = active ? shell_cz[shellC] : 0.0;
+
+    if (cache_bar) {
+      for (int idx = static_cast<int>(threadIdx.x); idx < nElem; idx += static_cast<int>(blockDim.x)) {
+        if (active) {
+          const int ia = idx / (nB * nC);
+          const int rem = idx - ia * (nB * nC);
+          const int ib = rem / nC;
+          const int ic = rem - ib * nC;
+          const int q_idx = c0 + ic;
+#pragma unroll
+          for (int br = 0; br < NBAR; ++br) {
+            sh_bar[br * kBarCacheMax + idx] = df_bar_cart_from_sph_qp_stream(
+                bar_ptrs[br],
+                q_idx,
+                q_offset,
+                q_count,
+                ia,
+                ib,
+                la,
+                lb,
+                a0_sph,
+                b0_sph,
+                nao_sph);
+          }
+        } else {
+#pragma unroll
+          for (int br = 0; br < NBAR; ++br) sh_bar[br * kBarCacheMax + idx] = 0.0;
+        }
+      }
+    }
+    __syncthreads();
+
+    // Block-level bar_X early-exit: skip tile if max|sh_bar| < threshold across all bars.
+    if (cache_bar) {
+      double tmax = 0.0;
+      for (int idx = static_cast<int>(threadIdx.x); idx < nElem; idx += static_cast<int>(blockDim.x)) {
+#pragma unroll
+        for (int br = 0; br < NBAR; ++br) {
+          double v = static_cast<double>(sh_bar[br * kBarCacheMax + idx]);
+          if (v < 0.0) v = -v;
+          if (v > tmax) tmax = v;
+        }
+      }
+      for (int offset = 16; offset > 0; offset >>= 1) {
+        double other = __shfl_down_sync(0xffffffff, tmax, offset);
+        if (other > tmax) tmax = other;
+      }
+      {
+        const int lane_ = static_cast<int>(threadIdx.x) & 31;
+        const int warp_ = static_cast<int>(threadIdx.x) >> 5;
+        if (lane_ == 0) sh_warp_sum[warp_][0] = tmax;
+      }
+      __syncthreads();
+      if (threadIdx.x == 0) {
+        double bmax = sh_warp_sum[0][0];
+        const int nw = static_cast<int>(blockDim.x) >> 5;
+        for (int w = 1; w < nw; ++w) {
+          if (sh_warp_sum[w][0] > bmax) bmax = sh_warp_sum[w][0];
+        }
+        sh_warp_sum[0][0] = bmax;
+      }
+      __syncthreads();
+      if (sh_warp_sum[0][0] < 1e-14) continue;
+    }
+
+    double acc[9 * NBAR];
+#pragma unroll
+    for (int i = 0; i < 9 * NBAR; ++i) acc[i] = 0.0;
+
+    const int64_t nTot = static_cast<int64_t>(nprimAB) * static_cast<int64_t>(nprimCD);
+    for (int64_t u = static_cast<int64_t>(warp_id); u < nTot; u += static_cast<int64_t>(warps)) {
+      const int iAB_prim = static_cast<int>(u / static_cast<int64_t>(nprimCD));
+      const int iCD = static_cast<int>(u - static_cast<int64_t>(iAB_prim) * static_cast<int64_t>(nprimCD));
+      const int ki = baseAB + iAB_prim;
+      const int kj = baseCD + iCD;
+
+      const double p = pair_eta[ki];
+      const double q = pair_eta[kj];
+      const double Px = pair_Px[ki];
+      const double Py = pair_Py[ki];
+      const double Pz = pair_Pz[ki];
+      const double Qx = pair_Px[kj];
+      const double Qy = pair_Py[kj];
+      const double Qz = pair_Pz[kj];
+      const double cKab = pair_cK[ki];
+      const double cKcd = pair_cK[kj];
+
+      const int ia_prim = iAB_prim / nprimB;
+      const int ib_prim = iAB_prim - ia_prim * nprimB;
+      const double aexp = prim_exp[sA + ia_prim];
+      const double bexp = prim_exp[sB + ib_prim];
+      const double cexp = prim_exp[sC + iCD];
+
+      const double denom = p + q;
+      const double inv_denom = 1.0 / denom;
+      const double dx = Px - Qx;
+      const double dy = Py - Qy;
+      const double dz = Pz - Qz;
+      const double PQ2 = dx * dx + dy * dy + dz * dz;
+      const double omega = p * q * inv_denom;
+      const double T = omega * PQ2;
+      const double base = kTwoPiToFiveHalves / (p * q * ::sqrt(denom)) * cKab * cKcd;
+
+      double roots[NROOTS];
+      double weights[NROOTS];
+      if (lane == 0) {
+        cueri_rys::rys_roots_weights<NROOTS>(T, roots, weights);
+      }
+
+      for (int r = 0; r < NROOTS; ++r) {
+        double x = (lane == 0) ? roots[r] : 0.0;
+        double w = (lane == 0) ? weights[r] : 0.0;
+        x = __shfl_sync(0xffffffff, x, 0);
+        w = __shfl_sync(0xffffffff, w, 0);
+
+        {
+          const double B0 = x * 0.5 * inv_denom;
+          const double B1 = (1.0 - x) * 0.5 / p + B0;
+          const double B1p = (1.0 - x) * 0.5 / q + B0;
+          const double q_over = q * inv_denom;
+          const double p_over = p * inv_denom;
+          if (lane < 3) {
+            double PA, QC, PQd;
+            double* G_target;
+            if (lane == 0) { PA = Px - Ax; QC = Qx - Cx; PQd = Qx - Px; G_target = sh_Gx[warp_id]; }
+            else if (lane == 1) { PA = Py - Ay; QC = Qy - Cy; PQd = Qy - Py; G_target = sh_Gy[warp_id]; }
+            else { PA = Pz - Az; QC = Qz - Cz; PQd = Qz - Pz; G_target = sh_Gz[warp_id]; }
+            compute_G_d(G_target, nmax, mmax, PA + q_over * x * PQd, QC - p_over * x * PQd, B0, B1, B1p);
+          }
+        }
+
+        const double scale = base * w;
+        __syncwarp();
+
+        for (int idx = lane; idx < nElem; idx += 32) {
+          const int ia = idx / (nB * nC);
+          const int rem = idx - ia * (nB * nC);
+          const int ib = rem / nC;
+          const int ic = rem - ib * nC;
+
+          double bars[NBAR];
+          bool any_bar = false;
+#pragma unroll
+          for (int br = 0; br < NBAR; ++br) {
+            double bar = 0.0;
+            if (cache_bar) {
+              bar = sh_bar[br * kBarCacheMax + idx];
+            } else {
+              const int q_idx = c0 + ic;
+              const TBar* bar_ptr = bar_ptrs[br];
+              bar = df_bar_cart_from_sph_qp_stream(
+                  bar_ptr,
+                  q_idx,
+                  q_offset,
+                  q_count,
+                  ia,
+                  ib,
+                  la,
+                  lb,
+                  a0_sph,
+                  b0_sph,
+                  nao_sph);
+            }
+            bars[br] = bar;
+            any_bar = any_bar || (bar != 0.0);
+          }
+          if (!any_bar) continue;
+
+          const int iax = static_cast<int>(shA_lx[ia]);
+          const int iay = static_cast<int>(shA_ly[ia]);
+          const int iaz = static_cast<int>(shA_lz[ia]);
+          const int ibx = static_cast<int>(shB_lx[ib]);
+          const int iby = static_cast<int>(shB_ly[ib]);
+          const int ibz = static_cast<int>(shB_lz[ib]);
+          const int icx = static_cast<int>(shC_lx[ic]);
+          const int icy = static_cast<int>(shC_ly[ic]);
+          const int icz = static_cast<int>(shC_lz[ic]);
+
+          const double Ix = shift_from_G_ld0_d(sh_Gx[warp_id], iax, ibx, icx, sh_xij_pow);
+          const double Iy = shift_from_G_ld0_d(sh_Gy[warp_id], iay, iby, icy, sh_yij_pow);
+          const double Iz = shift_from_G_ld0_d(sh_Gz[warp_id], iaz, ibz, icz, sh_zij_pow);
+
+          const double Ix_m_A = (iax > 0) ? shift_from_G_ld0_d(sh_Gx[warp_id], iax - 1, ibx, icx, sh_xij_pow) : 0.0;
+          const double Ix_p_A = shift_from_G_ld0_d(sh_Gx[warp_id], iax + 1, ibx, icx, sh_xij_pow);
+          const double dIx_A = (-static_cast<double>(iax)) * Ix_m_A + (2.0 * aexp) * Ix_p_A;
+          const double t0v = (dIx_A * Iy * Iz);
+
+          const double Iy_m_A = (iay > 0) ? shift_from_G_ld0_d(sh_Gy[warp_id], iay - 1, iby, icy, sh_yij_pow) : 0.0;
+          const double Iy_p_A = shift_from_G_ld0_d(sh_Gy[warp_id], iay + 1, iby, icy, sh_yij_pow);
+          const double dIy_A = (-static_cast<double>(iay)) * Iy_m_A + (2.0 * aexp) * Iy_p_A;
+          const double t1v = (Ix * dIy_A * Iz);
+
+          const double Iz_m_A = (iaz > 0) ? shift_from_G_ld0_d(sh_Gz[warp_id], iaz - 1, ibz, icz, sh_zij_pow) : 0.0;
+          const double Iz_p_A = shift_from_G_ld0_d(sh_Gz[warp_id], iaz + 1, ibz, icz, sh_zij_pow);
+          const double dIz_A = (-static_cast<double>(iaz)) * Iz_m_A + (2.0 * aexp) * Iz_p_A;
+          const double t2v = (Ix * Iy * dIz_A);
+
+          const double Ix_m_B = (ibx > 0) ? shift_from_G_ld0_d(sh_Gx[warp_id], iax, ibx - 1, icx, sh_xij_pow) : 0.0;
+          const double Ix_p_B = shift_from_G_ld0_d(sh_Gx[warp_id], iax, ibx + 1, icx, sh_xij_pow);
+          const double dIx_B = (-static_cast<double>(ibx)) * Ix_m_B + (2.0 * bexp) * Ix_p_B;
+          const double t3v = (dIx_B * Iy * Iz);
+
+          const double Iy_m_B = (iby > 0) ? shift_from_G_ld0_d(sh_Gy[warp_id], iay, iby - 1, icy, sh_yij_pow) : 0.0;
+          const double Iy_p_B = shift_from_G_ld0_d(sh_Gy[warp_id], iay, iby + 1, icy, sh_yij_pow);
+          const double dIy_B = (-static_cast<double>(iby)) * Iy_m_B + (2.0 * bexp) * Iy_p_B;
+          const double t4v = (Ix * dIy_B * Iz);
+
+          const double Iz_m_B = (ibz > 0) ? shift_from_G_ld0_d(sh_Gz[warp_id], iaz, ibz - 1, icz, sh_zij_pow) : 0.0;
+          const double Iz_p_B = shift_from_G_ld0_d(sh_Gz[warp_id], iaz, ibz + 1, icz, sh_zij_pow);
+          const double dIz_B = (-static_cast<double>(ibz)) * Iz_m_B + (2.0 * bexp) * Iz_p_B;
+          const double t5v = (Ix * Iy * dIz_B);
+
+          const double Ix_m_C = (icx > 0) ? shift_from_G_ld0_d(sh_Gx[warp_id], iax, ibx, icx - 1, sh_xij_pow) : 0.0;
+          const double Ix_p_C = shift_from_G_ld0_d(sh_Gx[warp_id], iax, ibx, icx + 1, sh_xij_pow);
+          const double dIx_C = (-static_cast<double>(icx)) * Ix_m_C + (2.0 * cexp) * Ix_p_C;
+          const double t6v = (dIx_C * Iy * Iz);
+
+          const double Iy_m_C = (icy > 0) ? shift_from_G_ld0_d(sh_Gy[warp_id], iay, iby, icy - 1, sh_yij_pow) : 0.0;
+          const double Iy_p_C = shift_from_G_ld0_d(sh_Gy[warp_id], iay, iby, icy + 1, sh_yij_pow);
+          const double dIy_C = (-static_cast<double>(icy)) * Iy_m_C + (2.0 * cexp) * Iy_p_C;
+          const double t7v = (Ix * dIy_C * Iz);
+
+          const double Iz_m_C = (icz > 0) ? shift_from_G_ld0_d(sh_Gz[warp_id], iaz, ibz, icz - 1, sh_zij_pow) : 0.0;
+          const double Iz_p_C = shift_from_G_ld0_d(sh_Gz[warp_id], iaz, ibz, icz + 1, sh_zij_pow);
+          const double dIz_C = (-static_cast<double>(icz)) * Iz_m_C + (2.0 * cexp) * Iz_p_C;
+          const double t8v = (Ix * Iy * dIz_C);
+
+#pragma unroll
+          for (int br = 0; br < NBAR; ++br) {
+            const double bar = bars[br];
+            if (bar == 0.0) continue;
+            const double bar_scale = bar * scale;
+            acc[br * 9 + 0] += bar_scale * t0v;
+            acc[br * 9 + 1] += bar_scale * t1v;
+            acc[br * 9 + 2] += bar_scale * t2v;
+            acc[br * 9 + 3] += bar_scale * t3v;
+            acc[br * 9 + 4] += bar_scale * t4v;
+            acc[br * 9 + 5] += bar_scale * t5v;
+            acc[br * 9 + 6] += bar_scale * t6v;
+            acc[br * 9 + 7] += bar_scale * t7v;
+            acc[br * 9 + 8] += bar_scale * t8v;
+          }
+        }
+        __syncwarp();
+      }
+    }
+
+#pragma unroll
+    for (int br = 0; br < NBAR; ++br) {
+      warp_reduce_sum_arr<9>(&acc[br * 9]);
+    }
+    if (lane == 0) {
+#pragma unroll
+      for (int br = 0; br < NBAR; ++br) {
+#pragma unroll
+        for (int i = 0; i < 9; ++i) sh_warp_sum[warp_id][br * 9 + i] = acc[br * 9 + i];
+      }
+    }
+    __syncthreads();
+
+    if (threadIdx.x == 0 && active) {
+      const int atomC = static_cast<int>(shell_atom[shellC]);
+      int slot = -1;
+#pragma unroll
+      for (int u = 0; u < kAtomAggMax; ++u) {
+        if (u >= sh_n_atomC_agg) break;
+        if (sh_atomC_agg[u] == atomC) {
+          slot = u;
+          break;
+        }
+      }
+      if (slot < 0 && sh_n_atomC_agg < kAtomAggMax) {
+        slot = sh_n_atomC_agg;
+        sh_atomC_agg[slot] = atomC;
+#pragma unroll
+        for (int br = 0; br < NBAR; ++br) {
+          sh_sumC_agg[br][slot][0] = 0.0;
+          sh_sumC_agg[br][slot][1] = 0.0;
+          sh_sumC_agg[br][slot][2] = 0.0;
+        }
+        ++sh_n_atomC_agg;
+      }
+
+      for (int br = 0; br < NBAR; ++br) {
+        double sum[9];
+#pragma unroll
+        for (int i = 0; i < 9; ++i) sum[i] = 0.0;
+        for (int w = 0; w < warps; ++w) {
+#pragma unroll
+          for (int i = 0; i < 9; ++i) sum[i] += sh_warp_sum[w][br * 9 + i];
+        }
+        sumA_blk[br * 3 + 0] += fac * sum[0];
+        sumA_blk[br * 3 + 1] += fac * sum[1];
+        sumA_blk[br * 3 + 2] += fac * sum[2];
+        sumB_blk[br * 3 + 0] += fac * sum[3];
+        sumB_blk[br * 3 + 1] += fac * sum[4];
+        sumB_blk[br * 3 + 2] += fac * sum[5];
+
+        if (slot >= 0) {
+          sh_sumC_agg[br][slot][0] += fac * sum[6];
+          sh_sumC_agg[br][slot][1] += fac * sum[7];
+          sh_sumC_agg[br][slot][2] += fac * sum[8];
+        } else {
+          double* grad_dev = grad_dev_multi + static_cast<int64_t>(br) * grad_stride;
+          atomicAdd(&grad_dev[atomC * 3 + 0], fac * sum[6]);
+          atomicAdd(&grad_dev[atomC * 3 + 1], fac * sum[7]);
+          atomicAdd(&grad_dev[atomC * 3 + 2], fac * sum[8]);
+        }
+      }
+    }
+    __syncthreads();
+  }
+
+  if (threadIdx.x == 0) {
+    for (int br = 0; br < NBAR; ++br) {
+      double* grad_dev = grad_dev_multi + static_cast<int64_t>(br) * grad_stride;
+      atomicAdd(&grad_dev[atomA * 3 + 0], sumA_blk[br * 3 + 0]);
+      atomicAdd(&grad_dev[atomA * 3 + 1], sumA_blk[br * 3 + 1]);
+      atomicAdd(&grad_dev[atomA * 3 + 2], sumA_blk[br * 3 + 2]);
+      atomicAdd(&grad_dev[atomB * 3 + 0], sumB_blk[br * 3 + 0]);
+      atomicAdd(&grad_dev[atomB * 3 + 1], sumB_blk[br * 3 + 1]);
+      atomicAdd(&grad_dev[atomB * 3 + 2], sumB_blk[br * 3 + 2]);
+      for (int u = 0; u < sh_n_atomC_agg; ++u) {
+        const int atomC = sh_atomC_agg[u];
+        atomicAdd(&grad_dev[atomC * 3 + 0], sh_sumC_agg[br][u][0]);
+        atomicAdd(&grad_dev[atomC * 3 + 1], sh_sumC_agg[br][u][1]);
+        atomicAdd(&grad_dev[atomC * 3 + 2], sh_sumC_agg[br][u][2]);
+      }
     }
   }
 }
@@ -4985,6 +7571,138 @@ static inline cudaError_t launch_df_int3c2e_deriv_cart_allsp_atomgrad_sphbar_qmn
   return cudaGetLastError();
 }
 
+static inline cudaError_t launch_df_int3c2e_deriv_cart_allsp_atomgrad_sphbar_qp(
+    const int32_t* spAB_arr,
+    int n_spAB,
+    const int32_t* spCD,
+    int ntasks,
+    const int32_t* sp_A,
+    const int32_t* sp_B,
+    const int32_t* sp_pair_start,
+    const int32_t* sp_npair,
+    const double* shell_cx,
+    const double* shell_cy,
+    const double* shell_cz,
+    const int32_t* shell_prim_start,
+    const int32_t* shell_nprim,
+    const int32_t* shell_ao_start,
+    const double* prim_exp,
+    const double* pair_eta,
+    const double* pair_Px,
+    const double* pair_Py,
+    const double* pair_Pz,
+    const double* pair_cK,
+    int nao,
+    int naux,
+    int nao_sph,
+    int la,
+    int lb,
+    int lc,
+    const double* bar_X_sph_Qp,
+    const int32_t* shell_ao_start_sph,
+    const int32_t* shell_atom,
+    int q_offset,
+    int q_count,
+    double* grad_dev,
+    cudaStream_t stream,
+    int threads) {
+  if (q_count <= 0) return cudaSuccess;
+  const int nroots = df_nroots_from_L(la + lb + lc);
+  const dim3 grid(static_cast<unsigned int>(ntasks), static_cast<unsigned int>(n_spAB));
+  switch (nroots) {
+#define LAUNCH_3C_SPH_QP(NR) \
+    case NR: \
+      KernelDFInt3c2eDerivContractedCartAllSPAtomGradSphBarQp<NR, double><<<grid, threads, 0, stream>>>( \
+          spAB_arr, n_spAB, spCD, ntasks, sp_A, sp_B, sp_pair_start, sp_npair, \
+          shell_cx, shell_cy, shell_cz, shell_prim_start, shell_nprim, shell_ao_start, \
+          prim_exp, pair_eta, pair_Px, pair_Py, pair_Pz, pair_cK, \
+          nao, naux, nao_sph, la, lb, lc, bar_X_sph_Qp, shell_ao_start_sph, shell_atom, \
+          q_offset, q_count, grad_dev); \
+      break;
+    LAUNCH_3C_SPH_QP(1)
+    LAUNCH_3C_SPH_QP(2)
+    LAUNCH_3C_SPH_QP(3)
+    LAUNCH_3C_SPH_QP(4)
+    LAUNCH_3C_SPH_QP(5)
+    LAUNCH_3C_SPH_QP(6)
+    LAUNCH_3C_SPH_QP(7)
+    LAUNCH_3C_SPH_QP(8)
+    LAUNCH_3C_SPH_QP(9)
+    LAUNCH_3C_SPH_QP(10)
+    LAUNCH_3C_SPH_QP(11)
+#undef LAUNCH_3C_SPH_QP
+    default:
+      return cudaErrorInvalidValue;
+  }
+  return cudaGetLastError();
+}
+
+static inline cudaError_t launch_df_int3c2e_deriv_cart_allsp_atomgrad_sphbar_qp_f32bar(
+    const int32_t* spAB_arr,
+    int n_spAB,
+    const int32_t* spCD,
+    int ntasks,
+    const int32_t* sp_A,
+    const int32_t* sp_B,
+    const int32_t* sp_pair_start,
+    const int32_t* sp_npair,
+    const double* shell_cx,
+    const double* shell_cy,
+    const double* shell_cz,
+    const int32_t* shell_prim_start,
+    const int32_t* shell_nprim,
+    const int32_t* shell_ao_start,
+    const double* prim_exp,
+    const double* pair_eta,
+    const double* pair_Px,
+    const double* pair_Py,
+    const double* pair_Pz,
+    const double* pair_cK,
+    int nao,
+    int naux,
+    int nao_sph,
+    int la,
+    int lb,
+    int lc,
+    const float* bar_X_sph_Qp,
+    const int32_t* shell_ao_start_sph,
+    const int32_t* shell_atom,
+    int q_offset,
+    int q_count,
+    double* grad_dev,
+    cudaStream_t stream,
+    int threads) {
+  if (q_count <= 0) return cudaSuccess;
+  const int nroots = df_nroots_from_L(la + lb + lc);
+  const dim3 grid(static_cast<unsigned int>(ntasks), static_cast<unsigned int>(n_spAB));
+  switch (nroots) {
+#define LAUNCH_3C_SPH_QP_F32(NR) \
+    case NR: \
+      KernelDFInt3c2eDerivContractedCartAllSPAtomGradSphBarQp<NR, float><<<grid, threads, 0, stream>>>( \
+          spAB_arr, n_spAB, spCD, ntasks, sp_A, sp_B, sp_pair_start, sp_npair, \
+          shell_cx, shell_cy, shell_cz, shell_prim_start, shell_nprim, shell_ao_start, \
+          prim_exp, pair_eta, pair_Px, pair_Py, pair_Pz, pair_cK, \
+          nao, naux, nao_sph, la, lb, lc, bar_X_sph_Qp, shell_ao_start_sph, shell_atom, \
+          q_offset, q_count, grad_dev); \
+      break;
+    LAUNCH_3C_SPH_QP_F32(1)
+    LAUNCH_3C_SPH_QP_F32(2)
+    LAUNCH_3C_SPH_QP_F32(3)
+    LAUNCH_3C_SPH_QP_F32(4)
+    LAUNCH_3C_SPH_QP_F32(5)
+    LAUNCH_3C_SPH_QP_F32(6)
+    LAUNCH_3C_SPH_QP_F32(7)
+    LAUNCH_3C_SPH_QP_F32(8)
+    LAUNCH_3C_SPH_QP_F32(9)
+    LAUNCH_3C_SPH_QP_F32(10)
+    LAUNCH_3C_SPH_QP_F32(11)
+#undef LAUNCH_3C_SPH_QP_F32
+    default:
+      return cudaErrorInvalidValue;
+  }
+  return cudaGetLastError();
+}
+
 static inline cudaError_t launch_df_int3c2e_deriv_cart_allsp_atomgrad_abtile(
     const int32_t* spAB_arr,
     int n_spAB,
@@ -5110,6 +7828,867 @@ static inline cudaError_t launch_df_int3c2e_deriv_cart_allsp_atomgrad_sphbar_qmn
     LAUNCH_3C_SPH_ABTILE(10)
     LAUNCH_3C_SPH_ABTILE(11)
 #undef LAUNCH_3C_SPH_ABTILE
+    default:
+      return cudaErrorInvalidValue;
+  }
+  return cudaGetLastError();
+}
+
+static inline cudaError_t launch_df_int3c2e_deriv_cart_allsp_atomgrad_sphbar_qp_abtile(
+    const int32_t* spAB_arr,
+    int n_spAB,
+    const int32_t* spCD,
+    int ntasks,
+    const int32_t* sp_A,
+    const int32_t* sp_B,
+    const int32_t* sp_pair_start,
+    const int32_t* sp_npair,
+    const double* shell_cx,
+    const double* shell_cy,
+    const double* shell_cz,
+    const int32_t* shell_prim_start,
+    const int32_t* shell_nprim,
+    const int32_t* shell_ao_start,
+    const double* prim_exp,
+    const double* pair_eta,
+    const double* pair_Px,
+    const double* pair_Py,
+    const double* pair_Pz,
+    const double* pair_cK,
+    int nao,
+    int naux,
+    int nao_sph,
+    int la,
+    int lb,
+    int lc,
+    const double* bar_X_sph_Qp,
+    const int32_t* shell_ao_start_sph,
+    const int32_t* shell_atom,
+    int cd_tile,
+    int q_offset,
+    int q_count,
+    double* grad_dev,
+    cudaStream_t stream,
+    int threads) {
+  if (cd_tile <= 0) return cudaErrorInvalidValue;
+  if (q_count <= 0) return cudaSuccess;
+  const int nroots = df_nroots_from_L(la + lb + lc);
+  const int ntiles = (ntasks + cd_tile - 1) / cd_tile;
+  const dim3 grid(static_cast<unsigned int>(ntiles), static_cast<unsigned int>(n_spAB));
+  switch (nroots) {
+#define LAUNCH_3C_SPH_ABTILE_QP(NR) \
+    case NR: \
+      KernelDFInt3c2eDerivContractedCartAllSPAtomGradSphBarQpABTile<NR, double><<<grid, threads, 0, stream>>>( \
+          spAB_arr, n_spAB, spCD, ntasks, sp_A, sp_B, sp_pair_start, sp_npair, \
+          shell_cx, shell_cy, shell_cz, shell_prim_start, shell_nprim, shell_ao_start, \
+          prim_exp, pair_eta, pair_Px, pair_Py, pair_Pz, pair_cK, \
+          nao, naux, nao_sph, la, lb, lc, bar_X_sph_Qp, shell_ao_start_sph, shell_atom, cd_tile, q_offset, q_count, grad_dev); \
+      break;
+    LAUNCH_3C_SPH_ABTILE_QP(1)
+    LAUNCH_3C_SPH_ABTILE_QP(2)
+    LAUNCH_3C_SPH_ABTILE_QP(3)
+    LAUNCH_3C_SPH_ABTILE_QP(4)
+    LAUNCH_3C_SPH_ABTILE_QP(5)
+    LAUNCH_3C_SPH_ABTILE_QP(6)
+    LAUNCH_3C_SPH_ABTILE_QP(7)
+    LAUNCH_3C_SPH_ABTILE_QP(8)
+    LAUNCH_3C_SPH_ABTILE_QP(9)
+    LAUNCH_3C_SPH_ABTILE_QP(10)
+    LAUNCH_3C_SPH_ABTILE_QP(11)
+#undef LAUNCH_3C_SPH_ABTILE_QP
+    default:
+      return cudaErrorInvalidValue;
+  }
+  return cudaGetLastError();
+}
+
+static inline cudaError_t launch_df_int3c2e_deriv_cart_allsp_atomgrad_sphbar_qp_abtile_f32bar(
+    const int32_t* spAB_arr,
+    int n_spAB,
+    const int32_t* spCD,
+    int ntasks,
+    const int32_t* sp_A,
+    const int32_t* sp_B,
+    const int32_t* sp_pair_start,
+    const int32_t* sp_npair,
+    const double* shell_cx,
+    const double* shell_cy,
+    const double* shell_cz,
+    const int32_t* shell_prim_start,
+    const int32_t* shell_nprim,
+    const int32_t* shell_ao_start,
+    const double* prim_exp,
+    const double* pair_eta,
+    const double* pair_Px,
+    const double* pair_Py,
+    const double* pair_Pz,
+    const double* pair_cK,
+    int nao,
+    int naux,
+    int nao_sph,
+    int la,
+    int lb,
+    int lc,
+    const float* bar_X_sph_Qp,
+    const int32_t* shell_ao_start_sph,
+    const int32_t* shell_atom,
+    int cd_tile,
+    int q_offset,
+    int q_count,
+    double* grad_dev,
+    cudaStream_t stream,
+    int threads) {
+  if (cd_tile <= 0) return cudaErrorInvalidValue;
+  if (q_count <= 0) return cudaSuccess;
+  const int nroots = df_nroots_from_L(la + lb + lc);
+  const int ntiles = (ntasks + cd_tile - 1) / cd_tile;
+  const dim3 grid(static_cast<unsigned int>(ntiles), static_cast<unsigned int>(n_spAB));
+  switch (nroots) {
+#define LAUNCH_3C_SPH_ABTILE_QP_F32(NR) \
+    case NR: \
+      KernelDFInt3c2eDerivContractedCartAllSPAtomGradSphBarQpABTile<NR, float><<<grid, threads, 0, stream>>>( \
+          spAB_arr, n_spAB, spCD, ntasks, sp_A, sp_B, sp_pair_start, sp_npair, \
+          shell_cx, shell_cy, shell_cz, shell_prim_start, shell_nprim, shell_ao_start, \
+          prim_exp, pair_eta, pair_Px, pair_Py, pair_Pz, pair_cK, \
+          nao, naux, nao_sph, la, lb, lc, bar_X_sph_Qp, shell_ao_start_sph, shell_atom, cd_tile, q_offset, q_count, grad_dev); \
+      break;
+    LAUNCH_3C_SPH_ABTILE_QP_F32(1)
+    LAUNCH_3C_SPH_ABTILE_QP_F32(2)
+    LAUNCH_3C_SPH_ABTILE_QP_F32(3)
+    LAUNCH_3C_SPH_ABTILE_QP_F32(4)
+    LAUNCH_3C_SPH_ABTILE_QP_F32(5)
+    LAUNCH_3C_SPH_ABTILE_QP_F32(6)
+    LAUNCH_3C_SPH_ABTILE_QP_F32(7)
+    LAUNCH_3C_SPH_ABTILE_QP_F32(8)
+    LAUNCH_3C_SPH_ABTILE_QP_F32(9)
+    LAUNCH_3C_SPH_ABTILE_QP_F32(10)
+    LAUNCH_3C_SPH_ABTILE_QP_F32(11)
+#undef LAUNCH_3C_SPH_ABTILE_QP_F32
+    default:
+      return cudaErrorInvalidValue;
+  }
+  return cudaGetLastError();
+}
+
+static inline cudaError_t launch_df_int3c2e_deriv_cart_allsp_atomgrad_sphbar_qmn_multibar(
+    const int32_t* spAB_arr,
+    int n_spAB,
+    const int32_t* spCD,
+    int ntasks,
+    const int32_t* sp_A,
+    const int32_t* sp_B,
+    const int32_t* sp_pair_start,
+    const int32_t* sp_npair,
+    const double* shell_cx,
+    const double* shell_cy,
+    const double* shell_cz,
+    const int32_t* shell_prim_start,
+    const int32_t* shell_nprim,
+    const int32_t* shell_ao_start,
+    const double* prim_exp,
+    const double* pair_eta,
+    const double* pair_Px,
+    const double* pair_Py,
+    const double* pair_Pz,
+    const double* pair_cK,
+    int nao,
+    int naux,
+    int nao_sph,
+    int la,
+    int lb,
+    int lc,
+    const double* bar_X_sph_Qmn_multi,
+    int64_t bar_stride,
+    int nbar,
+    const int32_t* shell_ao_start_sph,
+    const int32_t* shell_atom,
+    int q_offset,
+    int q_count,
+    double* grad_dev_multi,
+    int64_t grad_stride,
+    cudaStream_t stream,
+    int threads) {
+  if (nbar <= 0) return cudaErrorInvalidValue;
+  if (q_count <= 0) return cudaSuccess;
+  if (bar_stride <= 0 || grad_stride <= 0) return cudaErrorInvalidValue;
+  const int nroots = df_nroots_from_L(la + lb + lc);
+  const dim3 grid(static_cast<unsigned int>(ntasks), static_cast<unsigned int>(n_spAB));
+  switch (nbar) {
+    case 2:
+      switch (nroots) {
+#define LAUNCH_3C_SPH_STREAM_MULTI(NR) \
+    case NR: \
+      KernelDFInt3c2eDerivContractedCartAllSPAtomGradSphBarQmnMultiBar<NR, 2><<<grid, threads, 0, stream>>>( \
+          spAB_arr, n_spAB, spCD, ntasks, sp_A, sp_B, sp_pair_start, sp_npair, \
+          shell_cx, shell_cy, shell_cz, shell_prim_start, shell_nprim, shell_ao_start, \
+          prim_exp, pair_eta, pair_Px, pair_Py, pair_Pz, pair_cK, \
+          nao, naux, nao_sph, la, lb, lc, bar_X_sph_Qmn_multi, bar_stride, shell_ao_start_sph, shell_atom, \
+          q_offset, q_count, grad_dev_multi, grad_stride); \
+      break;
+        LAUNCH_3C_SPH_STREAM_MULTI(1)
+        LAUNCH_3C_SPH_STREAM_MULTI(2)
+        LAUNCH_3C_SPH_STREAM_MULTI(3)
+        LAUNCH_3C_SPH_STREAM_MULTI(4)
+        LAUNCH_3C_SPH_STREAM_MULTI(5)
+        LAUNCH_3C_SPH_STREAM_MULTI(6)
+        LAUNCH_3C_SPH_STREAM_MULTI(7)
+        LAUNCH_3C_SPH_STREAM_MULTI(8)
+        LAUNCH_3C_SPH_STREAM_MULTI(9)
+        LAUNCH_3C_SPH_STREAM_MULTI(10)
+        LAUNCH_3C_SPH_STREAM_MULTI(11)
+#undef LAUNCH_3C_SPH_STREAM_MULTI
+        default:
+          return cudaErrorInvalidValue;
+      }
+      break;
+    default:
+      return cudaErrorInvalidValue;
+  }
+  return cudaGetLastError();
+}
+
+static inline cudaError_t launch_df_int3c2e_deriv_cart_allsp_atomgrad_sphbar_qp_multibar2(
+    const int32_t* spAB_arr,
+    int n_spAB,
+    const int32_t* spCD,
+    int ntasks,
+    const int32_t* sp_A,
+    const int32_t* sp_B,
+    const int32_t* sp_pair_start,
+    const int32_t* sp_npair,
+    const double* shell_cx,
+    const double* shell_cy,
+    const double* shell_cz,
+    const int32_t* shell_prim_start,
+    const int32_t* shell_nprim,
+    const int32_t* shell_ao_start,
+    const double* prim_exp,
+    const double* pair_eta,
+    const double* pair_Px,
+    const double* pair_Py,
+    const double* pair_Pz,
+    const double* pair_cK,
+    int nao,
+    int naux,
+    int nao_sph,
+    int la,
+    int lb,
+    int lc,
+    const double* bar_X_sph_Qp0,
+    const double* bar_X_sph_Qp1,
+    const int32_t* shell_ao_start_sph,
+    const int32_t* shell_atom,
+    int q_offset,
+    int q_count,
+    double* grad_dev_multi,
+    int64_t grad_stride,
+    cudaStream_t stream,
+    int threads) {
+  if (q_count <= 0) return cudaSuccess;
+  if (grad_stride <= 0) return cudaErrorInvalidValue;
+  const int nroots = df_nroots_from_L(la + lb + lc);
+  const dim3 grid(static_cast<unsigned int>(ntasks), static_cast<unsigned int>(n_spAB));
+  switch (nroots) {
+#define LAUNCH_3C_SPH_QP_MULTI2(NR) \
+    case NR: \
+      KernelDFInt3c2eDerivContractedCartAllSPAtomGradSphBarQpMultiBar<NR, double, 2><<<grid, threads, 0, stream>>>( \
+          spAB_arr, n_spAB, spCD, ntasks, sp_A, sp_B, sp_pair_start, sp_npair, \
+          shell_cx, shell_cy, shell_cz, shell_prim_start, shell_nprim, shell_ao_start, \
+          prim_exp, pair_eta, pair_Px, pair_Py, pair_Pz, pair_cK, \
+          nao, naux, nao_sph, la, lb, lc, bar_X_sph_Qp0, bar_X_sph_Qp1, bar_X_sph_Qp1, shell_ao_start_sph, shell_atom, \
+          q_offset, q_count, grad_dev_multi, grad_stride); \
+      break;
+    LAUNCH_3C_SPH_QP_MULTI2(1)
+    LAUNCH_3C_SPH_QP_MULTI2(2)
+    LAUNCH_3C_SPH_QP_MULTI2(3)
+    LAUNCH_3C_SPH_QP_MULTI2(4)
+    LAUNCH_3C_SPH_QP_MULTI2(5)
+    LAUNCH_3C_SPH_QP_MULTI2(6)
+    LAUNCH_3C_SPH_QP_MULTI2(7)
+    LAUNCH_3C_SPH_QP_MULTI2(8)
+    LAUNCH_3C_SPH_QP_MULTI2(9)
+    LAUNCH_3C_SPH_QP_MULTI2(10)
+    LAUNCH_3C_SPH_QP_MULTI2(11)
+#undef LAUNCH_3C_SPH_QP_MULTI2
+    default:
+      return cudaErrorInvalidValue;
+  }
+  return cudaGetLastError();
+}
+
+static inline cudaError_t launch_df_int3c2e_deriv_cart_allsp_atomgrad_sphbar_qp_multibar2_f32bar(
+    const int32_t* spAB_arr,
+    int n_spAB,
+    const int32_t* spCD,
+    int ntasks,
+    const int32_t* sp_A,
+    const int32_t* sp_B,
+    const int32_t* sp_pair_start,
+    const int32_t* sp_npair,
+    const double* shell_cx,
+    const double* shell_cy,
+    const double* shell_cz,
+    const int32_t* shell_prim_start,
+    const int32_t* shell_nprim,
+    const int32_t* shell_ao_start,
+    const double* prim_exp,
+    const double* pair_eta,
+    const double* pair_Px,
+    const double* pair_Py,
+    const double* pair_Pz,
+    const double* pair_cK,
+    int nao,
+    int naux,
+    int nao_sph,
+    int la,
+    int lb,
+    int lc,
+    const float* bar_X_sph_Qp0,
+    const float* bar_X_sph_Qp1,
+    const int32_t* shell_ao_start_sph,
+    const int32_t* shell_atom,
+    int q_offset,
+    int q_count,
+    double* grad_dev_multi,
+    int64_t grad_stride,
+    cudaStream_t stream,
+    int threads) {
+  if (q_count <= 0) return cudaSuccess;
+  if (grad_stride <= 0) return cudaErrorInvalidValue;
+  const int nroots = df_nroots_from_L(la + lb + lc);
+  const dim3 grid(static_cast<unsigned int>(ntasks), static_cast<unsigned int>(n_spAB));
+  switch (nroots) {
+#define LAUNCH_3C_SPH_QP_MULTI2_F32(NR) \
+    case NR: \
+      KernelDFInt3c2eDerivContractedCartAllSPAtomGradSphBarQpMultiBar<NR, float, 2><<<grid, threads, 0, stream>>>( \
+          spAB_arr, n_spAB, spCD, ntasks, sp_A, sp_B, sp_pair_start, sp_npair, \
+          shell_cx, shell_cy, shell_cz, shell_prim_start, shell_nprim, shell_ao_start, \
+          prim_exp, pair_eta, pair_Px, pair_Py, pair_Pz, pair_cK, \
+          nao, naux, nao_sph, la, lb, lc, bar_X_sph_Qp0, bar_X_sph_Qp1, bar_X_sph_Qp1, shell_ao_start_sph, shell_atom, \
+          q_offset, q_count, grad_dev_multi, grad_stride); \
+      break;
+    LAUNCH_3C_SPH_QP_MULTI2_F32(1)
+    LAUNCH_3C_SPH_QP_MULTI2_F32(2)
+    LAUNCH_3C_SPH_QP_MULTI2_F32(3)
+    LAUNCH_3C_SPH_QP_MULTI2_F32(4)
+    LAUNCH_3C_SPH_QP_MULTI2_F32(5)
+    LAUNCH_3C_SPH_QP_MULTI2_F32(6)
+    LAUNCH_3C_SPH_QP_MULTI2_F32(7)
+    LAUNCH_3C_SPH_QP_MULTI2_F32(8)
+    LAUNCH_3C_SPH_QP_MULTI2_F32(9)
+    LAUNCH_3C_SPH_QP_MULTI2_F32(10)
+    LAUNCH_3C_SPH_QP_MULTI2_F32(11)
+#undef LAUNCH_3C_SPH_QP_MULTI2_F32
+    default:
+      return cudaErrorInvalidValue;
+  }
+  return cudaGetLastError();
+}
+
+static inline cudaError_t launch_df_int3c2e_deriv_cart_allsp_atomgrad_sphbar_qp_multibar3(
+    const int32_t* spAB_arr,
+    int n_spAB,
+    const int32_t* spCD,
+    int ntasks,
+    const int32_t* sp_A,
+    const int32_t* sp_B,
+    const int32_t* sp_pair_start,
+    const int32_t* sp_npair,
+    const double* shell_cx,
+    const double* shell_cy,
+    const double* shell_cz,
+    const int32_t* shell_prim_start,
+    const int32_t* shell_nprim,
+    const int32_t* shell_ao_start,
+    const double* prim_exp,
+    const double* pair_eta,
+    const double* pair_Px,
+    const double* pair_Py,
+    const double* pair_Pz,
+    const double* pair_cK,
+    int nao,
+    int naux,
+    int nao_sph,
+    int la,
+    int lb,
+    int lc,
+    const double* bar_X_sph_Qp0,
+    const double* bar_X_sph_Qp1,
+    const double* bar_X_sph_Qp2,
+    const int32_t* shell_ao_start_sph,
+    const int32_t* shell_atom,
+    int q_offset,
+    int q_count,
+    double* grad_dev_multi,
+    int64_t grad_stride,
+    cudaStream_t stream,
+    int threads) {
+  if (q_count <= 0) return cudaSuccess;
+  if (grad_stride <= 0) return cudaErrorInvalidValue;
+  const int nroots = df_nroots_from_L(la + lb + lc);
+  const dim3 grid(static_cast<unsigned int>(ntasks), static_cast<unsigned int>(n_spAB));
+  switch (nroots) {
+#define LAUNCH_3C_SPH_QP_MULTI3(NR) \
+    case NR: \
+      KernelDFInt3c2eDerivContractedCartAllSPAtomGradSphBarQpMultiBar<NR, double, 3><<<grid, threads, 0, stream>>>( \
+          spAB_arr, n_spAB, spCD, ntasks, sp_A, sp_B, sp_pair_start, sp_npair, \
+          shell_cx, shell_cy, shell_cz, shell_prim_start, shell_nprim, shell_ao_start, \
+          prim_exp, pair_eta, pair_Px, pair_Py, pair_Pz, pair_cK, \
+          nao, naux, nao_sph, la, lb, lc, bar_X_sph_Qp0, bar_X_sph_Qp1, bar_X_sph_Qp2, shell_ao_start_sph, shell_atom, \
+          q_offset, q_count, grad_dev_multi, grad_stride); \
+      break;
+    LAUNCH_3C_SPH_QP_MULTI3(1)
+    LAUNCH_3C_SPH_QP_MULTI3(2)
+    LAUNCH_3C_SPH_QP_MULTI3(3)
+    LAUNCH_3C_SPH_QP_MULTI3(4)
+    LAUNCH_3C_SPH_QP_MULTI3(5)
+    LAUNCH_3C_SPH_QP_MULTI3(6)
+    LAUNCH_3C_SPH_QP_MULTI3(7)
+    LAUNCH_3C_SPH_QP_MULTI3(8)
+    LAUNCH_3C_SPH_QP_MULTI3(9)
+    LAUNCH_3C_SPH_QP_MULTI3(10)
+    LAUNCH_3C_SPH_QP_MULTI3(11)
+#undef LAUNCH_3C_SPH_QP_MULTI3
+    default:
+      return cudaErrorInvalidValue;
+  }
+  return cudaGetLastError();
+}
+
+static inline cudaError_t launch_df_int3c2e_deriv_cart_allsp_atomgrad_sphbar_qp_multibar3_f32bar(
+    const int32_t* spAB_arr,
+    int n_spAB,
+    const int32_t* spCD,
+    int ntasks,
+    const int32_t* sp_A,
+    const int32_t* sp_B,
+    const int32_t* sp_pair_start,
+    const int32_t* sp_npair,
+    const double* shell_cx,
+    const double* shell_cy,
+    const double* shell_cz,
+    const int32_t* shell_prim_start,
+    const int32_t* shell_nprim,
+    const int32_t* shell_ao_start,
+    const double* prim_exp,
+    const double* pair_eta,
+    const double* pair_Px,
+    const double* pair_Py,
+    const double* pair_Pz,
+    const double* pair_cK,
+    int nao,
+    int naux,
+    int nao_sph,
+    int la,
+    int lb,
+    int lc,
+    const float* bar_X_sph_Qp0,
+    const float* bar_X_sph_Qp1,
+    const float* bar_X_sph_Qp2,
+    const int32_t* shell_ao_start_sph,
+    const int32_t* shell_atom,
+    int q_offset,
+    int q_count,
+    double* grad_dev_multi,
+    int64_t grad_stride,
+    cudaStream_t stream,
+    int threads) {
+  if (q_count <= 0) return cudaSuccess;
+  if (grad_stride <= 0) return cudaErrorInvalidValue;
+  const int nroots = df_nroots_from_L(la + lb + lc);
+  const dim3 grid(static_cast<unsigned int>(ntasks), static_cast<unsigned int>(n_spAB));
+  switch (nroots) {
+#define LAUNCH_3C_SPH_QP_MULTI3_F32(NR) \
+    case NR: \
+      KernelDFInt3c2eDerivContractedCartAllSPAtomGradSphBarQpMultiBar<NR, float, 3><<<grid, threads, 0, stream>>>( \
+          spAB_arr, n_spAB, spCD, ntasks, sp_A, sp_B, sp_pair_start, sp_npair, \
+          shell_cx, shell_cy, shell_cz, shell_prim_start, shell_nprim, shell_ao_start, \
+          prim_exp, pair_eta, pair_Px, pair_Py, pair_Pz, pair_cK, \
+          nao, naux, nao_sph, la, lb, lc, bar_X_sph_Qp0, bar_X_sph_Qp1, bar_X_sph_Qp2, shell_ao_start_sph, shell_atom, \
+          q_offset, q_count, grad_dev_multi, grad_stride); \
+      break;
+    LAUNCH_3C_SPH_QP_MULTI3_F32(1)
+    LAUNCH_3C_SPH_QP_MULTI3_F32(2)
+    LAUNCH_3C_SPH_QP_MULTI3_F32(3)
+    LAUNCH_3C_SPH_QP_MULTI3_F32(4)
+    LAUNCH_3C_SPH_QP_MULTI3_F32(5)
+    LAUNCH_3C_SPH_QP_MULTI3_F32(6)
+    LAUNCH_3C_SPH_QP_MULTI3_F32(7)
+    LAUNCH_3C_SPH_QP_MULTI3_F32(8)
+    LAUNCH_3C_SPH_QP_MULTI3_F32(9)
+    LAUNCH_3C_SPH_QP_MULTI3_F32(10)
+    LAUNCH_3C_SPH_QP_MULTI3_F32(11)
+#undef LAUNCH_3C_SPH_QP_MULTI3_F32
+    default:
+      return cudaErrorInvalidValue;
+  }
+  return cudaGetLastError();
+}
+
+static inline cudaError_t launch_df_int3c2e_deriv_cart_allsp_atomgrad_sphbar_qp_abtile_multibar2(
+    const int32_t* spAB_arr,
+    int n_spAB,
+    const int32_t* spCD,
+    int ntasks,
+    const int32_t* sp_A,
+    const int32_t* sp_B,
+    const int32_t* sp_pair_start,
+    const int32_t* sp_npair,
+    const double* shell_cx,
+    const double* shell_cy,
+    const double* shell_cz,
+    const int32_t* shell_prim_start,
+    const int32_t* shell_nprim,
+    const int32_t* shell_ao_start,
+    const double* prim_exp,
+    const double* pair_eta,
+    const double* pair_Px,
+    const double* pair_Py,
+    const double* pair_Pz,
+    const double* pair_cK,
+    int nao,
+    int naux,
+    int nao_sph,
+    int la,
+    int lb,
+    int lc,
+    const double* bar_X_sph_Qp0,
+    const double* bar_X_sph_Qp1,
+    const int32_t* shell_ao_start_sph,
+    const int32_t* shell_atom,
+    int cd_tile,
+    int q_offset,
+    int q_count,
+    double* grad_dev_multi,
+    int64_t grad_stride,
+    cudaStream_t stream,
+    int threads) {
+  if (cd_tile <= 0) return cudaErrorInvalidValue;
+  if (q_count <= 0) return cudaSuccess;
+  if (grad_stride <= 0) return cudaErrorInvalidValue;
+  const int nroots = df_nroots_from_L(la + lb + lc);
+  const int ntiles = (ntasks + cd_tile - 1) / cd_tile;
+  const dim3 grid(static_cast<unsigned int>(ntiles), static_cast<unsigned int>(n_spAB));
+  switch (nroots) {
+#define LAUNCH_3C_SPH_QP_ABTILE_MULTI2(NR) \
+    case NR: \
+      KernelDFInt3c2eDerivContractedCartAllSPAtomGradSphBarQpABTileMultiBar<NR, double, 2><<<grid, threads, 0, stream>>>( \
+          spAB_arr, n_spAB, spCD, ntasks, sp_A, sp_B, sp_pair_start, sp_npair, \
+          shell_cx, shell_cy, shell_cz, shell_prim_start, shell_nprim, shell_ao_start, \
+          prim_exp, pair_eta, pair_Px, pair_Py, pair_Pz, pair_cK, \
+          nao, naux, nao_sph, la, lb, lc, bar_X_sph_Qp0, bar_X_sph_Qp1, bar_X_sph_Qp1, shell_ao_start_sph, shell_atom, \
+          cd_tile, q_offset, q_count, grad_dev_multi, grad_stride); \
+      break;
+    LAUNCH_3C_SPH_QP_ABTILE_MULTI2(1)
+    LAUNCH_3C_SPH_QP_ABTILE_MULTI2(2)
+    LAUNCH_3C_SPH_QP_ABTILE_MULTI2(3)
+    LAUNCH_3C_SPH_QP_ABTILE_MULTI2(4)
+    LAUNCH_3C_SPH_QP_ABTILE_MULTI2(5)
+    LAUNCH_3C_SPH_QP_ABTILE_MULTI2(6)
+    LAUNCH_3C_SPH_QP_ABTILE_MULTI2(7)
+    LAUNCH_3C_SPH_QP_ABTILE_MULTI2(8)
+    LAUNCH_3C_SPH_QP_ABTILE_MULTI2(9)
+    LAUNCH_3C_SPH_QP_ABTILE_MULTI2(10)
+    LAUNCH_3C_SPH_QP_ABTILE_MULTI2(11)
+#undef LAUNCH_3C_SPH_QP_ABTILE_MULTI2
+    default:
+      return cudaErrorInvalidValue;
+  }
+  return cudaGetLastError();
+}
+
+static inline cudaError_t launch_df_int3c2e_deriv_cart_allsp_atomgrad_sphbar_qp_abtile_multibar2_f32bar(
+    const int32_t* spAB_arr,
+    int n_spAB,
+    const int32_t* spCD,
+    int ntasks,
+    const int32_t* sp_A,
+    const int32_t* sp_B,
+    const int32_t* sp_pair_start,
+    const int32_t* sp_npair,
+    const double* shell_cx,
+    const double* shell_cy,
+    const double* shell_cz,
+    const int32_t* shell_prim_start,
+    const int32_t* shell_nprim,
+    const int32_t* shell_ao_start,
+    const double* prim_exp,
+    const double* pair_eta,
+    const double* pair_Px,
+    const double* pair_Py,
+    const double* pair_Pz,
+    const double* pair_cK,
+    int nao,
+    int naux,
+    int nao_sph,
+    int la,
+    int lb,
+    int lc,
+    const float* bar_X_sph_Qp0,
+    const float* bar_X_sph_Qp1,
+    const int32_t* shell_ao_start_sph,
+    const int32_t* shell_atom,
+    int cd_tile,
+    int q_offset,
+    int q_count,
+    double* grad_dev_multi,
+    int64_t grad_stride,
+    cudaStream_t stream,
+    int threads) {
+  if (cd_tile <= 0) return cudaErrorInvalidValue;
+  if (q_count <= 0) return cudaSuccess;
+  if (grad_stride <= 0) return cudaErrorInvalidValue;
+  const int nroots = df_nroots_from_L(la + lb + lc);
+  const int ntiles = (ntasks + cd_tile - 1) / cd_tile;
+  const dim3 grid(static_cast<unsigned int>(ntiles), static_cast<unsigned int>(n_spAB));
+  switch (nroots) {
+#define LAUNCH_3C_SPH_QP_ABTILE_MULTI2_F32(NR) \
+    case NR: \
+      KernelDFInt3c2eDerivContractedCartAllSPAtomGradSphBarQpABTileMultiBar<NR, float, 2><<<grid, threads, 0, stream>>>( \
+          spAB_arr, n_spAB, spCD, ntasks, sp_A, sp_B, sp_pair_start, sp_npair, \
+          shell_cx, shell_cy, shell_cz, shell_prim_start, shell_nprim, shell_ao_start, \
+          prim_exp, pair_eta, pair_Px, pair_Py, pair_Pz, pair_cK, \
+          nao, naux, nao_sph, la, lb, lc, bar_X_sph_Qp0, bar_X_sph_Qp1, bar_X_sph_Qp1, shell_ao_start_sph, shell_atom, \
+          cd_tile, q_offset, q_count, grad_dev_multi, grad_stride); \
+      break;
+    LAUNCH_3C_SPH_QP_ABTILE_MULTI2_F32(1)
+    LAUNCH_3C_SPH_QP_ABTILE_MULTI2_F32(2)
+    LAUNCH_3C_SPH_QP_ABTILE_MULTI2_F32(3)
+    LAUNCH_3C_SPH_QP_ABTILE_MULTI2_F32(4)
+    LAUNCH_3C_SPH_QP_ABTILE_MULTI2_F32(5)
+    LAUNCH_3C_SPH_QP_ABTILE_MULTI2_F32(6)
+    LAUNCH_3C_SPH_QP_ABTILE_MULTI2_F32(7)
+    LAUNCH_3C_SPH_QP_ABTILE_MULTI2_F32(8)
+    LAUNCH_3C_SPH_QP_ABTILE_MULTI2_F32(9)
+    LAUNCH_3C_SPH_QP_ABTILE_MULTI2_F32(10)
+    LAUNCH_3C_SPH_QP_ABTILE_MULTI2_F32(11)
+#undef LAUNCH_3C_SPH_QP_ABTILE_MULTI2_F32
+    default:
+      return cudaErrorInvalidValue;
+  }
+  return cudaGetLastError();
+}
+
+static inline cudaError_t launch_df_int3c2e_deriv_cart_allsp_atomgrad_sphbar_qp_abtile_multibar3(
+    const int32_t* spAB_arr,
+    int n_spAB,
+    const int32_t* spCD,
+    int ntasks,
+    const int32_t* sp_A,
+    const int32_t* sp_B,
+    const int32_t* sp_pair_start,
+    const int32_t* sp_npair,
+    const double* shell_cx,
+    const double* shell_cy,
+    const double* shell_cz,
+    const int32_t* shell_prim_start,
+    const int32_t* shell_nprim,
+    const int32_t* shell_ao_start,
+    const double* prim_exp,
+    const double* pair_eta,
+    const double* pair_Px,
+    const double* pair_Py,
+    const double* pair_Pz,
+    const double* pair_cK,
+    int nao,
+    int naux,
+    int nao_sph,
+    int la,
+    int lb,
+    int lc,
+    const double* bar_X_sph_Qp0,
+    const double* bar_X_sph_Qp1,
+    const double* bar_X_sph_Qp2,
+    const int32_t* shell_ao_start_sph,
+    const int32_t* shell_atom,
+    int cd_tile,
+    int q_offset,
+    int q_count,
+    double* grad_dev_multi,
+    int64_t grad_stride,
+    cudaStream_t stream,
+    int threads) {
+  if (cd_tile <= 0) return cudaErrorInvalidValue;
+  if (q_count <= 0) return cudaSuccess;
+  if (grad_stride <= 0) return cudaErrorInvalidValue;
+  const int nroots = df_nroots_from_L(la + lb + lc);
+  const int ntiles = (ntasks + cd_tile - 1) / cd_tile;
+  const dim3 grid(static_cast<unsigned int>(ntiles), static_cast<unsigned int>(n_spAB));
+  switch (nroots) {
+#define LAUNCH_3C_SPH_QP_ABTILE_MULTI3(NR) \
+    case NR: \
+      KernelDFInt3c2eDerivContractedCartAllSPAtomGradSphBarQpABTileMultiBar<NR, double, 3><<<grid, threads, 0, stream>>>( \
+          spAB_arr, n_spAB, spCD, ntasks, sp_A, sp_B, sp_pair_start, sp_npair, \
+          shell_cx, shell_cy, shell_cz, shell_prim_start, shell_nprim, shell_ao_start, \
+          prim_exp, pair_eta, pair_Px, pair_Py, pair_Pz, pair_cK, \
+          nao, naux, nao_sph, la, lb, lc, bar_X_sph_Qp0, bar_X_sph_Qp1, bar_X_sph_Qp2, shell_ao_start_sph, shell_atom, \
+          cd_tile, q_offset, q_count, grad_dev_multi, grad_stride); \
+      break;
+    LAUNCH_3C_SPH_QP_ABTILE_MULTI3(1)
+    LAUNCH_3C_SPH_QP_ABTILE_MULTI3(2)
+    LAUNCH_3C_SPH_QP_ABTILE_MULTI3(3)
+    LAUNCH_3C_SPH_QP_ABTILE_MULTI3(4)
+    LAUNCH_3C_SPH_QP_ABTILE_MULTI3(5)
+    LAUNCH_3C_SPH_QP_ABTILE_MULTI3(6)
+    LAUNCH_3C_SPH_QP_ABTILE_MULTI3(7)
+    LAUNCH_3C_SPH_QP_ABTILE_MULTI3(8)
+    LAUNCH_3C_SPH_QP_ABTILE_MULTI3(9)
+    LAUNCH_3C_SPH_QP_ABTILE_MULTI3(10)
+    LAUNCH_3C_SPH_QP_ABTILE_MULTI3(11)
+#undef LAUNCH_3C_SPH_QP_ABTILE_MULTI3
+    default:
+      return cudaErrorInvalidValue;
+  }
+  return cudaGetLastError();
+}
+
+static inline cudaError_t launch_df_int3c2e_deriv_cart_allsp_atomgrad_sphbar_qp_abtile_multibar3_f32bar(
+    const int32_t* spAB_arr,
+    int n_spAB,
+    const int32_t* spCD,
+    int ntasks,
+    const int32_t* sp_A,
+    const int32_t* sp_B,
+    const int32_t* sp_pair_start,
+    const int32_t* sp_npair,
+    const double* shell_cx,
+    const double* shell_cy,
+    const double* shell_cz,
+    const int32_t* shell_prim_start,
+    const int32_t* shell_nprim,
+    const int32_t* shell_ao_start,
+    const double* prim_exp,
+    const double* pair_eta,
+    const double* pair_Px,
+    const double* pair_Py,
+    const double* pair_Pz,
+    const double* pair_cK,
+    int nao,
+    int naux,
+    int nao_sph,
+    int la,
+    int lb,
+    int lc,
+    const float* bar_X_sph_Qp0,
+    const float* bar_X_sph_Qp1,
+    const float* bar_X_sph_Qp2,
+    const int32_t* shell_ao_start_sph,
+    const int32_t* shell_atom,
+    int cd_tile,
+    int q_offset,
+    int q_count,
+    double* grad_dev_multi,
+    int64_t grad_stride,
+    cudaStream_t stream,
+    int threads) {
+  if (cd_tile <= 0) return cudaErrorInvalidValue;
+  if (q_count <= 0) return cudaSuccess;
+  if (grad_stride <= 0) return cudaErrorInvalidValue;
+  const int nroots = df_nroots_from_L(la + lb + lc);
+  const int ntiles = (ntasks + cd_tile - 1) / cd_tile;
+  const dim3 grid(static_cast<unsigned int>(ntiles), static_cast<unsigned int>(n_spAB));
+  switch (nroots) {
+#define LAUNCH_3C_SPH_QP_ABTILE_MULTI3_F32(NR) \
+    case NR: \
+      KernelDFInt3c2eDerivContractedCartAllSPAtomGradSphBarQpABTileMultiBar<NR, float, 3><<<grid, threads, 0, stream>>>( \
+          spAB_arr, n_spAB, spCD, ntasks, sp_A, sp_B, sp_pair_start, sp_npair, \
+          shell_cx, shell_cy, shell_cz, shell_prim_start, shell_nprim, shell_ao_start, \
+          prim_exp, pair_eta, pair_Px, pair_Py, pair_Pz, pair_cK, \
+          nao, naux, nao_sph, la, lb, lc, bar_X_sph_Qp0, bar_X_sph_Qp1, bar_X_sph_Qp2, shell_ao_start_sph, shell_atom, \
+          cd_tile, q_offset, q_count, grad_dev_multi, grad_stride); \
+      break;
+    LAUNCH_3C_SPH_QP_ABTILE_MULTI3_F32(1)
+    LAUNCH_3C_SPH_QP_ABTILE_MULTI3_F32(2)
+    LAUNCH_3C_SPH_QP_ABTILE_MULTI3_F32(3)
+    LAUNCH_3C_SPH_QP_ABTILE_MULTI3_F32(4)
+    LAUNCH_3C_SPH_QP_ABTILE_MULTI3_F32(5)
+    LAUNCH_3C_SPH_QP_ABTILE_MULTI3_F32(6)
+    LAUNCH_3C_SPH_QP_ABTILE_MULTI3_F32(7)
+    LAUNCH_3C_SPH_QP_ABTILE_MULTI3_F32(8)
+    LAUNCH_3C_SPH_QP_ABTILE_MULTI3_F32(9)
+    LAUNCH_3C_SPH_QP_ABTILE_MULTI3_F32(10)
+    LAUNCH_3C_SPH_QP_ABTILE_MULTI3_F32(11)
+#undef LAUNCH_3C_SPH_QP_ABTILE_MULTI3_F32
+    default:
+      return cudaErrorInvalidValue;
+  }
+  return cudaGetLastError();
+}
+
+static inline cudaError_t launch_df_int3c2e_deriv_cart_allsp_atomgrad_sphbar_qmn_abtile_multibar(
+    const int32_t* spAB_arr,
+    int n_spAB,
+    const int32_t* spCD,
+    int ntasks,
+    const int32_t* sp_A,
+    const int32_t* sp_B,
+    const int32_t* sp_pair_start,
+    const int32_t* sp_npair,
+    const double* shell_cx,
+    const double* shell_cy,
+    const double* shell_cz,
+    const int32_t* shell_prim_start,
+    const int32_t* shell_nprim,
+    const int32_t* shell_ao_start,
+    const double* prim_exp,
+    const double* pair_eta,
+    const double* pair_Px,
+    const double* pair_Py,
+    const double* pair_Pz,
+    const double* pair_cK,
+    int nao,
+    int naux,
+    int nao_sph,
+    int la,
+    int lb,
+    int lc,
+    const double* bar_X_sph_Qmn_multi,
+    int64_t bar_stride,
+    int nbar,
+    const int32_t* shell_ao_start_sph,
+    const int32_t* shell_atom,
+    int cd_tile,
+    int q_offset,
+    int q_count,
+    double* grad_dev_multi,
+    int64_t grad_stride,
+    cudaStream_t stream,
+    int threads) {
+  if (cd_tile <= 0) return cudaErrorInvalidValue;
+  if (nbar <= 0) return cudaErrorInvalidValue;
+  if (q_count <= 0) return cudaSuccess;
+  if (bar_stride <= 0 || grad_stride <= 0) return cudaErrorInvalidValue;
+  const int nroots = df_nroots_from_L(la + lb + lc);
+  const int ntiles = (ntasks + cd_tile - 1) / cd_tile;
+  const dim3 grid(static_cast<unsigned int>(ntiles), static_cast<unsigned int>(n_spAB));
+  switch (nbar) {
+    case 2:
+      switch (nroots) {
+#define LAUNCH_3C_SPH_ABTILE_MULTI(NR) \
+    case NR: \
+      KernelDFInt3c2eDerivContractedCartAllSPAtomGradSphBarQmnABTileMultiBar<NR, 2><<<grid, threads, 0, stream>>>( \
+          spAB_arr, n_spAB, spCD, ntasks, sp_A, sp_B, sp_pair_start, sp_npair, \
+          shell_cx, shell_cy, shell_cz, shell_prim_start, shell_nprim, shell_ao_start, \
+          prim_exp, pair_eta, pair_Px, pair_Py, pair_Pz, pair_cK, \
+          nao, naux, nao_sph, la, lb, lc, bar_X_sph_Qmn_multi, bar_stride, shell_ao_start_sph, shell_atom, \
+          cd_tile, q_offset, q_count, grad_dev_multi, grad_stride); \
+      break;
+        LAUNCH_3C_SPH_ABTILE_MULTI(1)
+        LAUNCH_3C_SPH_ABTILE_MULTI(2)
+        LAUNCH_3C_SPH_ABTILE_MULTI(3)
+        LAUNCH_3C_SPH_ABTILE_MULTI(4)
+        LAUNCH_3C_SPH_ABTILE_MULTI(5)
+        LAUNCH_3C_SPH_ABTILE_MULTI(6)
+        LAUNCH_3C_SPH_ABTILE_MULTI(7)
+        LAUNCH_3C_SPH_ABTILE_MULTI(8)
+        LAUNCH_3C_SPH_ABTILE_MULTI(9)
+        LAUNCH_3C_SPH_ABTILE_MULTI(10)
+        LAUNCH_3C_SPH_ABTILE_MULTI(11)
+#undef LAUNCH_3C_SPH_ABTILE_MULTI
+        default:
+          return cudaErrorInvalidValue;
+      }
+      break;
     default:
       return cudaErrorInvalidValue;
   }
@@ -5616,6 +9195,94 @@ extern "C" cudaError_t cueri_df_int3c2e_deriv_contracted_cart_allsp_atomgrad_sph
       stream, threads);
 }
 
+extern "C" cudaError_t cueri_df_int3c2e_deriv_contracted_cart_allsp_atomgrad_sphbar_qp_launch_stream(
+    const int32_t* spAB_arr,
+    int n_spAB,
+    const int32_t* spCD,
+    int ntasks,
+    const int32_t* sp_A,
+    const int32_t* sp_B,
+    const int32_t* sp_pair_start,
+    const int32_t* sp_npair,
+    const double* shell_cx,
+    const double* shell_cy,
+    const double* shell_cz,
+    const int32_t* shell_prim_start,
+    const int32_t* shell_nprim,
+    const int32_t* shell_ao_start,
+    const double* prim_exp,
+    const double* pair_eta,
+    const double* pair_Px,
+    const double* pair_Py,
+    const double* pair_Pz,
+    const double* pair_cK,
+    int nao,
+    int naux,
+    int nao_sph,
+    int la,
+    int lb,
+    int lc,
+    const double* bar_X_sph_Qp,
+    const int32_t* shell_ao_start_sph,
+    const int32_t* shell_atom,
+    double* grad_dev,
+    cudaStream_t stream,
+    int threads) {
+  return launch_df_int3c2e_deriv_cart_allsp_atomgrad_sphbar_qp(
+      spAB_arr, n_spAB, spCD, ntasks,
+      sp_A, sp_B, sp_pair_start, sp_npair,
+      shell_cx, shell_cy, shell_cz,
+      shell_prim_start, shell_nprim, shell_ao_start,
+      prim_exp, pair_eta, pair_Px, pair_Py, pair_Pz, pair_cK,
+      nao, naux, nao_sph, la, lb, lc,
+      bar_X_sph_Qp, shell_ao_start_sph, shell_atom, 0, naux, grad_dev,
+      stream, threads);
+}
+
+extern "C" cudaError_t cueri_df_int3c2e_deriv_contracted_cart_allsp_atomgrad_sphbar_qp_f32bar_launch_stream(
+    const int32_t* spAB_arr,
+    int n_spAB,
+    const int32_t* spCD,
+    int ntasks,
+    const int32_t* sp_A,
+    const int32_t* sp_B,
+    const int32_t* sp_pair_start,
+    const int32_t* sp_npair,
+    const double* shell_cx,
+    const double* shell_cy,
+    const double* shell_cz,
+    const int32_t* shell_prim_start,
+    const int32_t* shell_nprim,
+    const int32_t* shell_ao_start,
+    const double* prim_exp,
+    const double* pair_eta,
+    const double* pair_Px,
+    const double* pair_Py,
+    const double* pair_Pz,
+    const double* pair_cK,
+    int nao,
+    int naux,
+    int nao_sph,
+    int la,
+    int lb,
+    int lc,
+    const float* bar_X_sph_Qp,
+    const int32_t* shell_ao_start_sph,
+    const int32_t* shell_atom,
+    double* grad_dev,
+    cudaStream_t stream,
+    int threads) {
+  return launch_df_int3c2e_deriv_cart_allsp_atomgrad_sphbar_qp_f32bar(
+      spAB_arr, n_spAB, spCD, ntasks,
+      sp_A, sp_B, sp_pair_start, sp_npair,
+      shell_cx, shell_cy, shell_cz,
+      shell_prim_start, shell_nprim, shell_ao_start,
+      prim_exp, pair_eta, pair_Px, pair_Py, pair_Pz, pair_cK,
+      nao, naux, nao_sph, la, lb, lc,
+      bar_X_sph_Qp, shell_ao_start_sph, shell_atom, 0, naux, grad_dev,
+      stream, threads);
+}
+
 extern "C" cudaError_t cueri_df_int3c2e_deriv_contracted_cart_allsp_atomgrad_sphbar_qmn_streamed_launch_stream(
     const int32_t* spAB_arr,
     int n_spAB,
@@ -5750,6 +9417,96 @@ extern "C" cudaError_t cueri_df_int3c2e_deriv_contracted_cart_allsp_atomgrad_sph
       stream, threads);
 }
 
+extern "C" cudaError_t cueri_df_int3c2e_deriv_contracted_cart_allsp_atomgrad_sphbar_qp_abtile_launch_stream(
+    const int32_t* spAB_arr,
+    int n_spAB,
+    const int32_t* spCD,
+    int ntasks,
+    const int32_t* sp_A,
+    const int32_t* sp_B,
+    const int32_t* sp_pair_start,
+    const int32_t* sp_npair,
+    const double* shell_cx,
+    const double* shell_cy,
+    const double* shell_cz,
+    const int32_t* shell_prim_start,
+    const int32_t* shell_nprim,
+    const int32_t* shell_ao_start,
+    const double* prim_exp,
+    const double* pair_eta,
+    const double* pair_Px,
+    const double* pair_Py,
+    const double* pair_Pz,
+    const double* pair_cK,
+    int nao,
+    int naux,
+    int nao_sph,
+    int la,
+    int lb,
+    int lc,
+    const double* bar_X_sph_Qp,
+    const int32_t* shell_ao_start_sph,
+    const int32_t* shell_atom,
+    int cd_tile,
+    double* grad_dev,
+    cudaStream_t stream,
+    int threads) {
+  return launch_df_int3c2e_deriv_cart_allsp_atomgrad_sphbar_qp_abtile(
+      spAB_arr, n_spAB, spCD, ntasks,
+      sp_A, sp_B, sp_pair_start, sp_npair,
+      shell_cx, shell_cy, shell_cz,
+      shell_prim_start, shell_nprim, shell_ao_start,
+      prim_exp, pair_eta, pair_Px, pair_Py, pair_Pz, pair_cK,
+      nao, naux, nao_sph, la, lb, lc,
+      bar_X_sph_Qp, shell_ao_start_sph, shell_atom, cd_tile, 0, naux, grad_dev,
+      stream, threads);
+}
+
+extern "C" cudaError_t cueri_df_int3c2e_deriv_contracted_cart_allsp_atomgrad_sphbar_qp_abtile_f32bar_launch_stream(
+    const int32_t* spAB_arr,
+    int n_spAB,
+    const int32_t* spCD,
+    int ntasks,
+    const int32_t* sp_A,
+    const int32_t* sp_B,
+    const int32_t* sp_pair_start,
+    const int32_t* sp_npair,
+    const double* shell_cx,
+    const double* shell_cy,
+    const double* shell_cz,
+    const int32_t* shell_prim_start,
+    const int32_t* shell_nprim,
+    const int32_t* shell_ao_start,
+    const double* prim_exp,
+    const double* pair_eta,
+    const double* pair_Px,
+    const double* pair_Py,
+    const double* pair_Pz,
+    const double* pair_cK,
+    int nao,
+    int naux,
+    int nao_sph,
+    int la,
+    int lb,
+    int lc,
+    const float* bar_X_sph_Qp,
+    const int32_t* shell_ao_start_sph,
+    const int32_t* shell_atom,
+    int cd_tile,
+    double* grad_dev,
+    cudaStream_t stream,
+    int threads) {
+  return launch_df_int3c2e_deriv_cart_allsp_atomgrad_sphbar_qp_abtile_f32bar(
+      spAB_arr, n_spAB, spCD, ntasks,
+      sp_A, sp_B, sp_pair_start, sp_npair,
+      shell_cx, shell_cy, shell_cz,
+      shell_prim_start, shell_nprim, shell_ao_start,
+      prim_exp, pair_eta, pair_Px, pair_Py, pair_Pz, pair_cK,
+      nao, naux, nao_sph, la, lb, lc,
+      bar_X_sph_Qp, shell_ao_start_sph, shell_atom, cd_tile, 0, naux, grad_dev,
+      stream, threads);
+}
+
 extern "C" cudaError_t cueri_df_int3c2e_deriv_contracted_cart_allsp_atomgrad_sphbar_qmn_streamed_abtile_launch_stream(
     const int32_t* spAB_arr,
     int n_spAB,
@@ -5795,6 +9552,491 @@ extern "C" cudaError_t cueri_df_int3c2e_deriv_contracted_cart_allsp_atomgrad_sph
       nao, naux, nao_sph, la, lb, lc,
       bar_X_sph_Qmn_chunk, shell_ao_start_sph, shell_atom,
       cd_tile, q_offset, q_count, grad_dev,
+      stream, threads);
+}
+
+extern "C" cudaError_t cueri_df_int3c2e_deriv_contracted_cart_allsp_atomgrad_sphbar_qmn_streamed_multibar_launch_stream(
+    const int32_t* spAB_arr,
+    int n_spAB,
+    const int32_t* spCD,
+    int ntasks,
+    const int32_t* sp_A,
+    const int32_t* sp_B,
+    const int32_t* sp_pair_start,
+    const int32_t* sp_npair,
+    const double* shell_cx,
+    const double* shell_cy,
+    const double* shell_cz,
+    const int32_t* shell_prim_start,
+    const int32_t* shell_nprim,
+    const int32_t* shell_ao_start,
+    const double* prim_exp,
+    const double* pair_eta,
+    const double* pair_Px,
+    const double* pair_Py,
+    const double* pair_Pz,
+    const double* pair_cK,
+    int nao,
+    int naux,
+    int nao_sph,
+    int la,
+    int lb,
+    int lc,
+    const double* bar_X_sph_Qmn_chunk_multi,
+    int64_t bar_stride,
+    int nbar,
+    const int32_t* shell_ao_start_sph,
+    const int32_t* shell_atom,
+    int q_offset,
+    int q_count,
+    double* grad_dev_multi,
+    int64_t grad_stride,
+    cudaStream_t stream,
+    int threads) {
+  return launch_df_int3c2e_deriv_cart_allsp_atomgrad_sphbar_qmn_multibar(
+      spAB_arr, n_spAB, spCD, ntasks,
+      sp_A, sp_B, sp_pair_start, sp_npair,
+      shell_cx, shell_cy, shell_cz,
+      shell_prim_start, shell_nprim, shell_ao_start,
+      prim_exp, pair_eta, pair_Px, pair_Py, pair_Pz, pair_cK,
+      nao, naux, nao_sph, la, lb, lc,
+      bar_X_sph_Qmn_chunk_multi, bar_stride, nbar, shell_ao_start_sph, shell_atom,
+      q_offset, q_count, grad_dev_multi, grad_stride,
+      stream, threads);
+}
+
+extern "C" cudaError_t cueri_df_int3c2e_deriv_contracted_cart_allsp_atomgrad_sphbar_qp_multibar2_launch_stream(
+    const int32_t* spAB_arr,
+    int n_spAB,
+    const int32_t* spCD,
+    int ntasks,
+    const int32_t* sp_A,
+    const int32_t* sp_B,
+    const int32_t* sp_pair_start,
+    const int32_t* sp_npair,
+    const double* shell_cx,
+    const double* shell_cy,
+    const double* shell_cz,
+    const int32_t* shell_prim_start,
+    const int32_t* shell_nprim,
+    const int32_t* shell_ao_start,
+    const double* prim_exp,
+    const double* pair_eta,
+    const double* pair_Px,
+    const double* pair_Py,
+    const double* pair_Pz,
+    const double* pair_cK,
+    int nao,
+    int naux,
+    int nao_sph,
+    int la,
+    int lb,
+    int lc,
+    const double* bar_X_sph_Qp0,
+    const double* bar_X_sph_Qp1,
+    const int32_t* shell_ao_start_sph,
+    const int32_t* shell_atom,
+    double* grad_dev_multi,
+    int64_t grad_stride,
+    cudaStream_t stream,
+    int threads) {
+  return launch_df_int3c2e_deriv_cart_allsp_atomgrad_sphbar_qp_multibar2(
+      spAB_arr, n_spAB, spCD, ntasks,
+      sp_A, sp_B, sp_pair_start, sp_npair,
+      shell_cx, shell_cy, shell_cz,
+      shell_prim_start, shell_nprim, shell_ao_start,
+      prim_exp, pair_eta, pair_Px, pair_Py, pair_Pz, pair_cK,
+      nao, naux, nao_sph, la, lb, lc,
+      bar_X_sph_Qp0, bar_X_sph_Qp1, shell_ao_start_sph, shell_atom,
+      0, naux, grad_dev_multi, grad_stride,
+      stream, threads);
+}
+
+extern "C" cudaError_t cueri_df_int3c2e_deriv_contracted_cart_allsp_atomgrad_sphbar_qp_multibar2_f32bar_launch_stream(
+    const int32_t* spAB_arr,
+    int n_spAB,
+    const int32_t* spCD,
+    int ntasks,
+    const int32_t* sp_A,
+    const int32_t* sp_B,
+    const int32_t* sp_pair_start,
+    const int32_t* sp_npair,
+    const double* shell_cx,
+    const double* shell_cy,
+    const double* shell_cz,
+    const int32_t* shell_prim_start,
+    const int32_t* shell_nprim,
+    const int32_t* shell_ao_start,
+    const double* prim_exp,
+    const double* pair_eta,
+    const double* pair_Px,
+    const double* pair_Py,
+    const double* pair_Pz,
+    const double* pair_cK,
+    int nao,
+    int naux,
+    int nao_sph,
+    int la,
+    int lb,
+    int lc,
+    const float* bar_X_sph_Qp0,
+    const float* bar_X_sph_Qp1,
+    const int32_t* shell_ao_start_sph,
+    const int32_t* shell_atom,
+    double* grad_dev_multi,
+    int64_t grad_stride,
+    cudaStream_t stream,
+    int threads) {
+  return launch_df_int3c2e_deriv_cart_allsp_atomgrad_sphbar_qp_multibar2_f32bar(
+      spAB_arr, n_spAB, spCD, ntasks,
+      sp_A, sp_B, sp_pair_start, sp_npair,
+      shell_cx, shell_cy, shell_cz,
+      shell_prim_start, shell_nprim, shell_ao_start,
+      prim_exp, pair_eta, pair_Px, pair_Py, pair_Pz, pair_cK,
+      nao, naux, nao_sph, la, lb, lc,
+      bar_X_sph_Qp0, bar_X_sph_Qp1, shell_ao_start_sph, shell_atom,
+      0, naux, grad_dev_multi, grad_stride,
+      stream, threads);
+}
+
+extern "C" cudaError_t cueri_df_int3c2e_deriv_contracted_cart_allsp_atomgrad_sphbar_qp_abtile_multibar2_launch_stream(
+    const int32_t* spAB_arr,
+    int n_spAB,
+    const int32_t* spCD,
+    int ntasks,
+    const int32_t* sp_A,
+    const int32_t* sp_B,
+    const int32_t* sp_pair_start,
+    const int32_t* sp_npair,
+    const double* shell_cx,
+    const double* shell_cy,
+    const double* shell_cz,
+    const int32_t* shell_prim_start,
+    const int32_t* shell_nprim,
+    const int32_t* shell_ao_start,
+    const double* prim_exp,
+    const double* pair_eta,
+    const double* pair_Px,
+    const double* pair_Py,
+    const double* pair_Pz,
+    const double* pair_cK,
+    int nao,
+    int naux,
+    int nao_sph,
+    int la,
+    int lb,
+    int lc,
+    const double* bar_X_sph_Qp0,
+    const double* bar_X_sph_Qp1,
+    const int32_t* shell_ao_start_sph,
+    const int32_t* shell_atom,
+    int cd_tile,
+    double* grad_dev_multi,
+    int64_t grad_stride,
+    cudaStream_t stream,
+    int threads) {
+  return launch_df_int3c2e_deriv_cart_allsp_atomgrad_sphbar_qp_abtile_multibar2(
+      spAB_arr, n_spAB, spCD, ntasks,
+      sp_A, sp_B, sp_pair_start, sp_npair,
+      shell_cx, shell_cy, shell_cz,
+      shell_prim_start, shell_nprim, shell_ao_start,
+      prim_exp, pair_eta, pair_Px, pair_Py, pair_Pz, pair_cK,
+      nao, naux, nao_sph, la, lb, lc,
+      bar_X_sph_Qp0, bar_X_sph_Qp1, shell_ao_start_sph, shell_atom,
+      cd_tile, 0, naux, grad_dev_multi, grad_stride,
+      stream, threads);
+}
+
+extern "C" cudaError_t cueri_df_int3c2e_deriv_contracted_cart_allsp_atomgrad_sphbar_qp_abtile_multibar2_f32bar_launch_stream(
+    const int32_t* spAB_arr,
+    int n_spAB,
+    const int32_t* spCD,
+    int ntasks,
+    const int32_t* sp_A,
+    const int32_t* sp_B,
+    const int32_t* sp_pair_start,
+    const int32_t* sp_npair,
+    const double* shell_cx,
+    const double* shell_cy,
+    const double* shell_cz,
+    const int32_t* shell_prim_start,
+    const int32_t* shell_nprim,
+    const int32_t* shell_ao_start,
+    const double* prim_exp,
+    const double* pair_eta,
+    const double* pair_Px,
+    const double* pair_Py,
+    const double* pair_Pz,
+    const double* pair_cK,
+    int nao,
+    int naux,
+    int nao_sph,
+    int la,
+    int lb,
+    int lc,
+    const float* bar_X_sph_Qp0,
+    const float* bar_X_sph_Qp1,
+    const int32_t* shell_ao_start_sph,
+    const int32_t* shell_atom,
+    int cd_tile,
+    double* grad_dev_multi,
+    int64_t grad_stride,
+    cudaStream_t stream,
+    int threads) {
+  return launch_df_int3c2e_deriv_cart_allsp_atomgrad_sphbar_qp_abtile_multibar2_f32bar(
+      spAB_arr, n_spAB, spCD, ntasks,
+      sp_A, sp_B, sp_pair_start, sp_npair,
+      shell_cx, shell_cy, shell_cz,
+      shell_prim_start, shell_nprim, shell_ao_start,
+      prim_exp, pair_eta, pair_Px, pair_Py, pair_Pz, pair_cK,
+      nao, naux, nao_sph, la, lb, lc,
+      bar_X_sph_Qp0, bar_X_sph_Qp1, shell_ao_start_sph, shell_atom,
+      cd_tile, 0, naux, grad_dev_multi, grad_stride,
+      stream, threads);
+}
+
+extern "C" cudaError_t cueri_df_int3c2e_deriv_contracted_cart_allsp_atomgrad_sphbar_qp_multibar3_launch_stream(
+    const int32_t* spAB_arr,
+    int n_spAB,
+    const int32_t* spCD,
+    int ntasks,
+    const int32_t* sp_A,
+    const int32_t* sp_B,
+    const int32_t* sp_pair_start,
+    const int32_t* sp_npair,
+    const double* shell_cx,
+    const double* shell_cy,
+    const double* shell_cz,
+    const int32_t* shell_prim_start,
+    const int32_t* shell_nprim,
+    const int32_t* shell_ao_start,
+    const double* prim_exp,
+    const double* pair_eta,
+    const double* pair_Px,
+    const double* pair_Py,
+    const double* pair_Pz,
+    const double* pair_cK,
+    int nao,
+    int naux,
+    int nao_sph,
+    int la,
+    int lb,
+    int lc,
+    const double* bar_X_sph_Qp0,
+    const double* bar_X_sph_Qp1,
+    const double* bar_X_sph_Qp2,
+    const int32_t* shell_ao_start_sph,
+    const int32_t* shell_atom,
+    double* grad_dev_multi,
+    int64_t grad_stride,
+    cudaStream_t stream,
+    int threads) {
+  return launch_df_int3c2e_deriv_cart_allsp_atomgrad_sphbar_qp_multibar3(
+      spAB_arr, n_spAB, spCD, ntasks,
+      sp_A, sp_B, sp_pair_start, sp_npair,
+      shell_cx, shell_cy, shell_cz,
+      shell_prim_start, shell_nprim, shell_ao_start,
+      prim_exp, pair_eta, pair_Px, pair_Py, pair_Pz, pair_cK,
+      nao, naux, nao_sph, la, lb, lc,
+      bar_X_sph_Qp0, bar_X_sph_Qp1, bar_X_sph_Qp2, shell_ao_start_sph, shell_atom,
+      0, naux, grad_dev_multi, grad_stride,
+      stream, threads);
+}
+
+extern "C" cudaError_t cueri_df_int3c2e_deriv_contracted_cart_allsp_atomgrad_sphbar_qp_multibar3_f32bar_launch_stream(
+    const int32_t* spAB_arr,
+    int n_spAB,
+    const int32_t* spCD,
+    int ntasks,
+    const int32_t* sp_A,
+    const int32_t* sp_B,
+    const int32_t* sp_pair_start,
+    const int32_t* sp_npair,
+    const double* shell_cx,
+    const double* shell_cy,
+    const double* shell_cz,
+    const int32_t* shell_prim_start,
+    const int32_t* shell_nprim,
+    const int32_t* shell_ao_start,
+    const double* prim_exp,
+    const double* pair_eta,
+    const double* pair_Px,
+    const double* pair_Py,
+    const double* pair_Pz,
+    const double* pair_cK,
+    int nao,
+    int naux,
+    int nao_sph,
+    int la,
+    int lb,
+    int lc,
+    const float* bar_X_sph_Qp0,
+    const float* bar_X_sph_Qp1,
+    const float* bar_X_sph_Qp2,
+    const int32_t* shell_ao_start_sph,
+    const int32_t* shell_atom,
+    double* grad_dev_multi,
+    int64_t grad_stride,
+    cudaStream_t stream,
+    int threads) {
+  return launch_df_int3c2e_deriv_cart_allsp_atomgrad_sphbar_qp_multibar3_f32bar(
+      spAB_arr, n_spAB, spCD, ntasks,
+      sp_A, sp_B, sp_pair_start, sp_npair,
+      shell_cx, shell_cy, shell_cz,
+      shell_prim_start, shell_nprim, shell_ao_start,
+      prim_exp, pair_eta, pair_Px, pair_Py, pair_Pz, pair_cK,
+      nao, naux, nao_sph, la, lb, lc,
+      bar_X_sph_Qp0, bar_X_sph_Qp1, bar_X_sph_Qp2, shell_ao_start_sph, shell_atom,
+      0, naux, grad_dev_multi, grad_stride,
+      stream, threads);
+}
+
+extern "C" cudaError_t cueri_df_int3c2e_deriv_contracted_cart_allsp_atomgrad_sphbar_qp_abtile_multibar3_launch_stream(
+    const int32_t* spAB_arr,
+    int n_spAB,
+    const int32_t* spCD,
+    int ntasks,
+    const int32_t* sp_A,
+    const int32_t* sp_B,
+    const int32_t* sp_pair_start,
+    const int32_t* sp_npair,
+    const double* shell_cx,
+    const double* shell_cy,
+    const double* shell_cz,
+    const int32_t* shell_prim_start,
+    const int32_t* shell_nprim,
+    const int32_t* shell_ao_start,
+    const double* prim_exp,
+    const double* pair_eta,
+    const double* pair_Px,
+    const double* pair_Py,
+    const double* pair_Pz,
+    const double* pair_cK,
+    int nao,
+    int naux,
+    int nao_sph,
+    int la,
+    int lb,
+    int lc,
+    const double* bar_X_sph_Qp0,
+    const double* bar_X_sph_Qp1,
+    const double* bar_X_sph_Qp2,
+    const int32_t* shell_ao_start_sph,
+    const int32_t* shell_atom,
+    int cd_tile,
+    double* grad_dev_multi,
+    int64_t grad_stride,
+    cudaStream_t stream,
+    int threads) {
+  return launch_df_int3c2e_deriv_cart_allsp_atomgrad_sphbar_qp_abtile_multibar3(
+      spAB_arr, n_spAB, spCD, ntasks,
+      sp_A, sp_B, sp_pair_start, sp_npair,
+      shell_cx, shell_cy, shell_cz,
+      shell_prim_start, shell_nprim, shell_ao_start,
+      prim_exp, pair_eta, pair_Px, pair_Py, pair_Pz, pair_cK,
+      nao, naux, nao_sph, la, lb, lc,
+      bar_X_sph_Qp0, bar_X_sph_Qp1, bar_X_sph_Qp2, shell_ao_start_sph, shell_atom,
+      cd_tile, 0, naux, grad_dev_multi, grad_stride,
+      stream, threads);
+}
+
+extern "C" cudaError_t cueri_df_int3c2e_deriv_contracted_cart_allsp_atomgrad_sphbar_qp_abtile_multibar3_f32bar_launch_stream(
+    const int32_t* spAB_arr,
+    int n_spAB,
+    const int32_t* spCD,
+    int ntasks,
+    const int32_t* sp_A,
+    const int32_t* sp_B,
+    const int32_t* sp_pair_start,
+    const int32_t* sp_npair,
+    const double* shell_cx,
+    const double* shell_cy,
+    const double* shell_cz,
+    const int32_t* shell_prim_start,
+    const int32_t* shell_nprim,
+    const int32_t* shell_ao_start,
+    const double* prim_exp,
+    const double* pair_eta,
+    const double* pair_Px,
+    const double* pair_Py,
+    const double* pair_Pz,
+    const double* pair_cK,
+    int nao,
+    int naux,
+    int nao_sph,
+    int la,
+    int lb,
+    int lc,
+    const float* bar_X_sph_Qp0,
+    const float* bar_X_sph_Qp1,
+    const float* bar_X_sph_Qp2,
+    const int32_t* shell_ao_start_sph,
+    const int32_t* shell_atom,
+    int cd_tile,
+    double* grad_dev_multi,
+    int64_t grad_stride,
+    cudaStream_t stream,
+    int threads) {
+  return launch_df_int3c2e_deriv_cart_allsp_atomgrad_sphbar_qp_abtile_multibar3_f32bar(
+      spAB_arr, n_spAB, spCD, ntasks,
+      sp_A, sp_B, sp_pair_start, sp_npair,
+      shell_cx, shell_cy, shell_cz,
+      shell_prim_start, shell_nprim, shell_ao_start,
+      prim_exp, pair_eta, pair_Px, pair_Py, pair_Pz, pair_cK,
+      nao, naux, nao_sph, la, lb, lc,
+      bar_X_sph_Qp0, bar_X_sph_Qp1, bar_X_sph_Qp2, shell_ao_start_sph, shell_atom,
+      cd_tile, 0, naux, grad_dev_multi, grad_stride,
+      stream, threads);
+}
+
+extern "C" cudaError_t cueri_df_int3c2e_deriv_contracted_cart_allsp_atomgrad_sphbar_qmn_streamed_abtile_multibar_launch_stream(
+    const int32_t* spAB_arr,
+    int n_spAB,
+    const int32_t* spCD,
+    int ntasks,
+    const int32_t* sp_A,
+    const int32_t* sp_B,
+    const int32_t* sp_pair_start,
+    const int32_t* sp_npair,
+    const double* shell_cx,
+    const double* shell_cy,
+    const double* shell_cz,
+    const int32_t* shell_prim_start,
+    const int32_t* shell_nprim,
+    const int32_t* shell_ao_start,
+    const double* prim_exp,
+    const double* pair_eta,
+    const double* pair_Px,
+    const double* pair_Py,
+    const double* pair_Pz,
+    const double* pair_cK,
+    int nao,
+    int naux,
+    int nao_sph,
+    int la,
+    int lb,
+    int lc,
+    const double* bar_X_sph_Qmn_chunk_multi,
+    int64_t bar_stride,
+    int nbar,
+    const int32_t* shell_ao_start_sph,
+    const int32_t* shell_atom,
+    int q_offset,
+    int q_count,
+    int cd_tile,
+    double* grad_dev_multi,
+    int64_t grad_stride,
+    cudaStream_t stream,
+    int threads) {
+  return launch_df_int3c2e_deriv_cart_allsp_atomgrad_sphbar_qmn_abtile_multibar(
+      spAB_arr, n_spAB, spCD, ntasks,
+      sp_A, sp_B, sp_pair_start, sp_npair,
+      shell_cx, shell_cy, shell_cz,
+      shell_prim_start, shell_nprim, shell_ao_start,
+      prim_exp, pair_eta, pair_Px, pair_Py, pair_Pz, pair_cK,
+      nao, naux, nao_sph, la, lb, lc,
+      bar_X_sph_Qmn_chunk_multi, bar_stride, nbar, shell_ao_start_sph, shell_atom,
+      cd_tile, q_offset, q_count, grad_dev_multi, grad_stride,
       stream, threads);
 }
 

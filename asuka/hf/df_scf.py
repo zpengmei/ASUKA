@@ -142,6 +142,44 @@ def _df_K_qblocked_Qp(B_Qp, D, *, nao: int, q_block: int) -> Any:
         raise ValueError("q_block must be > 0")
     q_block = min(int(naux), int(q_block))
 
+    # Fast CUDA-extension path: compute the full K matrix via the same packed-Qp
+    # row/col blocked primitive used by the AH slice builder. This avoids
+    # materializing large (q,nao,nao) and tensordot temporaries inside the loop.
+    if xp is not np:
+        try:
+            ext = df_jk._load_hf_df_jk_cuda_ext()  # noqa: SLF001
+        except Exception:
+            ext = None
+        if ext is not None:
+            ws = df_jk._get_hf_df_jk_workspace(xp)  # noqa: SLF001
+            if hasattr(ws, "k_block_from_qp_d"):
+                if hasattr(B_Qp, "flags") and not bool(B_Qp.flags.c_contiguous):
+                    B_Qp = xp.ascontiguousarray(B_Qp)
+                if hasattr(D, "flags") and not bool(D.flags.c_contiguous):
+                    D = xp.ascontiguousarray(D)
+                out = xp.empty((nao_i, nao_i), dtype=xp.float64)
+                # Column blocking bounds the z-buffer (q*nao, col_block) without
+                # impacting correctness; tuneable via env.
+                col_block = _env_int("ASUKA_DF_JK_K_COLBLOCK_PACKED", 64)
+                col_block = max(1, min(int(nao_i), int(col_block)))
+                stream_ptr = int(xp.cuda.get_current_stream().ptr)
+                ws.k_block_from_qp_d(
+                    B_Qp,
+                    D,
+                    out,
+                    int(nao_i),
+                    0,
+                    int(nao_i),
+                    0,
+                    int(nao_i),
+                    int(q_block),
+                    int(col_block),
+                    stream=int(stream_ptr),
+                    math_mode=-1,
+                    sync=False,
+                )
+                return 0.5 * (out + out.T)
+
     from asuka.integrals.df_packed_s2 import unpack_Qp_to_Qmn_block  # noqa: PLC0415
 
     K = xp.zeros((nao_i, nao_i), dtype=xp.float64)
@@ -229,6 +267,38 @@ def _df_K_qblocked_Qp_rows_cols(
         raise ValueError("col_block must be > 0")
     col_block_i = min(int(col_count_i), int(col_block_i))
 
+    # Fast CUDA-extension path (avoids 3D extract temporaries and repacking).
+    if xp is not np:
+        try:
+            ext = df_jk._load_hf_df_jk_cuda_ext()  # noqa: SLF001
+        except Exception:
+            ext = None
+        if ext is not None:
+            ws = df_jk._get_hf_df_jk_workspace(xp)  # noqa: SLF001
+            if hasattr(ws, "k_block_from_qp_d"):
+                if hasattr(B_Qp, "flags") and not bool(B_Qp.flags.c_contiguous):
+                    B_Qp = xp.ascontiguousarray(B_Qp)
+                if hasattr(D, "flags") and not bool(D.flags.c_contiguous):
+                    D = xp.ascontiguousarray(D)
+                out = xp.empty((row_count_i, col_count_i), dtype=xp.float64)
+                stream_ptr = int(xp.cuda.get_current_stream().ptr)
+                ws.k_block_from_qp_d(
+                    B_Qp,
+                    D,
+                    out,
+                    int(nao_i),
+                    int(row0_i),
+                    int(row_count_i),
+                    int(col0_i),
+                    int(col_count_i),
+                    int(q_block_i),
+                    int(col_block_i),
+                    stream=int(stream_ptr),
+                    math_mode=-1,
+                    sync=False,
+                )
+                return out
+
     from asuka.integrals.df_packed_s2 import extract_Qp_rows_cols_block  # noqa: PLC0415
 
     K_sub = xp.zeros((row_count_i, col_count_i), dtype=xp.float64)
@@ -248,9 +318,14 @@ def _df_K_qblocked_Qp_rows_cols(
             col0=0,
             col_count=int(nao_i),
         )
-        Y = xp.matmul(B_rows, D)  # (qb,row_count,nao)
-        Y2 = xp.ascontiguousarray(Y.transpose(1, 0, 2)).reshape(row_count_i, qb * nao_i)
-        del B_rows, Y
+        # Avoid batched GEMM (often slow + high-workspace); flatten q and row dims
+        # into a single GEMM for better cublas efficiency.
+        Y2d = B_rows.reshape(qb * row_count_i, nao_i) @ D  # (qb*row_count, nao)
+        del B_rows
+        Y2 = xp.ascontiguousarray(Y2d.reshape(qb, row_count_i, nao_i).transpose(1, 0, 2)).reshape(
+            row_count_i, qb * nao_i
+        )
+        del Y2d
 
         for c_off in range(0, int(col_count_i), int(col_block_i)):
             cb = min(int(col_block_i), int(col_count_i) - int(c_off))
@@ -684,6 +759,7 @@ def rhf_df(
     ao_basis=None,
     aux_basis=None,
     df_backend: str = "gpu_rys",
+    df_ao_rep: str = "cart",
     df_threads: int = 256,
     df_mode: str = "auto",
     df_aux_block_naux: int = 256,
@@ -772,7 +848,34 @@ def rhf_df(
     if use_streamed and not use_k_cocc:
         raise NotImplementedError("jk_mode='streamed' currently requires k_engine='from_Cocc' (or 'auto' on GPU)")
     if use_streamed and dm0 is not None:
-        raise NotImplementedError("jk_mode='streamed' does not support dm0 (needs a C_occ-consistent density)")
+        # Streamed DF-K uses occupied orbitals (MO-driven), so we need an
+        # initial C_occ consistent with the provided dm0.  We project dm0 to an
+        # idempotent RHF density by taking its natural orbitals in the
+        # S-orthonormal basis and occupying the top nocc orbitals.
+        #
+        # This is primarily used for SAD-like initial guesses and is not meant
+        # to preserve a non-idempotent dm0 exactly.
+        Dp = _symmetrize(xp, X.T @ D @ X)
+        try:
+            # For small problems, host LAPACK can be faster than tiny GPU eigh.
+            use_cpu = bool(
+                xp is not np and int(_HF_CPU_EIGH_MAX_NAO) > 0 and int(Dp.shape[0]) <= int(_HF_CPU_EIGH_MAX_NAO)
+            )
+        except Exception:
+            use_cpu = False
+        if use_cpu:
+            Dp_h = np.asarray(xp.asnumpy(Dp), dtype=np.float64)
+            n_h, U_h = np.linalg.eigh(Dp_h)
+            n = xp.asarray(n_h, dtype=xp.float64)
+            U = xp.asarray(U_h, dtype=xp.float64)
+        else:
+            n, U = xp.linalg.eigh(Dp)
+        # Sort natural occupations descending.
+        idx = xp.argsort(n)[::-1]
+        U = U[:, idx]
+        C = X @ U
+        # Replace D with the idempotent density defined by the occupied space.
+        D = _symmetrize(xp, _density_from_C_occ(C, occ))
 
     k_q_block = int(k_q_block)
     if k_q_block <= 0:
@@ -849,6 +952,7 @@ def rhf_df(
             L_metric=L_metric,
             backend=str(df_backend),
             threads=int(df_threads),
+            ao_rep=str(df_ao_rep),
             mode=str(df_mode),
             aux_block_naux=int(df_aux_block_naux),
             profile=profile,
@@ -1118,6 +1222,7 @@ def uhf_df(
     ao_basis=None,
     aux_basis=None,
     df_backend: str = "gpu_rys",
+    df_ao_rep: str = "cart",
     df_threads: int = 256,
     df_mode: str = "auto",
     df_aux_block_naux: int = 256,
@@ -1282,6 +1387,7 @@ def uhf_df(
             L_metric=L_metric,
             backend=str(df_backend),
             threads=int(df_threads),
+            ao_rep=str(df_ao_rep),
             mode=str(df_mode),
             aux_block_naux=int(df_aux_block_naux),
             profile=profile,
@@ -1516,6 +1622,7 @@ def rohf_df(
     ao_basis=None,
     aux_basis=None,
     df_backend: str = "gpu_rys",
+    df_ao_rep: str = "cart",
     df_threads: int = 256,
     df_mode: str = "auto",
     df_aux_block_naux: int = 256,
@@ -1671,6 +1778,7 @@ def rohf_df(
             L_metric=L_metric,
             backend=str(df_backend),
             threads=int(df_threads),
+            ao_rep=str(df_ao_rep),
             mode=str(df_mode),
             aux_block_naux=int(df_aux_block_naux),
             profile=profile,

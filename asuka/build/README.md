@@ -10,6 +10,7 @@ checked-out repository.
 - `python -m asuka.build.int1e_ext build_ext --inplace`
 - `python -m asuka.build.guga_cuda_ext`
 - `python -m asuka.build.guga_cuda_linalg_ext`
+- `python -m asuka.build.orbitals_cuda_ext`
 
 ## Quick Usage
 
@@ -52,6 +53,7 @@ python -m asuka.build.guga_cuda_linalg_ext
 | `int1e_ext.py` | Cython build helper for `asuka.integrals._int1e_cart_cy` |
 | `guga_cuda_ext.py` | CMake/pybind11 build helper for `asuka.cuda._guga_cuda_ext` |
 | `guga_cuda_linalg_ext.py` | CMake/pybind11 build helper for `asuka.cuda._guga_cuda_linalg_ext` |
+| `orbitals_cuda_ext.py` | CMake/pybind11 build helper for `asuka._orbitals_cuda_ext` |
 
 ## Notes
 

@@ -53,6 +53,7 @@ class StreamedDFJKContext:
     backend: str
     threads: int
     mode: str
+    ao_rep: str
 
 
 def make_streamed_df_jk_context(
@@ -63,6 +64,7 @@ def make_streamed_df_jk_context(
     backend: str = "gpu_rys",
     threads: int = 256,
     mode: str = "auto",
+    ao_rep: str = "cart",
     aux_block_naux: int = 256,
     profile: dict | None = None,
 ) -> StreamedDFJKContext:
@@ -78,6 +80,10 @@ def make_streamed_df_jk_context(
     backend_s = str(backend).lower().strip()
     if backend_s not in ("gpu_ss", "gpu_sp", "gpu_rys"):
         raise ValueError("backend must be one of: 'gpu_ss', 'gpu_sp', 'gpu_rys'")
+
+    ao_rep_s = str(ao_rep).lower().strip()
+    if ao_rep_s not in ("cart", "sph"):
+        raise ValueError("ao_rep must be 'cart' or 'sph'")
 
     aux_block_naux = int(aux_block_naux)
     if aux_block_naux <= 0:
@@ -101,6 +107,7 @@ def make_streamed_df_jk_context(
         prof["backend"] = str(backend_s)
         prof["threads"] = int(threads)
         prof["mode"] = str(mode)
+        prof["ao_rep"] = str(ao_rep_s)
         prof["naux"] = int(L.shape[0])
 
     return StreamedDFJKContext(
@@ -111,6 +118,7 @@ def make_streamed_df_jk_context(
         backend=str(backend_s),
         threads=int(threads),
         mode=str(mode),
+        ao_rep=str(ao_rep_s),
     )
 
 
@@ -135,9 +143,12 @@ def _int3c2e_block(
             mode=str(ctx.mode),
             stream=None,
             profile=None,
+            ao_rep=str(ctx.ao_rep),
         )
 
     # Fallback: use the generic slice API (may be slower and may materialize internally).
+    if str(ctx.ao_rep).lower().strip() != "cart":
+        raise NotImplementedError("streamed DF fallback path does not support ao_rep='sph'")
     from asuka.cueri import df as cueri_df  # noqa: PLC0415
 
     # Convert shell indices to aux-function indices using the planned blocks.

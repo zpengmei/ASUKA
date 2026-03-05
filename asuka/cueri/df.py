@@ -64,6 +64,27 @@ def _trim_df_cache(cache: dict, max_items: int = _DF_METRIC_CHOL_CACHE_MAX) -> N
         cache.pop(next(iter(cache)))
 
 
+def clear_df_caches() -> None:
+    """Clear cuERI DF-level caches (metric Cholesky + streamed DF plans).
+
+    These caches can retain large GPU-resident buffers (pair tables, task lists)
+    across phases of a workflow. Clearing them is safe; plans will be rebuilt on
+    demand.
+    """
+    try:
+        _df_metric_chol_cache.clear()
+    except Exception:
+        pass
+    try:
+        _df_stream_rys_plan_cache.clear()
+    except Exception:
+        pass
+    try:
+        _df_stream_xblock_plan_cache.clear()
+    except Exception:
+        pass
+
+
 def _get_cached_metric_cholesky(aux_basis, *, backend: str, stream=None, profile: dict | None = None):
     """Cache and return the aux metric Cholesky factor L for a packed aux basis."""
 

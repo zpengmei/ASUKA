@@ -132,6 +132,7 @@ class MCSCFHessianOp:
     ci_ref_list: list[np.ndarray] | None
     sa_gram_inv: np.ndarray | None = None
     gpu_mode: bool = False  # True when h_op supports CuPy arrays natively
+    release_mo_jk: Callable[[], None] | None = None  # optional hook to drop GPU MO-JK precompute buffers
 
     @property
     def n_tot(self) -> int:
@@ -1501,6 +1502,10 @@ def build_mcscf_hessian_operator(
             if diag is not None and int(np.asarray(diag).size) != n_tot:
                 diag = None
 
+            _release_mo_jk = getattr(h_op, "release_mo_jk", None)
+            if not callable(_release_mo_jk):
+                _release_mo_jk = None
+
             return MCSCFHessianOp(
                 mv=_mv,
                 diag=diag,
@@ -1513,6 +1518,7 @@ def build_mcscf_hessian_operator(
                 ci_ref_list=ci_ref_list,
                 sa_gram_inv=sa_gram_inv,
                 gpu_mode=bool(_mv_gpu_mode),
+                release_mo_jk=_release_mo_jk,
             )
         except Exception:
             if use_newton_hessian:

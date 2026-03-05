@@ -7009,6 +7009,13 @@ class GugaMatvecEriMatWorkspace:
         if self.eri_mat is None and self.l_full is not None:
             bytes_per_row += int(self.naux) * int(self._itemsize)
         nrows_block = max(1, int(self.max_g_bytes // max(1, bytes_per_row)))
+        # Never allocate row-block workspaces larger than the CI dimension.
+        # This avoids multi-hundred-MB buffers for tiny active spaces (e.g. CAS(2,2)),
+        # where `nrows_eff = min(ncsf, nrows_block)` would otherwise waste VRAM.
+        try:
+            nrows_block = max(1, min(int(nrows_block), int(self.ncsf)))
+        except Exception:
+            pass
         self._g_buf = cp.empty((int(nrows_block), int(self.nops)), dtype=self._dtype)
         self._task_scale_rows = cp.empty((int(nrows_block),), dtype=self._dtype)
         self._diag_g_cache: dict[int, object] = {}

@@ -248,6 +248,34 @@ _STEP2_BASE_CLASS_IDS: set[int] = {
 }
 
 
+def clear_plan_caches() -> None:
+    """Clear internal cuERI plan caches to release GPU memory.
+
+    cuERI caches several "plans" (device basis/shell-pairs/pair-tables/task lists)
+    keyed by basis identity to accelerate repeated integral builds. In long
+    workflows (e.g., SCF -> CASSCF -> gradient), these caches can keep large
+    GPU-resident arrays alive even after the main tensors (e.g. B factors) are
+    already built.  Clearing them is safe; the next integral build will
+    re-initialize the plans on demand.
+    """
+    try:
+        _df_metric_2c2e_rys_plan_cache.clear()
+    except Exception:
+        pass
+    try:
+        _df_int3c2e_rys_plan_cache.clear()
+    except Exception:
+        pass
+    try:
+        _df_int3c2e_rys_contracted_ao_plan_cache.clear()
+    except Exception:
+        pass
+    try:
+        _expanded_cart_basis_cache.clear()
+    except Exception:
+        pass
+
+
 def _trim_plan_cache(cache: dict, max_items: int = _DF_PLAN_CACHE_MAX) -> None:
     while len(cache) > int(max_items):
         cache.pop(next(iter(cache)))
