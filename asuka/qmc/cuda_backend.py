@@ -2055,3 +2055,256 @@ def cuda_block_apply_right_matrix_phi_ws(
 
     ctx.nnz[:] = ctx.nnz_next
     ctx.use_a = not ctx.use_a
+
+
+# ---------------------------------------------------------------------------
+# CUDA FCIQMC context (spawn + coalesce, no FRI compression)
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class CudaFCIQMCContext:
+    """Reusable GPU context for repeated FCIQMC steps (spawn + coalesce, no compression).
+
+    Unlike :class:`CudaProjectorContext`, the walker population is not bounded by a
+    fixed ``m`` — it can grow up to ``max_walker``.  The shift-based population
+    control in the FCIQMC driver keeps the count finite.
+    """
+
+    drt_dev: Any
+    state_dev: Any
+    ws: Any
+
+    h_base_flat_dev: Any
+    eri_mat_dev: Any
+
+    nspawn_one: int
+    nspawn_two: int
+    max_walker: int
+    max_n: int
+    max_evt: int
+
+    threads_spawn: int = 128
+    threads_qmc: int = 256
+    stream: int | None = None
+
+    # Current sparse-vector buffers (capacity max_walker; only prefix [:nnz] valid).
+    x_idx: Any | None = None
+    x_val: Any | None = None
+    nnz: int = 0
+
+    # Preallocated step buffers.
+    evt_idx: Any | None = None
+    evt_val: Any | None = None
+    idx_all: Any | None = None
+    val_all: Any | None = None
+    idx_u: Any | None = None
+    val_u: Any | None = None
+    nnz_u: Any | None = None
+
+    def release(self) -> None:
+        if self.ws is not None:
+            self.ws.release()
+        if self.state_dev is not None:
+            self.state_dev.release()
+        if self.drt_dev is not None:
+            self.drt_dev.release()
+        self.ws = None
+        self.state_dev = None
+        self.drt_dev = None
+
+
+def make_cuda_fciqmc_context(
+    drt: Any,
+    h1e: Any,
+    eri: Any,
+    *,
+    max_walker: int,
+    nspawn_one: int,
+    nspawn_two: int,
+    threads_spawn: int = 128,
+    threads_qmc: int = 256,
+    stream: int | None = None,
+) -> CudaFCIQMCContext:
+    """Build a reusable CUDA FCIQMC context for dense-ERI Hamiltonians."""
+
+    if cp is None or _guga_cuda_ext is None:  # pragma: no cover
+        raise RuntimeError("CUDA QMC backend unavailable (requires cupy and asuka._guga_cuda_ext)")
+
+    from asuka.cuguga.state_cache import get_state_cache  # noqa: PLC0415
+    from asuka.cuguga.oracle import _child_prefix_walks  # noqa: PLC0415
+
+    norb = int(drt.norb)
+    nops = norb * norb
+
+    h1e = np.asarray(h1e, dtype=np.float64).reshape(norb, norb)
+    eri = np.asarray(eri, dtype=np.float64)
+    if eri.ndim == 4:
+        if eri.shape != (norb, norb, norb, norb):
+            raise ValueError("eri4 has wrong shape")
+        eri_mat = eri.reshape(nops, nops)
+        eri4 = eri
+    elif eri.ndim == 2:
+        if eri.shape != (nops, nops):
+            raise ValueError("eri_mat has wrong shape")
+        eri_mat = eri
+        eri4 = eri.reshape(norb, norb, norb, norb)
+    else:
+        raise ValueError("eri must be eri_mat[pq,rs] (2D) or eri4[p,q,r,s] (4D)")
+
+    h_base = h1e - 0.5 * np.einsum("pqqs->ps", eri4, optimize=True)
+
+    child_prefix = _child_prefix_walks(drt)
+    drt_dev = _guga_cuda_ext.make_device_drt(
+        int(drt.norb), np.asarray(drt.child), np.asarray(drt.node_twos), np.asarray(child_prefix)
+    )
+    cache = get_state_cache(drt)
+    state_dev = _guga_cuda_ext.make_device_state_cache(
+        drt_dev,
+        np.asarray(cache.steps, dtype=np.int8, order="C"),
+        np.asarray(cache.nodes, dtype=np.int32, order="C"),
+    )
+
+    if stream is None:
+        stream = int(cp.cuda.get_current_stream().ptr)
+
+    max_walker = int(max_walker)
+    nspawn_one = int(nspawn_one)
+    nspawn_two = int(nspawn_two)
+    if max_walker < 1:
+        raise ValueError("max_walker must be >= 1")
+    if nspawn_one < 0 or nspawn_two < 0:
+        raise ValueError("nspawn_one/nspawn_two must be >= 0")
+    if nspawn_one == 0 and nspawn_two == 0:
+        raise ValueError("at least one of nspawn_one/nspawn_two must be > 0")
+
+    nspawn_total = nspawn_one + nspawn_two
+    max_evt = max_walker * nspawn_total
+    max_n = max_walker + max_evt
+
+    ws = _guga_cuda_ext.QmcWorkspace(int(max_n), int(max_walker))
+
+    ctx = CudaFCIQMCContext(
+        drt_dev=drt_dev,
+        state_dev=state_dev,
+        ws=ws,
+        h_base_flat_dev=cp.asarray(h_base.ravel(order="C"), dtype=cp.float64),
+        eri_mat_dev=cp.asarray(eri_mat, dtype=cp.float64),
+        nspawn_one=nspawn_one,
+        nspawn_two=nspawn_two,
+        max_walker=max_walker,
+        max_n=max_n,
+        max_evt=max_evt,
+        threads_spawn=int(threads_spawn),
+        threads_qmc=int(threads_qmc),
+        stream=int(stream),
+    )
+
+    ctx.x_idx = cp.empty(max_walker, dtype=cp.int32)
+    ctx.x_val = cp.empty(max_walker, dtype=cp.float64)
+    ctx.evt_idx = cp.empty(max_evt, dtype=cp.int32)
+    ctx.evt_val = cp.empty(max_evt, dtype=cp.float64)
+    ctx.idx_all = cp.empty(max_n, dtype=cp.int32)
+    ctx.val_all = cp.empty(max_n, dtype=cp.float64)
+    ctx.idx_u = cp.empty(max_n, dtype=cp.int32)
+    ctx.val_u = cp.empty(max_n, dtype=cp.float64)
+    ctx.nnz_u = cp.empty(1, dtype=cp.int32)
+    return ctx
+
+
+def cuda_fciqmc_step_hamiltonian_ws(
+    ctx: CudaFCIQMCContext,
+    *,
+    dt: float,
+    shift: float,
+    initiator_t: float = 0.0,
+    seed_spawn: int,
+    sync: bool = True,
+) -> int:
+    """One FCIQMC step on GPU: spawn + shift-scale + coalesce (no FRI compression).
+
+    Applies ``x <- (1 + dt*S)*x - dt*H*x`` entirely on device.
+
+    Returns the new ``nnz`` after coalescing.
+
+    Notes
+    -----
+    Requires ``sync=True`` because the host reads ``nnz_u`` to update ``ctx.nnz``.
+    """
+
+    if cp is None or _guga_cuda_ext is None:  # pragma: no cover
+        raise RuntimeError("CUDA QMC backend unavailable (requires cupy and asuka._guga_cuda_ext)")
+    if not bool(sync):
+        raise ValueError("cuda_fciqmc_step_hamiltonian_ws currently requires sync=True")
+    if ctx.ws is None or ctx.drt_dev is None or ctx.state_dev is None:
+        raise RuntimeError("CudaFCIQMCContext is released")
+
+    nnz = int(ctx.nnz)
+    if nnz <= 0:
+        raise ValueError("current x is empty")
+    if nnz > int(ctx.max_walker):
+        raise ValueError(f"current nnz={nnz} exceeds max_walker={ctx.max_walker}")
+
+    if ctx.stream is None:
+        ctx.stream = int(cp.cuda.get_current_stream().ptr)
+
+    nspawn_total = int(ctx.nspawn_one + ctx.nspawn_two)
+    out_len = nnz * nspawn_total
+
+    x_idx = ctx.x_idx[:nnz]
+    x_val = ctx.x_val[:nnz]
+    evt_idx = ctx.evt_idx[:out_len]
+    evt_val = ctx.evt_val[:out_len]
+
+    # Spawn: fills evt_idx/evt_val with -dt*H*x events (-1 sentinel for invalid slots).
+    _guga_cuda_ext.qmc_spawn_hamiltonian_inplace_device(
+        ctx.drt_dev,
+        ctx.state_dev,
+        x_idx,
+        x_val,
+        ctx.h_base_flat_dev,
+        ctx.eri_mat_dev,
+        evt_idx,
+        evt_val,
+        float(dt),
+        int(ctx.nspawn_one),
+        int(ctx.nspawn_two),
+        int(seed_spawn),
+        float(initiator_t),
+        int(ctx.threads_spawn),
+        int(ctx.stream),
+        False,
+    )
+
+    # Merge: (1 + dt*S)*x_current alongside the spawned events.
+    all_len = nnz + out_len
+    ctx.idx_all[:nnz] = x_idx
+    ctx.idx_all[nnz:all_len] = evt_idx
+    ctx.val_all[:nnz] = float(1.0 + dt * shift) * x_val
+    ctx.val_all[nnz:all_len] = evt_val
+
+    # Coalesce (sort + reduce; idx < 0 sentinels contribute zero and are excluded).
+    ctx.ws.coalesce_coo_i32_f64_inplace_device(
+        ctx.idx_all,
+        ctx.val_all,
+        ctx.idx_u,
+        ctx.val_u,
+        ctx.nnz_u,
+        int(all_len),
+        int(ctx.threads_qmc),
+        int(ctx.stream),
+        bool(sync),
+    )
+    n_out = int(cp.asnumpy(ctx.nnz_u)[0])
+    if n_out < 0:
+        n_out = 0
+    if n_out > int(ctx.max_walker):
+        raise RuntimeError(
+            f"walker population after coalescing ({n_out}) exceeds max_walker ({ctx.max_walker}). "
+            "Increase max_walker or tighten population control."
+        )
+
+    ctx.x_idx[:n_out] = ctx.idx_u[:n_out]
+    ctx.x_val[:n_out] = ctx.val_u[:n_out]
+    ctx.nnz = n_out
+    return n_out

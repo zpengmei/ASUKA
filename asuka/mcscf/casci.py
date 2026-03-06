@@ -1443,8 +1443,19 @@ def run_casci_dense_cpu(
     eri_prof = None
     if profile is not None:
         eri_prof = profile.setdefault("active_dense_cpu", {})
+    # The CPU ERI builder uses a Cartesian AO basis (BasisCartSoA).  When the
+    # SCF was run in spherical AOs (mol.cart=False, the PySCF default), the MO
+    # coefficients are in the spherical AO basis and must be transformed before
+    # the contraction.
+    sph_map_cpu = coerce_sph_map(getattr(scf_out, "sph_map", None))
+    C_cas_for_eri: np.ndarray
+    if sph_map_cpu is not None:
+        T_c2s = np.asarray(sph_map_cpu.T_c2s, dtype=np.float64)  # (nao_cart, nao_sph)
+        C_cas_for_eri = T_c2s @ np.asarray(C_cas, dtype=np.float64, order="C")
+    else:
+        C_cas_for_eri = np.asarray(C_cas, dtype=np.float64, order="C")
     eri = builder.build_eri_packed(
-        np.asarray(C_cas, dtype=np.float64, order="C"),
+        C_cas_for_eri,
         eps_ao=float(eps_ao),
         eps_mo=float(eps_mo),
         blas_nthreads=None if blas_nthreads is None else int(blas_nthreads),

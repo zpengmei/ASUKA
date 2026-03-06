@@ -181,14 +181,16 @@ def run_fcifri_ground(
                     compressor=compressor,
                 )
 
-                n2 = float(cp.linalg.norm(ctx.x_val[: ctx.nnz]).get())
-                if n2 == 0.0:
-                    raise RuntimeError("vector collapsed to zero (try smaller eps or more spawn)")
-                ctx.x_val[: ctx.nnz] /= n2
+                # Keep normalization on GPU to avoid a host sync every iteration.
+                # Collapse is detected at energy evaluation points when we sync anyway.
+                n2_dev = cp.linalg.norm(ctx.x_val[: ctx.nnz])
+                ctx.x_val[: ctx.nnz] /= n2_dev
 
                 if it % energy_stride == 0:
                     x_idx_u = cp.asnumpy(ctx.x_idx[: ctx.nnz]).astype(np.int32, copy=False)
                     x_val_u = cp.asnumpy(ctx.x_val[: ctx.nnz]).astype(np.float64, copy=False)
+                    if float(np.linalg.norm(x_val_u)) == 0.0:
+                        raise RuntimeError("vector collapsed to zero (try smaller eps or more spawn)")
                     ref = choose_reference_index(x_idx_u, x_val_u, preferred=preferred_ref_idx)
                     if energy_estimator == "rayleigh":
                         e, _, _ = rayleigh_energy_ref(drt, h1e, eri, x_idx_u, x_val_u, state_cache=state_cache)
