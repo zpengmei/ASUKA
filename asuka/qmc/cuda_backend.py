@@ -1014,10 +1014,17 @@ def cuda_projector_step_hamiltonian_ws(
     - coalesce is still performed on GPU,
     - the coalesced COO vector is downloaded to host and passed to `compressor`,
     - the compressed vector is uploaded back to the output buffers on GPU.
+
+    Notes
+    -----
+    This workspace path currently requires ``sync=True`` because the host code
+    consumes device-written nnz counters before swapping buffers.
     """
 
     if cp is None or _guga_cuda_ext is None:  # pragma: no cover
         raise RuntimeError("CUDA QMC backend unavailable (requires cupy and asuka._guga_cuda_ext)")
+    if not bool(sync):
+        raise ValueError("cuda_projector_step_hamiltonian_ws currently requires sync=True")
     if ctx.ws is None or ctx.drt_dev is None or ctx.state_dev is None:
         raise RuntimeError("CudaProjectorContext is released")
     if ctx.x_idx is None or ctx.x_val is None or ctx.x_idx_next is None or ctx.x_val_next is None:
@@ -1151,10 +1158,18 @@ def cuda_block_projector_step_hamiltonian_ws(
     sync: bool = True,
     compressor: Callable[..., tuple[np.ndarray, np.ndarray]] | list[Callable[..., tuple[np.ndarray, np.ndarray]]] | tuple[Callable[..., tuple[np.ndarray, np.ndarray]], ...] | None = None,
 ) -> np.ndarray:
-    """Projector step for all roots: spawn + identity merge + coalesce + Φ (workspace path)."""
+    """Projector step for all roots: spawn + identity merge + coalesce + Φ (workspace path).
+
+    Notes
+    -----
+    This workspace path currently requires ``sync=True`` because the host code
+    consumes device-written nnz counters before advancing each root.
+    """
 
     if cp is None or _guga_cuda_ext is None:  # pragma: no cover
         raise RuntimeError("CUDA QMC backend unavailable (requires cupy and asuka._guga_cuda_ext)")
+    if not bool(sync):
+        raise ValueError("cuda_block_projector_step_hamiltonian_ws currently requires sync=True")
     if ctx.ws is None or ctx.drt_dev is None or ctx.state_dev is None:
         raise RuntimeError("CudaBlockProjectorContext is released")
     if ctx.x_idx is None or ctx.x_val is None or ctx.x_idx_next is None or ctx.x_val_next is None:
@@ -1378,6 +1393,12 @@ def cuda_block_orthonormalize_mgs_ws(
     - overlaps are computed with `cupy.searchsorted` against sorted sparse indices,
     - updates use concatenate → coalesce (workspace) → Φ (workspace),
     - output columns are written to the alternate ping-pong buffer, then swapped.
+
+    Notes
+    -----
+    This helper currently requires `sync=True`. It reads device-side nnz counters
+    back to the host after workspace kernels, so an asynchronous contract would be
+    misleading until the implementation is refactored.
     """
 
     if cp is None or _guga_cuda_ext is None:  # pragma: no cover
@@ -1390,6 +1411,8 @@ def cuda_block_orthonormalize_mgs_ws(
         raise RuntimeError("CudaBlockProjectorContext nnz buffers not initialized")
     if ctx.idx_all is None or ctx.val_all is None or ctx.idx_u is None or ctx.val_u is None or ctx.nnz_u is None or ctx.nnz_out is None:
         raise RuntimeError("CudaBlockProjectorContext scratch buffers not initialized")
+    if not sync:
+        raise ValueError("cuda_block_orthonormalize_mgs_ws currently requires sync=True")
 
     seeds_phi = np.asarray(seeds_phi, dtype=np.int64).ravel()
     nroots = int(ctx.nroots)
@@ -1548,6 +1571,8 @@ def cuda_block_build_tmat_hamiltonian_stochastic_ws(
     - This is a reference-oriented implementation intended to replace the CPU row-oracle
       Ritz build in `run_fcifri_subspace(backend="cuda")`.
     - `initiator_t` defaults to 0.0 to avoid adding initiator bias to the Ritz estimator.
+    - This helper currently requires `sync=True`. It reads device-side nnz counters
+      back to the host during coalescing and returns a host NumPy array.
     """
 
     if cp is None or _guga_cuda_ext is None:  # pragma: no cover
@@ -1560,6 +1585,8 @@ def cuda_block_build_tmat_hamiltonian_stochastic_ws(
         raise RuntimeError("CudaBlockProjectorContext nnz buffers not initialized")
     if ctx.evt_idx is None or ctx.evt_val is None or ctx.idx_u is None or ctx.val_u is None or ctx.nnz_u is None:
         raise RuntimeError("CudaBlockProjectorContext scratch buffers not initialized")
+    if not sync:
+        raise ValueError("cuda_block_build_tmat_hamiltonian_stochastic_ws currently requires sync=True")
 
     seeds_spawn = np.asarray(seeds_spawn, dtype=np.int64).ravel()
     nroots = int(ctx.nroots)
@@ -1688,6 +1715,11 @@ def cuda_block_build_sk_uthx_stochastic_ws(
         One spawn seed per root used to build a stochastic estimator of ``H x_k``.
     eps
         Spawn estimator scale. Must be non-zero.
+
+    Notes
+    -----
+    This helper currently requires `sync=True`. It reads device-side nnz counters
+    back to the host during coalescing and returns host NumPy arrays.
     """
 
     if cp is None or _guga_cuda_ext is None:  # pragma: no cover
@@ -1700,6 +1732,8 @@ def cuda_block_build_sk_uthx_stochastic_ws(
         raise RuntimeError("CudaBlockProjectorContext nnz buffers not initialized")
     if ctx.evt_idx is None or ctx.evt_val is None or ctx.idx_u is None or ctx.val_u is None or ctx.nnz_u is None:
         raise RuntimeError("CudaBlockProjectorContext scratch buffers not initialized")
+    if not sync:
+        raise ValueError("cuda_block_build_sk_uthx_stochastic_ws currently requires sync=True")
 
     eps = float(eps)
     if eps == 0.0:
@@ -1903,7 +1937,14 @@ def cuda_block_apply_right_matrix_phi_ws(
     seeds_phi: list[int] | np.ndarray,
     sync: bool = True,
 ) -> None:
-    """Apply `X <- Φ(X @ mat)` on GPU (column-wise), writing into the alternate buffer then swapping."""
+    """Apply `X <- Φ(X @ mat)` on GPU (column-wise), writing into the alternate buffer then swapping.
+
+    Notes
+    -----
+    This helper currently requires `sync=True`. It reads device-side nnz counters
+    back to the host after workspace kernels, so an asynchronous contract would be
+    misleading until the implementation is refactored.
+    """
 
     if cp is None or _guga_cuda_ext is None:  # pragma: no cover
         raise RuntimeError("CUDA QMC backend unavailable (requires cupy and asuka._guga_cuda_ext)")
@@ -1915,6 +1956,8 @@ def cuda_block_apply_right_matrix_phi_ws(
         raise RuntimeError("CudaBlockProjectorContext nnz buffers not initialized")
     if ctx.idx_all is None or ctx.val_all is None or ctx.idx_u is None or ctx.val_u is None or ctx.nnz_u is None or ctx.nnz_out is None:
         raise RuntimeError("CudaBlockProjectorContext scratch buffers not initialized")
+    if not sync:
+        raise ValueError("cuda_block_apply_right_matrix_phi_ws currently requires sync=True")
 
     mat = np.asarray(mat, dtype=np.float64)
     nroots = int(ctx.nroots)

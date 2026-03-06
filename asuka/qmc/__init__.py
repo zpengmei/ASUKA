@@ -9,6 +9,14 @@ from __future__ import annotations
 
 from .compress import compress_phi_pivot_resample, compress_phi_pivotal
 from .compress_guided import compress_phi_pivot_resample_guided
+from .debug import (
+    build_molecule_selected_ci_case,
+    build_sparse_trial_from_dense,
+    QMCProjectorDiagnostics,
+    QMCMoleculeDebugCase,
+    run_fcifri_debug,
+    run_projector_diagnostics,
+)
 from .estimators import choose_reference_index, projected_energy_ref, rayleigh_energy_ref
 from .epq_sample import EpqSample, sample_epq_from_arrays, sample_epq_one
 from .fcifri import FCIFRIRun, FCIFRISubspaceRun, run_fcifri_ground, run_fcifri_subspace
@@ -31,6 +39,8 @@ __all__ = [
     "compress_phi_pivot_resample",
     "compress_phi_pivotal",
     "compress_phi_pivot_resample_guided",
+    "build_molecule_selected_ci_case",
+    "build_sparse_trial_from_dense",
     "FCIFRIRSIResult",
     "have_openmp",
     "initiator_threshold",
@@ -39,11 +49,15 @@ __all__ = [
     "openmp_set_num_threads",
     "projector_step",
     "projected_energy_ref",
+    "QMCProjectorDiagnostics",
+    "QMCMoleculeDebugCase",
     "rayleigh_energy_ref",
+    "run_fcifri_debug",
     "run_fcifri_ground",
     "run_fcifri_rsi",
     "run_fcifri_subspace",
     "run_fciqmc",
+    "run_projector_diagnostics",
     "sample_epq_from_arrays",
     "sample_epq_one",
     "spawn_hamiltonian_events",

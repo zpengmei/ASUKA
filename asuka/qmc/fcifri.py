@@ -76,6 +76,8 @@ def run_fcifri_ground(
     niter = int(niter)
     if m < 1:
         raise ValueError("m must be >= 1")
+    if float(initiator_na) != 0.0 and m <= 1:
+        raise ValueError("m must be > 1 when initiator_na > 0")
     if niter < 0:
         raise ValueError("niter must be >= 0")
     energy_stride = int(energy_stride)

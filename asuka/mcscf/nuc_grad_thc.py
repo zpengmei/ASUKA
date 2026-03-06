@@ -1016,17 +1016,6 @@ def _build_bar_xy_lorb_thc(
 
     dm1 = cp.asarray(dm1_act, dtype=cp.float64)
     dm2 = cp.asarray(dm2_act, dtype=cp.float64)
-    try:
-        scale = float(
-            os.environ.get(
-                "ASUKA_THC_LORB_ACTIVE_RESPONSE_SCALE",
-                os.environ.get("ASUKA_CASPT2_LORB_ACTIVE_RESPONSE_SCALE", "1.0"),
-            )
-        )
-    except Exception:
-        scale = 1.0
-    dm1 = scale * dm1
-    dm2 = scale * dm2
 
     C_core = C[:, :ncore]
     C_act = C[:, ncore:nocc]

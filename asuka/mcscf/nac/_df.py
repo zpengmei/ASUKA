@@ -542,12 +542,6 @@ def _build_bar_L_lorb_df(
     L = xp.asarray(Lorb, dtype=_wd)
     dm1 = xp.asarray(dm1_act, dtype=_wd)
     dm2 = xp.asarray(dm2_act, dtype=_wd)
-    try:
-        _act_resp_scale = float(os.environ.get("ASUKA_CASPT2_LORB_ACTIVE_RESPONSE_SCALE", "0.0"))
-    except Exception:
-        _act_resp_scale = 0.0
-    dm1 = float(_act_resp_scale) * dm1
-    dm2 = float(_act_resp_scale) * dm2
     nmo = int(C.shape[1])
 
     C_core = C[:, :ncore]

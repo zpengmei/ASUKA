@@ -141,10 +141,15 @@ def rayleigh_energy_ref(
         if i_idx.size == 0:
             continue
         pos = np.searchsorted(x_idx, i_idx)
-        mask = (pos < int(x_idx.size)) & (x_idx[pos] == i_idx)
-        if not np.any(mask):
+        in_range = pos < int(x_idx.size)
+        if not np.any(in_range):
             continue
-        row_dot_x = float(np.dot(hij[mask], x_val[pos[mask]]))
+        pos2 = pos[in_range]
+        i2 = i_idx[in_range]
+        hit = x_idx[pos2] == i2
+        if not np.any(hit):
+            continue
+        row_dot_x = float(np.dot(hij[in_range][hit], x_val[pos2[hit]]))
         num += float(xj) * row_dot_x
 
     return float(num / den), float(num), float(den)

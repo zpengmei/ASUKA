@@ -808,6 +808,10 @@ def run_fcifri_rsi(
                 raise RuntimeError(f"restart produced column {k} nnz={int(idx_k.size)} (>m={int(m)})")
         return cols
 
+    def _restart_state_from_ritz(ritz: Sequence[SparseCol]) -> List[SparseCol]:
+        cols = _restart_from_ritz_cols(ritz)
+        return cols
+
     def _call_iteration_hook(*, it: int, x_cols: Sequence[SparseCol], y_cols: Sequence[SparseCol] | None) -> None:
         if iteration_hook is None:
             return
@@ -870,7 +874,7 @@ def run_fcifri_rsi(
 
         nonlocal prev_ritz_cols
         ritz_cols: List[SparseCol] | None = None
-        need_ritz = bool(eval_hook is not None and eval_hook_ritz) or (root_tracking == "overlap")
+        need_ritz = bool(restart_from_ritz) or bool(eval_hook is not None and eval_hook_ritz) or (root_tracking == "overlap")
         if need_ritz and X_cols_snap is not None:
             ritz_cols = _normalize_cols_l2(apply_right_matrix_no_phi(list(X_cols_snap), v_use))
 
@@ -999,7 +1003,9 @@ def run_fcifri_rsi(
             ritz0 = do_eval_cuda(0, eval_pos)
             eval_pos += 1
             if restart_from_ritz and ritz0 is not None and int(0) >= int(restart_min_it) and int(nsample) >= int(restart_min_nsample):
-                X_cols = _restart_from_ritz_cols(ritz0)
+                X_cols = _restart_state_from_ritz(ritz0)
+                l1_x = np.array([_l1_norm(v) for _, v in X_cols], dtype=np.float64)
+                N_diag = np.ones(nroots, dtype=np.float64)
                 ctx.set_cols(X_cols)
 
             for it in range(1, niter + 1):
@@ -1062,7 +1068,9 @@ def run_fcifri_rsi(
                         and (int(eval_pos) % int(restart_stride) == 0)
                     )
                     if do_restart:
-                        X_cols = _restart_from_ritz_cols(ritz)
+                        X_cols = _restart_state_from_ritz(ritz)
+                        l1_x = np.array([_l1_norm(v) for _, v in X_cols], dtype=np.float64)
+                        N_diag = np.ones(nroots, dtype=np.float64)
                         ctx.set_cols(X_cols)
 
             X_cols = ctx.get_cols()
@@ -1073,7 +1081,9 @@ def run_fcifri_rsi(
         ritz0 = do_eval_cpu(0, eval_pos)
         eval_pos += 1
         if restart_from_ritz and ritz0 is not None and int(0) >= int(restart_min_it) and int(nsample) >= int(restart_min_nsample):
-            X_cols = _restart_from_ritz_cols(ritz0)
+            X_cols = _restart_state_from_ritz(ritz0)
+            l1_x = np.array([_l1_norm(v) for _, v in X_cols], dtype=np.float64)
+            N_diag = np.ones(nroots, dtype=np.float64)
 
         for it in range(1, niter + 1):
             Y_cols: List[SparseCol] = []
@@ -1142,7 +1152,9 @@ def run_fcifri_rsi(
                     and (int(eval_pos) % int(restart_stride) == 0)
                 )
                 if do_restart:
-                    X_cols = _restart_from_ritz_cols(ritz)
+                    X_cols = _restart_state_from_ritz(ritz)
+                    l1_x = np.array([_l1_norm(v) for _, v in X_cols], dtype=np.float64)
+                    N_diag = np.ones(nroots, dtype=np.float64)
 
     if nsample > 0:
         S_avg = S_sum / float(nsample)

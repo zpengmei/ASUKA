@@ -97,6 +97,8 @@ def spawn_hamiltonian_events_guided_row(
     alpha = float(alpha)
     if not np.isfinite(alpha):
         raise ValueError("alpha must be finite")
+    if alpha < 0.0 or alpha > 1.0:
+        raise ValueError("alpha must satisfy 0<=alpha<=1")
     if alpha != 0.0 and logq_fn is None:
         raise ValueError("logq_fn must be provided when alpha != 0")
     q_floor = float(q_floor)
@@ -151,7 +153,12 @@ def spawn_hamiltonian_events_guided_row(
         # Initiator gating: restrict to current support.
         if not allow_new:
             pos = np.searchsorted(x_idx_u, i_idx)
-            keep = (pos < m) & (x_idx_u[pos] == i_idx)
+            in_range = pos < m
+            if not np.any(in_range):
+                continue
+            keep = np.zeros_like(in_range)
+            pos2 = pos[in_range]
+            keep[in_range] = x_idx_u[pos2] == i_idx[in_range]
             if not np.any(keep):
                 continue
             i_idx = i_idx[keep]
@@ -241,6 +248,8 @@ def spawn_hamiltonian_events_guided_thinning(
     alpha = float(alpha)
     if not np.isfinite(alpha):
         raise ValueError("alpha must be finite")
+    if alpha < 0.0 or alpha > 1.0:
+        raise ValueError("alpha must satisfy 0<=alpha<=1")
     if alpha != 0.0 and logq_fn is None:
         raise ValueError("logq_fn must be provided when alpha != 0")
 

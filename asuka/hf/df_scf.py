@@ -666,41 +666,100 @@ class _DIIS:
         xp, _ = _get_xp(self._F[-1])
         n = len(self._F)
 
+        def _all_finite(x) -> bool:
+            v = xp.isfinite(x).all()
+            try:
+                return bool(v.item())
+            except Exception:
+                return bool(v)
+
         # Build the DIIS B matrix via a single Gram matrix GEMM:
         #   G[i,j] = <e_i | e_j>
         E = xp.stack([xp.ravel(e).astype(xp.float64, copy=False) for e in self._e], axis=0)  # (n, m)
+        if not _all_finite(E):
+            return self._F[-1]
         G = E @ E.T  # (n, n)
+        if not _all_finite(G):
+            return self._F[-1]
+
+        # Scale Gram matrix before regularization to keep the damping ladder
+        # meaningful across very different residual magnitudes.
+        g_absmax = xp.max(xp.abs(G))
+        try:
+            g_absmax_f = float(g_absmax.item())
+        except Exception:
+            g_absmax_f = float(g_absmax)
+        g_scale = g_absmax_f if (np.isfinite(g_absmax_f) and g_absmax_f > 0.0) else 1.0
+        Gs = G / float(g_scale)
 
         B = xp.empty((n + 1, n + 1), dtype=xp.float64)
-        B[:n, :n] = G
+        B[:n, :n] = Gs
         B[:n, n] = -1.0
         B[n, :n] = -1.0
         B[n, n] = 0.0
 
         rhs = xp.zeros((n + 1,), dtype=xp.float64)
         rhs[n] = -1.0
-        finite = xp.isfinite(B).all()
-        try:
-            finite = bool(finite)
-        except Exception:
-            finite = bool(finite.item())
-        if not finite:
+        if not _all_finite(B):
             return self._F[-1]
 
-        try:
-            coeff_full = xp.linalg.solve(B, rhs)
-        except Exception:
-            # The DIIS Gram matrix can become (nearly) singular due to linear
-            # dependence in the error vectors. Prefer a least-squares fallback
-            # to keep SCF iterations robust (esp. along dissociation scans).
+        # The DIIS Gram matrix can become (nearly) singular due to linear
+        # dependence in the error vectors. Some GPU linear solvers may return
+        # non-finite coefficients without raising, so we must validate output.
+        coeff_full = None
+        reg_ladder = (0.0, 1e-14, 1e-12, 1e-10, 1e-8, 1e-6)
+        eye_n = xp.eye(n, dtype=xp.float64)
+        for lam in reg_ladder:
+            B_reg = B.copy()
+            if float(lam) > 0.0:
+                B_reg[:n, :n] = B_reg[:n, :n] + float(lam) * eye_n
+            if not _all_finite(B_reg):
+                continue
             try:
-                coeff_full = xp.linalg.lstsq(B, rhs, rcond=None)[0]
+                trial = xp.linalg.solve(B_reg, rhs)
             except Exception:
-                return self._F[-1]
+                trial = None
+            if trial is not None and _all_finite(trial):
+                coeff_full = trial
+                break
+
+        if coeff_full is None:
+            # Final fallback: regularized least-squares.
+            for lam in reg_ladder[1:]:
+                B_reg = B.copy()
+                B_reg[:n, :n] = B_reg[:n, :n] + float(lam) * eye_n
+                if not _all_finite(B_reg):
+                    continue
+                try:
+                    trial = xp.linalg.lstsq(B_reg, rhs, rcond=None)[0]
+                except Exception:
+                    trial = None
+                if trial is not None and _all_finite(trial):
+                    coeff_full = trial
+                    break
+        if coeff_full is None:
+            return self._F[-1]
+
         coeff = coeff_full[:n]  # (n,)
+        if not _all_finite(coeff):
+            return self._F[-1]
+
+        # Preserve the DIIS affine constraint defensively even after
+        # regularization/lstsq drift.
+        csum = xp.sum(coeff)
+        try:
+            csum_f = float(csum.item())
+        except Exception:
+            csum_f = float(csum)
+        if not np.isfinite(csum_f) or abs(csum_f) < 1e-15:
+            return self._F[-1]
+        coeff = coeff / csum
 
         Fstk = xp.stack([xp.asarray(F, dtype=xp.float64) for F in self._F], axis=0)  # (n, nao, nao)
-        return xp.tensordot(coeff, Fstk, axes=(0, 0))
+        F_out = xp.tensordot(coeff, Fstk, axes=(0, 0))
+        if not _all_finite(F_out):
+            return self._F[-1]
+        return F_out
 
 
 @dataclass(frozen=True)

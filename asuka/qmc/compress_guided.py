@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-"""Guided / importance-sampled Φ compression utilities.
+r"""Guided / importance-sampled Φ compression utilities.
 
 This module generalizes :func:`asuka.qmc.compress.compress_phi_pivot_resample` by
 allowing a *guiding distribution* ``q(i)`` to influence the stochastic resampling step.
@@ -90,6 +90,10 @@ def compress_phi_pivot_resample_guided(
         raise ValueError("alpha must be finite")
     if not np.isfinite(pivot_alpha):
         raise ValueError("pivot_alpha must be finite")
+    if alpha < 0.0 or alpha > 1.0:
+        raise ValueError("alpha must satisfy 0<=alpha<=1")
+    if pivot_alpha < 0.0 or pivot_alpha > 1.0:
+        raise ValueError("pivot_alpha must satisfy 0<=pivot_alpha<=1")
     if alpha != 0.0 or pivot_alpha != 0.0:
         if logq_fn is None:
             raise ValueError("logq_fn must be provided when alpha or pivot_alpha are non-zero")
