@@ -418,6 +418,146 @@ def _build_bar_xy_net_active_thc(
     return bar_X_list, bar_Y_list, cp.ascontiguousarray(D_act, dtype=cp.float64)
 
 
+def _build_bar_xy_ci_delta_thc(
+    scf_out: Any,
+    *,
+    D_core_ao: Any,
+    C_act: Any,
+    dm1_delta: Any,
+    dm2_delta: Any,
+    q_block: int = 256,
+    pair_p_block: int = 8,
+) -> tuple[Any, Any, Any]:
+    """Return the exact THC CI-response derivative for 2 Re <Lci|dH_ref|ci>."""
+
+    cp = _require_cupy()
+    from asuka.hf.local_thc_factors import LocalTHCFactors  # noqa: PLC0415
+    from asuka.hf.thc_factors import THCFactors  # noqa: PLC0415
+    from asuka.mcscf.nuc_grad_thc import (  # noqa: PLC0415
+        _dm2_sym_flat,
+        _thc_energy_adjoint_active_global,
+        _thc_energy_adjoint_active_local_block,
+        _thc_energy_adjoint_jk_bilinear,
+    )
+
+    thc = getattr(scf_out, "thc_factors", None)
+    if not isinstance(thc, (THCFactors, LocalTHCFactors)):
+        raise TypeError("scf_out.thc_factors must be THCFactors or LocalTHCFactors")
+
+    D_core = cp.asarray(D_core_ao, dtype=cp.float64)
+    C_act = cp.asarray(C_act, dtype=cp.float64)
+    dm1 = cp.asarray(dm1_delta, dtype=cp.float64)
+    dm1 = 0.5 * (dm1 + dm1.T)
+    D_act_delta = C_act @ dm1 @ C_act.T
+    ncas = int(C_act.shape[1])
+    dm2_flat = _dm2_sym_flat(cp, dm2_delta, ncas=int(ncas))
+
+    if isinstance(thc, THCFactors):
+        bar_X_mean, bar_Y_mean = _thc_energy_adjoint_jk_bilinear(
+            D_core,
+            D_act_delta,
+            thc.X,
+            thc.Z,
+            thc.Y,
+            cJ=1.0,
+            cK=-0.5,
+            q_block=int(q_block),
+        )
+        bar_X_aa, bar_Y_aa = _thc_energy_adjoint_active_global(
+            thc.X,
+            thc.Y,
+            C_act,
+            dm2_flat,
+            pair_p_block=int(pair_p_block),
+        )
+        return (
+            cp.ascontiguousarray(bar_X_mean + bar_X_aa),
+            cp.ascontiguousarray(bar_Y_mean + bar_Y_aa),
+            cp.ascontiguousarray(D_act_delta, dtype=cp.float64),
+        )
+
+    bar_X_list = []
+    bar_Y_list = []
+    for blk in thc.blocks:
+        idx_np = np.asarray(getattr(blk, "ao_idx_global"), dtype=np.int32).ravel()
+        idx = cp.asarray(idx_np, dtype=cp.int32)
+        D_core_sub = D_core[idx[:, None], idx[None, :]]
+        D_act_sub = D_act_delta[idx[:, None], idx[None, :]]
+        B_eff = _mask_local_left_density(D_act_sub, blk)
+
+        bar_X_mean, bar_Y_mean = _thc_energy_adjoint_jk_bilinear(
+            D_core_sub,
+            B_eff,
+            blk.X,
+            blk.Z,
+            blk.Y,
+            cJ=1.0,
+            cK=-0.5,
+            q_block=int(q_block),
+        )
+        bar_X_aa, bar_Y_aa = _thc_energy_adjoint_active_local_block(
+            blk.X,
+            blk.Z,
+            blk.Y,
+            ao_idx_global=idx_np,
+            n_early=int(getattr(blk, "n_early", 0)),
+            n_primary=int(getattr(blk, "n_primary", 0)),
+            C_act=C_act,
+            dm2_flat_sym=dm2_flat,
+            pair_p_block=int(pair_p_block),
+            q_block=int(q_block),
+        )
+        bar_X_list.append(cp.ascontiguousarray(bar_X_mean + bar_X_aa))
+        bar_Y_list.append(cp.ascontiguousarray(bar_Y_mean + bar_Y_aa))
+    return bar_X_list, bar_Y_list, cp.ascontiguousarray(D_act_delta, dtype=cp.float64)
+
+
+def _build_df_ci_delta_cache(
+    B_ao: Any,
+    *,
+    D_core_ao: Any,
+    C_act: Any,
+    xp: Any,
+    qblock: int | None = None,
+) -> tuple[Any, Any]:
+    """Return (rho_core, L2) cache for exact DF CI-response contractions."""
+
+    _wd = xp.float64
+    B_ao = xp.asarray(B_ao, dtype=_wd)
+    D_core_ao = xp.asarray(D_core_ao, dtype=_wd)
+    C_act = xp.asarray(C_act, dtype=_wd)
+    nao = int(D_core_ao.shape[0])
+    ncas = int(C_act.shape[1])
+
+    if int(getattr(B_ao, "ndim", 0)) == 2:
+        from asuka.integrals.tri_packed import pack_tril, tri_weights  # noqa: PLC0415
+        from asuka.integrals.df_packed_s2 import unpack_Qp_to_Qmn_block  # noqa: PLC0415
+
+        naux = int(B_ao.shape[0])
+        w = tri_weights(xp, int(nao), dtype=_wd)
+        D_core_p = pack_tril(xp, D_core_ao)
+        rho_core = B_ao @ (w * D_core_p)
+        L_act = xp.empty((ncas, ncas, naux), dtype=_wd)
+        _chunk = int(max(1, qblock if qblock is not None else (naux // 4)))
+        for q0 in range(0, naux, _chunk):
+            q1 = min(q0 + _chunk, naux)
+            q = int(q1 - q0)
+            if q <= 0:
+                continue
+            bq = unpack_Qp_to_Qmn_block(B_ao, nao=int(nao), q0=int(q0), q_count=int(q))
+            x = xp.matmul(bq, C_act)
+            l = xp.matmul(C_act.T[None, :, :], x)
+            L_act[:, :, q0:q1] = l.transpose(1, 2, 0)
+            del bq, x, l
+        return xp.asarray(rho_core, dtype=_wd), xp.asarray(L_act.reshape(ncas * ncas, naux), dtype=_wd)
+
+    B2 = B_ao.reshape(nao * nao, -1)
+    rho_core = B2.T @ D_core_ao.reshape(nao * nao)
+    x = xp.einsum("mnQ,nv->mvQ", B_ao, C_act, optimize=True)
+    L_act = xp.einsum("mu,mvQ->uvQ", C_act, x, optimize=True)
+    return xp.asarray(rho_core, dtype=_wd), xp.asarray(L_act.reshape(ncas * ncas, -1), dtype=_wd)
+
+
 def _build_bar_xy_lorb_thc(
     scf_out: Any,
     *,
@@ -455,9 +595,14 @@ def _build_bar_xy_lorb_thc(
     dm1 = cp.asarray(dm1_act, dtype=cp.float64)
     dm2 = cp.asarray(dm2_act, dtype=cp.float64)
     try:
-        scale = float(os.environ.get("ASUKA_CASPT2_LORB_ACTIVE_RESPONSE_SCALE", "0.0"))
+        scale = float(
+            os.environ.get(
+                "ASUKA_THC_LORB_ACTIVE_RESPONSE_SCALE",
+                os.environ.get("ASUKA_CASPT2_LORB_ACTIVE_RESPONSE_SCALE", "1.0"),
+            )
+        )
     except Exception:
-        scale = 0.0
+        scale = 1.0
     dm1 = scale * dm1
     dm2 = scale * dm2
 
@@ -560,7 +705,7 @@ def _build_bar_xy_lorb_thc(
         D_wL_sub = D_wL[idx[:, None], idx[None, :]]
         D_L_core_sub = D_L_core[idx[:, None], idx[None, :]]
         B_eff_wL = _mask_local_left_density(D_wL_sub, blk)
-        B_eff_Lcore = _mask_local_left_density(D_L_core_sub, blk)
+        B_eff_w = _mask_local_left_density(D_w_sub, blk)
 
         bar_X_1, bar_Y_1 = _thc_energy_adjoint_jk_bilinear(
             D_core_sub,
@@ -573,8 +718,8 @@ def _build_bar_xy_lorb_thc(
             q_block=int(q_block),
         )
         bar_X_2, bar_Y_2 = _thc_energy_adjoint_jk_bilinear(
-            D_w_sub,
-            B_eff_Lcore,
+            D_L_core_sub,
+            B_eff_w,
             blk.X,
             blk.Z,
             blk.Y,
@@ -807,6 +952,54 @@ def _contract_thc_bar_adjoint(
     return np.asarray(cp.asnumpy(grad_thc_dev + grad_metric_dev), dtype=np.float64)
 
 
+def _ic_mrcisd_rdm12_for_root(
+    ic_multi: Any,
+    *,
+    ci_cas: list[np.ndarray],
+    root: int,
+    rdm_ws: Any,
+    rdm_backend: str,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Compute correlated-space RDMs for an IC-MRCISD root.
+
+    Uses Phase-3 direct builders for single-block cases (avoids expensive
+    reconstruction to uncontracted CSF space). Falls back to reconstruction
+    for multi-block cases or when Phase-3 requirements are not met.
+    """
+    import types  # noqa: PLC0415
+
+    n_blocks = len(ic_multi.block_slices)
+
+    # Phase-3 direct path: only for single-block (single CAS reference).
+    if n_blocks == 1:
+        try:
+            from asuka.mrci.ic_rdm import ic_mrcisd_make_rdm12_phase3  # noqa: PLC0415
+
+            ic_view = types.SimpleNamespace(
+                c=np.asarray(ic_multi.c[root], dtype=np.float64).ravel(),
+                singles=ic_multi.singles[0],
+                doubles=ic_multi.doubles[0],
+                spaces=ic_multi.spaces[0],
+                drt_work=ic_multi.drt_work,
+            )
+            ci_ref = np.asarray(ci_cas[0], dtype=np.float64).ravel()
+            dm1, dm2 = ic_mrcisd_make_rdm12_phase3(
+                ic_view, ci_cas=ci_ref, backend="direct", rdm_backend=rdm_backend,
+            )
+            return np.asarray(dm1, dtype=np.float64), np.asarray(dm2, dtype=np.float64)
+        except (NotImplementedError, TypeError, ValueError):
+            pass  # Fall through to reconstruction.
+
+    # Fallback: expand to uncontracted CSF and compute RDMs there.
+    from asuka.mrci.ic_mrcisd import expand_ic_mrcisd_multi_root  # noqa: PLC0415
+    from asuka.mrci.rdm_mrcisd import make_rdm12_mrcisd  # noqa: PLC0415
+
+    _drt_u, ci_mrci = expand_ic_mrcisd_multi_root(ic_multi, ci_cas=ci_cas, root=root)
+    ci_mrci = np.asarray(ci_mrci, dtype=np.float64).ravel()
+    dm1, dm2 = make_rdm12_mrcisd(rdm_ws, ci_mrci, rdm_backend=rdm_backend)
+    return np.asarray(dm1, dtype=np.float64), np.asarray(dm2, dtype=np.float64)
+
+
 def mrci_grad_states_from_ref_analytic(
     scf_out: Any,
     ref: Any,
@@ -988,22 +1181,41 @@ def mrci_grad_states_from_ref_analytic(
     dm1_sa = np.asarray(dm1_sa, dtype=np.float64)
     dm2_sa = np.asarray(dm2_sa, dtype=np.float64)
 
-    mc_sa = DFNewtonCASSCFAdapter(
-        df_B=B_ao_np,
-        hcore_ao=h_ao_np,
-        ncore=int(ncore_ref),
-        ncas=int(ncas_ref),
-        nelecas=nelecas,
-        mo_coeff=C_full,
-        fcisolver=fcisolver,
-        weights=[float(w) for w in np.asarray(weights, dtype=np.float64).ravel()],
-        frozen=getattr(ref, "frozen", None),
-        internal_rotation=bool(getattr(ref, "internal_rotation", False)),
-        extrasym=getattr(ref, "extrasym", None),
-    )
+    if target_backend == "thc":
+        from asuka.mcscf.newton_thc import THCNewtonCASSCFAdapter  # noqa: PLC0415
+
+        mc_sa = THCNewtonCASSCFAdapter(
+            scf_out=scf_out,
+            hcore_ao=h_ao_np,
+            ncore=int(ncore_ref),
+            ncas=int(ncas_ref),
+            nelecas=nelecas,
+            mo_coeff=C_full,
+            fcisolver=fcisolver,
+            weights=[float(w) for w in np.asarray(weights, dtype=np.float64).ravel()],
+            frozen=getattr(ref, "frozen", None),
+            internal_rotation=bool(getattr(ref, "internal_rotation", False)),
+            extrasym=getattr(ref, "extrasym", None),
+            q_block=256,
+            pair_p_block=8,
+        )
+    else:
+        mc_sa = DFNewtonCASSCFAdapter(
+            df_B=B_ao_np,
+            hcore_ao=h_ao_np,
+            ncore=int(ncore_ref),
+            ncas=int(ncas_ref),
+            nelecas=nelecas,
+            mo_coeff=C_full,
+            fcisolver=fcisolver,
+            weights=[float(w) for w in np.asarray(weights, dtype=np.float64).ravel()],
+            frozen=getattr(ref, "frozen", None),
+            internal_rotation=bool(getattr(ref, "internal_rotation", False)),
+            extrasym=getattr(ref, "extrasym", None),
+        )
     eris_sa = mc_sa.ao2mo(C_full)
-    ppaa_sa = np.asarray(getattr(eris_sa, "ppaa"), dtype=np.float64)
-    papa_sa = np.asarray(getattr(eris_sa, "papa"), dtype=np.float64)
+    ppaa_sa = _asnumpy_f64(getattr(eris_sa, "ppaa"))
+    papa_sa = _asnumpy_f64(getattr(eris_sa, "papa"))
     with _force_internal_newton():
         hess_op = build_mcscf_hessian_operator(
             mc_sa,
@@ -1200,16 +1412,15 @@ def mrci_grad_states_from_ref_analytic(
 
         if method_s == "mrcisd":
             ci_mrci = np.asarray(mrci_states.mrci.ci[root], dtype=np.float64).ravel()
+            dm1_corr, dm2_corr = make_rdm12_mrcisd(rdm_ws, ci_mrci, rdm_backend=rdm_backend)
         else:
-            from asuka.mrci.ic_mrcisd import expand_ic_mrcisd_multi_root  # noqa: PLC0415
-
-            _drt_u, ci_mrci = expand_ic_mrcisd_multi_root(
+            dm1_corr, dm2_corr = _ic_mrcisd_rdm12_for_root(
                 mrci_states.mrci,
                 ci_cas=ci_ref_for_solver,
                 root=int(root),
+                rdm_ws=rdm_ws,
+                rdm_backend=rdm_backend,
             )
-            ci_mrci = np.asarray(ci_mrci, dtype=np.float64).ravel()
-        dm1_corr, dm2_corr = make_rdm12_mrcisd(rdm_ws, ci_mrci, rdm_backend=rdm_backend)
         dm1_corr = np.asarray(dm1_corr, dtype=np.float64)
         dm2_corr = np.asarray(dm2_corr, dtype=np.float64)
 
@@ -1263,7 +1474,6 @@ def mrci_grad_states_from_ref_analytic(
                 pair_p_block=int(pair_p_block_thc),
             )
             gfock_np = _asnumpy_f64(gfock)
-            de_pulay = np.zeros((natm, 3), dtype=np.float64)
 
         # Z-vector RHS from orbital gradient matrix 2*(gfock - gfock^T), packed in SA-CASSCF variables.
         g_orb = gfock_np - gfock_np.T
@@ -1286,42 +1496,46 @@ def mrci_grad_states_from_ref_analytic(
                 rhs_ci_full[st_idx] = np.asarray(rhs_blk, dtype=np.float64).ravel()
             rhs_ci_z = rhs_ci_full
 
-        if target_backend == "thc":
-            Lorb = np.zeros((nmo, nmo), dtype=np.float64)
-            dm1_lci = np.zeros((ncas_ref, ncas_ref), dtype=np.float64)
-            dm2_lci = np.zeros((ncas_ref, ncas_ref, ncas_ref, ncas_ref), dtype=np.float64)
-        else:
-            z = solve_mcscf_zvector(
-                mc_sa,
-                rhs_orb=rhs_orb,
-                rhs_ci=rhs_ci_z,
-                hessian_op=hess_op,
-                tol=float(z_tol),
-                maxiter=int(z_maxiter),
-            )
-            Lvec = np.asarray(z.z_packed, dtype=np.float64).ravel()
-            Lorb = mc_sa.unpack_uniq_var(Lvec[:n_orb])
-            Lci_list = hess_op.ci_unflatten(Lvec[n_orb:])
+        z = solve_mcscf_zvector(
+            mc_sa,
+            rhs_orb=rhs_orb,
+            rhs_ci=rhs_ci_z,
+            hessian_op=hess_op,
+            tol=float(z_tol),
+            maxiter=int(z_maxiter),
+        )
+        Lvec = np.asarray(z.z_packed, dtype=np.float64).ravel()
+        Lorb = mc_sa.unpack_uniq_var(Lvec[:n_orb])
+        Lci_list = hess_op.ci_unflatten(Lvec[n_orb:])
+        from asuka.mcscf.zvector import project_ci_rhs_normalized  # noqa: PLC0415
 
-            # CI-response transition RDMs (state-averaged weights).
-            dm1_lci = np.zeros((ncas_ref, ncas_ref), dtype=np.float64)
-            dm2_lci = np.zeros((ncas_ref, ncas_ref, ncas_ref, ncas_ref), dtype=np.float64)
-            for r in range(nroots_ref):
-                wr = float(np.asarray(weights, dtype=np.float64).ravel()[r])
-                if abs(wr) < 1e-14:
-                    continue
-                dm1_r, dm2_r = fcisolver.trans_rdm12(
-                    np.asarray(Lci_list[r], dtype=np.float64).ravel(),
-                    np.asarray(ci_list[r], dtype=np.float64).ravel(),
-                    int(ncas_ref),
-                    nelecas,
-                    rdm_backend=str(rdm_backend),
-                    return_cupy=False,
-                )
-                dm1_r = np.asarray(dm1_r, dtype=np.float64)
-                dm2_r = np.asarray(dm2_r, dtype=np.float64)
-                dm1_lci += wr * (dm1_r + dm1_r.T)
-                dm2_lci += wr * (dm2_r + dm2_r.transpose(1, 0, 3, 2))
+        # The exact CI-response term is L · d g_ci / dR in the tangent/root-span
+        # gauge. Project the solved CI multipliers before forming transition RDMs so
+        # the DF/THC adjoints see the exact D_L/Gamma^L object, and single-root runs
+        # do not pick up a spurious parallel-to-ci component.
+        Lci_list = project_ci_rhs_normalized(ci_list, Lci_list)
+        if not isinstance(Lci_list, list) or len(Lci_list) != int(nroots_ref):
+            raise RuntimeError("internal error: projected Lci_list has unexpected structure")
+
+        # CI-response transition RDMs (state-averaged weights).
+        dm1_lci = np.zeros((ncas_ref, ncas_ref), dtype=np.float64)
+        dm2_lci = np.zeros((ncas_ref, ncas_ref, ncas_ref, ncas_ref), dtype=np.float64)
+        for r in range(nroots_ref):
+            wr = float(np.asarray(weights, dtype=np.float64).ravel()[r])
+            if abs(wr) < 1e-14:
+                continue
+            dm1_r, dm2_r = fcisolver.trans_rdm12(
+                np.asarray(Lci_list[r], dtype=np.float64).ravel(),
+                np.asarray(ci_list[r], dtype=np.float64).ravel(),
+                int(ncas_ref),
+                nelecas,
+                rdm_backend=str(rdm_backend),
+                return_cupy=False,
+            )
+            dm1_r = np.asarray(dm1_r, dtype=np.float64)
+            dm2_r = np.asarray(dm2_r, dtype=np.float64)
+            dm1_lci += wr * (dm1_r + dm1_r.T)
+            dm2_lci += wr * (dm2_r + dm2_r.transpose(1, 0, 3, 2))
 
         if target_backend == "df":
             bar_L_lci_net, D_act_lci = _build_bar_L_net_active_df(
@@ -1362,7 +1576,6 @@ def mrci_grad_states_from_ref_analytic(
             D_h1_delta += _asnumpy_f64(D_act_lci)
             D_h1_delta += _asnumpy_f64(D_L_lorb)
             del D_act_lci, D_L_lorb
-
             gfock_lci_raw, _, _, _, _ = _build_gfock_casscf_df(
                 B_ao_x,
                 h_ao_x,
@@ -1510,7 +1723,6 @@ def mrci_grad_states_from_ref_analytic(
                     M=np.asarray(W_delta, dtype=np.float64),
                     shell_atom=shell_atom,
                 )
-
         if is_spherical:
             from asuka.integrals.int1e_sph import contract_dhcore_sph  # noqa: PLC0415
 

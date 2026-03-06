@@ -152,6 +152,18 @@ def prepare_mrcisd_rdm_workspace(
     sub_to_full = np.asarray(mapping.sub_to_full, dtype=np.int64).ravel()
     if sub_to_full.shape != (int(drt_sub.ncsf),):
         raise RuntimeError("unexpected sub_to_full shape from build_subspace_map")
+
+    ratio = int(drt_full.ncsf) / max(int(drt_sub.ncsf), 1)
+    mem_mb = int(drt_full.ncsf) * 8 / (1024 * 1024)
+    if ratio > 4.0 or mem_mb > 512:
+        import warnings
+
+        warnings.warn(
+            f"Augmented DRT for RDM embedding is {ratio:.1f}x larger than restricted DRT "
+            f"(ncsf: {int(drt_full.ncsf)} vs {int(drt_sub.ncsf)}, buffer ~{mem_mb:.0f} MB). "
+            f"This may cause high memory usage.",
+            stacklevel=2,
+        )
     c_full_buf = np.zeros(int(drt_full.ncsf), dtype=np.float64)
     return MRCISDRDMWorkspace(
         drt_sub=drt_sub,

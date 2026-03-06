@@ -32,6 +32,8 @@ from .casscf import (
 )
 from .nuc_grad import NucGradResult, casci_nuc_grad, casscf_nuc_grad
 from .nuc_grad_df import DFNucGradResult, DFNucGradMultirootResult, casscf_nuc_grad_df, casscf_nuc_grad_df_per_root, casci_nuc_grad_df_relaxed, casci_nuc_grad_df_unrelaxed
+from .nuc_grad_thc import THCNucGradComponents, THCNucGradMultirootResult, casscf_nuc_grad_thc, casscf_nuc_grad_thc_per_root
+from .newton_thc import THCNewtonCASSCFAdapter, build_thc_newton_eris
 from .nac import (
     sacasscf_nonadiabatic_couplings_df,
     sacasscf_nonadiabatic_couplings_df_densez,
@@ -91,6 +93,12 @@ __all__ = [
     "casscf_nuc_grad_df_per_root",
     "casci_nuc_grad_df_relaxed",
     "casci_nuc_grad_df_unrelaxed",
+    "THCNucGradComponents",
+    "THCNucGradMultirootResult",
+    "casscf_nuc_grad_thc",
+    "casscf_nuc_grad_thc_per_root",
+    "THCNewtonCASSCFAdapter",
+    "build_thc_newton_eris",
     "allowed_rotation_mask",
     "orbital_gradient_df",
     "orbital_gradient_thc",

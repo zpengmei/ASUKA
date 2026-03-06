@@ -50,13 +50,17 @@ Analytic gradient implementation:
 
 - native `mrcisd`
 - native `ic_mrcisd`
-- DF, global THC, and local THC target backends
+- DF target backend
+- global THC and local THC target backends
+- replay-validated THC analytic gradients on tiny CUDA validation systems
+- the `Lci` term is evaluated in the tangent/root-span gauge before building
+  DF/THC transition-density adjoints
 
 Current hard limits:
 
 - THC MRCI remains CUDA-only
-- THC analytic gradients require gradient-capable THC metadata, supported solve
-  modes, and no point downselect
+- THC analytic gradients still require gradient-capable THC factor metadata and
+  supported solve modes
 - SOC remains uncontracted-only
 - `+Q` remains uncontracted-only
 
@@ -72,16 +76,33 @@ Validated matrix on tiny LiH/STO-3G cases:
 - contracted `ic_mrcisd` with DF + `semi_direct`
 - contracted `ic_mrcisd` with DF + `rdm`
 - uncontracted `mrcisd` with global THC
+- uncontracted `mrcisd` with local THC
 - contracted `ic_mrcisd` with global THC + `semi_direct`
 - contracted `ic_mrcisd` with global THC + `rdm`
-- uncontracted `mrcisd` with local THC
 - contracted `ic_mrcisd` with local THC + `semi_direct`
 - contracted `ic_mrcisd` with local THC + `rdm`
+
+Current THC analytic status:
+
+- native analytic THC MRCI is enabled for the tiny native matrix above
+- native FD THC MRCI remains the replay oracle used by the slow CUDA
+  validation file
+
+Larger-system spot checks:
+
+- H2O/STO-3G with `ncore=4, ncas=2, nelecas=2` is green for uncontracted THC
+  (`mrcisd`)
+- the same H2O/STO-3G spot check is also green for contracted THC
+  `ic_mrcisd` with both `semi_direct` and `rdm`
+- on that H2O spot check, replay-FD max-abs errors are about:
+  - `8.8e-5` for uncontracted THC
+  - `3.84e-4` for contracted THC
 
 Test split:
 
 - `tests/test_mrci_grad_fd_replay_configs.py` locks the SCF/CASSCF FD replay settings.
-- `tests/test_mrci_analytic_grad_fd_cuda_smoke.py` checks full analytic-vs-FD gradients for the native matrix on a CUDA runner.
+- `tests/test_mrci_analytic_grad_fd_cuda_smoke.py` checks:
+  - full DF and THC analytic-vs-FD gradients for the native matrix on a CUDA runner
 
 The slow CUDA file is intentionally guarded by `ASUKA_RUN_SLOW_TESTS=1` and a
 conservative CUDA-availability probe. In environments where `pytest` cannot

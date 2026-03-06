@@ -3955,6 +3955,18 @@ def casscf_nuc_grad_df_per_root(
     ci_list = ci_as_list(getattr(casscf, "ci"), nroots=nroots)
     e_roots = np.asarray(getattr(casscf, "e_roots"), dtype=np.float64).ravel()
 
+    if nroots > 1:
+        w_arr = np.asarray(weights, dtype=np.float64).ravel()
+        if w_arr.size == nroots and not np.allclose(w_arr, w_arr[0]):
+            import warnings  # noqa: PLC0415
+
+            warnings.warn(
+                "Per-root SA-CASSCF gradients with unequal state-average weights may be "
+                "ill-defined. The projection-based gauge fixing assumes equal weights. "
+                f"Current weights: {w_arr.tolist()}",
+                stacklevel=2,
+            )
+
     if fcisolver is None:
         if twos is None:
             twos = int(getattr(mol, "spin", 0))

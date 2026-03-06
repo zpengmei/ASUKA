@@ -1005,7 +1005,7 @@ def project_ci_root_span(
     return out
 
 
-def _build_ci_active_hamiltonian(casscf: Any, mo: np.ndarray, eris: Any) -> CIActiveHamiltonian:
+def _build_ci_active_hamiltonian(casscf: Any, mo: Any, eris: Any) -> CIActiveHamiltonian:
     """Build (h1cas, eri_cas) for the Newton-CASSCF operator.
 
     Parameters
@@ -1030,7 +1030,10 @@ def _build_ci_active_hamiltonian(casscf: Any, mo: np.ndarray, eris: Any) -> CIAc
         raise ValueError("ncas must be positive")
 
     hcore = casscf.get_hcore()
-    h1e_mo = _to_np_f64((mo.T @ hcore) @ mo)
+    xp, _ = _get_xp(mo, hcore)
+    mo_x = _to_xp_f64(mo, xp)
+    hcore_x = _to_xp_f64(hcore, xp)
+    h1e_mo = _to_np_f64((mo_x.T @ hcore_x) @ mo_x)
 
     vhf_c = getattr(eris, "vhf_c", None)
     if vhf_c is None:
@@ -1393,9 +1396,11 @@ def compute_mcscf_gradient_vector(
     for Z-vector RHS construction where only ``g`` is needed.
     """
 
+    mo_use = mo
+
     g_orb = _compute_orb_grad_block_from_gpq(
         casscf,
-        np.asarray(mo, dtype=np.float64),
+        mo_use,
         ci0,
         eris,
         weights=weights,
@@ -1403,7 +1408,7 @@ def compute_mcscf_gradient_vector(
     )
     g_ci, _ = _compute_ci_grad_and_diag_blocks(
         casscf,
-        np.asarray(mo, dtype=np.float64),
+        mo_use,
         ci0,
         eris,
         weights=weights,
@@ -5027,6 +5032,107 @@ def gen_g_hop_orbital(
         return gen_g_hop_orbital(casscf, mo_new, ci_new, eris, weights=weights, strict_weights=strict_weights)[:3]
 
     return g_orb, _h_op_orb, h_diag_orb, _gorb_update
+
+
+def orbital_hessian_action_matrix(
+    casscf: Any,
+    mo: np.ndarray,
+    ci0: Any,
+    eris: Any,
+    x_packed: np.ndarray,
+    *,
+    weights: Sequence[float] | None = None,
+    strict_weights: bool = False,
+    antisymmetrize: bool = True,
+) -> np.ndarray:
+    """Return the orbital-only Hessian action matrix before packing.
+
+    This mirrors the CPU path inside :func:`gen_g_hop_orbital`. When
+    ``antisymmetrize=False``, the returned matrix is the pre-antisymmetrized
+    ``x2`` object before ``x2 - x2.T`` and before ``pack_uniq_var`` scaling.
+    """
+
+    ci0_list = _as_ci_list(ci0)
+    nroots = int(len(ci0_list))
+    w_info = _resolve_weights(casscf, nroots=nroots, weights=weights, strict=bool(strict_weights))
+    w = np.asarray(w_info.weights, dtype=np.float64)
+
+    ncas = int(getattr(casscf, "ncas"))
+    ncore = int(getattr(casscf, "ncore"))
+    nocc = ncore + ncas
+    nmo = int(mo.shape[1])
+
+    fcisolver = getattr(casscf, "fcisolver", None)
+    if fcisolver is None:
+        raise ValueError("casscf must provide fcisolver")
+
+    linkstr = _maybe_gen_linkstr(fcisolver, ncas, getattr(casscf, "nelecas"), False)
+    try:
+        casdm1_r, casdm2_r = fcisolver.states_make_rdm12(ci0_list, ncas, getattr(casscf, "nelecas"), link_index=linkstr)
+        casdm1_r = np.asarray(casdm1_r, dtype=np.float64)
+        casdm2_r = np.asarray(casdm2_r, dtype=np.float64)
+    except AttributeError:
+        dm1s_l: list[np.ndarray] = []
+        dm2s_l: list[np.ndarray] = []
+        for c in ci0_list:
+            dm1, dm2 = fcisolver.make_rdm12(c, ncas, getattr(casscf, "nelecas"), link_index=linkstr)
+            dm1s_l.append(np.asarray(dm1, dtype=np.float64))
+            dm2s_l.append(np.asarray(dm2, dtype=np.float64))
+        casdm1_r = np.asarray(dm1s_l, dtype=np.float64)
+        casdm2_r = np.asarray(dm2s_l, dtype=np.float64)
+
+    casdm1 = np.einsum("r,rpq->pq", w, casdm1_r, optimize=True)
+    gpq = _build_gpq_per_root(casscf, mo, ci0_list, eris, strict_weights=bool(strict_weights))
+    g_orb_mat = np.einsum("r,rpq->pq", w, gpq, optimize=True)
+
+    ppaa = getattr(eris, "ppaa", None)
+    papa = getattr(eris, "papa", None)
+    vhf_c = getattr(eris, "vhf_c", None)
+    xp, _on_gpu = _get_xp(ppaa, papa)
+    ppaa_arr = _to_xp_f64(ppaa, xp)
+    papa_arr = _to_xp_f64(papa, xp)
+    casdm1_g = xp.asarray(casdm1, dtype=xp.float64)
+    casdm2_g = xp.asarray(np.einsum("r,ruvwx->uvwx", w, casdm2_r, optimize=True), dtype=xp.float64)
+
+    vhf_a = xp.einsum("pquv,uv->pq", ppaa_arr, casdm1_g, optimize=True)
+    vhf_a -= 0.5 * xp.einsum("puqv,uv->pq", papa_arr, casdm1_g, optimize=True)
+    vhf_c_xp = _to_xp_f64(vhf_c, xp)
+    vhf_ca = _to_np_f64(vhf_a) + _to_np_f64(vhf_c_xp)
+
+    dm2tmp = casdm2_g.transpose(1, 2, 0, 3) + casdm2_g.transpose(0, 2, 1, 3)
+    _ppaa_2d = ppaa_arr.reshape(nmo * nmo, ncas * ncas)
+    _dm2_2d = casdm2_g.reshape(ncas * ncas, ncas * ncas)
+    jtmp_full = (_ppaa_2d @ _dm2_2d).reshape(nmo, nmo, ncas, ncas)
+    papa_t = papa_arr.transpose(0, 2, 1, 3)
+    _papa_t_2d = papa_t.reshape(nmo * nmo, ncas * ncas)
+    _dm2tmp_2d = dm2tmp.reshape(ncas * ncas, ncas * ncas)
+    ktmp_full = (_papa_t_2d @ _dm2tmp_2d).reshape(nmo, nmo, ncas, ncas)
+    hdm2 = _to_np_f64((jtmp_full + ktmp_full).transpose(0, 2, 1, 3))
+
+    hcore = casscf.get_hcore()
+    h1e_mo = _to_np_f64((_to_xp_f64(mo, xp).T @ _to_xp_f64(hcore, xp)) @ _to_xp_f64(mo, xp))
+    vhf_c_np = _to_np_f64(vhf_c_xp)
+
+    dm1_full = np.zeros((nmo, nmo), dtype=np.float64)
+    if ncore:
+        idx_c = np.arange(ncore)
+        dm1_full[idx_c, idx_c] = 2.0
+    dm1_full[ncore:nocc, ncore:nocc] = casdm1
+
+    x1 = casscf.unpack_uniq_var(np.asarray(x_packed, dtype=np.float64).ravel())
+    x2 = (h1e_mo @ x1) @ dm1_full
+    x2 -= (g_orb_mat + g_orb_mat.T) @ x1 * 0.5
+    if ncore:
+        x2[:ncore] += (x1[:ncore, ncore:] @ vhf_ca[ncore:]) * 2.0
+    x2[ncore:nocc] += (casdm1 @ x1[ncore:nocc]) @ vhf_c_np
+    x2[:, ncore:nocc] += np.einsum("purv,rv->pu", hdm2, x1[:, ncore:nocc], optimize=True)
+    if ncore > 0:
+        va, vc = casscf.update_jk_in_ah(mo, x1, casdm1, eris)
+        x2[ncore:nocc] += _to_np_f64(va)
+        x2[:ncore, ncore:] += _to_np_f64(vc)
+    if bool(antisymmetrize):
+        x2 = x2 - x2.T
+    return np.asarray(x2, dtype=np.float64)
 
 
 def rotate_orb_ah(

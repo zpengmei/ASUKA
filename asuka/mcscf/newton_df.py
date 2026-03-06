@@ -124,6 +124,7 @@ class DFNewtonERIs:
     L_pu: Any = None
     L_pi: Any = None
     L_uv: Any = None
+    L_pq: Any = None
 
 
 def build_df_newton_eris(

@@ -234,6 +234,10 @@ def generalized_davidson(
             st = np.asarray(overlap(t), dtype=np.float64).ravel()
             proj = v_mat.T @ st
             t = t - v_mat @ proj
+            # Second pass reorthogonalization for numerical stability.
+            st = np.asarray(overlap(t), dtype=np.float64).ravel()
+            proj2 = v_mat.T @ st
+            t = t - v_mat @ proj2
             if new_vecs:
                 q = np.column_stack(new_vecs)
                 sq = np.column_stack([np.asarray(overlap(v), dtype=np.float64).ravel() for v in new_vecs])
