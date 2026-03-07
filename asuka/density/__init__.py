@@ -12,6 +12,8 @@ Notes
 """
 
 from .grids import GridSpec, iter_becke_grid, iter_cube_grid, make_becke_grid
+from .types import GridBatch, GridRequest
+from .api import collect_grid, iter_grid
 
 try:  # optional CUDA backend
     from .grids_device import DeviceGridSpec, iter_becke_grid_device, make_becke_grid_device
@@ -32,6 +34,10 @@ __all__ = [
     "iter_becke_grid",
     "make_becke_grid",
     "iter_cube_grid",
+    "GridBatch",
+    "GridRequest",
+    "iter_grid",
+    "collect_grid",
 ]
 
 if _CUDA_GRID_IMPORT_OK:  # pragma: no cover

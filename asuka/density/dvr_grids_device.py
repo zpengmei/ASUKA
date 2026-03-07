@@ -36,6 +36,7 @@ from .dvr_grids import (
     _pruned_lreq_parrish_2013,
     _rdvr_radial_nodes_weights,
 )
+from .types import GridBatch
 
 
 def iter_rdvr_grid_device(
@@ -53,7 +54,8 @@ def iter_rdvr_grid_device(
     atom_Z: Any | None = None,
     threads: int = 256,
     stream: Any = None,
-) -> Iterator["tuple[Any, Any]"]:
+    return_batch: bool = False,
+) -> Iterator[Any]:
     """Yield device ``(points, weights)`` blocks for an R-DVR atom-centered grid.
 
     This is a CUDA-backed drop-in replacement for
@@ -88,6 +90,7 @@ def iter_rdvr_grid_device(
     threads = int(threads)
     if threads <= 0:
         raise ValueError("threads must be > 0")
+    return_batch = bool(return_batch)
 
     angular_prune = bool(angular_prune)
     angular_kind_s = str(angular_kind).strip().lower()
@@ -182,6 +185,8 @@ def iter_rdvr_grid_device(
         # Buffer blocks per atom to match CPU semantics (flush when n_buf >= block_size).
         pts_buf: list[Any] = []
         w_buf: list[Any] = []
+        rid_buf: list[Any] = []
+        nang_buf: list[Any] = []
         n_buf = 0
 
         # Process consecutive segments with identical nang to preserve radial-major ordering.
@@ -192,9 +197,11 @@ def iter_rdvr_grid_device(
             while i1 < nrad and int(nang_nodes[i1]) == nang:
                 i1 += 1
 
-            rho_seg = rho[i0:i1]
-            wr_seg = wr[i0:i1]
-            i0 = i1
+            i_start = int(i0)
+            i_end = int(i1)
+            rho_seg = rho[i_start:i_end]
+            wr_seg = wr[i_start:i_end]
+            i0 = i_end
 
             dirs_d, wang_d = _get_ang(int(nang))
 
@@ -228,6 +235,7 @@ def iter_rdvr_grid_device(
                 sync=False,
             )
 
+            mask = None
             if prune_tol > 0.0:
                 mask = w_out > float(prune_tol)
                 pts_out = pts_out[mask]
@@ -236,30 +244,126 @@ def iter_rdvr_grid_device(
             if int(w_out.size):
                 pts_out = cp.ascontiguousarray(pts_out)
                 w_out = cp.ascontiguousarray(w_out.ravel())
+                rid_out = None
+                nang_out = None
+                if return_batch:
+                    rid_h = np.repeat(np.arange(int(i_start), int(i_end), dtype=np.int32), int(nang))
+                    rid_out = cp.ascontiguousarray(cp.asarray(rid_h, dtype=cp.int32))
+                    nang_out = cp.full((int(nloc),), int(nang), dtype=cp.int32)
+                    if mask is not None:
+                        rid_out = rid_out[mask]
+                        nang_out = nang_out[mask]
+                    rid_out = cp.ascontiguousarray(rid_out.ravel())
+                    nang_out = cp.ascontiguousarray(nang_out.ravel())
                 pts_buf.append(pts_out)
                 w_buf.append(w_out)
+                if return_batch:
+                    assert rid_out is not None
+                    assert nang_out is not None
+                    rid_buf.append(rid_out)
+                    nang_buf.append(nang_out)
                 n_buf += int(w_out.size)
 
                 if n_buf >= int(block_size):
                     if len(pts_buf) == 1:
-                        yield pts_buf[0], w_buf[0]
+                        pts_blk = pts_buf[0]
+                        w_blk = w_buf[0]
+                        rid_blk = rid_buf[0] if return_batch else None
+                        nang_blk = nang_buf[0] if return_batch else None
                     else:
-                        yield (
-                            cp.ascontiguousarray(cp.concatenate(pts_buf, axis=0)),
-                            cp.ascontiguousarray(cp.concatenate(w_buf, axis=0).ravel()),
+                        pts_blk = cp.ascontiguousarray(cp.concatenate(pts_buf, axis=0))
+                        w_blk = cp.ascontiguousarray(cp.concatenate(w_buf, axis=0).ravel())
+                        rid_blk = cp.ascontiguousarray(cp.concatenate(rid_buf, axis=0).ravel()) if return_batch else None
+                        nang_blk = cp.ascontiguousarray(cp.concatenate(nang_buf, axis=0).ravel()) if return_batch else None
+                    if return_batch:
+                        assert rid_blk is not None
+                        assert nang_blk is not None
+                        yield GridBatch(
+                            points=pts_blk,
+                            weights=w_blk,
+                            point_atom=cp.full((int(w_blk.size),), int(ia), dtype=cp.int32),
+                            point_radial_index=rid_blk,
+                            point_angular_n=nang_blk,
+                            meta={"grid_kind": "rdvr", "backend": "cuda", "atom": int(ia), "angular_prune": bool(angular_prune)},
                         )
+                    else:
+                        yield pts_blk, w_blk
                     pts_buf.clear()
                     w_buf.clear()
+                    rid_buf.clear()
+                    nang_buf.clear()
                     n_buf = 0
 
         if n_buf:
             if len(pts_buf) == 1:
-                yield pts_buf[0], w_buf[0]
+                pts_blk = pts_buf[0]
+                w_blk = w_buf[0]
+                rid_blk = rid_buf[0] if return_batch else None
+                nang_blk = nang_buf[0] if return_batch else None
             else:
-                yield (
-                    cp.ascontiguousarray(cp.concatenate(pts_buf, axis=0)),
-                    cp.ascontiguousarray(cp.concatenate(w_buf, axis=0).ravel()),
+                pts_blk = cp.ascontiguousarray(cp.concatenate(pts_buf, axis=0))
+                w_blk = cp.ascontiguousarray(cp.concatenate(w_buf, axis=0).ravel())
+                rid_blk = cp.ascontiguousarray(cp.concatenate(rid_buf, axis=0).ravel()) if return_batch else None
+                nang_blk = cp.ascontiguousarray(cp.concatenate(nang_buf, axis=0).ravel()) if return_batch else None
+            if return_batch:
+                assert rid_blk is not None
+                assert nang_blk is not None
+                yield GridBatch(
+                    points=pts_blk,
+                    weights=w_blk,
+                    point_atom=cp.full((int(w_blk.size),), int(ia), dtype=cp.int32),
+                    point_radial_index=rid_blk,
+                    point_angular_n=nang_blk,
+                    meta={"grid_kind": "rdvr", "backend": "cuda", "atom": int(ia), "angular_prune": bool(angular_prune)},
                 )
+            else:
+                yield pts_blk, w_blk
+
+
+def iter_fdvr_grid_device(
+    dvr_basis: Any,
+    *,
+    block_size: int = 20_000,
+    ortho_cutoff: float = 1e-10,
+    max_sweeps: int = 50,
+    tol: float = 1e-12,
+    prune_tol: float = 1e-16,
+    validate: bool = True,
+    overlap_max_abs_tol: float = 1e-3,
+    return_batch: bool = False,
+) -> Iterator[Any]:
+    """Yield device ``(points, weights)`` blocks for an F-DVR grid.
+
+    This is a convenience wrapper: build on CPU, upload to GPU, then slice.
+    """
+
+    try:
+        import cupy as cp  # type: ignore
+    except Exception as e:  # pragma: no cover
+        raise RuntimeError("iter_fdvr_grid_device requires CuPy") from e
+
+    from .dvr_grids import make_fdvr_grid_device  # noqa: PLC0415
+
+    pts, w = make_fdvr_grid_device(
+        dvr_basis,
+        ortho_cutoff=float(ortho_cutoff),
+        max_sweeps=int(max_sweeps),
+        tol=float(tol),
+        prune_tol=float(prune_tol),
+        validate=bool(validate),
+        overlap_max_abs_tol=float(overlap_max_abs_tol),
+    )
+
+    block_size = max(1, int(block_size))
+    return_batch = bool(return_batch)
+    for p0 in range(0, int(w.size), int(block_size)):
+        p1 = min(int(w.size), p0 + int(block_size))
+        pts_blk = cp.ascontiguousarray(pts[p0:p1])
+        w_blk = cp.ascontiguousarray(w[p0:p1].ravel())
+        if return_batch:
+            yield GridBatch(points=pts_blk, weights=w_blk, meta={"grid_kind": "fdvr", "backend": "cuda"})
+        else:
+            yield pts_blk, w_blk
 
 
 def make_rdvr_grid_device(*args: Any, **kwargs: Any):
@@ -276,5 +380,4 @@ def make_rdvr_grid_device(*args: Any, **kwargs: Any):
     return cp.concatenate(pts_list, axis=0), cp.concatenate(w_list, axis=0).ravel()
 
 
-__all__ = ["iter_rdvr_grid_device", "make_rdvr_grid_device"]
-
+__all__ = ["iter_rdvr_grid_device", "make_rdvr_grid_device", "iter_fdvr_grid_device"]

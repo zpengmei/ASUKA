@@ -61,6 +61,12 @@ def rhf_thc(
     init_fock_cycles: int = 0,
     reference: THCReferenceRHF | None = None,
     profile: dict | None = None,
+    xc_spec=None,
+    xc_grid_coords=None,
+    xc_grid_weights=None,
+    xc_ao_basis=None,
+    xc_sph_transform=None,
+    xc_batch_size: int = 50000,
 ) -> SCFResult:
     """RHF SCF with THC J/K backend."""
 
@@ -136,7 +142,15 @@ def rhf_thc(
             J = J_ref + J_thc
             K = K_ref + K_thc
 
-            F = _df._symmetrize(xp, h + J - 0.5 * K)
+            _cx_init = 0.5 * float(xc_spec.cx_hf) if xc_spec is not None else 0.5
+            F = h + J - _cx_init * K
+            if xc_spec is not None:
+                from asuka.xc.numint import build_vxc as _build_vxc
+                _Vxc, _Exc = _build_vxc(xc_spec, D_prev, xc_ao_basis, xc_grid_coords,
+                                         xc_grid_weights, batch_size=int(xc_batch_size),
+                                         sph_transform=xc_sph_transform)
+                F = F + _Vxc
+            F = _df._symmetrize(xp, F)
 
             if level_shift:
                 shift = float(level_shift)
@@ -153,6 +167,8 @@ def rhf_thc(
             if profile is not None and t_init is not None:
                 profile["scf"]["init_fock_ms"] += _df._time_ms_end(xp, t_init)
 
+    _cx_main = 0.5 * float(xc_spec.cx_hf) if xc_spec is not None else 0.5
+    _E_xc = 0.0
     for cycle in range(1, int(max_cycle) + 1):
         t = _df._time_ms_start(xp)
         dD = D - D_ref
@@ -162,7 +178,14 @@ def rhf_thc(
         if profile is not None:
             profile["scf"]["jk_ms"] += _df._time_ms_end(xp, t)
 
-        F = _df._symmetrize(xp, h + J - 0.5 * K)
+        F = h + J - _cx_main * K
+        if xc_spec is not None:
+            from asuka.xc.numint import build_vxc as _build_vxc
+            _Vxc, _E_xc = _build_vxc(xc_spec, D, xc_ao_basis, xc_grid_coords,
+                                       xc_grid_weights, batch_size=int(xc_batch_size),
+                                       sph_transform=xc_sph_transform)
+            F = F + _Vxc
+        F = _df._symmetrize(xp, F)
 
         if level_shift:
             shift = float(level_shift)
@@ -188,7 +211,13 @@ def rhf_thc(
         if damping:
             D_new = (1.0 - lam) * D_new + lam * D
 
-        e_elec = float(0.5 * xp.trace(D_new @ (h + F)).item())
+        if xc_spec is not None:
+            e_one = float(xp.trace(D_new @ h).item())
+            e_coul = float(0.5 * xp.trace(D_new @ J).item())
+            e_ex = float(_cx_main * 0.5 * xp.trace(D_new @ K).item())
+            e_elec = e_one + e_coul - e_ex + _E_xc
+        else:
+            e_elec = float(0.5 * xp.trace(D_new @ (h + F)).item())
         e_tot = float(e_elec + float(enuc))
 
         dm_err = float(xp.linalg.norm(D_new - D).item())
@@ -207,7 +236,7 @@ def rhf_thc(
         profile.setdefault("scf", {})["iters"] = int(cycle)
 
     return SCFResult(
-        method="RHF-THC",
+        method="RKS-THC" if xc_spec is not None else "RHF-THC",
         converged=bool(converged),
         niter=int(cycle),
         e_tot=float(e_last if e_last is not None else float("nan")),

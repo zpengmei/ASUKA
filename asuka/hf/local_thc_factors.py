@@ -126,64 +126,77 @@ def _make_atom_grids_device(
 ):
     """Return per-atom device grids as lists of CuPy arrays.
 
-    For `grid_kind="becke"`, this uses the CUDA Becke grid iterator.
-    For `grid_kind="rdvr"`, this builds R-DVR grids on CPU then uploads to GPU.
+    This uses the unified density-layer dispatcher so grid logic lives in one place.
     """
 
     cp = _require_cupy()
     grid_kind_s = str(grid_kind).strip().lower()
     grid_opts = {} if grid_options is None else dict(grid_options)
 
-    pts_atoms: list[Any] = []
-    w_atoms: list[Any] = []
+    from asuka.density import GridRequest, iter_grid  # noqa: PLC0415
+    from asuka.density.grids import _coords_bohr  # noqa: PLC0415
 
-    if grid_kind_s in {"becke", "becke_grid", "atom", "atom-centered"}:
-        from asuka.density.grids_device import iter_becke_grid_device  # noqa: PLC0415
-
-        # One block per atom (block_size huge).
-        for pts, w in iter_becke_grid_device(
-            mol_or_coords,
-            radial_n=int(getattr(grid_spec, "radial_n", 50)),
-            angular_n=int(getattr(grid_spec, "angular_n", 302)),
-            angular_kind=str(getattr(grid_spec, "angular_kind", "auto")),
-            rmax=float(getattr(grid_spec, "rmax", 20.0)),
-            becke_n=int(getattr(grid_spec, "becke_n", 3)),
-            block_size=10**9,
-            prune_tol=float(getattr(grid_spec, "prune_tol", 1e-16)),
-            threads=int(getattr(grid_spec, "threads", 256)),
-            stream=stream,
-        ):
-            pts_atoms.append(cp.ascontiguousarray(cp.asarray(pts, dtype=cp.float64)))
-            w_atoms.append(cp.ascontiguousarray(cp.asarray(w, dtype=cp.float64).ravel()))
-        return pts_atoms, w_atoms
-
-    if grid_kind_s in {"rdvr", "r-dvr", "r_dvr"}:
-        if dvr_basis is None:
-            raise ValueError("grid_kind='rdvr' requires dvr_basis (use aux_basis or provide a separate DVR basis)")
-        from asuka.density.dvr_grids_device import iter_rdvr_grid_device  # noqa: PLC0415
-
-        for pts, w in iter_rdvr_grid_device(
-            mol_or_coords,
-            dvr_basis,
-            angular_n=int(getattr(grid_spec, "angular_n", 302)),
-            angular_kind=str(getattr(grid_spec, "angular_kind", "auto")),
-            radial_rmax=float(grid_opts.get("radial_rmax", getattr(grid_spec, "rmax", 20.0))),
-            becke_n=int(getattr(grid_spec, "becke_n", 3)),
-            block_size=10**9,
-            angular_prune=bool(grid_opts.get("angular_prune", True)),
-            prune_tol=float(getattr(grid_spec, "prune_tol", 1e-16)),
-            ortho_cutoff=float(grid_opts.get("ortho_cutoff", 1e-10)),
-            threads=int(getattr(grid_spec, "threads", 256)),
-            stream=stream,
-        ):
-            pts_atoms.append(cp.ascontiguousarray(cp.asarray(pts, dtype=cp.float64)))
-            w_atoms.append(cp.ascontiguousarray(cp.asarray(w, dtype=cp.float64).ravel()))
-        return pts_atoms, w_atoms
+    coords = np.asarray(_coords_bohr(mol_or_coords), dtype=np.float64).reshape((-1, 3))
+    natm = int(coords.shape[0])
+    pts_atoms: list[Any] = [cp.zeros((0, 3), dtype=cp.float64) for _ in range(natm)]
+    w_atoms: list[Any] = [cp.zeros((0,), dtype=cp.float64) for _ in range(natm)]
 
     if grid_kind_s in {"fdvr", "f-dvr", "f_dvr"}:
         raise NotImplementedError("F-DVR is a global/molecular grid and is not supported for local-THC")
 
-    raise ValueError("grid_kind must be one of: 'becke', 'rdvr'")
+    if grid_kind_s in {"becke", "becke_grid", "atom", "atom-centered"}:
+        kind = "becke"
+        angular_prune = bool(grid_opts.get("angular_prune", False))
+    elif grid_kind_s in {"rdvr", "r-dvr", "r_dvr"}:
+        kind = "rdvr"
+        angular_prune = bool(grid_opts.get("angular_prune", True))
+        if dvr_basis is None:
+            raise ValueError("grid_kind='rdvr' requires dvr_basis (use aux_basis or provide a separate DVR basis)")
+    else:
+        raise ValueError("grid_kind must be one of: 'becke', 'rdvr'")
+
+    req = GridRequest(
+        kind=kind,  # type: ignore[arg-type]
+        backend="cuda",
+        radial_n=int(getattr(grid_spec, "radial_n", 50)),
+        angular_n=int(getattr(grid_spec, "angular_n", 302)),
+        angular_kind=str(getattr(grid_spec, "angular_kind", "auto")),
+        rmax=float(getattr(grid_spec, "rmax", 20.0)),
+        becke_n=int(getattr(grid_spec, "becke_n", 3)),
+        block_size=10**9,  # one batch per atom
+        prune_tol=float(getattr(grid_spec, "prune_tol", 1e-16)),
+        threads=int(getattr(grid_spec, "threads", 256)),
+        stream=stream,
+        radial_rmax=float(grid_opts.get("radial_rmax", getattr(grid_spec, "rmax", 20.0))),
+        ortho_cutoff=float(grid_opts.get("ortho_cutoff", 1e-10)),
+        angular_prune=bool(angular_prune),
+        atom_Z=grid_opts.get("atom_Z", None),
+    )
+
+    for batch in iter_grid(mol_or_coords, request=req, dvr_basis=dvr_basis):
+        ia = batch.meta.get("atom", None)
+        if ia is None:
+            # Best-effort fallback if meta is absent.
+            pa = getattr(batch, "point_atom", None)
+            if pa is None or int(getattr(pa, "size", 0)) == 0:
+                continue
+            try:
+                ia = int(pa[0])
+            except Exception:  # pragma: no cover
+                ia = int(cp.asnumpy(pa[0]).item())
+        ia = int(ia)
+        if ia < 0 or ia >= int(natm):
+            raise RuntimeError("grid batch atom index out of range")
+
+        pts_i = cp.ascontiguousarray(cp.asarray(batch.points, dtype=cp.float64))
+        w_i = cp.ascontiguousarray(cp.asarray(batch.weights, dtype=cp.float64).ravel())
+        if int(pts_atoms[int(ia)].shape[0]) == 0:
+            pts_atoms[int(ia)] = pts_i
+            w_atoms[int(ia)] = w_i
+        else:
+            pts_atoms[int(ia)] = cp.ascontiguousarray(cp.concatenate([pts_atoms[int(ia)], pts_i], axis=0))
+            w_atoms[int(ia)] = cp.ascontiguousarray(cp.concatenate([w_atoms[int(ia)], w_i], axis=0)).ravel()
+
     return pts_atoms, w_atoms
 
 
@@ -592,37 +605,39 @@ def build_local_thc_factors(
         if npt_avail <= 0:
             raise RuntimeError("local-THC block has no grid points (check prune_tol / grid spec)")
 
+        # Always compute naux_total so npt scales with aux basis size (not n_primary).
+        # For a single-block system (all atoms in one block), n_primary << naux,
+        # so using npt_factor * n_primary severely under-samples the grid.
+        from asuka.cueri.cart import ncart  # noqa: PLC0415
+
+        naux_atom = np.zeros((len(aux_atoms),), dtype=np.int64)
+        for i, a in enumerate(aux_atoms):
+            if int(a) not in naux_atom_cache:
+                shells = atom_to_shells_aux[int(a)]
+                bas_i = subset_cart_basis_by_shells(aux_basis, shells)
+                aux_basis_atom_cache[int(a)] = bas_i
+                shell_l = np.asarray(bas_i.shell_l, dtype=np.int32).ravel()
+                shell_start = np.asarray(bas_i.shell_ao_start, dtype=np.int32).ravel()
+                if int(shell_l.size):
+                    nfn = np.asarray([ncart(int(l)) for l in shell_l.tolist()], dtype=np.int32)
+                    naux_i = int(np.max(shell_start + nfn))
+                else:
+                    naux_i = 0
+                naux_atom_cache[int(a)] = int(naux_i)
+            naux_atom[int(i)] = int(naux_atom_cache[int(a)])
+        naux_total = int(np.sum(naux_atom))
+
         if bool(getattr(cfg, "no_point_downselect", False)):
             npt_target = int(npt_avail)
         elif thc_npt is not None:
             npt_target = int(max(1, int(thc_npt)))
         else:
-            npt_target = int(cfg.npt_factor) * int(max(1, int(n_primary)))
+            # Scale with naux_total (aux basis size) for accuracy; n_primary
+            # (AO count) is often much smaller, leading to insufficient sampling.
+            npt_target = int(cfg.npt_factor) * int(max(1, int(naux_total) if int(naux_total) > 0 else int(n_primary)))
             npt_target = max(int(cfg.npt_min), min(int(cfg.npt_max), int(npt_target)))
 
         if solve_s in fit_metric_methods:
-            # Fit-metric requires npt >= naux for the block aux basis. We compute
-            # naux as the sum of per-atom aux-basis sizes (cart), which matches
-            # the union subset in aux_basis_blk.
-            from asuka.cueri.cart import ncart  # noqa: PLC0415
-
-            naux_atom = np.zeros((len(aux_atoms),), dtype=np.int64)
-            for i, a in enumerate(aux_atoms):
-                if int(a) not in naux_atom_cache:
-                    shells = atom_to_shells_aux[int(a)]
-                    bas_i = subset_cart_basis_by_shells(aux_basis, shells)
-                    aux_basis_atom_cache[int(a)] = bas_i
-                    shell_l = np.asarray(bas_i.shell_l, dtype=np.int32).ravel()
-                    shell_start = np.asarray(bas_i.shell_ao_start, dtype=np.int32).ravel()
-                    if int(shell_l.size):
-                        nfn = np.asarray([ncart(int(l)) for l in shell_l.tolist()], dtype=np.int32)
-                        naux_i = int(np.max(shell_start + nfn))
-                    else:
-                        naux_i = 0
-                    naux_atom_cache[int(a)] = int(naux_i)
-                naux_atom[int(i)] = int(naux_atom_cache[int(a)])
-
-            naux_total = int(np.sum(naux_atom))
             if int(naux_total) > 0:
                 if int(npt_avail) < int(naux_total):
                     raise ValueError(

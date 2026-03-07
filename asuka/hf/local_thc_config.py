@@ -30,9 +30,9 @@ class LocalTHCConfig:
     # Per-block number of grid points:
     # - If `thc_npt` is provided at call site, it overrides this.
     # - Otherwise use npt = clamp(npt_factor * n_primary_ao, npt_min, npt_max).
-    npt_factor: int = 8
+    npt_factor: int = 24
     npt_min: int = 512
-    npt_max: int = 2048
+    npt_max: int = 100000
     # If True, disable any point downselect and keep all available per-block
     # atom-centered grid points. This is required for analytic nuclear
     # gradients (downselect changes discretely with geometry).

@@ -1371,6 +1371,13 @@ def _build_dme0_lorb_response(
     dm1 = xp.asarray(dm1_act, dtype=xp.float64)
     dm1 = 0.5 * (dm1 + dm1.T)
     dm2 = xp.asarray(dm2_act, dtype=xp.float64)
+    try:
+        _act_resp_scale = float(_os.environ.get("ASUKA_CASPT2_LORB_ACTIVE_RESPONSE_SCALE", "1.0"))
+    except Exception:
+        _act_resp_scale = 1.0
+    if abs(float(_act_resp_scale) - 1.0) > 1e-12:
+        dm1 = float(_act_resp_scale) * dm1
+        dm2 = float(_act_resp_scale) * dm2
     _dm2_mode = str(_os.environ.get("ASUKA_CASPT2_LORB_DM2_MODE", "native")).strip().lower()
     if _dm2_mode == "swap_uv":
         dm2 = dm2.transpose(1, 0, 2, 3)

@@ -1251,8 +1251,13 @@ def run_rhf_thc(
     mo_coeff0: Any | None = None,
     init_fock_cycles: int | None = None,
     profile: dict | None = None,
+    # DFT (optional)
+    functional: str | None = None,
+    grid_radial_n: int = 75,
+    grid_angular_n: int = 590,
+    xc_batch_size: int = 50000,
 ) -> RHFDFRunResult:
-    """Run RHF with THC J/K.
+    """Run RHF (or RKS-DFT if functional is given) with THC J/K.
 
     Notes
     -----
@@ -1286,6 +1291,29 @@ def run_rhf_thc(
     # SCF AO representation: cart or sph
     int1e_scf, _B_unused, sph_map = _apply_sph_transform(mol, int1e, None, ao_basis, df_B_layout="mnQ")
     df_ao_rep = "cart" if bool(mol.cart) else "sph"
+
+    # DFT setup (optional)
+    xc_spec = None
+    xc_grid_coords = None
+    xc_grid_weights = None
+    xc_sph_transform = None
+    if functional is not None:
+        from asuka.xc.functional import get_functional
+        from asuka.density.grids_device import make_becke_grid_device
+
+        xc_spec = get_functional(functional)
+        xc_grid_coords, xc_grid_weights = make_becke_grid_device(
+            mol, radial_n=int(grid_radial_n), angular_n=int(grid_angular_n),
+            radial_scheme="treutler",
+        )
+        if not bool(mol.cart) and sph_map is not None:
+            import cupy as _cp_xc
+            if hasattr(sph_map, "T_c2s"):
+                xc_sph_transform = _cp_xc.asarray(sph_map.T_c2s, dtype=_cp_xc.float64)
+            elif hasattr(sph_map, "T_matrix"):
+                xc_sph_transform = _cp_xc.asarray(sph_map.T_matrix, dtype=_cp_xc.float64)
+            elif isinstance(sph_map, tuple) and len(sph_map) >= 1:
+                xc_sph_transform = _cp_xc.asarray(sph_map[0], dtype=_cp_xc.float64)
 
     # Optional guess reuse (RHF cache)
     init_guess_s = str(init_guess).strip().lower()
@@ -1536,6 +1564,12 @@ def run_rhf_thc(
             init_fock_cycles=int(init_fock_cycles_i),
             reference=ref,
             profile=scf_prof,
+            xc_spec=xc_spec,
+            xc_grid_coords=xc_grid_coords,
+            xc_grid_weights=xc_grid_weights,
+            xc_ao_basis=ao_basis,
+            xc_sph_transform=xc_sph_transform,
+            xc_batch_size=int(xc_batch_size),
         )
     else:
         from asuka.hf.local_thc_scf import rhf_local_thc  # noqa: PLC0415
@@ -1560,6 +1594,12 @@ def run_rhf_thc(
             init_fock_cycles=int(init_fock_cycles_i),
             reference=ref,
             profile=scf_prof,
+            xc_spec=xc_spec,
+            xc_grid_coords=xc_grid_coords,
+            xc_grid_weights=xc_grid_weights,
+            xc_ao_basis=ao_basis,
+            xc_sph_transform=xc_sph_transform,
+            xc_batch_size=int(xc_batch_size),
         )
 
     if bool(getattr(scf, "converged", False)):
@@ -2501,6 +2541,176 @@ def run_rohf(
     if not isinstance(out, ROHFDFRunResult):  # pragma: no cover
         raise TypeError("run_rohf returned non-ROHF result")
     return out
+
+
+def run_rks_df(
+    mol: Molecule,
+    *,
+    functional: str = "mn15",
+    basis: Any | None = None,
+    auxbasis: Any = "autoaux",
+    df_config: "CuERIDFConfig | None" = None,
+    df_layout: str = "mnQ",
+    expand_contractions: bool = True,
+    max_cycle: int = 100,
+    conv_tol: float = 1e-10,
+    conv_tol_dm: float = 1e-8,
+    diis: bool = True,
+    diis_start_cycle: int | None = None,
+    diis_space: int = 8,
+    damping: float = 0.0,
+    level_shift: float = 0.0,
+    k_q_block: int = 128,
+    cublas_math_mode: str | None = None,
+    dm0: Any | None = None,
+    mo_coeff0: Any | None = None,
+    init_fock_cycles: int | None = None,
+    grid_radial_n: int = 75,
+    grid_angular_n: int = 590,
+    xc_batch_size: int = 50000,
+    profile: dict | None = None,
+) -> RHFDFRunResult:
+    """Run RKS-DFT with DF integrals and a meta-GGA functional (MN15/M06/M06-2X/M06-L).
+
+    This wraps the DF-RHF solver with an XC potential on a Becke grid.
+    """
+    from asuka.xc.functional import get_functional
+    from asuka.density.grids_device import make_becke_grid_device
+
+    if int(mol.spin) != 0:
+        raise NotImplementedError("run_rks_df currently supports only closed-shell molecules (spin=0)")
+
+    xc_spec = get_functional(functional)
+
+    nelec = int(mol.nelectron)
+    if nelec <= 0 or nelec % 2 != 0:
+        raise ValueError("RKS requires an even, positive electron count")
+
+    basis_in = mol.basis if basis is None else basis
+
+    df_layout_s = str(df_layout).strip().lower()
+    if df_layout_s not in {"mnq", "qmn"}:
+        raise ValueError("df_layout must be one of: 'mnQ', 'Qmn'")
+    df_build_layout = df_layout_s
+    df_ao_rep = "cart" if bool(mol.cart) else "sph"
+
+    # AO basis + 1e integrals (reuse existing infrastructure)
+    ao_basis, basis_name = build_ao_basis_cart(mol, basis=basis_in, expand_contractions=bool(expand_contractions))
+    coords, charges = _atom_coords_charges_bohr(mol)
+    int1e = build_int1e_cart(ao_basis, atom_coords_bohr=coords, atom_charges=charges)
+
+    # DF auxiliary basis + whitened DF factors
+    aux_basis, auxbasis_name = _build_aux_basis_cart(
+        mol, basis_in=basis_in, auxbasis=auxbasis, expand_contractions=bool(expand_contractions),
+    )
+
+    df_prof = None
+    if profile is not None:
+        df_prof = profile.setdefault("df_build", {})
+
+    B, L_chol = build_df_B_from_cueri_packed_bases(
+        ao_basis, aux_basis, config=df_config, layout=str(df_build_layout),
+        ao_rep=str(df_ao_rep), profile=df_prof, return_L=True,
+    )
+
+    # Spherical AO transform
+    if bool(mol.cart):
+        int1e_scf, B_scf, sph_map = _apply_sph_transform(mol, int1e, B, ao_basis, df_B_layout=str(df_layout))
+    else:
+        int1e_scf, _B_unused, sph_map = _apply_sph_transform(mol, int1e, None, ao_basis, df_B_layout=str(df_layout))
+        B_scf = B
+
+    # Build DFT grid on device
+    grid_coords, grid_weights = make_becke_grid_device(
+        mol, radial_n=int(grid_radial_n), angular_n=int(grid_angular_n),
+        radial_scheme="treutler",
+    )
+
+    # Spherical transform for XC builder
+    xc_sph_transform = None
+    if not bool(mol.cart) and sph_map is not None:
+        import cupy as _cp_xc
+        if hasattr(sph_map, "T_c2s"):
+            xc_sph_transform = _cp_xc.asarray(sph_map.T_c2s, dtype=_cp_xc.float64)
+        elif hasattr(sph_map, "T_matrix"):
+            xc_sph_transform = _cp_xc.asarray(sph_map.T_matrix, dtype=_cp_xc.float64)
+        elif isinstance(sph_map, tuple) and len(sph_map) >= 1:
+            xc_sph_transform = _cp_xc.asarray(sph_map[0], dtype=_cp_xc.float64)
+
+    # SCF solve
+    init_fock_cycles_i = int(_HF_INIT_FOCK_CYCLES) if init_fock_cycles is None else max(0, int(init_fock_cycles))
+    diis_start_cycle_i = (
+        int(diis_start_cycle) if diis_start_cycle is not None else (1 if int(init_fock_cycles_i) > 0 else 2)
+    )
+    scf = rhf_df(
+        int1e_scf.S,
+        int1e_scf.hcore,
+        B_scf,
+        nelec=int(nelec),
+        enuc=float(mol.energy_nuc()),
+        max_cycle=int(max_cycle),
+        conv_tol=float(conv_tol),
+        conv_tol_dm=float(conv_tol_dm),
+        diis=bool(diis),
+        diis_start_cycle=int(diis_start_cycle_i),
+        diis_space=int(diis_space),
+        damping=float(damping),
+        level_shift=float(level_shift),
+        k_q_block=int(k_q_block),
+        cublas_math_mode=cublas_math_mode,
+        dm0=dm0,
+        mo_coeff0=mo_coeff0,
+        init_fock_cycles=int(init_fock_cycles_i),
+        profile=profile,
+        xc_spec=xc_spec,
+        xc_grid_coords=grid_coords,
+        xc_grid_weights=grid_weights,
+        xc_ao_basis=ao_basis,
+        xc_sph_transform=xc_sph_transform,
+        xc_batch_size=int(xc_batch_size),
+    )
+
+    return RHFDFRunResult(
+        mol=mol,
+        basis_name=str(basis_name),
+        auxbasis_name=str(auxbasis_name),
+        ao_basis=ao_basis,
+        aux_basis=aux_basis,
+        int1e=int1e,
+        df_B=B_scf,
+        scf=scf,
+        profile=profile,
+        sph_map=sph_map,
+        df_L=L_chol,
+    )
+
+
+def run_rks(
+    mol: Molecule,
+    *,
+    functional: str = "mn15",
+    backend: str = "cuda",
+    integral: str = "df",
+    **kwargs,
+) -> RHFDFRunResult:
+    """Unified RKS-DFT entrypoint.
+
+    Parameters
+    ----------
+    integral : str
+        Integral backend: 'df' (density fitting), 'thc' (global THC),
+        'local-thc' (local THC).
+    """
+    if str(backend).strip().lower() != "cuda":
+        raise NotImplementedError("RKS currently requires backend='cuda'")
+    int_s = str(integral).strip().lower()
+    if int_s == "df":
+        return run_rks_df(mol, functional=functional, **kwargs)
+    if int_s in {"thc", "global-thc", "global_thc"}:
+        return run_rhf_thc(mol, functional=functional, thc_mode="global", **kwargs)
+    if int_s in {"local-thc", "local_thc", "lthc"}:
+        return run_rhf_thc(mol, functional=functional, thc_mode="local", **kwargs)
+    raise ValueError(f"Unknown integral backend: {integral!r}. Use 'df', 'thc', or 'local-thc'.")
 
 
 def run_rhf_df_cpu(

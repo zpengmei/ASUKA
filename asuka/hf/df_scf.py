@@ -827,6 +827,12 @@ def rhf_df(
     mo_coeff0=None,
     init_fock_cycles: int = 1,
     profile: dict | None = None,
+    xc_spec=None,
+    xc_grid_coords=None,
+    xc_grid_weights=None,
+    xc_ao_basis=None,
+    xc_sph_transform=None,
+    xc_batch_size: int = 50000,
 ):
     """RHF SCF with DF ERIs in AO basis.
 
@@ -835,6 +841,11 @@ def rhf_df(
     - B: DF factors tensor (materialized mode) with shape (nao, nao, naux) or (naux, nao, nao),
          or None (streamed mode).
     - nelec: total electrons (even)
+    - xc_spec: FunctionalSpec for DFT (None = pure HF)
+    - xc_grid_coords, xc_grid_weights: Becke grid for V_xc
+    - xc_ao_basis: Cartesian AO basis for grid AO evaluation
+    - xc_sph_transform: spherical transform matrix (if spherical AOs)
+    - xc_batch_size: grid batch size for V_xc build
     """
 
     jk_mode_s = str(jk_mode).strip().lower()
@@ -1082,7 +1093,14 @@ def rhf_df(
                 if use_k_cocc:
                     K_prev = K
 
-            F = h + J - 0.5 * K
+            _cx = 0.5 * float(xc_spec.cx_hf) if xc_spec is not None else 0.5
+            F = h + J - _cx * K
+            if xc_spec is not None:
+                from asuka.xc.numint import build_vxc as _build_vxc
+                _Vxc, _Exc = _build_vxc(xc_spec, D_prev, xc_ao_basis, xc_grid_coords,
+                                         xc_grid_weights, batch_size=int(xc_batch_size),
+                                         sph_transform=xc_sph_transform)
+                F = F + _Vxc
             F = _symmetrize(xp, F)
 
             if level_shift:
@@ -1100,6 +1118,8 @@ def rhf_df(
             if profile is not None and t_init is not None:
                 profile["scf"]["init_fock_ms"] += _time_ms_end(xp, t_init)
 
+    _cx_main = 0.5 * float(xc_spec.cx_hf) if xc_spec is not None else 0.5
+    _E_xc = 0.0  # Will be updated each cycle if DFT
     for cycle in range(1, int(max_cycle) + 1):
         t = _time_ms_start(xp)
         if use_streamed:
@@ -1201,7 +1221,13 @@ def rhf_df(
                 K_prev = K
         if profile is not None:
             profile["scf"]["jk_ms"] += _time_ms_end(xp, t)
-        F = h + J - 0.5 * K
+        F = h + J - _cx_main * K
+        if xc_spec is not None:
+            from asuka.xc.numint import build_vxc as _build_vxc
+            _Vxc, _E_xc = _build_vxc(xc_spec, D, xc_ao_basis, xc_grid_coords,
+                                       xc_grid_weights, batch_size=int(xc_batch_size),
+                                       sph_transform=xc_sph_transform)
+            F = F + _Vxc
         F = _symmetrize(xp, F)
 
         if level_shift:
@@ -1229,7 +1255,14 @@ def rhf_df(
         if damping:
             D_new = (1.0 - lam) * D_new + lam * D
 
-        e_elec = float(0.5 * xp.trace(D_new @ (h + F)).item())
+        if xc_spec is not None:
+            # DFT energy: E = Tr(D@h) + 0.5*Tr(D@J) - cx*0.5*Tr(D@K) + E_xc
+            e_one = float(xp.trace(D_new @ h).item())
+            e_coul = float(0.5 * xp.trace(D_new @ J).item())
+            e_ex = float(_cx_main * 0.5 * xp.trace(D_new @ K).item())
+            e_elec = e_one + e_coul - e_ex + _E_xc
+        else:
+            e_elec = float(0.5 * xp.trace(D_new @ (h + F)).item())
         e_tot = float(e_elec + float(enuc))
 
         dm_err = float(xp.linalg.norm(D_new - D).item())
@@ -1247,7 +1280,7 @@ def rhf_df(
     if profile is not None:
         profile["scf"]["iters"] = int(cycle)
     return SCFResult(
-        method="RHF",
+        method="RKS" if xc_spec is not None else "RHF",
         converged=bool(converged),
         niter=int(cycle),
         e_tot=float(e_last if e_last is not None else float("nan")),

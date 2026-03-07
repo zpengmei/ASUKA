@@ -27,6 +27,7 @@ import numpy as np
 
 from asuka.cueri.basis_cart import BasisCartSoA
 from asuka.density.grids import _coords_bohr, angular_grid, becke_partition_weights
+from asuka.density.types import GridBatch
 
 # Bragg-Slater radii in Bohr, tabulated in PySCF:
 #   pyscf.dft.radi.BRAGG_RADII
@@ -492,7 +493,8 @@ def iter_rdvr_grid(
     ortho_cutoff: float = 1e-10,
     angular_prune: bool = True,
     atom_Z: Any | None = None,
-) -> Iterator[tuple[np.ndarray, np.ndarray]]:
+    return_batch: bool = False,
+) -> Iterator[Any]:
     """Yield (points, weights) blocks for an R-DVR atom-centered grid.
 
     If ``angular_prune=True`` (default), the angular grid order is selected
@@ -517,6 +519,7 @@ def iter_rdvr_grid(
 
     angular_prune = bool(angular_prune)
     angular_kind_s = str(angular_kind).strip().lower()
+    return_batch = bool(return_batch)
 
     # Angular rule: either shared (no pruning) or cached per selected Lebedev order.
     ang_cache: dict[int, tuple[np.ndarray, np.ndarray]] = {}
@@ -572,12 +575,14 @@ def iter_rdvr_grid(
 
         pts_buf: list[np.ndarray] = []
         w_buf: list[np.ndarray] = []
+        rid_buf: list[np.ndarray] = []
+        nang_buf: list[np.ndarray] = []
         n_buf = 0
 
         center = np.asarray(R[int(ia)], dtype=np.float64).reshape((3,))
         rho_bs_i = float(rho_bs[int(ia)]) if rho_bs is not None else 0.0
 
-        for rnode, wnode in zip(rho.tolist(), wr.tolist()):
+        for inode, (rnode, wnode) in enumerate(zip(rho.tolist(), wr.tolist())):
             if angular_prune:
                 assert lmax_max is not None  # for type-checkers
                 lreq = _pruned_lreq_parrish_2013(float(rnode), rho_bs=rho_bs_i, lmax_max=int(lmax_max))
@@ -600,13 +605,20 @@ def iter_rdvr_grid(
             w_node = float(wnode) * wang_i  # (nang,)
             pts_buf.append(pts_node)
             w_buf.append(w_node)
+            if return_batch:
+                rid_buf.append(np.full((int(w_node.size),), int(inode), dtype=np.int32))
+                nang_buf.append(np.full((int(w_node.size),), int(nang), dtype=np.int32))
             n_buf += int(w_node.size)
 
             if n_buf >= int(block_size):
                 pts_blk = np.concatenate(pts_buf, axis=0) if len(pts_buf) else np.zeros((0, 3), dtype=np.float64)
                 w_blk = np.concatenate(w_buf, axis=0) if len(w_buf) else np.zeros((0,), dtype=np.float64)
+                rid_blk = np.concatenate(rid_buf, axis=0) if len(rid_buf) else np.zeros((0,), dtype=np.int32)
+                nang_blk = np.concatenate(nang_buf, axis=0) if len(nang_buf) else np.zeros((0,), dtype=np.int32)
                 pts_buf.clear()
                 w_buf.clear()
+                rid_buf.clear()
+                nang_buf.clear()
                 n_buf = 0
 
                 if int(w_blk.size):
@@ -616,13 +628,28 @@ def iter_rdvr_grid(
                         mask = w_mol > prune_tol
                         pts_blk = pts_blk[mask]
                         w_mol = w_mol[mask]
+                        if return_batch:
+                            rid_blk = rid_blk[mask]
+                            nang_blk = nang_blk[mask]
                     if int(w_mol.size):
-                        yield np.ascontiguousarray(pts_blk), np.ascontiguousarray(w_mol)
+                        if return_batch:
+                            yield GridBatch(
+                                points=np.ascontiguousarray(pts_blk),
+                                weights=np.ascontiguousarray(w_mol),
+                                point_atom=np.full((int(w_mol.size),), int(ia), dtype=np.int32),
+                                point_radial_index=np.ascontiguousarray(rid_blk),
+                                point_angular_n=np.ascontiguousarray(nang_blk),
+                                meta={"grid_kind": "rdvr", "atom": int(ia), "angular_prune": bool(angular_prune)},
+                            )
+                        else:
+                            yield np.ascontiguousarray(pts_blk), np.ascontiguousarray(w_mol)
 
         # Flush remainder for this atom.
         if n_buf:
             pts_blk = np.concatenate(pts_buf, axis=0) if len(pts_buf) else np.zeros((0, 3), dtype=np.float64)
             w_blk = np.concatenate(w_buf, axis=0) if len(w_buf) else np.zeros((0,), dtype=np.float64)
+            rid_blk = np.concatenate(rid_buf, axis=0) if len(rid_buf) else np.zeros((0,), dtype=np.int32)
+            nang_blk = np.concatenate(nang_buf, axis=0) if len(nang_buf) else np.zeros((0,), dtype=np.int32)
             if int(w_blk.size):
                 wpart = becke_partition_weights(pts_blk, R, becke_n=int(becke_n), RAB=RAB)
                 w_mol = w_blk * wpart[:, int(ia)]
@@ -630,8 +657,21 @@ def iter_rdvr_grid(
                     mask = w_mol > prune_tol
                     pts_blk = pts_blk[mask]
                     w_mol = w_mol[mask]
+                    if return_batch:
+                        rid_blk = rid_blk[mask]
+                        nang_blk = nang_blk[mask]
                 if int(w_mol.size):
-                    yield np.ascontiguousarray(pts_blk), np.ascontiguousarray(w_mol)
+                    if return_batch:
+                        yield GridBatch(
+                            points=np.ascontiguousarray(pts_blk),
+                            weights=np.ascontiguousarray(w_mol),
+                            point_atom=np.full((int(w_mol.size),), int(ia), dtype=np.int32),
+                            point_radial_index=np.ascontiguousarray(rid_blk),
+                            point_angular_n=np.ascontiguousarray(nang_blk),
+                            meta={"grid_kind": "rdvr", "atom": int(ia), "angular_prune": bool(angular_prune)},
+                        )
+                    else:
+                        yield np.ascontiguousarray(pts_blk), np.ascontiguousarray(w_mol)
 
 
 def make_rdvr_grid(
@@ -883,6 +923,46 @@ def make_fdvr_grid(
     return pts, w
 
 
+def iter_fdvr_grid(
+    dvr_basis: BasisCartSoA,
+    *,
+    block_size: int = 20_000,
+    ortho_cutoff: float = 1e-10,
+    max_sweeps: int = 50,
+    tol: float = 1e-12,
+    prune_tol: float = 1e-16,
+    validate: bool = True,
+    overlap_max_abs_tol: float = 1e-3,
+    return_batch: bool = False,
+) -> Iterator[Any]:
+    """Iterator wrapper for F-DVR so callers can treat it like other grids.
+
+    Phase 1 still materializes the full F-DVR grid internally, then yields
+    slices. That is sufficient to unify the public API.
+    """
+
+    pts, w = make_fdvr_grid(
+        dvr_basis,
+        ortho_cutoff=float(ortho_cutoff),
+        max_sweeps=int(max_sweeps),
+        tol=float(tol),
+        prune_tol=float(prune_tol),
+        validate=bool(validate),
+        overlap_max_abs_tol=float(overlap_max_abs_tol),
+    )
+
+    block_size = max(1, int(block_size))
+    return_batch = bool(return_batch)
+    for p0 in range(0, int(w.size), int(block_size)):
+        p1 = min(int(w.size), p0 + int(block_size))
+        pts_blk = np.ascontiguousarray(pts[p0:p1])
+        w_blk = np.ascontiguousarray(w[p0:p1])
+        if return_batch:
+            yield GridBatch(points=pts_blk, weights=w_blk, meta={"grid_kind": "fdvr"})
+        else:
+            yield pts_blk, w_blk
+
+
 def make_fdvr_grid_device(*args: Any, **kwargs: Any):
     """Materialize an F-DVR grid on the GPU as CuPy arrays."""
 
@@ -900,5 +980,6 @@ __all__ = [
     "make_rdvr_grid",
     "make_rdvr_grid_device",
     "make_fdvr_grid",
+    "iter_fdvr_grid",
     "make_fdvr_grid_device",
 ]
