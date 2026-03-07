@@ -47,7 +47,7 @@ class LocalTHCBlock:
     atoms_aux: tuple[int, ...]
     X: Any  # cupy.ndarray, (npt, nlocal_ao)
     Y: Any  # cupy.ndarray, (npt, naux) such that Z = Y @ Y.T for this block
-    Z: Any  # cupy.ndarray, (npt, npt)
+    Z: Any | None  # optional: cupy.ndarray, (npt, npt)
     points: Any  # cupy.ndarray, (npt, 3)
     weights: Any  # cupy.ndarray, (npt,)
     L_metric: Any  # cupy.ndarray, (naux, naux) (Cholesky of aux metric for this block)
@@ -297,11 +297,20 @@ def _select_secondary_atoms_by_overlap(
     return keep
 
 
-def _build_Z_from_aux_metric(cp, X_aux_p, L, *, solve_method: str, solve_rcond: float = 1e-12):
+def _build_Z_from_aux_metric(
+    cp,
+    X_aux_p,
+    L,
+    *,
+    solve_method: str,
+    solve_rcond: float = 1e-12,
+    store_Z: bool = True,
+):
     """Return (Y,Z) for a local-THC block, where Z = Y @ Y.T.
 
     Y has shape (npt, naux) for the block's auxiliary basis, and Z has shape
-    (npt, npt). Z is symmetrized as a numerical guard.
+    (npt, npt) when `store_Z=True`. When `store_Z=False`, returns Z=None and
+    downstream code should apply Z via Y (e.g., n = Y @ (Y.T @ m)).
     """
 
     solve_s = str(solve_method).strip().lower()
@@ -309,6 +318,7 @@ def _build_Z_from_aux_metric(cp, X_aux_p, L, *, solve_method: str, solve_rcond: 
     fit_metric_qr_methods = {"fit_metric_qr", "fit_metric", "qr", "lq", "lstsq"}
     fit_metric_gram_methods = {"fit_metric_gram", "gram"}
     rcond = float(solve_rcond)
+    store_Z = bool(store_Z)
     if not np.isfinite(rcond) or rcond <= 0.0:
         raise ValueError("solve_rcond must be finite and > 0")
 
@@ -328,8 +338,11 @@ def _build_Z_from_aux_metric(cp, X_aux_p, L, *, solve_method: str, solve_rcond: 
             Xw_T = cp.linalg.solve(L, X_aux_p.T)
         Xw_p = cp.ascontiguousarray(Xw_T.T)
         Y = Xw_p
-        Z = cp.ascontiguousarray(Y @ Y.T)
-        Z = 0.5 * (Z + Z.T)
+        if store_Z:
+            Z = cp.ascontiguousarray(Y @ Y.T)
+            Z = 0.5 * (Z + Z.T)
+        else:
+            Z = None
         return Y, Z
 
     if solve_s in fit_metric_qr_methods:
@@ -352,26 +365,47 @@ def _build_Z_from_aux_metric(cp, X_aux_p, L, *, solve_method: str, solve_rcond: 
             G = cp.linalg.solve(R.T, L)
             Y = cp.ascontiguousarray(Q @ G)
             del G
-        Z = cp.ascontiguousarray(Y @ Y.T)
-        Z = 0.5 * (Z + Z.T)
-        # Same guard as global THC: prevent silent NaN/inf explosions.
-        try:
-            z_finite = bool(cp.all(cp.isfinite(Z)).item())
-        except Exception:  # pragma: no cover
-            z_finite = True
-        if not bool(z_finite):
-            raise ValueError(
-                "fit_metric produced non-finite Z entries. "
-                "This usually indicates an ill-conditioned THC grid; try grid_kind='rdvr' with angular_prune=True "
-                "and/or increase thc_npt / angular_n."
-            )
-        z_max = float(cp.max(cp.abs(Z)).item()) if int(Z.size) else 0.0
-        if not np.isfinite(z_max) or z_max > 1e12:
-            raise ValueError(
-                f"fit_metric produced huge Z values (max|Z|={z_max:.3e}). "
-                "This usually indicates an ill-conditioned THC grid; try grid_kind='rdvr' with angular_prune=True "
-                "and/or increase thc_npt / angular_n."
-            )
+        if store_Z:
+            Z = cp.ascontiguousarray(Y @ Y.T)
+            Z = 0.5 * (Z + Z.T)
+            # Same guard as global THC: prevent silent NaN/inf explosions.
+            try:
+                z_finite = bool(cp.all(cp.isfinite(Z)).item())
+            except Exception:  # pragma: no cover
+                z_finite = True
+            if not bool(z_finite):
+                raise ValueError(
+                    "fit_metric produced non-finite Z entries. "
+                    "This usually indicates an ill-conditioned THC grid; try grid_kind='rdvr' with angular_prune=True "
+                    "and/or increase thc_npt / angular_n."
+                )
+            z_max = float(cp.max(cp.abs(Z)).item()) if int(Z.size) else 0.0
+            if not np.isfinite(z_max) or z_max > 1e12:
+                raise ValueError(
+                    f"fit_metric produced huge Z values (max|Z|={z_max:.3e}). "
+                    "This usually indicates an ill-conditioned THC grid; try grid_kind='rdvr' with angular_prune=True "
+                    "and/or increase thc_npt / angular_n."
+                )
+        else:
+            Z = None
+            # Conservative guard without materializing Z: |Z_PQ| <= max_P ||Y_P||^2.
+            try:
+                y_finite = bool(cp.all(cp.isfinite(Y)).item())
+            except Exception:  # pragma: no cover
+                y_finite = True
+            if not bool(y_finite):
+                raise ValueError(
+                    "fit_metric produced non-finite Y entries. "
+                    "This usually indicates an ill-conditioned THC grid; try grid_kind='rdvr' with angular_prune=True "
+                    "and/or increase thc_npt / angular_n."
+                )
+            max_row_norm_sq = float(cp.max(cp.sum((Y * Y), axis=1)).item()) if int(Y.size) else 0.0
+            if not np.isfinite(max_row_norm_sq) or max_row_norm_sq > 1e12:
+                raise ValueError(
+                    f"fit_metric produced huge Y row norms (max||Y_row||^2={max_row_norm_sq:.3e}). "
+                    "This usually indicates an ill-conditioned THC grid; try grid_kind='rdvr' with angular_prune=True "
+                    "and/or increase thc_npt / angular_n."
+                )
         return Y, Z
 
     if solve_s in fit_metric_gram_methods:
@@ -385,8 +419,11 @@ def _build_Z_from_aux_metric(cp, X_aux_p, L, *, solve_method: str, solve_rcond: 
             Gm = Gm + lam * cp.eye(int(Gm.shape[0]), dtype=cp.float64)
         G = cp.linalg.solve(Gm, L)
         Y = cp.ascontiguousarray(X_aux_p @ G)
-        Z = cp.ascontiguousarray(Y @ Y.T)
-        Z = 0.5 * (Z + Z.T)
+        if store_Z:
+            Z = cp.ascontiguousarray(Y @ Y.T)
+            Z = 0.5 * (Z + Z.T)
+        else:
+            Z = None
         return Y, Z
 
     raise ValueError("unsupported solve_method for local-THC Z build")
@@ -408,6 +445,7 @@ def build_local_thc_factors(
     metric_mode: str = "warp",
     metric_threads: int = 256,
     solve_method: str = "fit_metric_qr",
+    store_Z: bool = True,
     stream: Any = None,
     profile: dict | None = None,
 ) -> LocalTHCFactors:
@@ -811,9 +849,10 @@ def build_local_thc_factors(
         )
         L = cueri_df.cholesky_metric(V)
 
-        Y, Z = _build_Z_from_aux_metric(cp, X_aux_p, L, solve_method=str(solve_method))
+        Y, Z = _build_Z_from_aux_metric(cp, X_aux_p, L, solve_method=str(solve_method), store_Z=bool(store_Z))
         Y = cp.ascontiguousarray(cp.asarray(Y, dtype=z_dtype))
-        Z = cp.ascontiguousarray(cp.asarray(Z, dtype=z_dtype))
+        if Z is not None:
+            Z = cp.ascontiguousarray(cp.asarray(Z, dtype=z_dtype))
 
         # Sanity: X columns must match local AO count.
         if int(X.shape[1]) != int(ao_idx_global_np.size):

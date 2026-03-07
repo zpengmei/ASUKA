@@ -1322,8 +1322,14 @@ def uhf_df(
     dm0=None,
     mo_coeff0=None,
     profile: dict | None = None,
+    xc_spec=None,
+    xc_grid_coords=None,
+    xc_grid_weights=None,
+    xc_ao_basis=None,
+    xc_sph_transform=None,
+    xc_batch_size: int = 50000,
 ):
-    """UHF SCF with DF ERIs in AO basis."""
+    """UHF/UKS SCF with DF ERIs in AO basis."""
 
     jk_mode_s = str(jk_mode).strip().lower()
     if jk_mode_s not in {"materialized", "streamed", "auto"}:
@@ -1628,8 +1634,20 @@ def uhf_df(
         if profile is not None:
             profile["scf"]["jk_ms"] += _time_ms_end(xp, t)
 
-        Fa = _symmetrize(xp, h + J - Ka)
-        Fb = _symmetrize(xp, h + J - Kb)
+        # UKS: add XC potential
+        _E_xc_u = 0.0
+        if xc_spec is not None:
+            from asuka.xc.numint import build_vxc_u as _build_vxc_u
+            _cx_u = float(xc_spec.cx_hf)
+            _Vxc_a, _Vxc_b, _E_xc_u = _build_vxc_u(
+                xc_spec, Da, Db, xc_ao_basis, xc_grid_coords, xc_grid_weights,
+                batch_size=int(xc_batch_size), sph_transform=xc_sph_transform,
+            )
+            Fa = _symmetrize(xp, h + J - _cx_u * Ka + _Vxc_a)
+            Fb = _symmetrize(xp, h + J - _cx_u * Kb + _Vxc_b)
+        else:
+            Fa = _symmetrize(xp, h + J - Ka)
+            Fb = _symmetrize(xp, h + J - Kb)
 
         if diis_a is not None and cycle >= int(diis_start_cycle):
             t = _time_ms_start(xp)
@@ -1661,8 +1679,13 @@ def uhf_df(
         Dtot_new = Da_new + Db_new
         e_one = float(xp.trace(Dtot_new @ h).item())
         e_coul = float(0.5 * xp.trace(Dtot_new @ J).item())
-        e_ex = float(0.5 * xp.trace(Da_new @ Ka).item() + 0.5 * xp.trace(Db_new @ Kb).item())
-        e_elec = e_one + e_coul - e_ex
+        e_ex_a = float(0.5 * xp.trace(Da_new @ Ka).item())
+        e_ex_b = float(0.5 * xp.trace(Db_new @ Kb).item())
+        if xc_spec is not None:
+            _cx_e = float(xc_spec.cx_hf)
+            e_elec = e_one + e_coul - _cx_e * (e_ex_a + e_ex_b) + _E_xc_u
+        else:
+            e_elec = e_one + e_coul - (e_ex_a + e_ex_b)
         e_tot = float(e_elec + float(enuc))
 
         dm_err = float(xp.linalg.norm(Da_new - Da).item() + xp.linalg.norm(Db_new - Db).item())
@@ -1680,7 +1703,7 @@ def uhf_df(
     if profile is not None:
         profile["scf"]["iters"] = int(cycle)
     return SCFResult(
-        method="UHF",
+        method="UKS" if xc_spec is not None else "UHF",
         converged=bool(converged),
         niter=int(cycle),
         e_tot=float(e_last if e_last is not None else float("nan")),

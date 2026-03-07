@@ -1,14 +1,8 @@
 """Parameter tables for Minnesota meta-GGA functionals.
-
-All parameters sourced from libxc 6.x C source files:
-  Exchange: mgga_x_m06l.c, hyb_mgga_x_m05.c, mgga_x_mn12.c
-  Correlation: mgga_c_m06l.c, mgga_c_m08.c
 """
 from __future__ import annotations
 
 # ── M06 family exchange parameters ─────────────────────────────────────
-# From mgga_x_m06l.c (par_m06l, par_m06) and hyb_mgga_x_m05.c (par_m06_2x)
-# struct: a[12] (w-series), d[6] (GVT4), alpha=0.00186726
 
 M06_X_ALPHA = 0.00186726
 
@@ -38,8 +32,6 @@ M06_2X_X_A = (
 M06_2X_X_D = (0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
 
 # ── M06 family correlation parameters ──────────────────────────────────
-# From mgga_c_m06l.c: gamma_ss, gamma_ab, alpha_ss, alpha_ab,
-#   css[5], cab[5], dss[6], dab[6], Fermi_D_cnst
 
 M06_C_GAMMA_SS = 0.06
 M06_C_GAMMA_AB = 0.0031
@@ -63,7 +55,7 @@ M06_2X_C_DSS = (6.902145e-01, 9.847204e-02, 2.214797e-01, -1.968264e-03, -6.7754
 M06_2X_C_DAB = (1.166404e-01, -9.120847e-02, -6.726189e-02, 6.720580e-05, 8.448011e-04, 0.0)
 
 # ── MN15 exchange parameters ──────────────────────────────────────────
-# From mgga_x_mn12.c (par_mn15), 40 coefficients in (ux, vx, w) polynomial
+
 MN15_X_GAMMA = 0.004
 MN15_X_OMEGA = 2.5
 
@@ -81,7 +73,7 @@ MN15_X_CC = (
 )
 
 # ── MN15 correlation parameters ───────────────────────────────────────
-# From mgga_c_m08.c (par_mn15): a[12], b[12] (w-series for PW-LDA and PBE-c)
+
 MN15_C_A = (
     1.093250748, -0.269735037, 6.368997613, -0.245337101, -1.587103441, 0.124698862,
     1.605819855, 0.466206031, 3.484978654, 0.0, 0.0, 0.0,

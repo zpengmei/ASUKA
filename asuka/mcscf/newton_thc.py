@@ -100,7 +100,7 @@ def build_thc_newton_eris(
         C_core = mo[:, : int(ncore)]
         D_core = 2.0 * (C_core @ C_core.T)
         if isinstance(thc, THCFactors):
-            Jc, Kc = thc_JK(D_core, thc.X, thc.Z, work=THCJKWork(q_block=int(max(1, q_block))))
+            Jc, Kc = thc_JK(D_core, thc.X, thc.Z, work=THCJKWork(q_block=int(max(1, q_block))), Y=thc.Y)
         else:
             Jc, Kc = local_thc_JK(D_core, thc, q_block=int(max(1, q_block)))
         v_ao = cp.asarray(Jc - 0.5 * Kc, dtype=cp.float64)

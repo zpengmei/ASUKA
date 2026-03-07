@@ -39,8 +39,9 @@ class THCFactors:
         Factor of the central metric with shape (npt, naux) such that
         ``Z = Y @ Y.T`` (up to numerical symmetrization). Here ``naux`` is
         the size of the auxiliary basis used in the metric build.
-    Z : cupy.ndarray
-        Central metric with shape (npt, npt), symmetric.
+    Z : cupy.ndarray | None
+        Optional dense central metric with shape (npt, npt), symmetric. When
+        omitted, downstream code should use ``Y`` and form ``Z`` actions lazily.
     points : cupy.ndarray
         Grid points (npt,3) in Bohr.
     weights : cupy.ndarray
@@ -52,7 +53,7 @@ class THCFactors:
 
     X: Any
     Y: Any
-    Z: Any
+    Z: Any | None
     points: Any
     weights: Any
     L_metric: Any
@@ -251,11 +252,13 @@ def build_thc_factors(
     # Linear solve for Y
     solve_method: str = "fit_metric_qr",
     solve_rcond: float | None = 1e-12,
+    # Optional dense Z storage
+    store_Z: bool = True,
     # GPU execution
     stream: Any = None,
     profile: dict | None = None,
 ) -> THCFactors:
-    """Build THC factors (X,Z) on GPU.
+    """Build THC factors (X,Y[,Z]) on GPU.
 
     Parameters
     ----------
@@ -585,7 +588,7 @@ def build_thc_factors(
     if prof is not None and t_metric is not None:
         _profile_ms_set(prof, "metric_ms", (time.perf_counter() - float(t_metric)) * 1000.0)
 
-    # ---- Assemble Z ----
+    # ---- Assemble Y (and optionally Z) ----
     #
     # Default and recommended: build the point-space Coulomb kernel via the
     # auxiliary metric inverse:
@@ -597,6 +600,7 @@ def build_thc_factors(
     if not np.isfinite(rcond) or rcond <= 0.0:
         raise ValueError("solve_rcond must be a finite, positive float")
 
+    store_Z = bool(store_Z)
     if solve_s in inv_metric_methods:
         t_solve = time.perf_counter() if prof is not None else None
         try:
@@ -608,8 +612,11 @@ def build_thc_factors(
 
         # Y = X_aux V^{-1/2} = X_aux L^{-T}  (npt,naux)
         Y = cp.ascontiguousarray(Xw_T.T)
-        Z = cp.ascontiguousarray(Y @ Y.T)
-        Z = 0.5 * (Z + Z.T)
+        if store_Z:
+            Z = cp.ascontiguousarray(Y @ Y.T)
+            Z = 0.5 * (Z + Z.T)
+        else:
+            Z = None
         del Xw_T
         _sync_if_profile()
         if prof is not None and t_solve is not None:
@@ -641,8 +648,11 @@ def build_thc_factors(
             G = cp.linalg.solve(R.T, L)
             Y = cp.ascontiguousarray(Q @ G)
             del G
-        Z = cp.ascontiguousarray(Y @ Y.T)
-        Z = 0.5 * (Z + Z.T)
+        if store_Z:
+            Z = cp.ascontiguousarray(Y @ Y.T)
+            Z = 0.5 * (Z + Z.T)
+        else:
+            Z = None
         del Q, R
         _sync_if_profile()
         if prof is not None and t_solve is not None:
@@ -661,8 +671,11 @@ def build_thc_factors(
             Gm = Gm + lam * cp.eye(int(Gm.shape[0]), dtype=cp.float64)
         G = cp.linalg.solve(Gm, L)
         Y = cp.ascontiguousarray(X_aux_p @ G)
-        Z = cp.ascontiguousarray(Y @ Y.T)
-        Z = 0.5 * (Z + Z.T)
+        if store_Z:
+            Z = cp.ascontiguousarray(Y @ Y.T)
+            Z = 0.5 * (Z + Z.T)
+        else:
+            Z = None
         del Gm, G
         _sync_if_profile()
         if prof is not None and t_solve is not None:
@@ -676,23 +689,45 @@ def build_thc_factors(
 
     if solve_s in fit_metric_qr_methods or solve_s in fit_metric_gram_methods:
         # Fail fast on pathological fits (typically caused by ill-conditioned grids).
-        try:
-            z_finite = bool(cp.all(cp.isfinite(Z)).item())
-        except Exception:  # pragma: no cover
-            z_finite = True
-        if not bool(z_finite):
-            raise ValueError(
-                "fit_metric produced non-finite Z entries. "
-                "This usually indicates an ill-conditioned THC grid; try grid_kind='rdvr' with angular_prune=True "
-                "and/or increase thc_npt / angular_n."
-            )
-        z_max = float(cp.max(cp.abs(Z)).item()) if int(Z.size) else 0.0
-        if not np.isfinite(z_max) or z_max > 1e12:
-            raise ValueError(
-                f"fit_metric produced huge Z values (max|Z|={z_max:.3e}). "
-                "This usually indicates an ill-conditioned THC grid; try grid_kind='rdvr' with angular_prune=True "
-                "and/or increase thc_npt / angular_n."
-            )
+        if store_Z:
+            assert Z is not None
+            try:
+                z_finite = bool(cp.all(cp.isfinite(Z)).item())
+            except Exception:  # pragma: no cover
+                z_finite = True
+            if not bool(z_finite):
+                raise ValueError(
+                    "fit_metric produced non-finite Z entries. "
+                    "This usually indicates an ill-conditioned THC grid; try grid_kind='rdvr' with angular_prune=True "
+                    "and/or increase thc_npt / angular_n."
+                )
+            z_max = float(cp.max(cp.abs(Z)).item()) if int(Z.size) else 0.0
+            if not np.isfinite(z_max) or z_max > 1e12:
+                raise ValueError(
+                    f"fit_metric produced huge Z values (max|Z|={z_max:.3e}). "
+                    "This usually indicates an ill-conditioned THC grid; try grid_kind='rdvr' with angular_prune=True "
+                    "and/or increase thc_npt / angular_n."
+                )
+        else:
+            # When we do not materialize dense Z, use a safe bound:
+            #   |Z_PQ| = |<Y_P, Y_Q>| <= max_P ||Y_P||^2
+            try:
+                y_finite = bool(cp.all(cp.isfinite(Y)).item())
+            except Exception:  # pragma: no cover
+                y_finite = True
+            if not bool(y_finite):
+                raise ValueError(
+                    "fit_metric produced non-finite Y entries. "
+                    "This usually indicates an ill-conditioned THC grid; try grid_kind='rdvr' with angular_prune=True "
+                    "and/or increase thc_npt / angular_n."
+                )
+            max_row_norm_sq = float(cp.max(cp.sum((Y * Y), axis=1)).item()) if int(Y.size) else 0.0
+            if not np.isfinite(max_row_norm_sq) or max_row_norm_sq > 1e12:
+                raise ValueError(
+                    f"fit_metric produced huge Y row norms (max||Y_row||^2={max_row_norm_sq:.3e}). "
+                    "This usually indicates an ill-conditioned THC grid; try grid_kind='rdvr' with angular_prune=True "
+                    "and/or increase thc_npt / angular_n."
+                )
 
     meta: dict[str, Any] = {
         "grid_kind": str(grid_kind_s),
@@ -702,6 +737,7 @@ def build_thc_factors(
         "solve_method": str(solve_method),
         "solve_rcond": float(rcond),
         "downselected": bool(downselected),
+        "store_Z": bool(store_Z),
     }
     if point_atom is not None:
         meta["point_atom"] = point_atom

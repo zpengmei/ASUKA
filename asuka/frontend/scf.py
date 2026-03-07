@@ -1229,6 +1229,11 @@ def run_rhf_thc(
     thc_grid_options: Any | None = None,
     thc_npt: int | None = None,
     thc_solve_method: str = "fit_metric_qr",
+    thc_mp_mode: str = "fp64",
+    thc_store_Z: bool | None = None,
+    thc_rebase_dD_rel_tol: float = 0.25,
+    thc_rebase_min_cycle: int = 2,
+    thc_tc_balance: bool = True,
     # Density-difference reference
     use_density_difference: bool = True,
     df_warmup_cycles: int = 2,
@@ -1375,6 +1380,17 @@ def run_rhf_thc(
     thc_mode_s = str(thc_mode).strip().lower()
     thc_prof = profile.setdefault("thc_build", {}) if profile is not None else None
 
+    thc_mp_mode_s = str(thc_mp_mode).strip().lower()
+    if thc_mp_mode_s not in {"fp64", "tf32"}:
+        raise ValueError("thc_mp_mode must be 'fp64' or 'tf32'")
+    if thc_store_Z is None:
+        store_Z_eff = bool(thc_mp_mode_s != "tf32")
+    else:
+        store_Z_eff = bool(thc_store_Z)
+    if thc_prof is not None:
+        thc_prof.setdefault("mp_mode", str(thc_mp_mode_s))
+        thc_prof.setdefault("store_Z", bool(store_Z_eff))
+
     thc_factors = None
     L_metric_full = None
 
@@ -1395,6 +1411,7 @@ def run_rhf_thc(
             metric_mode=str(cfg.mode),
             metric_threads=int(cfg.threads),
             solve_method=str(thc_solve_method),
+            store_Z=bool(store_Z_eff),
             stream=cfg.stream,
             profile=thc_prof,
         )
@@ -1440,6 +1457,7 @@ def run_rhf_thc(
             metric_mode=str(cfg.mode),
             metric_threads=int(cfg.threads),
             solve_method=str(thc_solve_method),
+            store_Z=bool(store_Z_eff),
             stream=cfg.stream,
             profile=thc_prof,
         )
@@ -1559,6 +1577,10 @@ def run_rhf_thc(
             damping=float(damping),
             level_shift=float(level_shift),
             q_block=int(q_block),
+            mp_mode=str(thc_mp_mode_s),
+            rebase_dD_rel_tol=float(thc_rebase_dD_rel_tol),
+            rebase_min_cycle=int(thc_rebase_min_cycle),
+            tc_balance=bool(thc_tc_balance),
             dm0=dm0_thc,
             mo_coeff0=mo_coeff_thc0,
             init_fock_cycles=int(init_fock_cycles_i),
@@ -1589,6 +1611,10 @@ def run_rhf_thc(
             damping=float(damping),
             level_shift=float(level_shift),
             q_block=int(q_block),
+            mp_mode=str(thc_mp_mode_s),
+            rebase_dD_rel_tol=float(thc_rebase_dD_rel_tol),
+            rebase_min_cycle=int(thc_rebase_min_cycle),
+            tc_balance=bool(thc_tc_balance),
             dm0=dm0_thc,
             mo_coeff0=mo_coeff_thc0,
             init_fock_cycles=int(init_fock_cycles_i),
@@ -1680,6 +1706,11 @@ def run_uhf_thc(
     thc_local_config: Any | None = None,
     thc_npt: int | None = None,
     thc_solve_method: str = "fit_metric_qr",
+    thc_mp_mode: str = "fp64",
+    thc_store_Z: bool | None = None,
+    thc_rebase_dD_rel_tol: float = 0.25,
+    thc_rebase_min_cycle: int = 2,
+    thc_tc_balance: bool = True,
     # Density-difference reference
     use_density_difference: bool = True,
     df_warmup_cycles: int = 2,
@@ -1697,8 +1728,13 @@ def run_uhf_thc(
     dm0: Any | None = None,
     mo_coeff0: Any | None = None,
     profile: dict | None = None,
+    # DFT (optional)
+    functional: str | None = None,
+    grid_radial_n: int = 75,
+    grid_angular_n: int = 590,
+    xc_batch_size: int = 50000,
 ) -> UHFDFRunResult:
-    """Run UHF with THC J/K."""
+    """Run UHF (or UKS-DFT if ``functional`` is given) with THC J/K."""
 
     nalpha, nbeta = _nalpha_nbeta_from_mol(mol)
     basis_in = mol.basis if basis is None else basis
@@ -1718,6 +1754,29 @@ def run_uhf_thc(
     int1e_scf, _B_unused, sph_map = _apply_sph_transform(mol, int1e, None, ao_basis, df_B_layout="mnQ")
     df_ao_rep = "cart" if bool(mol.cart) else "sph"
 
+    # DFT setup (optional)
+    xc_spec = None
+    xc_grid_coords = None
+    xc_grid_weights = None
+    xc_sph_transform = None
+    if functional is not None:
+        from asuka.xc.functional import get_functional
+        from asuka.density.grids_device import make_becke_grid_device
+
+        xc_spec = get_functional(functional)
+        xc_grid_coords, xc_grid_weights = make_becke_grid_device(
+            mol, radial_n=int(grid_radial_n), angular_n=int(grid_angular_n),
+            radial_scheme="treutler",
+        )
+        if not bool(mol.cart) and sph_map is not None:
+            import cupy as _cp_xc  # noqa: PLC0415
+            if hasattr(sph_map, "T_c2s"):
+                xc_sph_transform = _cp_xc.asarray(sph_map.T_c2s, dtype=_cp_xc.float64)
+            elif hasattr(sph_map, "T_matrix"):
+                xc_sph_transform = _cp_xc.asarray(sph_map.T_matrix, dtype=_cp_xc.float64)
+            elif isinstance(sph_map, tuple) and len(sph_map) >= 1:
+                xc_sph_transform = _cp_xc.asarray(sph_map[0], dtype=_cp_xc.float64)
+
     # Grid kind selection (Becke vs DVR).
     grid_kind_s = str(thc_grid_kind).strip().lower()
     dvr_basis_cart = None
@@ -1736,6 +1795,18 @@ def run_uhf_thc(
     # Build THC factors (global THC or local-THC/LS-THC-style blocks).
     thc_mode_s = str(thc_mode).strip().lower()
     thc_prof = profile.setdefault("thc_build", {}) if profile is not None else None
+
+    thc_mp_mode_s = str(thc_mp_mode).strip().lower()
+    if thc_mp_mode_s not in {"fp64", "tf32"}:
+        raise ValueError("thc_mp_mode must be 'fp64' or 'tf32'")
+    if thc_store_Z is None:
+        store_Z_eff = bool(thc_mp_mode_s != "tf32")
+    else:
+        store_Z_eff = bool(thc_store_Z)
+    if thc_prof is not None:
+        thc_prof.setdefault("mp_mode", str(thc_mp_mode_s))
+        thc_prof.setdefault("store_Z", bool(store_Z_eff))
+
     thc_factors = None
     L_metric_full = None
 
@@ -1756,6 +1827,7 @@ def run_uhf_thc(
             metric_mode=str(cfg.mode),
             metric_threads=int(cfg.threads),
             solve_method=str(thc_solve_method),
+            store_Z=bool(store_Z_eff),
             stream=cfg.stream,
             profile=thc_prof,
         )
@@ -1801,6 +1873,7 @@ def run_uhf_thc(
             metric_mode=str(cfg.mode),
             metric_threads=int(cfg.threads),
             solve_method=str(thc_solve_method),
+            store_Z=bool(store_Z_eff),
             stream=cfg.stream,
             profile=thc_prof,
         )
@@ -1847,6 +1920,12 @@ def run_uhf_thc(
             L_metric=L_metric_full,
             mo_coeff0=mo_coeff0,
             profile=warm_prof,
+            xc_spec=xc_spec,
+            xc_grid_coords=xc_grid_coords,
+            xc_grid_weights=xc_grid_weights,
+            xc_ao_basis=ao_basis,
+            xc_sph_transform=xc_sph_transform,
+            xc_batch_size=int(xc_batch_size),
         )
         Ca_ref, Cb_ref = warm.mo_coeff
         occ_a_ref, occ_b_ref = warm.mo_occ
@@ -1909,10 +1988,20 @@ def run_uhf_thc(
             diis_space=int(diis_space),
             damping=float(damping),
             q_block=int(q_block),
+            mp_mode=str(thc_mp_mode_s),
+            rebase_dD_rel_tol=float(thc_rebase_dD_rel_tol),
+            rebase_min_cycle=int(thc_rebase_min_cycle),
+            tc_balance=bool(thc_tc_balance),
             dm0=dm0,
             mo_coeff0=mo_coeff_thc0,
             reference=ref,
             profile=profile,
+            xc_spec=xc_spec,
+            xc_grid_coords=xc_grid_coords,
+            xc_grid_weights=xc_grid_weights,
+            xc_ao_basis=ao_basis,
+            xc_sph_transform=xc_sph_transform,
+            xc_batch_size=int(xc_batch_size),
         )
     else:
         from asuka.hf.local_thc_scf import uhf_local_thc  # noqa: PLC0415
@@ -1932,10 +2021,20 @@ def run_uhf_thc(
             diis_space=int(diis_space),
             damping=float(damping),
             q_block=int(q_block),
+            mp_mode=str(thc_mp_mode_s),
+            rebase_dD_rel_tol=float(thc_rebase_dD_rel_tol),
+            rebase_min_cycle=int(thc_rebase_min_cycle),
+            tc_balance=bool(thc_tc_balance),
             dm0=dm0,
             mo_coeff0=mo_coeff_thc0,
             reference=ref,
             profile=profile,
+            xc_spec=xc_spec,
+            xc_grid_coords=xc_grid_coords,
+            xc_grid_weights=xc_grid_weights,
+            xc_ao_basis=ao_basis,
+            xc_sph_transform=xc_sph_transform,
+            xc_batch_size=int(xc_batch_size),
         )
 
     return UHFDFRunResult(
@@ -1952,7 +2051,7 @@ def run_uhf_thc(
         df_L=L_metric_full,
         thc_factors=thc_factors,
         thc_run_config=_make_thc_run_config(
-            hf_method="uhf",
+            hf_method="uks" if functional is not None else "uhf",
             basis=basis_in,
             auxbasis=auxbasis,
             df_config=cfg,
@@ -1997,6 +2096,11 @@ def run_rohf_thc(
     thc_local_config: Any | None = None,
     thc_npt: int | None = None,
     thc_solve_method: str = "fit_metric_qr",
+    thc_mp_mode: str = "fp64",
+    thc_store_Z: bool | None = None,
+    thc_rebase_dD_rel_tol: float = 0.25,
+    thc_rebase_min_cycle: int = 2,
+    thc_tc_balance: bool = True,
     # Density-difference reference
     use_density_difference: bool = True,
     df_warmup_cycles: int = 2,
@@ -2056,6 +2160,18 @@ def run_rohf_thc(
     # Build THC factors (global THC or local-THC/LS-THC-style blocks).
     thc_mode_s = str(thc_mode).strip().lower()
     thc_prof = profile.setdefault("thc_build", {}) if profile is not None else None
+
+    thc_mp_mode_s = str(thc_mp_mode).strip().lower()
+    if thc_mp_mode_s not in {"fp64", "tf32"}:
+        raise ValueError("thc_mp_mode must be 'fp64' or 'tf32'")
+    if thc_store_Z is None:
+        store_Z_eff = bool(thc_mp_mode_s != "tf32")
+    else:
+        store_Z_eff = bool(thc_store_Z)
+    if thc_prof is not None:
+        thc_prof.setdefault("mp_mode", str(thc_mp_mode_s))
+        thc_prof.setdefault("store_Z", bool(store_Z_eff))
+
     thc_factors = None
     L_metric_full = None
 
@@ -2076,6 +2192,7 @@ def run_rohf_thc(
             metric_mode=str(cfg.mode),
             metric_threads=int(cfg.threads),
             solve_method=str(thc_solve_method),
+            store_Z=bool(store_Z_eff),
             stream=cfg.stream,
             profile=thc_prof,
         )
@@ -2121,6 +2238,7 @@ def run_rohf_thc(
             metric_mode=str(cfg.mode),
             metric_threads=int(cfg.threads),
             solve_method=str(thc_solve_method),
+            store_Z=bool(store_Z_eff),
             stream=cfg.stream,
             profile=thc_prof,
         )
@@ -2229,6 +2347,10 @@ def run_rohf_thc(
             diis_space=int(diis_space),
             damping=float(damping),
             q_block=int(q_block),
+            mp_mode=str(thc_mp_mode_s),
+            rebase_dD_rel_tol=float(thc_rebase_dD_rel_tol),
+            rebase_min_cycle=int(thc_rebase_min_cycle),
+            tc_balance=bool(thc_tc_balance),
             dm0=dm0,
             mo_coeff0=mo_coeff_thc0,
             reference=ref,
@@ -2252,6 +2374,10 @@ def run_rohf_thc(
             diis_space=int(diis_space),
             damping=float(damping),
             q_block=int(q_block),
+            mp_mode=str(thc_mp_mode_s),
+            rebase_dD_rel_tol=float(thc_rebase_dD_rel_tol),
+            rebase_min_cycle=int(thc_rebase_min_cycle),
+            tc_balance=bool(thc_tc_balance),
             dm0=dm0,
             mo_coeff0=mo_coeff_thc0,
             reference=ref,
@@ -2327,8 +2453,8 @@ def run_hf_df(
 
     method_s = str(method).strip().lower()
     backend_s = str(backend).strip().lower()
-    if method_s not in {"rhf", "uhf", "rohf"}:
-        raise ValueError("method must be one of: 'rhf', 'uhf', 'rohf'")
+    if method_s not in {"rhf", "uhf", "rohf", "rks", "uks"}:
+        raise ValueError("method must be one of: 'rhf', 'uhf', 'rohf', 'rks', 'uks'")
     if backend_s not in {"cpu", "cuda"}:
         raise ValueError("backend must be 'cpu' or 'cuda'")
 
@@ -2345,6 +2471,25 @@ def run_hf_df(
         two_e = str(two_e_backend).strip().lower()
         if two_e not in {"df", "dense", "thc"}:
             raise ValueError("two_e_backend must be one of: 'df', 'dense', 'thc'")
+
+    if method_s in {"rks", "uks"}:
+        if backend_s != "cuda":
+            raise NotImplementedError("RKS/UKS currently require backend='cuda'")
+        if two_e == "dense":
+            raise NotImplementedError("RKS/UKS currently do not support two_e_backend='dense'")
+
+        dft_kwargs = dict(kwargs)
+        xc_name = dft_kwargs.pop("functional", "mn15")
+
+        if two_e == "df":
+            if method_s == "rks":
+                return run_rks_df(mol, functional=str(xc_name), dm0=dm0, mo_coeff0=mo_coeff0, **dft_kwargs)
+            return run_uks_df(mol, functional=str(xc_name), dm0=dm0, mo_coeff0=mo_coeff0, **dft_kwargs)
+
+        # THC (global or local selected via thc_mode in kwargs)
+        if method_s == "rks":
+            return run_rhf_thc(mol, functional=str(xc_name), dm0=dm0, mo_coeff0=mo_coeff0, **dft_kwargs)
+        return run_uhf_thc(mol, functional=str(xc_name), dm0=dm0, mo_coeff0=mo_coeff0, **dft_kwargs)
 
     if two_e == "dense":
         dense_kwargs = dict(kwargs)
@@ -2567,6 +2712,8 @@ def run_rks_df(
     init_fock_cycles: int | None = None,
     grid_radial_n: int = 75,
     grid_angular_n: int = 590,
+    xc_grid_coords: Any | None = None,
+    xc_grid_weights: Any | None = None,
     xc_batch_size: int = 50000,
     profile: dict | None = None,
 ) -> RHFDFRunResult:
@@ -2620,11 +2767,16 @@ def run_rks_df(
         int1e_scf, _B_unused, sph_map = _apply_sph_transform(mol, int1e, None, ao_basis, df_B_layout=str(df_layout))
         B_scf = B
 
-    # Build DFT grid on device
-    grid_coords, grid_weights = make_becke_grid_device(
-        mol, radial_n=int(grid_radial_n), angular_n=int(grid_angular_n),
-        radial_scheme="treutler",
-    )
+    # Build DFT grid on device (or use caller-supplied grid)
+    import cupy as _cp_grid
+    if xc_grid_coords is not None and xc_grid_weights is not None:
+        grid_coords = _cp_grid.asarray(xc_grid_coords, dtype=_cp_grid.float64)
+        grid_weights = _cp_grid.asarray(xc_grid_weights, dtype=_cp_grid.float64)
+    else:
+        grid_coords, grid_weights = make_becke_grid_device(
+            mol, radial_n=int(grid_radial_n), angular_n=int(grid_angular_n),
+            radial_scheme="treutler",
+        )
 
     # Spherical transform for XC builder
     xc_sph_transform = None
@@ -2710,6 +2862,34 @@ def run_rks(
         return run_rhf_thc(mol, functional=functional, thc_mode="global", **kwargs)
     if int_s in {"local-thc", "local_thc", "lthc"}:
         return run_rhf_thc(mol, functional=functional, thc_mode="local", **kwargs)
+    raise ValueError(f"Unknown integral backend: {integral!r}. Use 'df', 'thc', or 'local-thc'.")
+
+
+def run_uks(
+    mol: Molecule,
+    *,
+    functional: str = "mn15",
+    backend: str = "cuda",
+    integral: str = "df",
+    **kwargs,
+) -> UHFDFRunResult:
+    """Unified UKS-DFT entrypoint.
+
+    Parameters
+    ----------
+    integral : str
+        Integral backend: 'df' (density fitting), 'thc' (global THC),
+        'local-thc' (local THC).
+    """
+    if str(backend).strip().lower() != "cuda":
+        raise NotImplementedError("UKS currently requires backend='cuda'")
+    int_s = str(integral).strip().lower()
+    if int_s == "df":
+        return run_uks_df(mol, functional=functional, **kwargs)
+    if int_s in {"thc", "global-thc", "global_thc"}:
+        return run_uhf_thc(mol, functional=functional, thc_mode="global", **kwargs)
+    if int_s in {"local-thc", "local_thc", "lthc"}:
+        return run_uhf_thc(mol, functional=functional, thc_mode="local", **kwargs)
     raise ValueError(f"Unknown integral backend: {integral!r}. Use 'df', 'thc', or 'local-thc'.")
 
 
@@ -3102,6 +3282,153 @@ def run_uhf_df(
     )
 
 
+def run_uks_df(
+    mol: Molecule,
+    *,
+    functional: str = "mn15",
+    basis: Any | None = None,
+    auxbasis: Any = "autoaux",
+    df_config: "CuERIDFConfig | None" = None,
+    df_layout: str = "mnQ",
+    expand_contractions: bool = True,
+    max_cycle: int = 100,
+    conv_tol: float = 1e-10,
+    conv_tol_dm: float = 1e-8,
+    diis: bool = True,
+    diis_start_cycle: int = 2,
+    diis_space: int = 8,
+    damping: float = 0.0,
+    k_q_block: int = 128,
+    grid_radial_n: int = 75,
+    grid_angular_n: int = 590,
+    xc_grid_coords: Any | None = None,
+    xc_grid_weights: Any | None = None,
+    xc_batch_size: int = 50000,
+    dm0: Any | None = None,
+    mo_coeff0: Any | None = None,
+    profile: dict | None = None,
+) -> UHFDFRunResult:
+    """Run UKS-DFT with DF integrals and a meta-GGA functional (MN15/M06/M06-2X/M06-L).
+
+    Open-shell (spin-polarized) analogue of run_rks_df, using the full
+    spin-polarized meta-GGA form (rho_a/rho_b, sigma_aa/sigma_ab/sigma_bb,
+    tau_a/tau_b) to build V_xc and E_xc.
+    """
+    from asuka.xc.functional import get_functional
+    from asuka.density.grids_device import make_becke_grid_device
+
+    xc_spec = get_functional(functional)
+    nalpha, nbeta = _nalpha_nbeta_from_mol(mol)
+
+    basis_in = mol.basis if basis is None else basis
+    df_layout_s = str(df_layout).strip().lower()
+    if df_layout_s not in {"mnq", "qmn"}:
+        raise ValueError("df_layout must be one of: 'mnQ', 'Qmn'")
+    df_ao_rep = "cart" if bool(mol.cart) else "sph"
+
+    ao_basis, basis_name = build_ao_basis_cart(mol, basis=basis_in, expand_contractions=bool(expand_contractions))
+    coords, charges = _atom_coords_charges_bohr(mol)
+    int1e = build_int1e_cart(ao_basis, atom_coords_bohr=coords, atom_charges=charges)
+
+    aux_basis, auxbasis_name = _build_aux_basis_cart(
+        mol, basis_in=basis_in, auxbasis=auxbasis, expand_contractions=bool(expand_contractions),
+    )
+
+    df_prof = None
+    if profile is not None:
+        df_prof = profile.setdefault("df_build", {})
+
+    B, L_chol = build_df_B_from_cueri_packed_bases(
+        ao_basis, aux_basis, config=df_config, layout=str(df_layout_s),
+        ao_rep=str(df_ao_rep), profile=df_prof, return_L=True,
+    )
+
+    if bool(mol.cart):
+        int1e_scf, B_scf, sph_map = _apply_sph_transform(mol, int1e, B, ao_basis, df_B_layout=str(df_layout))
+    else:
+        int1e_scf, _B_unused, sph_map = _apply_sph_transform(mol, int1e, None, ao_basis, df_B_layout=str(df_layout))
+        B_scf = B
+
+    # Build DFT grid (or use caller-supplied)
+    import cupy as _cp_grid
+    if xc_grid_coords is not None and xc_grid_weights is not None:
+        grid_coords = _cp_grid.asarray(xc_grid_coords, dtype=_cp_grid.float64)
+        grid_weights = _cp_grid.asarray(xc_grid_weights, dtype=_cp_grid.float64)
+    else:
+        grid_coords, grid_weights = make_becke_grid_device(
+            mol, radial_n=int(grid_radial_n), angular_n=int(grid_angular_n),
+            radial_scheme="treutler",
+        )
+
+    xc_sph_transform = None
+    if not bool(mol.cart) and sph_map is not None:
+        import cupy as _cp_xc
+        if hasattr(sph_map, "T_c2s"):
+            xc_sph_transform = _cp_xc.asarray(sph_map.T_c2s, dtype=_cp_xc.float64)
+        elif hasattr(sph_map, "T_matrix"):
+            xc_sph_transform = _cp_xc.asarray(sph_map.T_matrix, dtype=_cp_xc.float64)
+        elif isinstance(sph_map, tuple) and len(sph_map) >= 1:
+            xc_sph_transform = _cp_xc.asarray(sph_map[0], dtype=_cp_xc.float64)
+
+    diis_start_cycle_i = int(diis_start_cycle)
+    scf = uhf_df(
+        int1e_scf.S,
+        int1e_scf.hcore,
+        B_scf,
+        nalpha=int(nalpha),
+        nbeta=int(nbeta),
+        enuc=float(mol.energy_nuc()),
+        max_cycle=int(max_cycle),
+        conv_tol=float(conv_tol),
+        conv_tol_dm=float(conv_tol_dm),
+        diis=bool(diis),
+        diis_start_cycle=int(diis_start_cycle_i),
+        diis_space=int(diis_space),
+        damping=float(damping),
+        k_q_block=int(k_q_block),
+        dm0=dm0,
+        mo_coeff0=mo_coeff0,
+        profile=profile,
+        xc_spec=xc_spec,
+        xc_grid_coords=grid_coords,
+        xc_grid_weights=grid_weights,
+        xc_ao_basis=ao_basis,
+        xc_sph_transform=xc_sph_transform,
+        xc_batch_size=int(xc_batch_size),
+    )
+
+    return UHFDFRunResult(
+        mol=mol,
+        basis_name=str(basis_name),
+        auxbasis_name=str(auxbasis_name),
+        ao_basis=ao_basis,
+        aux_basis=aux_basis,
+        int1e=int1e_scf,
+        df_B=B_scf,
+        scf=scf,
+        profile=profile,
+        sph_map=sph_map,
+        df_L=L_chol,
+        df_run_config=_make_df_run_config(
+            hf_method="uks",
+            basis=basis_in,
+            auxbasis=auxbasis,
+            df_config=df_config,
+            expand_contractions=bool(expand_contractions),
+            backend="cuda",
+            max_cycle=int(max_cycle),
+            conv_tol=float(conv_tol),
+            conv_tol_dm=float(conv_tol_dm),
+            diis=bool(diis),
+            diis_start_cycle=int(diis_start_cycle_i),
+            diis_space=int(diis_space),
+            damping=float(damping),
+            level_shift=0.0,
+            k_q_block=int(k_q_block),
+        ),
+    )
+
+
 def run_rohf_df(
     mol: Molecule,
     *,
@@ -3244,6 +3571,10 @@ __all__ = [
     "UHFDFRunResult",
     "run_hf",
     "run_hf_df",
+    "run_rks_df",
+    "run_rks",
+    "run_uks_df",
+    "run_uks",
     "run_rhf_dense",
     "run_rhf_df_cpu",
     "run_rhf_df",

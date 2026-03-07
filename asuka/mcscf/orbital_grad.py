@@ -903,28 +903,35 @@ def orbital_gradient_thc(
     dm1_act_xp = _as_xp_f64(xp, dm1_act)
     dm2_act_xp = _as_xp_f64(xp, dm2_flat)
 
-    # Core + active AO densities
+    # Core + active MO blocks
     C_core = C[:, :ncore]
     C_act = C[:, ncore:nocc]
-    if ncore:
-        D_core_ao = 2.0 * (C_core @ C_core.T)
-    else:
-        D_core_ao = xp.zeros((nao, nao), dtype=xp.float64)
-    D_act_ao = C_act @ dm1_act_xp @ C_act.T
-    D_tot_ao = D_core_ao + D_act_ao
 
     t_density = time.perf_counter() if profile is not None else 0.0
 
     if isinstance(thc, THCFactors):
-        from asuka.hf.thc_jk import THCJKWork, thc_JK  # noqa: PLC0415
+        from asuka.hf.thc_jk import THCJKWork, thc_JK_factored  # noqa: PLC0415
 
-        Jc, Kc = thc_JK(D_core_ao, thc.X, thc.Z, work=THCJKWork(q_block=int(q_block)))
-        Ja, Ka = thc_JK(D_act_ao, thc.X, thc.Z, work=THCJKWork(q_block=int(q_block)))
+        work = THCJKWork(q_block=int(q_block))
+        # D_core = 2 * C_core C_core^T  -> U=V=sqrt(2) * C_core
+        Uc = xp.sqrt(2.0) * C_core
+        Vc = Uc
+        # D_act = C_act dm1 C_act^T -> U = C_act dm1, V = C_act
+        Ua = C_act @ dm1_act_xp
+        Va = C_act
+        Jc, Kc = thc_JK_factored(Uc, Vc, thc.X, thc.Z, work=work, Y=thc.Y)
+        Ja, Ka = thc_JK_factored(Ua, Va, thc.X, thc.Z, work=work, Y=thc.Y)
     else:
-        from asuka.hf.local_thc_jk import local_thc_JK  # noqa: PLC0415
+        from asuka.hf.local_thc_jk import local_thc_JK_factored  # noqa: PLC0415
 
-        Jc, Kc = local_thc_JK(D_core_ao, thc, q_block=int(q_block))
-        Ja, Ka = local_thc_JK(D_act_ao, thc, q_block=int(q_block))
+        # D_core = 2 * C_core C_core^T  -> U=V=sqrt(2) * C_core
+        Uc = xp.sqrt(2.0) * C_core
+        Vc = Uc
+        # D_act = C_act dm1 C_act^T -> U = C_act dm1, V = C_act
+        Ua = C_act @ dm1_act_xp
+        Va = C_act
+        Jc, Kc = local_thc_JK_factored(Uc, Vc, thc, q_block=int(q_block))
+        Ja, Ka = local_thc_JK_factored(Ua, Va, thc, q_block=int(q_block))
 
     vhf_c_ao = Jc - 0.5 * Kc
     vhf_a_ao = Ja - 0.5 * Ka
@@ -991,7 +998,7 @@ def orbital_gradient_thc(
         # g_dm2[p,v] = sum_P X_mo[P,p] * t[P,v]
         g_dm2 = X_mo.T @ t_pv  # (nmo,ncas)
     else:
-        from asuka.hf.local_thc_jk import local_thc_eri_apply_batched  # noqa: PLC0415
+        from asuka.hf.local_thc_jk import local_thc_eri_apply_pairs_mo_batched  # noqa: PLC0415
 
         if dm2_arr.shape == (ncas, ncas, ncas, ncas):
             dm2_wxuv = _as_xp_f64(xp, dm2_arr)
@@ -1019,7 +1026,8 @@ def orbital_gradient_thc(
                 continue
 
             nbatch = int(wb) * int(ncas)
-            D_batch = xp.empty((nbatch, int(nao), int(nao)), dtype=xp.float64)
+            c_w_batch = xp.empty((nbatch, int(nao)), dtype=xp.float64)
+            c_x_batch = xp.empty((nbatch, int(nao)), dtype=xp.float64)
             dm2_batch = xp.empty((nbatch, int(ncas), int(ncas)), dtype=xp.float64)
 
             ib = 0
@@ -1027,19 +1035,24 @@ def orbital_gradient_thc(
                 cw = C_act[:, int(w)]
                 for x in range(int(ncas)):
                     cx = C_act[:, int(x)]
-                    D_batch[int(ib)] = 0.5 * (
-                        cw[:, None] * cx[None, :] + cx[:, None] * cw[None, :]
-                    )
+                    c_w_batch[int(ib)] = cw
+                    c_x_batch[int(ib)] = cx
                     dm2_batch[int(ib)] = dm2_wxuv[int(w), int(x)]
                     ib += 1
 
-            V_batch = local_thc_eri_apply_batched(D_batch, thc, symmetrize=True)
-            pu_batch = cached_einsum("mp,bmn,nu->bpu", C, V_batch, C_act, xp=xp)
+            pu_batch = local_thc_eri_apply_pairs_mo_batched(
+                c_w_batch,
+                c_x_batch,
+                thc,
+                C,
+                C_act,
+                symmetrize=True,
+            )
             g_dm2 += cached_einsum("bpu,buv->pv", pu_batch, dm2_batch, xp=xp)
 
-            D_batch = None
+            c_w_batch = None
+            c_x_batch = None
             dm2_batch = None
-            V_batch = None
             pu_batch = None
 
     t_gdm2 = time.perf_counter() if profile is not None else 0.0

@@ -278,7 +278,7 @@ def _frozen_core_h1e_ecore_thc(
 
     dm_core = 2.0 * (c_core @ c_core.T)
     if isinstance(thc, THCFactors):
-        j, k = thc_JK(dm_core, thc.X, thc.Z, work=THCJKWork(q_block=int(q_block)))
+        j, k = thc_JK(dm_core, thc.X, thc.Z, work=THCJKWork(q_block=int(q_block)), Y=thc.Y)
     else:
         j, k = local_thc_JK(dm_core, thc, q_block=int(q_block))
     vhf_core = j - 0.5 * k

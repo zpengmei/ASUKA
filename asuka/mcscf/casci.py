@@ -566,7 +566,7 @@ def _build_casci_thc_integrals(
         if isinstance(thc, THCFactors):
             from asuka.hf.thc_jk import THCJKWork, thc_JK  # noqa: PLC0415
 
-            Jc, Kc = thc_JK(D_core, thc.X, thc.Z, work=THCJKWork(q_block=int(q_block)))
+            Jc, Kc = thc_JK(D_core, thc.X, thc.Z, work=THCJKWork(q_block=int(q_block)), Y=thc.Y)
         else:
             from asuka.hf.local_thc_jk import local_thc_JK  # noqa: PLC0415
 

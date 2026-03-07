@@ -60,7 +60,7 @@ class RHFTHCGradComponents:
 def _thc_energy_adjoint_rhf(
     D: Any,
     X: Any,
-    Z: Any,
+    Z: Any | None,
     Y: Any,
     *,
     q_block: int = 256,
@@ -70,14 +70,13 @@ def _thc_energy_adjoint_rhf(
     Shapes
     - D: (nao,nao)
     - X: (npt,nao)
-    - Z: (npt,npt)
+    - Z: optional (npt,npt)
     - Y: (npt,naux) with Z = Y Y^T
     """
 
     cp = _require_cupy()
     D = cp.asarray(D, dtype=cp.float64)
     X = cp.asarray(X, dtype=cp.float64)
-    Z = cp.asarray(Z, dtype=cp.float64)
     Y = cp.asarray(Y, dtype=cp.float64)
 
     if D.ndim != 2 or int(D.shape[0]) != int(D.shape[1]):
@@ -86,8 +85,10 @@ def _thc_energy_adjoint_rhf(
     if X.ndim != 2 or int(X.shape[1]) != nao:
         raise ValueError("X must have shape (npt,nao)")
     npt = int(X.shape[0])
-    if Z.shape != (npt, npt):
-        raise ValueError("Z must have shape (npt,npt)")
+    if Z is not None:
+        Z = cp.asarray(Z, dtype=cp.float64)
+        if Z.shape != (npt, npt):
+            raise ValueError("Z must have shape (npt,npt)")
     if Y.ndim != 2 or int(Y.shape[0]) != npt:
         raise ValueError("Y must have shape (npt,naux)")
 
@@ -99,8 +100,11 @@ def _thc_energy_adjoint_rhf(
     # m[p] = (X D X^T)[p,p]
     m = cp.sum(A * X, axis=1)  # (npt,)
 
-    # g = Z m
-    g = Z @ m  # (npt,)
+    # g = Z m (prefer factor Y where Z = Y Y^T)
+    if Z is not None:
+        g = Z @ m  # (npt,)
+    else:
+        g = Y @ (Y.T @ m)
 
     # bar_X = 2*(diag(g) X) D  -  (Z ⊙ (X D X^T)) X D
     # Use A = X D to avoid an extra GEMM: (diag(g) X) D = diag(g) (X D) = g[:,None]*A
@@ -122,7 +126,10 @@ def _thc_energy_adjoint_rhf(
         # M[:,Q] = (X D) X_Q^T = A Xq^T
         Mq = A @ Xq.T  # (npt,nb)
 
-        Zblk = Z[:, int(q0) : int(q1)]  # (npt,nb)
+        if Z is not None:
+            Zblk = Z[:, int(q0) : int(q1)]  # (npt,nb)
+        else:
+            Zblk = Y @ Yq.T  # (npt,nb)
         Tq = Zblk * Mq  # (npt,nb)
 
         # Xq D == (X D)[Q,:] == A[Q,:]

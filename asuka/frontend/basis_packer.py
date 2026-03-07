@@ -23,6 +23,76 @@ import numpy as np
 from asuka.integrals.gto_cart import ncart, primitive_norm_cart_like_pyscf
 
 
+def _double_factorial(n: int) -> int:
+    if int(n) <= 0:
+        return 1
+    out = 1
+    for k in range(int(n), 0, -2):
+        out *= k
+    return out
+
+
+def _cart_shell_self_overlap_target_lx_l(l: int) -> float:
+    """Self-overlap target for the (lx=l,ly=0,lz=0) Cartesian component.
+
+    This matches PySCF/libcint's `cart=True` normalization conventions given
+    primitives normalized with :func:`primitive_norm_cart_like_pyscf`.
+    """
+
+    l = int(l)
+    if l < 0:
+        raise ValueError("l must be >= 0")
+    if l <= 1:
+        return 1.0
+    return float(4.0 * np.pi / float(2 * l + 1))
+
+
+def _normalize_contraction_cart_like_pyscf(l: int, exps: np.ndarray, prim_coef: np.ndarray) -> np.ndarray:
+    """Return contraction-normalized primitive coefficients for one shell.
+
+    Parameters
+    ----------
+    prim_coef
+        Primitive coefficients that already include the primitive normalization
+        factors returned by :func:`primitive_norm_cart_like_pyscf`.
+
+    Notes
+    -----
+    PySCF normalizes each contracted shell (each contraction column) in addition
+    to primitive normalization. For general contractions, the raw coefficients
+    in common basis definitions are not guaranteed to be normalized.
+    """
+
+    l = int(l)
+    if l < 0:
+        raise ValueError("l must be >= 0")
+    exps = np.asarray(exps, dtype=np.float64).ravel()
+    prim_coef = np.asarray(prim_coef, dtype=np.float64).ravel()
+    if exps.shape != prim_coef.shape:
+        raise ValueError("exps and prim_coef must have the same shape")
+    if int(exps.size) == 0:
+        raise ValueError("empty contraction")
+
+    # Overlap kernel for the (lx=l,ly=0,lz=0) component between unnormalized
+    # primitives exp(-a r^2) with coefficients that include primitive norms.
+    #
+    # ∫ x^(2l) exp(-(ai+aj) r^2) d^3r = (2l-1)!! * pi^(3/2) / (2^l * (ai+aj)^(l+3/2))
+    # so S = c^T K c where K_ij follows the expression above.
+    alpha = exps[:, None] + exps[None, :]
+    if np.any(alpha <= 0.0):
+        raise ValueError("non-positive exponent sum in contraction normalization")
+
+    c_l = float(_double_factorial(2 * l - 1)) * float(np.pi ** 1.5) / float(2**l)
+    K = c_l / np.power(alpha, float(l) + 1.5)
+    s = float(prim_coef @ (K @ prim_coef))
+    if not np.isfinite(s) or s <= 0.0:
+        raise ValueError("non-positive contraction self-overlap; check coefficients")
+
+    target = _cart_shell_self_overlap_target_lx_l(l)
+    scale = float(np.sqrt(target / s))
+    return np.ascontiguousarray(prim_coef * scale, dtype=np.float64)
+
+
 def _parse_pyscf_shell_entry(entry: Any) -> list[tuple[int, np.ndarray, np.ndarray]]:
     """Parse one basis shell entry into (l, exps, coefs) list.
 
@@ -164,7 +234,9 @@ def pack_cart_basis(
 
                 col = coefs[:, int(ctr_id)]
                 prim_exp.extend(exps.tolist())
-                prim_coef.extend((col * norm).tolist())
+                prim = np.asarray(col * norm, dtype=np.float64)
+                prim = _normalize_contraction_cart_like_pyscf(l, exps, prim)
+                prim_coef.extend(prim.tolist())
 
                 ao_cursor += int(ncart(l))
 

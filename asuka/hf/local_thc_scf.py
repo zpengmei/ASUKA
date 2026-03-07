@@ -10,6 +10,7 @@ import numpy as np
 from .df_scf import SCFResult
 from .local_thc_factors import LocalTHCFactors
 from .local_thc_jk import local_thc_J, local_thc_JK, local_thc_K_blocked
+from .thc_jk import THCPrecisionPolicy
 
 from . import df_scf as _df  # reuse orthogonalization/DIIS helpers
 
@@ -46,6 +47,10 @@ def rhf_local_thc(
     damping: float = 0.0,
     level_shift: float = 0.0,
     q_block: int = 256,
+    mp_mode: str = "fp64",
+    rebase_dD_rel_tol: float = 0.25,
+    rebase_min_cycle: int = 2,
+    tc_balance: bool = True,
     dm0=None,
     mo_coeff0=None,
     init_fock_cycles: int = 0,
@@ -108,6 +113,21 @@ def rhf_local_thc(
     e_last = None
     converged = False
 
+    mp_mode_s = str(mp_mode).strip().lower()
+    if mp_mode_s not in {"fp64", "tf32"}:
+        raise ValueError("mp_mode must be 'fp64' or 'tf32'")
+    policy_fp64 = THCPrecisionPolicy(compute_dtype=np.float64, out_dtype=np.float64, use_tf32=False, prefer_Y=True)
+    if mp_mode_s == "tf32":
+        from .thc_tc import make_local_thc_tc_cache  # noqa: PLC0415
+
+        tc_cache = make_local_thc_tc_cache(lthc, compute_dtype=np.float32, balance=bool(tc_balance))
+        policy_tc = THCPrecisionPolicy(compute_dtype=np.float32, out_dtype=np.float64, use_tf32=True, prefer_Y=True)
+    else:
+        tc_cache = None
+        policy_tc = None
+
+    n_rebase = 0
+
     if profile is not None:
         prof = profile.setdefault("scf", {})
         prof.setdefault("jk_ms", 0.0)
@@ -116,6 +136,14 @@ def rhf_local_thc(
         prof.setdefault("init_fock_ms", 0.0)
         prof.setdefault("init_fock_cycles", int(init_fock_cycles))
         prof.setdefault("init_fock_applied", False)
+        prof.setdefault("mp_mode", str(mp_mode_s))
+        prof.setdefault("tc_balance", bool(tc_balance))
+        prof.setdefault("rebase_dD_rel_tol", float(rebase_dD_rel_tol))
+        prof.setdefault("rebase_min_cycle", int(rebase_min_cycle))
+        prof.setdefault("rebases", 0)
+        if tc_cache is not None:
+            # Only lightweight metadata; per-block arrays live in the cache.
+            prof.setdefault("tc_cache_blocks", int(len(tc_cache)))
         prof.setdefault("iters", 0)
 
     init_fock_cycles = max(0, int(init_fock_cycles))
@@ -129,9 +157,28 @@ def rhf_local_thc(
             t_init = _df._time_ms_start(xp) if profile is not None else None
 
             dD = D_prev - D_ref
-            J_thc, K_thc = local_thc_JK(dD, lthc, q_block=int(q_block))
-            J = J_ref + J_thc
-            K = K_ref + K_thc
+            if mp_mode_s == "tf32":
+                rel = float(xp.linalg.norm(dD).item()) / max(float(xp.linalg.norm(D_prev).item()), 1e-30)
+                init_cycle = int(_) + 1
+                if init_cycle >= int(rebase_min_cycle) and rel > float(rebase_dD_rel_tol):
+                    J_thc, K_thc = local_thc_JK(dD, lthc, q_block=int(q_block), policy=policy_fp64, tc_cache=None)
+                    J_ref = J_ref + J_thc
+                    K_ref = K_ref + K_thc
+                    D_ref = D_prev
+                    n_rebase += 1
+                    if profile is not None:
+                        profile.setdefault("scf", {})["rebases"] = int(n_rebase)
+                    J = J_ref
+                    K = K_ref
+                else:
+                    assert policy_tc is not None and tc_cache is not None
+                    J_thc, K_thc = local_thc_JK(dD, lthc, q_block=int(q_block), policy=policy_tc, tc_cache=tc_cache)
+                    J = J_ref + J_thc
+                    K = K_ref + K_thc
+            else:
+                J_thc, K_thc = local_thc_JK(dD, lthc, q_block=int(q_block), policy=policy_fp64, tc_cache=None)
+                J = J_ref + J_thc
+                K = K_ref + K_thc
             _cx_init = 0.5 * float(xc_spec.cx_hf) if xc_spec is not None else 0.5
             F = h + J - _cx_init * K
             if xc_spec is not None:
@@ -162,9 +209,27 @@ def rhf_local_thc(
     for cycle in range(1, int(max_cycle) + 1):
         t = _df._time_ms_start(xp)
         dD = D - D_ref
-        J_thc, K_thc = local_thc_JK(dD, lthc, q_block=int(q_block))
-        J = J_ref + J_thc
-        K = K_ref + K_thc
+        if mp_mode_s == "tf32":
+            rel = float(xp.linalg.norm(dD).item()) / max(float(xp.linalg.norm(D).item()), 1e-30)
+            if int(cycle) >= int(rebase_min_cycle) and rel > float(rebase_dD_rel_tol):
+                J_thc, K_thc = local_thc_JK(dD, lthc, q_block=int(q_block), policy=policy_fp64, tc_cache=None)
+                J_ref = J_ref + J_thc
+                K_ref = K_ref + K_thc
+                D_ref = D
+                n_rebase += 1
+                if profile is not None:
+                    profile.setdefault("scf", {})["rebases"] = int(n_rebase)
+                J = J_ref
+                K = K_ref
+            else:
+                assert policy_tc is not None and tc_cache is not None
+                J_thc, K_thc = local_thc_JK(dD, lthc, q_block=int(q_block), policy=policy_tc, tc_cache=tc_cache)
+                J = J_ref + J_thc
+                K = K_ref + K_thc
+        else:
+            J_thc, K_thc = local_thc_JK(dD, lthc, q_block=int(q_block), policy=policy_fp64, tc_cache=None)
+            J = J_ref + J_thc
+            K = K_ref + K_thc
         if profile is not None:
             profile["scf"]["jk_ms"] += _df._time_ms_end(xp, t)
 
@@ -253,12 +318,22 @@ def uhf_local_thc(
     diis_space: int = 8,
     damping: float = 0.0,
     q_block: int = 256,
+    mp_mode: str = "fp64",
+    rebase_dD_rel_tol: float = 0.25,
+    rebase_min_cycle: int = 2,
+    tc_balance: bool = True,
     dm0=None,
     mo_coeff0=None,
     reference: LocalTHCReferenceUHF | None = None,
     profile: dict | None = None,
+    xc_spec=None,
+    xc_grid_coords=None,
+    xc_grid_weights=None,
+    xc_ao_basis=None,
+    xc_sph_transform=None,
+    xc_batch_size: int = 50000,
 ) -> SCFResult:
-    """UHF SCF with local-THC J/K backend."""
+    """UHF SCF with local-THC J/K backend (or UKS if ``xc_spec`` is provided)."""
 
     try:
         import cupy as cp
@@ -331,26 +406,98 @@ def uhf_local_thc(
     e_last = None
     converged = False
 
+    mp_mode_s = str(mp_mode).strip().lower()
+    if mp_mode_s not in {"fp64", "tf32"}:
+        raise ValueError("mp_mode must be 'fp64' or 'tf32'")
+    policy_fp64 = THCPrecisionPolicy(compute_dtype=np.float64, out_dtype=np.float64, use_tf32=False, prefer_Y=True)
+    if mp_mode_s == "tf32":
+        from .thc_tc import make_local_thc_tc_cache  # noqa: PLC0415
+
+        tc_cache = make_local_thc_tc_cache(lthc, compute_dtype=np.float32, balance=bool(tc_balance))
+        policy_tc = THCPrecisionPolicy(compute_dtype=np.float32, out_dtype=np.float64, use_tf32=True, prefer_Y=True)
+    else:
+        tc_cache = None
+        policy_tc = None
+
+    n_rebase = 0
+
     if profile is not None:
         prof = profile.setdefault("scf", {})
         prof.setdefault("jk_ms", 0.0)
         prof.setdefault("diag_ms", 0.0)
         prof.setdefault("diis_ms", 0.0)
         prof.setdefault("iters", 0)
+        prof.setdefault("mp_mode", str(mp_mode_s))
+        prof.setdefault("tc_balance", bool(tc_balance))
+        prof.setdefault("rebase_dD_rel_tol", float(rebase_dD_rel_tol))
+        prof.setdefault("rebase_min_cycle", int(rebase_min_cycle))
+        prof.setdefault("rebases", 0)
+        if tc_cache is not None:
+            prof.setdefault("tc_cache_blocks", int(len(tc_cache)))
 
     for cycle in range(1, int(max_cycle) + 1):
         Dtot = Da + Db
         Dtot_ref = Da_ref + Db_ref
 
         t = _df._time_ms_start(xp)
-        J = J_ref + local_thc_J(Dtot - Dtot_ref, lthc)
-        Ka = Ka_ref + local_thc_K_blocked(Da - Da_ref, lthc, q_block=int(q_block))
-        Kb = Kb_ref + local_thc_K_blocked(Db - Db_ref, lthc, q_block=int(q_block))
+        dDtot = Dtot - Dtot_ref
+        dDa = Da - Da_ref
+        dDb = Db - Db_ref
+        if mp_mode_s == "tf32":
+            rel = float(xp.linalg.norm(dDtot).item()) / max(float(xp.linalg.norm(Dtot).item()), 1e-30)
+            if int(cycle) >= int(rebase_min_cycle) and rel > float(rebase_dD_rel_tol):
+                dJ = local_thc_J(dDtot, lthc, policy=policy_fp64, tc_cache=None)
+                dKa = local_thc_K_blocked(dDa, lthc, q_block=int(q_block), policy=policy_fp64, tc_cache=None)
+                dKb = local_thc_K_blocked(dDb, lthc, q_block=int(q_block), policy=policy_fp64, tc_cache=None)
+                J_ref = J_ref + dJ
+                Ka_ref = Ka_ref + dKa
+                Kb_ref = Kb_ref + dKb
+                Da_ref = Da
+                Db_ref = Db
+                n_rebase += 1
+                if profile is not None:
+                    profile.setdefault("scf", {})["rebases"] = int(n_rebase)
+                J = J_ref
+                Ka = Ka_ref
+                Kb = Kb_ref
+            else:
+                assert policy_tc is not None and tc_cache is not None
+                dJ = local_thc_J(dDtot, lthc, policy=policy_tc, tc_cache=tc_cache)
+                dKa = local_thc_K_blocked(dDa, lthc, q_block=int(q_block), policy=policy_tc, tc_cache=tc_cache)
+                dKb = local_thc_K_blocked(dDb, lthc, q_block=int(q_block), policy=policy_tc, tc_cache=tc_cache)
+                J = J_ref + dJ
+                Ka = Ka_ref + dKa
+                Kb = Kb_ref + dKb
+        else:
+            dJ = local_thc_J(dDtot, lthc, policy=policy_fp64, tc_cache=None)
+            dKa = local_thc_K_blocked(dDa, lthc, q_block=int(q_block), policy=policy_fp64, tc_cache=None)
+            dKb = local_thc_K_blocked(dDb, lthc, q_block=int(q_block), policy=policy_fp64, tc_cache=None)
+            J = J_ref + dJ
+            Ka = Ka_ref + dKa
+            Kb = Kb_ref + dKb
         if profile is not None:
             profile["scf"]["jk_ms"] += _df._time_ms_end(xp, t)
 
-        Fa = _df._symmetrize(xp, h + J - Ka)
-        Fb = _df._symmetrize(xp, h + J - Kb)
+        _E_xc = 0.0
+        if xc_spec is not None:
+            from asuka.xc.numint import build_vxc_u as _build_vxc_u  # noqa: PLC0415
+
+            _cx = float(xc_spec.cx_hf)
+            _Vxc_a, _Vxc_b, _E_xc = _build_vxc_u(
+                xc_spec,
+                Da,
+                Db,
+                xc_ao_basis,
+                xc_grid_coords,
+                xc_grid_weights,
+                batch_size=int(xc_batch_size),
+                sph_transform=xc_sph_transform,
+            )
+            Fa = _df._symmetrize(xp, h + J - _cx * Ka + _Vxc_a)
+            Fb = _df._symmetrize(xp, h + J - _cx * Kb + _Vxc_b)
+        else:
+            Fa = _df._symmetrize(xp, h + J - Ka)
+            Fb = _df._symmetrize(xp, h + J - Kb)
 
         if diis_a is not None and cycle >= int(diis_start_cycle):
             t = _df._time_ms_start(xp)
@@ -384,7 +531,11 @@ def uhf_local_thc(
         e_one = float(xp.trace(Dtot_new @ h).item())
         e_coul = float(0.5 * xp.trace(Dtot_new @ J).item())
         e_ex = float(0.5 * xp.trace(Da_new @ Ka).item() + 0.5 * xp.trace(Db_new @ Kb).item())
-        e_elec = e_one + e_coul - e_ex
+        if xc_spec is not None:
+            _cx_e = float(xc_spec.cx_hf)
+            e_elec = e_one + e_coul - _cx_e * e_ex + float(_E_xc)
+        else:
+            e_elec = e_one + e_coul - e_ex
         e_tot = float(e_elec + float(enuc))
 
         dm_err = float(xp.linalg.norm(Da_new - Da).item() + xp.linalg.norm(Db_new - Db).item())
@@ -403,7 +554,7 @@ def uhf_local_thc(
         profile.setdefault("scf", {})["iters"] = int(cycle)
 
     return SCFResult(
-        method="UHF-LTHC",
+        method="UKS-LTHC" if xc_spec is not None else "UHF-LTHC",
         converged=bool(converged),
         niter=int(cycle),
         e_tot=float(e_last if e_last is not None else float("nan")),
@@ -431,6 +582,10 @@ def rohf_local_thc(
     diis_space: int = 8,
     damping: float = 0.0,
     q_block: int = 256,
+    mp_mode: str = "fp64",
+    rebase_dD_rel_tol: float = 0.25,
+    rebase_min_cycle: int = 2,
+    tc_balance: bool = True,
     dm0=None,
     mo_coeff0=None,
     reference: LocalTHCReferenceUHF | None = None,
@@ -502,21 +657,75 @@ def rohf_local_thc(
     e_last = None
     converged = False
 
+    mp_mode_s = str(mp_mode).strip().lower()
+    if mp_mode_s not in {"fp64", "tf32"}:
+        raise ValueError("mp_mode must be 'fp64' or 'tf32'")
+    policy_fp64 = THCPrecisionPolicy(compute_dtype=np.float64, out_dtype=np.float64, use_tf32=False, prefer_Y=True)
+    if mp_mode_s == "tf32":
+        from .thc_tc import make_local_thc_tc_cache  # noqa: PLC0415
+
+        tc_cache = make_local_thc_tc_cache(lthc, compute_dtype=np.float32, balance=bool(tc_balance))
+        policy_tc = THCPrecisionPolicy(compute_dtype=np.float32, out_dtype=np.float64, use_tf32=True, prefer_Y=True)
+    else:
+        tc_cache = None
+        policy_tc = None
+
+    n_rebase = 0
+
     if profile is not None:
         prof = profile.setdefault("scf", {})
         prof.setdefault("jk_ms", 0.0)
         prof.setdefault("diag_ms", 0.0)
         prof.setdefault("diis_ms", 0.0)
         prof.setdefault("iters", 0)
+        prof.setdefault("mp_mode", str(mp_mode_s))
+        prof.setdefault("tc_balance", bool(tc_balance))
+        prof.setdefault("rebase_dD_rel_tol", float(rebase_dD_rel_tol))
+        prof.setdefault("rebase_min_cycle", int(rebase_min_cycle))
+        prof.setdefault("rebases", 0)
+        if tc_cache is not None:
+            prof.setdefault("tc_cache_blocks", int(len(tc_cache)))
 
     for cycle in range(1, int(max_cycle) + 1):
         Dtot = Da + Db
         Dtot_ref = Da_ref + Db_ref
 
         t = _df._time_ms_start(xp)
-        J = J_ref + local_thc_J(Dtot - Dtot_ref, lthc)
-        Ka = Ka_ref + local_thc_K_blocked(Da - Da_ref, lthc, q_block=int(q_block))
-        Kb = Kb_ref + local_thc_K_blocked(Db - Db_ref, lthc, q_block=int(q_block))
+        dDtot = Dtot - Dtot_ref
+        dDa = Da - Da_ref
+        dDb = Db - Db_ref
+        if mp_mode_s == "tf32":
+            rel = float(xp.linalg.norm(dDtot).item()) / max(float(xp.linalg.norm(Dtot).item()), 1e-30)
+            if int(cycle) >= int(rebase_min_cycle) and rel > float(rebase_dD_rel_tol):
+                dJ = local_thc_J(dDtot, lthc, policy=policy_fp64, tc_cache=None)
+                dKa = local_thc_K_blocked(dDa, lthc, q_block=int(q_block), policy=policy_fp64, tc_cache=None)
+                dKb = local_thc_K_blocked(dDb, lthc, q_block=int(q_block), policy=policy_fp64, tc_cache=None)
+                J_ref = J_ref + dJ
+                Ka_ref = Ka_ref + dKa
+                Kb_ref = Kb_ref + dKb
+                Da_ref = Da
+                Db_ref = Db
+                n_rebase += 1
+                if profile is not None:
+                    profile.setdefault("scf", {})["rebases"] = int(n_rebase)
+                J = J_ref
+                Ka = Ka_ref
+                Kb = Kb_ref
+            else:
+                assert policy_tc is not None and tc_cache is not None
+                dJ = local_thc_J(dDtot, lthc, policy=policy_tc, tc_cache=tc_cache)
+                dKa = local_thc_K_blocked(dDa, lthc, q_block=int(q_block), policy=policy_tc, tc_cache=tc_cache)
+                dKb = local_thc_K_blocked(dDb, lthc, q_block=int(q_block), policy=policy_tc, tc_cache=tc_cache)
+                J = J_ref + dJ
+                Ka = Ka_ref + dKa
+                Kb = Kb_ref + dKb
+        else:
+            dJ = local_thc_J(dDtot, lthc, policy=policy_fp64, tc_cache=None)
+            dKa = local_thc_K_blocked(dDa, lthc, q_block=int(q_block), policy=policy_fp64, tc_cache=None)
+            dKb = local_thc_K_blocked(dDb, lthc, q_block=int(q_block), policy=policy_fp64, tc_cache=None)
+            J = J_ref + dJ
+            Ka = Ka_ref + dKa
+            Kb = Kb_ref + dKb
         if profile is not None:
             profile["scf"]["jk_ms"] += _df._time_ms_end(xp, t)
 

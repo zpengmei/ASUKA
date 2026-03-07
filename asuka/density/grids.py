@@ -611,8 +611,9 @@ def make_becke_grid(
     prune_tol: float = 1e-16,
     radial_scheme: str = "leggauss",
     atom_Z: Any | None = None,
-) -> tuple[np.ndarray, np.ndarray]:
-    """Materialize a full Becke grid (points, weights).
+    return_point_atom: bool = False,
+) -> tuple[np.ndarray, np.ndarray] | tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Materialize a full Becke grid (points, weights[, point_atom]).
 
     This is convenient for small systems / debugging. For production, prefer
     :func:`iter_becke_grid` to avoid large allocations.
@@ -620,26 +621,54 @@ def make_becke_grid(
 
     pts_list: list[np.ndarray] = []
     w_list: list[np.ndarray] = []
-    for pts, w in iter_becke_grid(
-        mol_or_coords,
-        radial_n=radial_n,
-        angular_n=angular_n,
-        angular_kind=angular_kind,
-        rmax=rmax,
-        becke_n=becke_n,
-        block_size=10**9,
-        prune_tol=prune_tol,
-        radial_scheme=radial_scheme,
-        atom_Z=atom_Z,
-    ):
-        pts_list.append(pts)
-        w_list.append(w)
+    atom_list: list[np.ndarray] = []
+    if bool(return_point_atom):
+        for batch in iter_becke_grid(
+            mol_or_coords,
+            radial_n=radial_n,
+            angular_n=angular_n,
+            angular_kind=angular_kind,
+            rmax=rmax,
+            becke_n=becke_n,
+            block_size=10**9,
+            prune_tol=prune_tol,
+            radial_scheme=radial_scheme,
+            atom_Z=atom_Z,
+            return_batch=True,
+        ):
+            pts_list.append(batch.points)
+            w_list.append(batch.weights)
+            atom_list.append(batch.point_atom)
+    else:
+        for pts, w in iter_becke_grid(
+            mol_or_coords,
+            radial_n=radial_n,
+            angular_n=angular_n,
+            angular_kind=angular_kind,
+            rmax=rmax,
+            becke_n=becke_n,
+            block_size=10**9,
+            prune_tol=prune_tol,
+            radial_scheme=radial_scheme,
+            atom_Z=atom_Z,
+        ):
+            pts_list.append(pts)
+            w_list.append(w)
 
     if len(pts_list) == 0:
+        if bool(return_point_atom):
+            return (
+                np.zeros((0, 3), dtype=np.float64),
+                np.zeros((0,), dtype=np.float64),
+                np.zeros((0,), dtype=np.int32),
+            )
         return np.zeros((0, 3), dtype=np.float64), np.zeros((0,), dtype=np.float64)
 
     pts_all = np.concatenate(pts_list, axis=0)
     w_all = np.concatenate(w_list, axis=0)
+    if bool(return_point_atom):
+        atom_all = np.concatenate(atom_list, axis=0)
+        return pts_all, w_all, atom_all
     return pts_all, w_all
 
 

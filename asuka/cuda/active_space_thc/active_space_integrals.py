@@ -27,7 +27,7 @@ from typing import Any
 
 import numpy as np
 
-from asuka.hf.local_thc_jk import local_thc_eri_apply_batched
+from asuka.hf.local_thc_jk import local_thc_eri_apply_pairs_mo_batched
 from asuka.integrals.df_integrals import DeviceDFMOIntegrals
 
 
@@ -266,26 +266,34 @@ def build_device_dfmo_integrals_local_thc(
             continue
 
         nbatch = int(rb) * int(ncas)
-        D_batch = cp.empty((nbatch, int(nao), int(nao)), dtype=cp.float64)
+        c_r_batch = cp.empty((nbatch, int(nao)), dtype=cp.float64)
+        c_s_batch = cp.empty((nbatch, int(nao)), dtype=cp.float64)
 
         ib = 0
         for r in range(int(r0), int(r1)):
             cr = C_act[:, int(r)]
             for s in range(int(ncas)):
                 cs = C_act[:, int(s)]
-                D_batch[int(ib)] = 0.5 * (
-                    cr[:, None] * cs[None, :] + cs[:, None] * cr[None, :]
-                )
+                c_r_batch[int(ib)] = cr
+                c_s_batch[int(ib)] = cs
                 ib += 1
 
-        V_batch = local_thc_eri_apply_batched(D_batch, lthc, symmetrize=True)
-        eri_blk = cp.einsum("mp,bmn,nq->pqb", C_act, V_batch, C_act, optimize=True)
+        eri_blk_bpq = local_thc_eri_apply_pairs_mo_batched(
+            c_r_batch,
+            c_s_batch,
+            lthc,
+            C_act,
+            C_act,
+            symmetrize=True,
+        )
+        eri_blk = eri_blk_bpq.transpose((1, 2, 0))  # (p,q,b)
         eri_mat[:, int(r0) * int(ncas) : int(r1) * int(ncas)] = eri_blk.reshape(int(nops), int(nbatch))
 
         nblocks_used += 1
 
-        D_batch = None
-        V_batch = None
+        c_r_batch = None
+        c_s_batch = None
+        eri_blk_bpq = None
         eri_blk = None
 
     if nblocks_used <= 0:

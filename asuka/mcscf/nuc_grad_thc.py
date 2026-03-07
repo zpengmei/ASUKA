@@ -129,7 +129,7 @@ def _thc_energy_adjoint_jk_bilinear(
     D_right: Any,
     D_left: Any,
     X: Any,
-    Z: Any,
+    Z: Any | None,
     Y: Any,
     *,
     cJ: float,
@@ -141,7 +141,7 @@ def _thc_energy_adjoint_jk_bilinear(
     Shapes
     - D_right, D_left: (nao,nao), symmetric
     - X: (npt,nao)
-    - Z: (npt,npt) (symmetric)
+    - Z: optional (npt,npt) (symmetric)
     - Y: (npt,naux) with Z = Y @ Y.T
     """
 
@@ -149,7 +149,6 @@ def _thc_energy_adjoint_jk_bilinear(
     D = cp.asarray(D_right, dtype=cp.float64)
     B = cp.asarray(D_left, dtype=cp.float64)
     X = cp.asarray(X, dtype=cp.float64)
-    Z = cp.asarray(Z, dtype=cp.float64)
     Y = cp.asarray(Y, dtype=cp.float64)
 
     if D.ndim != 2 or int(D.shape[0]) != int(D.shape[1]):
@@ -161,8 +160,10 @@ def _thc_energy_adjoint_jk_bilinear(
     if X.ndim != 2 or int(X.shape[1]) != int(nao):
         raise ValueError("X must have shape (npt,nao)")
     npt = int(X.shape[0])
-    if Z.shape != (npt, npt):
-        raise ValueError("Z must have shape (npt,npt)")
+    if Z is not None:
+        Z = cp.asarray(Z, dtype=cp.float64)
+        if Z.shape != (npt, npt):
+            raise ValueError("Z must have shape (npt,npt)")
     if Y.ndim != 2 or int(Y.shape[0]) != int(npt):
         raise ValueError("Y must have shape (npt,naux)")
 
@@ -180,8 +181,11 @@ def _thc_energy_adjoint_jk_bilinear(
     # t[P] = (X B X^T)[P,P]
     t = cp.sum(A_B * X, axis=1)
 
-    # g = Z m
-    g = Z @ m  # (npt,)
+    # g = Z m (prefer factor Y where Z = Y Y^T)
+    if Z is not None:
+        g = Z @ m  # (npt,)
+    else:
+        g = Y @ (Y.T @ m)
 
     # ---- Coulomb-like contribution: E_J = cJ * t^T (Z m) ----
     # bar_t = cJ * g
@@ -193,7 +197,10 @@ def _thc_energy_adjoint_jk_bilinear(
     # dt/dX: 2 * diag(bar_t) * (X B)
     bar_X = 2.0 * (bar_t[:, None] * A_B)
     # dg/dm: bar_m = Z^T bar_g (Z symmetric)
-    bar_m = Z @ bar_g
+    if Z is not None:
+        bar_m = Z @ bar_g
+    else:
+        bar_m = Y @ (Y.T @ bar_g)
     # dm/dX: 2 * diag(bar_m) * (X D)
     bar_X += 2.0 * (bar_m[:, None] * A_D)
 
@@ -222,7 +229,10 @@ def _thc_energy_adjoint_jk_bilinear(
             Mq = A_D @ Xq.T  # (npt,nb)
             Nq = A_B @ Xq.T  # (npt,nb)
 
-            Zblk = Z[:, int(q0) : int(q1)]  # (npt,nb)
+            if Z is not None:
+                Zblk = Z[:, int(q0) : int(q1)]  # (npt,nb)
+            else:
+                Zblk = Y @ Yq.T  # (npt,nb)
             T_N = Zblk * Nq  # (npt,nb)
             T_M = Zblk * Mq  # (npt,nb)
 
@@ -677,16 +687,24 @@ def _build_gfock_casscf_thc(
     D_tot_ao = D_core_ao + D_act_ao
 
     # Mean-field potentials from core and active 1-RDM.
+    #
+    # Use factored-density THC builds to avoid forming dense AO intermediates in
+    # the THC backend (D_core and D_act are low-rank by construction).
+    Uc = cp.sqrt(2.0) * C_core
+    Vc = Uc
+    Ua = C_act @ dm1
+    Va = C_act
     if isinstance(thc, THCFactors):
-        from asuka.hf.thc_jk import THCJKWork, thc_JK  # noqa: PLC0415
+        from asuka.hf.thc_jk import THCJKWork, thc_JK_factored  # noqa: PLC0415
 
-        Jc, Kc = thc_JK(D_core_ao, thc.X, thc.Z, work=THCJKWork(q_block=int(q_block)))
-        Ja, Ka = thc_JK(D_act_ao, thc.X, thc.Z, work=THCJKWork(q_block=int(q_block)))
+        work = THCJKWork(q_block=int(q_block))
+        Jc, Kc = thc_JK_factored(Uc, Vc, thc.X, thc.Z, work=work, Y=thc.Y)
+        Ja, Ka = thc_JK_factored(Ua, Va, thc.X, thc.Z, work=work, Y=thc.Y)
     else:
-        from asuka.hf.local_thc_jk import local_thc_JK  # noqa: PLC0415
+        from asuka.hf.local_thc_jk import local_thc_JK_factored  # noqa: PLC0415
 
-        Jc, Kc = local_thc_JK(D_core_ao, thc, q_block=int(q_block))
-        Ja, Ka = local_thc_JK(D_act_ao, thc, q_block=int(q_block))
+        Jc, Kc = local_thc_JK_factored(Uc, Vc, thc, q_block=int(q_block))
+        Ja, Ka = local_thc_JK_factored(Ua, Va, thc, q_block=int(q_block))
 
     vhf_c_ao = Jc - 0.5 * Kc
     vhf_a_ao = Ja - 0.5 * Ka
@@ -732,7 +750,7 @@ def _build_gfock_casscf_thc(
         t_pv = cached_einsum("Pu,Puv->Pv", X_act_thc, S, xp=cp)
         g_dm2 = X_mo.T @ t_pv  # (nmo,ncas)
     else:
-        from asuka.hf.local_thc_jk import local_thc_eri_apply_batched  # noqa: PLC0415
+        from asuka.hf.local_thc_jk import local_thc_eri_apply_pairs_mo_batched  # noqa: PLC0415
 
         dm2_wxuv = cp.asarray(dm2_act, dtype=cp.float64)
         if dm2_wxuv.shape != (ncas, ncas, ncas, ncas):
@@ -746,7 +764,8 @@ def _build_gfock_casscf_thc(
                 continue
 
             nbatch = int(wb) * int(ncas)
-            D_batch = cp.empty((nbatch, int(nao), int(nao)), dtype=cp.float64)
+            c_w_batch = cp.empty((nbatch, int(nao)), dtype=cp.float64)
+            c_x_batch = cp.empty((nbatch, int(nao)), dtype=cp.float64)
             dm2_batch = cp.empty((nbatch, int(ncas), int(ncas)), dtype=cp.float64)
 
             ib = 0
@@ -754,19 +773,24 @@ def _build_gfock_casscf_thc(
                 cw = C_act[:, int(w)]
                 for x in range(int(ncas)):
                     cx = C_act[:, int(x)]
-                    D_batch[int(ib)] = 0.5 * (
-                        cw[:, None] * cx[None, :] + cx[:, None] * cw[None, :]
-                    )
+                    c_w_batch[int(ib)] = cw
+                    c_x_batch[int(ib)] = cx
                     dm2_batch[int(ib)] = dm2_wxuv[int(w), int(x)]
                     ib += 1
 
-            V_batch = local_thc_eri_apply_batched(D_batch, thc, symmetrize=True)
-            pu_batch = cached_einsum("mp,bmn,nu->bpu", C, V_batch, C_act, xp=cp)
+            pu_batch = local_thc_eri_apply_pairs_mo_batched(
+                c_w_batch,
+                c_x_batch,
+                thc,
+                C,
+                C_act,
+                symmetrize=True,
+            )
             g_dm2 += cached_einsum("bpu,buv->pv", pu_batch, dm2_batch, xp=cp)
 
-            D_batch = None
+            c_w_batch = None
+            c_x_batch = None
             dm2_batch = None
-            V_batch = None
             pu_batch = None
 
     # Generalized Fock matrix in MO basis.
