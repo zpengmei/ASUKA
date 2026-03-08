@@ -231,19 +231,22 @@ class build_ext(_build_ext):
 
         env["GUGA_CUDA_EXT_OUTPUT_DIR"] = guga_out
 
-        subprocess.check_call([sys.executable, "-m", "asuka.build.guga_cuda_ext"], cwd=repo_root, env=env)
-        subprocess.check_call([sys.executable, "-m", "asuka.build.guga_cuda_linalg_ext"], cwd=repo_root, env=env)
-        subprocess.check_call([sys.executable, "-m", "asuka.build.caspt2_cuda_ext"], cwd=repo_root, env=env)
-        subprocess.check_call([sys.executable, "-m", "asuka.build.hf_df_jk_cuda_ext"], cwd=repo_root, env=env)
-        subprocess.check_call([sys.executable, "-m", "asuka.build.hf_thc_cuda_ext"], cwd=repo_root, env=env)
-        subprocess.check_call([sys.executable, "-m", "asuka.build.orbitals_cuda_ext"], cwd=repo_root, env=env)
+        build_scripts_dir = os.path.join(repo_root, "asuka", "build")
+        for script in (
+            "guga_cuda_ext.py",
+            "guga_cuda_linalg_ext.py",
+            "caspt2_cuda_ext.py",
+            "hf_df_jk_cuda_ext.py",
+            "hf_thc_cuda_ext.py",
+            "orbitals_cuda_ext.py",
+        ):
+            subprocess.check_call([sys.executable, os.path.join(build_scripts_dir, script)], cwd=repo_root, env=env)
 
         cueri_build_dir = os.path.join(build_temp, "cueri_cuda_ext")
         subprocess.check_call(
             [
                 sys.executable,
-                "-m",
-                "asuka.cueri.build_cuda_ext",
+                os.path.join(repo_root, "asuka", "cueri", "build_cuda_ext.py"),
                 "--build-dir",
                 cueri_build_dir,
                 "--out-dir",
