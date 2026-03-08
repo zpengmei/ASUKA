@@ -234,6 +234,50 @@ for r_bohr in (1.40, 1.45, 1.50):
     print(f"r = {r_bohr:.2f}  e_avg = {out.e_tot:.10f}")
 ```
 
+For finer control, `mo_coeff_init` and `ci_init` can be passed separately and take precedence over `guess`:
+
+```python
+# Restart from a previous MO set but with fresh CI vectors
+out2 = run_casscf(scf_out, mo_coeff_init=out.mo_coeff, **cas_kw)
+
+# Restart with a specific CI guess from a different calculation
+out3 = run_casscf(scf_out, mo_coeff_init=out.mo_coeff, ci_init=ci_ref, **cas_kw)
+```
+
+The same `mo_coeff_init` / `ci_init` parameters are available on the geometry-optimization callbacks
+`make_df_casscf_energy_grad`, `make_df_casscf_multiroot_energy_grad`, and `make_df_casscf_multiroot_eval`.
+
+## SA-CASSCF energies, forces, and NACVs
+
+`sacasscf_properties` computes all quantities needed for non-adiabatic molecular dynamics in one call:
+
+```python
+from asuka.mcscf.properties import sacasscf_properties
+
+mol = Molecule.from_atoms([...], basis="6-31g*")
+scf = run_hf(mol, backend="cuda")
+mc  = run_casscf(scf, ncore=4, ncas=4, nelecas=4, nroots=3,
+                 root_weights=(1/3, 1/3, 1/3), backend="cuda")
+
+res = sacasscf_properties(scf, mc, df_backend="cuda")
+
+res.e_roots   # (nroots,)           energies in Eh
+res.forces    # (nroots, natm, 3)   forces = −dE/dR in Eh/Bohr
+res.e_sa                     # state-averaged energy
+res.grad_sa                  # (natm, 3) SA gradient
+```
+
+NACVs are opt-in (`compute_nacvs=False` by default) since they require an additional Z-vector solve per state pair:
+
+```python
+res = sacasscf_properties(scf, mc, df_backend="cuda", compute_nacvs=True)
+res.nacvs      # (nroots, nroots, natm, 3)  ⟨I|∂/∂R|J⟩ in 1/Bohr
+res.nacv_pairs # list of (bra, ket) pairs computed
+```
+
+Use `nacv_pairs=[(0,1)]` to compute only selected couplings, or `mult_ediff=True` to return
+the Hamiltonian-derivative numerator `⟨I|∂H/∂R|J⟩` instead of the coupling vector.
+
 ## Geometry optimization + harmonic frequencies
 
 ```python
