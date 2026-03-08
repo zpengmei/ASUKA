@@ -2282,4 +2282,31 @@ extern "C" cudaError_t cueri_scatter_eri_tiles_sph_s4_launch_stream(
     cudaStream_t stream,
     int threads);
 
+extern "C" cudaError_t cueri_df_fused_qp_l_act_launch_stream(
+    const double* B_Qp,
+    const double* C_act,
+    double* L_act,
+    int naux,
+    int nao,
+    int ncas,
+    int ntri,
+    int q0,
+    int q_count,
+    cudaStream_t stream,
+    int tile);
+
+extern "C" cudaError_t cueri_df_fused_qp_exchange_sym_launch_stream(
+    const double* B_Qp,
+    const double* D1,
+    const double* D2,
+    double* out_Qp,
+    int naux,
+    int nao,
+    int ntri,
+    int q0,
+    int q_count,
+    double alpha,
+    cudaStream_t stream,
+    int threads);
+
 #endif  // CUERI_CUDA_KERNELS_API_H

@@ -537,39 +537,72 @@ def reorder_dm123_molcas_cuda(
         dm2 = dm2.copy()
         dm3 = dm3.copy()
 
-    # 2-body delta correction:
-    for k in range(n):
-        dm2[:, k, k, :] -= dm1
+    # Try P5 CUDA kernels; fall back to CuPy if unavailable
+    _use_p5 = False
+    try:
+        from asuka.cuda.cuda_backend import (
+            has_rdm123_reorder_device,
+            dm2_delta_correction_inplace_device,
+            dm2_4way_symmetry_inplace_device,
+            dm3_delta_correction_inplace_device,
+            dm3_6way_symmetry_inplace_device,
+        )
+        _use_p5 = has_rdm123_reorder_device()
+    except Exception:
+        pass
 
-    # MKFG3 diagonal symmetries (bra=ket):
-    dm2 = cp.ascontiguousarray(
-        0.25
-        * (
-            dm2
-            + dm2.transpose(2, 3, 0, 1)
-            + dm2.transpose(3, 2, 1, 0)
-            + dm2.transpose(1, 0, 3, 2)
-        ),
-        dtype=cp.float64,
-    )
+    if _use_p5:
+        dm2 = cp.ascontiguousarray(dm2)
+        dm3 = cp.ascontiguousarray(dm3)
+        dm1_flat = cp.ascontiguousarray(dm1).ravel()
+        # dm2 delta
+        dm2_delta_correction_inplace_device(dm2.ravel(), dm1_flat, n=n)
+        # dm2 4-way symmetry
+        dm2_sym = cp.empty_like(dm2)
+        dm2_4way_symmetry_inplace_device(dm2.ravel(), dm2_sym.ravel(), n=n)
+        dm2 = dm2_sym
+        # dm3 delta (uses post-symmetry dm2)
+        dm3_delta_correction_inplace_device(
+            dm3.ravel(), dm2.ravel(), dm1_flat, n=n,
+        )
+        # dm3 6-way symmetry
+        dm3_sym = cp.empty_like(dm3)
+        dm3_6way_symmetry_inplace_device(dm3.ravel(), dm3_sym.ravel(), n=n)
+        dm3 = dm3_sym
+    else:
+        # 2-body delta correction:
+        for k in range(n):
+            dm2[:, k, k, :] -= dm1
 
-    # 3-body delta correction:
-    dm2_vxtz = dm2.transpose(2, 0, 1, 3)
-    for q in range(n):
-        dm3[:, q, q, :, :, :] -= dm2
-        dm3[:, :, :, q, q, :] -= dm2
-        dm3[:, q, :, :, q, :] -= dm2_vxtz
-        for s in range(n):
-            dm3[:, q, q, s, s, :] -= dm1
+        # MKFG3 diagonal symmetries (bra=ket):
+        dm2 = cp.ascontiguousarray(
+            0.25
+            * (
+                dm2
+                + dm2.transpose(2, 3, 0, 1)
+                + dm2.transpose(3, 2, 1, 0)
+                + dm2.transpose(1, 0, 3, 2)
+            ),
+            dtype=cp.float64,
+        )
 
-    # Full pair-permutation symmetry of TG3/G3:
-    dm3_sym = cp.ascontiguousarray(dm3, dtype=cp.float64).copy()
-    dm3_sym += dm3.transpose(2, 3, 0, 1, 4, 5)
-    dm3_sym += dm3.transpose(4, 5, 2, 3, 0, 1)
-    dm3_sym += dm3.transpose(0, 1, 4, 5, 2, 3)
-    dm3_sym += dm3.transpose(2, 3, 4, 5, 0, 1)
-    dm3_sym += dm3.transpose(4, 5, 0, 1, 2, 3)
-    dm3 = cp.ascontiguousarray(dm3_sym * (1.0 / 6.0), dtype=cp.float64)
+        # 3-body delta correction:
+        dm2_vxtz = dm2.transpose(2, 0, 1, 3)
+        for q in range(n):
+            dm3[:, q, q, :, :, :] -= dm2
+            dm3[:, :, :, q, q, :] -= dm2
+            dm3[:, q, :, :, q, :] -= dm2_vxtz
+            for s in range(n):
+                dm3[:, q, q, s, s, :] -= dm1
+
+        # Full pair-permutation symmetry of TG3/G3:
+        dm3_sym = cp.ascontiguousarray(dm3, dtype=cp.float64).copy()
+        dm3_sym += dm3.transpose(2, 3, 0, 1, 4, 5)
+        dm3_sym += dm3.transpose(4, 5, 2, 3, 0, 1)
+        dm3_sym += dm3.transpose(0, 1, 4, 5, 2, 3)
+        dm3_sym += dm3.transpose(2, 3, 4, 5, 0, 1)
+        dm3_sym += dm3.transpose(4, 5, 0, 1, 2, 3)
+        dm3 = cp.ascontiguousarray(dm3_sym * (1.0 / 6.0), dtype=cp.float64)
 
     if profile is not None:
         _sync(cp)
@@ -843,7 +876,6 @@ def make_trans_rdm123_raw_cuda(
                     out_cols = int(nops) * int(nvec)
 
                     x_batch = x_ket[:, int(yz0) : int(yz1)]
-
                     w_tile_full = ws.w_tile_mm.get(out_cols)
                     if w_tile_full is None or tuple(getattr(w_tile_full, "shape", ())) != (tile_csf, out_cols):
                         w_tile_full = cp.empty((tile_csf, out_cols), dtype=cp.float64)
@@ -1113,11 +1145,30 @@ def reorder_dm123_molcas_trans_cuda(
         dm2 = dm2.copy()
         dm3 = dm3.copy()
 
+    # Try P5 CUDA kernels for delta + symmetry; fall back to CuPy
+    _use_p5 = False
+    try:
+        from asuka.cuda.cuda_backend import (
+            has_rdm123_reorder_device,
+            dm2_delta_correction_inplace_device,
+            dm3_delta_correction_inplace_device,
+            dm3_6way_symmetry_inplace_device,
+        )
+        _use_p5 = has_rdm123_reorder_device()
+    except Exception:
+        pass
+
     # 2-body delta correction (transition; no bra=ket hermitization):
-    for k in range(n):
-        dm2[:, k, k, :] -= dm1
+    if _use_p5:
+        dm2_delta_correction_inplace_device(
+            dm2.ravel(), cp.ascontiguousarray(dm1).ravel(), n=n,
+        )
+    else:
+        for k in range(n):
+            dm2[:, k, k, :] -= dm1
 
     # Enforce OpenMolcas P2LEV canonical-half symmetry for TG2 by copying.
+    # (P2LEV is complex permutation logic — keep on CuPy)
     n2 = int(n * n)
     perm_h, inv_h = _p2lev_perm_inv(n)
     perm = cp.asarray(perm_h, dtype=cp.int64)
@@ -1130,23 +1181,34 @@ def reorder_dm123_molcas_trans_cuda(
     m_sym = m_p_sym[inv][:, inv]
     dm2 = cp.ascontiguousarray(m_sym.reshape(n, n, n, n, order="F"), dtype=cp.float64)
 
-    # 3-body delta correction (transition; no bra=ket symmetrization):
-    dm2_vxtz = dm2.transpose(2, 0, 1, 3)  # (t,v,x,z) = dm2[v,x,t,z]
-    for q in range(n):
-        dm3[:, q, q, :, :, :] -= dm2
-        dm3[:, :, :, q, q, :] -= dm2
-        dm3[:, q, :, :, q, :] -= dm2_vxtz
-        for s in range(n):
-            dm3[:, q, q, s, s, :] -= dm1
+    if _use_p5:
+        # dm3 delta (uses post-P2LEV dm2)
+        dm3 = cp.ascontiguousarray(dm3)
+        dm3_delta_correction_inplace_device(
+            dm3.ravel(), dm2.ravel(), cp.ascontiguousarray(dm1).ravel(), n=n,
+        )
+        # dm3 6-way symmetry
+        dm3_sym = cp.empty_like(dm3)
+        dm3_6way_symmetry_inplace_device(dm3.ravel(), dm3_sym.ravel(), n=n)
+        dm3 = dm3_sym
+    else:
+        # 3-body delta correction (transition; no bra=ket symmetrization):
+        dm2_vxtz = dm2.transpose(2, 0, 1, 3)  # (t,v,x,z) = dm2[v,x,t,z]
+        for q in range(n):
+            dm3[:, q, q, :, :, :] -= dm2
+            dm3[:, :, :, q, q, :] -= dm2
+            dm3[:, q, :, :, q, :] -= dm2_vxtz
+            for s in range(n):
+                dm3[:, q, q, s, s, :] -= dm1
 
-    # Full pair-permutation symmetry of TG3:
-    dm3_sym = cp.ascontiguousarray(dm3, dtype=cp.float64).copy()
-    dm3_sym += dm3.transpose(2, 3, 0, 1, 4, 5)
-    dm3_sym += dm3.transpose(4, 5, 2, 3, 0, 1)
-    dm3_sym += dm3.transpose(0, 1, 4, 5, 2, 3)
-    dm3_sym += dm3.transpose(2, 3, 4, 5, 0, 1)
-    dm3_sym += dm3.transpose(4, 5, 0, 1, 2, 3)
-    dm3 = cp.ascontiguousarray(dm3_sym * (1.0 / 6.0), dtype=cp.float64)
+        # Full pair-permutation symmetry of TG3:
+        dm3_sym = cp.ascontiguousarray(dm3, dtype=cp.float64).copy()
+        dm3_sym += dm3.transpose(2, 3, 0, 1, 4, 5)
+        dm3_sym += dm3.transpose(4, 5, 2, 3, 0, 1)
+        dm3_sym += dm3.transpose(0, 1, 4, 5, 2, 3)
+        dm3_sym += dm3.transpose(2, 3, 4, 5, 0, 1)
+        dm3_sym += dm3.transpose(4, 5, 0, 1, 2, 3)
+        dm3 = cp.ascontiguousarray(dm3_sym * (1.0 / 6.0), dtype=cp.float64)
 
     if profile is not None:
         _sync(cp)

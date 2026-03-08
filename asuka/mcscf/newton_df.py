@@ -320,7 +320,7 @@ def _build_df_newton_eris_blocked_qp(
 
     This avoids materializing full mnQ and unpacks only one aux chunk at a time.
     """
-    from asuka.integrals.df_packed_s2 import unpack_Qp_to_Qmn_block  # noqa: PLC0415
+    from asuka.integrals.df_packed_s2 import apply_Qp_to_C_block  # noqa: PLC0415
 
     nao = int(mo.shape[0])
     mo_c = xp.asarray(mo, dtype=cdtype)
@@ -342,16 +342,13 @@ def _build_df_newton_eris_blocked_qp(
     #
     # Only enable the workspace on GPU (CuPy). CPU runs typically have much
     # smaller `block_size` and should avoid multi-GB staging buffers.
+    # B_qmn_buf and X2d_buf are removed: apply_Qp_to_C_block (Tier A) reads directly
+    # from packed Qp and produces (q*nao, nmo) without a (q,nao,nao) unpack step.
     _use_ws = xp is not np
-    B_qmn_buf = None
-    X2d_buf = None
     X_t_buf = None
     L_raw_buf = None
     L_blk_buf = None
     if bool(_use_ws):
-        # Unpack output is always FP64 from cuERI.
-        B_qmn_buf = xp.empty((int(block_size), int(nao), int(nao)), dtype=xp.float64)
-        X2d_buf = xp.empty((int(block_size) * int(nao), int(nmo)), dtype=cdtype)
         X_t_buf = xp.empty((int(nao), int(block_size), int(nmo)), dtype=cdtype)
         L_raw_buf = xp.empty((int(nmo), int(block_size) * int(nmo)), dtype=cdtype)
         L_blk_buf = xp.empty((int(nmo), int(nmo), int(block_size)), dtype=cdtype)
@@ -362,26 +359,11 @@ def _build_df_newton_eris_blocked_qp(
         if q <= 0:
             continue
 
-        # Qp -> Qmn for the current aux block.
-        #
-        # Use batched GEMM for the half-transform (B_qmn @ C) and then a single
-        # large GEMM for the second half-transform, mirroring the fast mnQ path.
-        if B_qmn_buf is not None:
-            B_qmn = unpack_Qp_to_Qmn_block(
-                B_Qp, nao=int(nao), q0=int(q0), q_count=int(q), out=B_qmn_buf[: int(q)]
-            )  # (q,nao,nao)
-        else:
-            B_qmn = unpack_Qp_to_Qmn_block(B_Qp, nao=int(nao), q0=int(q0), q_count=int(q))  # (q,nao,nao)
-        B_qmn = xp.asarray(B_qmn, dtype=cdtype)
-
-        # Half-transform via a single GEMM (often faster than batched matmul):
-        #   X[(q,mu), p] = sum_nu B_qmn[q,mu,nu] * C[nu,p]
-        if X2d_buf is not None:
-            X2d = X2d_buf[: int(q) * int(nao)]
-            xp.matmul(B_qmn.reshape(int(q) * int(nao), int(nao)), mo_c, out=X2d)  # (q*nao, nmo)
-        else:
-            X2d = B_qmn.reshape(int(q) * int(nao), int(nao)) @ mo_c  # (q*nao, nmo)
-        del B_qmn
+        # Tier A: half-transform via apply_Qp_to_C_block — reads directly from packed
+        # Qp storage, no (q,nao,nao) unpack intermediate.
+        #   X2d[(q*mu), p] = sum_nu B[q,mu,nu] * C[nu,p]
+        X2d = apply_Qp_to_C_block(B_Qp, mo_c, nao=int(nao), q0=int(q0), q_count=int(q))  # (q,nao,nmo)
+        X2d = xp.asarray(X2d.reshape(int(q) * int(nao), int(nmo)), dtype=cdtype)
         X_blk = X2d.reshape(int(q), int(nao), int(nmo))
 
         if X_t_buf is not None:

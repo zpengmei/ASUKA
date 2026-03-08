@@ -23,6 +23,46 @@ def _env_float(name: str, default: float) -> float:
         return float(default)
 
 
+def _sym_pair_pack(W, W_pair, pair_pq, pair_qp, nrows, nops, fp_dtype):
+    """Pack W into symmetric-pair layout, using CUDA kernel if available."""
+    import cupy as cp
+    from asuka.cuda.cuda_backend import has_sym_pair_pack_device
+
+    npair = int(pair_pq.shape[0])
+    if has_sym_pair_pack_device():
+        from asuka.cuda.cuda_backend import sym_pair_pack_inplace_device
+        sym_pair_pack_inplace_device(
+            W, W_pair, pair_pq, pair_qp,
+            nrows=nrows, nops=nops, npair=npair,
+            is_f32=(cp.dtype(fp_dtype) == cp.float32),
+        )
+    else:
+        cp.take(W, pair_pq, axis=1, out=W_pair)
+        scratch = cp.empty_like(W_pair)
+        cp.take(W, pair_qp, axis=1, out=scratch)
+        W_pair += scratch
+        diag_mask = (pair_pq == pair_qp)
+        if cp.any(diag_mask):
+            W_pair[:, diag_mask] *= 0.5
+
+
+def _sym_pair_unpack(G_pair, G, full_to_pair, nrows, nops, fp_dtype):
+    """Unpack symmetric-pair G into full layout, using CUDA kernel if available."""
+    import cupy as cp
+    from asuka.cuda.cuda_backend import has_sym_pair_pack_device
+
+    npair = int(G_pair.shape[1])
+    if has_sym_pair_pack_device():
+        from asuka.cuda.cuda_backend import sym_pair_unpack_inplace_device
+        sym_pair_unpack_inplace_device(
+            G_pair, G, full_to_pair,
+            nrows=nrows, nops=nops, npair=npair,
+            is_f32=(cp.dtype(fp_dtype) == cp.float32),
+        )
+    else:
+        cp.take(G_pair, full_to_pair, axis=1, out=G)
+
+
 class CudaMrciHopWorkspace:
     """Reusable buffers for tiled `hop_cuda_epq_table`."""
 
@@ -453,11 +493,7 @@ def _hop_cuda_epq_table_1d_tiled(
             W_pair = workspace.W_pair[:k_count]
             G_pair = workspace.G_pair[:k_count]
 
-            cp.take(W, pair_pq, axis=1, out=W_pair)
-            cp.take(W, pair_qp, axis=1, out=G_pair)  # scratch
-            W_pair += G_pair
-            if int(diag_u.size) > 0:
-                W_pair[:, diag_u] *= 0.5
+            _sym_pair_pack(W, W_pair, pair_pq, pair_qp, k_count, nops, fp_dtype)
 
             if use_df:
                 Z = workspace.Z[:k_count]
@@ -476,7 +512,7 @@ def _hop_cuda_epq_table_1d_tiled(
                 except TypeError:
                     G_pair[...] = cp.matmul(W_pair, eri_pair_t)
 
-            cp.take(G_pair, full_to_pair, axis=1, out=G)
+            _sym_pair_unpack(G_pair, G, full_to_pair, k_count, nops, fp_dtype)
 
         if profile_stages:
             ev3.record(stream)
@@ -584,6 +620,22 @@ def _hop_cuda_epq_table_2d_block_tiled(
     fp_dtype = cp.dtype(fp_dtype)
     if fp_dtype not in (cp.float32, cp.float64):
         raise ValueError("fp_dtype must be float32 or float64")
+
+    # P1A: batched W-build (env-gated, float64 only)
+    _use_batched_w = (
+        _env_int("CUGUGA_USE_BATCHED_W_BUILD", 1) != 0
+        and fp_dtype == cp.float64
+    )
+    if _use_batched_w:
+        try:
+            from asuka.cuda.cuda_backend import (
+                has_build_w_batched_device,
+                build_w_from_epq_table_batched_inplace_device,
+                build_w_diag_batched_inplace_device,
+            )
+            _use_batched_w = has_build_w_batched_device()
+        except Exception:
+            _use_batched_w = False
 
     x = cp.asarray(x, dtype=fp_dtype)
     if x.ndim != 2:
@@ -710,54 +762,88 @@ def _hop_cuda_epq_table_2d_block_tiled(
                 ev5 = cp.cuda.Event()
                 ev0.record(stream)
 
-            for t in range(g):
-                x_vec = x[:, v_start + t]
-                w_sub = W_stack[t * k_count : (t + 1) * k_count]
-                build_w_from_epq_table_inplace_device(
-                    drt,
-                    state_dev,
+            # P1A batched path: avoid when target buffer exceeds ~8MB (L2 pressure)
+            _batched_ok = _use_batched_w and g > 1 and (g * k_count * nops < 1_000_000)
+            if _batched_ok:
+                # P1A batched: single launch for all g vectors
+                build_w_from_epq_table_batched_inplace_device(
                     epq_table,
-                    x_vec,
-                    w_out=w_sub,
-                    overflow=workspace.overflow,
+                    x,
+                    ncsf=ncsf,
+                    norb=norb,
+                    w_out=W_stack,
+                    nvec=g,
+                    v_start=v_start,
                     k_start=k_start,
                     k_count=k_count,
-                    dtype=fp_dtype,
                     threads=int(build_threads),
                     sync=sync,
-                    check_overflow=check_overflow,
                 )
+            else:
+                for t in range(g):
+                    x_vec = x[:, v_start + t]
+                    w_sub = W_stack[t * k_count : (t + 1) * k_count]
+                    build_w_from_epq_table_inplace_device(
+                        drt,
+                        state_dev,
+                        epq_table,
+                        x_vec,
+                        w_out=w_sub,
+                        overflow=workspace.overflow,
+                        k_start=k_start,
+                        k_count=k_count,
+                        dtype=fp_dtype,
+                        threads=int(build_threads),
+                        sync=sync,
+                        check_overflow=check_overflow,
+                    )
 
             if profile_stages:
                 ev1.record(stream)
 
-            for t in range(g):
-                x_vec = x[:, v_start + t]
-                w_sub = W_stack[t * k_count : (t + 1) * k_count]
-                if fp_dtype == cp.float64:
-                    build_w_diag_from_steps_inplace_device(
-                        state_dev,
-                        j_start=k_start,
-                        j_count=k_count,
-                        x=x_vec,
-                        w_out=w_sub,
-                        threads=int(diag_threads),
-                        sync=sync,
-                        relative_w=True,
-                    )
-                else:
-                    occ = cp.empty((k_count, norb), dtype=cp.float64)
-                    build_occ_block_from_steps_inplace_device(
-                        state_dev,
-                        j_start=k_start,
-                        j_count=k_count,
-                        occ_out=occ,
-                        threads=int(diag_threads),
-                        sync=sync,
-                    )
-                    diag_idx = cp.arange(norb, dtype=cp.int32)
-                    rr_idx = diag_idx * int(norb) + diag_idx
-                    w_sub[:, rr_idx] += (occ.astype(fp_dtype, copy=False) * x_vec[k_start:k_end, None])
+            if _batched_ok:
+                # P1A batched diagonal: single launch for all g vectors
+                build_w_diag_batched_inplace_device(
+                    state_dev,
+                    x,
+                    w_out=W_stack,
+                    ncsf=ncsf,
+                    norb=norb,
+                    j_start=k_start,
+                    j_count=k_count,
+                    nvec=g,
+                    v_start=v_start,
+                    threads=int(diag_threads),
+                    sync=sync,
+                )
+            else:
+                for t in range(g):
+                    x_vec = x[:, v_start + t]
+                    w_sub = W_stack[t * k_count : (t + 1) * k_count]
+                    if fp_dtype == cp.float64:
+                        build_w_diag_from_steps_inplace_device(
+                            state_dev,
+                            j_start=k_start,
+                            j_count=k_count,
+                            x=x_vec,
+                            w_out=w_sub,
+                            threads=int(diag_threads),
+                            sync=sync,
+                            relative_w=True,
+                        )
+                    else:
+                        occ = cp.empty((k_count, norb), dtype=cp.float64)
+                        build_occ_block_from_steps_inplace_device(
+                            state_dev,
+                            j_start=k_start,
+                            j_count=k_count,
+                            occ_out=occ,
+                            threads=int(diag_threads),
+                            sync=sync,
+                        )
+                        diag_idx = cp.arange(norb, dtype=cp.int32)
+                        rr_idx = diag_idx * int(norb) + diag_idx
+                        w_sub[:, rr_idx] += (occ.astype(fp_dtype, copy=False) * x_vec[k_start:k_end, None])
 
             if profile_stages:
                 ev2.record(stream)
@@ -783,11 +869,7 @@ def _hop_cuda_epq_table_2d_block_tiled(
                 W_pair_stack = workspace.W_pair[:total_rows]
                 G_pair_stack = workspace.G_pair[:total_rows]
 
-                cp.take(W_stack, pair_pq, axis=1, out=W_pair_stack)
-                cp.take(W_stack, pair_qp, axis=1, out=G_pair_stack)  # scratch
-                W_pair_stack += G_pair_stack
-                if int(diag_u.size) > 0:
-                    W_pair_stack[:, diag_u] *= 0.5
+                _sym_pair_pack(W_stack, W_pair_stack, pair_pq, pair_qp, total_rows, nops, fp_dtype)
 
                 if use_df:
                     Z_stack = workspace.Z[:total_rows]
@@ -806,7 +888,7 @@ def _hop_cuda_epq_table_2d_block_tiled(
                     except TypeError:
                         G_pair_stack[...] = cp.matmul(W_pair_stack, eri_pair_t)
 
-                cp.take(G_pair_stack, full_to_pair, axis=1, out=G_stack)
+                _sym_pair_unpack(G_pair_stack, G_stack, full_to_pair, total_rows, nops, fp_dtype)
 
             if profile_stages:
                 ev3.record(stream)
@@ -840,8 +922,9 @@ def _hop_cuda_epq_table_2d_block_tiled(
                 cp.dot(W_stack, h_eff_flat, out=tmp)
             else:
                 cp.dot(workspace.W_pair[:total_rows], h_eff_pair, out=tmp)
-            for t in range(g):
-                y_f[k_start:k_end, v_start + t] += tmp[t * k_count : (t + 1) * k_count]
+            # P1D: vectorized row-dot-add via reshape instead of per-vector loop
+            tmp_2d = tmp.reshape(g, k_count)
+            y_f[k_start:k_end, v_start:v_start + g] += tmp_2d.T
 
             if profile_stages:
                 ev5.record(stream)

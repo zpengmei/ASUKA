@@ -56,5 +56,6 @@ df_data = builder.build(c_cas=mo_cas)
 - Runtime: CuPy + CUDA-capable GPU.
 - ASUKA CUDA extension: `python -m asuka.build.guga_cuda_ext`
 - Optional CUDA linalg extension: `python -m asuka.build.guga_cuda_linalg_ext`
+- Optional CUTLASS dense GEMM extension: `ASUKA_CUTLASS_DIR=/path/to/cutlass python -m asuka.build.cutlass_cuda_ext`
 - For `active_space_df` cuERI paths: build cuERI CUDA extension too
   (`python -m asuka.cueri.build_cuda_ext`).

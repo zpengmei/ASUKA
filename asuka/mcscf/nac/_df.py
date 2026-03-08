@@ -343,7 +343,11 @@ def _build_bar_L_net_active_df(
         if not bool(is_qp):  # pragma: no cover
             raise RuntimeError("internal error: expected packed df_B")
         from asuka.integrals.tri_packed import pack_tril, tri_weights  # noqa: PLC0415
-        from asuka.integrals.df_packed_s2 import unpack_Qp_to_Qmn_block  # noqa: PLC0415
+        from asuka.integrals.df_packed_s2 import (  # noqa: PLC0415
+            apply_Qp_to_C_block,
+            fused_qp_exchange_sym_f64,
+            fused_qp_l_act_f64,
+        )
 
         w = tri_weights(xp, int(nao), dtype=_wd)
         D_core_p = pack_tril(xp, D_core_ao)
@@ -375,27 +379,32 @@ def _build_bar_L_net_active_df(
         )
         _log_vram("  net_active_fused_qp: after net Coulomb")
 
-        # --- Net Exchange (chunked): -0.5*(D_core @ BQ @ D_ah + D_w @ BQ @ D_core) ---
+        # Tier B-2: fused exchange kernel — no (q,nao,nao) intermediate.
+        # Computes -0.5 * (D_core @ B_q @ D_ah + D_ah @ B_q @ D_core) in packed Qp format.
         if ncore:
+            B_ao_f64 = xp.asarray(B_ao, dtype=xp.float64)
+            D_core_f64 = xp.asarray(D_core_ao, dtype=xp.float64)
+            D_ah_f64 = xp.asarray(D_ah, dtype=xp.float64)
+            _exch_f64 = xp.zeros((naux, ntri), dtype=xp.float64)
             _chunk = int(max(1, qblock if qblock is not None else (naux // 4)))
             for _q0 in range(0, naux, _chunk):
                 _q1 = min(_q0 + _chunk, naux)
                 _q = int(_q1 - _q0)
                 if _q <= 0:
                     continue
-                _bq = unpack_Qp_to_Qmn_block(B_ao, nao=int(nao), q0=int(_q0), q_count=int(_q))
-                _t = xp.matmul(xp.matmul(D_core_ao[None, :, :], _bq), D_ah)
-                _t += xp.matmul(xp.matmul(D_w[None, :, :], _bq), D_core_ao)
-                _t *= -0.5
-                _tp = _pack_qmn_block_to_qp(xp, _t.astype(xp.float64, copy=False), nao=int(nao))
-                bar_net[_q0:_q1] += _tp.astype(_od, copy=False)
-                del _bq, _t, _tp
+                fused_qp_exchange_sym_f64(
+                    B_ao_f64, D_core_f64, D_ah_f64, _exch_f64,
+                    nao=int(nao), q0=int(_q0), q_count=int(_q), alpha=-0.5,
+                )
+            bar_net += _exch_f64.astype(_od, copy=False)
+            del _exch_f64
         _log_vram("  net_active_fused_qp: after net exchange")
 
         # --- Active 2-RDM term (identical to _build_bar_L_casscf_df) ---
         dm2_arr = xp.asarray(dm2_act, dtype=_wd)
         if L_act is None:
-            # Build L_act in aux blocks.
+            # Tier B-1: fused kernel — no (q,nao,nao) or (q,nao,ncas) intermediate.
+            B_ao_f64 = xp.asarray(B_ao, dtype=xp.float64)
             L_act_val = xp.empty((ncas, ncas, naux), dtype=_wd)
             _chunkL = int(max(1, qblock if qblock is not None else (naux // 4)))
             for _q0 in range(0, naux, _chunkL):
@@ -403,11 +412,9 @@ def _build_bar_L_net_active_df(
                 _q = int(_q1 - _q0)
                 if _q <= 0:
                     continue
-                _bq = unpack_Qp_to_Qmn_block(B_ao, nao=int(nao), q0=int(_q0), q_count=int(_q))
-                _x = xp.matmul(_bq, C_act)  # (q,nao,ncas)
-                _l = xp.matmul(C_act.T[None, :, :], _x)  # (q,ncas,ncas)
+                _l = fused_qp_l_act_f64(B_ao_f64, C_act, nao=int(nao), q0=int(_q0), q_count=int(_q))  # (q,ncas,ncas)
                 L_act_val[:, :, _q0:_q1] = _l.transpose(1, 2, 0)
-                del _bq, _x, _l
+                del _l
         else:
             L_act_val = xp.asarray(L_act, dtype=_wd)
 

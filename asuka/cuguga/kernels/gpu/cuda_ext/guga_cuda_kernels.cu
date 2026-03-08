@@ -22,3 +22,4 @@
 #include "guga_cuda_kernels_kernel25_ws.cuh"
 #include "guga_cuda_kernels_fused_hop.cuh"
 #include "guga_cuda_kernels_soc_triplet.cuh"
+#include "guga_cuda_kernels_mrci_fused.cuh"

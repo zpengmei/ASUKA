@@ -11916,3 +11916,451 @@ def kernel4_apply_csr_eri_mat_fused_epq_table_range_inplace_device(
         bool(use_kahan),
     )
     return y, overflow
+
+
+# ============================================================================
+# Fused MRCI kernels (P1C, P2, P4)
+# ============================================================================
+
+
+def has_sym_pair_pack_device() -> bool:
+    return _ext is not None and hasattr(_ext, "sym_pair_pack_inplace_device")
+
+
+def sym_pair_pack_inplace_device(
+    W,
+    W_pair,
+    pair_pq,
+    pair_qp,
+    *,
+    nrows: int,
+    nops: int,
+    npair: int,
+    is_f32: bool = False,
+    threads: int = 256,
+    stream=None,
+    sync: bool = False,
+):
+    """Pack W into symmetric-pair layout on GPU.
+
+    W_pair[k, u] = W[k, pair_pq[u]] + W[k, pair_qp[u]], halved on diagonal.
+    """
+    if _ext is None:
+        raise RuntimeError("CUDA extension not available")
+
+    import cupy as cp
+
+    if stream is None:
+        stream_ptr = int(cp.cuda.get_current_stream().ptr)
+    else:
+        stream_ptr = int(getattr(stream, "ptr", stream))
+
+    _ext.sym_pair_pack_inplace_device(
+        W, W_pair, pair_pq, pair_qp,
+        int(nrows), int(nops), int(npair),
+        bool(is_f32), int(stream_ptr), int(threads),
+    )
+    if sync:
+        cp.cuda.get_current_stream().synchronize()
+
+
+def sym_pair_unpack_inplace_device(
+    G_pair,
+    G,
+    full_to_pair,
+    *,
+    nrows: int,
+    nops: int,
+    npair: int,
+    is_f32: bool = False,
+    threads: int = 256,
+    stream=None,
+    sync: bool = False,
+):
+    """Unpack symmetric-pair G into full layout on GPU.
+
+    G[k, pq] = G_pair[k, full_to_pair[pq]].
+    """
+    if _ext is None:
+        raise RuntimeError("CUDA extension not available")
+
+    import cupy as cp
+
+    if stream is None:
+        stream_ptr = int(cp.cuda.get_current_stream().ptr)
+    else:
+        stream_ptr = int(getattr(stream, "ptr", stream))
+
+    _ext.sym_pair_unpack_inplace_device(
+        G_pair, G, full_to_pair,
+        int(nrows), int(nops), int(npair),
+        bool(is_f32), int(stream_ptr), int(threads),
+    )
+    if sync:
+        cp.cuda.get_current_stream().synchronize()
+
+
+def rdm12_reorder_delta_inplace_device(
+    dm1_pq,
+    gram0,
+    *,
+    dm1_out=None,
+    dm2_out=None,
+    norb: int,
+    threads: int = 256,
+    stream=None,
+    sync: bool = True,
+):
+    """Reorder dm1/dm2 from EPQ layout + apply delta correction, all on GPU.
+
+    dm1_out[q,p] = dm1_pq[p*norb+q]
+    dm2_out[p,q,r,s] = gram0[r*norb+s, p*norb+q] - delta(q,r)*dm1_pq[s*norb+p]
+    """
+    if _ext is None:
+        raise RuntimeError("CUDA extension not available")
+
+    import cupy as cp
+
+    nops = int(norb) * int(norb)
+    dm1_pq = cp.ascontiguousarray(cp.asarray(dm1_pq, dtype=cp.float64).ravel())
+    gram0 = cp.ascontiguousarray(cp.asarray(gram0, dtype=cp.float64).reshape(nops, nops))
+
+    if dm1_out is None:
+        dm1_out = cp.empty((norb, norb), dtype=cp.float64)
+    if dm2_out is None:
+        dm2_out = cp.empty((norb, norb, norb, norb), dtype=cp.float64)
+
+    if stream is None:
+        stream_ptr = int(cp.cuda.get_current_stream().ptr)
+    else:
+        stream_ptr = int(getattr(stream, "ptr", stream))
+
+    _ext.rdm12_reorder_delta_inplace_device(
+        dm1_pq, gram0, dm1_out, dm2_out,
+        int(norb), int(stream_ptr), int(threads), bool(sync),
+    )
+    return dm1_out, dm2_out
+
+
+def scatter_embed_batched_inplace_device(
+    x_sub,
+    sub_to_full,
+    x_full,
+    *,
+    threads: int = 128,
+    stream=None,
+    sync: bool = False,
+):
+    """Batched scatter embed: x_full[sub_to_full[i], :] = x_sub[i, :] for all vectors."""
+    if _ext is None:
+        raise RuntimeError("CUDA extension not available")
+
+    import cupy as cp
+
+    x_sub = cp.ascontiguousarray(cp.asarray(x_sub, dtype=cp.float64))
+    sub_to_full = cp.asarray(sub_to_full, dtype=cp.int64).ravel()
+    x_full = cp.asarray(x_full, dtype=cp.float64)
+
+    if x_sub.ndim != 2:
+        raise ValueError("x_sub must be 2D (nsub, nvec)")
+    nsub, nvec = x_sub.shape
+    sub_stride = int(x_sub.strides[0] // 8)
+    full_stride = int(x_full.strides[0] // 8) if x_full.ndim >= 2 else nvec
+
+    if stream is None:
+        stream_ptr = int(cp.cuda.get_current_stream().ptr)
+    else:
+        stream_ptr = int(getattr(stream, "ptr", stream))
+
+    _ext.scatter_embed_batched_inplace_device(
+        x_sub, sub_to_full, x_full,
+        int(nvec), int(sub_stride), int(full_stride),
+        int(stream_ptr), int(threads),
+    )
+    if sync:
+        cp.cuda.get_current_stream().synchronize()
+
+
+def gather_project_batched_inplace_device(
+    y_full,
+    sub_to_full,
+    y_sub,
+    *,
+    threads: int = 128,
+    stream=None,
+    sync: bool = False,
+):
+    """Batched gather project: y_sub[i, :] = y_full[sub_to_full[i], :] for all vectors."""
+    if _ext is None:
+        raise RuntimeError("CUDA extension not available")
+
+    import cupy as cp
+
+    y_full = cp.asarray(y_full, dtype=cp.float64)
+    sub_to_full = cp.asarray(sub_to_full, dtype=cp.int64).ravel()
+    y_sub = cp.ascontiguousarray(cp.asarray(y_sub, dtype=cp.float64))
+
+    if y_sub.ndim != 2:
+        raise ValueError("y_sub must be 2D (nsub, nvec)")
+    nsub, nvec = y_sub.shape
+    full_stride = int(y_full.strides[0] // 8) if y_full.ndim >= 2 else nvec
+    sub_stride = int(y_sub.strides[0] // 8)
+
+    if stream is None:
+        stream_ptr = int(cp.cuda.get_current_stream().ptr)
+    else:
+        stream_ptr = int(getattr(stream, "ptr", stream))
+
+    _ext.gather_project_batched_inplace_device(
+        y_full, sub_to_full, y_sub,
+        int(nvec), int(full_stride), int(sub_stride),
+        int(stream_ptr), int(threads),
+    )
+    if sync:
+        cp.cuda.get_current_stream().synchronize()
+
+
+# ============================================================================
+# P1A: Batched W-build + diagonal
+# ============================================================================
+
+
+def has_build_w_batched_device() -> bool:
+    return _ext is not None and hasattr(_ext, "build_w_from_epq_table_batched_inplace_device")
+
+
+def build_w_from_epq_table_batched_inplace_device(
+    epq_table,
+    x,
+    *,
+    ncsf: int,
+    norb: int,
+    w_out,
+    nvec: int,
+    v_start: int,
+    k_start: int,
+    k_count: int,
+    threads: int = 256,
+    stream=None,
+    sync: bool = False,
+):
+    """Batched off-diagonal W-build from EPQ table for nvec vectors.
+
+    W_out[v*k_count + k_local, pq] += coef * x[j, v_start+v] for all EPQ entries.
+    """
+    if _ext is None:
+        raise RuntimeError("CUDA extension not available")
+
+    import cupy as cp
+
+    epq_indptr, epq_indices, epq_pq, epq_data = epq_table
+
+    nops = int(norb) * int(norb)
+
+    # Ensure int64 indptr for the batched kernel
+    epq_indptr = cp.asarray(epq_indptr, dtype=cp.int64).ravel()
+    epq_indptr = cp.ascontiguousarray(epq_indptr)
+    epq_indices = cp.ascontiguousarray(cp.asarray(epq_indices, dtype=cp.int32).ravel())
+    epq_pq = cp.ascontiguousarray(cp.asarray(epq_pq, dtype=cp.int32).ravel())
+    epq_data = cp.ascontiguousarray(cp.asarray(epq_data, dtype=cp.float64).ravel())
+
+    # x stride (number of columns in the full multivector array)
+    if x.ndim == 2:
+        x_stride = int(x.strides[0] // 8)
+    else:
+        x_stride = 1
+
+    # w_out stride
+    if w_out.ndim == 2:
+        w_stride = int(w_out.strides[0] // 8)
+    else:
+        w_stride = nops
+
+    if stream is None:
+        stream_ptr = int(cp.cuda.get_current_stream().ptr)
+    else:
+        stream_ptr = int(getattr(stream, "ptr", stream))
+
+    _ext.build_w_from_epq_table_batched_inplace_device(
+        epq_indptr, epq_indices, epq_pq, epq_data,
+        x, int(x_stride),
+        w_out, int(w_stride),
+        int(ncsf), int(nops),
+        int(nvec), int(v_start),
+        int(k_start), int(k_count),
+        int(stream_ptr), int(threads),
+    )
+    if sync:
+        cp.cuda.get_current_stream().synchronize()
+
+
+def build_w_diag_batched_inplace_device(
+    state_dev,
+    x,
+    *,
+    w_out,
+    ncsf: int,
+    norb: int,
+    j_start: int,
+    j_count: int,
+    nvec: int,
+    v_start: int,
+    threads: int = 256,
+    stream=None,
+    sync: bool = False,
+):
+    """Batched diagonal W-build for nvec vectors.
+
+    W_out[v*j_count + j_local, r*norb+r] = occ(j,r) * x[j, v_start+v].
+    """
+    if _ext is None:
+        raise RuntimeError("CUDA extension not available")
+
+    import cupy as cp
+
+    steps_table = state_dev.steps_table_dev
+    nops = int(norb) * int(norb)
+
+    if x.ndim == 2:
+        x_stride = int(x.strides[0] // 8)
+    else:
+        x_stride = 1
+
+    if w_out.ndim == 2:
+        w_stride = int(w_out.strides[0] // 8)
+    else:
+        w_stride = nops
+
+    if stream is None:
+        stream_ptr = int(cp.cuda.get_current_stream().ptr)
+    else:
+        stream_ptr = int(getattr(stream, "ptr", stream))
+
+    _ext.build_w_diag_batched_inplace_device(
+        steps_table, x, int(x_stride),
+        w_out, int(w_stride),
+        int(ncsf), int(norb),
+        int(j_start), int(j_count),
+        int(nvec), int(v_start),
+        int(stream_ptr), int(threads),
+    )
+    if sync:
+        cp.cuda.get_current_stream().synchronize()
+
+
+# ============================================================================
+# P5: RDM123 delta correction + symmetry
+# ============================================================================
+
+
+def has_rdm123_reorder_device() -> bool:
+    return _ext is not None and hasattr(_ext, "dm2_delta_correction_inplace_device")
+
+
+def dm2_delta_correction_inplace_device(
+    dm2,
+    dm1,
+    *,
+    n: int,
+    threads: int = 256,
+    stream=None,
+    sync: bool = False,
+):
+    """In-place dm2 delta: dm2[:, k, k, :] -= dm1 for all k."""
+    if _ext is None:
+        raise RuntimeError("CUDA extension not available")
+
+    import cupy as cp
+
+    if stream is None:
+        stream_ptr = int(cp.cuda.get_current_stream().ptr)
+    else:
+        stream_ptr = int(getattr(stream, "ptr", stream))
+
+    _ext.dm2_delta_correction_inplace_device(
+        dm2, dm1, int(n), int(stream_ptr), int(threads),
+    )
+    if sync:
+        cp.cuda.get_current_stream().synchronize()
+
+
+def dm2_4way_symmetry_inplace_device(
+    dm2_in,
+    dm2_out,
+    *,
+    n: int,
+    threads: int = 256,
+    stream=None,
+    sync: bool = False,
+):
+    """4-way dm2 symmetry: dm2_out = 0.25*(dm2 + 3 permutations)."""
+    if _ext is None:
+        raise RuntimeError("CUDA extension not available")
+
+    import cupy as cp
+
+    if stream is None:
+        stream_ptr = int(cp.cuda.get_current_stream().ptr)
+    else:
+        stream_ptr = int(getattr(stream, "ptr", stream))
+
+    _ext.dm2_4way_symmetry_inplace_device(
+        dm2_in, dm2_out, int(n), int(stream_ptr), int(threads),
+    )
+    if sync:
+        cp.cuda.get_current_stream().synchronize()
+
+
+def dm3_delta_correction_inplace_device(
+    dm3,
+    dm2,
+    dm1,
+    *,
+    n: int,
+    threads: int = 256,
+    stream=None,
+    sync: bool = False,
+):
+    """In-place dm3 delta: 4 correction terms using post-symmetry dm2."""
+    if _ext is None:
+        raise RuntimeError("CUDA extension not available")
+
+    import cupy as cp
+
+    if stream is None:
+        stream_ptr = int(cp.cuda.get_current_stream().ptr)
+    else:
+        stream_ptr = int(getattr(stream, "ptr", stream))
+
+    _ext.dm3_delta_correction_inplace_device(
+        dm3, dm2, dm1, int(n), int(stream_ptr), int(threads),
+    )
+    if sync:
+        cp.cuda.get_current_stream().synchronize()
+
+
+def dm3_6way_symmetry_inplace_device(
+    dm3_in,
+    dm3_out,
+    *,
+    n: int,
+    threads: int = 256,
+    stream=None,
+    sync: bool = False,
+):
+    """6-way dm3 pair-permutation symmetry."""
+    if _ext is None:
+        raise RuntimeError("CUDA extension not available")
+
+    import cupy as cp
+
+    if stream is None:
+        stream_ptr = int(cp.cuda.get_current_stream().ptr)
+    else:
+        stream_ptr = int(getattr(stream, "ptr", stream))
+
+    _ext.dm3_6way_symmetry_inplace_device(
+        dm3_in, dm3_out, int(n), int(stream_ptr), int(threads),
+    )
+    if sync:
+        cp.cuda.get_current_stream().synchronize()

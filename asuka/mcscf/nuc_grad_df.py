@@ -1270,10 +1270,10 @@ def _build_gfock_casscf_df(
         L_pact = xp.einsum("mp,mvQ->pvQ", C, X, optimize=True)  # (nmo,ncas,naux)
         del X
     else:
-        from asuka.integrals.df_packed_s2 import unpack_Qp_to_Qmn_block  # noqa: PLC0415
+        from asuka.integrals.df_packed_s2 import apply_Qp_to_C_block  # noqa: PLC0415
 
-        # Build L_pact in aux blocks by unpacking Qp -> Qmn. ncas is small so
-        # the intermediate (q,nao,ncas) fits comfortably even for large nao.
+        # Build L_pact in aux blocks via Tier A: apply_Qp_to_C_block fuses the
+        # unpack and first half-transform, eliminating the (q,nao,nao) intermediate.
         try:
             q_block_L = int(_os.environ.get("ASUKA_DF_L_PACT_QBLOCK", "128"))
         except Exception:
@@ -1286,11 +1286,10 @@ def _build_gfock_casscf_df(
             q = int(q1 - q0)
             if q <= 0:
                 continue
-            BQc = unpack_Qp_to_Qmn_block(B_ao, nao=int(nao), q0=int(q0), q_count=int(q))  # (q,nao,nao)
-            X_blk = xp.matmul(BQc, C_act)  # (q,nao,ncas)
+            X_blk = apply_Qp_to_C_block(B_ao, C_act, nao=int(nao), q0=int(q0), q_count=int(q))  # (q,nao,ncas)
             L_blk = xp.matmul(C.T[None, :, :], X_blk)  # (q,nmo,ncas)
             L_pact[:, :, int(q0) : int(q1)] = L_blk.transpose(1, 2, 0)
-            del BQc, X_blk, L_blk
+            del X_blk, L_blk
     L_act = L_pact[ncore:nocc]  # (ncas,ncas,naux)
 
     dm2_flat = dm2_arr.reshape(ncas * ncas, ncas * ncas)
@@ -2211,7 +2210,10 @@ def _build_bar_L_casscf_df_qp(
         raise RuntimeError("internal error: expected packed Qp df_B")
 
     from asuka.integrals.tri_packed import pack_tril, tri_weights  # noqa: PLC0415
-    from asuka.integrals.df_packed_s2 import unpack_Qp_to_Qmn_block  # noqa: PLC0415
+    from asuka.integrals.df_packed_s2 import (  # noqa: PLC0415
+        fused_qp_l_act_f64,
+        fused_qp_exchange_sym_f64,
+    )
 
     # Mean-field interaction with the core potential:
     #   E_cc + E_ca = Tr(D_w * (J(Dc) - 0.5 K(Dc))), where D_w = D_act + 0.5 D_core
@@ -2240,20 +2242,25 @@ def _build_bar_L_casscf_df_qp(
     )
     _log_vram("    casscf_df_qp: after bar_mean J")
 
-    # Exchange part: unpack B in aux blocks, build Qmn blocks, then pack back to Qp.
+    # Tier B-2 exchange: fused kernel reads Qp and writes Qp, no (q,nao,nao) intermediate.
+    # Computes -0.5 * (D_core @ B_q @ D_w + D_w @ B_q @ D_core) in packed Qp format.
     _chunk = int(max(1, qblock if qblock is not None else (naux // 4)))
+    D_core_f64 = xp.asarray(D_core_ao, dtype=xp.float64)
+    D_w_f64 = xp.asarray(D_w, dtype=xp.float64)
+    B_Qp_f64 = xp.asarray(B_Qp, dtype=xp.float64)
+    # Accumulate exchange into a float64 working buffer, then cast back.
+    _exch_f64 = xp.zeros((naux, ntri), dtype=xp.float64)
     for _q0 in range(0, naux, _chunk):
         _q1 = min(_q0 + _chunk, naux)
         _q = int(_q1 - _q0)
         if _q <= 0:
             continue
-        _bq = unpack_Qp_to_Qmn_block(B_Qp, nao=int(nao), q0=int(_q0), q_count=int(_q))  # (q,nao,nao)
-        _t = xp.matmul(xp.matmul(D_core_ao[None, :, :], _bq), D_w)
-        _t += xp.matmul(xp.matmul(D_w[None, :, :], _bq), D_core_ao)
-        _t *= -0.5
-        _tp = _pack_qmn_block_to_qp(xp, _t.astype(xp.float64, copy=False), nao=int(nao))
-        bar_mean[_q0:_q1] += _tp.astype(_od, copy=False)
-        del _bq, _t, _tp
+        fused_qp_exchange_sym_f64(
+            B_Qp_f64, D_core_f64, D_w_f64, _exch_f64,
+            nao=int(nao), q0=int(_q0), q_count=int(_q), alpha=-0.5,
+        )
+    bar_mean += _exch_f64.astype(_od, copy=False)
+    del _exch_f64
     _log_vram("    casscf_df_qp: after exchange")
 
     # Active-active 2-RDM term.
@@ -2269,7 +2276,8 @@ def _build_bar_L_casscf_df_qp(
         raise ValueError("dm2_act shape mismatch")
 
     if L_act is None:
-        # Build L_act[u,v,Q] = C_act^T B_Q C_act in aux blocks.
+        # Tier B-1: fused kernel computes L_act[q,u,v] = C_act.T @ B_q @ C_act
+        # directly from packed Qp — no (q,nao,nao) or (q,nao,ncas) intermediate.
         L_act_val = xp.empty((ncas, ncas, naux), dtype=_wd)
         _chunkL = int(max(1, qblock if qblock is not None else (naux // 4)))
         for _q0 in range(0, naux, _chunkL):
@@ -2277,11 +2285,9 @@ def _build_bar_L_casscf_df_qp(
             _q = int(_q1 - _q0)
             if _q <= 0:
                 continue
-            _bq = unpack_Qp_to_Qmn_block(B_Qp, nao=int(nao), q0=int(_q0), q_count=int(_q))  # (q,nao,nao)
-            _x = xp.matmul(_bq, C_act)  # (q,nao,ncas)
-            _l = xp.matmul(C_act.T[None, :, :], _x)  # (q,ncas,ncas)
+            _l = fused_qp_l_act_f64(B_Qp_f64, C_act, nao=int(nao), q0=int(_q0), q_count=int(_q))  # (q,ncas,ncas)
             L_act_val[:, :, _q0:_q1] = _l.transpose(1, 2, 0)
-            del _bq, _x, _l
+            del _l
     else:
         L_act_val = xp.asarray(L_act, dtype=_wd)
         if L_act_val.shape != (ncas, ncas, naux):
@@ -5987,22 +5993,26 @@ def casscf_nuc_grad_df_per_root(
                 _flush_gpu_pool()
                 _log_vram(f"root {K} after delta_hf flush")
 
-                # CI response term: accumulate directly into bar_L_delta_total.
-                _, D_act_lci = _build_bar_L_net_active_df(
+                # CI response term: use linearized bar_L (cross-terms with
+                # core only, no quadratic self-interaction of D_lci) so that
+                # the weighted sum over roots cancels exactly.
+                _build_bar_L_delta_casscf_df(
                     B_ao,
-                    C,
-                    dm1_lci,
-                    dm2_lci,
-                    ncore=int(ncore),
-                    ncas=int(ncas),
-                    xp=xp,
-                    L_act=L_act,
+                    D_core_ao=D_core_sa,
+                    C_act=C_act_sa,
+                    dm1_delta=dm1_lci,
+                    dm2_delta=dm2_lci,
                     rho_core=rho_core,
+                    L2=L2,
                     out=bar_L_delta_total,
                     symmetrize=False,
                     work_dtype=_barl_work_dtype,
                     out_dtype=_barl_out_dtype,
                     qblock=qblock_eff,
+                )
+                D_act_lci = xp.asarray(
+                    C_act_sa @ xp.asarray(dm1_lci, dtype=xp.float64) @ C_act_sa.T,
+                    dtype=xp.float64,
                 )
                 _log_vram(f"root {K} after lci_net")
                 _flush_gpu_pool()
@@ -6025,6 +6035,7 @@ def casscf_nuc_grad_df_per_root(
                     qblock=qblock_eff,
                 )
                 _log_vram(f"root {K} after lorb")
+
 
                 if not bool(is_qp):
                     _symmetrize_bar_L_inplace(bar_L_delta_total, xp)
@@ -6107,21 +6118,23 @@ def casscf_nuc_grad_df_per_root(
                 out_dtype=xp.float64,
                 qblock=int(_barl_policy.get("qblock", 0)),
             )
-            _, D_act_lci_ref = _build_bar_L_net_active_df(
+            _build_bar_L_delta_casscf_df(
                 B_ao,
-                C,
-                dm1_lci,
-                dm2_lci,
-                ncore=int(ncore),
-                ncas=int(ncas),
-                xp=xp,
-                L_act=L_act,
+                D_core_ao=D_core_sa,
+                C_act=C_act_sa,
+                dm1_delta=dm1_lci,
+                dm2_delta=dm2_lci,
                 rho_core=rho_core,
+                L2=L2,
                 out=bar_L_ref,
                 symmetrize=False,
                 work_dtype=xp.float64,
                 out_dtype=xp.float64,
                 qblock=int(_barl_policy.get("qblock", 0)),
+            )
+            D_act_lci_ref = xp.asarray(
+                C_act_sa @ xp.asarray(dm1_lci, dtype=xp.float64) @ C_act_sa.T,
+                dtype=xp.float64,
             )
             _, D_L_lorb_ref = _build_bar_L_lorb_df(
                 B_ao,

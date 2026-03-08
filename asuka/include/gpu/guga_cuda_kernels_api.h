@@ -1853,4 +1853,88 @@ extern "C" void guga_triplet_build_gm_all_m_dfs_launch_stream(
     cudaStream_t stream,
     int threads);
 
+// --------------------------------------------------------------------------
+// Fused MRCI kernels (guga_cuda_kernels_mrci_fused.cuh)
+// --------------------------------------------------------------------------
+
+extern "C" void sym_pair_pack_launch_stream(
+    const double* W, double* W_pair,
+    const int32_t* pair_pq, const int32_t* pair_qp,
+    int nrows, int nops, int npair,
+    int64_t w_stride, int64_t wp_stride,
+    cudaStream_t stream, int threads);
+
+extern "C" void sym_pair_unpack_launch_stream(
+    const double* G_pair, double* G,
+    const int32_t* full_to_pair,
+    int nrows, int nops, int npair,
+    int64_t gp_stride, int64_t g_stride,
+    cudaStream_t stream, int threads);
+
+extern "C" void sym_pair_pack_f32_launch_stream(
+    const float* W, float* W_pair,
+    const int32_t* pair_pq, const int32_t* pair_qp,
+    int nrows, int nops, int npair,
+    int64_t w_stride, int64_t wp_stride,
+    cudaStream_t stream, int threads);
+
+extern "C" void sym_pair_unpack_f32_launch_stream(
+    const float* G_pair, float* G,
+    const int32_t* full_to_pair,
+    int nrows, int nops, int npair,
+    int64_t gp_stride, int64_t g_stride,
+    cudaStream_t stream, int threads);
+
+extern "C" void rdm12_reorder_delta_launch_stream(
+    const double* dm1_pq, const double* gram0,
+    double* dm1_out, double* dm2_out,
+    int norb,
+    cudaStream_t stream, int threads);
+
+extern "C" void scatter_embed_batched_launch_stream(
+    const double* x_sub, const int64_t* sub_to_full, double* x_full,
+    int nsub, int nvec, int64_t sub_stride, int64_t full_stride,
+    cudaStream_t stream, int threads);
+
+extern "C" void gather_project_batched_launch_stream(
+    const double* y_full, const int64_t* sub_to_full, double* y_sub,
+    int nsub, int nvec, int64_t full_stride, int64_t sub_stride,
+    cudaStream_t stream, int threads);
+
+// P1A: Batched W-build + diagonal
+extern "C" void build_w_from_epq_table_batched_launch_stream(
+    const int64_t* epq_indptr, const int32_t* epq_indices,
+    const int32_t* epq_pq, const double* epq_data,
+    const double* x, int64_t x_stride,
+    double* w_out, int64_t w_stride,
+    int ncsf, int nops,
+    int nvec, int v_start,
+    int k_start, int k_count,
+    cudaStream_t stream, int threads);
+
+extern "C" void build_w_diag_batched_launch_stream(
+    const int8_t* steps_table, const double* x, int64_t x_stride,
+    double* w_out, int64_t w_stride,
+    int ncsf, int norb,
+    int j_start, int j_count,
+    int nvec, int v_start,
+    cudaStream_t stream, int threads);
+
+// P5: RDM123 delta + symmetry
+extern "C" void dm2_delta_correction_launch_stream(
+    double* dm2, const double* dm1, int n,
+    cudaStream_t stream, int threads);
+
+extern "C" void dm2_4way_symmetry_launch_stream(
+    const double* dm2_in, double* dm2_out, int n,
+    cudaStream_t stream, int threads);
+
+extern "C" void dm3_delta_correction_launch_stream(
+    double* dm3, const double* dm2, const double* dm1, int n,
+    cudaStream_t stream, int threads);
+
+extern "C" void dm3_6way_symmetry_launch_stream(
+    const double* dm3_in, double* dm3_out, int n,
+    cudaStream_t stream, int threads);
+
 #endif  // CUGUGA_GPU_GUGA_CUDA_KERNELS_API_H

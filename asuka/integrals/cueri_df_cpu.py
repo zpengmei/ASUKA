@@ -160,8 +160,13 @@ def build_df_B_from_cueri_packed_bases_cpu(
     *,
     threads: int = 0,
     profile: dict | None = None,
-) -> np.ndarray:
-    """Build whitened AO DF factors B[μ,ν,Q] on CPU using cuERI Step-2 tiles."""
+    return_L: bool = False,
+) -> np.ndarray | tuple[np.ndarray, np.ndarray]:
+    """Build whitened AO DF factors ``B[mu,nu,Q]`` on CPU using cuERI Step-2 tiles.
+
+    When ``return_L=True``, also return the lower Cholesky factor ``L`` of the
+    auxiliary metric so replay paths can recover the unwhitened 3c tensor.
+    """
 
     if profile is not None:
         profile.clear()
@@ -182,7 +187,10 @@ def build_df_B_from_cueri_packed_bases_cpu(
     nao = nao_cart_from_basis(ao_basis)
     naux = nao_cart_from_basis(aux_basis)
     if nao == 0 or naux == 0:
-        return np.empty((nao, nao, naux), dtype=np.float64)
+        B_empty = np.empty((nao, nao, naux), dtype=np.float64)
+        if bool(return_L):
+            return B_empty, np.empty((naux, naux), dtype=np.float64)
+        return B_empty
 
     basis_all, sp_all, nsp_ao, _n_shell_ao, n_shell_aux = _build_df_combined_basis_and_shell_pairs(ao_basis, aux_basis)
     aux_sp0 = int(nsp_ao)
@@ -350,6 +358,8 @@ def build_df_B_from_cueri_packed_bases_cpu(
         profile["naux"] = int(naux)
         profile["threads"] = int(threads_i)
 
+    if bool(return_L):
+        return B, np.asarray(L, dtype=np.float64, order="C")
     return B
 
 

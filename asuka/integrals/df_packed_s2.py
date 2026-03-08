@@ -654,12 +654,171 @@ def extract_Qp_rows_cols_block(
     return out_np
 
 
+def fused_qp_l_act_f64(
+    B_Qp: Any,
+    C_act: Any,
+    *,
+    nao: int,
+    q0: int,
+    q_count: int,
+) -> Any:
+    """Compute L_act[q,u,v] = C_act.T @ unpack(B_Qp[q0:q0+q_count]) @ C_act.
+
+    No (q,nao,nao) or (q,nao,ncas) intermediate is allocated on GPU.
+    Falls back to apply_Qp_to_C_block + matmul on CPU/when cuERI ext unavailable.
+
+    Inputs
+    - B_Qp:  (naux, ntri)
+    - C_act: (nao, ncas)
+    Output
+    - L_act: (q_count, ncas, ncas)
+    """
+    nao_i = int(nao)
+    q0_i = int(q0)
+    q_count_i = int(q_count)
+    if nao_i < 0 or q0_i < 0 or q_count_i < 0:
+        raise ValueError("invalid nao/q0/q_count")
+    if q_count_i == 0:
+        ncas = int(C_act.shape[1])
+        return np.zeros((0, ncas, ncas), dtype=np.float64)
+
+    ntri_expected = int(ntri_from_nao(nao_i))
+    ncas = int(C_act.shape[1])
+
+    try:
+        import cupy as cp  # type: ignore
+    except Exception:
+        cp = None  # type: ignore
+
+    if cp is not None and isinstance(B_Qp, cp.ndarray):  # type: ignore[attr-defined]
+        _ext = _require_cueri_ext()
+        B = cp.asarray(B_Qp, dtype=cp.float64)
+        C = cp.asarray(C_act, dtype=cp.float64)
+        if not bool(getattr(B, "flags", None).c_contiguous):
+            B = cp.ascontiguousarray(B)
+        if not bool(getattr(C, "flags", None).c_contiguous):
+            C = cp.ascontiguousarray(C)
+        naux = int(B.shape[0])
+        if q0_i > naux or q_count_i > naux - q0_i:
+            raise ValueError("q0+q_count must be <= naux")
+        L = cp.zeros((q_count_i, ncas, ncas), dtype=cp.float64)
+        _ext.df_fused_qp_l_act_device(
+            B.ravel(),
+            C.ravel(),
+            L.ravel(),
+            int(naux),
+            int(nao_i),
+            int(ncas),
+            int(ntri_expected),
+            int(q0_i),
+            int(q_count_i),
+            16,  # tile
+            cp.cuda.get_current_stream().ptr,
+            False,
+        )
+        return L
+
+    # CPU fallback: apply_Qp_to_C_block + batched matmul
+    X = apply_Qp_to_C_block(B_Qp, C_act, nao=nao_i, q0=q0_i, q_count=q_count_i)
+    C_np = np.asarray(C_act, dtype=np.float64)
+    return np.matmul(C_np.T[None, :, :], X)
+
+
+def fused_qp_exchange_sym_f64(
+    B_Qp: Any,
+    D1: Any,
+    D2: Any,
+    out_Qp: Any,
+    *,
+    nao: int,
+    q0: int,
+    q_count: int,
+    alpha: float = 1.0,
+) -> None:
+    """Accumulate alpha*(D1@B@D2 + D2@B@D1) into out_Qp in packed Qp format.
+
+    The result is symmetric (D1, D2, B all symmetric), so it maps directly
+    to Qp without a separate pack step.  out_Qp is updated in-place.
+
+    Inputs
+    - B_Qp:   (naux, ntri) packed DF tensor (read-only for rows q0..q0+q_count-1)
+    - D1, D2: (nao, nao) density matrices
+    - out_Qp: (naux, ntri) accumulated output — modified in place
+    """
+    nao_i = int(nao)
+    q0_i = int(q0)
+    q_count_i = int(q_count)
+    alpha_f = float(alpha)
+    if nao_i < 0 or q0_i < 0 or q_count_i < 0:
+        raise ValueError("invalid nao/q0/q_count")
+    if q_count_i == 0:
+        return
+
+    ntri_expected = int(ntri_from_nao(nao_i))
+
+    try:
+        import cupy as cp  # type: ignore
+    except Exception:
+        cp = None  # type: ignore
+
+    if cp is not None and isinstance(B_Qp, cp.ndarray):  # type: ignore[attr-defined]
+        _ext = _require_cueri_ext()
+        B = cp.asarray(B_Qp, dtype=cp.float64)
+        d1 = cp.asarray(D1, dtype=cp.float64)
+        d2 = cp.asarray(D2, dtype=cp.float64)
+        out = cp.asarray(out_Qp, dtype=cp.float64)
+        if not bool(getattr(B, "flags", None).c_contiguous):
+            B = cp.ascontiguousarray(B)
+        if not bool(getattr(d1, "flags", None).c_contiguous):
+            d1 = cp.ascontiguousarray(d1)
+        if not bool(getattr(d2, "flags", None).c_contiguous):
+            d2 = cp.ascontiguousarray(d2)
+        if not bool(getattr(out, "flags", None).c_contiguous):
+            out = cp.ascontiguousarray(out)
+        naux = int(B.shape[0])
+        if q0_i > naux or q_count_i > naux - q0_i:
+            raise ValueError("q0+q_count must be <= naux")
+        _ext.df_fused_qp_exchange_sym_device(
+            B.ravel(),
+            d1.ravel(),
+            d2.ravel(),
+            out.ravel(),
+            int(naux),
+            int(nao_i),
+            int(ntri_expected),
+            int(q0_i),
+            int(q_count_i),
+            alpha_f,
+            256,  # threads
+            cp.cuda.get_current_stream().ptr,
+            False,
+        )
+        # Write back if out is a copy (non-contiguous input case)
+        if out is not out_Qp:
+            cp.copyto(out_Qp, out)
+        return
+
+    # CPU fallback: unpack + matmul chain + pack lower triangle
+    B_np = np.asarray(B_Qp, dtype=np.float64, order="C")
+    D1_np = np.asarray(D1, dtype=np.float64, order="C")
+    D2_np = np.asarray(D2, dtype=np.float64, order="C")
+    bq = unpack_Qp_to_Qmn_block(B_np, nao=nao_i, q0=q0_i, q_count=q_count_i)
+    t = np.matmul(np.matmul(D1_np[None, :, :], bq), D2_np)
+    t += np.matmul(np.matmul(D2_np[None, :, :], bq), D1_np)
+    t *= alpha_f
+    tri_i, tri_j = np.tril_indices(nao_i)
+    out_Qp_np = np.asarray(out_Qp)
+    out_Qp_np[q0_i : q0_i + q_count_i] += t[:, tri_i, tri_j]
+
+
 __all__ = [
     "ao_packed_s2_enabled",
     "is_df_qp",
     "infer_nao_from_Qp",
     "apply_Qp_to_C_block",
     "extract_Qp_rows_cols_block",
+    "fused_qp_l_act_f64",
+    "fused_qp_exchange_sym_f64",
     "pack_B_to_Qp",
     "pack_Lf_block_to_Qp",
     "unpack_Qp_to_mnQ",

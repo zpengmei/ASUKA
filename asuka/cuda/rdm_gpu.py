@@ -555,11 +555,20 @@ def make_rdm12_cuda(
                 check_overflow=True,
             )
         dm1_pq_gpu, gram0_gpu = rdm_gram_and_dm1_inplace_device(workspace.gram_ws, T_gpu, c_gpu)
-    dm1_pq = cp.asnumpy(dm1_pq_gpu)
-    gram0 = cp.asnumpy(gram0_gpu).T.copy()
-
+    gram0_t = gram0_gpu.T.copy()
     if symmetrize_gram:
-        gram0 = 0.5 * (gram0 + gram0.T)
+        gram0_t = 0.5 * (gram0_t + gram0_t.T)
+
+    from asuka.cuda.cuda_backend import has_sym_pair_pack_device
+    if has_sym_pair_pack_device():
+        from asuka.cuda.cuda_backend import rdm12_reorder_delta_inplace_device
+        dm1, dm2 = rdm12_reorder_delta_inplace_device(
+            dm1_pq_gpu, gram0_t, norb=norb, sync=True,
+        )
+        return cp.asnumpy(dm1).astype(np.float64), cp.asnumpy(dm2).astype(np.float64)
+
+    dm1_pq = cp.asnumpy(dm1_pq_gpu)
+    gram0 = cp.asnumpy(gram0_t)
 
     dm1 = dm1_pq.reshape(norb, norb).T.copy()
 
@@ -999,8 +1008,18 @@ def trans_rdm12_cuda(
             gram_out=gram0_gpu,
         )
 
+    from asuka.cuda.cuda_backend import has_sym_pair_pack_device
+    if has_sym_pair_pack_device():
+        from asuka.cuda.cuda_backend import rdm12_reorder_delta_inplace_device
+        gram0_t = gram0_gpu.T.copy()
+        dm1, dm2 = rdm12_reorder_delta_inplace_device(
+            dm1_pq_gpu, gram0_t, norb=norb, sync=True,
+        )
+        if return_cupy:
+            return cp.asarray(dm1, dtype=cp.float64), cp.asarray(dm2, dtype=cp.float64)
+        return cp.asnumpy(dm1).astype(np.float64), cp.asnumpy(dm2).astype(np.float64)
+
     if return_cupy:
-        # Keep everything on GPU — zero sync points.
         dm1 = dm1_pq_gpu.reshape(norb, norb).T.copy()
         swap = cp.arange(nops, dtype=cp.int32).reshape(norb, norb).T.ravel()
         gram = gram0_gpu.T[swap]

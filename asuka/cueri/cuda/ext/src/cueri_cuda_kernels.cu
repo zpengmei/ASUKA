@@ -1095,6 +1095,121 @@ __global__ void KernelDFUnpackQpToMnQ(
   }
 }
 
+// ---------------------------------------------------------------------------
+// KernelFusedQpLact
+// Computes L_act[q,u,v] = sum_{mu,nu} C_act[mu,u] * B[q,mu,nu] * C_act[nu,v]
+// directly from packed Qp storage with no (q,nao,nao) or (q,nao,ncas) intermediate.
+//
+// Grid:  (q_count, ceil(ncas/blockDim.x), ceil(ncas/blockDim.y))
+// Block: (tile, tile)  — tile=16 is the default; one thread per (q, u, v) output.
+// ---------------------------------------------------------------------------
+__global__ void KernelFusedQpLact(
+    const double* __restrict__ B_Qp,   // (naux, ntri) packed lower triangle
+    const double* __restrict__ C_act,  // (nao, ncas) row-major
+    double* __restrict__ L_act,        // (q_count, ncas, ncas) output
+    int naux,
+    int nao,
+    int ncas,
+    int ntri,
+    int q0,
+    int q_count) {
+  const int q_local = blockIdx.x;
+  const int u = static_cast<int>(blockIdx.y) * static_cast<int>(blockDim.x) + static_cast<int>(threadIdx.x);
+  const int v = static_cast<int>(blockIdx.z) * static_cast<int>(blockDim.y) + static_cast<int>(threadIdx.y);
+  if (q_local >= q_count) return;
+  const int q = q0 + q_local;
+  if (q < 0 || q >= naux) return;
+  if (u >= ncas || v >= ncas) return;
+
+  const double* B_q = B_Qp + static_cast<int64_t>(q) * static_cast<int64_t>(ntri);
+  double acc = 0.0;
+
+  // L[q,u,v] = sum_{mu,nu} B[q,mu,nu] * C[mu,u] * C[nu,v]
+  // Iterate lower triangle: p = mu*(mu+1)/2 + nu with mu >= nu.
+  // Diagonal (mu==nu): contributes once.
+  // Off-diagonal (mu>nu): B is symmetric → contributes (mu,nu) AND (nu,mu) directions.
+  for (int mu = 0; mu < nao; ++mu) {
+    const double c_mu_u = C_act[static_cast<int64_t>(mu) * ncas + u];
+    const double c_mu_v = C_act[static_cast<int64_t>(mu) * ncas + v];
+    const int p_base = mu * (mu + 1) / 2;
+    // diagonal element
+    acc += B_q[p_base + mu] * c_mu_u * c_mu_v;
+    // off-diagonal elements
+    for (int nu = 0; nu < mu; ++nu) {
+      const double bval = B_q[p_base + nu];
+      acc += bval * (c_mu_u * C_act[static_cast<int64_t>(nu) * ncas + v] +
+                     C_act[static_cast<int64_t>(nu) * ncas + u] * c_mu_v);
+    }
+  }
+  L_act[static_cast<int64_t>(q_local) * static_cast<int64_t>(ncas) * static_cast<int64_t>(ncas) +
+        static_cast<int64_t>(u) * ncas + v] = acc;
+}
+
+// ---------------------------------------------------------------------------
+// KernelFusedQpExchangeSym
+// Computes out_Qp[q,p] += alpha * (F[mu,nu] + F[nu,mu])
+// where F = D1 @ B_q @ D2 and B_q is read from packed Qp storage.
+// The result is symmetric, so written back in packed Qp format.
+//
+// Grid:  ceil(q_count * ntri / threads) 1-D blocks
+// Block: threads (typically 256)
+// ---------------------------------------------------------------------------
+__global__ void KernelFusedQpExchangeSym(
+    const double* __restrict__ B_Qp,  // (naux, ntri) input
+    const double* __restrict__ D1,    // (nao, nao) density matrix
+    const double* __restrict__ D2,    // (nao, nao) density matrix
+    double* __restrict__ out_Qp,      // (naux, ntri) accumulated output
+    int naux,
+    int nao,
+    int ntri,
+    int q0,
+    int q_count,
+    double alpha) {
+  const int64_t stride = static_cast<int64_t>(blockDim.x) * static_cast<int64_t>(gridDim.x);
+  int64_t tid = static_cast<int64_t>(blockIdx.x) * static_cast<int64_t>(blockDim.x) + static_cast<int64_t>(threadIdx.x);
+  const int64_t total = static_cast<int64_t>(q_count) * static_cast<int64_t>(ntri);
+
+  for (int64_t idx = tid; idx < total; idx += stride) {
+    const int q_local = static_cast<int>(idx / static_cast<int64_t>(ntri));
+    const int64_t p = idx - static_cast<int64_t>(q_local) * static_cast<int64_t>(ntri);
+    const int q = q0 + q_local;
+    if (q < 0 || q >= naux) continue;
+
+    int mu, nu;
+    TriUnpackS2Index(p, mu, nu);  // mu >= nu
+
+    const double* B_q = B_Qp + static_cast<int64_t>(q) * static_cast<int64_t>(ntri);
+
+    // F[mu,nu] + F[nu,mu] where F = D1 @ B_q @ D2.
+    // Exploit B_q symmetry: iterate lower triangle of B_q.
+    // Diagonal (k==l): D1[mu,k]*B[k,k]*D2[k,nu] + D1[nu,k]*B[k,k]*D2[k,mu]
+    // Off-diag (k>l):  B[k,l] contributes to pairs (k,l) and (l,k) in double sum.
+    double val = 0.0;
+    for (int k = 0; k < nao; ++k) {
+      const double D1_mu_k = D1[static_cast<int64_t>(mu) * nao + k];
+      const double D1_nu_k = D1[static_cast<int64_t>(nu) * nao + k];
+      const int k_base = k * (k + 1) / 2;
+      // diagonal l == k
+      {
+        const double b_kk = B_q[k_base + k];
+        val += b_kk * (D1_mu_k * D2[static_cast<int64_t>(k) * nao + nu] +
+                       D1_nu_k * D2[static_cast<int64_t>(k) * nao + mu]);
+      }
+      // off-diagonal l < k
+      for (int l = 0; l < k; ++l) {
+        const double b_kl = B_q[k_base + l];
+        const double D1_mu_l = D1[static_cast<int64_t>(l) * nao + mu];
+        const double D1_nu_l = D1[static_cast<int64_t>(l) * nao + nu];
+        val += b_kl * (D1_mu_k * D2[static_cast<int64_t>(l) * nao + nu] +
+                       D1_nu_k * D2[static_cast<int64_t>(l) * nao + mu] +
+                       D1_mu_l * D2[static_cast<int64_t>(k) * nao + nu] +
+                       D1_nu_l * D2[static_cast<int64_t>(k) * nao + mu]);
+      }
+    }
+    out_Qp[static_cast<int64_t>(q) * static_cast<int64_t>(ntri) + p] += alpha * val;
+  }
+}
+
 }  // namespace
 
 extern "C" cudaError_t cueri_scatter_df_metric_tiles_launch_stream(
@@ -1330,5 +1445,54 @@ extern "C" cudaError_t cueri_df_unpack_qp_to_mnq_launch_stream(
   if (n == 0) return cudaSuccess;
   const int blocks = static_cast<int>((n + static_cast<int64_t>(threads) - 1) / static_cast<int64_t>(threads));
   KernelDFUnpackQpToMnQ<<<blocks, threads, 0, stream>>>(in_Qp, out_mnQ, nao, naux);
+  return cudaGetLastError();
+}
+
+extern "C" cudaError_t cueri_df_fused_qp_l_act_launch_stream(
+    const double* B_Qp,
+    const double* C_act,
+    double* L_act,
+    int naux,
+    int nao,
+    int ncas,
+    int ntri,
+    int q0,
+    int q_count,
+    cudaStream_t stream,
+    int tile) {
+  if (naux < 0 || nao < 0 || ncas < 0 || ntri < 0 || q0 < 0 || q_count < 0 || tile <= 0)
+    return cudaErrorInvalidValue;
+  if (ncas == 0 || q_count == 0) return cudaSuccess;
+  const dim3 block(static_cast<unsigned>(tile), static_cast<unsigned>(tile), 1);
+  const dim3 grid(
+      static_cast<unsigned>(q_count),
+      static_cast<unsigned>((ncas + tile - 1) / tile),
+      static_cast<unsigned>((ncas + tile - 1) / tile));
+  KernelFusedQpLact<<<grid, block, 0, stream>>>(
+      B_Qp, C_act, L_act, naux, nao, ncas, ntri, q0, q_count);
+  return cudaGetLastError();
+}
+
+extern "C" cudaError_t cueri_df_fused_qp_exchange_sym_launch_stream(
+    const double* B_Qp,
+    const double* D1,
+    const double* D2,
+    double* out_Qp,
+    int naux,
+    int nao,
+    int ntri,
+    int q0,
+    int q_count,
+    double alpha,
+    cudaStream_t stream,
+    int threads) {
+  if (naux < 0 || nao < 0 || ntri < 0 || q0 < 0 || q_count < 0 || threads <= 0)
+    return cudaErrorInvalidValue;
+  if (q_count == 0) return cudaSuccess;
+  const int64_t n = static_cast<int64_t>(q_count) * static_cast<int64_t>(ntri);
+  if (n == 0) return cudaSuccess;
+  const int blocks = static_cast<int>((n + static_cast<int64_t>(threads) - 1) / static_cast<int64_t>(threads));
+  KernelFusedQpExchangeSym<<<blocks, threads, 0, stream>>>(
+      B_Qp, D1, D2, out_Qp, naux, nao, ntri, q0, q_count, alpha);
   return cudaGetLastError();
 }

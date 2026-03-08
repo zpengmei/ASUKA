@@ -340,7 +340,11 @@ def _g_dm2_df_blocked_qp(
     mo_block_nmo = max(1, int(mo_block_nmo))
     use_batched_matmul = bool(use_batched_matmul)
 
-    from asuka.integrals.df_packed_s2 import unpack_Qp_to_Qmn_block  # noqa: PLC0415
+    from asuka.integrals.df_packed_s2 import (  # noqa: PLC0415
+        unpack_Qp_to_Qmn_block,
+        apply_Qp_to_C_block,
+        fused_qp_l_act_f64,
+    )
 
     # Contiguous operands help cuBLAS avoid implicit copies.
     try:
@@ -363,38 +367,21 @@ def _g_dm2_df_blocked_qp(
         if qb <= 0:
             continue
 
+        # Tier B-1: fused kernel computes L_act[q,u,v] = C_act.T @ B_q @ C_act
+        # directly from packed Qp with no (qb,nao,nao) or (qb,nao,ncas) intermediate.
+        # Falls back to apply_Qp_to_C_block + matmul on CPU.
         tt = time.perf_counter() if profile is not None else 0.0
-        B_qmn = unpack_Qp_to_Qmn_block(B_Qp, nao=int(nao), q0=int(q0), q_count=int(qb))  # (qb,nao,nao)
-        if profile is not None:
-            t_unpack += time.perf_counter() - tt
-
-        # X[q,mu,u] = sum_nu B[q,mu,nu] * C_act[nu,u]
-        tt = time.perf_counter() if profile is not None else 0.0
-        if use_batched_matmul and hasattr(xp, "matmul"):
-            X = xp.matmul(B_qmn, C_act)  # (qb,nao,ncas)
-        else:
-            # Flatten the batched matmul into a single GEMM. This is typically
-            # faster and uses less temporary workspace for small ncas (e.g. CAS(2,2)).
-            X2d = B_qmn.reshape(qb * nao, nao) @ C_act  # (qb*nao,ncas)
-            X = X2d.reshape(qb, nao, ncas)
-            del X2d
-        del B_qmn
-        if profile is not None:
-            t_x += time.perf_counter() - tt
-
-        # L_act[q,u,v] = C_act^T @ X[q]
-        tt = time.perf_counter() if profile is not None else 0.0
-        if use_batched_matmul and hasattr(xp, "matmul"):
-            L_act = xp.matmul(C_act.T[None, :, :], X)  # (qb,ncas,ncas)
-            X_t = None
-        else:
-            # One GEMM for all q: (ncas,nao) @ (nao,qb*ncas) -> (ncas,qb*ncas)
-            X_t = xp.ascontiguousarray(X.transpose(1, 0, 2))  # (nao,qb,ncas)
-            L_raw = C_act.T @ X_t.reshape(nao, qb * ncas)  # (ncas,qb*ncas)
-            L_act = xp.ascontiguousarray(L_raw.reshape(ncas, qb, ncas).transpose(1, 0, 2))  # (qb,ncas,ncas)
-            del L_raw
+        L_act = fused_qp_l_act_f64(B_Qp, C_act, nao=int(nao), q0=int(q0), q_count=int(qb))  # (qb,ncas,ncas)
         if profile is not None:
             t_lact += time.perf_counter() - tt
+
+        # Tier A: compute X[q,mu,u] = B_q @ C_act for the inner MO Lp loop.
+        # apply_Qp_to_C_block reads directly from packed Qp — no (qb,nao,nao) intermediate.
+        tt = time.perf_counter() if profile is not None else 0.0
+        X = apply_Qp_to_C_block(B_Qp, C_act, nao=int(nao), q0=int(q0), q_count=int(qb))  # (qb,nao,ncas)
+        X_t = None  # will be built on demand inside the MO inner loop if needed
+        if profile is not None:
+            t_x += time.perf_counter() - tt
 
         # T[q,u,v] = sum_{w,x} L_act[q,w,x] * dm2[w x, u v]
         tt = time.perf_counter() if profile is not None else 0.0

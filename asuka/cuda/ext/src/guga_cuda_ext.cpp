@@ -16405,6 +16405,323 @@ void coo_scatter_device(
   }
 }
 
+// ============================================================================
+// Fused MRCI kernel wrappers (P1C, P2, P4)
+// ============================================================================
+
+void sym_pair_pack_inplace_device(
+    py::object W,
+    py::object W_pair,
+    py::object pair_pq,
+    py::object pair_qp,
+    int nrows, int nops, int npair,
+    bool is_f32,
+    uint64_t stream,
+    int threads) {
+  auto w_dev = cuda_array_view_from_object(W, "W");
+  auto wp_dev = cuda_array_view_from_object(W_pair, "W_pair");
+  auto ppq_dev = cuda_array_view_from_object(pair_pq, "pair_pq");
+  auto pqp_dev = cuda_array_view_from_object(pair_qp, "pair_qp");
+
+  require_typestr(ppq_dev, "pair_pq", "<i4");
+  require_typestr(pqp_dev, "pair_qp", "<i4");
+  if (wp_dev.read_only) throw std::invalid_argument("W_pair must be writable");
+
+  cudaStream_t stream_t = reinterpret_cast<cudaStream_t>(stream);
+
+  if (is_f32) {
+    require_typestr(w_dev, "W", "<f4");
+    require_typestr(wp_dev, "W_pair", "<f4");
+    int64_t w_stride = (w_dev.strides_bytes.size() >= 2) ? w_dev.strides_bytes[0] / 4 : (int64_t)nops;
+    int64_t wp_stride = (wp_dev.strides_bytes.size() >= 2) ? wp_dev.strides_bytes[0] / 4 : (int64_t)npair;
+    sym_pair_pack_f32_launch_stream(
+        (const float*)w_dev.ptr, (float*)wp_dev.ptr,
+        (const int32_t*)ppq_dev.ptr, (const int32_t*)pqp_dev.ptr,
+        nrows, nops, npair, w_stride, wp_stride,
+        stream_t, threads);
+  } else {
+    require_typestr(w_dev, "W", "<f8");
+    require_typestr(wp_dev, "W_pair", "<f8");
+    int64_t w_stride = (w_dev.strides_bytes.size() >= 2) ? w_dev.strides_bytes[0] / 8 : (int64_t)nops;
+    int64_t wp_stride = (wp_dev.strides_bytes.size() >= 2) ? wp_dev.strides_bytes[0] / 8 : (int64_t)npair;
+    sym_pair_pack_launch_stream(
+        (const double*)w_dev.ptr, (double*)wp_dev.ptr,
+        (const int32_t*)ppq_dev.ptr, (const int32_t*)pqp_dev.ptr,
+        nrows, nops, npair, w_stride, wp_stride,
+        stream_t, threads);
+  }
+}
+
+void sym_pair_unpack_inplace_device(
+    py::object G_pair,
+    py::object G,
+    py::object full_to_pair,
+    int nrows, int nops, int npair,
+    bool is_f32,
+    uint64_t stream,
+    int threads) {
+  auto gp_dev = cuda_array_view_from_object(G_pair, "G_pair");
+  auto g_dev = cuda_array_view_from_object(G, "G");
+  auto ftp_dev = cuda_array_view_from_object(full_to_pair, "full_to_pair");
+
+  require_typestr(ftp_dev, "full_to_pair", "<i4");
+  if (g_dev.read_only) throw std::invalid_argument("G must be writable");
+
+  cudaStream_t stream_t = reinterpret_cast<cudaStream_t>(stream);
+
+  if (is_f32) {
+    require_typestr(gp_dev, "G_pair", "<f4");
+    require_typestr(g_dev, "G", "<f4");
+    int64_t gp_stride = (gp_dev.strides_bytes.size() >= 2) ? gp_dev.strides_bytes[0] / 4 : (int64_t)npair;
+    int64_t g_stride = (g_dev.strides_bytes.size() >= 2) ? g_dev.strides_bytes[0] / 4 : (int64_t)nops;
+    sym_pair_unpack_f32_launch_stream(
+        (const float*)gp_dev.ptr, (float*)g_dev.ptr,
+        (const int32_t*)ftp_dev.ptr,
+        nrows, nops, npair, gp_stride, g_stride,
+        stream_t, threads);
+  } else {
+    require_typestr(gp_dev, "G_pair", "<f8");
+    require_typestr(g_dev, "G", "<f8");
+    int64_t gp_stride = (gp_dev.strides_bytes.size() >= 2) ? gp_dev.strides_bytes[0] / 8 : (int64_t)npair;
+    int64_t g_stride = (g_dev.strides_bytes.size() >= 2) ? g_dev.strides_bytes[0] / 8 : (int64_t)nops;
+    sym_pair_unpack_launch_stream(
+        (const double*)gp_dev.ptr, (double*)g_dev.ptr,
+        (const int32_t*)ftp_dev.ptr,
+        nrows, nops, npair, gp_stride, g_stride,
+        stream_t, threads);
+  }
+}
+
+void rdm12_reorder_delta_inplace_device(
+    py::object dm1_pq,
+    py::object gram0,
+    py::object dm1_out,
+    py::object dm2_out,
+    int norb,
+    uint64_t stream,
+    int threads,
+    bool sync) {
+  auto dm1pq_dev = cuda_array_view_from_object(dm1_pq, "dm1_pq");
+  auto gram0_dev = cuda_array_view_from_object(gram0, "gram0");
+  auto dm1o_dev = cuda_array_view_from_object(dm1_out, "dm1_out");
+  auto dm2o_dev = cuda_array_view_from_object(dm2_out, "dm2_out");
+
+  require_typestr(dm1pq_dev, "dm1_pq", "<f8");
+  require_typestr(gram0_dev, "gram0", "<f8");
+  require_typestr(dm1o_dev, "dm1_out", "<f8");
+  require_typestr(dm2o_dev, "dm2_out", "<f8");
+
+  if (dm1o_dev.read_only) throw std::invalid_argument("dm1_out must be writable");
+  if (dm2o_dev.read_only) throw std::invalid_argument("dm2_out must be writable");
+
+  cudaStream_t stream_t = reinterpret_cast<cudaStream_t>(stream);
+  rdm12_reorder_delta_launch_stream(
+      (const double*)dm1pq_dev.ptr, (const double*)gram0_dev.ptr,
+      (double*)dm1o_dev.ptr, (double*)dm2o_dev.ptr,
+      norb, stream_t, threads);
+
+  if (sync) {
+    throw_on_cuda_error(cudaStreamSynchronize(stream_t),
+                        "cudaStreamSynchronize(rdm12_reorder_delta)");
+  }
+}
+
+void scatter_embed_batched_inplace_device(
+    py::object x_sub,
+    py::object sub_to_full,
+    py::object x_full,
+    int nvec,
+    int64_t sub_stride,
+    int64_t full_stride,
+    uint64_t stream,
+    int threads) {
+  auto xs_dev = cuda_array_view_from_object(x_sub, "x_sub");
+  auto stf_dev = cuda_array_view_from_object(sub_to_full, "sub_to_full");
+  auto xf_dev = cuda_array_view_from_object(x_full, "x_full");
+
+  require_typestr(xs_dev, "x_sub", "<f8");
+  require_typestr(stf_dev, "sub_to_full", "<i8");
+  require_typestr(xf_dev, "x_full", "<f8");
+  if (xf_dev.read_only) throw std::invalid_argument("x_full must be writable");
+
+  int nsub = (int)xs_dev.shape[0];
+  cudaStream_t stream_t = reinterpret_cast<cudaStream_t>(stream);
+  scatter_embed_batched_launch_stream(
+      (const double*)xs_dev.ptr, (const int64_t*)stf_dev.ptr,
+      (double*)xf_dev.ptr,
+      nsub, nvec, sub_stride, full_stride,
+      stream_t, threads);
+}
+
+void gather_project_batched_inplace_device(
+    py::object y_full,
+    py::object sub_to_full,
+    py::object y_sub,
+    int nvec,
+    int64_t full_stride,
+    int64_t sub_stride,
+    uint64_t stream,
+    int threads) {
+  auto yf_dev = cuda_array_view_from_object(y_full, "y_full");
+  auto stf_dev = cuda_array_view_from_object(sub_to_full, "sub_to_full");
+  auto ys_dev = cuda_array_view_from_object(y_sub, "y_sub");
+
+  require_typestr(yf_dev, "y_full", "<f8");
+  require_typestr(stf_dev, "sub_to_full", "<i8");
+  require_typestr(ys_dev, "y_sub", "<f8");
+  if (ys_dev.read_only) throw std::invalid_argument("y_sub must be writable");
+
+  int nsub = (int)ys_dev.shape[0];
+  cudaStream_t stream_t = reinterpret_cast<cudaStream_t>(stream);
+  gather_project_batched_launch_stream(
+      (const double*)yf_dev.ptr, (const int64_t*)stf_dev.ptr,
+      (double*)ys_dev.ptr,
+      nsub, nvec, full_stride, sub_stride,
+      stream_t, threads);
+}
+
+// P1A: Batched W-build + diagonal
+void build_w_from_epq_table_batched_inplace_device(
+    py::object epq_indptr,
+    py::object epq_indices,
+    py::object epq_pq,
+    py::object epq_data,
+    py::object x,
+    int64_t x_stride,
+    py::object w_out,
+    int64_t w_stride,
+    int ncsf, int nops,
+    int nvec, int v_start,
+    int k_start, int k_count,
+    uint64_t stream,
+    int threads) {
+  auto indptr_dev = cuda_array_view_from_object(epq_indptr, "epq_indptr");
+  auto indices_dev = cuda_array_view_from_object(epq_indices, "epq_indices");
+  auto pq_dev = cuda_array_view_from_object(epq_pq, "epq_pq");
+  auto data_dev = cuda_array_view_from_object(epq_data, "epq_data");
+  auto x_dev = cuda_array_view_from_object(x, "x");
+  auto w_dev = cuda_array_view_from_object(w_out, "w_out");
+
+  require_typestr(indptr_dev, "epq_indptr", "<i8");
+  require_typestr(indices_dev, "epq_indices", "<i4");
+  require_typestr(pq_dev, "epq_pq", "<i4");
+  require_typestr(data_dev, "epq_data", "<f8");
+  require_typestr(x_dev, "x", "<f8");
+  require_typestr(w_dev, "w_out", "<f8");
+  if (w_dev.read_only) throw std::invalid_argument("w_out must be writable");
+
+  cudaStream_t stream_t = reinterpret_cast<cudaStream_t>(stream);
+  build_w_from_epq_table_batched_launch_stream(
+      (const int64_t*)indptr_dev.ptr, (const int32_t*)indices_dev.ptr,
+      (const int32_t*)pq_dev.ptr, (const double*)data_dev.ptr,
+      (const double*)x_dev.ptr, x_stride,
+      (double*)w_dev.ptr, w_stride,
+      ncsf, nops, nvec, v_start, k_start, k_count,
+      stream_t, threads);
+}
+
+void build_w_diag_batched_inplace_device(
+    py::object steps_table,
+    py::object x,
+    int64_t x_stride,
+    py::object w_out,
+    int64_t w_stride,
+    int ncsf, int norb,
+    int j_start, int j_count,
+    int nvec, int v_start,
+    uint64_t stream,
+    int threads) {
+  auto st_dev = cuda_array_view_from_object(steps_table, "steps_table");
+  auto x_dev = cuda_array_view_from_object(x, "x");
+  auto w_dev = cuda_array_view_from_object(w_out, "w_out");
+
+  // int8 has no endianness; CuPy uses |i1, NumPy uses <i1 or |i1
+  {
+    std::string ts = st_dev.typestr;
+    if (!ts.empty() && ts[0] == '|') ts[0] = '<';
+    if (ts != "<i1") throw std::invalid_argument("steps_table must be int8");
+  }
+  require_typestr(x_dev, "x", "<f8");
+  require_typestr(w_dev, "w_out", "<f8");
+  if (w_dev.read_only) throw std::invalid_argument("w_out must be writable");
+
+  cudaStream_t stream_t = reinterpret_cast<cudaStream_t>(stream);
+  build_w_diag_batched_launch_stream(
+      (const int8_t*)st_dev.ptr, (const double*)x_dev.ptr, x_stride,
+      (double*)w_dev.ptr, w_stride,
+      ncsf, norb, j_start, j_count, nvec, v_start,
+      stream_t, threads);
+}
+
+// P5: RDM123 delta + symmetry
+void dm2_delta_correction_inplace_device(
+    py::object dm2,
+    py::object dm1,
+    int n,
+    uint64_t stream,
+    int threads) {
+  auto dm2_dev = cuda_array_view_from_object(dm2, "dm2");
+  auto dm1_dev = cuda_array_view_from_object(dm1, "dm1");
+  require_typestr(dm2_dev, "dm2", "<f8");
+  require_typestr(dm1_dev, "dm1", "<f8");
+  if (dm2_dev.read_only) throw std::invalid_argument("dm2 must be writable");
+  cudaStream_t stream_t = reinterpret_cast<cudaStream_t>(stream);
+  dm2_delta_correction_launch_stream(
+      (double*)dm2_dev.ptr, (const double*)dm1_dev.ptr, n, stream_t, threads);
+}
+
+void dm2_4way_symmetry_inplace_device(
+    py::object dm2_in,
+    py::object dm2_out,
+    int n,
+    uint64_t stream,
+    int threads) {
+  auto in_dev = cuda_array_view_from_object(dm2_in, "dm2_in");
+  auto out_dev = cuda_array_view_from_object(dm2_out, "dm2_out");
+  require_typestr(in_dev, "dm2_in", "<f8");
+  require_typestr(out_dev, "dm2_out", "<f8");
+  if (out_dev.read_only) throw std::invalid_argument("dm2_out must be writable");
+  cudaStream_t stream_t = reinterpret_cast<cudaStream_t>(stream);
+  dm2_4way_symmetry_launch_stream(
+      (const double*)in_dev.ptr, (double*)out_dev.ptr, n, stream_t, threads);
+}
+
+void dm3_delta_correction_inplace_device(
+    py::object dm3,
+    py::object dm2,
+    py::object dm1,
+    int n,
+    uint64_t stream,
+    int threads) {
+  auto dm3_dev = cuda_array_view_from_object(dm3, "dm3");
+  auto dm2_dev = cuda_array_view_from_object(dm2, "dm2");
+  auto dm1_dev = cuda_array_view_from_object(dm1, "dm1");
+  require_typestr(dm3_dev, "dm3", "<f8");
+  require_typestr(dm2_dev, "dm2", "<f8");
+  require_typestr(dm1_dev, "dm1", "<f8");
+  if (dm3_dev.read_only) throw std::invalid_argument("dm3 must be writable");
+  cudaStream_t stream_t = reinterpret_cast<cudaStream_t>(stream);
+  dm3_delta_correction_launch_stream(
+      (double*)dm3_dev.ptr, (const double*)dm2_dev.ptr,
+      (const double*)dm1_dev.ptr, n, stream_t, threads);
+}
+
+void dm3_6way_symmetry_inplace_device(
+    py::object dm3_in,
+    py::object dm3_out,
+    int n,
+    uint64_t stream,
+    int threads) {
+  auto in_dev = cuda_array_view_from_object(dm3_in, "dm3_in");
+  auto out_dev = cuda_array_view_from_object(dm3_out, "dm3_out");
+  require_typestr(in_dev, "dm3_in", "<f8");
+  require_typestr(out_dev, "dm3_out", "<f8");
+  if (out_dev.read_only) throw std::invalid_argument("dm3_out must be writable");
+  cudaStream_t stream_t = reinterpret_cast<cudaStream_t>(stream);
+  dm3_6way_symmetry_launch_stream(
+      (const double*)in_dev.ptr, (double*)out_dev.ptr, n, stream_t, threads);
+}
+
 }  // namespace
 
 PYBIND11_MODULE(_guga_cuda_ext, m) {
@@ -17679,4 +17996,147 @@ PYBIND11_MODULE(_guga_cuda_ext, m) {
       py::arg("y"),
       py::arg("stream") = 0,
       py::arg("sync") = true);
+
+  // ---- Fused MRCI kernels (P1C, P2, P4) ----
+
+  m.def(
+      "sym_pair_pack_inplace_device",
+      &sym_pair_pack_inplace_device,
+      py::arg("W"),
+      py::arg("W_pair"),
+      py::arg("pair_pq"),
+      py::arg("pair_qp"),
+      py::arg("nrows"),
+      py::arg("nops"),
+      py::arg("npair"),
+      py::arg("is_f32") = false,
+      py::arg("stream") = 0,
+      py::arg("threads") = 256);
+
+  m.def(
+      "sym_pair_unpack_inplace_device",
+      &sym_pair_unpack_inplace_device,
+      py::arg("G_pair"),
+      py::arg("G"),
+      py::arg("full_to_pair"),
+      py::arg("nrows"),
+      py::arg("nops"),
+      py::arg("npair"),
+      py::arg("is_f32") = false,
+      py::arg("stream") = 0,
+      py::arg("threads") = 256);
+
+  m.def(
+      "rdm12_reorder_delta_inplace_device",
+      &rdm12_reorder_delta_inplace_device,
+      py::arg("dm1_pq"),
+      py::arg("gram0"),
+      py::arg("dm1_out"),
+      py::arg("dm2_out"),
+      py::arg("norb"),
+      py::arg("stream") = 0,
+      py::arg("threads") = 256,
+      py::arg("sync") = true);
+
+  m.def(
+      "scatter_embed_batched_inplace_device",
+      &scatter_embed_batched_inplace_device,
+      py::arg("x_sub"),
+      py::arg("sub_to_full"),
+      py::arg("x_full"),
+      py::arg("nvec"),
+      py::arg("sub_stride"),
+      py::arg("full_stride"),
+      py::arg("stream") = 0,
+      py::arg("threads") = 128);
+
+  m.def(
+      "gather_project_batched_inplace_device",
+      &gather_project_batched_inplace_device,
+      py::arg("y_full"),
+      py::arg("sub_to_full"),
+      py::arg("y_sub"),
+      py::arg("nvec"),
+      py::arg("full_stride"),
+      py::arg("sub_stride"),
+      py::arg("stream") = 0,
+      py::arg("threads") = 128);
+
+  // ---- P1A: Batched W-build + diagonal ----
+
+  m.def(
+      "build_w_from_epq_table_batched_inplace_device",
+      &build_w_from_epq_table_batched_inplace_device,
+      py::arg("epq_indptr"),
+      py::arg("epq_indices"),
+      py::arg("epq_pq"),
+      py::arg("epq_data"),
+      py::arg("x"),
+      py::arg("x_stride"),
+      py::arg("w_out"),
+      py::arg("w_stride"),
+      py::arg("ncsf"),
+      py::arg("nops"),
+      py::arg("nvec"),
+      py::arg("v_start"),
+      py::arg("k_start"),
+      py::arg("k_count"),
+      py::arg("stream") = 0,
+      py::arg("threads") = 256);
+
+  m.def(
+      "build_w_diag_batched_inplace_device",
+      &build_w_diag_batched_inplace_device,
+      py::arg("steps_table"),
+      py::arg("x"),
+      py::arg("x_stride"),
+      py::arg("w_out"),
+      py::arg("w_stride"),
+      py::arg("ncsf"),
+      py::arg("norb"),
+      py::arg("j_start"),
+      py::arg("j_count"),
+      py::arg("nvec"),
+      py::arg("v_start"),
+      py::arg("stream") = 0,
+      py::arg("threads") = 256);
+
+  // ---- P5: RDM123 delta + symmetry ----
+
+  m.def(
+      "dm2_delta_correction_inplace_device",
+      &dm2_delta_correction_inplace_device,
+      py::arg("dm2"),
+      py::arg("dm1"),
+      py::arg("n"),
+      py::arg("stream") = 0,
+      py::arg("threads") = 256);
+
+  m.def(
+      "dm2_4way_symmetry_inplace_device",
+      &dm2_4way_symmetry_inplace_device,
+      py::arg("dm2_in"),
+      py::arg("dm2_out"),
+      py::arg("n"),
+      py::arg("stream") = 0,
+      py::arg("threads") = 256);
+
+  m.def(
+      "dm3_delta_correction_inplace_device",
+      &dm3_delta_correction_inplace_device,
+      py::arg("dm3"),
+      py::arg("dm2"),
+      py::arg("dm1"),
+      py::arg("n"),
+      py::arg("stream") = 0,
+      py::arg("threads") = 256);
+
+  m.def(
+      "dm3_6way_symmetry_inplace_device",
+      &dm3_6way_symmetry_inplace_device,
+      py::arg("dm3_in"),
+      py::arg("dm3_out"),
+      py::arg("n"),
+      py::arg("stream") = 0,
+      py::arg("threads") = 256);
 }

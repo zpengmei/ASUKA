@@ -824,7 +824,9 @@ def active_Lfull_from_B(B, C_active):
         raise ValueError(f"C_active has nao={nao}, but B implies nao={nao0}")
 
     # tmp[p, ν, Q] = Σ_μ C_{μp} B_{μν}^Q
-    tmp = C_active.T @ B.reshape((nao, nao * naux))
+    B_flat = B.reshape(nao, nao * naux)  # (nao, nao*naux), already contiguous
+    C_T = cp.ascontiguousarray(C_active.T)  # (norb, nao)
+    tmp = C_T @ B_flat
     tmp = tmp.reshape((norb, nao, naux))
 
     # out[p, Q, q] = Σ_ν tmp[p, ν, Q] C_{νq}

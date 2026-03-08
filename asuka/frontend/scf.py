@@ -2941,7 +2941,13 @@ def run_rhf_df_cpu(
     df_prof = None
     if profile is not None:
         df_prof = profile.setdefault("df_build_cpu", {})
-    B = build_df_B_from_cueri_packed_bases_cpu(ao_basis, aux_basis, threads=int(df_threads), profile=df_prof)
+    B, L_chol = build_df_B_from_cueri_packed_bases_cpu(
+        ao_basis,
+        aux_basis,
+        threads=int(df_threads),
+        profile=df_prof,
+        return_L=True,
+    )
 
     # Spherical AO transform (if requested)
     int1e_scf, B_scf, sph_map = _apply_sph_transform(mol, int1e, B, ao_basis)
@@ -2984,6 +2990,7 @@ def run_rhf_df_cpu(
         scf=scf,
         profile=profile,
         sph_map=sph_map,
+        df_L=L_chol,
     )
 
 
@@ -3026,7 +3033,13 @@ def run_uhf_df_cpu(
     df_prof = None
     if profile is not None:
         df_prof = profile.setdefault("df_build_cpu", {})
-    B = build_df_B_from_cueri_packed_bases_cpu(ao_basis, aux_basis, threads=int(df_threads), profile=df_prof)
+    B, L_chol = build_df_B_from_cueri_packed_bases_cpu(
+        ao_basis,
+        aux_basis,
+        threads=int(df_threads),
+        profile=df_prof,
+        return_L=True,
+    )
 
     # Spherical AO transform (if requested)
     int1e_scf, B_scf, sph_map = _apply_sph_transform(mol, int1e, B, ao_basis)
@@ -3064,6 +3077,7 @@ def run_uhf_df_cpu(
         scf=scf,
         profile=profile,
         sph_map=sph_map,
+        df_L=L_chol,
     )
 
 
@@ -3109,7 +3123,13 @@ def run_rohf_df_cpu(
     df_prof = None
     if profile is not None:
         df_prof = profile.setdefault("df_build_cpu", {})
-    B = build_df_B_from_cueri_packed_bases_cpu(ao_basis, aux_basis, threads=int(df_threads), profile=df_prof)
+    B, L_chol = build_df_B_from_cueri_packed_bases_cpu(
+        ao_basis,
+        aux_basis,
+        threads=int(df_threads),
+        profile=df_prof,
+        return_L=True,
+    )
 
     # Spherical AO transform (if requested)
     int1e_scf, B_scf, sph_map = _apply_sph_transform(mol, int1e, B, ao_basis)
@@ -3147,6 +3167,7 @@ def run_rohf_df_cpu(
         scf=scf,
         profile=profile,
         sph_map=sph_map,
+        df_L=L_chol,
     )
 
 
