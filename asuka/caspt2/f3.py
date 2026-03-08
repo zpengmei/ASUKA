@@ -1,22 +1,51 @@
-"""F3 contractions for CASPT2 cases A/C (OpenMolcas DELTA3).
+r"""F3 contractions for CASPT2 cases A/C (OpenMolcas DELTA3).
 
 OpenMolcas stores the active-space, Fock-contracted 4-body quantity as
-`DELTA3` (`mkfg3.f`) and later scatters it into the case-A/case-C B matrices
-(`mkbmat.f`).
+``DELTA3`` (``mkfg3.f``) and later scatters it into the case-A/case-C B matrices
+(``mkbmat.f``).
 
-Naively, one can form a "raw" contraction without a 4-RDM by building:
+Mathematical Background
+-----------------------
+Cases A and C of the IC-CASPT2 B matrix require the Fock-contracted
+4-body quantity:
 
-    |fc> = (sum_w epsa[w] E_ww) |c>
+.. math::
 
-and evaluating:
+    \text{F3}[t,u,v,x,y,z] = \sum_w \varepsilon_w \,
+        \langle E_{tu}\, E_{vx}\, E_{yz}\, E_{ww} \rangle
 
-    F3_raw(t,u,v,x,y,z) = <c| E_tu E_vx E_yz |fc>.
+This is a contraction of the 4-particle RDM with Fock orbital energies.
+Computing the full 4-RDM is prohibitively expensive
+(:math:`O(N_{\text{act}}^8)` storage), so this module avoids it using a
+CI-driven approach:
 
-However, OpenMolcas' `DELTA3` corresponds to the *irreducible* unitary-group
-generator `E_tuvxyzww` contracted with `epsa[w]`. In `mkfg3.f`, Molcas applies
-additional delta corrections to convert product expectations into the
-irreducible-generator convention. These corrections are crucial for energy-side
-parity (notably the case-C/ATVX term).
+1. Precompute :math:`|f_c\rangle = (\sum_w \varepsilon_w E_{ww})|c\rangle`
+   and the first-order intermediate table
+   :math:`T_1[pq] = E_{pq}|c\rangle`.
+
+2. For a given :math:`(y,z)` pair, form the raw F3 matrix via:
+
+   .. math::
+
+       R[pq, vx] = \langle c | E_{pq}\, (\hat{H}_{\text{diag}} - \varepsilon_v)\,
+                   E_{vx}\, E_{yz} | c \rangle
+
+   where :math:`\hat{H}_{\text{diag}} = \sum_w \varepsilon_w E_{ww}`.
+
+3. Apply Molcas DELTA3 correction terms (from ``mkfg3.f``) that account
+   for operator re-ordering when index coincidences occur among
+   :math:`\{t,u,v,x,y,z,w\}`.
+
+Results are cached per :math:`(y,z)` pair to amortize the cost of the
+CI-driven :math:`E_{yz}|c\rangle` application.
+
+Classes
+-------
+- ``CASPT2CIContext``: Carries the DRT plus CI vector needed for
+  operator applications.
+- ``F3ContractionEngine``: On-demand engine that computes F3 elements
+  using the ``f3_case_a`` and ``f3_case_c`` entry points for cases A
+  and C respectively.
 """
 
 from __future__ import annotations

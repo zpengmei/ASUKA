@@ -1,6 +1,55 @@
-"""Level-shift implementations for CASPT2.
+r"""Level-shift implementations for intruder-state removal in CASPT2.
 
-Supports IPEA shift, imaginary shift, and real shift.
+Mathematical Definitions
+------------------------
+Level shifts modify the zeroth-order denominator
+:math:`d_P = b_\mu + \varepsilon^{\text{ext}}` to regularize near-zero
+denominators caused by intruder states.
+
+**IPEA Shift** (Ionization Potential / Electron Affinity):
+
+An orbital-occupation-dependent shift:
+
+.. math::
+
+    d_P \to d_P + \sigma \cdot (D_{tt} - 1) \quad \text{(particle-like)} \\
+    d_P \to d_P + \sigma \cdot (1 - D_{tt}) \quad \text{(hole-like)}
+
+where :math:`D_{tt}` is the occupation of active orbital *t* and the
+standard value is :math:`\sigma = 0.25` Hartree.
+
+**Imaginary Shift**:
+
+Replaces the real-valued denominator with a regularized form:
+
+.. math::
+
+    \frac{1}{d_P} \;\to\; \frac{d_P}{d_P^2 + \sigma^2}
+
+Equivalently, adds :math:`i\sigma` to the denominator and takes the
+real part: :math:`\text{Re}[1/(d_P + i\sigma)]`. In practice, the
+diagonal is transformed as:
+
+.. math::
+
+    d_P \to d_P + \frac{\sigma^2}{d_P}
+
+**Real Shift**:
+
+Simply adds a constant to all denominators:
+
+.. math::
+
+    d_P \to d_P + \varepsilon
+
+**Shift Energy Correction**:
+
+After applying any shift, the PT2 energy must be corrected:
+
+.. math::
+
+    E_{\text{shift}} = \sum_P |T_P|^2 \cdot \Delta_P, \qquad
+    \Delta_P = d_P^{\text{shifted}} - d_P^{\text{orig}}
 """
 
 from __future__ import annotations

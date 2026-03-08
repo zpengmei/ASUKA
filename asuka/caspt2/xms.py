@@ -1,8 +1,43 @@
-"""XMS-CASPT2: Extended Multi-State rotation of reference states.
+r"""XMS-CASPT2: Extended Multi-State rotation of reference states.
 
 Ports OpenMolcas ``xdwinit.f``.
 Rotates the SA-CASSCF CI vectors to diagonalize the state-averaged
 Fock operator in the model space before performing MS-CASPT2.
+
+Mathematical Background
+-----------------------
+The XMS (Extended Multi-State) approach ensures invariance of the
+MS-CASPT2 results with respect to unitary rotations within the model
+space.  This is achieved by rotating the SA-CASSCF CI vectors to
+diagonalize the state-averaged Fock operator projected onto the model
+space.
+
+**Model-space H₀ matrix:**
+
+.. math::
+
+    H_0^{\text{model}}[I,J] = \langle I|{\hat{F}_{\text{SA}}}|J\rangle
+                             = \sum_{pq} F_{pq}^{\text{SA}}\,
+                               \langle I|E_{pq}|J\rangle
+
+where :math:`\hat{F}_{\text{SA}}` is the Fock operator built from the
+state-averaged 1-RDM, and the off-diagonal elements use transition
+1-RDMs.
+
+**State rotation:**
+
+.. math::
+
+    H_0^{\text{model}} = U_0 \, \Lambda \, U_0^\top
+
+yields the rotation matrix :math:`U_0`.  The rotated CI vectors are:
+
+.. math::
+
+    |J'\rangle = \sum_I U_0[I,J] \, |I\rangle
+
+These rotated vectors then enter the MS-CASPT2 calculation, where a
+common (state-averaged) Fock operator is used for all states.
 """
 
 from __future__ import annotations

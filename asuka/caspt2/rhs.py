@@ -1,9 +1,87 @@
-"""RHS vector construction for IC-CASPT2.
+r"""RHS vector construction for IC-CASPT2.
 
 Ports OpenMolcas ``mkrhs.f`` (MKRHSA through MKRHSH).
-The RHS vector V_P = <P|H|0> is the coupling between the IC basis
-functions and the reference wavefunction through the full Hamiltonian.
-All integrals use chemists' notation: eri_mo[p,q,r,s] = (pq|rs).
+The RHS vector :math:`V_P = \langle\Phi_P|\hat{H}|0\rangle` is the coupling
+between the internally contracted (IC) basis functions and the reference
+wavefunction through the full Hamiltonian.  All integrals use chemists'
+notation: ``eri_mo[p,q,r,s]`` = :math:`(pq|rs)`.
+
+Mathematical Definitions
+------------------------
+The RHS vector couples the reference :math:`|0\rangle` to each IC
+perturber :math:`|\Phi_P\rangle` through the two-electron part
+of the Hamiltonian.  The one-electron part enters only through
+Fock-matrix corrections proportional to :math:`F^I_{pt}/N_{\text{act}}`.
+
+Per-Case RHS Formulas
+~~~~~~~~~~~~~~~~~~~~~
+Using :math:`(pq|rs)` for chemists' notation ERIs and
+:math:`\delta_{pq}` for Kronecker delta:
+
+* **Case A (VJTU)** — 3 active + 1 inactive:
+
+  .. math::
+
+      V_A(tuv, i) = (uv|ti)
+                    + \delta_{uv}\,\frac{F^I_{ti}}{N_{\text{act}}}
+
+* **Case B+ (VJTIP)** — symmetric active/inactive pairs:
+
+  .. math::
+
+      V_{B+}(t{\ge}u, i{\ge}j) =
+          \frac{[(it|ju) + (jt|iu)]\,(1 - \tfrac{1}{2}\delta_{tu})}
+               {2\sqrt{1 + \delta_{ij}}}
+
+* **Case B− (VJTIM)** — antisymmetric active/inactive pairs:
+
+  .. math::
+
+      V_{B-}(t{>}u, i{>}j) = \frac{(it|ju) - (jt|iu)}{2}
+
+* **Case C (ATVX)** — 3 active + 1 virtual:
+
+  .. math::
+
+      V_C(tuv, a) = (at|uv)
+                    + \delta_{uv}\,\frac{F^I_{at} - \sum_y (ay|yt)}{N_{\text{act}}}
+
+* **Case D (AIVX)** — mixed inactive-virtual:
+
+  .. math::
+
+      V_{D1}(tu, ai) &= (ai|tu) + \delta_{tu}\,\frac{F^I_{ai}}{N_{\text{act}}} \\
+      V_{D2}(tu, ai) &= (ti|au)
+
+* **Cases E± (VJAI)** — 1 active, virtual + inactive pair:
+
+  .. math::
+
+      V_{E+}(t, i{\ge}j, a) &= \frac{(ai|tj) + (aj|ti)}{\sqrt{2 + 2\delta_{ij}}} \\
+      V_{E-}(t, i{>}j, a) &= \sqrt{\tfrac{3}{2}}\,[(ai|tj) - (aj|ti)]
+
+* **Cases F± (BVAT)** — symmetric/antisymmetric active + virtual pairs:
+
+  .. math::
+
+      V_{F+}(t{\ge}u, a{\ge}b) &= \frac{[(au|bt) + (at|bu)]\,(1 - \tfrac{1}{2}\delta_{tu})}
+                                        {2\sqrt{1 + \delta_{ab}}} \\
+      V_{F-}(t{>}u, a{>}b) &= \frac{(au|bt) - (at|bu)}{2}
+
+* **Cases G± (BJAT)** — 1 active, inactive + virtual pair:
+
+  .. math::
+
+      V_{G+}(t, a{\ge}b, i) &= \frac{(at|bi) + (ai|bt)}{\sqrt{2 + 2\delta_{ab}}} \\
+      V_{G-}(t, a{>}b, i) &= \sqrt{\tfrac{3}{2}}\,[(at|bi) - (ai|bt)]
+
+* **Cases H± (BJAI)** — virtual + inactive pairs only:
+
+  .. math::
+
+      V_{H+}(a{\ge}b, i{\ge}j) &= \frac{(ai|bj) + (aj|bi)}
+                                        {\sqrt{(1+\delta_{ab})(1+\delta_{ij})}} \\
+      V_{H-}(a{>}b, i{>}j) &= \sqrt{3}\,[(ai|bj) - (aj|bi)]
 """
 
 from __future__ import annotations
@@ -91,52 +169,43 @@ def _rhs_a(smap, fock, eri_mo, dm1, dm2, *, nactel: int | None = None):
     return rhs.ravel()
 
 
-def _rhs_bp(smap, fock, eri_mo, dm1, dm2):
-    """Case 2 (B+): VJTIP - 2 active(sym) + 2 inactive(sym).
+def _rhs_b(smap, fock, eri_mo, dm1, dm2, *, sign: int):
+    """Cases 2/3 (B±): 2 active + 2 inactive pairs.
 
-    WP[tgeu, igej] = [(it|ju) + (jt|iu)] * (1-d_tu/2) / (2*sqrt(1+d_ij))
+    B+: WP[tgeu, igej] = [(it|ju) + (jt|iu)] * (1-d_tu/2) / (2*sqrt(1+d_ij))
+    B-: WM[tgtu, igtj] = [(it|ju) - (jt|iu)] / 2
     """
-    ntgeu = smap.ntgeu
-    nigej = smap.nigej
-    if ntgeu == 0 or nigej == 0:
-        return np.zeros(ntgeu * nigej, dtype=np.float64)
+    act_map = smap.mtgeu if sign > 0 else smap.mtgtu
+    ext_map = smap.migej if sign > 0 else smap.migtj
+    nact = smap.ntgeu if sign > 0 else smap.ntgtu
+    next_ = smap.nigej if sign > 0 else smap.nigtj
+    if nact == 0 or next_ == 0:
+        return np.zeros(nact * next_, dtype=np.float64)
 
     ao = smap.orbs.nish
-    rhs = np.zeros((ntgeu, nigej), dtype=np.float64)
+    rhs = np.zeros((nact, next_), dtype=np.float64)
 
-    for p in range(ntgeu):
-        t, u = smap.mtgeu[p]
-        fac_tu = 0.5 if t != u else 0.25
-        for q in range(nigej):
-            i, j = smap.migej[q]
-            val = eri_mo[i, ao+t, j, ao+u] + eri_mo[j, ao+t, i, ao+u]
-            fac_ij = 1.0 / np.sqrt(1.0 + (1.0 if i == j else 0.0))
-            rhs[p, q] = val * fac_tu * fac_ij
+    for p in range(nact):
+        t, u = act_map[p]
+        for q in range(next_):
+            i, j = ext_map[q]
+            val = eri_mo[i, ao+t, j, ao+u] + sign * eri_mo[j, ao+t, i, ao+u]
+            if sign > 0:
+                fac_tu = 0.5 if t != u else 0.25
+                fac_ij = 1.0 / np.sqrt(1.0 + (1.0 if i == j else 0.0))
+                rhs[p, q] = val * fac_tu * fac_ij
+            else:
+                rhs[p, q] = val * 0.5
 
     return rhs.ravel()
+
+
+def _rhs_bp(smap, fock, eri_mo, dm1, dm2):
+    return _rhs_b(smap, fock, eri_mo, dm1, dm2, sign=+1)
 
 
 def _rhs_bm(smap, fock, eri_mo, dm1, dm2):
-    """Case 3 (B-): VJTIM - 2 active(asym) + 2 inactive(asym).
-
-    WM[tgtu, igtj] = [(it|ju) - (jt|iu)] / 2
-    """
-    ntgtu = smap.ntgtu
-    nigtj = smap.nigtj
-    if ntgtu == 0 or nigtj == 0:
-        return np.zeros(ntgtu * nigtj, dtype=np.float64)
-
-    ao = smap.orbs.nish
-    rhs = np.zeros((ntgtu, nigtj), dtype=np.float64)
-
-    for p in range(ntgtu):
-        t, u = smap.mtgtu[p]
-        for q in range(nigtj):
-            i, j = smap.migtj[q]
-            val = eri_mo[i, ao+t, j, ao+u] - eri_mo[j, ao+t, i, ao+u]
-            rhs[p, q] = val * 0.5
-
-    return rhs.ravel()
+    return _rhs_b(smap, fock, eri_mo, dm1, dm2, sign=-1)
 
 
 def _rhs_c(smap, fock, eri_mo, dm1, dm2, *, nactel: int | None = None):
@@ -212,16 +281,18 @@ def _rhs_d(smap, fock, eri_mo, dm1, dm2, *, nactel: int | None = None):
     return rhs.ravel()
 
 
-def _rhs_ep(smap, fock, eri_mo, dm1, dm2):
-    """Case 6 (E+): VJAIP - 1 active + (virtual, sym inactive pair).
+def _rhs_e(smap, fock, eri_mo, dm1, dm2, *, sign: int):
+    """Cases 6/7 (E±): 1 active + (virtual, inactive pair).
 
-    WP[t, igej*nssh+a] = [(ai|tj) + (aj|ti)] / sqrt(2+2*d_ij)
+    E+: WP[t, igej*nssh+a] = [(ai|tj) + (aj|ti)] / sqrt(2+2*d_ij)
+    E-: WM[t, igtj*nssh+a] = sqrt(3/2) * [(ai|tj) - (aj|ti)]
     """
     nash = smap.orbs.nash
     nish = smap.orbs.nish
     nssh = smap.orbs.nssh
-    nigej = smap.nigej
-    nisup = nssh * nigej
+    ext_map = smap.migej if sign > 0 else smap.migtj
+    next_ = smap.nigej if sign > 0 else smap.nigtj
+    nisup = nssh * next_
     if nash == 0 or nisup == 0:
         return np.zeros(nash * nisup, dtype=np.float64)
 
@@ -229,203 +300,148 @@ def _rhs_ep(smap, fock, eri_mo, dm1, dm2):
     vo = nish + nash
     rhs = np.zeros((nash, nisup), dtype=np.float64)
 
-    for q_igej in range(nigej):
-        i, j = smap.migej[q_igej]
-        fac = 1.0 / np.sqrt(2.0 + 2.0 * (1.0 if i == j else 0.0))
+    for q_ext in range(next_):
+        i, j = ext_map[q_ext]
         for a in range(nssh):
-            ext = q_igej * nssh + a
+            ext = q_ext * nssh + a
             for t in range(nash):
-                val = eri_mo[vo+a, i, ao+t, j] + eri_mo[vo+a, j, ao+t, i]
-                rhs[t, ext] = val * fac
+                val = eri_mo[vo+a, i, ao+t, j] + sign * eri_mo[vo+a, j, ao+t, i]
+                if sign > 0:
+                    fac = 1.0 / np.sqrt(2.0 + 2.0 * (1.0 if i == j else 0.0))
+                    rhs[t, ext] = val * fac
+                else:
+                    rhs[t, ext] = np.sqrt(1.5) * val
 
     return rhs.ravel()
 
 
+def _rhs_ep(smap, fock, eri_mo, dm1, dm2):
+    return _rhs_e(smap, fock, eri_mo, dm1, dm2, sign=+1)
+
+
 def _rhs_em(smap, fock, eri_mo, dm1, dm2):
-    """Case 7 (E-): VJAIM - 1 active + (virtual, asym inactive pair).
+    return _rhs_e(smap, fock, eri_mo, dm1, dm2, sign=-1)
 
-    WM[t, igtj*nssh+a] = sqrt(3/2) * [(ai|tj) - (aj|ti)]
+
+def _rhs_f(smap, fock, eri_mo, dm1, dm2, *, sign: int):
+    """Cases 8/9 (F±): 2 active + 2 virtual pairs.
+
+    F+: WP[tgeu, ageb] = [(au|bt) + (at|bu)] * (1-d_tu/2) / (2*sqrt(1+d_ab))
+    F-: WM[tgtu, agtb] = [(au|bt) - (at|bu)] / 2
     """
-    nash = smap.orbs.nash
-    nish = smap.orbs.nish
-    nssh = smap.orbs.nssh
-    nigtj = smap.nigtj
-    nisup = nssh * nigtj
-    if nash == 0 or nisup == 0:
-        return np.zeros(nash * nisup, dtype=np.float64)
+    act_map = smap.mtgeu if sign > 0 else smap.mtgtu
+    ext_map = smap.mageb if sign > 0 else smap.magtb
+    nact = smap.ntgeu if sign > 0 else smap.ntgtu
+    next_ = smap.nageb if sign > 0 else smap.nagtb
+    if nact == 0 or next_ == 0:
+        return np.zeros(nact * next_, dtype=np.float64)
 
-    ao = nish
-    vo = nish + nash
-    sq32 = np.sqrt(1.5)
-    rhs = np.zeros((nash, nisup), dtype=np.float64)
+    ao = smap.orbs.nish
+    vo = smap.orbs.nish + smap.orbs.nash
+    rhs = np.zeros((nact, next_), dtype=np.float64)
 
-    for q_igtj in range(nigtj):
-        i, j = smap.migtj[q_igtj]
-        for a in range(nssh):
-            ext = q_igtj * nssh + a
-            for t in range(nash):
-                val = eri_mo[vo+a, i, ao+t, j] - eri_mo[vo+a, j, ao+t, i]
-                rhs[t, ext] = sq32 * val
+    for p in range(nact):
+        t, u = act_map[p]
+        for q in range(next_):
+            a, b = ext_map[q]
+            val = eri_mo[vo+a, ao+u, vo+b, ao+t] + sign * eri_mo[vo+a, ao+t, vo+b, ao+u]
+            if sign > 0:
+                fac_tu = 0.5 if t != u else 0.25
+                fac_ab = 1.0 / np.sqrt(1.0 + (1.0 if a == b else 0.0))
+                rhs[p, q] = val * fac_tu * fac_ab
+            else:
+                rhs[p, q] = val * 0.5
 
     return rhs.ravel()
 
 
 def _rhs_fp(smap, fock, eri_mo, dm1, dm2):
-    """Case 8 (F+): BVATP - 2 active(sym) + 2 virtual(sym).
-
-    WP[tgeu, ageb] = [(au|bt) + (at|bu)] * (1-d_tu/2) / (2*sqrt(1+d_ab))
-    """
-    ntgeu = smap.ntgeu
-    nageb = smap.nageb
-    if ntgeu == 0 or nageb == 0:
-        return np.zeros(ntgeu * nageb, dtype=np.float64)
-
-    ao = smap.orbs.nish
-    vo = smap.orbs.nish + smap.orbs.nash
-    rhs = np.zeros((ntgeu, nageb), dtype=np.float64)
-
-    for p in range(ntgeu):
-        t, u = smap.mtgeu[p]
-        fac_tu = 0.5 if t != u else 0.25
-        for q in range(nageb):
-            a, b = smap.mageb[q]
-            val = eri_mo[vo+a, ao+u, vo+b, ao+t] + eri_mo[vo+a, ao+t, vo+b, ao+u]
-            fac_ab = 1.0 / np.sqrt(1.0 + (1.0 if a == b else 0.0))
-            rhs[p, q] = val * fac_tu * fac_ab
-
-    return rhs.ravel()
+    return _rhs_f(smap, fock, eri_mo, dm1, dm2, sign=+1)
 
 
 def _rhs_fm(smap, fock, eri_mo, dm1, dm2):
-    """Case 9 (F-): BVATM - 2 active(asym) + 2 virtual(asym).
+    return _rhs_f(smap, fock, eri_mo, dm1, dm2, sign=-1)
 
-    WM[tgtu, agtb] = [(au|bt) - (at|bu)] / 2
+
+def _rhs_g(smap, fock, eri_mo, dm1, dm2, *, sign: int):
+    """Cases 10/11 (G±): 1 active + (inactive, virtual pair).
+
+    G+: WP[t, ageb*nish+i] = [(at|bi) + (ai|bt)] / sqrt(2+2*d_ab)
+    G-: WM[t, agtb*nish+i] = sqrt(3/2) * [(at|bi) - (ai|bt)]
     """
-    ntgtu = smap.ntgtu
-    nagtb = smap.nagtb
-    if ntgtu == 0 or nagtb == 0:
-        return np.zeros(ntgtu * nagtb, dtype=np.float64)
+    nash = smap.orbs.nash
+    nish = smap.orbs.nish
+    ext_map = smap.mageb if sign > 0 else smap.magtb
+    next_ = smap.nageb if sign > 0 else smap.nagtb
+    nisup = nish * next_
+    if nash == 0 or nisup == 0:
+        return np.zeros(nash * nisup, dtype=np.float64)
 
-    ao = smap.orbs.nish
-    vo = smap.orbs.nish + smap.orbs.nash
-    rhs = np.zeros((ntgtu, nagtb), dtype=np.float64)
+    ao = nish
+    vo = nish + nash
+    rhs = np.zeros((nash, nisup), dtype=np.float64)
 
-    for p in range(ntgtu):
-        t, u = smap.mtgtu[p]
-        for q in range(nagtb):
-            a, b = smap.magtb[q]
-            val = eri_mo[vo+a, ao+u, vo+b, ao+t] - eri_mo[vo+a, ao+t, vo+b, ao+u]
-            rhs[p, q] = val * 0.5
+    for q_ext in range(next_):
+        a, b = ext_map[q_ext]
+        for i in range(nish):
+            ext = q_ext * nish + i
+            for t in range(nash):
+                val = eri_mo[vo+a, ao+t, vo+b, i] + sign * eri_mo[vo+a, i, vo+b, ao+t]
+                if sign > 0:
+                    fac = 1.0 / np.sqrt(2.0 + 2.0 * (1.0 if a == b else 0.0))
+                    rhs[t, ext] = val * fac
+                else:
+                    rhs[t, ext] = np.sqrt(1.5) * val
 
     return rhs.ravel()
 
 
 def _rhs_gp(smap, fock, eri_mo, dm1, dm2):
-    """Case 10 (G+): BJATQ - 1 active + (inactive, sym virtual pair).
-
-    WP[t, ageb*nish+i] = [(at|bi) + (ai|bt)] / sqrt(2+2*d_ab)
-    """
-    nash = smap.orbs.nash
-    nish = smap.orbs.nish
-    nageb = smap.nageb
-    nisup = nish * nageb
-    if nash == 0 or nisup == 0:
-        return np.zeros(nash * nisup, dtype=np.float64)
-
-    ao = nish
-    vo = nish + nash
-    rhs = np.zeros((nash, nisup), dtype=np.float64)
-
-    for q_ageb in range(nageb):
-        a, b = smap.mageb[q_ageb]
-        fac = 1.0 / np.sqrt(2.0 + 2.0 * (1.0 if a == b else 0.0))
-        for i in range(nish):
-            ext = q_ageb * nish + i
-            for t in range(nash):
-                val = eri_mo[vo+a, ao+t, vo+b, i] + eri_mo[vo+a, i, vo+b, ao+t]
-                rhs[t, ext] = val * fac
-
-    return rhs.ravel()
+    return _rhs_g(smap, fock, eri_mo, dm1, dm2, sign=+1)
 
 
 def _rhs_gm(smap, fock, eri_mo, dm1, dm2):
-    """Case 11 (G-): BJATM - 1 active + (inactive, asym virtual pair).
+    return _rhs_g(smap, fock, eri_mo, dm1, dm2, sign=-1)
 
-    WM[t, agtb*nish+i] = sqrt(3/2) * [(at|bi) - (ai|bt)]
+
+def _rhs_h(smap, fock, eri_mo, dm1, dm2, *, sign: int):
+    """Cases 12/13 (H±): virtual + inactive pairs only.
+
+    H+: VP[ageb, igej] = [(ai|bj) + (aj|bi)] / sqrt((1+d_ab)*(1+d_ij))
+    H-: VM[agtb, igtj] = sqrt(3) * [(ai|bj) - (aj|bi)]
     """
-    nash = smap.orbs.nash
+    act_map = smap.mageb if sign > 0 else smap.magtb
+    ext_map = smap.migej if sign > 0 else smap.migtj
+    nact = smap.nageb if sign > 0 else smap.nagtb
+    next_ = smap.nigej if sign > 0 else smap.nigtj
+    if nact == 0 or next_ == 0:
+        return np.zeros(nact * next_, dtype=np.float64)
+
     nish = smap.orbs.nish
-    nagtb = smap.nagtb
-    nisup = nish * nagtb
-    if nash == 0 or nisup == 0:
-        return np.zeros(nash * nisup, dtype=np.float64)
-
-    ao = nish
+    nash = smap.orbs.nash
     vo = nish + nash
-    sq32 = np.sqrt(1.5)
-    rhs = np.zeros((nash, nisup), dtype=np.float64)
+    rhs = np.zeros((nact, next_), dtype=np.float64)
 
-    for q_agtb in range(nagtb):
-        a, b = smap.magtb[q_agtb]
-        for i in range(nish):
-            ext = q_agtb * nish + i
-            for t in range(nash):
-                val = eri_mo[vo+a, ao+t, vo+b, i] - eri_mo[vo+a, i, vo+b, ao+t]
-                rhs[t, ext] = sq32 * val
+    for p in range(nact):
+        a, b = act_map[p]
+        for q in range(next_):
+            i, j = ext_map[q]
+            val = eri_mo[vo+a, i, vo+b, j] + sign * eri_mo[vo+a, j, vo+b, i]
+            if sign > 0:
+                fac = 1.0 / np.sqrt(
+                    (1.0 + (1.0 if a == b else 0.0))
+                    * (1.0 + (1.0 if i == j else 0.0))
+                )
+                rhs[p, q] = val * fac
+            else:
+                rhs[p, q] = np.sqrt(3.0) * val
 
     return rhs.ravel()
 
 
 def _rhs_hp(smap, fock, eri_mo, dm1, dm2):
-    """Case 12 (H+): BJAIP - 2 virtual(sym) + 2 inactive(sym).
-
-    VP[ageb, igej] = [(ai|bj) + (aj|bi)] / sqrt((1+d_ab)*(1+d_ij))
-    """
-    nageb = smap.nageb
-    nigej = smap.nigej
-    if nageb == 0 or nigej == 0:
-        return np.zeros(nageb * nigej, dtype=np.float64)
-
-    nish = smap.orbs.nish
-    nash = smap.orbs.nash
-    vo = nish + nash
-    rhs = np.zeros((nageb, nigej), dtype=np.float64)
-
-    for p in range(nageb):
-        a, b = smap.mageb[p]
-        for q in range(nigej):
-            i, j = smap.migej[q]
-            val = eri_mo[vo+a, i, vo+b, j] + eri_mo[vo+a, j, vo+b, i]
-            fac = 1.0 / np.sqrt(
-                (1.0 + (1.0 if a == b else 0.0))
-                * (1.0 + (1.0 if i == j else 0.0))
-            )
-            rhs[p, q] = val * fac
-
-    return rhs.ravel()
+    return _rhs_h(smap, fock, eri_mo, dm1, dm2, sign=+1)
 
 
 def _rhs_hm(smap, fock, eri_mo, dm1, dm2):
-    """Case 13 (H-): BJAIM - 2 virtual(asym) + 2 inactive(asym).
-
-    VM[agtb, igtj] = sqrt(3) * [(ai|bj) - (aj|bi)]
-    """
-    nagtb = smap.nagtb
-    nigtj = smap.nigtj
-    if nagtb == 0 or nigtj == 0:
-        return np.zeros(nagtb * nigtj, dtype=np.float64)
-
-    nish = smap.orbs.nish
-    nash = smap.orbs.nash
-    vo = nish + nash
-    sq3 = np.sqrt(3.0)
-    rhs = np.zeros((nagtb, nigtj), dtype=np.float64)
-
-    for p in range(nagtb):
-        a, b = smap.magtb[p]
-        for q in range(nigtj):
-            i, j = smap.migtj[q]
-            val = eri_mo[vo+a, i, vo+b, j] - eri_mo[vo+a, j, vo+b, i]
-            rhs[p, q] = sq3 * val
-
-    return rhs.ravel()
+    return _rhs_h(smap, fock, eri_mo, dm1, dm2, sign=-1)

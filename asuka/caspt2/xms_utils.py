@@ -1,4 +1,23 @@
-"""Shared XMS-CASPT2 utilities (no heavy dependencies)."""
+r"""Shared XMS-CASPT2 utilities (no heavy dependencies).
+
+This module contains lightweight helper functions for XMS-CASPT2 that
+have no dependency on heavy compute backends (CUDA, RDM builders, etc.).
+
+Mathematical Background
+-----------------------
+In XMS-CASPT2, the reference states are rotated by a unitary matrix
+:math:`U_0` obtained by diagonalising the model-space Fock operator.
+The effective Hamiltonian must be corrected for this rotation:
+
+.. math::
+
+    H_{\text{eff}}^{\text{XMS}} = H_{\text{eff}} - \text{diag}(E_{\text{ref}})
+        + U_0^T \, \text{diag}(E_{\text{ref}}) \, U_0
+
+This ensures that the diagonal of :math:`H_{\text{eff}}^{\text{XMS}}`
+reflects the reference energies in the rotated basis rather than the
+original SA-CASSCF basis.
+"""
 from __future__ import annotations
 
 import numpy as np

@@ -1,12 +1,68 @@
-"""Sigma vector (H0 action) for IC-CASPT2.
+r"""Sigma vector (H₀ action) for IC-CASPT2.
 
 OpenMolcas solves the CASPT2 equations with a sigma-vector operator
 (``SIGMA_CASPT2`` in ``sigma.f``) rather than a pure diagonal divide.
 
 Even after S/B diagonalization (SR basis), non-diagonal blocks of the
-Fock matrix couple different excitation *cases* (see ``sgm.f`` and the
-``IFCOUP`` table in ``eqsolv.F90``). For parity with OpenMolcas, ASUKA
-must include these couplings when computing ``sigma = (H0 - E0) x``.
+full Fock matrix couple different IC cases through the sigma operator.
+This module implements those couplings for C1 symmetry.
+
+Mathematical Background
+-----------------------
+The CASPT2 linear system to be solved is:
+
+.. math::
+
+    (\hat{H}_0 - E_0)\,|T\rangle = -|V\rangle
+
+In the diagonalized (SR) basis, the purely diagonal part gives:
+
+.. math::
+
+    \sigma_\mu^{\text{diag}} = d_\mu \cdot T_\mu \qquad
+    (d_\mu = b_\mu + \varepsilon^{\text{ext}})
+
+When the Fock matrix has non-zero off-diagonal blocks between orbital
+subspaces, additional inter-case coupling terms arise in the sigma
+vector.  These are organized by **KOD (Kind of Operation Descriptor)**
+channels from the OpenMolcas IFCOUP table:
+
+**Active–Virtual couplings** (:math:`F_{ta}` blocks, KOD 9–10):
+
+  These couple cases C ↔ F± through the active–virtual Fock elements.
+  Used when ``nish=0`` (no inactive orbitals) via
+  ``SigmaC1ActiveVirtualCoupling``.
+
+**Full inter-case couplings** (24 KOD channels):
+
+  The ``SigmaC1CaseCoupling`` class implements all coupling channels
+  from OpenMolcas ``sgm.f``/``eqsolv.F90``, including:
+
+  - :math:`F_{ti}` (active–inactive) couplings: KOD 1–8
+  - :math:`F_{ta}` (active–virtual) couplings: KOD 9–10
+  - :math:`F_{ia}` (inactive–virtual) couplings: KOD 11–24
+
+  Each coupling is implemented via one of four tensor contraction
+  primitives ported from OpenMolcas:
+
+  - ``_mltsca`` — scalar-like contractions (``mltsca.f``)
+  - ``_mltmv`` — matrix-vector contractions (``mltmv.f``)
+  - ``_mltdxp`` — blocked matrix contractions (``mltdxp.f``)
+  - ``_mltr1`` — rank-1 contractions (``mltr1.f``)
+
+  using precomputed coupling lists (MKLIST 1–17) from ``mklist.f``.
+
+Representation Convention
+~~~~~~~~~~~~~~~~~~~~~~~~~
+The sigma operator works in the *covariant/contravariant C
+representation* and transforms between C and SR (diagonalized) bases:
+
+.. math::
+
+    T^C &= C \cdot T^{SR} \quad \text{(contravariant)} \\
+    \sigma^{SR} &= C^\top \cdot \sigma^C \quad \text{(back-transform)}
+
+where :math:`C` is the ``transform`` matrix from ``SBDecomposition``.
 """
 
 from __future__ import annotations

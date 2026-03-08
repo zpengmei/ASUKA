@@ -1,4 +1,4 @@
-"""Overlap (S) matrix construction for the 13-case IC-CASPT2 basis.
+r"""Overlap (S) matrix construction for the 13-case IC-CASPT2 basis.
 
 Ports OpenMolcas ``mksmat.f`` routines (MKSA through MKSG) and
 ``sbdiag.f`` for joint S/B diagonalization with linear-dependence removal.
@@ -7,6 +7,93 @@ RDM conventions (E-operator):
     dm1[p,q] = <E_pq>
     dm2[p,q,r,s] = <E_pq E_rs>
     dm3[p,q,r,s,t,u] = <E_pq E_rs E_tu>
+
+Mathematical Definitions
+------------------------
+The IC-CASPT2 overlap matrix :math:`S_{\mu\nu}` measures the metric of
+the internally contracted basis functions
+:math:`|\Phi_\mu\rangle = \hat{E}_\mu |0\rangle`:
+
+.. math::
+
+    S_{\mu\nu} = \langle 0|\hat{E}_\mu^\dagger \hat{E}_\nu|0\rangle
+
+All elements are expressed exclusively in terms of active-space RDMs
+(:math:`\Gamma^{(1)}, \Gamma^{(2)}, \Gamma^{(3)}`) and Kronecker deltas.
+
+Per-Case S Matrix Formulas
+~~~~~~~~~~~~~~~~~~~~~~~~~~
+Using the shorthand :math:`G_n \equiv \Gamma^{(n)}` and
+:math:`\delta(p,q) \equiv \delta_{pq}`:
+
+* **Case A (VJTU)** — 3 active + 1 inactive:
+
+  .. math::
+
+      S_A(tuv, xyz) = -G_3[v,u,x,t,y,z] - \delta_{yu}\,G_2[v,z,x,t]
+                      - \delta_{yt}\,G_2[v,u,x,z] - \delta_{xu}\,G_2[v,t,y,z]
+                      - \delta_{xu}\delta_{yt}\,G_1[v,z]
+                      + 2\delta_{tx}\,G_2[v,u,y,z]
+                      + 2\delta_{tx}\delta_{yu}\,G_1[v,z]
+
+* **Case B (VJTI)** — 2 active + 2 inactive (raw, before ± splitting):
+
+  .. math::
+
+      S_B(tu, xy) = 2\,G_2[x,t,y,u] - 4\delta_{xt}\,G_1[y,u]
+                    + 8\delta_{xt}\delta_{yu} - 4\delta_{yu}\,G_1[x,t]
+                    + 2\delta_{yt}\,G_1[x,u]
+                    + 2\delta_{xu}\,G_1[y,t] - 4\delta_{xu}\delta_{yt}
+
+  Symmetrized: :math:`S_{B+}(t \ge u, x \ge y) = S_B(tu,xy) + S_B(tu,yx)`,
+  :math:`S_{B-}(t > u, x > y) = S_B(tu,xy) - S_B(tu,yx)`.
+
+* **Case C (ATVX)** — 3 active + 1 virtual:
+
+  .. math::
+
+      S_C(tuv, xyz) = G_3[v,u,t,x,y,z] + \delta_{yu}\,G_2[v,z,t,x]
+                      + \delta_{yx}\,G_2[v,u,t,z]
+                      + \delta_{tu}\,G_2[v,x,y,z]
+                      + \delta_{tu}\delta_{yx}\,G_1[v,z]
+
+* **Case D (AIVX)** — 2×2 block structure per active pair:
+
+  .. math::
+
+      S_D(tu_1, xy_1) &= 2\,(G_2[u,t,x,y] + \delta_{xt}\,G_1[u,y]) \\
+      S_D(tu_2, xy_1) &= -(G_2[u,t,x,y] + \delta_{xt}\,G_1[u,y]) \\
+      S_D(tu_2, xy_2) &= -G_2[x,t,u,y] + 2\delta_{xt}\,G_1[u,y]
+
+* **Case E± (VJAI)** — 1 active:
+  :math:`S_E(t, x) = 2\delta_{tx} - G_1[t,x]`
+
+* **Case F (BVAT)** — 2 active + 2 virtual:
+  :math:`S_F(tu, xy) = 2\,G_2[t,x,u,y]`
+  (symmetrized analogously to case B).
+
+* **Case G± (BJAT)** — 1 active:
+  :math:`S_G(t, x) = G_1[t,x]`
+
+* **Case H± (BJAI)** — purely external:
+  :math:`S_H = I` (identity matrix).
+
+Joint S/B Diagonalization (``sbdiag``)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+The ``sbdiag`` procedure follows OpenMolcas ``sbdiag.f``:
+
+1. **Pre-screen**: remove basis functions with :math:`S_{\mu\mu}` below
+   threshold (``THRSHN``).  Scale remaining rows/columns by
+   :math:`1/\sqrt{S_{\mu\mu}}`.
+
+2. **Diagonalize** the scaled S matrix; remove eigenvalues below
+   ``THRSHS`` to form the linearly independent subspace.
+
+3. **Construct** orthonormal transform :math:`C` such that
+   :math:`C^\top S\, C = I`.
+
+4. **Diagonalize** :math:`C^\top B\, C` to obtain H₀ eigenvalues
+   :math:`b_\mu` in the orthonormal basis.
 """
 
 from __future__ import annotations

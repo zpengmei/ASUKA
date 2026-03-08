@@ -1,14 +1,81 @@
-"""Zeroth-order Hamiltonian (H0) matrix construction for IC-CASPT2.
+r"""Zeroth-order Hamiltonian (H₀) matrix construction for IC-CASPT2.
 
 Ports OpenMolcas ``mkbmat.f`` and ``nadiag.f``.
-The B matrix is the representation of H0_active in the IC basis for each case.
+The B matrix is the representation of Dyall's :math:`\hat{H}_0` projected
+onto the active superindex space of each IC case.
 
-Key quantities:
-    EASUM = sum_w epsa[w] * dm1[w,w]           (active Fock energy)
-    FD[t,x] = sum_w epsa[w] * dm2[t,x,w,w]    (Fock-weighted 2-RDM trace)
-    FP[p,q,r,s] = 0.5 * sum_w epsa[w] * dm3[p,q,r,s,w,w]
-                                                (Fock-weighted 3-RDM trace, half)
-    PREF[p,q,r,s] = 0.5 * dm2[p,q,r,s]        (half 2-RDM)
+Theory Overview
+---------------
+Dyall's zeroth-order Hamiltonian for IC-CASPT2 separates the total
+electronic Hamiltonian into a zeroth-order part that is diagonal in the
+inactive and virtual orbital subspaces, while retaining the full
+active-space Hamiltonian:
+
+.. math::
+
+    \hat{H}_0 = \hat{H}_0^{\text{inact}} + \hat{H}_0^{\text{act}}
+              + \hat{H}_0^{\text{virt}}
+
+In the diagonalized IC basis the denominator for each function *P*
+is :math:`d_P = b_\mu + \varepsilon^{\text{ext}}`, where :math:`b_\mu`
+comes from the active B matrix and :math:`\varepsilon^{\text{ext}}`
+from inactive/virtual orbital energies.
+
+Fock-Weighted Intermediates
+~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Let :math:`\varepsilon_w = F_{ww}` (diagonal of the full Fock in the
+active block). Three key intermediates are precomputed:
+
+.. math::
+
+    \text{EASUM} &= \sum_w \varepsilon_w \, D_{ww} \\
+    \text{FD}[t,x] &= \sum_w \varepsilon_w \, \Gamma^{(2)}[t,x,w,w] \\
+    \text{FP}[p,q,r,s] &= \tfrac{1}{2}\sum_w \varepsilon_w \,
+                          \Gamma^{(3)}[p,q,r,s,w,w]
+
+Additionally, :math:`\text{PREF}[p,q,r,s] = \tfrac{1}{2}\,\Gamma^{(2)}[p,q,r,s]`.
+
+EASUM is the active-space contribution to :math:`E_0`.
+
+Per-Case B Matrix Formulas
+~~~~~~~~~~~~~~~~~~~~~~~~~~
+* **Case E± (VJAI)** — 1-active (simplest case):
+
+  .. math::
+
+      B_E(t,x) = -\text{FD}[t,x]
+                 + (\text{EASUM} - \varepsilon_x - \varepsilon_t)\,D[t,x]
+                 + 2\,\delta_{tx}\,\varepsilon_x
+
+* **Case G± (BJAT)** — 1-active:
+
+  .. math::
+
+      B_G(t,x) = \text{FD}[t,x] - \text{EASUM}\,D[t,x]
+
+* **Case B (VJTI)** — 2-active (raw, before ± split):
+
+  .. math::
+
+      B_B(tu,xy) = 4\bigl[\text{FP}[x,t,y,u]
+                    - (\text{EASUM}-\varepsilon_t-\varepsilon_u
+                       -\varepsilon_x-\varepsilon_y)\,\text{PREF}[x,t,y,u]\bigr]
+                 + \text{delta corrections}
+
+  Symmetrized: :math:`B_{B+} = B_B(tu,xy) + B_B(tu,yx)`,
+  :math:`B_{B-} = B_B(tu,xy) - B_B(tu,yx)`.
+
+* **Case D (AIVX)** — 2×2 block structure with sub-blocks BD11, BD12, BD22.
+
+* **Case F (BVAT)** — 2-active:
+  :math:`B_F(tu,xy) = 4\,[\text{FP}[t,x,u,y] - \text{EASUM}\,\text{PREF}[t,x,u,y]]`
+
+* **Cases A, C** — 3-active (most complex): involve F3 (DELTA3)
+  Fock-contracted 4-body quantities computed without explicit 4-RDM via
+  ``F3ContractionEngine``.
+
+* **Cases H±** — purely external: :math:`B_{H\pm}` is diagonal with
+  :math:`B_{H\pm}(a{\ge}b) = \varepsilon_a + \varepsilon_b`.
 """
 
 from __future__ import annotations

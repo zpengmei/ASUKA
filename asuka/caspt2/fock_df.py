@@ -1,10 +1,41 @@
-"""DF/Cholesky-vector Fock matrix construction for CASPT2.
+r"""DF/Cholesky-vector Fock matrix construction for CASPT2.
 
-This module provides two backends for constructing CASPT2 Fock matrices:
+This module provides two backends for constructing CASPT2 Fock matrices
+using Density Fitting (DF) or Cholesky Decomposition (CD) approximations
+to the two-electron integrals.
 
+Mathematical Background
+-----------------------
+The exact two-electron integrals are approximated using auxiliary basis
+functions (DF vectors):
+
+.. math::
+
+    (pq|rs) \approx \sum_P L_{pq}^P \, L_{rs}^P
+
+where :math:`L_{pq}^P` are the DF pair factors for auxiliary index *P*.
+
+The CASPT2 Fock matrix is split as:
+
+.. math::
+
+    F^{\text{IFA}} &= h + 2J_{\text{core}} - K_{\text{core}} \\
+    F^{\text{ACT}} &= J_{\text{act}} - \tfrac{1}{2}K_{\text{act}} \\
+    F^{\text{full}} &= F^{\text{IFA}} + F^{\text{ACT}}
+
+where the Coulomb and exchange matrices are computed from DF vectors:
+
+.. math::
+
+    J_{pq}[D] &= \sum_{rs} D_{rs} (pq|rs) = \sum_P L_{pq}^P \sum_{rs} D_{rs} L_{rs}^P \\
+    K_{pq}[D] &= \sum_{rs} D_{rs} (pr|qs) = \sum_{Ps} L_{ps}^P \sum_r D_{rs} L_{qr}^P
+
+Backends
+--------
 1. ``build_caspt2_fock_ao`` (preferred): builds J/K in AO basis via the SCF
    ``_df_JK`` routine and transforms to MO.  This never materialises MO pair
-   blocks and avoids the expensive virtual–virtual DF allocation entirely.
+   blocks and avoids the expensive :math:`O(n_{\text{virt}}^2 \times n_{\text{aux}})`
+   virtual–virtual DF allocation entirely.
 
 2. ``build_caspt2_fock_df`` (legacy): contracts MO-basis DF pair blocks
    (``CASPT2DFBlocks``).  Requires all six pair blocks including ``l_ab``.
@@ -326,12 +357,17 @@ def build_caspt2_fock_ao(
     if nmo <= 0:
         raise ValueError("invalid orbital partition: nmo <= 0")
 
-    # Detect backend (NumPy vs CuPy) from B_ao.
+    # Detect backend (NumPy vs CuPy) from all array-like inputs.
+    # Mixed NumPy/CuPy inputs can occur in parity/debug flows.
+    def _is_cupy_array(a) -> bool:
+        if hasattr(a, "__cuda_array_interface__"):
+            return True
+        mod = str(getattr(type(a), "__module__", ""))
+        return "cupy" in mod
+
     xp = np
     _is_cupy = False
-    if hasattr(B_ao, "__cuda_array_interface__") or (
-        hasattr(B_ao, "__class__") and "cupy" in type(B_ao).__module__
-    ):
+    if any(_is_cupy_array(x) for x in (B_ao, C, h1e_ao, dm1_act)):
         import cupy as cp  # noqa: PLC0415
 
         xp = cp

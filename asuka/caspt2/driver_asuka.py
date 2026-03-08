@@ -1,9 +1,48 @@
 from __future__ import annotations
 
-"""ASUKA-native CASPT2 drivers (GPU-first, DF, C1, FP64).
+r"""ASUKA-native CASPT2 drivers (GPU-first, DF, C1, FP64).
 
 This module provides end-to-end CASPT2 entry points that start from ASUKA's
 frontend SCF outputs and ASUKA CASCI/CASSCF results.
+
+Computational Workflow
+----------------------
+1. **Reference Resolution**: Extract orbital coefficients, CI vectors, and
+   reference energies from CASCI/CASSCF results.
+
+2. **RDM Construction**: Build state-specific (or state-averaged for XMS)
+   1-, 2-, and 3-body RDMs using CUDA or CPU backends.
+
+3. **Superindex Setup**: Precompute the superindex maps for all 13 IC cases
+   via ``build_superindex(ncore, ncas, nvirt)``.
+
+4. **DF Block Assembly**: Build DF pair blocks (``l_it``, ``l_ia``, ``l_at``,
+   ``l_tu``, ``l_ii``) from AO-basis DF factors ``B_ao``. The expensive
+   virtual–virtual block ``l_ab`` is avoided by using the AO Fock builder.
+
+5. **Fock Construction**: Build CASPT2 Fock matrices in AO basis via
+   ``build_caspt2_fock_ao()``, avoiding the
+   :math:`O(n_{\text{virt}}^2 \times n_{\text{aux}})` MO-basis allocation.
+
+6. **SS-CASPT2 Energy**: For each state, compute the SS-CASPT2 energy using
+   ``caspt2_energy_ss()`` with optional CUDA acceleration.
+
+7. **MS/XMS-CASPT2** (if applicable):
+
+   - For **MS**: Build state-specific Fock matrices, run SS per state, then
+     construct and diagonalise :math:`H_{\text{eff}}` via CUDA HCOUP kernels.
+   - For **XMS**: Rotate CI vectors by diagonalising the model-space Fock
+     operator, recompute RDMs in the rotated basis, then proceed as MS with
+     a reference-rotation correction to :math:`H_{\text{eff}}`.
+
+Supported Backends
+~~~~~~~~~~~~~~~~~~
+- **PT2**: ``ic`` (standard IC-CASPT2), ``sst`` / ``sst-ic`` / ``sst-full``
+  (SST-CASPT2 variants)
+- **RDM**: ``cuda`` (GPU-accelerated via CuPy)
+- **Integrals**: ``df`` (Density Fitting / Cholesky)
+- **Fock**: ``df`` (AO-basis DF Fock build)
+- **Heff**: ``cuda`` (GPU HCOUP kernels for multi-state)
 """
 
 from typing import Any, Literal, Sequence
@@ -142,6 +181,11 @@ def _build_df_blocks_from_scf_out(
         raise RuntimeError("CuPy is required for DF-CASPT2 CUDA drivers") from e
 
     B_arr = cp.asarray(B_ao, dtype=cp.float64)
+    if B_arr.ndim == 2:
+        # Packed (naux, ntri) → unpack to (nao, nao, naux)
+        from asuka.integrals.df_packed_s2 import unpack_Qp_to_mnQ  # noqa: PLC0415
+        _nao_unpack = int(C.shape[0])
+        B_arr = cp.asarray(unpack_Qp_to_mnQ(B_arr, nao=_nao_unpack), dtype=cp.float64)
     if B_arr.ndim != 3:
         raise ValueError("scf_out.df_B must have shape (nao,nao,naux)")
     naux = int(B_arr.shape[2])
@@ -343,6 +387,14 @@ def _caspt2_from_asuka_ref(
     B_ao = getattr(scf_out, "df_B", None)
     if B_ao is None:
         raise ValueError("scf_out.df_B is missing (DF factors required)")
+    # Unpack packed 2D (naux, ntri) → 3D (nao, nao, naux) if needed.
+    import numpy as _np  # noqa: PLC0415
+    _B_tmp = _np.asarray(B_ao.get() if hasattr(B_ao, "get") else B_ao)
+    if _B_tmp.ndim == 2:
+        from asuka.integrals.df_packed_s2 import unpack_Qp_to_mnQ  # noqa: PLC0415
+        _nao_unpack = int(C.shape[0])
+        B_ao = unpack_Qp_to_mnQ(_B_tmp, nao=_nao_unpack)
+    del _B_tmp
     df_blocks = _build_df_blocks_from_scf_out(
         B_ao=B_ao,
         C=C,

@@ -1,12 +1,35 @@
-"""CPU DF-native RHS construction for IC-CASPT2.
+r"""CPU DF-native RHS construction for IC-CASPT2.
 
-Eliminates the O(N^5) full-ERI construction by computing RHS vectors
+Eliminates the :math:`O(N^5)` full-ERI construction by computing RHS vectors
 directly from DF pair blocks via targeted GEMMs. NumPy port of
 ``cuda/rhs_df_cuda.py``.
 
-Each IC case needs only specific ERI slices (e.g., (core,act|act,act)),
-reconstructed on-the-fly from 4 DF pair blocks: l_it, l_ia, l_at, l_tu.
-Worst-case scaling is O(N^2 * n_act^2 * n_aux) per case.
+Mathematical Background
+-----------------------
+The RHS vector for IC case *c* is:
+
+.. math::
+
+    V_P^{(c)} = \langle \Phi_P^{(c)} | \hat{H} | \Psi_0 \rangle
+
+Each IC case needs only specific ERI slices (e.g., ``(core,act|act,act)``),
+reconstructed on-the-fly from 4 DF pair blocks: ``l_it``, ``l_ia``,
+``l_at``, ``l_tu``:
+
+.. math::
+
+    (pq|rs) \approx \sum_P L_{pq}^P \, L_{rs}^P
+
+Worst-case scaling is :math:`O(N^2 \cdot n_{\text{act}}^2 \cdot n_{\text{aux}})` per case.
+For :math:`\pm`-symmetrized cases (B±, E±, F±, G±, H±), a ``_df_gram_gather``
+helper computes:
+
+.. math::
+
+    \text{result}[k,m] = \sum_P L_{i_m,t_k}^P L_{j_m,u_k}^P
+        \pm \sum_P L_{j_m,t_k}^P L_{i_m,u_k}^P
+
+avoiding the formation of the full Gram matrix.
 """
 from __future__ import annotations
 

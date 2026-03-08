@@ -1,26 +1,55 @@
-"""MS-CASPT2: Multi-State CASPT2 effective Hamiltonian.
+r"""MS-CASPT2: Multi-State CASPT2 effective Hamiltonian.
 
 Ports OpenMolcas ``hcoup.f``, ``hefval.F90``, ``mltctl.f``.
 Constructs the effective Hamiltonian Heff from SS-CASPT2 results
 for multiple states, then diagonalizes to get MS-CASPT2 energies.
 
-The effective Hamiltonian is defined as:
+Mathematical Background
+-----------------------
+The multi-state CASPT2 effective Hamiltonian is built as:
 
-    Heff[I,J] = δ(I,J) · E_CASPT2(I)  +  (1 - δ(I,J)) · ⟨I|H|Ω_J⟩
+.. math::
 
-where |Ω_J⟩ is the first-order wavefunction for state J.  The off-diagonal
-couplings ⟨I|H|Ω_J⟩ are evaluated by contracting the ket-state J's RHS and
-solution vectors (in the raw active superindex basis) against transition
-densities (TG1/TG2/TG3) between states I and J, using per-case HCOUP kernels.
+    H_{\text{eff}}[I,J] = \begin{cases}
+        E_{\text{CASPT2}}^{(I)} & \text{if } I = J \\
+        \langle I|\hat{H}|\Omega_J\rangle & \text{if } I \neq J
+    \end{cases}
 
-The workflow is:
-  1. Run SS-CASPT2 for each state → amplitudes + per-case decompositions
-  2. Back-transform amplitudes to the raw (un-diagonalized) active superindex
-     basis: T_raw = transform @ T_SR
-  3. Precompute row_dots[ias,jas] = V1[ias,:] · V2[jas,:] (RHS × solution)
-  4. For each off-diagonal (I,J) pair, compute transition dm1/dm2/dm3 and
-     contract with row_dots via hcoup_case_contribution()
-  5. Diagonalize Heff to obtain MS-CASPT2 energies
+where :math:`|\Omega_J\rangle = |J\rangle + |J^{(1)}\rangle` is the
+first-order corrected wavefunction for state *J*, consisting of the
+zeroth-order reference :math:`|J\rangle` and the first-order correction
+:math:`|J^{(1)}\rangle = \sum_P T_P^{(J)} |\Phi_P\rangle`.
+
+Off-Diagonal Coupling Elements
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+The off-diagonal elements are computed via per-case HCOUP kernels:
+
+.. math::
+
+    \langle I|\hat{H}|\Omega_J\rangle = \sum_{c=1}^{13}
+        \sum_{\mu\nu} K^{(c)}_{\mu\nu}\,
+        \text{row\_dots}^{(c)}[\mu,\nu]
+
+where:
+
+.. math::
+
+    \text{row\_dots}[\mu,\nu] = \sum_{\text{ext}} V_I[\mu,\text{ext}] \cdot
+                                                  T_J[\nu,\text{ext}]
+
+The HCOUP kernels :math:`K^{(c)}_{\mu\nu}` contract transition density
+matrices (TG1, TG2, TG3) between states *I* and *J* against the
+active-superindex structure (see ``hcoup.py``).
+
+Workflow
+~~~~~~~~
+1. Run SS-CASPT2 for each state → amplitudes + per-case decompositions
+2. Back-transform amplitudes to the raw (un-diagonalized) active superindex
+   basis: ``T_raw = transform @ T_SR``
+3. Precompute ``row_dots[ias,jas] = V1[ias,:] · V2[jas,:]`` (RHS × solution)
+4. For each off-diagonal (I,J) pair, compute transition dm1/dm2/dm3 and
+   contract with row_dots via ``hcoup_case_contribution()``
+5. Diagonalize Heff to obtain MS-CASPT2 energies
 """
 
 from __future__ import annotations

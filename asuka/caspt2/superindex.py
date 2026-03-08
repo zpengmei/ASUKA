@@ -1,15 +1,73 @@
-"""Superindex infrastructure for the 13-case internally contracted CASPT2 basis.
+r"""Superindex infrastructure for the 13-case internally contracted CASPT2 basis.
 
 Ports OpenMolcas ``superindex.f`` (``SUPINI``) for C1 symmetry.
 Each IC case pairs an *active superindex* (functions of active-space indices)
 with an *inactive/virtual superindex* (functions of inactive/virtual indices).
+
+Mathematical Structure
+----------------------
+The first-order wavefunction in IC-CASPT2 is expanded over perturber
+functions :math:`|\Phi_P\rangle` classified into 13 cases. Each case
+has a compound index :math:`P = (\mu, \text{ext})` where:
+
+- :math:`\mu` is the **active superindex** (built from active orbital
+  indices :math:`t, u, v \in [0, N_{\text{act}})`)
+- :math:`\text{ext}` is the **external superindex** (built from
+  inactive :math:`i, j` and/or virtual :math:`a, b` orbital indices)
+
+Active Superindex Types
+~~~~~~~~~~~~~~~~~~~~~~~
+- **Triple index** :math:`(t,u,v)` — all permutations of 3 active orbitals.
+  Dimension: :math:`N_{\text{act}}^3`. Used by cases A, C.
+- **All pairs** :math:`(t,u)` — :math:`N_{\text{act}}^2` pairs.
+  Used by case D (with 2× blocking).
+- **Symmetric pairs** :math:`t \ge u` — :math:`N_{\text{act}}(N_{\text{act}}+1)/2`.
+  Used by cases B+, F+.
+- **Antisymmetric pairs** :math:`t > u` — :math:`N_{\text{act}}(N_{\text{act}}-1)/2`.
+  Used by cases B−, F−.
+- **Single index** :math:`t` — :math:`N_{\text{act}}`.
+  Used by cases E±, G±.
+- **No active index** — cases H± (purely external).
+
+External Superindex Types
+~~~~~~~~~~~~~~~~~~~~~~~~~
+Analogous pair/single indices over inactive and virtual orbitals,
+combined depending on the case (e.g., case D uses :math:`a \cdot N_{\text{inact}} + i`,
+case E+ uses :math:`(i{\ge}j) \cdot N_{\text{virt}} + a`).
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
+from enum import IntEnum
 
 import numpy as np
+
+
+class ICCase(IntEnum):
+    """The 13 internally-contracted CASPT2 perturber cases.
+
+    Each case pairs an active superindex (functions of active-space indices
+    t, u, v) with an external superindex (functions of inactive i, j and/or
+    virtual a, b indices).
+
+    IntEnum so ``ICCase.A == 1`` is True — existing ``if case == 1:`` code
+    continues to work without changes.
+    """
+
+    A = 1    # (t,u,v) active triple, i inactive
+    Bp = 2   # t>=u active pair, i>=j inactive pair (symmetric)
+    Bm = 3   # t>u active pair, i>j inactive pair (antisymmetric)
+    C = 4    # (t,u,v) active triple, a virtual
+    D = 5    # (t,u) active pair, (a,i) mixed external
+    Ep = 6   # t active, (i>=j, a) external (symmetric)
+    Em = 7   # t active, (i>j, a) external (antisymmetric)
+    Fp = 8   # t>=u active pair, a>=b virtual pair (symmetric)
+    Fm = 9   # t>u active pair, a>b virtual pair (antisymmetric)
+    Gp = 10  # t active, (a>=b, i) external (symmetric)
+    Gm = 11  # t active, (a>b, i) external (antisymmetric)
+    Hp = 12  # no active index, (a>=b, i>=j) external (symmetric)
+    Hm = 13  # no active index, (a>b, i>j) external (antisymmetric)
 
 
 @dataclass(frozen=True)

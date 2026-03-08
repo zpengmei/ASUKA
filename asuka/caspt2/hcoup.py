@@ -1,29 +1,54 @@
-"""MS-CASPT2 coupling contraction (OpenMolcas `hcoup.f` port, C1 only).
+r"""MS-CASPT2 coupling contraction (OpenMolcas ``hcoup.f`` port, C1 only).
 
 OpenMolcas evaluates off-diagonal effective Hamiltonian elements via:
 
-  HEL = < ROOT1 | H * OMEGA | ROOT2 >
+.. math::
+
+    H_{\text{eff}}[I,J] = \langle I|\hat{H}|\Omega_J\rangle
 
 using:
-  - a contravariant RHS vector (H|ROOT1>) stored on disk (`IVECW`)
-  - a contravariant solution vector (|OMEGA ROOT2>) stored on disk (`IVECC`)
-  - active transition densities (TG1/TG2/TG3) and overlap (OVL) between the
-    two reference states.
 
-This module ports the per-case kernels from `OpenMolcas/src/caspt2/hcoup.f`
-and contracts them against precomputed row-wise dot products:
+- a contravariant RHS vector (:math:`\hat{H}|I\rangle`) stored on disk
+  (``IVECW``)
+- a covariant amplitude vector from state *J* (``IVECR2``)
+- transition RDMs ``TG1``, ``TG2``, ``TG3`` between states *I* and *J*
 
-  row_dots[IAS, JAS] = dot(V1[IAS, :], V2[JAS, :])
+Mathematical Structure
+----------------------
+For each IC case *c*, the coupling contribution is:
 
-where `V1` is the RHS block and `V2` is the solution block for the *ket* state.
+.. math::
 
-Notes
------
-The overlap builders in `asuka.caspt2.overlap` implement the *SBMAT* (S-metric)
-formulae, which are symmetric by construction. For MS couplings OpenMolcas uses
-the `HCOUP` kernels, which:
-  - are generally *not* symmetric for transition densities, and
-  - use a different index layout in case 4 (see `hcoup.f`, CASE(4)).
+    H_{\text{eff}}^{(c)}[I,J] = \sum_{\mu\nu}
+        K^{(c)}_{\mu\nu}(\text{TG1}, \text{TG2}, \text{TG3})\,
+        \text{row\_dots}[\mu,\nu]
+
+where:
+
+.. math::
+
+    \text{row\_dots}[\mu,\nu] = \sum_{\text{ext}}
+        V_I^{\text{raw}}[\mu, \text{ext}] \cdot T_J^{\text{raw}}[\nu, \text{ext}]
+
+and :math:`K^{(c)}_{\mu\nu}` is the active-space kernel for case *c*.
+
+Key Properties
+~~~~~~~~~~~~~~
+- The HCOUP kernels are structurally similar to the S-matrix builders in
+  ``overlap.py`` but use *transition* densities instead of state-specific
+  RDMs.
+- They are generally **not symmetric** for bra ≠ ket transition densities.
+- Case D (ICASE=5) has a different active-index layout from the
+  symmetric S/B builders (see ``hcoup.f``, ``CASE(4)``).
+
+Per-Case Kernel Summary
+~~~~~~~~~~~~~~~~~~~~~~~
+- Cases A, C: triple active index + 3-RDM transition density
+- Cases B±, F±: pair active index + ± symmetrization of 2-RDM terms
+- Case D: 2×2 block active pairs
+- Cases E±: :math:`K_E(t,x) = 2\delta_{tx}\,\text{OVL} - \text{TG1}[x,t]`
+- Cases G±: :math:`K_G(t,x) = \text{TG1}[t,x]`
+- Cases H±: purely external, weighted by state overlap ``OVL``
 """
 
 from __future__ import annotations

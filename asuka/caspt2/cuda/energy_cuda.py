@@ -51,6 +51,7 @@ def caspt2_energy_ss_cuda(
     device: int | None = None,
     store_rhs: bool = False,
     store_row_dots: bool = False,
+    store_sb_decomp: bool = False,
     mixed_precision_rhs: bool = False,
 ) -> CASPT2EnergyResult:
     """SS-CASPT2 energy on GPU (C1, FP64) using DF RHS and CUDA sigma kernels."""
@@ -163,6 +164,7 @@ def caspt2_energy_ss_cuda(
         profile["rhs_df_build_s"] = float(time.perf_counter() - t0)
 
     rhs_sr_list: list[Any] = []
+    sb_decomp_breakdown: dict[str, Any] = {}
     # GPU F3 engine (case 1/4) for full/strict modes.
     f3_eng = None
     if cuda_mode_norm in ("full", "strict") and nash > 0 and int(smap.ntuv) > 0:
@@ -355,6 +357,26 @@ def caspt2_energy_ss_cuda(
             sb_decomps.append(decomp)
 
         if decomp.nindep == 0:
+            if bool(store_sb_decomp):
+                case_lbl = f"{int(case):02d}"
+                # Store empty SB decomposition metadata for parity tooling.
+                try:
+                    sb_decomp_breakdown[f"sb_transform_case{case_lbl}"] = np.asarray(
+                        cp.asnumpy(getattr(decomp, "transform")), dtype=np.float64
+                    )
+                except Exception:
+                    sb_decomp_breakdown[f"sb_transform_case{case_lbl}"] = np.asarray(
+                        getattr(decomp, "transform"), dtype=np.float64
+                    )
+                try:
+                    sb_decomp_breakdown[f"sb_bdiag_case{case_lbl}"] = np.asarray(
+                        cp.asnumpy(getattr(decomp, "b_diag")), dtype=np.float64
+                    ).reshape(-1)[:0]
+                except Exception:
+                    sb_decomp_breakdown[f"sb_bdiag_case{case_lbl}"] = np.asarray(
+                        getattr(decomp, "b_diag"), dtype=np.float64
+                    ).reshape(-1)[:0]
+                sb_decomp_breakdown[f"sb_nindep_case{case_lbl}"] = int(getattr(decomp, "nindep", 0))
             if cuda_mode_norm == "strict":
                 bd_list.append(cp.empty((0,), dtype=cp.float64))
             else:
@@ -390,6 +412,23 @@ def caspt2_energy_ss_cuda(
         rhs_sr_list.append(rhs_sr.ravel())
         _sync()
         _t_rhs_sr_total += time.perf_counter() - _t_rhs_sr0
+
+        if bool(store_sb_decomp):
+            case_lbl = f"{int(case):02d}"
+            try:
+                tr_host = np.asarray(cp.asnumpy(getattr(decomp, "transform")), dtype=np.float64)
+            except Exception:
+                tr_host = np.asarray(getattr(decomp, "transform"), dtype=np.float64)
+            try:
+                bd_host = np.asarray(cp.asnumpy(getattr(decomp, "b_diag")), dtype=np.float64).reshape(-1)
+            except Exception:
+                bd_host = np.asarray(getattr(decomp, "b_diag"), dtype=np.float64).reshape(-1)
+            sb_decomp_breakdown[f"sb_transform_case{case_lbl}"] = tr_host
+            sb_decomp_breakdown[f"sb_bdiag_case{case_lbl}"] = bd_host[: int(getattr(decomp, "nindep", 0))].copy()
+            sb_decomp_breakdown[f"sb_nindep_case{case_lbl}"] = int(getattr(decomp, "nindep", 0))
+            sb_decomp_breakdown[f"rhs_sr_case{case_lbl}"] = np.asarray(
+                cp.asnumpy(rhs_sr), dtype=np.float64
+            )
 
         if verbose >= 2:
             print(f"  Case {case}: nasup={nasup}, nisup={nisup}, nindep={decomp.nindep}")
@@ -528,6 +567,8 @@ def caspt2_energy_ss_cuda(
     breakdown: dict[str, Any] = {}
     if profile is not None:
         breakdown["cuda_profile"] = dict(profile)
+    if bool(store_sb_decomp) and sb_decomp_breakdown:
+        breakdown.update(sb_decomp_breakdown)
     for case_idx, (rhs, t) in enumerate(zip(rhs_sr_list, amps_sr_list), start=1):
         if int(rhs.size) == 0:
             continue

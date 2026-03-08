@@ -1,12 +1,45 @@
-"""Internally contracted CASPT2 (SS/MS/XMS) on GPU (DF, C1, FP64).
+r"""Internally contracted CASPT2 (SS/MS/XMS) on GPU (DF, C1, FP64).
 
-This module implements the 13-case OpenMolcas formalism for IC-CASPT2
+This package implements the 13-case OpenMolcas formalism for IC-CASPT2
 with support for both CPU (NumPy + full ERIs) and GPU (CuPy + DF) backends.
+
+Theory
+------
+IC-CASPT2 expands the first-order wavefunction in internally contracted
+basis functions :math:`|\Phi_P\rangle = \hat{E}_{pqrs\ldots}|\Psi_0\rangle`,
+classified into 13 cases (A–H±) by the orbital subspace (inactive/active/
+virtual) of the excitation indices. The PT2 energy is:
+
+.. math::
+
+    E_{\text{PT2}} = \sum_{c=1}^{13} \sum_P T_P^{(c)} V_P^{(c)}
+
+where :math:`V_P = \langle \Phi_P|\hat{H}|\Psi_0\rangle` and the amplitudes
+:math:`T_P` solve :math:`(\hat{H}_0 - E_0) T = -V`.
+
+Module Map
+----------
+- ``superindex.py``: Superindex infrastructure for 13 IC cases
+- ``fock.py`` / ``fock_df.py``: Fock matrix construction (full ERI / DF)
+- ``overlap.py``: S matrix + joint S/B diagonalisation
+- ``hzero.py``: Dyall's :math:`\hat{H}_0` (B matrix) for all cases
+- ``rhs.py`` / ``rhs_df.py``: RHS coupling vectors :math:`V_P`
+- ``f3.py``: Fock-contracted 4-body quantity engine (DELTA3)
+- ``sigma.py``: Sigma-vector operator + inter-case couplings
+- ``solver.py``: PCG linear system solver
+- ``shifts.py``: IPEA / imaginary / real level shifts
+- ``energy.py``: SS-CASPT2 energy workflow
+- ``multistate.py`` / ``hcoup.py``: MS-CASPT2 effective Hamiltonian
+- ``xms.py`` / ``xms_utils.py``: XMS state rotation
+- ``driver_asuka.py``: End-to-end ASUKA workflow drivers
+- ``result.py``: Result dataclasses
+- ``pt2lag.py`` / ``pt2lag_df2e.py``: Gradient Lagrangian intermediates
+- ``sigder_native.py``: SIGDER OFFDIAG for CLagDX
+
 Primary entry points for end-to-end ASUKA workflows are:
   - :func:`run_caspt2` (ASUKA CASCIResult/CASSCFResult)
 
-See ``asuka/caspt2/README.md`` for a detailed description of the
-computational workflow, module structure, and conventions.
+See ``asuka/caspt2/README.md`` for detailed conventions and usage examples.
 """
 
 from asuka.caspt2.driver_asuka import run_caspt2, run_caspt2_soc, run_caspt2_soc_multispin

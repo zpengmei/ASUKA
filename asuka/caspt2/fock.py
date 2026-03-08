@@ -1,7 +1,57 @@
-"""Fock matrix construction for CASPT2.
+r"""Fock matrix construction for CASPT2.
 
 Ports OpenMolcas ``fmat_caspt2.f`` and ``newfock.f``.
 Builds inactive Fock, active Fock, and full state-specific Fock in the MO basis.
+
+Mathematical Definitions
+------------------------
+Given MO-basis one-electron integrals :math:`h_{pq}` and two-electron
+integrals in chemists' notation :math:`(pq|rs)`, the Fock matrices are:
+
+**Inactive Fock** (:math:`F^I`):
+
+.. math::
+
+    F^I_{pq} = h_{pq} + \sum_{i \in \text{inact}}
+               \bigl[2\,(pq|ii) - (pi|iq)\bigr]
+
+This represents the mean-field potential from the doubly occupied
+inactive orbitals (core + frozen).
+
+**Active Fock** (:math:`F^A`):
+
+.. math::
+
+    F^A_{pq} = \sum_{tu} D_{tu}\,\bigl[(pq|tu) - \tfrac{1}{2}(pt|qu)\bigr]
+
+where :math:`D_{tu} = \langle E_{tu}\rangle` is the active-space 1-RDM
+in E-operator convention.
+
+**Full (state-specific) Fock** (:math:`F`):
+
+.. math::
+
+    F_{pq} = F^I_{pq} + F^A_{pq}
+
+**Active Fock eigenvalues** (:math:`\varepsilon_t`):
+
+.. math::
+
+    \varepsilon_t = F_{tt} \quad (t \in \text{active block})
+
+These diagonal elements serve as the orbital energies entering Dyall's
+zeroth-order Hamiltonian.
+
+**Core energy** (:math:`E_{\text{core}}`):
+
+.. math::
+
+    E_{\text{core}} = \sum_{i \in \text{inact}} (h_{ii} + F^I_{ii}) + E_{\text{nuc}}
+                    = \operatorname{Tr}[h\, D_{\text{core}}]
+                      + \tfrac{1}{2}\operatorname{Tr}[V_{\text{core}}\, D_{\text{core}}]
+                      + E_{\text{nuc}}
+
+where :math:`D_{\text{core}} = 2\sum_i |i\rangle\langle i|`.
 """
 
 from __future__ import annotations

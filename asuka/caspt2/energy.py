@@ -1,8 +1,62 @@
-"""SS-CASPT2 energy driver.
+r"""SS-CASPT2 energy driver.
 
 Ports OpenMolcas ``eqctl2.f`` equation control logic.
 Orchestrates S/B construction, diagonalization, RHS computation,
 and amplitude solution for single-state CASPT2.
+
+Mathematical Background
+-----------------------
+The second-order perturbation energy for a single reference state
+:math:`|0\rangle` is:
+
+.. math::
+
+    E^{(2)} = \sum_{c=1}^{13} \sum_P V_P^{(c)} \, T_P^{(c)}
+
+where the sum runs over all 13 internally contracted (IC) cases and
+*P* indexes the combined active × external superindex functions.
+
+For each case *c* the workflow is:
+
+1. **Overlap (S) matrix** — :math:`S_{\mu\nu} = \langle\Phi_\mu|\Phi_\nu\rangle`
+   built from active-space RDMs (1-/2-/3-RDM depending on case).
+
+2. **Zeroth-order Hamiltonian (B) matrix** —
+   :math:`B_{\mu\nu} = \langle\Phi_\mu|\hat{H}_0|\Phi_\nu\rangle`
+   using Dyall's H₀ expressed via Fock-weighted RDM quantities
+   (EASUM, FD, FP) and, for cases A/C, the F3 (DELTA3) contractions.
+
+3. **Joint diagonalization** — simultaneous diagonalization of *S* and *B*
+   with Molcas-style linear-dependence removal:
+
+   .. math::
+
+       C^\dagger S\, C = I, \qquad  C^\dagger B\, C = \mathrm{diag}(b_\mu)
+
+   yielding the transformation matrix *C* (``transform``) and diagonal
+   eigenvalues :math:`b_\mu` (``b_diag``).
+
+4. **RHS coupling vector** —
+   :math:`V_P = \langle\Phi_P|\hat{H}|0\rangle`
+   transformed to the diagonalized (SR) basis:
+   :math:`V_P^{\mathrm{SR}} = (S\,C)^\top\, V_P`.
+
+5. **Denominator assembly** — per-function denominator combining active
+   eigenvalue :math:`b_\mu` and external orbital energies
+   :math:`\varepsilon^{\mathrm{ext}}`:
+
+   .. math::
+
+       d_{P} = b_\mu + \sum_{\text{ext}} (\pm\varepsilon_p)
+
+   where inactive holes contribute :math:`-\varepsilon_i` and virtual
+   particles :math:`+\varepsilon_a`.
+
+6. **Amplitude solution** — direct divide :math:`T_P = -V_P / d_P` when
+   the Fock matrix is quasi-canonical, or iterative PCG otherwise.
+
+7. **Level-shift corrections** (optional) — imaginary shift replaces
+   :math:`1/d \to d/(d^2 + \sigma^2)`; real shift adds a constant to *d*.
 """
 
 from __future__ import annotations
@@ -50,6 +104,7 @@ def caspt2_energy_ss(
     df_blocks: object | None = None,
     store_rhs: bool = False,
     store_row_dots: bool = False,
+    store_sb_decomp: bool = False,
     ipea_shift: float = 0.0,
     imag_shift: float = 0.0,
     real_shift: float = 0.0,
@@ -92,6 +147,10 @@ def caspt2_energy_ss(
     store_row_dots : bool
         If True, store per-case row_dots matrices (needed for MS Heff).
         Only supported for ``pt2_backend="cuda"``.
+    store_sb_decomp : bool
+        If True, store per-case SB decomposition arrays in ``breakdown``:
+        ``sb_transform_caseXX``, ``sb_bdiag_caseXX``, ``sb_nindep_caseXX``,
+        and ``rhs_sr_caseXX``. This is useful for strict parity replay paths.
     ipea_shift, imag_shift, real_shift : float
         Level-shift parameters for intruder-state removal.
     tol : float
@@ -143,6 +202,7 @@ def caspt2_energy_ss(
             device=cuda_device,
             store_rhs=store_rhs,
             store_row_dots=store_row_dots,
+            store_sb_decomp=bool(store_sb_decomp),
             mixed_precision_rhs=bool(mixed_precision_rhs),
         )
 
@@ -199,6 +259,11 @@ def caspt2_energy_ss(
         # Joint diagonalization with linear-dep removal
         decomp = sbdiag(smat, bmat, threshold_norm=threshold, threshold_s=threshold_s)
         sb_decomps.append(decomp)
+        case_lbl = f"{int(case):02d}"
+        if bool(store_sb_decomp):
+            breakdown[f"sb_transform_case{case_lbl}"] = np.asarray(decomp.transform, dtype=np.float64)
+            breakdown[f"sb_bdiag_case{case_lbl}"] = np.asarray(decomp.b_diag[: decomp.nindep], dtype=np.float64)
+            breakdown[f"sb_nindep_case{case_lbl}"] = int(decomp.nindep)
 
         if decomp.nindep == 0:
             h0_diags.append(np.empty(0, dtype=np.float64))
@@ -236,6 +301,8 @@ def caspt2_energy_ss(
             rhs_mat = rhs_raw.reshape(nasup, nisup)
             rhs_diag = decomp.transform.T @ smat @ rhs_mat  # (nindep, nisup)
             rhs_transformed.append(rhs_diag.ravel())
+            if bool(store_sb_decomp):
+                breakdown[f"rhs_sr_case{case_lbl}"] = np.asarray(rhs_diag, dtype=np.float64)
         else:
             rhs_transformed.append(rhs_raw)
 
@@ -359,89 +426,115 @@ def _get_external_energies(case: int, smap: SuperindexMap, fock: CASPT2Fock) -> 
       * Inactive hole  → -eps_i  (removing an electron costs +|eps_i|)
       * Virtual particle → +eps_a (adding an electron costs eps_a > 0)
     """
-    nish = smap.orbs.nish
-    nash = smap.orbs.nash
-    nssh = smap.orbs.nssh
+    builder = _ext_energy_builders.get(int(case))
+    if builder is None:
+        return np.empty(0, dtype=np.float64)
+    return builder(smap, fock)
 
-    # Orbital energies from Fock diagonal
+
+def _ext_eps(smap: SuperindexMap, fock: CASPT2Fock):
+    """Extract inactive/virtual orbital energies from Fock diagonal."""
+    nish, nash, nssh = smap.orbs.nish, smap.orbs.nash, smap.orbs.nssh
     eps_i = np.array([fock.fifa[i, i] for i in range(nish)], dtype=np.float64)
     vo = nish + nash
     eps_a = np.array([fock.fifa[vo + a, vo + a] for a in range(nssh)], dtype=np.float64)
+    return eps_i, eps_a
 
-    if case == 1:  # A: 1 inactive hole
-        return -eps_i
-    elif case == 2:  # B+: 2 inactive holes (sym)
-        energies = []
-        for q in range(smap.nigej):
-            i, j = smap.migej[q]
-            energies.append(-(eps_i[i] + eps_i[j]))
-        return np.array(energies, dtype=np.float64)
-    elif case == 3:  # B-: 2 inactive holes (asym)
-        energies = []
-        for q in range(smap.nigtj):
-            i, j = smap.migtj[q]
-            energies.append(-(eps_i[i] + eps_i[j]))
-        return np.array(energies, dtype=np.float64)
-    elif case == 4:  # C: 1 virtual particle
-        return eps_a
-    elif case == 5:  # D: 1 virtual particle + 1 inactive hole
-        energies = []
-        for ai in range(nssh * nish):
-            a = ai // nish
-            i = ai % nish
-            energies.append(eps_a[a] - eps_i[i])
-        return np.array(energies, dtype=np.float64)
-    elif case == 6:  # E+: 1 virtual + sym inactive pair (igej, a)
-        energies = []
-        for igej in range(smap.nigej):
-            i, j = smap.migej[igej]
-            for a in range(nssh):
-                energies.append(-eps_i[i] - eps_i[j] + eps_a[a])
-        return np.array(energies, dtype=np.float64)
-    elif case == 7:  # E-: 1 virtual + asym inactive pair (igtj, a)
-        energies = []
-        for igtj in range(smap.nigtj):
-            i, j = smap.migtj[igtj]
-            for a in range(nssh):
-                energies.append(-eps_i[i] - eps_i[j] + eps_a[a])
-        return np.array(energies, dtype=np.float64)
-    elif case == 8:  # F+: 2 virtual particles (sym)
-        energies = []
-        for q in range(smap.nageb):
-            a, b = smap.mageb[q]
-            energies.append(eps_a[a] + eps_a[b])
-        return np.array(energies, dtype=np.float64)
-    elif case == 9:  # F-: 2 virtual particles (asym)
-        energies = []
-        for q in range(smap.nagtb):
-            a, b = smap.magtb[q]
-            energies.append(eps_a[a] + eps_a[b])
-        return np.array(energies, dtype=np.float64)
-    elif case == 10:  # G+: 1 inactive + sym virtual pair (ageb, i)
-        energies = []
-        for ageb in range(smap.nageb):
-            a, b = smap.mageb[ageb]
-            for i in range(nish):
-                energies.append(-eps_i[i] + eps_a[a] + eps_a[b])
-        return np.array(energies, dtype=np.float64)
-    elif case == 11:  # G-: 1 inactive + asym virtual pair (agtb, i)
-        energies = []
-        for agtb in range(smap.nagtb):
-            a, b = smap.magtb[agtb]
-            for i in range(nish):
-                energies.append(-eps_i[i] + eps_a[a] + eps_a[b])
-        return np.array(energies, dtype=np.float64)
-    elif case == 12:  # H+: 2 inactive holes (virtual part in B matrix)
-        energies = []
-        for q in range(smap.nigej):
-            i, j = smap.migej[q]
-            energies.append(-(eps_i[i] + eps_i[j]))
-        return np.array(energies, dtype=np.float64)
-    elif case == 13:  # H-: 2 inactive holes (virtual part in B matrix)
-        energies = []
-        for q in range(smap.nigtj):
-            i, j = smap.migtj[q]
-            energies.append(-(eps_i[i] + eps_i[j]))
-        return np.array(energies, dtype=np.float64)
-    else:
-        return np.empty(0, dtype=np.float64)
+
+def _ext_hole_pair(pair_map, npair, eps_i):
+    """Sum of two hole energies: -(eps_i + eps_j) for each pair."""
+    return np.array([-(eps_i[pair_map[q, 0]] + eps_i[pair_map[q, 1]])
+                     for q in range(npair)], dtype=np.float64)
+
+
+def _ext_virt_pair(pair_map, npair, eps_a):
+    """Sum of two particle energies: eps_a + eps_b for each pair."""
+    return np.array([eps_a[pair_map[q, 0]] + eps_a[pair_map[q, 1]]
+                     for q in range(npair)], dtype=np.float64)
+
+
+# --- Per-case builders ---
+
+def _ext_energy_a(smap, fock):
+    eps_i, _ = _ext_eps(smap, fock)
+    return -eps_i
+
+
+def _ext_energy_bp(smap, fock):
+    eps_i, _ = _ext_eps(smap, fock)
+    return _ext_hole_pair(smap.migej, smap.nigej, eps_i)
+
+
+def _ext_energy_bm(smap, fock):
+    eps_i, _ = _ext_eps(smap, fock)
+    return _ext_hole_pair(smap.migtj, smap.nigtj, eps_i)
+
+
+def _ext_energy_c(smap, fock):
+    _, eps_a = _ext_eps(smap, fock)
+    return eps_a
+
+
+def _ext_energy_d(smap, fock):
+    eps_i, eps_a = _ext_eps(smap, fock)
+    nish, nssh = smap.orbs.nish, smap.orbs.nssh
+    return np.array([eps_a[ai // nish] - eps_i[ai % nish]
+                     for ai in range(nssh * nish)], dtype=np.float64)
+
+
+def _ext_energy_ep(smap, fock):
+    eps_i, eps_a = _ext_eps(smap, fock)
+    return np.array([-eps_i[smap.migej[q, 0]] - eps_i[smap.migej[q, 1]] + eps_a[a]
+                     for q in range(smap.nigej) for a in range(smap.orbs.nssh)],
+                    dtype=np.float64)
+
+
+def _ext_energy_em(smap, fock):
+    eps_i, eps_a = _ext_eps(smap, fock)
+    return np.array([-eps_i[smap.migtj[q, 0]] - eps_i[smap.migtj[q, 1]] + eps_a[a]
+                     for q in range(smap.nigtj) for a in range(smap.orbs.nssh)],
+                    dtype=np.float64)
+
+
+def _ext_energy_fp(smap, fock):
+    _, eps_a = _ext_eps(smap, fock)
+    return _ext_virt_pair(smap.mageb, smap.nageb, eps_a)
+
+
+def _ext_energy_fm(smap, fock):
+    _, eps_a = _ext_eps(smap, fock)
+    return _ext_virt_pair(smap.magtb, smap.nagtb, eps_a)
+
+
+def _ext_energy_gp(smap, fock):
+    eps_i, eps_a = _ext_eps(smap, fock)
+    return np.array([-eps_i[i] + eps_a[smap.mageb[q, 0]] + eps_a[smap.mageb[q, 1]]
+                     for q in range(smap.nageb) for i in range(smap.orbs.nish)],
+                    dtype=np.float64)
+
+
+def _ext_energy_gm(smap, fock):
+    eps_i, eps_a = _ext_eps(smap, fock)
+    return np.array([-eps_i[i] + eps_a[smap.magtb[q, 0]] + eps_a[smap.magtb[q, 1]]
+                     for q in range(smap.nagtb) for i in range(smap.orbs.nish)],
+                    dtype=np.float64)
+
+
+def _ext_energy_hp(smap, fock):
+    eps_i, _ = _ext_eps(smap, fock)
+    return _ext_hole_pair(smap.migej, smap.nigej, eps_i)
+
+
+def _ext_energy_hm(smap, fock):
+    eps_i, _ = _ext_eps(smap, fock)
+    return _ext_hole_pair(smap.migtj, smap.nigtj, eps_i)
+
+
+_ext_energy_builders = {
+    1: _ext_energy_a,   2: _ext_energy_bp,  3: _ext_energy_bm,
+    4: _ext_energy_c,   5: _ext_energy_d,
+    6: _ext_energy_ep,  7: _ext_energy_em,
+    8: _ext_energy_fp,  9: _ext_energy_fm,
+    10: _ext_energy_gp, 11: _ext_energy_gm,
+    12: _ext_energy_hp, 13: _ext_energy_hm,
+}

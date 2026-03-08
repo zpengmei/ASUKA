@@ -1,3 +1,28 @@
+r"""CASPT2 result data structures.
+
+This module defines frozen dataclasses that encapsulate the outputs of
+CASPT2 calculations at various levels of theory:
+
+Result Hierarchy
+----------------
+- ``CASPT2EnergyResult``: Single-state (SS) CASPT2 energy result.
+  Stores the reference energy :math:`E_{\text{ref}}`, the PT2 correlation
+  energy :math:`E_{\text{PT2}} = \sum_c \langle V_c | T_c \rangle`, and the
+  total energy :math:`E_{\text{tot}} = E_{\text{ref}} + E_{\text{PT2}}`,
+  along with the per-case amplitude vectors :math:`T_c`.
+
+- ``CASPT2Result``: Unified SS/MS/XMS result. For multi-state calculations
+  this includes the effective Hamiltonian :math:`H_{\text{eff}}` and its
+  eigenvectors :math:`U_{\text{eff}}`.
+
+- ``CASPT2SOCResult`` / ``CASPT2SOCResultMultiSpin``: Spin-orbit coupling
+  results on top of CASPT2 spin-free states, including spin-orbit energies
+  and complex eigenvectors.
+
+- ``CASPT2GradResult``: Nuclear gradient result containing the gradient
+  vector, Lagrangian intermediates (CLag, OLag, SLag, WLag), and PT2
+  density matrices. Also stores finite-difference validation diagnostics.
+"""
 from __future__ import annotations
 
 from typing import Any

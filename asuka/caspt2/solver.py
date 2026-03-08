@@ -1,8 +1,53 @@
-"""Preconditioned conjugate gradient solver for CASPT2 equations.
+r"""Preconditioned conjugate gradient solver for CASPT2 equations.
 
 Ports OpenMolcas ``pcg.f``.
-Solves (H0 - E0)|T> = -|V> for the amplitudes T,
-where H0 is diagonal in the decomposed basis.
+
+Mathematical Problem
+--------------------
+Solves the CASPT2 amplitude equations:
+
+.. math::
+
+    (\hat{H}_0 - E_0)\,|T\rangle = -|V\rangle
+
+for the first-order amplitudes :math:`T_P`, where:
+
+- :math:`\hat{H}_0` is Dyall's zeroth-order Hamiltonian
+- :math:`E_0` is the zeroth-order energy (EASUM + inactive contribution)
+- :math:`|V\rangle` is the RHS coupling vector
+  :math:`V_P = \langle\Phi_P|\hat{H}|0\rangle`
+
+Solver Strategies
+~~~~~~~~~~~~~~~~~
+**Direct divide** (``pcg_solve``):
+When all off-diagonal Fock blocks are zero (quasi-canonical orbitals),
+:math:`\hat{H}_0` is diagonal in the SR basis and the solution is:
+
+.. math::
+
+    T_P = \frac{-V_P}{d_P}
+
+where :math:`d_P = b_\mu + \varepsilon^{\text{ext}}` is the per-function
+denominator.
+
+**Iterative PCG** (``pcg_solve_iterative``):
+When inter-case Fock couplings exist, the system is solved iteratively
+using preconditioned conjugate gradients.  The diagonal of
+:math:`\hat{H}_0 - E_0` serves as the preconditioner:
+
+.. math::
+
+    M^{-1} r_k = z_k, \qquad M_{PP} = d_P
+
+The PCG iteration follows the standard scheme:
+
+1. :math:`r_0 = b - A x_0`, :math:`z_0 = M^{-1} r_0`, :math:`p_0 = z_0`
+2. :math:`\alpha_k = (r_k \cdot z_k) / (p_k \cdot A p_k)`
+3. :math:`x_{k+1} = x_k + \alpha_k\, p_k`
+4. :math:`r_{k+1} = r_k - \alpha_k\, A p_k`
+5. :math:`z_{k+1} = M^{-1} r_{k+1}`,
+   :math:`\beta_k = (r_{k+1} \cdot z_{k+1}) / (r_k \cdot z_k)`
+6. :math:`p_{k+1} = z_{k+1} + \beta_k\, p_k`
 """
 
 from __future__ import annotations
