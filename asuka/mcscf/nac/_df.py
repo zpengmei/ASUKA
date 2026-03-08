@@ -261,7 +261,8 @@ def _core_energy_weighted_density(
                 q_block = int(os.environ.get("ASUKA_DF_JK_K_QBLOCK", "128"))
             except Exception:
                 q_block = 128
-            q_block = max(1, min(int(getattr(B_ao, "shape", (0, 0, 0))[2]), int(q_block)))
+            _is_qp, _nao_i, naux, _ntri = _df_B_dims(B_ao, nao=int(nao), where="_core_energy_weighted_density")
+            q_block = max(1, min(int(naux), int(q_block)))
 
             Jc, _ = _df_scf._df_JK(B_ao, D_core_ao, want_J=True, want_K=False)  # noqa: SLF001
             occ_core = xp.full((int(ncore),), 2.0, dtype=xp.float64)
@@ -526,6 +527,8 @@ def _build_bar_L_lorb_df(
     work_dtype: Any | None = None,
     out_dtype: Any | None = None,
     qblock: int | None = None,
+    act_resp_scale: float | None = None,
+    dml_sym_mode: str | None = None,
 ) -> tuple[Any, Any]:
     """Return (bar_L_lorb, D_L_ao) for the orbital Lagrange DF gradient contribution.
 
@@ -549,10 +552,13 @@ def _build_bar_L_lorb_df(
     L = xp.asarray(Lorb, dtype=_wd)
     dm1 = xp.asarray(dm1_act, dtype=_wd)
     dm2 = xp.asarray(dm2_act, dtype=_wd)
-    try:
-        _act_resp_scale = float(os.environ.get("ASUKA_CASPT2_LORB_ACTIVE_RESPONSE_SCALE", "1.0"))
-    except Exception:
-        _act_resp_scale = 1.0
+    if act_resp_scale is None:
+        try:
+            _act_resp_scale = float(os.environ.get("ASUKA_CASPT2_LORB_ACTIVE_RESPONSE_SCALE", "1.0"))
+        except Exception:
+            _act_resp_scale = 1.0
+    else:
+        _act_resp_scale = float(act_resp_scale)
     if abs(float(_act_resp_scale) - 1.0) > 1e-12:
         dm1 = float(_act_resp_scale) * dm1
         dm2 = float(_act_resp_scale) * dm2
@@ -564,7 +570,10 @@ def _build_bar_L_lorb_df(
     C_L_core = C_L[:, :ncore]
     C_L_act = C_L[:, ncore:nocc]
 
-    _dml_sym_mode = str(os.environ.get("ASUKA_CASPT2_LORB_DML_SYM_MODE", "full")).strip().lower()
+    if dml_sym_mode is None:
+        _dml_sym_mode = str(os.environ.get("ASUKA_CASPT2_LORB_DML_SYM_MODE", "full")).strip().lower()
+    else:
+        _dml_sym_mode = str(dml_sym_mode).strip().lower()
     if _dml_sym_mode not in {
         "full",
         "core_raw",
@@ -1054,10 +1063,11 @@ def _grad_elec_casscf_df(
 
     B_ao = _as_xp_f64(xp, getattr(scf_out, "df_B"))
     _restore_pool = _apply_df_pool_policy(B_ao, label="_grad_elec_casscf_df")
+    _is_qp, _nao_i, _naux_hint, _ntri = _df_B_dims(B_ao, nao=int(mo_coeff.shape[0]), where="_grad_elec_active_df")
     _barl_policy = _resolve_barl_hybrid(
         xp=xp,
         is_gpu=bool(_is_gpu),
-        naux_hint=int(getattr(B_ao, "shape", (0, 0, 1))[2]),
+        naux_hint=int(_naux_hint),
     )
     if bool(_barl_policy.get("enabled", False)):
         _barl_work_dtype = _barl_policy.get("work_dtype", xp.float64)
@@ -1187,10 +1197,11 @@ def _Lorb_dot_dgorb_dx_df(
 
     B_ao = _as_xp_f64(xp, getattr(scf_out, "df_B"))
     _restore_pool = _apply_df_pool_policy(B_ao, label="_Lorb_dot_dgorb_dx_df")
+    _is_qp, _nao_i, _naux_hint, _ntri = _df_B_dims(B_ao, nao=int(mo_coeff.shape[0]), where="_Lorb_dot_dgorb_dx_df")
     _barl_policy = _resolve_barl_hybrid(
         xp=xp,
         is_gpu=bool(_is_gpu),
-        naux_hint=int(getattr(B_ao, "shape", (0, 0, 1))[2]),
+        naux_hint=int(_naux_hint),
     )
     if bool(_barl_policy.get("enabled", False)):
         _barl_work_dtype = _barl_policy.get("work_dtype", xp.float64)
@@ -1333,71 +1344,24 @@ def _Lorb_dot_dgorb_dx_df(
     gfock = gfock + (C @ t2 @ C_L_act.T)
 
     # ── GPU phase: bar_L build + DF 2e contraction (before 1e to keep GPU busy) ──
-    # Two-electron DF derivative term: build bar_L for the L-effective contraction.
-    D_w = D_act + 0.5 * D_core
-    D_wL = D_L_act + 0.5 * D_L_core
-    bar_mean = _build_bar_L_df_cross(
+    # Build the bar_L tensor for the DF derivative contraction. Use the shared
+    # helper that supports both full mnQ and packed Qp layouts.
+    bar_L_ao, _ = _build_bar_L_lorb_df(
         B_ao,
-        D_left=D_wL,
-        D_right=D_core,
-        coeff_J=1.0,
-        coeff_K=-0.5,
-        symmetrize=False,
+        C,
+        L,
+        dm1_act,
+        dm2_act,
+        ncore=int(ncore),
+        ncas=int(ncas),
+        xp=xp,
+        symmetrize=True,
         work_dtype=_barl_work_dtype,
         out_dtype=_barl_out_dtype,
-        qblock=_barl_qblock,
+        qblock=int(_barl_qblock) if int(_barl_qblock) > 0 else None,
+        act_resp_scale=1.0,
+        dml_sym_mode="full",
     )
-    _build_bar_L_df_cross(
-        B_ao,
-        D_left=D_w,
-        D_right=D_L_core,
-        coeff_J=1.0,
-        coeff_K=-0.5,
-        out=bar_mean,
-        symmetrize=False,
-        work_dtype=_barl_work_dtype,
-        out_dtype=_barl_out_dtype,
-        qblock=_barl_qblock,
-    )
-
-    # Active-active DF term: linearize _build_bar_L_casscf_df active block w.r.t C_act along C_L_act.
-    X = xp.einsum("mnQ,nv->mvQ", B_ao, C_act, optimize=True)  # (nao,ncas,naux)
-    L_act_mo = xp.einsum("mu,mvQ->uvQ", C_act, X, optimize=True)  # (ncas,ncas,naux)
-    L2 = L_act_mo.reshape(ncas * ncas, -1)
-
-    dm2_flat = dm2.reshape(ncas * ncas, ncas * ncas)
-    dm2_flat = 0.5 * (dm2_flat + dm2_flat.T)
-
-    M_mat = dm2_flat @ L2  # (ncas^2,naux)
-    M_uvQ = M_mat.reshape(ncas, ncas, -1)
-
-    tmp = xp.einsum("mu,uvQ->mvQ", C_act, M_uvQ, optimize=True)  # (nao,ncas,naux)
-    tmp_L = xp.einsum("mu,uvQ->mvQ", C_L_act, M_uvQ, optimize=True)
-
-    # δM from δL_act induced by δC_act = C_L_act
-    X_L = xp.einsum("mnQ,nv->mvQ", B_ao, C_L_act, optimize=True)
-    dL_act = xp.einsum("mu,mvQ->uvQ", C_L_act, X, optimize=True) + xp.einsum("mu,mvQ->uvQ", C_act, X_L, optimize=True)
-    dL2 = dL_act.reshape(ncas * ncas, -1)
-    dM = dm2_flat @ dL2
-    dM_uvQ = dM.reshape(ncas, ncas, -1)
-    tmp_M = xp.einsum("mu,uvQ->mvQ", C_act, dM_uvQ, optimize=True)
-
-    # Accumulate all three bar_act einsum terms directly into bar_mean in chunks.
-    naux_lorb = int(bar_mean.shape[0])
-    _chunk = int(max(1, _barl_qblock if int(_barl_qblock) > 0 else (naux_lorb // 4)))
-    for _q0 in range(0, naux_lorb, _chunk):
-        _q1 = min(_q0 + _chunk, naux_lorb)
-        _blk = xp.einsum("mvQ,nv->Qmn", tmp_L[:, :, _q0:_q1], C_act, optimize=True)
-        bar_mean[_q0:_q1] += _blk.astype(_barl_out_dtype, copy=False)
-        _blk = xp.einsum("mvQ,nv->Qmn", tmp[:, :, _q0:_q1], C_L_act, optimize=True)
-        bar_mean[_q0:_q1] += _blk.astype(_barl_out_dtype, copy=False)
-        _blk = xp.einsum("mvQ,nv->Qmn", tmp_M[:, :, _q0:_q1], C_act, optimize=True)
-        bar_mean[_q0:_q1] += _blk.astype(_barl_out_dtype, copy=False)
-        del _blk
-    del tmp_L, tmp, tmp_M
-
-    _symmetrize_bar_L_inplace(bar_mean, xp)
-    bar_L_ao = xp.asarray(bar_mean, dtype=_barl_out_dtype)
     bar_L_contract = bar_L_ao
     if str(getattr(bar_L_contract, "dtype", "")) != str(np.float64):
         bar_L_contract = xp.asarray(bar_L_contract, dtype=xp.float64)

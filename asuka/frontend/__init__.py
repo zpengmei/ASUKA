@@ -6,10 +6,13 @@ from .analysis import (
     fd_hessian_molecule,
     frequency_analysis_molecule,
     geomopt_molecule,
+    meciopt_molecule,
     MethodWorkflow,
+    make_df_casscf_hvec_df,
     make_df_casci_energy_grad,
     make_df_casscf_energy_grad,
     make_df_casscf_multiroot_energy_grad,
+    make_df_casscf_multiroot_eval,
 )
 from .df import build_df_B_cueri, build_df_bases_cart
 from .molecule import Molecule
@@ -43,10 +46,13 @@ __all__ = [
     "Molecule",
     "MethodWorkflow",
     "geomopt_molecule",
+    "meciopt_molecule",
     "fd_hessian_molecule",
     "frequency_analysis_molecule",
     "make_df_casscf_energy_grad",
     "make_df_casscf_multiroot_energy_grad",
+    "make_df_casscf_multiroot_eval",
+    "make_df_casscf_hvec_df",
     "make_df_casci_energy_grad",
     "build_ao_basis_cart",
     "build_df_B_cueri",

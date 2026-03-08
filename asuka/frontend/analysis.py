@@ -18,6 +18,8 @@ from asuka.frontend.molecule import Molecule
 
 EnergyGradFn = Callable[[np.ndarray], tuple[float, np.ndarray]]
 GradFn = Callable[[np.ndarray], np.ndarray | tuple[float, np.ndarray]]
+MultiRootEvalFn = Callable[[np.ndarray], tuple[np.ndarray, np.ndarray, Any | None]]
+HVecFn = Callable[[np.ndarray, Any, int, int], np.ndarray]
 
 
 @dataclass(frozen=True)
@@ -676,6 +678,112 @@ def make_df_casscf_multiroot_energy_grad(
     return energy_grad
 
 
+def make_df_casscf_multiroot_eval(
+    mol: Molecule,
+    *,
+    hf_kwargs: Mapping[str, Any] | None = None,
+    casscf_kwargs: Mapping[str, Any] | None = None,
+    grad_kwargs: Mapping[str, Any] | None = None,
+    save_key: str = "method_eval",
+    save_intermediates: bool = True,
+    warm_start: bool = True,
+    guess: Any | None = None,
+    orbital_tracking: bool = True,
+    tracking_method: str = "subspace",
+    tracking_ref: Any | None = None,
+) -> MultiRootEvalFn:
+    """Build a multiroot callback returning (e_roots, grads, ctx).
+
+    This is a thin wrapper over :func:`make_df_casscf_multiroot_energy_grad`
+    that also returns the latest :class:`DFMethodEvalArtifacts` (if stored).
+    """
+
+    eg = make_df_casscf_multiroot_energy_grad(
+        mol,
+        hf_kwargs=hf_kwargs,
+        casscf_kwargs=casscf_kwargs,
+        grad_kwargs=grad_kwargs,
+        save_key=str(save_key),
+        save_intermediates=bool(save_intermediates),
+        warm_start=bool(warm_start),
+        guess=guess,
+        orbital_tracking=bool(orbital_tracking),
+        tracking_method=str(tracking_method),
+        tracking_ref=tracking_ref,
+    )
+
+    def multiroot_eval(coords_bohr: np.ndarray) -> tuple[np.ndarray, np.ndarray, Any | None]:
+        e_roots, grads = eg(coords_bohr)
+        ctx = None
+        if bool(save_intermediates):
+            prev = mol.results.get(str(save_key))
+            if isinstance(prev, DFMethodEvalArtifacts):
+                ctx = prev
+        return np.asarray(e_roots, dtype=np.float64), np.asarray(grads, dtype=np.float64), ctx
+
+    return multiroot_eval
+
+
+def make_df_casscf_hvec_df(
+    *,
+    use_etfs: bool = False,
+    mult_ediff: bool = True,
+    fcisolver: Any | None = None,
+    twos: int | None = None,
+    df_backend: str = "cpu",
+    df_config: Any | None = None,
+    df_threads: int = 0,
+    z_tol: float = 1e-10,
+    z_maxiter: int = 200,
+    delta_bohr: float = 1e-4,
+) -> HVecFn:
+    """Build an h-vector callback for SA-CASSCF from ASUKA's DF NAC driver.
+
+    The returned callback matches the MECI optimizer signature:
+      ``hvec(coords_bohr, ctx, bra, ket) -> (natm,3)``.
+    """
+
+    if not bool(mult_ediff):
+        raise ValueError("MECI h-vector must use mult_ediff=True (numerator mode)")
+
+    def hvec_cb(coords_bohr: np.ndarray, ctx: Any, bra: int, ket: int) -> np.ndarray:
+        from asuka.mcscf.nac import sacasscf_nonadiabatic_couplings_df  # noqa: PLC0415
+
+        _ = coords_bohr  # signature compatibility (ctx carries the actual scf/casscf objects)
+
+        if not isinstance(ctx, DFMethodEvalArtifacts):
+            raise TypeError("ctx must be a DFMethodEvalArtifacts from make_df_casscf_multiroot_eval")
+
+        scf_out = getattr(ctx, "scf_out", None)
+        mc = getattr(ctx, "mc", None)
+        if scf_out is None or mc is None:
+            raise TypeError("ctx must contain scf_out and mc objects")
+
+        bra_i = int(bra)
+        ket_i = int(ket)
+        nac_num = sacasscf_nonadiabatic_couplings_df(
+            scf_out,
+            mc,
+            pairs=[(ket_i, bra_i)],
+            use_etfs=bool(use_etfs),
+            mult_ediff=True,
+            fcisolver=fcisolver,
+            twos=twos,
+            df_backend=str(df_backend),
+            df_config=df_config,
+            df_threads=int(df_threads),
+            z_tol=float(z_tol),
+            z_maxiter=int(z_maxiter),
+            delta_bohr=float(delta_bohr),
+        )
+        h = np.asarray(nac_num[bra_i, ket_i], dtype=np.float64)
+        if h.ndim != 2 or h.shape[1] != 3:
+            raise ValueError("unexpected NAC shape (expected (natm,3))")
+        return h
+
+    return hvec_cb
+
+
 def geomopt_molecule(
     mol: Molecule,
     energy_grad: EnergyGradFn,
@@ -691,6 +799,29 @@ def geomopt_molecule(
     coords0 = np.asarray(mol.coords_bohr, dtype=np.float64)
     st = GeomOptSettings() if settings is None else settings
     res = optimize_cartesian(energy_grad, coords0, settings=st)
+    mol.results[str(save_key)] = res
+    if bool(update_geometry):
+        mol.set_coords_bohr_inplace(res.coords_final_bohr)
+    return res
+
+
+def meciopt_molecule(
+    mol: Molecule,
+    multiroot_eval: MultiRootEvalFn,
+    hvec: HVecFn,
+    *,
+    roots: tuple[int, int] = (0, 1),
+    settings: Any | None = None,
+    save_key: str = "meciopt",
+    update_geometry: bool = True,
+):
+    """Run Cartesian MECI optimization and attach results to the Molecule."""
+
+    from asuka.geomopt.meci import MECISettings, optimize_meci_cartesian  # noqa: PLC0415
+
+    coords0 = np.asarray(mol.coords_bohr, dtype=np.float64)
+    st = MECISettings() if settings is None else settings
+    res = optimize_meci_cartesian(multiroot_eval, coords0, roots=tuple(roots), hvec=hvec, settings=st)
     mol.results[str(save_key)] = res
     if bool(update_geometry):
         mol.set_coords_bohr_inplace(res.coords_final_bohr)
@@ -765,12 +896,17 @@ def frequency_analysis_molecule(
 __all__ = [
     "EnergyGradFn",
     "GradFn",
+    "MultiRootEvalFn",
+    "HVecFn",
     "DFMethodEvalArtifacts",
     "MethodWorkflow",
     "make_df_casscf_energy_grad",
     "make_df_casscf_multiroot_energy_grad",
+    "make_df_casscf_multiroot_eval",
+    "make_df_casscf_hvec_df",
     "make_df_casci_energy_grad",
     "geomopt_molecule",
+    "meciopt_molecule",
     "fd_hessian_molecule",
     "frequency_analysis_molecule",
 ]

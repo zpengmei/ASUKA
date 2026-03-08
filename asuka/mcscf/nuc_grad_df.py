@@ -207,6 +207,77 @@ def _require_df_mnq_layout(scf_out: Any, *, where: str) -> tuple[int, int, int]:
     return n0, n1, naux
 
 
+def _contract_df_gradient_2e(
+    scf_out: Any,
+    *,
+    is_spherical: bool,
+    B_ao: Any,
+    bar_L_ao: Any,
+    coords: Any,
+    df_backend: str,
+    df_threads: int,
+    profile: Any = None,
+) -> Any:
+    """Dispatch the DF 2e gradient contraction, handling both MNQ and packed-Qp layouts.
+
+    For packed-Qp B_ao (ndim==2, shape (naux, ntri)), builds a
+    :class:`~asuka.integrals.df_grad_context.DFGradContractionContext` and
+    calls ``contract_sph`` (spherical) or ``contract`` (Cartesian).  For the
+    legacy MNQ layout (ndim==3), falls through to the existing analytic helpers.
+    """
+    ao_basis = getattr(scf_out, "ao_basis")
+    aux_basis = getattr(scf_out, "aux_basis")
+    L_chol = getattr(scf_out, "df_L", None)
+
+    if int(getattr(B_ao, "ndim", 0)) == 2:
+        # Packed-Qp layout produced by the CUDA SCF frontend.
+        from asuka.integrals.df_grad_context import DFGradContractionContext  # noqa: PLC0415
+
+        _ctx = DFGradContractionContext.build(
+            ao_basis,
+            aux_basis,
+            atom_coords_bohr=coords,
+            backend=str(df_backend),
+            df_threads=int(df_threads),
+            L_chol=L_chol,
+        )
+        if bool(is_spherical):
+            return _ctx.contract_sph(B_sph=B_ao, bar_L_sph=bar_L_ao, T_c2s=None)
+        else:
+            return _ctx.contract(B_ao=B_ao, bar_L_ao=bar_L_ao)
+
+    # Legacy MNQ layout (nao, nao, naux) or (nao_sph, nao_sph, naux).
+    if bool(is_spherical):
+        from asuka.integrals.grad import compute_df_gradient_contributions_analytic_sph  # noqa: PLC0415
+
+        return compute_df_gradient_contributions_analytic_sph(
+            ao_basis,
+            aux_basis,
+            atom_coords_bohr=coords,
+            B_sph=B_ao,
+            bar_L_sph=bar_L_ao,
+            T_c2s=None,
+            L_chol=L_chol,
+            backend=str(df_backend),
+            df_threads=int(df_threads),
+            profile=profile,
+        )
+    else:
+        from asuka.integrals.grad import compute_df_gradient_contributions_analytic_packed_bases  # noqa: PLC0415
+
+        return compute_df_gradient_contributions_analytic_packed_bases(
+            ao_basis,
+            aux_basis,
+            atom_coords_bohr=coords,
+            B_ao=B_ao,
+            bar_L_ao=bar_L_ao,
+            L_chol=L_chol,
+            backend=str(df_backend),
+            df_threads=int(df_threads),
+            profile=profile,
+        )
+
+
 def _df_B_dims(df_B: Any, *, nao: int, where: str = "") -> tuple[bool, int, int, int]:
     """Return (is_qp, nao, naux, ntri) for df_B in mnQ or packed Qp layout."""
 
@@ -3001,45 +3072,16 @@ def casscf_nuc_grad_df(
     df_prof = None if profile is None else profile.setdefault("df_2e", {})
     try:
         t0_df = time.perf_counter() if profile is not None else 0.0
-        if is_spherical:
-            if int(getattr(B_ao, "ndim", 0)) == 2:
-                # Packed-Qp path: require the DFGradContractionContext (CUDA fused kernels).
-                from asuka.integrals.df_grad_context import DFGradContractionContext  # noqa: PLC0415
-
-                _ctx = DFGradContractionContext.build(
-                    getattr(scf_out, "ao_basis"),
-                    getattr(scf_out, "aux_basis"),
-                    atom_coords_bohr=coords,
-                    backend=str(df_backend),
-                    df_threads=int(df_threads),
-                    L_chol=getattr(scf_out, "df_L", None),
-                )
-                de_df = _ctx.contract_sph(B_sph=B_ao, bar_L_sph=bar_L_ao, T_c2s=None)
-            else:
-                de_df = compute_df_gradient_contributions_analytic_sph(
-                    getattr(scf_out, "ao_basis"),
-                    getattr(scf_out, "aux_basis"),
-                    atom_coords_bohr=coords,
-                    B_sph=B_ao,
-                    bar_L_sph=bar_L_ao,
-                    T_c2s=None,
-                    L_chol=getattr(scf_out, "df_L", None),
-                    backend=str(df_backend),
-                    df_threads=int(df_threads),
-                    profile=df_prof,
-                )
-        else:
-            de_df = compute_df_gradient_contributions_analytic_packed_bases(
-                getattr(scf_out, "ao_basis"),
-                getattr(scf_out, "aux_basis"),
-                atom_coords_bohr=coords,
-                B_ao=B_ao,
-                bar_L_ao=bar_L_ao,
-                L_chol=getattr(scf_out, "df_L", None),
-                backend=str(df_backend),
-                df_threads=int(df_threads),
-                profile=df_prof,
-            )
+        de_df = _contract_df_gradient_2e(
+            scf_out,
+            is_spherical=bool(is_spherical),
+            B_ao=B_ao,
+            bar_L_ao=bar_L_ao,
+            coords=coords,
+            df_backend=str(df_backend),
+            df_threads=int(df_threads),
+            profile=df_prof,
+        )
     except (NotImplementedError, RuntimeError) as _analytic_exc:
         if is_spherical:
             raise
@@ -3361,31 +3403,16 @@ def casci_nuc_grad_df_unrelaxed(
 
     df_prof = None if profile is None else profile.setdefault("df_2e", {})
     try:
-        if is_spherical:
-            de_df = compute_df_gradient_contributions_analytic_sph(
-                getattr(scf_out, "ao_basis"),
-                getattr(scf_out, "aux_basis"),
-                atom_coords_bohr=coords,
-                B_sph=B_ao,
-                bar_L_sph=bar_L_ao,
-                T_c2s=None,
-                L_chol=getattr(scf_out, "df_L", None),
-                backend=str(df_backend),
-                df_threads=int(df_threads),
-                profile=df_prof,
-            )
-        else:
-            de_df = compute_df_gradient_contributions_analytic_packed_bases(
-                getattr(scf_out, "ao_basis"),
-                getattr(scf_out, "aux_basis"),
-                atom_coords_bohr=coords,
-                B_ao=B_ao,
-                bar_L_ao=bar_L_ao,
-                L_chol=getattr(scf_out, "df_L", None),
-                backend=str(df_backend),
-                df_threads=int(df_threads),
-                profile=df_prof,
-            )
+        de_df = _contract_df_gradient_2e(
+            scf_out,
+            is_spherical=bool(is_spherical),
+            B_ao=B_ao,
+            bar_L_ao=bar_L_ao,
+            coords=coords,
+            df_backend=str(df_backend),
+            df_threads=int(df_threads),
+            profile=df_prof,
+        )
     except (NotImplementedError, RuntimeError):
         if is_spherical:
             raise
@@ -3725,31 +3752,16 @@ def casci_nuc_grad_df_relaxed(
 
     df_prof = None if profile is None else profile.setdefault("df_2e", {})
     try:
-        if is_spherical:
-            de_df = compute_df_gradient_contributions_analytic_sph(
-                getattr(scf_out, "ao_basis"),
-                getattr(scf_out, "aux_basis"),
-                atom_coords_bohr=coords,
-                B_sph=B_ao,
-                bar_L_sph=bar_L_tot,
-                T_c2s=None,
-                L_chol=getattr(scf_out, "df_L", None),
-                backend=str(df_backend),
-                df_threads=int(df_threads),
-                profile=df_prof,
-            )
-        else:
-            de_df = compute_df_gradient_contributions_analytic_packed_bases(
-                getattr(scf_out, "ao_basis"),
-                getattr(scf_out, "aux_basis"),
-                atom_coords_bohr=coords,
-                B_ao=B_ao,
-                bar_L_ao=bar_L_tot,
-                L_chol=getattr(scf_out, "df_L", None),
-                backend=str(df_backend),
-                df_threads=int(df_threads),
-                profile=df_prof,
-            )
+        de_df = _contract_df_gradient_2e(
+            scf_out,
+            is_spherical=bool(is_spherical),
+            B_ao=B_ao,
+            bar_L_ao=bar_L_tot,
+            coords=coords,
+            df_backend=str(df_backend),
+            df_threads=int(df_threads),
+            profile=df_prof,
+        )
     except (NotImplementedError, RuntimeError):
         if is_spherical:
             raise
@@ -3903,6 +3915,25 @@ def casscf_nuc_grad_df_per_root(
     -------
     DFNucGradMultirootResult
         Per-root energies and gradients.
+
+    Notes
+    -----
+    Relevant environment variables:
+
+    ``ASUKA_ZVECTOR_GUARD`` (bool, default ``1``)
+        Enable the Z-vector sanity guard.  When the primary solver
+        (GCROTMK) produces non-finite or absurdly large values the guard
+        automatically retries the failed roots with GMRES + fp64 +
+        ``epq_blocked`` matvec.
+
+    ``ASUKA_ZVECTOR_GUARD_ZMAX`` (float, default ``1e20``)
+        Maximum allowed absolute value in the Z-vector before the guard
+        is triggered.
+
+    ``ASUKA_ZVECTOR_BATCH_SOLVE`` (bool, default ``1``)
+        Solve all per-root Z-vectors as a single batched system (faster
+        via shared Krylov recycling).  Set to ``0`` to fall back to the
+        sequential per-root solve.
     """
     from contextlib import contextmanager, nullcontext  # noqa: PLC0415
     import os  # noqa: PLC0415
@@ -3965,8 +3996,6 @@ def casscf_nuc_grad_df_per_root(
     if nroots > 1:
         w_arr = np.asarray(weights, dtype=np.float64).ravel()
         if w_arr.size == nroots and not np.allclose(w_arr, w_arr[0]):
-            import warnings  # noqa: PLC0415
-
             warnings.warn(
                 "Per-root SA-CASSCF gradients with unequal state-average weights may be "
                 "ill-defined. The projection-based gauge fixing assumes equal weights. "
@@ -4472,6 +4501,41 @@ def casscf_nuc_grad_df_per_root(
     _fallback_rtol_env = _parse_env_float("ASUKA_GPU_PRECISION_FALLBACK_RREL")
     if _fallback_rtol_env is not None and _fallback_rtol_env > 0.0:
         _mixed_fallback_rtol = float(_fallback_rtol_env)
+
+    # Guard: if the Z-vector solve returns non-finite/absurd values (observed rarely on GPU
+    # with GCROTMK recycle/batch settings), retry with a more conservative setup.
+    _z_guard_enabled = _normalize_bool_env(_os.environ.get("ASUKA_ZVECTOR_GUARD"), default=True)
+    _z_guard_zmax = _parse_env_float("ASUKA_ZVECTOR_GUARD_ZMAX")
+    if _z_guard_zmax is None or _z_guard_zmax <= 0.0:
+        _z_guard_zmax = 1e20
+
+    def _zvector_guard_bad(z_res: Any) -> bool:
+        try:
+            z_vec = np.asarray(getattr(z_res, "z_packed", None), dtype=np.float64).ravel()
+        except Exception:
+            return True
+        if z_vec.size and (not bool(np.isfinite(z_vec).all())):
+            return True
+        z_maxabs = float(np.max(np.abs(z_vec))) if z_vec.size else 0.0
+        if (not np.isfinite(z_maxabs)) or (float(z_maxabs) > float(_z_guard_zmax)):
+            return True
+        info = getattr(z_res, "info", None)
+        info_get = getattr(info, "get", None)
+        if not callable(info_get):
+            return True
+        try:
+            _res_rel = float(info_get("residual_rel", np.nan))
+        except Exception:
+            _res_rel = np.nan
+        if not np.isfinite(_res_rel):
+            return True
+        try:
+            _res_norm = float(getattr(z_res, "residual_norm", np.nan))
+        except Exception:
+            _res_norm = np.nan
+        if not np.isfinite(_res_norm):
+            return True
+        return False
 
     _MISSING = object()
 
@@ -5320,6 +5384,78 @@ def casscf_nuc_grad_df_per_root(
                 if _profile_df_per_root:
                     _t_z_solve += float(time.perf_counter() - _fallback_start)
 
+        # Guard: if GCROTMK produced garbage (non-finite / absurd magnitude), retry
+        # only the bad roots with GMRES (fp64, epq_blocked).  Good roots keep their
+        # GCROTMK solutions untouched.
+        if bool(_z_guard_enabled) and _z_results_by_root is not None:
+            bad_roots = [int(K) for K in range(int(nroots)) if _zvector_guard_bad(_z_results_by_root[int(K)])]
+            if bad_roots:
+                if str(_z_method) != "gcrotmk":
+                    raise RuntimeError(
+                        "Z-vector solve produced invalid values even with method="
+                        f"{str(_z_method)!s}; roots={bad_roots}"
+                    )
+                warnings.warn(
+                    "Z-vector GCROTMK guard triggered (non-finite/absurd z-vector). "
+                    f"Retrying bad roots with GMRES + fp64 + epq_blocked. Bad roots: {bad_roots}",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+                try:
+                    if _z_recycle_space is not None:
+                        _z_recycle_space.clear()
+                except Exception:
+                    pass
+                _guard_updates = {
+                    "matvec_cuda_dtype": "float64",
+                    "approx_cuda_dtype": "float64",
+                    "matvec_cuda_mixed_low_precision_max_iter": 0,
+                }
+                _guard_t0 = time.perf_counter()
+                with _temporary_solver_attrs(fcisolver_use, _guard_updates):
+                    for K in bad_roots:
+                        z_gmres = solve_mcscf_zvector(
+                            mc_sa,
+                            rhs_orb=_rhs_orb_all[int(K)],
+                            rhs_ci=_rhs_ci_all[int(K)],
+                            hessian_op=hess_op,
+                            tol=float(z_tol),
+                            maxiter=int(z_maxiter),
+                            method="gmres",
+                            x0=None,
+                            recycle_space=None,
+                            gcrotmk_k=None,
+                        )
+                        try:
+                            z_gmres.info["guard_fallback"] = "gcrotmk_to_gmres_fp64_epq_blocked"
+                            z_gmres.info["guard_bad_roots"] = [int(i) for i in bad_roots]
+                        except Exception:
+                            pass
+                        _z_results_by_root[int(K)] = z_gmres
+                if any(_zvector_guard_bad(_z_results_by_root[int(K)]) for K in bad_roots):
+                    raise RuntimeError("Z-vector guard fallback failed: GMRES also returned invalid values")
+                _z_method = "gmres"
+                _z_recycle_space = None
+                if _profile_df_per_root:
+                    _t_z_solve += float(time.perf_counter() - _guard_t0)
+
+        # Warn for roots that finished with converged=False but passed the sanity guard
+        # (finite, reasonable magnitude).  This can happen when the solver exhausts
+        # z_maxiter without reaching z_tol and no mixed-precision fallback is active.
+        if _z_results_by_root is not None:
+            _unconverged_roots = [
+                int(K) for K, zr in enumerate(_z_results_by_root)
+                if not bool(getattr(zr, "converged", True))
+            ]
+            if _unconverged_roots:
+                warnings.warn(
+                    f"Z-vector solve did not converge for roots {_unconverged_roots} "
+                    f"(tol={float(z_tol):.2e}, maxiter={int(z_maxiter)}). "
+                    "Per-root gradients may be inaccurate.",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+
         if _z_use_x0 and _z_results_by_root:
             _z_prev_x0 = np.asarray(_z_results_by_root[-1].z_packed, dtype=np.float64).ravel().copy()
 
@@ -5854,6 +5990,62 @@ def casscf_nuc_grad_df_per_root(
                     except Exception:
                         pass
                     z_K = z_fp64
+
+            # Guard: if GCROTMK produced garbage (non-finite / absurd magnitude), retry this root with GMRES (fp64, epq_blocked).
+            if bool(_z_guard_enabled) and _zvector_guard_bad(z_K):
+                if str(_z_method) != "gcrotmk":
+                    raise RuntimeError(
+                        "Z-vector solve produced invalid values even with method="
+                        f"{str(_z_method)!s} (root={int(K)})"
+                    )
+                warnings.warn(
+                    "Z-vector GCROTMK guard triggered (non-finite/absurd z-vector). "
+                    f"Retrying root={int(K)} with GMRES + fp64 + epq_blocked.",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+                try:
+                    if _z_recycle_space is not None:
+                        _z_recycle_space.clear()
+                except Exception:
+                    pass
+                _guard_updates = {
+                    "matvec_cuda_dtype": "float64",
+                    "approx_cuda_dtype": "float64",
+                    "matvec_cuda_mixed_low_precision_max_iter": 0,
+                }
+                with _temporary_solver_attrs(fcisolver_use, _guard_updates):
+                    z_gmres = solve_mcscf_zvector(
+                        mc_sa,
+                        rhs_orb=np.asarray(rhs_orb, dtype=np.float64),
+                        rhs_ci=rhs_ci,
+                        hessian_op=hess_op,
+                        tol=float(z_tol),
+                        maxiter=int(z_maxiter),
+                        method="gmres",
+                        x0=None,
+                        recycle_space=None,
+                        gcrotmk_k=None,
+                    )
+                if _zvector_guard_bad(z_gmres):
+                    raise RuntimeError("Z-vector guard fallback failed: GMRES also returned invalid values")
+                try:
+                    z_gmres.info["guard_fallback"] = "gcrotmk_to_gmres_fp64_epq_blocked"
+                except Exception:
+                    pass
+                z_K = z_gmres
+                _z_method = "gmres"
+                _z_recycle_space = None
+
+            # Warn if the solver finished without converging but passed the sanity guard.
+            if not bool(z_K.converged):
+                warnings.warn(
+                    f"Z-vector solve did not converge for root {int(K)} "
+                    f"(tol={float(z_tol):.2e}, maxiter={int(z_maxiter)}). "
+                    "Per-root gradient may be inaccurate.",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
 
             if _profile_df_per_root:
                 _t_z_solve += time.perf_counter() - t0

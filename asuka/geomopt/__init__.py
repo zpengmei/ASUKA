@@ -10,6 +10,7 @@ SOC-SI, ...) and any other code that can supply an energy+gradient callback.
 from __future__ import annotations
 
 from .constraints import AngleConstraint, DistanceConstraint, InternalCoordinateConstraint
+from .meci import MECIResult, MECISettings, optimize_meci_cartesian
 from .optimizer import GeomOptResult, GeomOptSettings, optimize_cartesian
 from .scan import (
     Scan2DPointResult,
@@ -35,6 +36,9 @@ __all__ = [
     "GeomOptResult",
     "GeomOptSettings",
     "optimize_cartesian",
+    "MECIResult",
+    "MECISettings",
+    "optimize_meci_cartesian",
     "ScanSettings",
     "ScanPointResult",
     "ScanResult",

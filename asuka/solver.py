@@ -1831,6 +1831,9 @@ class GUGAFCISolver(_StreamObject):
         raise_on_unconverged = bool(
             kwargs.pop("raise_on_unconverged", getattr(self, "raise_on_unconverged", False))
         )
+        warn_on_unconverged = bool(
+            kwargs.pop("warn_on_unconverged", getattr(self, "warn_on_unconverged", True))
+        )
         contract_nthreads = int(kwargs.pop("contract_nthreads", int(getattr(self, "contract_nthreads", 0))))
         if contract_nthreads <= 0:
             contract_nthreads = _auto_num_threads()
@@ -4170,7 +4173,8 @@ class GUGAFCISolver(_StreamObject):
                         + " Increase max_cycle/max_space, or enable unconverged_fallback_full_diag "
                         "for small CSF spaces."
                     )
-                warnings.warn(msg)
+                if warn_on_unconverged:
+                    warnings.warn(msg)
 
         e = np.asarray(e, dtype=np.float64) + float(ecore)
         if warm_state_update:
