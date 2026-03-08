@@ -199,11 +199,26 @@ def main(argv: list[str] | None = None) -> None:
     if extra_cfg:
         cmake_args.extend(extra_cfg.split())
 
+    # Use Ninja if available (faster dependency tracking than Makefiles)
+    if shutil.which("ninja"):
+        cmake_args += ["-G", "Ninja"]
+        if build_dir.joinpath("Makefile").exists():
+            shutil.rmtree(str(build_dir), ignore_errors=True)
+            build_dir.mkdir(parents=True, exist_ok=True)
+
+    # Enable ccache if available (speeds up incremental rebuilds)
+    _ccache = shutil.which("ccache")
+    if _ccache:
+        cmake_args += [
+            f"-DCMAKE_CUDA_COMPILER_LAUNCHER={_ccache}",
+            f"-DCMAKE_CXX_COMPILER_LAUNCHER={_ccache}",
+        ]
+
     subprocess.check_call(cmake_args)
 
     jobs = int(args.jobs)
     if jobs <= 0:
-        jobs = max(1, min(8, int(os.cpu_count() or 4)))
+        jobs = os.cpu_count() or 4
 
     build_args = ["cmake", "--build", str(build_dir), "-j", str(jobs)]
     extra_build = os.getenv("CUERI_CUDA_CMAKE_BUILD_ARGS")

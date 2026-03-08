@@ -10,7 +10,9 @@ checked-out repository.
 - `python -m asuka.build.int1e_ext build_ext --inplace`
 - `python -m asuka.build.guga_cuda_ext`
 - `python -m asuka.build.guga_cuda_linalg_ext`
-- `python -m asuka.build.cutlass_cuda_ext`
+- `python -m asuka.build.hf_df_jk_cuda_ext`
+- `python -m asuka.build.hf_thc_cuda_ext`
+- `python -m asuka.build.caspt2_cuda_ext`
 - `python -m asuka.build.orbitals_cuda_ext`
 
 ## Quick Usage
@@ -39,7 +41,6 @@ python -m asuka.build.guga_cuda_linalg_ext
 - `GUGA_CUDA_NVCC` / `CUDACXX` / `NVCC`: explicit `nvcc` path override.
 - `GUGA_CUDA_ROOT` / `CUDAToolkit_ROOT` / `CUDA_HOME` / `CUDA_PATH`:
   explicit CUDA toolkit root override.
-- `ASUKA_CUTLASS_DIR`: path to a CUTLASS checkout (required for `cutlass_cuda_ext`).
 - `GUGA_CUDA_ARCH`: override `CMAKE_CUDA_ARCHITECTURES` (for example `80`,
   `89`, or `80;89`).
 - `GUGA_CUDA_CMAKE_CONFIGURE_ARGS`: extra args appended to `cmake -S ... -B ...`.
@@ -55,8 +56,10 @@ python -m asuka.build.guga_cuda_linalg_ext
 | `int1e_ext.py` | Cython build helper for `asuka.integrals._int1e_cart_cy` |
 | `guga_cuda_ext.py` | CMake/pybind11 build helper for `asuka.cuda._guga_cuda_ext` |
 | `guga_cuda_linalg_ext.py` | CMake/pybind11 build helper for `asuka.cuda._guga_cuda_linalg_ext` |
-| `cutlass_cuda_ext.py` | CMake/pybind11 build helper for `asuka._cutlass_cuda_ext` |
-| `orbitals_cuda_ext.py` | CMake/pybind11 build helper for `asuka._orbitals_cuda_ext` |
+| `hf_df_jk_cuda_ext.py` | CMake/pybind11 build helper for `asuka.hf.cuda._hf_df_jk_cuda_ext` |
+| `hf_thc_cuda_ext.py` | CMake/pybind11 build helper for `asuka.hf.thc.cuda._hf_thc_cuda_ext` |
+| `caspt2_cuda_ext.py` | CMake/pybind11 build helper for `asuka.caspt2.cuda._caspt2_cuda_ext` |
+| `orbitals_cuda_ext.py` | CMake/pybind11 build helper for `asuka.orbitals._orbitals_cuda_ext` |
 
 ## Notes
 

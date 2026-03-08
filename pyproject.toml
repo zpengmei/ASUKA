@@ -84,9 +84,27 @@ asuka = [
   "cueri/cuda/ext/src/*.cuh",
   "cueri/cuda/ext/src/*.cpp",
   "cueri/cuda/ext/src/*.h",
+  # HF-THC CUDA extension sources
+  "hf/thc/cuda/ext/CMakeLists.txt",
+  "hf/thc/cuda/ext/src/*.cu",
+  "hf/thc/cuda/ext/src/*.cuh",
+  "hf/thc/cuda/ext/src/*.cpp",
+  "hf/thc/cuda/ext/src/*.h",
+  # Orbitals CUDA extension sources
+  "orbitals/cuda_ext/CMakeLists.txt",
+  "orbitals/cuda_ext/src/*.cu",
+  "orbitals/cuda_ext/src/*.cuh",
+  "orbitals/cuda_ext/src/*.cpp",
+  "orbitals/cuda_ext/src/*.h",
+  # CASPT2 CUDA extension sources
+  "caspt2/cuda/ext/CMakeLists.txt",
+  "caspt2/cuda/ext/src/*.cu",
+  "caspt2/cuda/ext/src/*.cuh",
+  "caspt2/cuda/ext/src/*.cpp",
   # Runtime data
   "cuguga/overlap/*.json",
   "semiempirical/data/*.json",
   "semiempirical/gpu/cuda/*.cu",
   "semiempirical/gpu/cuda/*.cuh",
+  "xc/*.cu",
 ]
