@@ -39,6 +39,7 @@ from .nac import (
     sacasscf_nonadiabatic_couplings_df_densez,
     sacasscf_nonadiabatic_couplings_dense,
 )
+from .properties import SACASSCFPropertiesResult, sacasscf_properties
 from .orbital_grad import allowed_rotation_mask, orbital_gradient_dense, orbital_gradient_df, orbital_gradient_thc
 from .orbital_tracking import (
     align_orbital_phases,
@@ -87,6 +88,8 @@ __all__ = [
     "sacasscf_nonadiabatic_couplings_df",
     "sacasscf_nonadiabatic_couplings_df_densez",
     "sacasscf_nonadiabatic_couplings_dense",
+    "SACASSCFPropertiesResult",
+    "sacasscf_properties",
     "DFNucGradResult",
     "DFNucGradMultirootResult",
     "casscf_nuc_grad_df",

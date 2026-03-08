@@ -2356,10 +2356,25 @@ def run_casscf(
     backend: str = "cuda",
     df: bool = True,
     guess: Any | None = None,
+    mo_coeff_init: Any | None = None,
+    ci_init: Any | None = None,
     matvec_backend: str | None = None,
     **kwargs,
 ) -> CASSCFResult:
-    """Unified CASSCF driver over (backend, df) switches."""
+    """Unified CASSCF driver over (backend, df) switches.
+
+    Parameters
+    ----------
+    guess
+        Optional previous result object; ``mo_coeff`` and ``ci`` are extracted
+        and used as initial guess (lower priority than ``mo_coeff_init``/``ci_init``).
+    mo_coeff_init
+        MO coefficient array to use as the CASSCF initial guess.  Overrides
+        whatever ``guess`` provides.
+    ci_init
+        CI vector (or list of CI vectors for SA) to use as the initial CI guess.
+        Overrides whatever ``guess`` provides.
+    """
 
     from dataclasses import replace as _dc_replace  # noqa: PLC0415
 
@@ -2399,6 +2414,12 @@ def run_casscf(
     if guess is not None:
         kwargs.setdefault("mo_coeff0", getattr(guess, "mo_coeff", None))
         kwargs.setdefault("ci0", getattr(guess, "ci", None))
+
+    # Explicit init args override guess.
+    if mo_coeff_init is not None:
+        kwargs["mo_coeff0"] = mo_coeff_init
+    if ci_init is not None:
+        kwargs["ci0"] = ci_init
 
     if not df_b:
         kwargs.setdefault("dense_exact_jk", "auto")

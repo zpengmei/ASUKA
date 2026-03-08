@@ -58,6 +58,8 @@ def make_df_casscf_energy_grad(
     save_intermediates: bool = True,
     warm_start: bool = True,
     guess: Any | None = None,
+    mo_coeff_init: Any | None = None,
+    ci_init: Any | None = None,
     orbital_tracking: bool = True,
     tracking_method: str = "subspace",
     tracking_ref: Any | None = None,
@@ -158,6 +160,14 @@ def make_df_casscf_energy_grad(
             prev_ci = getattr(g_mc, "ci", None)
             if prev_scf_mo_coeff is None and prev_casscf_mo_coeff is not None:
                 prev_scf_mo_coeff = prev_casscf_mo_coeff
+
+    # Explicit init args override guess.
+    if mo_coeff_init is not None:
+        prev_casscf_mo_coeff = mo_coeff_init
+        if prev_scf_mo_coeff is None:
+            prev_scf_mo_coeff = mo_coeff_init
+    if ci_init is not None:
+        prev_ci = ci_init
 
     # Parse tracking_ref for explicit reference geometry/calculation
     if tracking_ref is not None and orbital_tracking:
@@ -313,6 +323,8 @@ def make_df_casscf_energy_grad(
             if "mo_coeff0" not in casscf_call:
                 if tracked_mo_coeff0 is not None:
                     casscf_call["mo_coeff0"] = tracked_mo_coeff0
+                elif prev_casscf_mo_coeff is not None:
+                    casscf_call["mo_coeff0"] = prev_casscf_mo_coeff
             if "ci0" not in casscf_call and prev_ci is not None:
                 casscf_call["ci0"] = prev_ci
 
@@ -349,6 +361,8 @@ def make_df_casci_energy_grad(
     save_intermediates: bool = True,
     warm_start: bool = True,
     guess: Any | None = None,
+    mo_coeff_init: Any | None = None,
+    ci_init: Any | None = None,
 ) -> EnergyGradFn:
     """Build an `energy_grad(coords_bohr)` callback for DF-CASCI.
 
@@ -384,6 +398,12 @@ def make_df_casci_energy_grad(
             prev_scf_mo_coeff = getattr(scf_guess, "mo_coeff", None)
         if g_mc is not None:
             prev_ci = getattr(g_mc, "ci", None)
+
+    # Explicit init args override guess.
+    if mo_coeff_init is not None:
+        prev_scf_mo_coeff = mo_coeff_init
+    if ci_init is not None:
+        prev_ci = ci_init
 
     def energy_grad(coords_bohr: np.ndarray) -> tuple[float, np.ndarray]:
         from asuka.frontend import run_hf  # noqa: PLC0415
@@ -449,6 +469,8 @@ def make_df_casscf_multiroot_energy_grad(
     save_intermediates: bool = True,
     warm_start: bool = True,
     guess: Any | None = None,
+    mo_coeff_init: Any | None = None,
+    ci_init: Any | None = None,
     orbital_tracking: bool = True,
     tracking_method: str = "subspace",
     tracking_ref: Any | None = None,
@@ -518,6 +540,14 @@ def make_df_casscf_multiroot_energy_grad(
             prev_ci = getattr(g_mc, "ci", None)
             if prev_scf_mo_coeff is None and prev_casscf_mo_coeff is not None:
                 prev_scf_mo_coeff = prev_casscf_mo_coeff
+
+    # Explicit init args override guess.
+    if mo_coeff_init is not None:
+        prev_casscf_mo_coeff = mo_coeff_init
+        if prev_scf_mo_coeff is None:
+            prev_scf_mo_coeff = mo_coeff_init
+    if ci_init is not None:
+        prev_ci = ci_init
 
     if tracking_ref is not None and orbital_tracking:
         ref_mol_parsed = None
@@ -654,6 +684,8 @@ def make_df_casscf_multiroot_energy_grad(
             if "mo_coeff0" not in casscf_call:
                 if tracked_mo_coeff0 is not None:
                     casscf_call["mo_coeff0"] = tracked_mo_coeff0
+                elif prev_casscf_mo_coeff is not None:
+                    casscf_call["mo_coeff0"] = prev_casscf_mo_coeff
             if "ci0" not in casscf_call and prev_ci is not None:
                 casscf_call["ci0"] = prev_ci
 
@@ -688,6 +720,8 @@ def make_df_casscf_multiroot_eval(
     save_intermediates: bool = True,
     warm_start: bool = True,
     guess: Any | None = None,
+    mo_coeff_init: Any | None = None,
+    ci_init: Any | None = None,
     orbital_tracking: bool = True,
     tracking_method: str = "subspace",
     tracking_ref: Any | None = None,
@@ -707,6 +741,8 @@ def make_df_casscf_multiroot_eval(
         save_intermediates=bool(save_intermediates),
         warm_start=bool(warm_start),
         guess=guess,
+        mo_coeff_init=mo_coeff_init,
+        ci_init=ci_init,
         orbital_tracking=bool(orbital_tracking),
         tracking_method=str(tracking_method),
         tracking_ref=tracking_ref,
