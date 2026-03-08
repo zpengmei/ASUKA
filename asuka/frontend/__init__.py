@@ -13,6 +13,7 @@ from .analysis import (
     make_df_casscf_energy_grad,
     make_df_casscf_multiroot_energy_grad,
     make_df_casscf_multiroot_eval,
+    make_df_sacasscf_properties_eval,
 )
 from .df import build_df_B_cueri, build_df_bases_cart
 from .molecule import Molecule
@@ -52,6 +53,7 @@ __all__ = [
     "make_df_casscf_energy_grad",
     "make_df_casscf_multiroot_energy_grad",
     "make_df_casscf_multiroot_eval",
+    "make_df_sacasscf_properties_eval",
     "make_df_casscf_hvec_df",
     "make_df_casci_energy_grad",
     "build_ao_basis_cart",

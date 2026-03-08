@@ -8,6 +8,9 @@ Typical usage::
     result.e_roots      # (nroots,)        energies in Eh
     result.forces       # (nroots, natm, 3) forces  in Eh/Bohr  (= -grads)
     result.nacvs        # (nroots, nroots, natm, 3) NACVs in 1/Bohr
+    result.ci           # (nroots, ncsf)   CI vectors (for time-derivative coupling)
+    result.mo_coeff     # (nao, nmo)       MO coefficients
+    result.sigma        # (nroots, nroots) <ψ_I(t-dt)|ψ_J(t)> overlaps (from callback only)
 """
 
 from dataclasses import dataclass
@@ -43,6 +46,18 @@ class SACASSCFPropertiesResult:
     nacv_pairs : list of (int, int) or None
         The (bra, ket) pairs that were computed.  Off-diagonal entries not in
         this list are zero in ``nacvs``.  ``None`` when ``compute_nacvs=False``.
+    ci : np.ndarray or None
+        CI vectors in the CSF basis, shape ``(nroots, ncsf)``.
+        Useful for computing time-derivative couplings
+        ``σ_IJ = <ψ_I(t-dt)|ψ_J(t)>`` between consecutive NAMD steps.
+    mo_coeff : np.ndarray or None
+        MO coefficient matrix, shape ``(nao, nmo)``.
+    sigma : np.ndarray or None
+        CI-vector overlap matrix ``σ_IJ = <ψ_I(t-dt)|ψ_J(t)>``,
+        shape ``(nroots, nroots)``.  Populated by :func:`make_df_sacasscf_properties_eval`
+        on the second and subsequent trajectory steps; ``None`` otherwise.
+        This is the primary coupling quantity for FSSH propagation —
+        phase-invariant and finite at conical intersections.
     """
 
     e_roots: np.ndarray
@@ -53,6 +68,9 @@ class SACASSCFPropertiesResult:
     grad_sa: np.ndarray | None
     nacvs: np.ndarray | None
     nacv_pairs: list[tuple[int, int]] | None
+    ci: np.ndarray | None = None
+    mo_coeff: np.ndarray | None = None
+    sigma: np.ndarray | None = None
 
     @property
     def forces(self) -> np.ndarray | None:
@@ -241,6 +259,18 @@ def sacasscf_properties(
         nacvs = np.zeros((nroots, nroots, natm_guess, 3), dtype=np.float64)
         computed_pairs = []
 
+    # ── CI vectors and MO coefficients ──────────────────────────────────────
+    ci_arr: np.ndarray | None = None
+    ci_raw = getattr(casscf, "ci", None)
+    if ci_raw is not None:
+        _ci = np.asarray(ci_raw, dtype=np.float64)
+        ci_arr = _ci.reshape(nroots, -1) if _ci.ndim == 1 else _ci
+
+    mo_coeff_arr: np.ndarray | None = None
+    mo_raw = getattr(casscf, "mo_coeff", None)
+    if mo_raw is not None:
+        mo_coeff_arr = np.asarray(mo_raw, dtype=np.float64)
+
     return SACASSCFPropertiesResult(
         e_roots=e_roots,
         e_sa=e_sa,
@@ -250,4 +280,7 @@ def sacasscf_properties(
         grad_sa=grad_sa,
         nacvs=nacvs,
         nacv_pairs=computed_pairs,
+        ci=ci_arr,
+        mo_coeff=mo_coeff_arr,
+        sigma=None,  # populated by make_df_sacasscf_properties_eval across steps
     )

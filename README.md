@@ -265,6 +265,8 @@ res.e_roots   # (nroots,)           energies in Eh
 res.forces    # (nroots, natm, 3)   forces = −dE/dR in Eh/Bohr
 res.e_sa                     # state-averaged energy
 res.grad_sa                  # (natm, 3) SA gradient
+res.ci        # (nroots, ncsf)      CI vectors in CSF basis
+res.mo_coeff  # (nao, nmo)          MO coefficients
 ```
 
 NACVs are opt-in (`compute_nacvs=False` by default) since they require an additional Z-vector solve per state pair:
@@ -278,23 +280,34 @@ res.nacv_pairs # list of (bra, ket) pairs computed
 Use `nacv_pairs=[(0,1)]` to compute only selected couplings, or `mult_ediff=True` to return
 the Hamiltonian-derivative numerator `⟨I|∂H/∂R|J⟩` instead of the coupling vector.
 
-For dynamics loops, warm-start SCF and CASSCF from the previous step using `mo_coeff_init`
-and `ci_init` so the optimizer starts from the converged solution at the prior geometry:
+## Non-adiabatic MD trajectory callback
+
+For production NAMD trajectories, `make_df_sacasscf_properties_eval` combines SCF, CASSCF,
+gradient, and coupling into a single stateful callback with automatic warm-starting and
+active-space orbital tracking:
 
 ```python
-hf_kw  = dict(method="rhf", backend="cuda")
-cas_kw = dict(ncore=4, ncas=4, nelecas=4, nroots=3,
-              root_weights=(1/3, 1/3, 1/3), backend="cuda")
+from asuka.frontend import make_df_sacasscf_properties_eval
 
-scf, mc = None, None
+eval_fn = make_df_sacasscf_properties_eval(
+    mol,
+    casscf_kwargs=dict(ncore=4, ncas=4, nelecas=4, nroots=3,
+                       root_weights=(1/3, 1/3, 1/3), backend="cuda", df=True),
+)
+
 for coords in trajectory:
-    mol_t = clone_molecule_with_coords(mol, coords)
-    scf   = run_hf(mol_t, guess=scf, **hf_kw)
-    mc    = run_casscf(scf, mo_coeff_init=mc.mo_coeff if mc else None,
-                            ci_init=mc.ci if mc else None, **cas_kw)
-    res   = sacasscf_properties(scf, mc)
-    # res.e_roots, res.forces, res.nacvs (if compute_nacvs=True)
+    res = eval_fn(coords)          # SCF + CASSCF + gradients in one call
+    force = res.forces[active_state]   # (natm, 3) force on the active state
+    sigma = res.sigma              # (nroots, nroots)  <ψ_I(t-dt)|ψ_J(t)>
+                                   # None on the first step, available from step 2
 ```
+
+`res.sigma` is the CI-vector overlap matrix `σ_IJ = ⟨ψ_I(t−Δt)|ψ_J(t)⟩` — the standard
+time-derivative coupling used by FSSH integrators (Newton-X, SHARC, etc.).  Unlike the NACV
+`d_IJ = ⟨I|∂/∂R|J⟩`, it is phase-invariant and stays finite through conical intersections.
+
+The callback keeps internal state between calls (previous CI vectors, MO coefficients, and
+molecular geometry) to enable orbital tracking and warm-starting with no extra bookkeeping.
 
 ## Geometry optimization + harmonic frequencies
 

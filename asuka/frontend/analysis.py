@@ -760,6 +760,140 @@ def make_df_casscf_multiroot_eval(
     return multiroot_eval
 
 
+def make_df_sacasscf_properties_eval(
+    mol: Molecule,
+    *,
+    hf_kwargs: Mapping[str, Any] | None = None,
+    casscf_kwargs: Mapping[str, Any] | None = None,
+    properties_kwargs: Mapping[str, Any] | None = None,
+    save_key: str = "method_eval_properties",
+    save_intermediates: bool = True,
+    warm_start: bool = True,
+    guess: Any | None = None,
+    mo_coeff_init: Any | None = None,
+    ci_init: Any | None = None,
+    orbital_tracking: bool = True,
+    tracking_method: str = "subspace",
+    tracking_ref: Any | None = None,
+) -> Callable[[np.ndarray], "SACASSCFPropertiesResult"]:
+    """Build a ``coords_bohr -> SACASSCFPropertiesResult`` callback for NAMD.
+
+    Wraps :func:`~asuka.mcscf.properties.sacasscf_properties` with the same
+    orbital-tracking and warm-start machinery as
+    :func:`make_df_casscf_multiroot_eval`.  On the second and subsequent steps,
+    the result's ``.sigma`` field is populated with the CI-vector overlap matrix
+
+    .. math::
+
+        \\sigma_{IJ} = \\langle\\psi_I(t-\\Delta t)\\vert\\psi_J(t)\\rangle
+
+    computed as a dot product of consecutive CI vectors in the CSF basis.
+    This is the primary coupling quantity for FSSH propagation: it is
+    phase-invariant and stays finite through conical intersections.
+
+    Parameters
+    ----------
+    mol
+        Template molecule (coordinates are cloned per evaluation).
+    hf_kwargs, casscf_kwargs, properties_kwargs
+        Keyword arguments forwarded to :func:`~asuka.frontend.run_hf`,
+        :func:`~asuka.mcscf.run_casscf`, and
+        :func:`~asuka.mcscf.properties.sacasscf_properties` respectively.
+    save_key
+        Key under ``mol.results`` where :class:`DFMethodEvalArtifacts` is stored.
+    warm_start
+        Reuse MO coefficients and CI vectors from the previous evaluation.
+    guess
+        Optional seed result object (SCF or CASSCF) for the very first step.
+    mo_coeff_init, ci_init
+        Explicit MO/CI seed for the first step (override ``guess``).
+    orbital_tracking
+        Track active-space orbitals via cross-geometry overlap to prevent drift.
+    tracking_method
+        ``"subspace"`` (default) or ``"hungarian"``.
+    tracking_ref
+        Explicit reference for orbital tracking initialisation.
+
+    Returns
+    -------
+    Callable[[np.ndarray], SACASSCFPropertiesResult]
+        A stateful callback ``(coords_bohr) -> SACASSCFPropertiesResult``.
+        The result carries ``.ci``, ``.mo_coeff``, and ``.sigma`` in addition
+        to energies, forces, and optional NACVs.
+    """
+    from asuka.mcscf.properties import SACASSCFPropertiesResult  # noqa: PLC0415
+
+    # Delegate SCF+CASSCF to make_df_casscf_multiroot_energy_grad so we get
+    # orbital tracking and warm-start for free.
+    eg = make_df_casscf_multiroot_energy_grad(
+        mol,
+        hf_kwargs=hf_kwargs,
+        casscf_kwargs=casscf_kwargs,
+        grad_kwargs={},  # gradients computed via sacasscf_properties instead
+        save_key=str(save_key),
+        save_intermediates=True,  # must store ctx for properties call
+        warm_start=bool(warm_start),
+        guess=guess,
+        mo_coeff_init=mo_coeff_init,
+        ci_init=ci_init,
+        orbital_tracking=bool(orbital_tracking),
+        tracking_method=str(tracking_method),
+        tracking_ref=tracking_ref,
+    )
+
+    properties_kwargs_use = dict(properties_kwargs or {})
+    prev_ci: np.ndarray | None = None  # (nroots, ncsf) from previous step
+
+    def properties_eval(coords_bohr: np.ndarray) -> SACASSCFPropertiesResult:
+        from asuka.mcscf.properties import sacasscf_properties  # noqa: PLC0415
+
+        nonlocal prev_ci
+
+        # Run SCF + CASSCF with orbital tracking and warm-start.
+        eg(coords_bohr)
+
+        ctx = mol.results.get(str(save_key))
+        if not isinstance(ctx, DFMethodEvalArtifacts) or ctx.scf_out is None or ctx.mc is None:
+            raise RuntimeError("make_df_casscf_multiroot_energy_grad did not store intermediates")
+
+        res = sacasscf_properties(ctx.scf_out, ctx.mc, **properties_kwargs_use)
+
+        # Compute σ_IJ = <ψ_I(t-dt)|ψ_J(t)> from CI-vector dot products.
+        # Shape: (nroots, nroots).  Available from step 2 onward.
+        sigma: np.ndarray | None = None
+        if res.ci is not None and prev_ci is not None:
+            sigma = prev_ci @ res.ci.T  # (nroots, nroots)
+
+        # Advance history.
+        if res.ci is not None:
+            prev_ci = np.array(res.ci)
+
+        # Attach sigma to the result (frozen dataclass — must rebuild).
+        if sigma is not None:
+            res = SACASSCFPropertiesResult(
+                e_roots=res.e_roots,
+                e_sa=res.e_sa,
+                e_nuc=res.e_nuc,
+                root_weights=res.root_weights,
+                grads=res.grads,
+                grad_sa=res.grad_sa,
+                nacvs=res.nacvs,
+                nacv_pairs=res.nacv_pairs,
+                ci=res.ci,
+                mo_coeff=res.mo_coeff,
+                sigma=sigma,
+            )
+
+        if bool(save_intermediates):
+            mol.results[str(save_key)] = DFMethodEvalArtifacts(
+                scf_out=ctx.scf_out, mc=ctx.mc, grad=res
+            )
+
+        return res
+
+    return properties_eval
+
+
 def make_df_casscf_hvec_df(
     *,
     use_etfs: bool = False,
