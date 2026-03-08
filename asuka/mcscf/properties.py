@@ -71,7 +71,7 @@ def sacasscf_properties(
     nacv_pairs: Sequence[tuple[int, int]] | None = None,
     mult_ediff: bool = False,
     use_etfs: bool = False,
-    df_backend: Literal["cpu", "cuda"] = "cpu",
+    df_backend: Literal["cpu", "cuda", "auto"] = "auto",
     df_threads: int = 0,
     z_tol: float = 1e-10,
     z_maxiter: int = 200,
@@ -103,8 +103,10 @@ def sacasscf_properties(
         (returns the numerator ``<I|∂H/∂R|J>`` instead of the coupling).
     use_etfs : bool, default ``False``
         Include electron-translation-factor corrections to NACVs.
-    df_backend : ``"cpu"`` or ``"cuda"``, default ``"cpu"``
-        Backend for DF derivative contractions.
+    df_backend : ``"cpu"``, ``"cuda"``, or ``"auto"``, default ``"auto"``
+        Backend for DF derivative contractions.  ``"auto"`` detects from
+        ``scf_out``: uses ``"cuda"`` if the DF tensor is a CuPy array,
+        otherwise ``"cpu"``.
     df_threads : int, default ``0``
         Number of threads for CPU DF backend.
     z_tol : float, default ``1e-10``
@@ -145,6 +147,15 @@ def sacasscf_properties(
 
     grad_kwargs = dict(grad_kwargs or {})
     nacv_kwargs = dict(nacv_kwargs or {})
+
+    # ── resolve df_backend ───────────────────────────────────────────────────
+    if str(df_backend) == "auto":
+        try:
+            import cupy as cp  # type: ignore[import-not-found]
+            _b = getattr(scf_out, "df_B", None) or getattr(scf_out, "B_ao", None)
+            df_backend = "cuda" if (_b is not None and isinstance(_b, cp.ndarray)) else "cpu"
+        except Exception:
+            df_backend = "cpu"
 
     # ── energies (always available) ──────────────────────────────────────────
     e_raw = getattr(casscf, "e_roots", None)
