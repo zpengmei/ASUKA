@@ -72,6 +72,7 @@ def sacasscf_properties(
     mult_ediff: bool = False,
     use_etfs: bool = False,
     df_backend: Literal["cpu", "cuda", "auto"] = "auto",
+    int1e_backend: Literal["auto", "cpu", "cuda"] = "auto",
     df_threads: int = 0,
     z_tol: float = 1e-10,
     z_maxiter: int = 200,
@@ -104,9 +105,12 @@ def sacasscf_properties(
     use_etfs : bool, default ``False``
         Include electron-translation-factor corrections to NACVs.
     df_backend : ``"cpu"``, ``"cuda"``, or ``"auto"``, default ``"auto"``
-        Backend for DF derivative contractions.  ``"auto"`` detects from
+        Backend for DF 2e derivative contractions.  ``"auto"`` detects from
         ``scf_out``: uses ``"cuda"`` if the DF tensor is a CuPy array,
         otherwise ``"cpu"``.
+    int1e_backend : ``"auto"``, ``"cpu"``, or ``"cuda"``, default ``"auto"``
+        Backend for 1e AO derivative contractions (hcore, overlap).
+        ``"auto"`` picks CUDA fused kernels when available, CPU otherwise.
     df_threads : int, default ``0``
         Number of threads for CPU DF backend.
     z_tol : float, default ``1e-10``
@@ -187,6 +191,7 @@ def sacasscf_properties(
             scf_out,
             casscf,
             df_backend=df_backend,
+            int1e_contract_backend=int1e_backend,
             df_threads=df_threads,
             z_tol=z_tol,
             z_maxiter=z_maxiter,
