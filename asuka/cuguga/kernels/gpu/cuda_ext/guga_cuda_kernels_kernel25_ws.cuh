@@ -53,6 +53,8 @@ inline void kernel25_profile_zero(Kernel25Profile* profile) {
   profile->nnz_in = 0;
   profile->nnz_out = 0;
   profile->nrows = 0;
+  profile->bucket_ms = 0.0f;
+  for (int b = 0; b < 4; b++) profile->bucket_counts[b] = 0;
 }
 
 template <typename Fn>
@@ -109,6 +111,13 @@ struct Kernel25Workspace {
 
   void* d_temp = nullptr;
   size_t temp_bytes = 0;
+
+  // Bucketing output (aliases into workspace buffers, set after bucketing step).
+  int32_t* d_row_perm = nullptr;           // sorted row indices by bucket (alias: d_k or d_rs_alt)
+  int32_t* d_sorted_bucket_ids = nullptr;  // sorted bucket ids (alias: d_j or d_rs)
+  int bucket_counts_host[4] = {};
+  int bucket_offsets_host[5] = {};
+  bool bucketing_valid = false;
 
   Kernel25Workspace(int max_tasks_, int max_nnz_in_) : max_tasks(max_tasks_), max_nnz_in(max_nnz_in_) {
     throw_on_cuda_error_ws(cudaGetDevice(&device), "cudaGetDevice");
@@ -213,6 +222,26 @@ struct Kernel25Workspace {
         cub::DeviceScan::ExclusiveSum(nullptr, tmp, d_counts64, d_offsets, max_tasks, stream),
         "cub::DeviceScan::ExclusiveSum(tasks) query");
     temp_max = std::max(temp_max, tmp);
+
+    // Bucket sort (2-bit radix sort of int32 keys + int32 values).
+    {
+      cub::DoubleBuffer<int32_t> bkeys_q(d_j, d_rs);
+      cub::DoubleBuffer<int32_t> bvals_q(d_k, d_rs_alt);
+      throw_on_cuda_error_ws(
+          cub::DeviceRadixSort::SortPairs(nullptr, tmp, bkeys_q, bvals_q, max_nnz_in, 0, 2, stream),
+          "cub::DeviceRadixSort::SortPairs(bucket) query");
+      temp_max = std::max(temp_max, tmp);
+    }
+
+    // Phase 4: rowkey-only sort (uint64_t keys, int32_t index values).
+    {
+      cub::DoubleBuffer<uint64_t> rkeys_q(d_jk_a, d_jk_b);
+      cub::DoubleBuffer<int32_t> rvals_q(d_rs_alt, d_j);
+      throw_on_cuda_error_ws(
+          cub::DeviceRadixSort::SortPairs(nullptr, tmp, rkeys_q, rvals_q, max_nnz_in, 0, 64, stream),
+          "cub::DeviceRadixSort::SortPairs(rowkey_idx) query");
+      temp_max = std::max(temp_max, tmp);
+    }
 
     if (temp_max == 0) temp_max = 1;
     temp_bytes = temp_max;
@@ -383,86 +412,128 @@ inline void kernel25_build_csr_allpairs_packed_ws_typed(
   int bits_rs = ceil_log2_u32((uint32_t)nops);
   int bits_k = ceil_log2_u32((uint32_t)ncsf);
   int bits_j = ceil_log2_u32((uint32_t)j_count);
-  int bits_total = bits_rs + bits_k + bits_j;
+  int bits_jk = bits_k + bits_j;
+  int bits_total = bits_rs + bits_jk;
   if (bits_total <= 0 || bits_total > 64) {
     throw std::runtime_error("packed CSR key width exceeds 64 bits (fallback required)");
   }
-  uint64_t rs_mask = (bits_rs >= 63) ? ~0ull : ((1ull << (uint32_t)bits_rs) - 1ull);
 
   int threads = 256;
   int blocks = (nnz_in + threads - 1) / threads;
-
-  stage_timer.start(stream);
-  k25_build_packed_key_kernel<<<blocks, threads, 0, stream>>>(
-      ws->d_j, ws->d_k, ws->d_rs, ws->d_jk_a, nnz_in, j_start, bits_k, bits_rs);
-  throw_on_cuda_error_ws(cudaGetLastError(), "k25_build_packed_key_kernel");
-  if (profile) {
-    profile->pack_ms += stage_timer.stop(stream);
-  }
-
-  cub::DoubleBuffer<uint64_t> keys(ws->d_jk_a, ws->d_jk_b);
-  cub::DoubleBuffer<CoeffT> vals(coeff_in, coeff_tmp);
-  stage_timer.start(stream);
-  throw_on_cuda_error_ws(
-      cub::DeviceRadixSort::SortPairs(ws->d_temp, ws->temp_bytes, keys, vals, nnz_in, 0, bits_total, stream),
-      "cub::DeviceRadixSort::SortPairs(packed)");
-  if (profile) {
-    profile->sort_ms += stage_timer.stop(stream);
-  }
-
   int nnz_out = nnz_in;
-  uint64_t* rowkey_inout = keys.Current();
-  const CoeffT* vals_in = vals.Current();
+  uint64_t* rowkey_inout = nullptr;
 
-  if (coalesce) {
-    uint64_t* keys_out = (rowkey_inout == ws->d_jk_a) ? ws->d_jk_b : ws->d_jk_a;
+  if (!coalesce) {
+    // --- Phase 4: Rowkey-only sort (no rs in key) ---
+    // Sort by (j_off, k) only with int32 index values, then gather rs and c.
+    // Saves radix sort passes (bits_jk < bits_total) and bandwidth (int32 < double).
+
+    stage_timer.start(stream);
+    k25_build_rowkey_iota_kernel<<<blocks, threads, 0, stream>>>(
+        ws->d_j, ws->d_k, ws->d_jk_a, ws->d_rs_alt, nnz_in, j_start, bits_k);
+    throw_on_cuda_error_ws(cudaGetLastError(), "k25_build_rowkey_iota_kernel");
+    // d_j and d_k are dead (encoded in rowkey). d_rs and coeff_in remain live for gather.
+    // Iota written to d_rs_alt; d_j and d_k free for sort DoubleBuffer.
+    if (profile) {
+      profile->pack_ms += stage_timer.stop(stream);
+    }
+
+    cub::DoubleBuffer<uint64_t> rkeys(ws->d_jk_a, ws->d_jk_b);
+    cub::DoubleBuffer<int32_t> rvals(ws->d_rs_alt, ws->d_j);
     stage_timer.start(stream);
     throw_on_cuda_error_ws(
-        cub::DeviceReduce::ReduceByKey(
-            ws->d_temp,
-            ws->temp_bytes,
-            rowkey_inout,
-            keys_out,
-            vals_in,
-            out_data,
-            ws->d_nnz,
-            K25SumT<CoeffT>(),
-            nnz_in,
-            stream),
-        "cub::DeviceReduce::ReduceByKey(packed)");
+        cub::DeviceRadixSort::SortPairs(ws->d_temp, ws->temp_bytes, rkeys, rvals, nnz_in, 0, bits_jk, stream),
+        "cub::DeviceRadixSort::SortPairs(rowkey_idx)");
     if (profile) {
-      profile->reduce_ms += stage_timer.stop(stream);
+      profile->sort_ms += stage_timer.stop(stream);
     }
 
-    kernel25_profile_measure_sync_overhead(profile, [&]() {
-      throw_on_cuda_error_ws(cudaMemcpyAsync(&nnz_out, ws->d_nnz, sizeof(int), cudaMemcpyDeviceToHost, stream), "D2H nnz_out");
-      throw_on_cuda_error_ws(cudaStreamSynchronize(stream), "cudaStreamSynchronize(nnz_out)");
-    });
-    if (nnz_out < 0) nnz_out = 0;
-    if (nnz_out == 0) {
-      int64_t zero64 = 0;
-      throw_on_cuda_error_ws(cudaMemcpyAsync(out_indptr, &zero64, sizeof(int64_t), cudaMemcpyHostToDevice, stream), "H2D indptr[0]=0");
-      throw_on_cuda_error_ws(cudaMemsetAsync(ws->d_nrows, 0, sizeof(int), stream), "cudaMemsetAsync(nrows=0)");
-      if (profile) {
-        profile->nnz_out = 0;
-        profile->nrows = 0;
-      }
-      return;
+    rowkey_inout = rkeys.Current();
+    const int32_t* sorted_idx = rvals.Current();
+
+    // Gather rs and c by sorted indices into output arrays.
+    stage_timer.start(stream);
+    k25_gather_rs_c_kernel_t<CoeffT><<<blocks, threads, 0, stream>>>(
+        sorted_idx, ws->d_rs, coeff_in, nnz_in, out_indices, out_data);
+    throw_on_cuda_error_ws(cudaGetLastError(), "k25_gather_rs_c_kernel_t");
+    if (profile) {
+      profile->unpack_ms += stage_timer.stop(stream);
     }
 
-    rowkey_inout = keys_out;
-    vals_in = out_data;
-  } else {
     throw_on_cuda_error_ws(cudaMemcpyAsync(ws->d_nnz, &nnz_out, sizeof(int), cudaMemcpyHostToDevice, stream), "H2D nnz_out");
-  }
+  } else {
+    // --- Original full-key sort path (with coalesce support) ---
+    uint64_t rs_mask = (bits_rs >= 63) ? ~0ull : ((1ull << (uint32_t)bits_rs) - 1ull);
 
-  blocks = (nnz_out + threads - 1) / threads;
-  stage_timer.start(stream);
-  k25_unpack_packed_key_and_vals_kernel_t<CoeffT><<<blocks, threads, 0, stream>>>(
-      rowkey_inout, vals_in, nnz_out, out_indices, out_data, bits_rs, rs_mask);
-  throw_on_cuda_error_ws(cudaGetLastError(), "k25_unpack_packed_key_and_vals_kernel_t");
-  if (profile) {
-    profile->unpack_ms += stage_timer.stop(stream);
+    stage_timer.start(stream);
+    k25_build_packed_key_kernel<<<blocks, threads, 0, stream>>>(
+        ws->d_j, ws->d_k, ws->d_rs, ws->d_jk_a, nnz_in, j_start, bits_k, bits_rs);
+    throw_on_cuda_error_ws(cudaGetLastError(), "k25_build_packed_key_kernel");
+    if (profile) {
+      profile->pack_ms += stage_timer.stop(stream);
+    }
+
+    cub::DoubleBuffer<uint64_t> keys(ws->d_jk_a, ws->d_jk_b);
+    cub::DoubleBuffer<CoeffT> vals(coeff_in, coeff_tmp);
+    stage_timer.start(stream);
+    throw_on_cuda_error_ws(
+        cub::DeviceRadixSort::SortPairs(ws->d_temp, ws->temp_bytes, keys, vals, nnz_in, 0, bits_total, stream),
+        "cub::DeviceRadixSort::SortPairs(packed)");
+    if (profile) {
+      profile->sort_ms += stage_timer.stop(stream);
+    }
+
+    rowkey_inout = keys.Current();
+    const CoeffT* vals_in = vals.Current();
+
+    {
+      uint64_t* keys_out = (rowkey_inout == ws->d_jk_a) ? ws->d_jk_b : ws->d_jk_a;
+      stage_timer.start(stream);
+      throw_on_cuda_error_ws(
+          cub::DeviceReduce::ReduceByKey(
+              ws->d_temp,
+              ws->temp_bytes,
+              rowkey_inout,
+              keys_out,
+              vals_in,
+              out_data,
+              ws->d_nnz,
+              K25SumT<CoeffT>(),
+              nnz_in,
+              stream),
+          "cub::DeviceReduce::ReduceByKey(packed)");
+      if (profile) {
+        profile->reduce_ms += stage_timer.stop(stream);
+      }
+
+      kernel25_profile_measure_sync_overhead(profile, [&]() {
+        throw_on_cuda_error_ws(cudaMemcpyAsync(&nnz_out, ws->d_nnz, sizeof(int), cudaMemcpyDeviceToHost, stream), "D2H nnz_out");
+        throw_on_cuda_error_ws(cudaStreamSynchronize(stream), "cudaStreamSynchronize(nnz_out)");
+      });
+      if (nnz_out < 0) nnz_out = 0;
+      if (nnz_out == 0) {
+        int64_t zero64 = 0;
+        throw_on_cuda_error_ws(cudaMemcpyAsync(out_indptr, &zero64, sizeof(int64_t), cudaMemcpyHostToDevice, stream), "H2D indptr[0]=0");
+        throw_on_cuda_error_ws(cudaMemsetAsync(ws->d_nrows, 0, sizeof(int), stream), "cudaMemsetAsync(nrows=0)");
+        if (profile) {
+          profile->nnz_out = 0;
+          profile->nrows = 0;
+        }
+        return;
+      }
+
+      rowkey_inout = keys_out;
+      vals_in = out_data;
+    }
+
+    blocks = (nnz_out + threads - 1) / threads;
+    stage_timer.start(stream);
+    k25_unpack_packed_key_and_vals_kernel_t<CoeffT><<<blocks, threads, 0, stream>>>(
+        rowkey_inout, vals_in, nnz_out, out_indices, out_data, bits_rs, rs_mask);
+    throw_on_cuda_error_ws(cudaGetLastError(), "k25_unpack_packed_key_and_vals_kernel_t");
+    if (profile) {
+      profile->unpack_ms += stage_timer.stop(stream);
+    }
   }
 
   stage_timer.start(stream);
@@ -480,6 +551,7 @@ inline void kernel25_build_csr_allpairs_packed_ws_typed(
     throw_on_cuda_error_ws(cudaStreamSynchronize(stream), "cudaStreamSynchronize(nrows)");
   });
   if (nrows < 0) nrows = 0;
+  ws->bucketing_valid = false;
   if (nrows == 0) {
     int64_t zero64 = 0;
     throw_on_cuda_error_ws(cudaMemcpyAsync(out_indptr, &zero64, sizeof(int64_t), cudaMemcpyHostToDevice, stream), "H2D indptr[0]=0");
@@ -488,6 +560,58 @@ inline void kernel25_build_csr_allpairs_packed_ws_typed(
       profile->nrows = 0;
     }
     return;
+  }
+
+  // --- Bucketing step: classify rows by width and build a row permutation ---
+  {
+    stage_timer.start(stream);
+    blocks = (nrows + threads - 1) / threads;
+
+    // Step 1: classify each row into a bucket based on its CSR row width.
+    k25_classify_bucket_kernel<<<blocks, threads, 0, stream>>>(ws->d_row_counts, ws->d_j, nrows);
+    throw_on_cuda_error_ws(cudaGetLastError(), "k25_classify_bucket_kernel");
+
+    // Step 2: generate iota indices [0..nrows-1].
+    k25_iota_kernel<<<blocks, threads, 0, stream>>>(ws->d_k, nrows);
+    throw_on_cuda_error_ws(cudaGetLastError(), "k25_iota_kernel");
+
+    // Step 3: stable sort (bucket_id, row_index) by bucket_id using 2-bit radix sort.
+    cub::DoubleBuffer<int32_t> bkeys(ws->d_j, ws->d_rs);
+    cub::DoubleBuffer<int32_t> bvals(ws->d_k, ws->d_rs_alt);
+    throw_on_cuda_error_ws(
+        cub::DeviceRadixSort::SortPairs(ws->d_temp, ws->temp_bytes, bkeys, bvals, nrows, 0, 2, stream),
+        "cub::DeviceRadixSort::SortPairs(bucket)");
+
+    // Step 4: find bucket boundaries via binary search (1 block, 4 threads).
+    // Write counts to d_counts[0..3] (safe: kernel 2B counting is finished).
+    k25_bucket_boundaries_kernel<<<1, 4, 0, stream>>>(bkeys.Current(), nrows, ws->d_counts);
+    throw_on_cuda_error_ws(cudaGetLastError(), "k25_bucket_boundaries_kernel");
+
+    // Step 5: D2H readback of bucket counts (16 bytes).
+    kernel25_profile_measure_sync_overhead(profile, [&]() {
+      throw_on_cuda_error_ws(
+          cudaMemcpyAsync(ws->bucket_counts_host, ws->d_counts, 4 * sizeof(int32_t), cudaMemcpyDeviceToHost, stream),
+          "D2H bucket_counts");
+      throw_on_cuda_error_ws(cudaStreamSynchronize(stream), "cudaStreamSynchronize(bucket_counts)");
+    });
+
+    // Step 6: compute bucket offsets on host (trivial prefix sum).
+    ws->bucket_offsets_host[0] = 0;
+    for (int b = 0; b < 4; b++) {
+      ws->bucket_offsets_host[b + 1] = ws->bucket_offsets_host[b] + ws->bucket_counts_host[b];
+    }
+
+    // Track result pointers (CUB DoubleBuffer may swap).
+    ws->d_row_perm = bvals.Current();
+    ws->d_sorted_bucket_ids = bkeys.Current();
+    ws->bucketing_valid = true;
+
+    if (profile) {
+      profile->bucket_ms += stage_timer.stop(stream);
+      for (int b = 0; b < 4; b++) {
+        profile->bucket_counts[b] = ws->bucket_counts_host[b];
+      }
+    }
   }
 
   blocks = (nrows + threads - 1) / threads;
@@ -524,6 +648,7 @@ inline void kernel25_build_csr_ws(
     double* out_data,
     cudaStream_t stream,
     Kernel25Profile* profile = nullptr) {
+  ws->bucketing_valid = false;  // Non-packed path does not support bucketing.
   if (profile) {
     profile->nnz_in = nnz_in;
   }
@@ -676,6 +801,23 @@ extern "C" void* guga_kernel25_workspace_create(int max_tasks, int max_nnz_in) {
 extern "C" void guga_kernel25_workspace_destroy(void* ws_handle) {
   auto* ws = reinterpret_cast<Kernel25Workspace*>(ws_handle);
   delete ws;
+}
+
+extern "C" void guga_kernel25_workspace_get_bucket_info(
+    void* ws_handle,
+    int* bucketing_valid_out,
+    int* bucket_offsets_out,
+    int* bucket_counts_out,
+    void** d_row_perm_out) {
+  auto* ws = ws_from_handle(ws_handle);
+  if (bucketing_valid_out) *bucketing_valid_out = ws->bucketing_valid ? 1 : 0;
+  if (bucket_offsets_out) {
+    for (int i = 0; i < 5; i++) bucket_offsets_out[i] = ws->bucket_offsets_host[i];
+  }
+  if (bucket_counts_out) {
+    for (int i = 0; i < 4; i++) bucket_counts_out[i] = ws->bucket_counts_host[i];
+  }
+  if (d_row_perm_out) *d_row_perm_out = ws->bucketing_valid ? reinterpret_cast<void*>(ws->d_row_perm) : nullptr;
 }
 
 extern "C" void guga_kernel25_build_csr_from_jrs_allpairs_deterministic_inplace_device_ws(

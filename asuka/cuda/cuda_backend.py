@@ -4428,6 +4428,20 @@ def build_epq_action_table_transpose_device(
         t_pq = cp.ascontiguousarray(epq_pq[perm])
         t_data = cp.ascontiguousarray(epq_data[perm])
 
+    # Sort entries within each row by t_source (destination CSF k) so that the
+    # apply kernel can use binary search to find the k-block range, eliminating
+    # redundant scans (Opt 1: ~49x speedup on the apply kernel for large CI).
+    if t_total_nnz > 0:
+        # Expand row indices from CSR indptr: row_ids[t] = row of entry t (vectorized).
+        t_indptr_i64 = t_indptr if cp.dtype(t_indptr.dtype) == cp.dtype(cp.int64) else t_indptr.astype(cp.int64)
+        row_ids = cp.searchsorted(t_indptr_i64[1:], cp.arange(t_total_nnz, dtype=cp.int64), side="right")
+        # Build composite key: (row_id << 32) | t_source — sorts first by row, then by source within row.
+        composite_key = (row_ids.astype(cp.uint64) << np.uint64(32)) | t_source.astype(cp.uint64)
+        perm_sort = cp.argsort(composite_key, kind="stable")
+        t_source = cp.ascontiguousarray(t_source[perm_sort])
+        t_pq = cp.ascontiguousarray(t_pq[perm_sort])
+        t_data = cp.ascontiguousarray(t_data[perm_sort])
+
     out = (t_indptr, t_source, t_pq, t_data)
     if bool(use_cache):
         setattr(drt, "_epq_action_table_transpose_device_key", cache_key)
@@ -6226,9 +6240,11 @@ class GugaMatvecEriMatWorkspace:
             _coalesce_mode = coalesce.strip().lower()
             if _coalesce_mode in ("", "auto"):
                 self.coalesce_mode = "auto"
-                # Phase 6.4 option A: default FP32 policy disables coalesce to avoid
-                # coalesce-related sync/readback overhead in kernel2.5 tile builds.
-                self.coalesce = bool(self._dtype != cp.float32)
+                # Coalesce disabled: the GUGA oracle produces unique (j,k,rs) triples
+                # (nnz_in == nnz_out), so ReduceByKey is a no-op. Disabling enables
+                # Phase 4 rowkey-only sort (fewer radix bits, int32 index values →
+                # 1.1-1.5x faster sort) and removes the coalesce sync point.
+                self.coalesce = False
             elif _coalesce_mode in ("1", "true", "yes", "on", "enabled"):
                 self.coalesce_mode = "on"
                 self.coalesce = True
@@ -6338,6 +6354,19 @@ class GugaMatvecEriMatWorkspace:
             epq_blocked_transpose_reserve_mib, env_epq_blocked_transpose_reserve_mib
         )
         self.epq_blocked_transpose_reserve_bytes = int(reserve_mib) * 1024 * 1024
+
+        # Adaptive thread tuning for blocked aggregate path:
+        # For large active spaces (ncsf > 10k), benchmarking shows threads_apply=64
+        # outperforms 32 due to better warp utilization in the gather kernel.
+        _auto_tune_threads = os.getenv("CUGUGA_AUTO_TUNE_THREADS", "1").strip().lower()
+        if _auto_tune_threads in ("1", "true", "yes") and self.threads_apply == 32 and self.threads_w == 256:
+            try:
+                _ncsf_est = int(getattr(drt, "ncsf", 0))
+                if _ncsf_est > 10000:
+                    self.threads_apply = 64
+                    self.threads_w = 128
+            except Exception:
+                pass
 
         env_epq_streaming = str(os.getenv("ASUKA_CUGUGA_EPQ_STREAMING", "")).strip().lower()
         if epq_streaming is None:
@@ -7020,6 +7049,61 @@ class GugaMatvecEriMatWorkspace:
         self._task_scale_rows = cp.empty((int(nrows_block),), dtype=self._dtype)
         self._diag_g_cache: dict[int, object] = {}
 
+        # Symmetric-pair index maps for compressed GEMM (Opt 2).
+        # pack: W[k, nops] → W_pair[k, npair] where npair = norb*(norb+1)/2
+        # unpack: G_pair[k, npair] → G[k, nops]
+        self._sym_pair_pair_pq: object | None = None
+        self._sym_pair_pair_qp: object | None = None
+        self._sym_pair_full_to_pair: object | None = None
+        self._sym_pair_npair: int = 0
+        self._sym_pair_eri_pair: object | None = None
+        self._sym_pair_eri_pair_src_id: int | None = None
+        self._sym_pair_l_pair: object | None = None
+        self._sym_pair_l_pair_src_id: int | None = None
+        self._sym_pair_w_pair: object | None = None
+        self._sym_pair_g_pair: object | None = None
+        self._sym_pair_gemm_ws: Kernel3BuildGWorkspace | None = None
+        # Only enable sym-pair for norb >= 10 where GEMM dominates; for smaller
+        # active spaces, pack/unpack overhead exceeds the GEMM savings.
+        _sym_pair_min_norb = int(os.getenv("CUGUGA_SYM_PAIR_MIN_NORB", "10"))
+        if bool(self.aggregate_offdiag_k) and has_sym_pair_pack_device() and int(self.norb) >= _sym_pair_min_norb:
+            norb_int = int(self.norb)
+            npair = norb_int * (norb_int + 1) // 2
+            self._sym_pair_npair = npair
+            pair_pq_h = []
+            pair_qp_h = []
+            full_to_pair_h = np.empty(int(self.nops), dtype=np.int32)
+            u = 0
+            for p in range(norb_int):
+                for q in range(p, norb_int):
+                    pq = p * norb_int + q
+                    qp = q * norb_int + p
+                    pair_pq_h.append(pq)
+                    pair_qp_h.append(qp)
+                    full_to_pair_h[pq] = u
+                    full_to_pair_h[qp] = u
+                    u += 1
+            self._sym_pair_pair_pq = cp.asarray(np.array(pair_pq_h, dtype=np.int32))
+            self._sym_pair_pair_qp = cp.asarray(np.array(pair_qp_h, dtype=np.int32))
+            self._sym_pair_full_to_pair = cp.asarray(full_to_pair_h)
+            # cuBLAS workspace for pair-sized dense GEMM.
+            # Use cublasLt with heuristic algo selection for the npair×npair shape —
+            # better tile utilization than default cublasGemmEx for small K.
+            _sp_backend = os.getenv("CUGUGA_SYM_PAIR_GEMM_BACKEND", "cublaslt_fp64")
+            try:
+                self._sym_pair_gemm_ws = Kernel3BuildGWorkspace(
+                    npair, max_nrows=1, dtype=self._dtype,
+                    gemm_backend=_sp_backend,
+                )
+            except Exception:
+                try:
+                    self._sym_pair_gemm_ws = Kernel3BuildGWorkspace(
+                        npair, max_nrows=1, dtype=self._dtype,
+                        gemm_backend="gemmex_fp64",
+                    )
+                except Exception:
+                    pass  # fallback to cp.matmul
+
         # Optional k-aggregated off-diagonal buffers:
         #   W[k,rs] = sum_j x[j] * c(j->k,rs)
         #   g_block[k,pq] = 0.5 * W_block @ ERI_mat
@@ -7119,6 +7203,80 @@ class GugaMatvecEriMatWorkspace:
                 )
             else:
                 self._w_offdiag_prefer_blocked = True
+
+    def _sym_pair_get_eri_pair(self, eri_mat):
+        """Build or retrieve cached compressed ERI pair matrix: (npair, npair) from (nops, nops)."""
+        import cupy as cp
+
+        src_id = id(eri_mat)
+        if self._sym_pair_eri_pair is not None and self._sym_pair_eri_pair_src_id == src_id:
+            return self._sym_pair_eri_pair
+
+        pair_pq = self._sym_pair_pair_pq
+        pair_qp = self._sym_pair_pair_qp
+        if pair_pq is None or pair_qp is None:
+            return None
+
+        eri_mat = cp.asarray(eri_mat, dtype=self._dtype)
+        eri_mat = cp.ascontiguousarray(eri_mat)
+        # Symmetrize: eri_pair[u,v] = 0.5*(eri[pq,·]+eri[qp,·]) rows, then same on columns.
+        rows = 0.5 * (cp.take(eri_mat, pair_pq, axis=0) + cp.take(eri_mat, pair_qp, axis=0))
+        eri_pair = 0.5 * (cp.take(rows, pair_pq, axis=1) + cp.take(rows, pair_qp, axis=1))
+        eri_pair = cp.ascontiguousarray(eri_pair)
+
+        self._sym_pair_eri_pair_src_id = src_id
+        self._sym_pair_eri_pair = eri_pair
+        return eri_pair
+
+    def _sym_pair_get_l_pair(self, l_full):
+        """Build or retrieve cached compressed L_pair: (npair, naux) from (nops, naux)."""
+        import cupy as cp
+
+        src_id = id(l_full)
+        if self._sym_pair_l_pair is not None and self._sym_pair_l_pair_src_id == src_id:
+            return self._sym_pair_l_pair
+
+        pair_pq = self._sym_pair_pair_pq
+        pair_qp = self._sym_pair_pair_qp
+        if pair_pq is None or pair_qp is None:
+            return None
+
+        l_full = cp.asarray(l_full, dtype=self._dtype)
+        l_full = cp.ascontiguousarray(l_full)
+        l_pair = 0.5 * (cp.take(l_full, pair_pq, axis=0) + cp.take(l_full, pair_qp, axis=0))
+        l_pair = cp.ascontiguousarray(l_pair)
+
+        self._sym_pair_l_pair_src_id = src_id
+        self._sym_pair_l_pair = l_pair
+        return l_pair
+
+    def _sym_pair_ensure_buffers(self, nrows_block_max):
+        """Ensure W_pair/G_pair buffers for symmetric-pair GEMM.
+
+        To minimize VRAM overhead, ``w_pair`` aliases the flat memory of
+        ``_w_block`` (which has shape ``(nrows_block_max, nops)`` and is no
+        longer needed once packing is done).  Only ``g_pair`` gets a
+        dedicated allocation — a single ``(nrows_block_max, npair)`` buffer.
+        """
+        import cupy as cp
+
+        npair = self._sym_pair_npair
+        if npair <= 0:
+            return
+        nrows = int(nrows_block_max)
+        shape = (nrows, int(npair))
+        # w_pair: alias into _w_block flat memory (npair <= nops, so it fits).
+        w_block = self._w_block
+        if w_block is not None and w_block.size >= nrows * npair:
+            self._sym_pair_w_pair = cp.ndarray(
+                shape, dtype=self._dtype,
+                memptr=w_block.data,
+            )
+        elif self._sym_pair_w_pair is None or tuple(self._sym_pair_w_pair.shape) != shape:
+            self._sym_pair_w_pair = cp.empty(shape, dtype=self._dtype)
+        # g_pair: needs its own allocation (used simultaneously with g_block).
+        if self._sym_pair_g_pair is None or tuple(self._sym_pair_g_pair.shape) != shape:
+            self._sym_pair_g_pair = cp.empty(shape, dtype=self._dtype)
 
     def _build_diag_g_cache(self) -> None:
         """Precompute the diagonal (r==s) g_diag blocks for all j-tiles.
@@ -8818,6 +8976,8 @@ class GugaMatvecEriMatWorkspace:
 
         # One-body contribution: y = sum_pq h_eff[pq] E_pq |x>.
         # In fused-hop mode, one-body is computed inside the fused kernel, so we only zero y here.
+        _one_body_overlap = False
+        _stream_onebody = None
         t0 = time.perf_counter() if profile is not None else None
         if use_fused_hop:
             cp.cuda.runtime.memsetAsync(
@@ -8950,27 +9110,67 @@ class GugaMatvecEriMatWorkspace:
                         profile["tile_apply_apply_s"] = profile.get("tile_apply_apply_s", 0.0) + dt
                     zero_y = False
         else:
-            apply_g_flat_scatter_atomic_inplace_device(
-                self.drt,
-                self.drt_dev,
-                self.state_dev,
-                self.task_csf_all,
-                h_eff_flat,
-                task_scale=x,
-                epq_table=self._epq_table,
-                apply_mode=str(self.apply_mode),
-                y=y,
-                overflow=self.overflow_apply,
-                threads=int(self.threads_apply),
-                zero_y=True,
-                stream=stream,
-                sync=bool(sync),
-                check_overflow=bool(check_overflow),
-                dtype=self._dtype,
-                use_kahan=bool(self.kahan_compensation),
+            # When the blocked offdiag path will be used and profiling is not active,
+            # launch one_body on a separate stream so W-build+GEMM can overlap with it.
+            _one_body_overlap = (
+                bool(use_aggregate_offdiag)
+                and self._epq_table is not None
+                and self._w_offdiag is None
+                and profile is None
             )
+            if _one_body_overlap:
+                _stream_onebody = getattr(self, "_stream_onebody", None)
+                if _stream_onebody is None:
+                    _stream_onebody = cp.cuda.Stream(non_blocking=True)
+                    self._stream_onebody = _stream_onebody
+                # one_body on separate stream (overlaps with W-build+GEMM on main stream).
+                apply_g_flat_scatter_atomic_inplace_device(
+                    self.drt,
+                    self.drt_dev,
+                    self.state_dev,
+                    self.task_csf_all,
+                    h_eff_flat,
+                    task_scale=x,
+                    epq_table=self._epq_table,
+                    apply_mode=str(self.apply_mode),
+                    y=y,
+                    overflow=self.overflow_apply,
+                    threads=int(self.threads_apply),
+                    zero_y=True,
+                    stream=_stream_onebody,
+                    sync=False,
+                    check_overflow=False,
+                    dtype=self._dtype,
+                    use_kahan=bool(self.kahan_compensation),
+                )
+            else:
+                _stream_onebody = None
+                apply_g_flat_scatter_atomic_inplace_device(
+                    self.drt,
+                    self.drt_dev,
+                    self.state_dev,
+                    self.task_csf_all,
+                    h_eff_flat,
+                    task_scale=x,
+                    epq_table=self._epq_table,
+                    apply_mode=str(self.apply_mode),
+                    y=y,
+                    overflow=self.overflow_apply,
+                    threads=int(self.threads_apply),
+                    zero_y=True,
+                    stream=stream,
+                    sync=bool(sync),
+                    check_overflow=bool(check_overflow),
+                    dtype=self._dtype,
+                    use_kahan=bool(self.kahan_compensation),
+                )
+        # Record event for one_body completion (used by offdiag Apply to wait on y).
+        _one_body_event = cp.cuda.Event(disable_timing=True)
+        _one_body_event.record(_stream_onebody if _one_body_overlap else stream)
         if profile is not None and t0 is not None:
             stream.synchronize()
+            if _stream_onebody is not None:
+                _stream_onebody.synchronize()
             profile["one_body_s"] = profile.get("one_body_s", 0.0) + (time.perf_counter() - t0)
 
         # Blocked epq-table aggregate path:
@@ -9070,24 +9270,55 @@ class GugaMatvecEriMatWorkspace:
                     profile["df_l_full_used"] = float(1.0)
                     profile["df_cublas_workspace_bytes"] = float(int(gdf_ws.cublas_workspace_bytes()))
 
+            # Symmetric-pair GEMM setup (Opt 2): compress nops → npair = norb*(norb+1)/2.
+            use_sym_pair = False
+            eri_pair = None
+            l_pair = None
+            l_pair_t = None
+            npair = self._sym_pair_npair
+            if npair > 0 and self._sym_pair_pair_pq is not None:
+                if use_df:
+                    # DF path: sym-pair compression only reduces one GEMM dimension
+                    # (npair vs nops) while adding pack/unpack overhead — not beneficial.
+                    pass
+                else:
+                    eri_pair = self._sym_pair_get_eri_pair(eri_mat_use)
+                    if eri_pair is not None:
+                        use_sym_pair = True
+                if use_sym_pair:
+                    self._sym_pair_ensure_buffers(nrows_block_max)
+                    if profile is not None:
+                        profile["sym_pair_active"] = 1.0
+                        profile["sym_pair_npair"] = float(npair)
+                        profile["sym_pair_nops"] = float(int(self.nops))
+
+            # Detect if fused pair-indexed kernels are available (avoids pack/unpack overhead).
+            use_pair_fused = bool(use_sym_pair and has_sym_pair_fused_kernels())
+            _ftp_dev = self._sym_pair_full_to_pair if use_pair_fused else None
+
             for k0 in range(0, int(self.ncsf), int(nrows_block_max)):
                 k1 = min(int(self.ncsf), int(k0 + int(nrows_block_max)))
                 k_count = int(k1 - k0)
 
-                # W block buffer (k_count, nops)
-                if use_df:
-                    w_block = self._g_buf[:k_count]
+                # Select W buffer: pair-indexed (k_count, npair) or full (k_count, nops).
+                if use_pair_fused:
+                    w_pair_buf = self._sym_pair_w_pair[:k_count]
+                    w_target = w_pair_buf  # W-build/W-diag write directly to pair buffer
                 else:
-                    if w_block_buf is None:  # pragma: no cover
-                        raise RuntimeError("internal error: missing w_block_buf for dense blocked aggregate")
-                    w_block = w_block_buf[:k_count]
+                    if use_df:
+                        w_block = self._g_buf[:k_count]
+                    else:
+                        if w_block_buf is None:  # pragma: no cover
+                            raise RuntimeError("internal error: missing w_block_buf for dense blocked aggregate")
+                        w_block = w_block_buf[:k_count]
+                    w_target = w_block
 
-                # Zero W block.
+                # Zero W buffer.
                 t0 = time.perf_counter() if profile is not None else None
                 cp.cuda.runtime.memsetAsync(
-                    int(w_block.data.ptr),
+                    int(w_target.data.ptr),
                     0,
-                    int(w_block.size) * int(w_block.itemsize),
+                    int(w_target.size) * int(w_target.itemsize),
                     int(stream.ptr),
                 )
                 if profile is not None and t0 is not None:
@@ -9095,38 +9326,73 @@ class GugaMatvecEriMatWorkspace:
                     profile["offdiag_w_zero_s"] = profile.get("offdiag_w_zero_s", 0.0) + (time.perf_counter() - t0)
 
                 if self.include_diagonal_rs:
-                    # Fill diagonal rs (r==s) entries for this k-block directly into W (relative buffer).
+                    # Fill diagonal rs (r==s) entries for this k-block.
                     t0 = time.perf_counter() if profile is not None else None
-                    self._build_w_diag_from_steps_inplace(
-                        x=x,
-                        w_out=w_block,
-                        j_start=int(k0),
-                        j_count=int(k_count),
-                        stream=stream,
-                        sync=bool(sync),
-                        relative_w=True,
-                    )
+                    if use_pair_fused:
+                        _ext.build_w_diag_pair_from_steps_inplace_device(
+                            self.state_dev,
+                            int(k0),
+                            int(k_count),
+                            x,
+                            w_pair_buf,
+                            _ftp_dev,
+                            256,  # threads
+                            int(stream.ptr),
+                            bool(sync),
+                            True,  # relative_w
+                        )
+                    else:
+                        self._build_w_diag_from_steps_inplace(
+                            x=x,
+                            w_out=w_target,
+                            j_start=int(k0),
+                            j_count=int(k_count),
+                            stream=stream,
+                            sync=bool(sync),
+                            relative_w=True,
+                        )
                     if profile is not None and t0 is not None:
                         stream.synchronize()
                         profile["diag_w_build_s"] = profile.get("diag_w_build_s", 0.0) + (time.perf_counter() - t0)
 
-                # Off-diagonal W from epq_table (accumulates into W block).
+                # Off-diagonal W from epq_table.
                 t0 = time.perf_counter() if profile is not None else None
-                build_w_from_epq_transpose_range_inplace_device(
-                    self.drt,
-                    self.state_dev,
-                    epq_table_t,
-                    x,
-                    w_out=w_block,
-                    overflow=self._overflow_w,
-                    threads=int(self.threads_w),
-                    stream=stream,
-                    sync=bool(sync),
-                    check_overflow=bool(check_overflow),
-                    k_start=int(k0),
-                    k_count=int(k_count),
-                    dtype=self._dtype,
-                )
+                if use_pair_fused:
+                    t_indptr, t_source, t_pq, t_data = epq_table_t
+                    _ext.build_w_pair_from_epq_transpose_range_inplace_device(
+                        self.state_dev,
+                        t_indptr,
+                        t_source,
+                        t_pq,
+                        t_data,
+                        x,
+                        w_pair_buf,
+                        _ftp_dev,
+                        int(npair),
+                        self._overflow_w,
+                        int(self.threads_w),
+                        int(stream.ptr),
+                        bool(sync),
+                        bool(check_overflow),
+                        int(k0),
+                        int(k_count),
+                    )
+                else:
+                    build_w_from_epq_transpose_range_inplace_device(
+                        self.drt,
+                        self.state_dev,
+                        epq_table_t,
+                        x,
+                        w_out=w_target,
+                        overflow=self._overflow_w,
+                        threads=int(self.threads_w),
+                        stream=stream,
+                        sync=bool(sync),
+                        check_overflow=bool(check_overflow),
+                        k_start=int(k0),
+                        k_count=int(k_count),
+                        dtype=self._dtype,
+                    )
                 if profile is not None and t0 is not None:
                     stream.synchronize()
                     dt = time.perf_counter() - t0
@@ -9134,7 +9400,99 @@ class GugaMatvecEriMatWorkspace:
                     profile["blocked_w_build_s"] = profile.get("blocked_w_build_s", 0.0) + dt
 
                 # Contract W against ERIs to build g_block.
-                if use_df:
+                if use_pair_fused:
+                    # Pair-fused path: W is already pair-indexed, GEMM directly, Apply reads pair-indexed g.
+                    t0 = time.perf_counter() if profile is not None else None
+                    g_pair_buf = self._sym_pair_g_pair[:k_count]
+                    if use_df:
+                        naux = int(l_full_use.shape[1])
+                        df_t_buf = self._offdiag_df_t
+                        if (
+                            df_t_buf is None
+                            or not hasattr(df_t_buf, "shape")
+                            or tuple(df_t_buf.shape) != (int(nrows_block_max), int(naux))
+                        ):
+                            self._offdiag_df_t = cp.empty((int(nrows_block_max), int(naux)), dtype=self._dtype)
+                            df_t_buf = self._offdiag_df_t
+                        z_block = df_t_buf[:k_count]
+                        cp.matmul(w_pair_buf, l_pair, out=z_block)
+                        z_block *= 0.5
+                        cp.matmul(z_block, l_pair_t, out=g_pair_buf)
+                        gemm_flops = float(4.0 * float(k_count) * float(npair) * float(naux))
+                    else:
+                        sp_ws = self._sym_pair_gemm_ws
+                        if sp_ws is not None:
+                            sp_ws.gemm_w_eri_mat_inplace_device(
+                                w_pair_buf, eri_pair, g_out=g_pair_buf,
+                                dtype=self._dtype, half=0.5, stream=stream, sync=False,
+                            )
+                        else:
+                            cp.matmul(w_pair_buf, eri_pair, out=g_pair_buf)
+                            g_pair_buf *= 0.5
+                        gemm_flops = float(2.0 * float(k_count) * float(npair) * float(npair))
+                    # g_pair_buf IS the g_block for the pair-indexed Apply kernel.
+                    g_block = g_pair_buf
+                    if profile is not None and t0 is not None:
+                        stream.synchronize()
+                        dt = time.perf_counter() - t0
+                        gemm_key = "offdiag_df_gemm_s" if use_df else "offdiag_gemm_s"
+                        flops_key = "offdiag_df_gemm_flops" if use_df else "offdiag_gemm_flops"
+                        profile[gemm_key] = profile.get(gemm_key, 0.0) + dt
+                        profile["blocked_w_gemm_s"] = profile.get("blocked_w_gemm_s", 0.0) + dt
+                        profile[flops_key] = profile.get(flops_key, 0.0) + gemm_flops
+                elif use_sym_pair:
+                    # Legacy pack/unpack path (fallback when fused kernels unavailable).
+                    t0 = time.perf_counter() if profile is not None else None
+                    w_pair_buf = self._sym_pair_w_pair[:k_count]
+                    g_pair_buf = self._sym_pair_g_pair[:k_count]
+                    is_f32 = bool(self._dtype == cp.float32)
+                    sym_pair_pack_inplace_device(
+                        w_block, w_pair_buf,
+                        self._sym_pair_pair_pq, self._sym_pair_pair_qp,
+                        nrows=k_count, nops=int(self.nops), npair=npair,
+                        is_f32=is_f32, stream=stream, sync=False,
+                    )
+                    if use_df:
+                        naux = int(l_full_use.shape[1])
+                        df_t_buf = self._offdiag_df_t
+                        if (
+                            df_t_buf is None
+                            or not hasattr(df_t_buf, "shape")
+                            or tuple(df_t_buf.shape) != (int(nrows_block_max), int(naux))
+                        ):
+                            self._offdiag_df_t = cp.empty((int(nrows_block_max), int(naux)), dtype=self._dtype)
+                            df_t_buf = self._offdiag_df_t
+                        z_block = df_t_buf[:k_count]
+                        cp.matmul(w_pair_buf, l_pair, out=z_block)
+                        z_block *= 0.5
+                        cp.matmul(z_block, l_pair_t, out=g_pair_buf)
+                        gemm_flops = float(4.0 * float(k_count) * float(npair) * float(naux))
+                    else:
+                        sp_ws = self._sym_pair_gemm_ws
+                        if sp_ws is not None:
+                            sp_ws.gemm_w_eri_mat_inplace_device(
+                                w_pair_buf, eri_pair, g_out=g_pair_buf,
+                                dtype=self._dtype, half=0.5, stream=stream, sync=False,
+                            )
+                        else:
+                            cp.matmul(w_pair_buf, eri_pair, out=g_pair_buf)
+                            g_pair_buf *= 0.5
+                        gemm_flops = float(2.0 * float(k_count) * float(npair) * float(npair))
+                    g_block = self._g_buf[:k_count]
+                    sym_pair_unpack_inplace_device(
+                        g_pair_buf, g_block, self._sym_pair_full_to_pair,
+                        nrows=k_count, nops=int(self.nops), npair=npair,
+                        is_f32=is_f32, stream=stream, sync=False,
+                    )
+                    if profile is not None and t0 is not None:
+                        stream.synchronize()
+                        dt = time.perf_counter() - t0
+                        gemm_key = "offdiag_df_gemm_s" if use_df else "offdiag_gemm_s"
+                        flops_key = "offdiag_df_gemm_flops" if use_df else "offdiag_gemm_flops"
+                        profile[gemm_key] = profile.get(gemm_key, 0.0) + dt
+                        profile["blocked_w_gemm_s"] = profile.get("blocked_w_gemm_s", 0.0) + dt
+                        profile[flops_key] = profile.get(flops_key, 0.0) + gemm_flops
+                elif use_df:
                     t0 = time.perf_counter() if profile is not None else None
                     naux = int(l_full_use.shape[1])
                     l_full_t = self._l_full_t
@@ -9229,26 +9587,53 @@ class GugaMatvecEriMatWorkspace:
                             2.0 * float(int(gemm_rows)) * float(int(self.nops)) * float(int(self.nops))
                         )
 
+                # Wait for one_body to finish writing y before Apply accumulates into it.
+                if _one_body_event is not None:
+                    stream.wait_event(_one_body_event)
+                    _one_body_event = None  # only need to wait once
+
                 # Apply g_block to y via destination-major EPQ transpose gather.
                 t0 = time.perf_counter() if profile is not None else None
-                apply_g_flat_gather_epq_transpose_range_inplace_device(
-                    self.drt,
-                    self.drt_dev,
-                    self.state_dev,
-                    epq_table_t,
-                    g_block,
-                    k_start=int(k0),
-                    k_count=int(k_count),
-                    y=y,
-                    overflow=self.overflow_apply,
-                    threads=int(self.threads_apply),
-                    add=True,
-                    stream=stream,
-                    sync=bool(sync),
-                    check_overflow=bool(check_overflow),
-                    dtype=self._dtype,
-                    use_kahan=bool(self.kahan_compensation),
-                )
+                if use_pair_fused:
+                    t_indptr, t_source, t_pq, t_data = epq_table_t
+                    _ext.apply_g_pair_gather_epq_transpose_range_inplace_device(
+                        self.drt_dev,
+                        self.state_dev,
+                        t_indptr,
+                        t_source,
+                        t_pq,
+                        t_data,
+                        g_block,  # g_pair_buf (pair-indexed)
+                        int(k0),
+                        int(k_count),
+                        _ftp_dev,
+                        y,
+                        self.overflow_apply,
+                        int(self.threads_apply),
+                        True,  # add
+                        int(stream.ptr),
+                        bool(sync),
+                        bool(check_overflow),
+                    )
+                else:
+                    apply_g_flat_gather_epq_transpose_range_inplace_device(
+                        self.drt,
+                        self.drt_dev,
+                        self.state_dev,
+                        epq_table_t,
+                        g_block,
+                        k_start=int(k0),
+                        k_count=int(k_count),
+                        y=y,
+                        overflow=self.overflow_apply,
+                        threads=int(self.threads_apply),
+                        add=True,
+                        stream=stream,
+                        sync=bool(sync),
+                        check_overflow=bool(check_overflow),
+                        dtype=self._dtype,
+                        use_kahan=bool(self.kahan_compensation),
+                    )
                 if profile is not None and t0 is not None:
                     stream.synchronize()
                     dt = time.perf_counter() - t0
@@ -9931,6 +10316,7 @@ class GugaMatvecEriMatWorkspace:
                                             ("indptr_ms", "csr_k25_indptr_s"),
                                             ("unpack_ms", "csr_k25_unpack_s"),
                                             ("sync_overhead_ms", "csr_k25_sync_overhead_s"),
+                                            ("bucket_ms", "csr_k25_bucket_s"),
                                         )
                                         for src_key, dst_key in stage_map:
                                             ms_val = float(tile_profile.get(src_key, 0.0))
@@ -10052,31 +10438,127 @@ class GugaMatvecEriMatWorkspace:
                 continue
 
             if w_offdiag is not None:
-                if int(nnz) != int(nrows):
-                    raise RuntimeError(
-                        "aggregate_offdiag_k requires nnz==nrows (unit-nnz CSR rows); "
-                        "try coalesce=False or disable aggregate_offdiag_k"
+                # --- Width-aware hybrid dispatch (bucketed) ---
+                _bucket_info = None
+                _ws_for_bucket = getattr(self, "_k25_ws", None)
+                if _ws_for_bucket is not None:
+                    try:
+                        _bucket_info = _ws_for_bucket.get_bucket_info()
+                    except Exception:
+                        _bucket_info = None
+
+                if _bucket_info is not None and bool(_bucket_info[0]):
+                    _bvalid, _boffsets, _bcounts, _bperm_ptr = _bucket_info
+                    _n_b0 = int(_boffsets[1])         # bucket 0: width 1
+                    _n_b1 = int(_boffsets[2]) - _n_b0  # bucket 1: width 2-4
+                    _n_b23 = int(nrows) - int(_boffsets[2])  # buckets 2+3: width 5+
+                    _has_remaining = (_n_b1 > 0 or _n_b23 > 0)
+
+                    t0 = time.perf_counter() if profile is not None else None
+                    if _n_b0 > 0:
+                        _ext.kernel4_build_w_from_csr_bucket0_rawptr(
+                            int(_bperm_ptr),
+                            _n_b0,
+                            row_j_d,
+                            row_k_d,
+                            indptr_d,
+                            indices_d,
+                            data_d,
+                            x,
+                            w_offdiag,
+                            self._overflow_w,
+                            int(self.drt.ncsf),
+                            int(self.drt.norb) * int(self.drt.norb),
+                            int(self.threads_w),
+                            int(stream_apply.ptr),
+                            bool(tile_sync_apply) and (not _has_remaining),
+                            bool(check_overflow_apply_tile) and (not _has_remaining),
+                        )
+                    if _has_remaining and self._epq_table is not None and eri_mat_t is not None:
+                        _epq_indptr_d, _epq_indices_d, _epq_pq_d, _epq_data_d = self._epq_table
+                        # Bucket 1 (width 2-4): narrow kernel (no shared memory).
+                        if _n_b1 > 0:
+                            _perm_b1_ptr = int(_bperm_ptr) + _n_b0 * 4
+                            _ext.kernel4_apply_csr_narrow_fused_perm_rawptr(
+                                _perm_b1_ptr,
+                                _n_b1,
+                                self.state_dev,
+                                _epq_indptr_d,
+                                _epq_indices_d,
+                                _epq_pq_d,
+                                _epq_data_d,
+                                row_j_d,
+                                row_k_d,
+                                indptr_d,
+                                indices_d,
+                                data_d,
+                                eri_mat_t,
+                                x,
+                                y,
+                                self.overflow_apply,
+                                int(self.drt.norb) * int(self.drt.norb),
+                                int(self.threads_apply),
+                                int(stream_apply.ptr),
+                                bool(tile_sync_apply) and (_n_b23 == 0),
+                                bool(check_overflow_apply_tile) and (_n_b23 == 0),
+                            )
+                        # Buckets 2+3 (width 5+): general fused warp kernel.
+                        if _n_b23 > 0:
+                            _perm_b23_ptr = int(_bperm_ptr) + int(_boffsets[2]) * 4
+                            _ext.kernel4_apply_csr_fused_perm_rawptr(
+                                _perm_b23_ptr,
+                                _n_b23,
+                                self.state_dev,
+                                _epq_indptr_d,
+                                _epq_indices_d,
+                                _epq_pq_d,
+                                _epq_data_d,
+                                row_j_d,
+                                row_k_d,
+                                indptr_d,
+                                indices_d,
+                                data_d,
+                                eri_mat_t,
+                                x,
+                                y,
+                                self.overflow_apply,
+                                int(self.drt.norb) * int(self.drt.norb),
+                                int(self.threads_apply),
+                                int(stream_apply.ptr),
+                                bool(tile_sync_apply),
+                                bool(check_overflow_apply_tile),
+                            )
+                    if profile is not None and t0 is not None:
+                        stream_apply.synchronize()
+                        profile["offdiag_w_build_s"] = profile.get("offdiag_w_build_s", 0.0) + (time.perf_counter() - t0)
+                else:
+                    # Fallback: old unit-nnz path (requires nnz==nrows).
+                    if int(nnz) != int(nrows):
+                        raise RuntimeError(
+                            "aggregate_offdiag_k requires nnz==nrows (unit-nnz CSR rows); "
+                            "try coalesce=False or disable aggregate_offdiag_k"
+                        )
+                    t0 = time.perf_counter() if profile is not None else None
+                    kernel4_build_w_from_csr_unitnnz_inplace_device(
+                        self.drt,
+                        self.drt_dev,
+                        self.state_dev,
+                        row_j_d,
+                        row_k_d,
+                        indices_d,
+                        data_d,
+                        x,
+                        w_out=w_offdiag,
+                        overflow=self._overflow_w,
+                        threads=int(self.threads_w),
+                        stream=stream_apply,
+                        sync=bool(tile_sync_apply),
+                        check_overflow=bool(check_overflow_apply_tile),
                     )
-                t0 = time.perf_counter() if profile is not None else None
-                kernel4_build_w_from_csr_unitnnz_inplace_device(
-                    self.drt,
-                    self.drt_dev,
-                    self.state_dev,
-                    row_j_d,
-                    row_k_d,
-                    indices_d,
-                    data_d,
-                    x,
-                    w_out=w_offdiag,
-                    overflow=self._overflow_w,
-                    threads=int(self.threads_w),
-                    stream=stream_apply,
-                    sync=bool(tile_sync_apply),
-                    check_overflow=bool(check_overflow_apply_tile),
-                )
-                if profile is not None and t0 is not None:
-                    stream_apply.synchronize()
-                    profile["offdiag_w_build_s"] = profile.get("offdiag_w_build_s", 0.0) + (time.perf_counter() - t0)
+                    if profile is not None and t0 is not None:
+                        stream_apply.synchronize()
+                        profile["offdiag_w_build_s"] = profile.get("offdiag_w_build_s", 0.0) + (time.perf_counter() - t0)
+
                 if use_csr_pipeline and tile_slot is not None and (not tile_sync_apply):
                     evt = tile_slot.get("inflight_event")
                     if evt is None:
@@ -11998,6 +12480,16 @@ def sym_pair_unpack_inplace_device(
     )
     if sync:
         cp.cuda.get_current_stream().synchronize()
+
+
+def has_sym_pair_fused_kernels() -> bool:
+    """Check if pair-indexed W-build/Apply/W-diag kernels are available."""
+    return (
+        _ext is not None
+        and hasattr(_ext, "build_w_pair_from_epq_transpose_range_inplace_device")
+        and hasattr(_ext, "apply_g_pair_gather_epq_transpose_range_inplace_device")
+        and hasattr(_ext, "build_w_diag_pair_from_steps_inplace_device")
+    )
 
 
 def rdm12_reorder_delta_inplace_device(

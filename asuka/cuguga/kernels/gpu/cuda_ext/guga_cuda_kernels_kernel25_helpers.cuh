@@ -216,6 +216,94 @@ __global__ void k25_rowkey_to_rowjk_kernel(uint64_t* __restrict__ rowkey_inout, 
   rowkey_inout[tid] = (((uint64_t)ju) << 32) | (uint64_t)ku;
 }
 
+// ---------------------------------------------------------------------------
+// Phase 4: Rowkey-only sort kernels
+// ---------------------------------------------------------------------------
+
+__global__ void k25_build_rowkey_iota_kernel(
+    const int32_t* __restrict__ j,
+    const int32_t* __restrict__ k,
+    uint64_t* __restrict__ rowkey_out,
+    int32_t* __restrict__ iota_out,
+    int n,
+    int j_start,
+    int bits_k) {
+  int tid = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+  if (tid >= n) return;
+  uint32_t j_off = (uint32_t)j[tid] - (uint32_t)j_start;
+  uint32_t ku = (uint32_t)k[tid];
+  rowkey_out[tid] = (((uint64_t)j_off) << (uint32_t)bits_k) | (uint64_t)ku;
+  iota_out[tid] = tid;
+}
+
+template <typename CoeffT>
+__global__ void k25_gather_rs_c_kernel_t(
+    const int32_t* __restrict__ sorted_idx,
+    const int32_t* __restrict__ rs_src,
+    const CoeffT* __restrict__ c_src,
+    int n,
+    int32_t* __restrict__ rs_out,
+    CoeffT* __restrict__ c_out) {
+  int tid = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+  if (tid >= n) return;
+  int32_t idx = sorted_idx[tid];
+  rs_out[tid] = rs_src[idx];
+  c_out[tid] = c_src[idx];
+}
+
+// ---------------------------------------------------------------------------
+// Bucketing kernels for width-aware dispatch (Phase 1)
+// ---------------------------------------------------------------------------
+
+__global__ void k25_classify_bucket_kernel(
+    const int32_t* __restrict__ row_counts,
+    int32_t* __restrict__ bucket_ids,
+    int nrows) {
+  int tid = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+  if (tid >= nrows) return;
+  int w = row_counts[tid];
+  int b;
+  if (w <= 1) b = 0;
+  else if (w <= 4) b = 1;
+  else if (w <= 16) b = 2;
+  else b = 3;
+  bucket_ids[tid] = b;
+}
+
+__global__ void k25_iota_kernel(int32_t* __restrict__ out, int n) {
+  int tid = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+  if (tid >= n) return;
+  out[tid] = tid;
+}
+
+__global__ void k25_bucket_boundaries_kernel(
+    const int32_t* __restrict__ sorted_bucket_ids,
+    int nrows,
+    int32_t* __restrict__ bucket_counts) {
+  // 4 threads, each finds count for one bucket via binary search in sorted array.
+  int b = (int)threadIdx.x;
+  if (b >= 4) return;
+
+  // Find first index where sorted_bucket_ids[i] >= b.
+  int lo = 0, hi = nrows;
+  while (lo < hi) {
+    int mid = (lo + hi) >> 1;
+    if (sorted_bucket_ids[mid] < b) lo = mid + 1;
+    else hi = mid;
+  }
+  int start = lo;
+
+  // Find first index where sorted_bucket_ids[i] >= b+1.
+  lo = start; hi = nrows;
+  while (lo < hi) {
+    int mid = (lo + hi) >> 1;
+    if (sorted_bucket_ids[mid] < (b + 1)) lo = mid + 1;
+    else hi = mid;
+  }
+
+  bucket_counts[b] = lo - start;
+}
+
 }  // namespace
 
 extern "C" cudaError_t guga_unpack_row_jk_launch_stream(

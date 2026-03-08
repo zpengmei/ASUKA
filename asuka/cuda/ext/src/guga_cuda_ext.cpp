@@ -716,9 +716,30 @@ struct Kernel25Workspace {
       profile_dict["nnz_in"] = py::int_(native_profile.nnz_in);
       profile_dict["nnz_out"] = py::int_(native_profile.nnz_out);
       profile_dict["nrows"] = py::int_(native_profile.nrows);
+      profile_dict["bucket_ms"] = py::float_(native_profile.bucket_ms);
+      auto bucket_counts_list = py::list(4);
+      for (int b = 0; b < 4; b++) {
+        bucket_counts_list[b] = py::int_(native_profile.bucket_counts[b]);
+      }
+      profile_dict["bucket_counts"] = bucket_counts_list;
     }
 
     return py::make_tuple(py::int_(h_nrows), py::int_(h_nnz), py::int_(h_nnz_in));
+  }
+
+  py::tuple get_bucket_info() const {
+    if (!ws) return py::make_tuple(false, py::none(), py::none(), py::int_(0));
+    int valid = 0;
+    int offsets[5] = {};
+    int counts[4] = {};
+    void* perm_ptr = nullptr;
+    guga_kernel25_workspace_get_bucket_info(ws, &valid, offsets, counts, &perm_ptr);
+    if (!valid) return py::make_tuple(false, py::none(), py::none(), py::int_(0));
+    auto py_offsets = py::tuple(5);
+    for (int i = 0; i < 5; i++) py_offsets[i] = py::int_(offsets[i]);
+    auto py_counts = py::tuple(4);
+    for (int i = 0; i < 4; i++) py_counts[i] = py::int_(counts[i]);
+    return py::make_tuple(true, py_offsets, py_counts, py::int_((uint64_t)(uintptr_t)perm_ptr));
   }
 
   py::tuple build_from_tasks_deterministic_inplace_device(
@@ -9723,6 +9744,157 @@ void apply_g_flat_gather_epq_transpose_range_inplace_device(
   }
 }
 
+// ---------------------------------------------------------------------------
+// Pair-indexed Apply: reads g_block via full_to_pair index mapping.
+// ---------------------------------------------------------------------------
+void apply_g_pair_gather_epq_transpose_range_inplace_device(
+    const DeviceDRT& drt,
+    const DeviceStateCache& state,
+    py::object epq_t_indptr,
+    py::object epq_t_source,
+    py::object epq_t_pq,
+    py::object epq_t_data,
+    py::object g_block,
+    int k_start,
+    int k_count,
+    py::object full_to_pair_obj,
+    py::object y,
+    py::object overflow,
+    int threads,
+    bool add,
+    uint64_t stream,
+    bool sync,
+    bool check_overflow) {
+  if (state.steps == nullptr) {
+    throw std::runtime_error("DeviceStateCache is not initialized");
+  }
+  if (drt.norb != state.norb) {
+    throw std::invalid_argument("DeviceDRT and DeviceStateCache have inconsistent norb");
+  }
+  if (drt.norb <= 0 || drt.norb > MAX_NORB) {
+    throw std::invalid_argument("norb out of supported range");
+  }
+  if (threads <= 0 || threads > 256) {
+    throw std::invalid_argument("threads must be in 1..256");
+  }
+  if (check_overflow && !sync) {
+    throw std::invalid_argument("check_overflow=True requires sync=True");
+  }
+  if (k_start < 0 || k_count <= 0 || k_start + k_count > state.ncsf) {
+    throw std::invalid_argument("k_start/k_count out of range");
+  }
+  if (y.is_none() || overflow.is_none() || full_to_pair_obj.is_none()) {
+    throw std::invalid_argument("y, overflow, and full_to_pair must be device arrays");
+  }
+
+  auto epq_t_indptr_dev = cuda_array_view_from_object(epq_t_indptr, "epq_t_indptr");
+  int epq_t_indptr_type = epq_indptr_type_from_typestr(epq_t_indptr_dev, "epq_t_indptr");
+  if (epq_t_indptr_dev.shape.size() != 1 || epq_t_indptr_dev.shape[0] != (int64_t)state.ncsf + 1) {
+    throw std::invalid_argument("epq_t_indptr must have shape (ncsf+1,)");
+  }
+
+  auto epq_t_source_dev = cuda_array_view_from_object(epq_t_source, "epq_t_source");
+  require_typestr(epq_t_source_dev, "epq_t_source", "<i4");
+
+  auto epq_t_pq_dev = cuda_array_view_from_object(epq_t_pq, "epq_t_pq");
+  int epq_t_pq_type = epq_pq_type_from_typestr(epq_t_pq_dev, "epq_t_pq");
+
+  auto epq_t_data_dev = cuda_array_view_from_object(epq_t_data, "epq_t_data");
+  std::string epq_t_typestr = normalize_typestr(epq_t_data_dev.typestr);
+  if (epq_t_typestr != "<f8") {
+    throw std::invalid_argument("pair Apply only supports float64 epq_t_data");
+  }
+
+  auto g_block_dev = cuda_array_view_from_object(g_block, "g_block");
+  require_typestr(g_block_dev, "g_block", "<f8");
+  int64_t g_stride = 0;
+  if (g_block_dev.shape.size() == 2) {
+    if (g_block_dev.shape[0] != (int64_t)k_count) {
+      throw std::invalid_argument("g_block (2D) first dim must equal k_count");
+    }
+    if (g_block_dev.strides_bytes.empty()) {
+      g_stride = g_block_dev.shape[1];
+    } else {
+      int64_t s0 = g_block_dev.strides_bytes[0];
+      int64_t s1 = g_block_dev.strides_bytes[1];
+      if (s1 != (int64_t)sizeof(double)) {
+        throw std::invalid_argument("g_block must be C-contiguous along last dim");
+      }
+      g_stride = s0 / (int64_t)sizeof(double);
+    }
+  } else if (g_block_dev.shape.size() == 1) {
+    // Infer stride from total size.
+    g_stride = g_block_dev.shape[0] / (int64_t)k_count;
+  } else {
+    throw std::invalid_argument("g_block must be 1D or 2D");
+  }
+
+  auto y_dev = cuda_array_view_from_object(y, "y");
+  require_typestr(y_dev, "y", "<f8");
+  if (y_dev.read_only) {
+    throw std::invalid_argument("y must be writable");
+  }
+  if (y_dev.shape.size() != 1 || y_dev.shape[0] != (int64_t)state.ncsf) {
+    throw std::invalid_argument("y must have shape (ncsf,)");
+  }
+
+  int64_t nops_ll = (int64_t)drt.norb * (int64_t)drt.norb;
+  auto ftp_dev = cuda_array_view_from_object(full_to_pair_obj, "full_to_pair");
+  require_typestr(ftp_dev, "full_to_pair", "<i4");
+  if (ftp_dev.shape.size() != 1 || ftp_dev.shape[0] != nops_ll) {
+    throw std::invalid_argument("full_to_pair must have shape (nops,)");
+  }
+
+  auto overflow_dev = cuda_array_view_from_object(overflow, "overflow");
+  require_typestr(overflow_dev, "overflow", "<i4");
+
+  uint64_t stream_u = stream;
+  if (stream_u == 0) {
+    if (y_dev.stream) stream_u = y_dev.stream;
+    else if (g_block_dev.stream) stream_u = g_block_dev.stream;
+  }
+  cudaStream_t stream_t = reinterpret_cast<cudaStream_t>(stream_u);
+
+  int* d_overflow = reinterpret_cast<int*>(overflow_dev.ptr);
+  throw_on_cuda_error(cudaMemsetAsync(d_overflow, 0, sizeof(int), stream_t), "cudaMemsetAsync(overflow=0)");
+
+  guga_apply_g_pair_gather_epq_transpose_range_launch_stream(
+      reinterpret_cast<const int8_t*>(state.steps),
+      state.ncsf,
+      drt.norb,
+      epq_t_indptr_dev.ptr,
+      epq_t_indptr_type,
+      reinterpret_cast<const int32_t*>(epq_t_source_dev.ptr),
+      epq_t_pq_dev.ptr,
+      epq_t_pq_type,
+      reinterpret_cast<const double*>(epq_t_data_dev.ptr),
+      reinterpret_cast<const double*>(g_block_dev.ptr),
+      g_stride,
+      k_start,
+      k_count,
+      reinterpret_cast<const int32_t*>(ftp_dev.ptr),
+      reinterpret_cast<double*>(y_dev.ptr),
+      d_overflow,
+      stream_t,
+      threads,
+      add ? 1 : 0);
+
+  throw_on_cuda_error(cudaGetLastError(), "kernel launch(apply_g_pair)");
+
+  int h_overflow = 0;
+  if (check_overflow) {
+    throw_on_cuda_error(
+        cudaMemcpyAsync(&h_overflow, d_overflow, sizeof(int), cudaMemcpyDeviceToHost, stream_t),
+        "D2H overflow");
+  }
+  if (sync) {
+    throw_on_cuda_error(cudaStreamSynchronize(stream_t), "sync(apply_g_pair)");
+  }
+  if (check_overflow && h_overflow) {
+    throw std::runtime_error("apply_g_pair overflow (invalid indices)");
+  }
+}
+
 void kernel4_apply_csr_eri_mat_fused_epq_table_range_inplace_device(
     const DeviceDRT& drt,
     const DeviceStateCache& state,
@@ -10343,6 +10515,310 @@ void kernel4_build_w_from_csr_unitnnz_inplace_device(
   }
 }
 
+// Bucket-0 W-aggregate: reads width-1 rows from CSR via row_perm pointer.
+void kernel4_build_w_from_csr_bucket0_rawptr(
+    uint64_t row_perm_ptr,
+    int n_bucket0,
+    py::object row_j,
+    py::object row_k,
+    py::object indptr,
+    py::object indices,
+    py::object data,
+    py::object x,
+    py::object w_out,
+    py::object overflow,
+    int ncsf,
+    int nops,
+    int threads,
+    uint64_t stream,
+    bool sync,
+    bool check_overflow) {
+  if (row_perm_ptr == 0) throw std::invalid_argument("row_perm_ptr must be a non-null device pointer");
+  if (n_bucket0 <= 0) return;
+  if (ncsf <= 0 || nops <= 0) throw std::invalid_argument("ncsf and nops must be > 0");
+  if (threads <= 0 || threads > 1024) throw std::invalid_argument("threads must be in 1..1024");
+  if (check_overflow && !sync) throw std::invalid_argument("check_overflow=True requires sync=True");
+
+  auto row_j_dev = cuda_array_view_from_object(row_j, "row_j");
+  auto row_k_dev = cuda_array_view_from_object(row_k, "row_k");
+  auto indptr_dev = cuda_array_view_from_object(indptr, "indptr");
+  auto indices_dev = cuda_array_view_from_object(indices, "indices");
+  auto data_dev = cuda_array_view_from_object(data, "data");
+  auto x_dev = cuda_array_view_from_object(x, "x");
+  auto w_out_dev = cuda_array_view_from_object(w_out, "w_out");
+  auto overflow_dev = cuda_array_view_from_object(overflow, "overflow");
+
+  require_typestr(row_j_dev, "row_j", "<i4");
+  require_typestr(row_k_dev, "row_k", "<i4");
+  require_typestr(indptr_dev, "indptr", "<i8");
+  require_typestr(indices_dev, "indices", "<i4");
+  require_typestr(data_dev, "data", "<f8");
+  require_typestr(x_dev, "x", "<f8");
+  require_typestr(w_out_dev, "w_out", "<f8");
+  require_typestr(overflow_dev, "overflow", "<i4");
+
+  int64_t w_stride = nops;
+  if (w_out_dev.shape.size() == 2) {
+    if (w_out_dev.strides_bytes.empty()) {
+      w_stride = w_out_dev.shape[1];
+    } else {
+      w_stride = w_out_dev.strides_bytes[0] / (int64_t)sizeof(double);
+    }
+  }
+
+  uint64_t stream_u = stream;
+  if (stream_u == 0) {
+    if (w_out_dev.stream) stream_u = w_out_dev.stream;
+    else if (x_dev.stream) stream_u = x_dev.stream;
+  }
+  cudaStream_t stream_t = reinterpret_cast<cudaStream_t>(stream_u);
+
+  int* d_overflow = reinterpret_cast<int*>(overflow_dev.ptr);
+  throw_on_cuda_error(cudaMemsetAsync(d_overflow, 0, sizeof(int), stream_t), "cudaMemsetAsync(overflow=0)");
+
+  guga_build_w_from_csr_bucket0_launch_stream(
+      reinterpret_cast<const int32_t*>((uintptr_t)row_perm_ptr),
+      reinterpret_cast<const int32_t*>(row_j_dev.ptr),
+      reinterpret_cast<const int32_t*>(row_k_dev.ptr),
+      reinterpret_cast<const int64_t*>(indptr_dev.ptr),
+      reinterpret_cast<const int32_t*>(indices_dev.ptr),
+      reinterpret_cast<const double*>(data_dev.ptr),
+      n_bucket0,
+      reinterpret_cast<const double*>(x_dev.ptr),
+      ncsf, nops,
+      reinterpret_cast<double*>(w_out_dev.ptr),
+      w_stride,
+      d_overflow,
+      stream_t,
+      threads);
+  throw_on_cuda_error(cudaGetLastError(), "kernel launch(build_w_from_csr_bucket0)");
+
+  int h_overflow = 0;
+  if (check_overflow) {
+    throw_on_cuda_error(cudaMemcpyAsync(&h_overflow, d_overflow, sizeof(int), cudaMemcpyDeviceToHost, stream_t),
+                        "D2H overflow");
+  }
+  if (sync) {
+    throw_on_cuda_error(cudaStreamSynchronize(stream_t), "cudaStreamSynchronize(build_w_from_csr_bucket0)");
+  }
+  if (check_overflow && h_overflow) {
+    throw std::runtime_error("build_w_from_csr_bucket0 overflow (invalid indices)");
+  }
+}
+
+// Fused apply with row_perm: processes permuted subset of CSR rows.
+void kernel4_apply_csr_fused_perm_rawptr(
+    uint64_t row_perm_ptr,
+    int nrows_perm,
+    const DeviceStateCache& state,
+    py::object epq_indptr,
+    py::object epq_indices,
+    py::object epq_pq,
+    py::object epq_data,
+    py::object row_j,
+    py::object row_k,
+    py::object indptr,
+    py::object indices,
+    py::object data,
+    py::object eri_mat_t,
+    py::object x,
+    py::object y,
+    py::object overflow,
+    int nops,
+    int threads,
+    uint64_t stream,
+    bool sync,
+    bool check_overflow) {
+  if (row_perm_ptr == 0) throw std::invalid_argument("row_perm_ptr must be a non-null device pointer");
+  if (nrows_perm <= 0) return;
+  if (nops <= 0) throw std::invalid_argument("nops must be > 0");
+  if (threads <= 0 || threads > 1024) throw std::invalid_argument("threads must be in 1..1024");
+  if (check_overflow && !sync) throw std::invalid_argument("check_overflow=True requires sync=True");
+
+  auto epq_indptr_dev = cuda_array_view_from_object(epq_indptr, "epq_indptr");
+  auto epq_indices_dev = cuda_array_view_from_object(epq_indices, "epq_indices");
+  auto epq_pq_dev = cuda_array_view_from_object(epq_pq, "epq_pq");
+  auto epq_data_dev = cuda_array_view_from_object(epq_data, "epq_data");
+  auto row_j_dev = cuda_array_view_from_object(row_j, "row_j");
+  auto row_k_dev = cuda_array_view_from_object(row_k, "row_k");
+  auto indptr_dev = cuda_array_view_from_object(indptr, "indptr");
+  auto indices_dev = cuda_array_view_from_object(indices, "indices");
+  auto data_dev = cuda_array_view_from_object(data, "data");
+  auto eri_mat_dev = cuda_array_view_from_object(eri_mat_t, "eri_mat_t");
+  auto x_dev = cuda_array_view_from_object(x, "x");
+  auto y_dev = cuda_array_view_from_object(y, "y");
+  auto overflow_dev = cuda_array_view_from_object(overflow, "overflow");
+
+  require_typestr(epq_indptr_dev, "epq_indptr", "<i8");
+  require_typestr(epq_indices_dev, "epq_indices", "<i4");
+  int epq_pq_type = epq_pq_type_from_typestr(epq_pq_dev, "epq_pq");
+  require_typestr(epq_data_dev, "epq_data", "<f8");
+  require_typestr(row_j_dev, "row_j", "<i4");
+  require_typestr(row_k_dev, "row_k", "<i4");
+  require_typestr(indptr_dev, "indptr", "<i8");
+  require_typestr(indices_dev, "indices", "<i4");
+  require_typestr(data_dev, "data", "<f8");
+  require_typestr(eri_mat_dev, "eri_mat_t", "<f8");
+  require_typestr(x_dev, "x", "<f8");
+  require_typestr(y_dev, "y", "<f8");
+  require_typestr(overflow_dev, "overflow", "<i4");
+
+  uint64_t stream_u = stream;
+  if (stream_u == 0) {
+    if (y_dev.stream) stream_u = y_dev.stream;
+    else if (x_dev.stream) stream_u = x_dev.stream;
+  }
+  cudaStream_t stream_t = reinterpret_cast<cudaStream_t>(stream_u);
+
+  int* d_overflow = reinterpret_cast<int*>(overflow_dev.ptr);
+  throw_on_cuda_error(cudaMemsetAsync(d_overflow, 0, sizeof(int), stream_t), "cudaMemsetAsync(overflow=0)");
+
+  int norb = (int)state.norb;
+  guga_apply_csr_eri_mat_fused_epq_table_range_perm_launch_stream(
+      reinterpret_cast<const int8_t*>(state.steps),
+      int(state.ncsf),
+      norb,
+      reinterpret_cast<const int64_t*>(epq_indptr_dev.ptr),
+      reinterpret_cast<const int32_t*>(epq_indices_dev.ptr),
+      reinterpret_cast<const void*>(epq_pq_dev.ptr),
+      epq_pq_type,
+      reinterpret_cast<const double*>(epq_data_dev.ptr),
+      reinterpret_cast<const int32_t*>(row_j_dev.ptr),
+      reinterpret_cast<const int32_t*>(row_k_dev.ptr),
+      reinterpret_cast<const int64_t*>(indptr_dev.ptr),
+      reinterpret_cast<const int32_t*>(indices_dev.ptr),
+      reinterpret_cast<const double*>(data_dev.ptr),
+      reinterpret_cast<const int32_t*>((uintptr_t)row_perm_ptr),
+      nrows_perm,
+      reinterpret_cast<const double*>(eri_mat_dev.ptr),
+      nops,
+      0.5,
+      reinterpret_cast<const double*>(x_dev.ptr),
+      reinterpret_cast<double*>(y_dev.ptr),
+      d_overflow,
+      stream_t,
+      threads);
+  throw_on_cuda_error(cudaGetLastError(), "kernel launch(fused_perm)");
+
+  int h_overflow = 0;
+  if (check_overflow) {
+    throw_on_cuda_error(cudaMemcpyAsync(&h_overflow, d_overflow, sizeof(int), cudaMemcpyDeviceToHost, stream_t),
+                        "D2H overflow");
+  }
+  if (sync) {
+    throw_on_cuda_error(cudaStreamSynchronize(stream_t), "cudaStreamSynchronize(fused_perm)");
+  }
+  if (check_overflow && h_overflow) {
+    throw std::runtime_error("fused_perm overflow (invalid indices)");
+  }
+}
+
+void kernel4_apply_csr_narrow_fused_perm_rawptr(
+    uint64_t row_perm_ptr,
+    int nrows_perm,
+    const DeviceStateCache& state,
+    py::object epq_indptr,
+    py::object epq_indices,
+    py::object epq_pq,
+    py::object epq_data,
+    py::object row_j,
+    py::object row_k,
+    py::object indptr,
+    py::object indices,
+    py::object data,
+    py::object eri_mat_t,
+    py::object x,
+    py::object y,
+    py::object overflow,
+    int nops,
+    int threads,
+    uint64_t stream,
+    bool sync,
+    bool check_overflow) {
+  if (row_perm_ptr == 0) throw std::invalid_argument("row_perm_ptr must be a non-null device pointer");
+  if (nrows_perm <= 0) return;
+  if (nops <= 0) throw std::invalid_argument("nops must be > 0");
+  if (threads <= 0 || threads > 1024) throw std::invalid_argument("threads must be in 1..1024");
+  if (check_overflow && !sync) throw std::invalid_argument("check_overflow=True requires sync=True");
+
+  auto epq_indptr_dev = cuda_array_view_from_object(epq_indptr, "epq_indptr");
+  auto epq_indices_dev = cuda_array_view_from_object(epq_indices, "epq_indices");
+  auto epq_pq_dev = cuda_array_view_from_object(epq_pq, "epq_pq");
+  auto epq_data_dev = cuda_array_view_from_object(epq_data, "epq_data");
+  auto row_j_dev = cuda_array_view_from_object(row_j, "row_j");
+  auto row_k_dev = cuda_array_view_from_object(row_k, "row_k");
+  auto indptr_dev = cuda_array_view_from_object(indptr, "indptr");
+  auto indices_dev = cuda_array_view_from_object(indices, "indices");
+  auto data_dev = cuda_array_view_from_object(data, "data");
+  auto eri_mat_dev = cuda_array_view_from_object(eri_mat_t, "eri_mat_t");
+  auto x_dev = cuda_array_view_from_object(x, "x");
+  auto y_dev = cuda_array_view_from_object(y, "y");
+  auto overflow_dev = cuda_array_view_from_object(overflow, "overflow");
+
+  require_typestr(epq_indptr_dev, "epq_indptr", "<i8");
+  require_typestr(epq_indices_dev, "epq_indices", "<i4");
+  int epq_pq_type = epq_pq_type_from_typestr(epq_pq_dev, "epq_pq");
+  require_typestr(epq_data_dev, "epq_data", "<f8");
+  require_typestr(row_j_dev, "row_j", "<i4");
+  require_typestr(row_k_dev, "row_k", "<i4");
+  require_typestr(indptr_dev, "indptr", "<i8");
+  require_typestr(indices_dev, "indices", "<i4");
+  require_typestr(data_dev, "data", "<f8");
+  require_typestr(eri_mat_dev, "eri_mat_t", "<f8");
+  require_typestr(x_dev, "x", "<f8");
+  require_typestr(y_dev, "y", "<f8");
+  require_typestr(overflow_dev, "overflow", "<i4");
+
+  uint64_t stream_u = stream;
+  if (stream_u == 0) {
+    if (y_dev.stream) stream_u = y_dev.stream;
+    else if (x_dev.stream) stream_u = x_dev.stream;
+  }
+  cudaStream_t stream_t = reinterpret_cast<cudaStream_t>(stream_u);
+
+  int* d_overflow = reinterpret_cast<int*>(overflow_dev.ptr);
+  throw_on_cuda_error(cudaMemsetAsync(d_overflow, 0, sizeof(int), stream_t), "cudaMemsetAsync(overflow=0)");
+
+  int norb = (int)state.norb;
+  guga_apply_csr_narrow_fused_epq_perm_launch_stream(
+      reinterpret_cast<const int8_t*>(state.steps),
+      int(state.ncsf),
+      norb,
+      reinterpret_cast<const int64_t*>(epq_indptr_dev.ptr),
+      reinterpret_cast<const int32_t*>(epq_indices_dev.ptr),
+      reinterpret_cast<const void*>(epq_pq_dev.ptr),
+      epq_pq_type,
+      reinterpret_cast<const double*>(epq_data_dev.ptr),
+      reinterpret_cast<const int32_t*>(row_j_dev.ptr),
+      reinterpret_cast<const int32_t*>(row_k_dev.ptr),
+      reinterpret_cast<const int64_t*>(indptr_dev.ptr),
+      reinterpret_cast<const int32_t*>(indices_dev.ptr),
+      reinterpret_cast<const double*>(data_dev.ptr),
+      reinterpret_cast<const int32_t*>((uintptr_t)row_perm_ptr),
+      nrows_perm,
+      reinterpret_cast<const double*>(eri_mat_dev.ptr),
+      nops,
+      0.5,
+      reinterpret_cast<const double*>(x_dev.ptr),
+      reinterpret_cast<double*>(y_dev.ptr),
+      d_overflow,
+      stream_t,
+      threads);
+  throw_on_cuda_error(cudaGetLastError(), "kernel launch(narrow_fused_perm)");
+
+  int h_overflow = 0;
+  if (check_overflow) {
+    throw_on_cuda_error(cudaMemcpyAsync(&h_overflow, d_overflow, sizeof(int), cudaMemcpyDeviceToHost, stream_t),
+                        "D2H overflow");
+  }
+  if (sync) {
+    throw_on_cuda_error(cudaStreamSynchronize(stream_t), "cudaStreamSynchronize(narrow_fused_perm)");
+  }
+  if (check_overflow && h_overflow) {
+    throw std::runtime_error("narrow_fused_perm overflow (invalid indices)");
+  }
+}
+
 void build_w_from_epq_table_inplace_device(
     const DeviceStateCache& state,
     py::object epq_indptr,
@@ -10945,6 +11421,166 @@ void build_w_from_epq_transpose_range_inplace_device(
   }
   if (check_overflow && h_overflow) {
     throw std::runtime_error("build_w_from_epq_transpose_range overflow (invalid indices)");
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Pair-indexed W-build: writes to pair-indexed output via full_to_pair.
+// ---------------------------------------------------------------------------
+void build_w_pair_from_epq_transpose_range_inplace_device(
+    const DeviceStateCache& state,
+    py::object epq_t_indptr,
+    py::object epq_t_source,
+    py::object epq_t_pq,
+    py::object epq_t_data,
+    py::object x,
+    py::object w_out,
+    py::object full_to_pair_obj,
+    int ncol,
+    py::object overflow,
+    int threads,
+    uint64_t stream,
+    bool sync,
+    bool check_overflow,
+    int k_start,
+    int k_count) {
+  if (state.norb <= 0 || state.norb > MAX_NORB) {
+    throw std::invalid_argument("norb out of supported range");
+  }
+  if (threads <= 0 || threads > 1024) {
+    throw std::invalid_argument("threads must be in 1..1024");
+  }
+  if (check_overflow && !sync) {
+    throw std::invalid_argument("check_overflow=True requires sync=True");
+  }
+  if (ncol <= 0) {
+    throw std::invalid_argument("ncol must be > 0");
+  }
+  if (overflow.is_none() || w_out.is_none() || full_to_pair_obj.is_none()) {
+    throw std::invalid_argument("overflow, w_out, and full_to_pair must be device arrays");
+  }
+  if (k_start < 0 || k_start >= state.ncsf) {
+    throw std::invalid_argument("k_start out of range");
+  }
+  int eff_k_count = (k_count > 0) ? k_count : (state.ncsf - k_start);
+  if (eff_k_count <= 0 || k_start + eff_k_count > state.ncsf) {
+    throw std::invalid_argument("k_count out of range");
+  }
+
+  auto epq_t_indptr_dev = cuda_array_view_from_object(epq_t_indptr, "epq_t_indptr");
+  int epq_t_indptr_type = epq_indptr_type_from_typestr(epq_t_indptr_dev, "epq_t_indptr");
+  if (epq_t_indptr_dev.shape.size() != 1 || epq_t_indptr_dev.shape[0] != (int64_t)state.ncsf + 1) {
+    throw std::invalid_argument("epq_t_indptr must have shape (ncsf+1,)");
+  }
+
+  auto epq_t_source_dev = cuda_array_view_from_object(epq_t_source, "epq_t_source");
+  require_typestr(epq_t_source_dev, "epq_t_source", "<i4");
+
+  auto epq_t_pq_dev = cuda_array_view_from_object(epq_t_pq, "epq_t_pq");
+  int epq_t_pq_type = epq_pq_type_from_typestr(epq_t_pq_dev, "epq_t_pq");
+
+  auto epq_t_data_dev = cuda_array_view_from_object(epq_t_data, "epq_t_data");
+  std::string epq_t_typestr = normalize_typestr(epq_t_data_dev.typestr);
+  if (epq_t_typestr != "<f8") {
+    throw std::invalid_argument("pair W-build only supports float64 epq_t_data");
+  }
+
+  auto x_dev = cuda_array_view_from_object(x, "x");
+  std::string x_typestr = normalize_typestr(x_dev.typestr);
+  if (x_typestr != "<f8") {
+    throw std::invalid_argument("pair W-build only supports float64 x");
+  }
+  if (x_dev.shape.size() != 1 || x_dev.shape[0] != (int64_t)state.ncsf) {
+    throw std::invalid_argument("x must have shape (ncsf,)");
+  }
+
+  int64_t nops_ll = (int64_t)state.norb * (int64_t)state.norb;
+  int nops = (int)nops_ll;
+
+  auto w_out_dev = cuda_array_view_from_object(w_out, "w_out");
+  require_typestr(w_out_dev, "w_out", "<f8");
+  if (w_out_dev.read_only) {
+    throw std::invalid_argument("w_out must be writable");
+  }
+  int64_t w_stride = 0;
+  if (w_out_dev.shape.size() == 2) {
+    if (w_out_dev.shape[0] != (int64_t)eff_k_count) {
+      throw std::invalid_argument("w_out (2D) must have shape (k_count, ncol_or_more)");
+    }
+    if (w_out_dev.shape[1] < (int64_t)ncol) {
+      throw std::invalid_argument("w_out (2D) second dimension too small for ncol");
+    }
+    if (w_out_dev.strides_bytes.empty()) {
+      w_stride = w_out_dev.shape[1];
+    } else {
+      int64_t s0 = w_out_dev.strides_bytes[0];
+      int64_t s1 = w_out_dev.strides_bytes[1];
+      if (s1 != (int64_t)sizeof(double)) {
+        throw std::invalid_argument("w_out must be C-contiguous along last dimension");
+      }
+      w_stride = s0 / (int64_t)sizeof(double);
+    }
+  } else if (w_out_dev.shape.size() == 1) {
+    if (w_out_dev.shape[0] < (int64_t)eff_k_count * (int64_t)ncol) {
+      throw std::invalid_argument("w_out (1D) too small");
+    }
+    w_stride = (int64_t)ncol;
+  } else {
+    throw std::invalid_argument("w_out must be 1D or 2D");
+  }
+
+  auto ftp_dev = cuda_array_view_from_object(full_to_pair_obj, "full_to_pair");
+  require_typestr(ftp_dev, "full_to_pair", "<i4");
+  if (ftp_dev.shape.size() != 1 || ftp_dev.shape[0] != nops_ll) {
+    throw std::invalid_argument("full_to_pair must have shape (nops,)");
+  }
+
+  auto overflow_dev = cuda_array_view_from_object(overflow, "overflow");
+  require_typestr(overflow_dev, "overflow", "<i4");
+
+  uint64_t stream_u = stream;
+  if (stream_u == 0) {
+    if (w_out_dev.stream) stream_u = w_out_dev.stream;
+    else if (x_dev.stream) stream_u = x_dev.stream;
+  }
+  cudaStream_t stream_t = reinterpret_cast<cudaStream_t>(stream_u);
+
+  int* d_overflow = reinterpret_cast<int*>(overflow_dev.ptr);
+  throw_on_cuda_error(cudaMemsetAsync(d_overflow, 0, sizeof(int), stream_t), "cudaMemsetAsync(overflow=0)");
+
+  guga_build_w_pair_from_epq_transpose_range_launch_stream(
+      epq_t_indptr_dev.ptr,
+      epq_t_indptr_type,
+      reinterpret_cast<const int32_t*>(epq_t_source_dev.ptr),
+      epq_t_pq_dev.ptr,
+      epq_t_pq_type,
+      reinterpret_cast<const double*>(epq_t_data_dev.ptr),
+      reinterpret_cast<const double*>(x_dev.ptr),
+      int(state.ncsf),
+      nops,
+      ncol,
+      reinterpret_cast<const int32_t*>(ftp_dev.ptr),
+      reinterpret_cast<double*>(w_out_dev.ptr),
+      w_stride,
+      d_overflow,
+      stream_t,
+      threads,
+      int(k_start),
+      int(eff_k_count));
+
+  throw_on_cuda_error(cudaGetLastError(), "kernel launch(build_w_pair)");
+
+  int h_overflow = 0;
+  if (check_overflow) {
+    throw_on_cuda_error(
+        cudaMemcpyAsync(&h_overflow, d_overflow, sizeof(int), cudaMemcpyDeviceToHost, stream_t),
+        "D2H overflow");
+  }
+  if (sync) {
+    throw_on_cuda_error(cudaStreamSynchronize(stream_t), "sync(build_w_pair)");
+  }
+  if (check_overflow && h_overflow) {
+    throw std::runtime_error("build_w_pair overflow (invalid indices)");
   }
 }
 
@@ -12027,6 +12663,109 @@ void build_w_diag_from_steps_inplace_device(
 
   if (sync) {
     throw_on_cuda_error(cudaStreamSynchronize(stream_t), "cudaStreamSynchronize(build_w_diag_from_steps)");
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Pair-indexed W-diag: writes diagonal via full_to_pair.
+// ---------------------------------------------------------------------------
+void build_w_diag_pair_from_steps_inplace_device(
+    const DeviceStateCache& state,
+    int j_start,
+    int j_count,
+    py::object x,
+    py::object w_out,
+    py::object full_to_pair_obj,
+    int threads,
+    uint64_t stream,
+    bool sync,
+    bool relative_w) {
+  if (state.steps == nullptr) {
+    throw std::runtime_error("DeviceStateCache is not initialized");
+  }
+  if (state.norb <= 0 || state.norb > MAX_NORB) {
+    throw std::invalid_argument("norb out of supported range");
+  }
+  if (j_start < 0 || j_count < 0 || j_start + j_count > state.ncsf) {
+    throw std::invalid_argument("invalid j_start/j_count");
+  }
+  if (threads <= 0 || threads > 1024) {
+    throw std::invalid_argument("threads must be in 1..1024");
+  }
+  if (x.is_none() || w_out.is_none() || full_to_pair_obj.is_none()) {
+    throw std::invalid_argument("x, w_out, and full_to_pair must be device arrays");
+  }
+
+  auto x_dev = cuda_array_view_from_object(x, "x");
+  std::string x_typestr = normalize_typestr(x_dev.typestr);
+  if (x_typestr != "<f8") {
+    throw std::invalid_argument("pair W-diag only supports float64");
+  }
+  if (x_dev.shape.size() != 1 || x_dev.shape[0] != (int64_t)state.ncsf) {
+    throw std::invalid_argument("x must have shape (ncsf,)");
+  }
+
+  int64_t nops_ll = (int64_t)state.norb * (int64_t)state.norb;
+
+  auto w_out_dev = cuda_array_view_from_object(w_out, "w_out");
+  require_typestr(w_out_dev, "w_out", "<f8");
+  if (w_out_dev.read_only) {
+    throw std::invalid_argument("w_out must be writable");
+  }
+  int expected_rows = relative_w ? j_count : (int)state.ncsf;
+  int64_t w_stride = 0;
+  if (w_out_dev.shape.size() == 2) {
+    if (w_out_dev.shape[0] != (int64_t)expected_rows) {
+      throw std::invalid_argument("w_out row count mismatch");
+    }
+    if (w_out_dev.strides_bytes.empty()) {
+      w_stride = w_out_dev.shape[1];
+    } else {
+      int64_t s0 = w_out_dev.strides_bytes[0];
+      int64_t s1 = w_out_dev.strides_bytes[1];
+      if (s1 != (int64_t)sizeof(double)) {
+        throw std::invalid_argument("w_out must be C-contiguous along last dim");
+      }
+      w_stride = s0 / (int64_t)sizeof(double);
+    }
+  } else if (w_out_dev.shape.size() == 1) {
+    w_stride = w_out_dev.shape[0] / (int64_t)expected_rows;
+  } else {
+    throw std::invalid_argument("w_out must be 1D or 2D");
+  }
+
+  auto ftp_dev = cuda_array_view_from_object(full_to_pair_obj, "full_to_pair");
+  require_typestr(ftp_dev, "full_to_pair", "<i4");
+  if (ftp_dev.shape.size() != 1 || ftp_dev.shape[0] != nops_ll) {
+    throw std::invalid_argument("full_to_pair must have shape (nops,)");
+  }
+
+  uint64_t stream_u = stream;
+  if (stream_u == 0) {
+    if (w_out_dev.stream) stream_u = w_out_dev.stream;
+    else if (x_dev.stream) stream_u = x_dev.stream;
+  }
+  cudaStream_t stream_t = reinterpret_cast<cudaStream_t>(stream_u);
+
+  const int8_t* d_steps = reinterpret_cast<const int8_t*>(state.steps);
+  const double* d_x = reinterpret_cast<const double*>(x_dev.ptr);
+  double* d_w = reinterpret_cast<double*>(w_out_dev.ptr);
+  const int32_t* d_ftp = reinterpret_cast<const int32_t*>(ftp_dev.ptr);
+
+  if (j_count > 0) {
+    throw_on_cuda_error(
+        guga_build_w_diag_pair_from_steps_launch_stream(
+            d_steps, state.ncsf, state.norb,
+            int(j_start), int(j_count),
+            d_x, int(nops_ll), d_ftp,
+            d_w, int64_t(w_stride),
+            stream_t, threads, int(relative_w)),
+        "guga_build_w_diag_pair_from_steps_launch_stream");
+    throw_on_cuda_error(cudaGetLastError(), "kernel launch(build_w_diag_pair)");
+  }
+
+  if (sync) {
+    throw_on_cuda_error(cudaStreamSynchronize(stream_t), "sync(build_w_diag_pair)");
   }
 }
 
@@ -17074,6 +17813,7 @@ PYBIND11_MODULE(_guga_cuda_ext, m) {
           py::arg("check_overflow_mode") = 1,
           py::arg("use_fused_count_write") = false,
           py::arg("profile") = py::none())
+      .def("get_bucket_info", &Kernel25Workspace::get_bucket_info)
       .def(
           "build_from_tasks_deterministic_inplace_device",
           &Kernel25Workspace::build_from_tasks_deterministic_inplace_device,
@@ -17632,6 +18372,76 @@ PYBIND11_MODULE(_guga_cuda_ext, m) {
       py::arg("check_overflow") = true);
 
   m.def(
+      "kernel4_build_w_from_csr_bucket0_rawptr",
+      &kernel4_build_w_from_csr_bucket0_rawptr,
+      py::arg("row_perm_ptr"),
+      py::arg("n_bucket0"),
+      py::arg("row_j"),
+      py::arg("row_k"),
+      py::arg("indptr"),
+      py::arg("indices"),
+      py::arg("data"),
+      py::arg("x"),
+      py::arg("w_out"),
+      py::arg("overflow"),
+      py::arg("ncsf"),
+      py::arg("nops"),
+      py::arg("threads") = 256,
+      py::arg("stream") = 0,
+      py::arg("sync") = true,
+      py::arg("check_overflow") = true);
+
+  m.def(
+      "kernel4_apply_csr_fused_perm_rawptr",
+      &kernel4_apply_csr_fused_perm_rawptr,
+      py::arg("row_perm_ptr"),
+      py::arg("nrows_perm"),
+      py::arg("state"),
+      py::arg("epq_indptr"),
+      py::arg("epq_indices"),
+      py::arg("epq_pq"),
+      py::arg("epq_data"),
+      py::arg("row_j"),
+      py::arg("row_k"),
+      py::arg("indptr"),
+      py::arg("indices"),
+      py::arg("data"),
+      py::arg("eri_mat_t"),
+      py::arg("x"),
+      py::arg("y"),
+      py::arg("overflow"),
+      py::arg("nops"),
+      py::arg("threads") = 32,
+      py::arg("stream") = 0,
+      py::arg("sync") = true,
+      py::arg("check_overflow") = true);
+
+  m.def(
+      "kernel4_apply_csr_narrow_fused_perm_rawptr",
+      &kernel4_apply_csr_narrow_fused_perm_rawptr,
+      py::arg("row_perm_ptr"),
+      py::arg("nrows_perm"),
+      py::arg("state"),
+      py::arg("epq_indptr"),
+      py::arg("epq_indices"),
+      py::arg("epq_pq"),
+      py::arg("epq_data"),
+      py::arg("row_j"),
+      py::arg("row_k"),
+      py::arg("indptr"),
+      py::arg("indices"),
+      py::arg("data"),
+      py::arg("eri_mat_t"),
+      py::arg("x"),
+      py::arg("y"),
+      py::arg("overflow"),
+      py::arg("nops"),
+      py::arg("threads") = 32,
+      py::arg("stream") = 0,
+      py::arg("sync") = true,
+      py::arg("check_overflow") = true);
+
+  m.def(
       "build_w_from_epq_table_inplace_device",
       &build_w_from_epq_table_inplace_device,
       py::arg("state"),
@@ -17730,6 +18540,61 @@ PYBIND11_MODULE(_guga_cuda_ext, m) {
       py::arg("j_count"),
       py::arg("x"),
       py::arg("w_out"),
+      py::arg("threads") = 256,
+      py::arg("stream") = 0,
+      py::arg("sync") = true,
+      py::arg("relative_w") = false);
+
+  m.def(
+      "build_w_pair_from_epq_transpose_range_inplace_device",
+      &build_w_pair_from_epq_transpose_range_inplace_device,
+      py::arg("state"),
+      py::arg("epq_t_indptr"),
+      py::arg("epq_t_source"),
+      py::arg("epq_t_pq"),
+      py::arg("epq_t_data"),
+      py::arg("x"),
+      py::arg("w_out"),
+      py::arg("full_to_pair"),
+      py::arg("ncol"),
+      py::arg("overflow"),
+      py::arg("threads") = 256,
+      py::arg("stream") = 0,
+      py::arg("sync") = true,
+      py::arg("check_overflow") = true,
+      py::arg("k_start") = 0,
+      py::arg("k_count") = 0);
+
+  m.def(
+      "apply_g_pair_gather_epq_transpose_range_inplace_device",
+      &apply_g_pair_gather_epq_transpose_range_inplace_device,
+      py::arg("drt"),
+      py::arg("state"),
+      py::arg("epq_t_indptr"),
+      py::arg("epq_t_source"),
+      py::arg("epq_t_pq"),
+      py::arg("epq_t_data"),
+      py::arg("g_block"),
+      py::arg("k_start"),
+      py::arg("k_count"),
+      py::arg("full_to_pair"),
+      py::arg("y"),
+      py::arg("overflow"),
+      py::arg("threads") = 256,
+      py::arg("add") = true,
+      py::arg("stream") = 0,
+      py::arg("sync") = true,
+      py::arg("check_overflow") = true);
+
+  m.def(
+      "build_w_diag_pair_from_steps_inplace_device",
+      &build_w_diag_pair_from_steps_inplace_device,
+      py::arg("state"),
+      py::arg("j_start"),
+      py::arg("j_count"),
+      py::arg("x"),
+      py::arg("w_out"),
+      py::arg("full_to_pair"),
       py::arg("threads") = 256,
       py::arg("stream") = 0,
       py::arg("sync") = true,

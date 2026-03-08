@@ -130,6 +130,75 @@ extern "C" cudaError_t guga_build_w_diag_from_steps_f32_launch_stream(
   return cudaGetLastError();
 }
 
+// ---------------------------------------------------------------------------
+// Pair-indexed variant: W-diag with full_to_pair index mapping.
+// Writes diagonal occupation to pair-indexed column via full_to_pair[r*norb+r].
+// ---------------------------------------------------------------------------
+template <typename T>
+__global__ void build_w_diag_pair_from_steps_kernel_t(
+    const int8_t* __restrict__ steps_table,  // [ncsf,norb]
+    int ncsf,
+    int norb,
+    int j_start,
+    int j_count,
+    const T* __restrict__ x,  // [ncsf]
+    int nops,
+    const int32_t* __restrict__ full_to_pair,  // [nops]
+    T* __restrict__ w_out,  // [rows, w_stride]
+    int64_t w_stride,
+    int relative_w) {
+  int t = (int)blockIdx.x * (int)blockDim.x + (int)threadIdx.x;
+  int total = j_count * norb;
+  if (t >= total) return;
+
+  int j_local = t / norb;
+  int r = t - j_local * norb;
+  int csf_idx = j_start + j_local;
+  if ((unsigned)csf_idx >= (unsigned)ncsf) return;
+
+  T scale = x[csf_idx];
+  if (scale == (T)0) return;
+
+  int8_t step = steps_table[(int64_t)csf_idx * (int64_t)norb + (int64_t)r];
+  int occ_r = step_to_occ(step);
+  if (!occ_r) return;
+
+  int rr = r * norb + r;
+  if ((unsigned)rr >= (unsigned)nops) return;
+  int col = full_to_pair[rr];
+
+  int64_t row_idx = (int64_t)(relative_w ? j_local : csf_idx);
+  w_out[row_idx * w_stride + (int64_t)col] = scale * (T)occ_r;
+}
+
+extern "C" cudaError_t guga_build_w_diag_pair_from_steps_launch_stream(
+    const int8_t* steps_table,
+    int ncsf,
+    int norb,
+    int j_start,
+    int j_count,
+    const double* x,
+    int nops,
+    const int32_t* full_to_pair,
+    double* w_out,
+    int64_t w_stride,
+    cudaStream_t stream,
+    int threads,
+    int relative_w) {
+  if (!steps_table || !x || !w_out || !full_to_pair) return cudaErrorInvalidValue;
+  if (ncsf < 0 || norb < 0 || j_start < 0 || j_count < 0) return cudaErrorInvalidValue;
+  if (nops != norb * norb) return cudaErrorInvalidValue;
+  if (j_start + j_count > ncsf) return cudaErrorInvalidValue;
+  if (threads <= 0 || threads > 1024) return cudaErrorInvalidValue;
+  if (j_count <= 0) return cudaSuccess;
+
+  int total = j_count * norb;
+  int blocks = (total + threads - 1) / threads;
+  build_w_diag_pair_from_steps_kernel_t<double><<<blocks, threads, 0, stream>>>(
+      steps_table, ncsf, norb, j_start, j_count, x, nops, full_to_pair, w_out, w_stride, relative_w);
+  return cudaGetLastError();
+}
+
 __global__ void build_hdiag_det_guess_from_steps_kernel(
     const int8_t* __restrict__ steps_table,      // [ncsf,norb]
     int ncsf,                                    //

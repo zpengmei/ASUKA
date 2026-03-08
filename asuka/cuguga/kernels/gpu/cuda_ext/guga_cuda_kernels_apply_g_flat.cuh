@@ -1568,13 +1568,37 @@ __global__ void guga_apply_g_flat_gather_epq_transpose_range_kernel_t(
     return;
   }
 
-  for (int64_t t = start + (int64_t)threadIdx.x; t < end; t += (int64_t)blockDim.x) {
+  // Binary-search bounded scan (Opt 1): when t_source is sorted within each row,
+  // narrow the iteration range to entries where csf_k ∈ [k_start, k_start+k_count).
+  // Thread 0 performs the binary search, then broadcasts via shared memory.
+  __shared__ int64_t seg_range[2];
+  if ((int)threadIdx.x == 0) {
+    int k_end = k_start + k_count;
+    // Lower bound: first t where epq_t_source[t] >= k_start.
+    int64_t lo = start, hi = end;
+    while (lo < hi) {
+      int64_t mid = lo + (hi - lo) / 2;
+      if (epq_t_source[mid] < k_start) lo = mid + 1; else hi = mid;
+    }
+    seg_range[0] = lo;
+    // Upper bound: first t where epq_t_source[t] >= k_end.
+    hi = end;
+    while (lo < hi) {
+      int64_t mid = lo + (hi - lo) / 2;
+      if (epq_t_source[mid] < k_end) lo = mid + 1; else hi = mid;
+    }
+    seg_range[1] = lo;
+  }
+  __syncthreads();
+  int64_t seg_start = seg_range[0];
+  int64_t seg_end = seg_range[1];
+
+  for (int64_t t = seg_start + (int64_t)threadIdx.x; t < seg_end; t += (int64_t)blockDim.x) {
     int32_t csf_k = epq_t_source[t];
     if ((unsigned)csf_k >= (unsigned)ncsf) {
       atomicExch(overflow_flag, 1);
       continue;
     }
-    if (csf_k < k_start || csf_k >= (k_start + k_count)) continue;
 
     int pq = (int)epq_t_pq[t];
     if ((unsigned)pq >= (unsigned)nops) {
@@ -1780,7 +1804,8 @@ void guga_apply_csr_eri_mat_fused_epq_table_range_warp_kernel_t(
     OUT_T half,
     const OUT_T* __restrict__ x,  // [ncsf]
     OUT_T* __restrict__ y,
-    int* __restrict__ overflow_flag) {
+    int* __restrict__ overflow_flag,
+    const int32_t* __restrict__ row_perm = nullptr) {  // optional: if non-null, row = row_perm[row_local]
   guga_maybe_enable_smem_spilling();
 
   // Warp-cooperative: each warp processes one CSR row, and each block processes `warps_per_block` rows.
@@ -1792,7 +1817,7 @@ void guga_apply_csr_eri_mat_fused_epq_table_range_warp_kernel_t(
   int row_local = (int)blockIdx.x * warps_per_block + warp_id;
   if (row_local >= nrows) return;
 
-  int row = row_start + row_local;
+  int row = (row_perm != nullptr) ? row_perm[row_local] : (row_start + row_local);
   if (row < 0) {
     if (lane == 0) atomicExch(overflow_flag, 1);
     return;
@@ -3945,6 +3970,202 @@ extern "C" void guga_apply_g_flat_gather_epq_transpose_range_f32_kahan_launch_st
   }
 }
 
+// ---------------------------------------------------------------------------
+// Pair-indexed variant: Apply with full_to_pair index mapping.
+// Reads g_block with pair-indexed columns [k_count, g_stride] where g_stride >= npair.
+// full_to_pair[pq] maps full orbital index pq ∈ [0,nops) to pair index ∈ [0,npair).
+// ---------------------------------------------------------------------------
+template <typename INDPTR_T, typename OUT_T, typename COEF_T, typename PQ_T, bool USE_KAHAN = false>
+__global__ void guga_apply_g_pair_gather_epq_transpose_range_kernel_t(
+    const int8_t* __restrict__ steps_table,     // [ncsf,norb]
+    int ncsf,
+    int norb,
+    const INDPTR_T* __restrict__ epq_t_indptr,  // [ncsf+1]
+    const int32_t* __restrict__ epq_t_source,   // [nnz]
+    const PQ_T* __restrict__ epq_t_pq,          // [nnz], values in [0,nops)
+    const COEF_T* __restrict__ epq_t_data,      // [nnz]
+    const OUT_T* __restrict__ g_block,          // [k_count, g_stride]
+    int64_t g_stride,
+    int k_start,
+    int k_count,
+    const int32_t* __restrict__ full_to_pair,   // [nops] -> [0,npair)
+    OUT_T* __restrict__ y,                      // [ncsf]
+    int* __restrict__ overflow_flag,
+    int add) {
+  int csf_i = (int)blockIdx.x;
+  if (csf_i < 0 || csf_i >= ncsf) return;
+
+  int nops = norb * norb;
+  OUT_T sum = (OUT_T)0;
+  OUT_T comp = (OUT_T)0;
+
+  // Diagonal contribution: E_pp for CSFs in the current k-block.
+  if (csf_i >= k_start && csf_i < (k_start + k_count)) {
+    int k_local = csf_i - k_start;
+    const OUT_T* g_row = g_block + (int64_t)k_local * g_stride;
+    const int8_t* steps_i = steps_table + (int64_t)csf_i * (int64_t)norb;
+    for (int p = (int)threadIdx.x; p < norb; p += (int)blockDim.x) {
+      int occ_p = step_to_occ(steps_i[p]);
+      if (!occ_p) continue;
+      int u = full_to_pair[p * norb + p];
+      OUT_T wgt = g_row[u];
+      if (wgt == (OUT_T)0) continue;
+      if constexpr (USE_KAHAN) {
+        kahan_add(sum, comp, (OUT_T)occ_p * wgt);
+      } else {
+        sum += (OUT_T)occ_p * wgt;
+      }
+    }
+  }
+
+  int64_t start = epq_t_indptr[(int64_t)csf_i];
+  int64_t end = epq_t_indptr[(int64_t)csf_i + 1];
+  if (start < 0 || end < start) {
+    if ((int)threadIdx.x == 0) atomicExch(overflow_flag, 1);
+    return;
+  }
+
+  // Binary-search bounded scan.
+  __shared__ int64_t seg_range[2];
+  if ((int)threadIdx.x == 0) {
+    int k_end = k_start + k_count;
+    int64_t lo = start, hi = end;
+    while (lo < hi) {
+      int64_t mid = lo + (hi - lo) / 2;
+      if (epq_t_source[mid] < k_start) lo = mid + 1; else hi = mid;
+    }
+    seg_range[0] = lo;
+    hi = end;
+    while (lo < hi) {
+      int64_t mid = lo + (hi - lo) / 2;
+      if (epq_t_source[mid] < k_end) lo = mid + 1; else hi = mid;
+    }
+    seg_range[1] = lo;
+  }
+  __syncthreads();
+  int64_t seg_start = seg_range[0];
+  int64_t seg_end = seg_range[1];
+
+  for (int64_t t = seg_start + (int64_t)threadIdx.x; t < seg_end; t += (int64_t)blockDim.x) {
+    int32_t csf_k = epq_t_source[t];
+    if ((unsigned)csf_k >= (unsigned)ncsf) {
+      atomicExch(overflow_flag, 1);
+      continue;
+    }
+    int pq = (int)epq_t_pq[t];
+    if ((unsigned)pq >= (unsigned)nops) {
+      atomicExch(overflow_flag, 1);
+      continue;
+    }
+    OUT_T coef = (OUT_T)epq_t_data[t];
+    if (coef == (OUT_T)0) continue;
+    int u = full_to_pair[pq];
+    OUT_T wgt = g_block[(int64_t)(csf_k - k_start) * g_stride + (int64_t)u];
+    if (wgt == (OUT_T)0) continue;
+    if constexpr (USE_KAHAN) {
+      kahan_add(sum, comp, wgt * coef);
+    } else {
+      sum += wgt * coef;
+    }
+  }
+
+  if constexpr (USE_KAHAN) {
+    sum += comp;
+  }
+
+  // Warp reduction.
+  __syncwarp();
+  int lane = (int)threadIdx.x & 31;
+  int warp = (int)threadIdx.x >> 5;
+  int nwarps = ((int)blockDim.x + 31) >> 5;
+  int warp_threads = min(32, (int)blockDim.x - warp * 32);
+  unsigned warp_mask = (warp_threads == 32) ? 0xFFFFFFFFu : ((1u << warp_threads) - 1u);
+  OUT_T v = sum;
+  #pragma unroll
+  for (int off = 16; off > 0; off >>= 1) {
+    v += __shfl_down_sync(warp_mask, v, off);
+  }
+  __shared__ OUT_T warp_sums[8];
+  if (lane == 0) warp_sums[warp] = v;
+  __syncthreads();
+  OUT_T block_sum = ((int)threadIdx.x < nwarps) ? warp_sums[(int)threadIdx.x] : (OUT_T)0;
+  if (warp == 0) {
+    unsigned warp0_threads = min(32, (int)blockDim.x);
+    unsigned warp0_mask = (warp0_threads == 32) ? 0xFFFFFFFFu : ((1u << warp0_threads) - 1u);
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+      block_sum += __shfl_down_sync(warp0_mask, block_sum, off);
+    }
+  }
+  if ((int)threadIdx.x == 0) {
+    if (add) y[csf_i] += block_sum;
+    else y[csf_i] = block_sum;
+  }
+}
+
+extern "C" void guga_apply_g_pair_gather_epq_transpose_range_launch_stream(
+    const int8_t* steps_table,
+    int ncsf,
+    int norb,
+    const void* epq_t_indptr,
+    int epq_t_indptr_type,
+    const int32_t* epq_t_source,
+    const void* epq_t_pq,
+    int epq_t_pq_type,
+    const double* epq_t_data,
+    const double* g_block,
+    int64_t g_stride,
+    int k_start,
+    int k_count,
+    const int32_t* full_to_pair,
+    double* y,
+    int* overflow_flag,
+    cudaStream_t stream,
+    int threads,
+    int add) {
+  if (epq_t_indptr_type != 4 && epq_t_indptr_type != 8) return;
+  if (ncsf <= 0 || k_count <= 0) return;
+  if (epq_t_pq_type != 1 && epq_t_pq_type != 2 && epq_t_pq_type != 4) return;
+  int blocks = ncsf;
+  if (epq_t_indptr_type == 4) {
+    const int32_t* indptr_i32 = reinterpret_cast<const int32_t*>(epq_t_indptr);
+    if (epq_t_pq_type == 1) {
+      guga_apply_g_pair_gather_epq_transpose_range_kernel_t<int32_t, double, double, uint8_t><<<blocks, threads, 0, stream>>>(
+          steps_table, ncsf, norb, indptr_i32, epq_t_source,
+          reinterpret_cast<const uint8_t*>(epq_t_pq), epq_t_data,
+          g_block, g_stride, k_start, k_count, full_to_pair, y, overflow_flag, add);
+    } else if (epq_t_pq_type == 2) {
+      guga_apply_g_pair_gather_epq_transpose_range_kernel_t<int32_t, double, double, uint16_t><<<blocks, threads, 0, stream>>>(
+          steps_table, ncsf, norb, indptr_i32, epq_t_source,
+          reinterpret_cast<const uint16_t*>(epq_t_pq), epq_t_data,
+          g_block, g_stride, k_start, k_count, full_to_pair, y, overflow_flag, add);
+    } else {
+      guga_apply_g_pair_gather_epq_transpose_range_kernel_t<int32_t, double, double, int32_t><<<blocks, threads, 0, stream>>>(
+          steps_table, ncsf, norb, indptr_i32, epq_t_source,
+          reinterpret_cast<const int32_t*>(epq_t_pq), epq_t_data,
+          g_block, g_stride, k_start, k_count, full_to_pair, y, overflow_flag, add);
+    }
+  } else {
+    const int64_t* indptr_i64 = reinterpret_cast<const int64_t*>(epq_t_indptr);
+    if (epq_t_pq_type == 1) {
+      guga_apply_g_pair_gather_epq_transpose_range_kernel_t<int64_t, double, double, uint8_t><<<blocks, threads, 0, stream>>>(
+          steps_table, ncsf, norb, indptr_i64, epq_t_source,
+          reinterpret_cast<const uint8_t*>(epq_t_pq), epq_t_data,
+          g_block, g_stride, k_start, k_count, full_to_pair, y, overflow_flag, add);
+    } else if (epq_t_pq_type == 2) {
+      guga_apply_g_pair_gather_epq_transpose_range_kernel_t<int64_t, double, double, uint16_t><<<blocks, threads, 0, stream>>>(
+          steps_table, ncsf, norb, indptr_i64, epq_t_source,
+          reinterpret_cast<const uint16_t*>(epq_t_pq), epq_t_data,
+          g_block, g_stride, k_start, k_count, full_to_pair, y, overflow_flag, add);
+    } else {
+      guga_apply_g_pair_gather_epq_transpose_range_kernel_t<int64_t, double, double, int32_t><<<blocks, threads, 0, stream>>>(
+          steps_table, ncsf, norb, indptr_i64, epq_t_source,
+          reinterpret_cast<const int32_t*>(epq_t_pq), epq_t_data,
+          g_block, g_stride, k_start, k_count, full_to_pair, y, overflow_flag, add);
+    }
+  }
+}
+
 extern "C" void guga_apply_csr_eri_mat_fused_epq_table_range_launch_stream(
     const int8_t* steps_table,
     int ncsf,
@@ -4115,6 +4336,268 @@ extern "C" void guga_apply_csr_eri_mat_fused_epq_table_range_launch_stream(
           x,
           y,
           overflow_flag);
+    }
+  }
+}
+
+// ============================================================================
+// Phase 3: Width-specialized narrow kernel for bucket 1 (2 <= w <= 4).
+// Avoids full g[nops] shared memory materialization by keeping CSR entries
+// in registers and computing g[pq] on-the-fly during EPQ scatter.
+// ============================================================================
+
+template <int MAX_WIDTH, typename OUT_T, typename COEF_T, typename PQ_T>
+__global__
+void guga_apply_csr_narrow_fused_epq_warp_kernel_t(
+    const int8_t* __restrict__ steps_table,  // [ncsf, norb]
+    int ncsf,
+    int norb,
+    const int64_t* __restrict__ epq_indptr,   // [ncsf+1]
+    const int32_t* __restrict__ epq_indices,  // [epq_nnz]
+    const PQ_T* __restrict__ epq_pq,          // [epq_nnz]
+    const COEF_T* __restrict__ epq_data,      // [epq_nnz]
+    const int32_t* __restrict__ row_j,        // [nrows_total]
+    const int32_t* __restrict__ row_k,        // [nrows_total]
+    const int64_t* __restrict__ csr_indptr,   // [nrows_total+1]
+    const int32_t* __restrict__ csr_indices,  // [csr_nnz_total]
+    const OUT_T* __restrict__ csr_data,       // [csr_nnz_total]
+    const int32_t* __restrict__ row_perm,     // [nrows_bucket] indices into full CSR
+    int nrows,
+    const OUT_T* __restrict__ eri_mat_t,      // [nops, nops] row-major
+    int nops,
+    OUT_T half,
+    const OUT_T* __restrict__ x,              // [ncsf]
+    OUT_T* __restrict__ y,
+    int* __restrict__ overflow_flag) {
+
+  int lane = (int)threadIdx.x & 31;
+  int warp_id = (int)threadIdx.x >> 5;
+  int warps_per_block = (int)blockDim.x >> 5;
+  if (warps_per_block <= 0) return;
+
+  int row_local = (int)blockIdx.x * warps_per_block + warp_id;
+  if (row_local >= nrows) return;
+
+  int row = row_perm[row_local];
+  if (row < 0) {
+    if (lane == 0) atomicExch(overflow_flag, 1);
+    return;
+  }
+
+  int csf_j = row_j[row];
+  int csf_k = row_k[row];
+  if ((unsigned)csf_j >= (unsigned)ncsf || (unsigned)csf_k >= (unsigned)ncsf) {
+    if (lane == 0) atomicExch(overflow_flag, 1);
+    return;
+  }
+
+  OUT_T scale = x[csf_j];
+  if (scale == (OUT_T)0) return;
+  OUT_T scale_half = scale * half;
+
+  int64_t csr_start = csr_indptr[row];
+  int64_t csr_end = csr_indptr[row + 1];
+  int nnz_row = (int)(csr_end - csr_start);
+  if (nnz_row <= 0 || nnz_row > MAX_WIDTH) {
+    // Shouldn't happen if bucketing is correct, but guard anyway.
+    if (lane == 0 && nnz_row > MAX_WIDTH) atomicExch(overflow_flag, 1);
+    return;
+  }
+
+  // Load CSR entries into registers.
+  int32_t reg_rs[MAX_WIDTH];
+  OUT_T reg_c[MAX_WIDTH];
+  #pragma unroll
+  for (int t = 0; t < MAX_WIDTH; t++) {
+    if (t < nnz_row) {
+      reg_rs[t] = csr_indices[csr_start + t];
+      reg_c[t] = csr_data[csr_start + t];
+    } else {
+      reg_rs[t] = 0;
+      reg_c[t] = (OUT_T)0;
+    }
+  }
+
+  // Diagonal (p==q) contribution to y[csf_k] — lane 0 only.
+  if (lane == 0) {
+    const int8_t* steps = steps_table + (int64_t)csf_k * (int64_t)norb;
+    OUT_T diag = (OUT_T)0;
+    for (int p = 0; p < norb; p++) {
+      int occ_p = step_to_occ(steps[p]);
+      if (!occ_p) continue;
+      int pq_pp = p * norb + p;
+      OUT_T g_pp = (OUT_T)0;
+      #pragma unroll
+      for (int t = 0; t < MAX_WIDTH; t++) {
+        if (t < nnz_row) {
+          g_pp += eri_mat_t[(int64_t)reg_rs[t] * (int64_t)nops + (int64_t)pq_pp] * reg_c[t];
+        }
+      }
+      diag += scale_half * g_pp * (OUT_T)occ_p;
+    }
+    if (diag != (OUT_T)0) atomicAdd(&y[csf_k], diag);
+  }
+
+  // EPQ scatter: compute g[pq] on-the-fly for each EPQ entry.
+  int64_t epq_start = epq_indptr[(int64_t)csf_k];
+  int64_t epq_end = epq_indptr[(int64_t)csf_k + 1];
+  if (epq_start < 0 || epq_end < epq_start) {
+    if (lane == 0) atomicExch(overflow_flag, 1);
+    return;
+  }
+
+  for (int64_t t = epq_start + (int64_t)lane; t < epq_end; t += 32) {
+    int32_t csf_i = epq_indices[t];
+    if ((unsigned)csf_i >= (unsigned)ncsf) {
+      atomicExch(overflow_flag, 1);
+      continue;
+    }
+    int pq = (int)epq_pq[t];
+    if ((unsigned)pq >= (unsigned)nops) {
+      atomicExch(overflow_flag, 1);
+      continue;
+    }
+    OUT_T w = (OUT_T)epq_data[t];
+    if (w == (OUT_T)0) continue;
+
+    // Compute g[pq] on-the-fly from register-cached CSR entries.
+    OUT_T g_pq = (OUT_T)0;
+    #pragma unroll
+    for (int s = 0; s < MAX_WIDTH; s++) {
+      if (s < nnz_row) {
+        g_pq += eri_mat_t[(int64_t)reg_rs[s] * (int64_t)nops + (int64_t)pq] * reg_c[s];
+      }
+    }
+    g_pq *= scale_half;
+    if (g_pq != (OUT_T)0) atomicAdd(&y[csf_i], g_pq * w);
+  }
+}
+
+// Narrow kernel launcher for bucket 1 (MAX_WIDTH=4, no shared memory).
+extern "C" void guga_apply_csr_narrow_fused_epq_perm_launch_stream(
+    const int8_t* steps_table,
+    int ncsf,
+    int norb,
+    const int64_t* epq_indptr,
+    const int32_t* epq_indices,
+    const void* epq_pq,
+    int epq_pq_type,
+    const double* epq_data,
+    const int32_t* row_j,
+    const int32_t* row_k,
+    const int64_t* csr_indptr,
+    const int32_t* csr_indices,
+    const double* csr_data,
+    const int32_t* row_perm,
+    int nrows,
+    const double* eri_mat_t,
+    int nops,
+    double half,
+    const double* x,
+    double* y,
+    int* overflow_flag,
+    cudaStream_t stream,
+    int threads) {
+  if (nrows <= 0 || nops <= 0) return;
+  if (epq_pq_type != 1 && epq_pq_type != 2 && epq_pq_type != 4) return;
+  int thr = (threads >= 32 && (threads % 32) == 0) ? threads : 32;
+  int warps = thr / 32;
+  int blocks = (nrows + warps - 1) / warps;
+  // No shared memory needed — CSR entries stored in registers.
+  if (epq_pq_type == 1) {
+    guga_apply_csr_narrow_fused_epq_warp_kernel_t<4, double, double, uint8_t><<<blocks, thr, 0, stream>>>(
+        steps_table, ncsf, norb, epq_indptr, epq_indices,
+        reinterpret_cast<const uint8_t*>(epq_pq), epq_data,
+        row_j, row_k, csr_indptr, csr_indices, csr_data,
+        row_perm, nrows, eri_mat_t, nops, half, x, y, overflow_flag);
+  } else if (epq_pq_type == 2) {
+    guga_apply_csr_narrow_fused_epq_warp_kernel_t<4, double, double, uint16_t><<<blocks, thr, 0, stream>>>(
+        steps_table, ncsf, norb, epq_indptr, epq_indices,
+        reinterpret_cast<const uint16_t*>(epq_pq), epq_data,
+        row_j, row_k, csr_indptr, csr_indices, csr_data,
+        row_perm, nrows, eri_mat_t, nops, half, x, y, overflow_flag);
+  } else {
+    guga_apply_csr_narrow_fused_epq_warp_kernel_t<4, double, double, int32_t><<<blocks, thr, 0, stream>>>(
+        steps_table, ncsf, norb, epq_indptr, epq_indices,
+        reinterpret_cast<const int32_t*>(epq_pq), epq_data,
+        row_j, row_k, csr_indptr, csr_indices, csr_data,
+        row_perm, nrows, eri_mat_t, nops, half, x, y, overflow_flag);
+  }
+}
+
+// Row-perm-aware launcher: routes rows via explicit permutation array instead of contiguous range.
+extern "C" void guga_apply_csr_eri_mat_fused_epq_table_range_perm_launch_stream(
+    const int8_t* steps_table,
+    int ncsf,
+    int norb,
+    const int64_t* epq_indptr,
+    const int32_t* epq_indices,
+    const void* epq_pq,
+    int epq_pq_type,
+    const double* epq_data,
+    const int32_t* row_j,
+    const int32_t* row_k,
+    const int64_t* csr_indptr,
+    const int32_t* csr_indices,
+    const double* csr_data,
+    const int32_t* row_perm,
+    int nrows,
+    const double* eri_mat_t,
+    int nops,
+    double half,
+    const double* x,
+    double* y,
+    int* overflow_flag,
+    cudaStream_t stream,
+    int threads) {
+  if (nrows <= 0 || nops <= 0) return;
+  if (epq_pq_type != 1 && epq_pq_type != 2 && epq_pq_type != 4) return;
+  if (threads >= 32 && (threads % 32) == 0) {
+    int warps = threads / 32;
+    int blocks = (nrows + warps - 1) / warps;
+    size_t smem_bytes = (size_t)warps * (size_t)nops * sizeof(double);
+    if (epq_pq_type == 1) {
+      guga_apply_csr_eri_mat_fused_epq_table_range_warp_kernel_t<double, double, uint8_t><<<blocks, threads, smem_bytes, stream>>>(
+          steps_table, ncsf, norb, epq_indptr, epq_indices,
+          reinterpret_cast<const uint8_t*>(epq_pq), epq_data,
+          row_j, row_k, csr_indptr, csr_indices, csr_data,
+          /*row_start=*/0, nrows, eri_mat_t, nops, half, x, y, overflow_flag, row_perm);
+    } else if (epq_pq_type == 2) {
+      guga_apply_csr_eri_mat_fused_epq_table_range_warp_kernel_t<double, double, uint16_t><<<blocks, threads, smem_bytes, stream>>>(
+          steps_table, ncsf, norb, epq_indptr, epq_indices,
+          reinterpret_cast<const uint16_t*>(epq_pq), epq_data,
+          row_j, row_k, csr_indptr, csr_indices, csr_data,
+          /*row_start=*/0, nrows, eri_mat_t, nops, half, x, y, overflow_flag, row_perm);
+    } else {
+      guga_apply_csr_eri_mat_fused_epq_table_range_warp_kernel_t<double, double, int32_t><<<blocks, threads, smem_bytes, stream>>>(
+          steps_table, ncsf, norb, epq_indptr, epq_indices,
+          reinterpret_cast<const int32_t*>(epq_pq), epq_data,
+          row_j, row_k, csr_indptr, csr_indices, csr_data,
+          /*row_start=*/0, nrows, eri_mat_t, nops, half, x, y, overflow_flag, row_perm);
+    }
+  } else {
+    // Fallback: single-warp-per-block path does not support row_perm directly;
+    // use the warp path with threads=32 as minimum.
+    int blocks = (nrows + 0) / 1;  // 1 warp per block
+    size_t smem_bytes = (size_t)nops * sizeof(double);
+    if (epq_pq_type == 1) {
+      guga_apply_csr_eri_mat_fused_epq_table_range_warp_kernel_t<double, double, uint8_t><<<blocks, 32, smem_bytes, stream>>>(
+          steps_table, ncsf, norb, epq_indptr, epq_indices,
+          reinterpret_cast<const uint8_t*>(epq_pq), epq_data,
+          row_j, row_k, csr_indptr, csr_indices, csr_data,
+          /*row_start=*/0, nrows, eri_mat_t, nops, half, x, y, overflow_flag, row_perm);
+    } else if (epq_pq_type == 2) {
+      guga_apply_csr_eri_mat_fused_epq_table_range_warp_kernel_t<double, double, uint16_t><<<blocks, 32, smem_bytes, stream>>>(
+          steps_table, ncsf, norb, epq_indptr, epq_indices,
+          reinterpret_cast<const uint16_t*>(epq_pq), epq_data,
+          row_j, row_k, csr_indptr, csr_indices, csr_data,
+          /*row_start=*/0, nrows, eri_mat_t, nops, half, x, y, overflow_flag, row_perm);
+    } else {
+      guga_apply_csr_eri_mat_fused_epq_table_range_warp_kernel_t<double, double, int32_t><<<blocks, 32, smem_bytes, stream>>>(
+          steps_table, ncsf, norb, epq_indptr, epq_indices,
+          reinterpret_cast<const int32_t*>(epq_pq), epq_data,
+          row_j, row_k, csr_indptr, csr_indices, csr_data,
+          /*row_start=*/0, nrows, eri_mat_t, nops, half, x, y, overflow_flag, row_perm);
     }
   }
 }
@@ -4441,6 +4924,70 @@ extern "C" void guga_apply_csr_eri_mat_fused_epq_table_range_f32_kahan_launch_st
   }
 }
 
+// ---------------------------------------------------------------------------
+// Bucket-0 W-aggregate kernel: reads width-1 rows from CSR via row_perm.
+// ---------------------------------------------------------------------------
+__global__ void guga_build_w_from_csr_bucket0_kernel(
+    const int32_t* __restrict__ row_perm,       // [n_bucket0] indices into full CSR
+    const int32_t* __restrict__ row_j,           // [nrows_total]
+    const int32_t* __restrict__ row_k,           // [nrows_total]
+    const int64_t* __restrict__ csr_indptr,      // [nrows_total+1]
+    const int32_t* __restrict__ csr_indices,     // [nnz_total]
+    const double* __restrict__ csr_data,         // [nnz_total]
+    int n_bucket0,
+    const double* __restrict__ x,  // [ncsf]
+    int ncsf,
+    int nops,
+    double* __restrict__ w_out,  // [ncsf, w_stride]
+    int64_t w_stride,
+    int* __restrict__ overflow_flag) {
+  int idx = (int)blockIdx.x * (int)blockDim.x + (int)threadIdx.x;
+  if (idx >= n_bucket0) return;
+
+  int row = row_perm[idx];
+  int csf_j = row_j[row];
+  int csf_k = row_k[row];
+
+  // Width-1 row: exactly one CSR entry.
+  int64_t start = csr_indptr[row];
+  int rs = csr_indices[start];
+  double c = csr_data[start];
+
+  if ((unsigned)csf_j >= (unsigned)ncsf || (unsigned)csf_k >= (unsigned)ncsf || (unsigned)rs >= (unsigned)nops) {
+    atomicExch(overflow_flag, 1);
+    return;
+  }
+
+  double scale = x[csf_j];
+  if (scale == 0.0 || c == 0.0) return;
+
+  atomicAdd(&w_out[(int64_t)csf_k * w_stride + (int64_t)rs], scale * c);
+}
+
+extern "C" void guga_build_w_from_csr_bucket0_launch_stream(
+    const int32_t* row_perm,
+    const int32_t* row_j,
+    const int32_t* row_k,
+    const int64_t* csr_indptr,
+    const int32_t* csr_indices,
+    const double* csr_data,
+    int n_bucket0,
+    const double* x,
+    int ncsf,
+    int nops,
+    double* w_out,
+    int64_t w_stride,
+    int* overflow_flag,
+    cudaStream_t stream,
+    int threads) {
+  if (n_bucket0 <= 0) return;
+  if (ncsf <= 0 || nops <= 0) return;
+  int blocks = (n_bucket0 + threads - 1) / threads;
+  guga_build_w_from_csr_bucket0_kernel<<<blocks, threads, 0, stream>>>(
+      row_perm, row_j, row_k, csr_indptr, csr_indices, csr_data,
+      n_bucket0, x, ncsf, nops, w_out, w_stride, overflow_flag);
+}
+
 extern "C" void guga_build_w_from_csr_unitnnz_launch_stream(
     const int32_t* row_j,
     const int32_t* row_k,
@@ -4574,6 +5121,132 @@ extern "C" void guga_build_w_from_epq_transpose_range_launch_stream(
           overflow_flag,
           k_start,
           k_count);
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Pair-indexed variant: W-build with full_to_pair index mapping.
+// Writes to pair-indexed output [k_count, ncol] where ncol = npair.
+// full_to_pair[pq] maps full orbital index pq ∈ [0,nops) to pair index ∈ [0,npair).
+// ---------------------------------------------------------------------------
+template <typename INDPTR_T, typename OUT_T, typename COEF_T, typename PQ_T>
+__global__ void guga_build_w_pair_from_epq_transpose_range_kernel_t(
+    const INDPTR_T* __restrict__ epq_t_indptr,  // [ncsf+1]
+    const int32_t* __restrict__ epq_t_source,   // [nnz]
+    const PQ_T* __restrict__ epq_t_pq,          // [nnz], values in [0,nops)
+    const COEF_T* __restrict__ epq_t_data,      // [nnz]
+    const OUT_T* __restrict__ x,                // [ncsf]
+    int ncsf,
+    int nops,                                   // full orbital pairs (for bounds check)
+    int ncol,                                   // output columns (= npair)
+    const int32_t* __restrict__ full_to_pair,   // [nops] -> [0,npair)
+    OUT_T* __restrict__ w_out,                  // [k_count, w_stride]
+    int64_t w_stride,
+    int* __restrict__ overflow_flag,
+    int k_start,
+    int k_count) {
+  int k_local = (int)blockIdx.x;
+  if (k_local < 0 || k_local >= k_count) return;
+  int csf_k = k_start + k_local;
+  if ((unsigned)csf_k >= (unsigned)ncsf) {
+    if ((int)threadIdx.x == 0) atomicExch(overflow_flag, 1);
+    return;
+  }
+
+  extern __shared__ unsigned char smem[];
+  OUT_T* w_s = reinterpret_cast<OUT_T*>(smem);
+  for (int u = (int)threadIdx.x; u < ncol; u += (int)blockDim.x) {
+    w_s[u] = (OUT_T)0;
+  }
+  __syncthreads();
+
+  int64_t start = epq_t_indptr[(int64_t)csf_k];
+  int64_t end = epq_t_indptr[(int64_t)csf_k + 1];
+  if (start < 0 || end < start) {
+    if ((int)threadIdx.x == 0) atomicExch(overflow_flag, 1);
+    return;
+  }
+
+  for (int64_t t = start + (int64_t)threadIdx.x; t < end; t += (int64_t)blockDim.x) {
+    int32_t csf_j = epq_t_source[t];
+    if ((unsigned)csf_j >= (unsigned)ncsf) {
+      atomicExch(overflow_flag, 1);
+      continue;
+    }
+    int pq = (int)epq_t_pq[t];
+    if ((unsigned)pq >= (unsigned)nops) {
+      atomicExch(overflow_flag, 1);
+      continue;
+    }
+    COEF_T coef = epq_t_data[t];
+    if (coef == (COEF_T)0) continue;
+    OUT_T xj = x[csf_j];
+    if (xj == (OUT_T)0) continue;
+    int u = full_to_pair[pq];
+    atomicAdd(&w_s[u], xj * (OUT_T)coef);
+  }
+  __syncthreads();
+
+  OUT_T* w_row = w_out + (int64_t)k_local * w_stride;
+  for (int u = (int)threadIdx.x; u < ncol; u += (int)blockDim.x) {
+    w_row[u] += w_s[u];
+  }
+}
+
+extern "C" void guga_build_w_pair_from_epq_transpose_range_launch_stream(
+    const void* epq_t_indptr,
+    int epq_t_indptr_type,
+    const int32_t* epq_t_source,
+    const void* epq_t_pq,
+    int epq_t_pq_type,
+    const double* epq_t_data,
+    const double* x,
+    int ncsf,
+    int nops,
+    int ncol,
+    const int32_t* full_to_pair,
+    double* w_out,
+    int64_t w_stride,
+    int* overflow_flag,
+    cudaStream_t stream,
+    int threads,
+    int k_start,
+    int k_count) {
+  if (epq_t_indptr_type != 4 && epq_t_indptr_type != 8) return;
+  if (k_count <= 0 || ncsf <= 0 || nops <= 0 || ncol <= 0) return;
+  if (epq_t_pq_type != 1 && epq_t_pq_type != 2 && epq_t_pq_type != 4) return;
+  int blocks = k_count;
+  size_t smem_bytes = (size_t)ncol * sizeof(double);
+  if (epq_t_indptr_type == 4) {
+    const int32_t* indptr_i32 = reinterpret_cast<const int32_t*>(epq_t_indptr);
+    if (epq_t_pq_type == 1) {
+      guga_build_w_pair_from_epq_transpose_range_kernel_t<int32_t, double, double, uint8_t><<<blocks, threads, smem_bytes, stream>>>(
+          indptr_i32, epq_t_source, reinterpret_cast<const uint8_t*>(epq_t_pq), epq_t_data,
+          x, ncsf, nops, ncol, full_to_pair, w_out, w_stride, overflow_flag, k_start, k_count);
+    } else if (epq_t_pq_type == 2) {
+      guga_build_w_pair_from_epq_transpose_range_kernel_t<int32_t, double, double, uint16_t><<<blocks, threads, smem_bytes, stream>>>(
+          indptr_i32, epq_t_source, reinterpret_cast<const uint16_t*>(epq_t_pq), epq_t_data,
+          x, ncsf, nops, ncol, full_to_pair, w_out, w_stride, overflow_flag, k_start, k_count);
+    } else {
+      guga_build_w_pair_from_epq_transpose_range_kernel_t<int32_t, double, double, int32_t><<<blocks, threads, smem_bytes, stream>>>(
+          indptr_i32, epq_t_source, reinterpret_cast<const int32_t*>(epq_t_pq), epq_t_data,
+          x, ncsf, nops, ncol, full_to_pair, w_out, w_stride, overflow_flag, k_start, k_count);
+    }
+  } else {
+    const int64_t* indptr_i64 = reinterpret_cast<const int64_t*>(epq_t_indptr);
+    if (epq_t_pq_type == 1) {
+      guga_build_w_pair_from_epq_transpose_range_kernel_t<int64_t, double, double, uint8_t><<<blocks, threads, smem_bytes, stream>>>(
+          indptr_i64, epq_t_source, reinterpret_cast<const uint8_t*>(epq_t_pq), epq_t_data,
+          x, ncsf, nops, ncol, full_to_pair, w_out, w_stride, overflow_flag, k_start, k_count);
+    } else if (epq_t_pq_type == 2) {
+      guga_build_w_pair_from_epq_transpose_range_kernel_t<int64_t, double, double, uint16_t><<<blocks, threads, smem_bytes, stream>>>(
+          indptr_i64, epq_t_source, reinterpret_cast<const uint16_t*>(epq_t_pq), epq_t_data,
+          x, ncsf, nops, ncol, full_to_pair, w_out, w_stride, overflow_flag, k_start, k_count);
+    } else {
+      guga_build_w_pair_from_epq_transpose_range_kernel_t<int64_t, double, double, int32_t><<<blocks, threads, smem_bytes, stream>>>(
+          indptr_i64, epq_t_source, reinterpret_cast<const int32_t*>(epq_t_pq), epq_t_data,
+          x, ncsf, nops, ncol, full_to_pair, w_out, w_stride, overflow_flag, k_start, k_count);
     }
   }
 }

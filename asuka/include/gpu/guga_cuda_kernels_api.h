@@ -876,6 +876,28 @@ extern "C" void guga_apply_g_flat_gather_epq_transpose_range_launch_stream(
     int threads,
     int add);
 
+// Pair-indexed Apply: reads g_block via full_to_pair index mapping.
+extern "C" void guga_apply_g_pair_gather_epq_transpose_range_launch_stream(
+    const int8_t* steps_table,
+    int ncsf,
+    int norb,
+    const void* epq_t_indptr,
+    int epq_t_indptr_type,
+    const int32_t* epq_t_source,
+    const void* epq_t_pq,
+    int epq_t_pq_type,
+    const double* epq_t_data,
+    const double* g_block,
+    int64_t g_stride,
+    int k_start,
+    int k_count,
+    const int32_t* full_to_pair,
+    double* y,
+    int* overflow_flag,
+    cudaStream_t stream,
+    int threads,
+    int add);
+
 extern "C" void guga_apply_g_flat_gather_epq_transpose_range_mixed_launch_stream(
     const int8_t* steps_table,
     int ncsf,
@@ -977,6 +999,73 @@ extern "C" void guga_build_w_from_csr_unitnnz_launch_stream(
     cudaStream_t stream,
     int threads);
 
+extern "C" void guga_build_w_from_csr_bucket0_launch_stream(
+    const int32_t* row_perm,
+    const int32_t* row_j,
+    const int32_t* row_k,
+    const int64_t* csr_indptr,
+    const int32_t* csr_indices,
+    const double* csr_data,
+    int n_bucket0,
+    const double* x,
+    int ncsf,
+    int nops,
+    double* w_out,
+    int64_t w_stride,
+    int* overflow_flag,
+    cudaStream_t stream,
+    int threads);
+
+extern "C" void guga_apply_csr_narrow_fused_epq_perm_launch_stream(
+    const int8_t* steps_table,
+    int ncsf,
+    int norb,
+    const int64_t* epq_indptr,
+    const int32_t* epq_indices,
+    const void* epq_pq,
+    int epq_pq_type,
+    const double* epq_data,
+    const int32_t* row_j,
+    const int32_t* row_k,
+    const int64_t* csr_indptr,
+    const int32_t* csr_indices,
+    const double* csr_data,
+    const int32_t* row_perm,
+    int nrows,
+    const double* eri_mat_t,
+    int nops,
+    double half,
+    const double* x,
+    double* y,
+    int* overflow_flag,
+    cudaStream_t stream,
+    int threads);
+
+extern "C" void guga_apply_csr_eri_mat_fused_epq_table_range_perm_launch_stream(
+    const int8_t* steps_table,
+    int ncsf,
+    int norb,
+    const int64_t* epq_indptr,
+    const int32_t* epq_indices,
+    const void* epq_pq,
+    int epq_pq_type,
+    const double* epq_data,
+    const int32_t* row_j,
+    const int32_t* row_k,
+    const int64_t* csr_indptr,
+    const int32_t* csr_indices,
+    const double* csr_data,
+    const int32_t* row_perm,
+    int nrows,
+    const double* eri_mat_t,
+    int nops,
+    double half,
+    const double* x,
+    double* y,
+    int* overflow_flag,
+    cudaStream_t stream,
+    int threads);
+
 extern "C" void guga_build_w_from_epq_table_launch_stream(
     const void* epq_indptr,
     int epq_indptr_type,
@@ -1005,6 +1094,27 @@ extern "C" void guga_build_w_from_epq_transpose_range_launch_stream(
     const double* x,
     int ncsf,
     int nops,
+    double* w_out,
+    int64_t w_stride,
+    int* overflow_flag,
+    cudaStream_t stream,
+    int threads,
+    int k_start,
+    int k_count);
+
+// Pair-indexed W-build: writes to pair-indexed output via full_to_pair.
+extern "C" void guga_build_w_pair_from_epq_transpose_range_launch_stream(
+    const void* epq_t_indptr,
+    int epq_t_indptr_type,
+    const int32_t* epq_t_source,
+    const void* epq_t_pq,
+    int epq_t_pq_type,
+    const double* epq_t_data,
+    const double* x,
+    int ncsf,
+    int nops,
+    int ncol,
+    const int32_t* full_to_pair,
     double* w_out,
     int64_t w_stride,
     int* overflow_flag,
@@ -1240,6 +1350,22 @@ extern "C" cudaError_t guga_build_w_diag_from_steps_launch_stream(
     int j_count,
     const double* x,
     int nops,
+    double* w_out,
+    int64_t w_stride,
+    cudaStream_t stream,
+    int threads,
+    int relative_w);
+
+// Pair-indexed W-diag: writes diagonal via full_to_pair.
+extern "C" cudaError_t guga_build_w_diag_pair_from_steps_launch_stream(
+    const int8_t* steps_table,
+    int ncsf,
+    int norb,
+    int j_start,
+    int j_count,
+    const double* x,
+    int nops,
+    const int32_t* full_to_pair,
     double* w_out,
     int64_t w_stride,
     cudaStream_t stream,
@@ -1534,10 +1660,19 @@ typedef struct Kernel25Profile {
   int nnz_in;
   int nnz_out;
   int nrows;
+  float bucket_ms;
+  int bucket_counts[4];
 } Kernel25Profile;
 
 extern "C" void* guga_kernel25_workspace_create(int max_tasks, int max_nnz_in);
 extern "C" void guga_kernel25_workspace_destroy(void* ws_handle);
+
+extern "C" void guga_kernel25_workspace_get_bucket_info(
+    void* ws_handle,
+    int* bucketing_valid_out,
+    int* bucket_offsets_out,
+    int* bucket_counts_out,
+    void** d_row_perm_out);
 
 extern "C" void guga_kernel25_build_csr_from_jrs_allpairs_deterministic_inplace_device_ws(
     void* ws_handle,
