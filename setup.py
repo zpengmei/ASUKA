@@ -4,6 +4,7 @@ import os
 import shutil
 import subprocess
 import sys
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from setuptools.command.build_ext import build_ext as _build_ext
 from setuptools import Extension, setup
@@ -194,6 +195,7 @@ def _cythonize_exts(exts: list[Extension]) -> list[Extension]:
 
 class build_ext(_build_ext):
     def run(self) -> None:
+        self.parallel = os.cpu_count() or 4
         super().run()
 
         if _bool_env("ASUKA_SKIP_CUDA_EXT"):
@@ -232,29 +234,38 @@ class build_ext(_build_ext):
         env["GUGA_CUDA_EXT_OUTPUT_DIR"] = guga_out
 
         build_scripts_dir = os.path.join(repo_root, "asuka", "build")
-        for script in (
-            "guga_cuda_ext.py",
-            "guga_cuda_linalg_ext.py",
-            "caspt2_cuda_ext.py",
-            "hf_df_jk_cuda_ext.py",
-            "hf_thc_cuda_ext.py",
-            "orbitals_cuda_ext.py",
-        ):
-            subprocess.check_call([sys.executable, os.path.join(build_scripts_dir, script)], cwd=repo_root, env=env)
-
         cueri_build_dir = os.path.join(build_temp, "cueri_cuda_ext")
-        subprocess.check_call(
+
+        cuda_cmds = [
+            [sys.executable, os.path.join(build_scripts_dir, "guga_cuda_ext.py")],
+            [sys.executable, os.path.join(build_scripts_dir, "guga_cuda_linalg_ext.py")],
+            [sys.executable, os.path.join(build_scripts_dir, "caspt2_cuda_ext.py")],
+            [sys.executable, os.path.join(build_scripts_dir, "hf_df_jk_cuda_ext.py")],
+            [sys.executable, os.path.join(build_scripts_dir, "hf_thc_cuda_ext.py")],
+            [sys.executable, os.path.join(build_scripts_dir, "orbitals_cuda_ext.py")],
             [
                 sys.executable,
                 os.path.join(repo_root, "asuka", "cueri", "build_cuda_ext.py"),
-                "--build-dir",
-                cueri_build_dir,
-                "--out-dir",
-                cueri_out,
+                "--build-dir", cueri_build_dir,
+                "--out-dir", cueri_out,
+                "--clean",  # always reconfigure so split-file and flag changes take effect
             ],
-            cwd=repo_root,
-            env=env,
-        )
+        ]
+
+        # Give each cmake build the full core count. The small builds finish quickly
+        # and cuERI (the slowest) then gets all cores uncontested. Brief initial
+        # oversubscription (7 × n_cpu) is harmless — the OS scheduler handles it.
+        n_cpu = os.cpu_count() or 4
+        n_parallel = min(len(cuda_cmds), n_cpu)
+        env["ASUKA_CUDA_BUILD_JOBS"] = str(n_cpu)
+
+        def _run(cmd):
+            subprocess.check_call(cmd, cwd=repo_root, env=env)
+
+        with ThreadPoolExecutor(max_workers=n_parallel) as pool:
+            futures = {pool.submit(_run, cmd): cmd for cmd in cuda_cmds}
+            for fut in as_completed(futures):
+                fut.result()  # re-raises any subprocess exception
 
 
 setup(

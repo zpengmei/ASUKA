@@ -181,7 +181,7 @@ def main() -> None:
 
     subprocess.check_call(cmake_args)
 
-    n_jobs = os.cpu_count() or 4
+    n_jobs = int(os.getenv("ASUKA_CUDA_BUILD_JOBS") or os.cpu_count() or 4)
     build_args = ["cmake", "--build", build_dir, "-j", str(n_jobs)]
     extra_build = os.getenv("GUGA_CUDA_CMAKE_BUILD_ARGS")
     if extra_build:

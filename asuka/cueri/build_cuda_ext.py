@@ -147,6 +147,17 @@ def main(argv: list[str] | None = None) -> None:
 
     build_dir = Path(args.build_dir).expanduser().resolve() if args.build_dir else _default_build_dir(repo_root=repo_root)
     build_dir = _ensure_writable_dir(build_dir)
+
+    # Auto-clean if CMakeLists.txt is newer than the cached build.ninja.
+    # This catches structural changes (new TUs, flag changes) that cmake would
+    # otherwise silently miss when reusing a stale Ninja cache.
+    cmake_lists = src_dir / "CMakeLists.txt"
+    build_ninja = build_dir / "build.ninja"
+    if not bool(args.clean) and build_ninja.exists() and cmake_lists.exists():
+        if cmake_lists.stat().st_mtime > build_ninja.stat().st_mtime:
+            print("cuERI CMakeLists.txt is newer than build cache — cleaning build dir.", file=sys.stderr)
+            args.clean = True
+
     if bool(args.clean) and build_dir.is_dir():
         shutil.rmtree(str(build_dir), ignore_errors=True)
         build_dir.mkdir(parents=True, exist_ok=True)
@@ -218,7 +229,7 @@ def main(argv: list[str] | None = None) -> None:
 
     jobs = int(args.jobs)
     if jobs <= 0:
-        jobs = os.cpu_count() or 4
+        jobs = int(os.getenv("ASUKA_CUDA_BUILD_JOBS") or os.cpu_count() or 4)
 
     build_args = ["cmake", "--build", str(build_dir), "-j", str(jobs)]
     extra_build = os.getenv("CUERI_CUDA_CMAKE_BUILD_ARGS")
