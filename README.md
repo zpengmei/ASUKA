@@ -278,6 +278,24 @@ res.nacv_pairs # list of (bra, ket) pairs computed
 Use `nacv_pairs=[(0,1)]` to compute only selected couplings, or `mult_ediff=True` to return
 the Hamiltonian-derivative numerator `⟨I|∂H/∂R|J⟩` instead of the coupling vector.
 
+For dynamics loops, warm-start SCF and CASSCF from the previous step using `mo_coeff_init`
+and `ci_init` so the optimizer starts from the converged solution at the prior geometry:
+
+```python
+hf_kw  = dict(method="rhf", backend="cuda")
+cas_kw = dict(ncore=4, ncas=4, nelecas=4, nroots=3,
+              root_weights=(1/3, 1/3, 1/3), backend="cuda")
+
+scf, mc = None, None
+for coords in trajectory:
+    mol_t = clone_molecule_with_coords(mol, coords)
+    scf   = run_hf(mol_t, guess=scf, **hf_kw)
+    mc    = run_casscf(scf, mo_coeff_init=mc.mo_coeff if mc else None,
+                            ci_init=mc.ci if mc else None, **cas_kw)
+    res   = sacasscf_properties(scf, mc)
+    # res.e_roots, res.forces, res.nacvs (if compute_nacvs=True)
+```
+
 ## Geometry optimization + harmonic frequencies
 
 ```python
