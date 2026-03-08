@@ -587,7 +587,7 @@ def run_casscf_df(
     ah_conv_tol_grad: float = 1e-4,
     ah_conv_tol_energy: float = 1e-7,
     ah_ci_update: str = "orthonormalize",
-    ci_max_cycle_inner: int | None = 2,
+    ci_max_cycle_inner: int | None = None,
     dense_cpu_eps_ao: float = 0.0,
     dense_cpu_eps_mo: float = 0.0,
     dense_cpu_threads: int = 0,
@@ -1171,6 +1171,7 @@ def run_casscf_df(
         _casci_kwargs = dict(solver_kwargs)
         if it > 1 and ci_max_cycle_inner is not None and prev_ci_list is not None:
             _casci_kwargs.setdefault("max_cycle", int(ci_max_cycle_inner))
+            _casci_kwargs.setdefault("warn_on_unconverged", False)
         casci_profile = profile.setdefault("casci", {}) if profile is not None else None
         casci_cache_out = None
         if b_cache_enabled and cached_b_whitened is None:
