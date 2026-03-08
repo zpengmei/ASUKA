@@ -181,9 +181,13 @@ def _parse_structure(lines: list[str]):
         end = checkpoints[idx + 1][0] if idx + 1 < len(checkpoints) else ns_end
         checkpoint_extents.append((pos, kind, name, pos, end))
 
-    # Build kernel groups: kernel + inline helpers that are "inside" the kernel
-    # (i.e. between this kernel's block_start and the next kernel's block_start).
-    # Inline helpers AFTER the last kernel's block_start become dispatch helpers.
+    # Build kernel groups and dispatch helpers.
+    # Inter-kernel inline helpers (between kernels) attach to the PRECEDING kernel's
+    # group — this preserves correct declaration order (the helper comes after the
+    # kernels it calls, matching the original file).  When splitting, the "bridge code"
+    # (trailing gap lines after the kernel body) is also injected as a leading section
+    # of the FOLLOWING part's namespace, so type definitions (e.g. template structs)
+    # that appear in the gap are visible to later kernels even in other parts.
     last_kernel_pos = kernel_positions[-1][0]
 
     kernel_groups: list[tuple[str, list[str]]] = []
@@ -203,12 +207,10 @@ def _parse_structure(lines: list[str]):
             current_kernel_lines = list(lines[start:end])
         elif kind == "inline":
             if current_kernel is not None and pos < last_kernel_pos:
-                # Inline between kernels → attach to current kernel group
-                # (But only if there's no kernel starting at or after this inline's start
-                #  that would make it a dispatch helper; we already sorted so this is correct)
+                # Inter-kernel inline → attach to current kernel group (preceding kernel).
                 current_kernel_lines.extend(lines[start:end])
             else:
-                # Dispatch helper (after all kernels)
+                # Post-all-kernels inline → Structure B dispatch helper
                 block_lines = list(lines[start:end])
                 dispatch_helper_lines.append(block_lines)
 
@@ -241,6 +243,7 @@ def _parse_structure(lines: list[str]):
         for fname in _extract_func_names_in_block(klines):
             callable_to_kernel.setdefault(fname, set()).add(kname)
 
+
     # (b) Dispatch helpers — already parsed, find kernel refs by body scan
     for hname, hlines, hkernels in dispatch_helpers:
         callable_to_kernel.setdefault(hname, set()).update(hkernels)
@@ -270,8 +273,18 @@ def _parse_structure(lines: list[str]):
             i = end_i
         elif m_static:
             fname = m_static.group(1)
+            # Include any immediately-preceding `template <...>` line.
+            # When the template specifier is on its own line (e.g. `template <int CTR_MAX>`
+            # above `static cudaError_t fn(`), the regex only matches the `static` line;
+            # we must walk back to capture the template line so the generated TU is valid.
+            block_start = i
+            j = i - 1
+            while j > ns_end and lines[j].strip() == "":
+                j -= 1
+            if j > ns_end and rx_template.match(lines[j]):
+                block_start = j
             end_i = _find_func_end(lines, i)
-            post_ns_statics.append((fname, lines[i:end_i]))
+            post_ns_statics.append((fname, lines[block_start:end_i]))
             i = end_i
         else:
             i += 1
@@ -328,6 +341,63 @@ def _parse_structure(lines: list[str]):
 # ---------------------------------------------------------------------------
 # Splitting
 # ---------------------------------------------------------------------------
+
+def _filter_bridge_code(lines: list[str]) -> list[str]:
+    """Strip inline function definitions that launch kernels via <<<>>> from bridge code.
+
+    When the trailing gap of a kernel group contains a dispatch helper that calls
+    kernels from the same part (via <<<>>>), including it verbatim in the NEXT part's
+    bridge causes compile errors because those kernels are not defined there.
+    Only type/struct/enum definitions (which have no <<<>>> inside) are safe to bridge.
+    """
+    rx_template = re.compile(r"^template\s*<")
+    rx_fn_start = re.compile(r"^(?:static|inline|__device__)\s")
+    result: list[str] = []
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        # If this is a template line, peek ahead to see if the following function has <<<>>>
+        if rx_template.match(line):
+            j = i + 1
+            while j < len(lines) and lines[j].strip() == "":
+                j += 1
+            if j < len(lines) and rx_fn_start.match(lines[j]):
+                try:
+                    func_end = _find_func_end(lines, j)
+                    body = "\n".join(lines[j:func_end])
+                    if "<<<" in body:
+                        i = func_end  # skip template line + function body
+                        continue
+                except ValueError:
+                    pass
+        # If this is a function start, check for <<<>>> inside its body
+        if rx_fn_start.match(line):
+            try:
+                func_end = _find_func_end(lines, i)
+                body = "\n".join(lines[i:func_end])
+                if "<<<" in body:
+                    i = func_end
+                    continue
+            except ValueError:
+                pass
+        result.append(line)
+        i += 1
+    return result
+
+
+def _kernel_body_end(kernel_group_lines: list[str]) -> int:
+    """Return the index (into kernel_group_lines) one past the __global__ body's closing brace.
+
+    The lines AFTER this index are inter-kernel gap code (helpers/structs that follow
+    the kernel body but precede the next kernel).  Returns len(kernel_group_lines) if
+    no gap code exists.
+    """
+    rx_global = re.compile(r"^__global__")
+    for i, line in enumerate(kernel_group_lines):
+        if rx_global.match(line):
+            return _find_func_end(kernel_group_lines, i)
+    return len(kernel_group_lines)
+
 
 def _balance_groups(sizes: list[int], n_parts: int) -> list[list[int]]:
     n = len(sizes)
@@ -463,6 +533,19 @@ def split_file(src: Path, n_parts: int, no_cmake: bool = False) -> list[Path]:
 
         # Preamble: namespace { + shared constants/helpers
         out_lines.extend(preamble_lines)
+
+        # Bridge code: trailing inter-kernel gap lines from the PREVIOUS part's last kernel.
+        # These may contain type/struct definitions needed by this part's first kernel.
+        # Since everything is in an anonymous namespace with internal linkage (templates,
+        # static helpers), duplicating them here is safe (no ODR violation).
+        if part_idx > 0:
+            prev_last_kidx = groups[part_idx - 1][-1]
+            _, prev_last_klines = kernel_groups[prev_last_kidx]
+            body_end = _kernel_body_end(prev_last_klines)
+            bridge = _filter_bridge_code(prev_last_klines[body_end:])
+            if bridge:
+                out_lines.append("// Bridge: gap code from previous part (types needed here).")
+                out_lines.extend(bridge)
 
         # Kernel blocks (with attached inline helpers)
         for kidx in group:

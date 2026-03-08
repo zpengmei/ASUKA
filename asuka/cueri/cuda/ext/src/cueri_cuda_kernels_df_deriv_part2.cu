@@ -361,6 +361,17 @@ __device__ __forceinline__ void warp_reduce_sum_arr(double* v) {
   }
 }
 
+// Bridge: gap code from previous part (types needed here).
+
+
+// Multi-bar (multi-state) spherical bar_X streamed variant.
+//
+// This kernel evaluates the 3c derivative integrals once per block and applies them to
+// `NBAR` independent bar_X tensors, accumulating `NBAR` gradients in one pass.
+//
+// `bar_X_sph_Qmn_multi` stores `NBAR` chunks of shape [bar_stride] each, where the first
+// `q_count*nao_sph*nao_sph` elements of each chunk are a (Q,m,n) buffer for Q in
+// [q_offset, q_offset+q_count). `bar_stride` may be >= q_count*nao_sph*nao_sph (padding).
 template <int NROOTS, int NBAR>
 __global__ void KernelDFInt3c2eDerivContractedCartAllSPAtomGradSphBarQmnMultiBar(
     const int32_t* spAB_arr,   // [n_spAB] AO shell-pair indices in this (la,lb) class

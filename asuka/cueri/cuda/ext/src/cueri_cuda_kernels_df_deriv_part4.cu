@@ -361,6 +361,10 @@ __device__ __forceinline__ void warp_reduce_sum_arr(double* v) {
   }
 }
 
+// Bridge: gap code from previous part (types needed here).
+
+// Spherical bar_X + float32 variant: reads bar_X in spherical AO basis in Qmn layout as float32
+// (reduced global memory bandwidth), while keeping accumulation in FP64.
 template <int NROOTS>
 __global__ void KernelDFInt3c2eDerivContractedCartAllSPAtomGradSphBarQmnF32Bar(
     const int32_t* spAB_arr,   // [n_spAB] AO shell-pair indices in this (la,lb) class

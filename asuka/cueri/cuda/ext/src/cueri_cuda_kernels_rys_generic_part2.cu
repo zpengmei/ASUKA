@@ -132,6 +132,49 @@ __device__ __forceinline__ double shift_from_G(
   return shift_from_G_stride<kStride>(G, i, j, k, l, xij_pow, xkl_pow);
 }
 
+// Bridge: gap code from previous part (types needed here).
+
+enum class Ld0WarpMode : int { kWarp = 0, kSubwarp16 = 1, kSubwarp8 = 2 };
+
+
+// ---- DF int3c2e with non-expanded AO contractions (AO-side only) ----
+//
+// This is a DF-specific kernel family that:
+// - assumes ld=0 (dummy s shell),
+// - consumes the same (spAB, spCD) task encoding as the tile kernels,
+// - writes directly to X(nao,nao,naux) with symmetric fill,
+// - supports AO general contractions via per-shell coefficient matrices.
+//
+// Current scope:
+// - AO contractions only (aux shells are still treated as expanded shells).
+// - nctr per AO shell is limited to kCtrMax for now.
+constexpr int kCtrMax = 5;
+[[maybe_unused]] constexpr int kCtrPairMax = kCtrMax * kCtrMax;  // 25
+
+template <int NROOTS, int STRIDE, int CTR_PAIR_MAX>
+struct DFInt3c2eContractedLd0SubwarpScratch {
+  int8_t Ax[kNcartMax], Ay[kNcartMax], Az[kNcartMax];
+  int8_t Bx[kNcartMax], By[kNcartMax], Bz[kNcartMax];
+  int8_t Cx[kNcartMax], Cy[kNcartMax], Cz[kNcartMax];
+
+  double Gx[STRIDE * STRIDE];
+  double Gy[STRIDE * STRIDE];
+  double Gz[STRIDE * STRIDE];
+
+  double scale;
+  double roots[NROOTS];
+  double weights[NROOTS];
+
+  double xij_pow[kLMax + 1], xkl_pow[kLMax + 1];
+  double yij_pow[kLMax + 1], ykl_pow[kLMax + 1];
+  double zij_pow[kLMax + 1], zkl_pow[kLMax + 1];
+
+  double Axyz[3];
+  double Cxyz[3];
+
+  double wab[CTR_PAIR_MAX];
+};
+
 template <int NROOTS, int STRIDE, int CTR_MAX>
 __global__ void KernelDFInt3c2e_RysContractedLd0Subwarp8(
     const int32_t* task_spAB,
@@ -1359,6 +1402,7 @@ __global__ void KernelDFInt3c2e_RysContractedLd0Block(
 
 }  // namespace
 
+template <int CTR_MAX>
 static cudaError_t cueri_df_int3c2e_rys_contracted_launch_stream_impl(
     const int32_t* task_spAB,
     const int32_t* task_spCD,

@@ -361,6 +361,9 @@ __device__ __forceinline__ void warp_reduce_sum_arr(double* v) {
   }
 }
 
+// Bridge: gap code from previous part (types needed here).
+
+// Packed-Qp + AB-tiled spherical-bar_X variant: packed Qp bar_X in spherical AO basis (no Qmn unpack).
 template <int NROOTS, typename TBar>
 __global__ void KernelDFInt3c2eDerivContractedCartAllSPAtomGradSphBarQpABTile(
     const int32_t* spAB_arr,

@@ -20,6 +20,34 @@ from pathlib import Path
 # Parsing helpers
 # ---------------------------------------------------------------------------
 
+def _find_func_end(lines: list[str], start: int) -> int:
+    """Return index one past the closing brace of the function starting at `start`."""
+    depth = 0
+    seen_open = False
+    for i in range(start, len(lines)):
+        depth += lines[i].count("{") - lines[i].count("}")
+        if depth > 0:
+            seen_open = True
+        if seen_open and depth == 0:
+            return i + 1
+    raise ValueError(f"No matching closing brace for block starting at line {start}")
+
+
+def _kernel_trailing_gap(block_lines: list[str]) -> list[str]:
+    """Return the lines AFTER the __global__ body in a kernel block.
+
+    These are device helper functions that appear after the __global__'s closing
+    brace but before the next kernel's template line.  They belong to the current
+    block but may be needed by the following part.
+    """
+    rx_global = re.compile(r"^__global__")
+    for i, line in enumerate(block_lines):
+        if rx_global.match(line):
+            body_end = _find_func_end(block_lines, i)
+            return block_lines[body_end:]
+    return []
+
+
 def _find_line(lines: list[str], pattern: str) -> int:
     """Return first 0-based index matching regex pattern."""
     rx = re.compile(pattern)
@@ -224,6 +252,20 @@ def split_file(src: Path, n_parts: int) -> list[Path]:
         # Includes + namespace { + shared helpers
         out_lines.extend(includes)
         out_lines.extend(shared_lines)
+
+        # Bridge code: trailing device helpers from the previous part's last kernel block.
+        # These helper functions appear after the __global__ body of the last kernel in
+        # the previous part, and are needed by the first kernel in this part (same angular
+        # class).  Since they are __device__ __forceinline__ in an anonymous namespace
+        # (internal linkage), duplicating them is safe (no ODR violation).
+        if part_idx > 0:
+            prev_last_kidx = groups[part_idx - 1][-1]
+            prev_start, prev_end = bounds[prev_last_kidx]
+            prev_block = lines[prev_start:prev_end]
+            bridge = _kernel_trailing_gap(prev_block)
+            if bridge:
+                out_lines.append("// Bridge: device helpers from previous part (needed here).")
+                out_lines.extend(bridge)
 
         # Kernel blocks for this part (still inside the namespace)
         for kidx in group:
