@@ -34,6 +34,8 @@ nvcc --version   # should print the CUDA compiler version
 ```bash
 conda create -n asuka python=3.10 -y && conda activate asuka
 conda install -c nvidia cuda-toolkit   # if nvcc is not already available
+# System-level build tools (if not already present system-wide)
+conda install -c conda-forge cmake ninja ccache
 
 # CUDA 13.x (default)
 pip install -e ".[cuda]"
