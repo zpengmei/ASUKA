@@ -96,6 +96,7 @@ asuka = [
   "caspt2/cuda/ext/src/*.cpp",
   # Runtime data
   "cuguga/overlap/*.json",
+  "frontend/basis_data/*.gbs",
   "semiempirical/data/*.json",
   "semiempirical/gpu/cuda/*.cu",
   "semiempirical/gpu/cuda/*.cuh",

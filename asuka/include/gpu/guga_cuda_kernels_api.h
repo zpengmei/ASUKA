@@ -2134,4 +2134,38 @@ extern "C" cudaError_t guga_cipsi_score_and_select_topk_launch_stream(
     cudaStream_t stream,
     int threads);
 
+// ---------------------------------------------------------------------------
+// Heat-Bath SCI kernels
+// ---------------------------------------------------------------------------
+
+extern "C" cudaError_t guga_hb_screen_and_apply_launch_stream(
+    const int32_t* sel_idx,
+    const double*  c_root,
+    int nsel,
+    int root,
+    const int8_t*  steps_table,
+    const int32_t* nodes_table,
+    int norb,
+    int ncsf,
+    const int32_t* h1_pq,
+    const double*  h1_abs,
+    const double*  h1_signed,
+    int n_h1,
+    const int64_t* pq_ptr,
+    const int32_t* rs_idx,
+    const double*  v_abs,
+    const double*  v_signed,
+    const double*  pq_max_v,
+    double eps,
+    const int32_t* child_table,
+    const int16_t* node_twos,
+    const int64_t* child_prefix,
+    int nnodes,
+    int32_t* hash_keys,
+    double*  hash_vals,
+    int cap,
+    int* overflow_flag,
+    cudaStream_t stream,
+    int threads);
+
 #endif  // CUGUGA_GPU_GUGA_CUDA_KERNELS_API_H

@@ -20,6 +20,7 @@
 #include "guga_cuda_kernels_diag_csr.cuh"
 #include "guga_cuda_kernels_kernel25_helpers.cuh"
 #include "guga_cuda_cipsi_frontier_hash.cuh"
+#include "guga_cuda_hb_sci.cuh"
 #include "guga_cuda_kernels_kernel25_ws.cuh"
 #include "guga_cuda_kernels_fused_hop.cuh"
 #include "guga_cuda_kernels_soc_triplet.cuh"

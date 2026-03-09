@@ -5066,6 +5066,82 @@ def cipsi_score_and_select_topk_inplace_device(
     return out_new_idx, out_new_n, out_pt2
 
 
+def has_hb_screen_and_apply_device() -> bool:
+    """Return True if the CUDA extension exposes the HB screen-and-apply kernel."""
+    return _ext is not None and hasattr(_ext, "hb_screen_and_apply_inplace_device")
+
+
+def hb_screen_and_apply_inplace_device(
+    drt,
+    drt_dev,
+    state_dev,
+    sel_idx,
+    c_root,
+    *,
+    nsel: int,
+    nroots: int,
+    root: int,
+    h1_pq,
+    h1_abs,
+    h1_signed,
+    n_h1: int,
+    pq_ptr,
+    rs_idx,
+    v_abs,
+    v_signed,
+    pq_max_v,
+    eps: float,
+    hash_keys,
+    hash_vals,
+    overflow,
+    threads: int = 256,
+    stream=None,
+    sync: bool = True,
+):
+    """Launch the fused heat-bath screen + apply kernel."""
+    if _ext is None or not hasattr(_ext, "hb_screen_and_apply_inplace_device"):
+        raise RuntimeError("CUDA extension is missing HB-SCI kernels; rebuild with python -m asuka.build.guga_cuda_ext")
+
+    try:
+        import cupy as cp
+    except Exception as e:  # pragma: no cover
+        raise RuntimeError("CuPy is required") from e
+
+    if stream is None:
+        stream_ptr = int(cp.cuda.get_current_stream().ptr)
+    else:
+        stream_ptr = int(getattr(stream, "ptr", stream))
+
+    sel_idx = cp.ascontiguousarray(cp.asarray(sel_idx, dtype=cp.int32).ravel())
+    c_root = cp.ascontiguousarray(cp.asarray(c_root, dtype=cp.float64).ravel())
+
+    _ext.hb_screen_and_apply_inplace_device(
+        drt_dev,
+        state_dev,
+        sel_idx,
+        c_root,
+        int(nsel),
+        int(nroots),
+        int(root),
+        h1_pq,
+        h1_abs,
+        h1_signed,
+        int(n_h1),
+        pq_ptr,
+        rs_idx,
+        v_abs,
+        v_signed,
+        pq_max_v,
+        float(eps),
+        hash_keys,
+        hash_vals,
+        overflow,
+        int(threads),
+        int(stream_ptr),
+        bool(sync),
+    )
+
+
 def apply_g_flat_scatter_atomic_frontier_hash_inplace_device(
     drt: DRT,
     drt_dev,

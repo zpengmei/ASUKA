@@ -17,11 +17,20 @@ recursive-include asuka/cuda/linalg_ext CMakeLists.txt
 recursive-include asuka/cuda/linalg_ext/src *.cu *.cpp
 recursive-include asuka/cueri/cuda/ext CMakeLists.txt
 recursive-include asuka/cueri/cuda/ext/src *.cu *.cuh *.cpp *.h
+recursive-include asuka/cueri/cuda/ext/src/generated *.cu
 recursive-include asuka/cuguga/kernels/gpu *.cu *.cuh
 recursive-include asuka/hf/cuda/ext CMakeLists.txt
 recursive-include asuka/hf/cuda/ext/src *.cu *.cuh *.cpp *.h
+recursive-include asuka/hf/thc/cuda/ext CMakeLists.txt
+recursive-include asuka/hf/thc/cuda/ext/src *.cu *.cuh *.cpp *.h
+recursive-include asuka/orbitals/cuda_ext CMakeLists.txt
+recursive-include asuka/orbitals/cuda_ext/src *.cu *.cuh *.cpp *.h
+recursive-include asuka/caspt2/cuda/ext CMakeLists.txt
+recursive-include asuka/caspt2/cuda/ext/src *.cu *.cuh *.cpp *.h
 
 # Runtime data
 recursive-include asuka/cuguga/overlap *.json
 recursive-include asuka/semiempirical/data *.json
 recursive-include asuka/semiempirical/gpu/cuda *.cu *.cuh
+recursive-include asuka/xc *.cu
+recursive-include asuka/frontend/basis_data *.gbs

@@ -8906,6 +8906,113 @@ void cipsi_score_and_select_topk_inplace_device(
   }
 }
 
+void hb_screen_and_apply_inplace_device(
+    const DeviceDRT& drt,
+    const DeviceStateCache& state,
+    py::object sel_idx_obj,
+    py::object c_root_obj,
+    int nsel,
+    int nroots,
+    int root,
+    py::object h1_pq_obj,
+    py::object h1_abs_obj,
+    py::object h1_signed_obj,
+    int n_h1,
+    py::object pq_ptr_obj,
+    py::object rs_idx_obj,
+    py::object v_abs_obj,
+    py::object v_signed_obj,
+    py::object pq_max_v_obj,
+    double eps,
+    py::object hash_keys_obj,
+    py::object hash_vals_obj,
+    py::object overflow_obj,
+    int threads,
+    uint64_t stream,
+    bool sync) {
+  if (state.steps == nullptr) {
+    throw std::runtime_error("DeviceStateCache is not initialized");
+  }
+  if (drt.norb != state.norb) {
+    throw std::invalid_argument("DeviceDRT and DeviceStateCache have inconsistent norb");
+  }
+  if (drt.norb <= 0 || drt.norb > MAX_NORB) {
+    throw std::invalid_argument("norb out of supported range");
+  }
+  if (threads <= 0 || threads > 1024) {
+    throw std::invalid_argument("threads must be in 1..1024");
+  }
+  if (nsel <= 0) return;
+
+  auto sel_idx_dev = cuda_array_view_from_object(sel_idx_obj, "sel_idx");
+  auto c_root_dev = cuda_array_view_from_object(c_root_obj, "c_root");
+  auto h1_pq_dev = cuda_array_view_from_object(h1_pq_obj, "h1_pq");
+  auto h1_abs_dev = cuda_array_view_from_object(h1_abs_obj, "h1_abs");
+  auto h1_signed_dev = cuda_array_view_from_object(h1_signed_obj, "h1_signed");
+  auto pq_ptr_dev = cuda_array_view_from_object(pq_ptr_obj, "pq_ptr");
+  auto rs_idx_dev = cuda_array_view_from_object(rs_idx_obj, "rs_idx");
+  auto v_abs_dev = cuda_array_view_from_object(v_abs_obj, "v_abs");
+  auto v_signed_dev = cuda_array_view_from_object(v_signed_obj, "v_signed");
+  auto pq_max_v_dev = cuda_array_view_from_object(pq_max_v_obj, "pq_max_v");
+  auto hash_keys_dev = cuda_array_view_from_object(hash_keys_obj, "hash_keys");
+  auto hash_vals_dev = cuda_array_view_from_object(hash_vals_obj, "hash_vals");
+  auto overflow_dev = cuda_array_view_from_object(overflow_obj, "overflow");
+
+  require_typestr(sel_idx_dev, "sel_idx", "<i4");
+  require_typestr(c_root_dev, "c_root", "<f8");
+  require_typestr(h1_pq_dev, "h1_pq", "<i4");
+  require_typestr(h1_abs_dev, "h1_abs", "<f8");
+  require_typestr(h1_signed_dev, "h1_signed", "<f8");
+  require_typestr(pq_ptr_dev, "pq_ptr", "<i8");
+  require_typestr(rs_idx_dev, "rs_idx", "<i4");
+  require_typestr(v_abs_dev, "v_abs", "<f8");
+  require_typestr(v_signed_dev, "v_signed", "<f8");
+  require_typestr(pq_max_v_dev, "pq_max_v", "<f8");
+  require_typestr(hash_keys_dev, "hash_keys", "<i4");
+  require_typestr(hash_vals_dev, "hash_vals", "<f8");
+  require_typestr(overflow_dev, "overflow", "<i4");
+
+  int norb = drt.norb;
+  int ncsf = state.ncsf;
+  int cap = (int)hash_keys_dev.shape[0];
+
+  uint64_t stream_u = stream;
+  if (stream_u == 0) {
+    if (sel_idx_dev.stream) stream_u = sel_idx_dev.stream;
+  }
+  cudaStream_t stream_t = reinterpret_cast<cudaStream_t>(stream_u);
+
+  throw_on_cuda_error(
+      guga_hb_screen_and_apply_launch_stream(
+          reinterpret_cast<const int32_t*>(sel_idx_dev.ptr),
+          reinterpret_cast<const double*>(c_root_dev.ptr),
+          nsel, root,
+          state.steps, state.nodes,
+          norb, ncsf,
+          reinterpret_cast<const int32_t*>(h1_pq_dev.ptr),
+          reinterpret_cast<const double*>(h1_abs_dev.ptr),
+          reinterpret_cast<const double*>(h1_signed_dev.ptr),
+          n_h1,
+          reinterpret_cast<const int64_t*>(pq_ptr_dev.ptr),
+          reinterpret_cast<const int32_t*>(rs_idx_dev.ptr),
+          reinterpret_cast<const double*>(v_abs_dev.ptr),
+          reinterpret_cast<const double*>(v_signed_dev.ptr),
+          reinterpret_cast<const double*>(pq_max_v_dev.ptr),
+          eps,
+          drt.child, drt.node_twos, drt.child_prefix,
+          drt.nnodes,
+          reinterpret_cast<int32_t*>(hash_keys_dev.ptr),
+          reinterpret_cast<double*>(hash_vals_dev.ptr),
+          cap,
+          reinterpret_cast<int*>(overflow_dev.ptr),
+          stream_t,
+          threads),
+      "guga_hb_screen_and_apply_launch_stream");
+  if (sync) {
+    throw_on_cuda_error(cudaStreamSynchronize(stream_t), "cudaStreamSynchronize(hb_screen_and_apply)");
+  }
+}
+
 void apply_g_flat_scatter_atomic_epq_table_inplace_device(
     const DeviceDRT& drt,
     const DeviceStateCache& state,
@@ -18846,6 +18953,33 @@ PYBIND11_MODULE(_guga_cuda_ext, m) {
       py::arg("out_new_idx"),
       py::arg("out_new_n"),
       py::arg("out_pt2"),
+      py::arg("threads") = 256,
+      py::arg("stream") = 0,
+      py::arg("sync") = true);
+
+  m.def(
+      "hb_screen_and_apply_inplace_device",
+      &hb_screen_and_apply_inplace_device,
+      py::arg("drt"),
+      py::arg("state"),
+      py::arg("sel_idx"),
+      py::arg("c_root"),
+      py::arg("nsel"),
+      py::arg("nroots"),
+      py::arg("root"),
+      py::arg("h1_pq"),
+      py::arg("h1_abs"),
+      py::arg("h1_signed"),
+      py::arg("n_h1"),
+      py::arg("pq_ptr"),
+      py::arg("rs_idx"),
+      py::arg("v_abs"),
+      py::arg("v_signed"),
+      py::arg("pq_max_v"),
+      py::arg("eps"),
+      py::arg("hash_keys"),
+      py::arg("hash_vals"),
+      py::arg("overflow"),
       py::arg("threads") = 256,
       py::arg("stream") = 0,
       py::arg("sync") = true);

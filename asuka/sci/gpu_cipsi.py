@@ -12,15 +12,8 @@ from asuka.cuguga.drt import DRT, build_drt
 from asuka.cuguga.oracle import _restore_eri_4d
 from asuka.cuda.cuda_backend import (
     GugaMatvecEriMatWorkspace,
-    Kernel3BuildGDFWorkspace,
-    apply_g_flat_scatter_atomic_frontier_hash_inplace_device,
-    build_occ_block_from_steps_inplace_device,
-    cipsi_frontier_hash_clear_inplace_device,
-    cipsi_frontier_hash_extract_inplace_device,
-    cipsi_score_and_select_topk_inplace_device,
     gather_project_batched_inplace_device,
     has_cipsi_frontier_hash_device,
-    kernel3_build_g_from_csr_eri_mat_range_inplace_device,
     make_device_drt,
     make_device_state_cache,
     scatter_embed_batched_inplace_device,
@@ -29,6 +22,7 @@ from asuka.cuda.cuda_davidson import davidson_sym_gpu
 from asuka.integrals.df_integrals import DFMOIntegrals, DeviceDFMOIntegrals
 from asuka.mcscf.casci import CASCIResult, _build_casci_df_integrals
 from asuka.qmc.sparse import SparseVector
+from asuka.sci.frontier_hash import FrontierHashSelector
 from asuka.sci.selected_ci import _initial_selection, _make_hdiag_guess, _normalize_ci0
 
 
@@ -476,6 +470,10 @@ def run_cipsi_trials(
     frontier_hash_rs_block: int = 128,
     frontier_hash_csr_capacity_mult: float = 2.0,
     frontier_hash_max_retries: int = 8,
+    hb_epsilon: float = 1e-4,
+    hb_eps_schedule: str = "fixed",
+    hb_eps_init: float = 1e-3,
+    hb_eps_final: float = 1e-6,
     verbose: int = 0,
 ) -> CIPSITrialSpaceResult:
     cp = _require_cupy()
@@ -519,95 +517,73 @@ def run_cipsi_trials(
         if len(sel) >= int(max_ncsf):
             break
 
-    ws, profile = _build_cuda_workspace(drt, h1e, eri, epq_mode=epq_mode, workspace_kwargs=workspace_kwargs)
-    history: list[dict[str, Any]] = []
-    prev_c_sel: np.ndarray | None = None
-
     selection_mode_s = str(selection_mode).strip().lower()
     if selection_mode_s in ("dense", "full", "hc_full"):
         selection_mode_s = "dense"
     elif selection_mode_s in ("frontier_hash", "hash", "frontier-hash"):
         selection_mode_s = "frontier_hash"
+    elif selection_mode_s in ("heat_bath", "hb", "heatbath", "hb_sci", "heat-bath"):
+        selection_mode_s = "heat_bath"
     else:
-        raise ValueError("selection_mode must be 'dense' or 'frontier_hash'")
-    profile["selection_mode"] = str(selection_mode_s)
+        raise ValueError("selection_mode must be 'dense', 'frontier_hash', or 'heat_bath'")
 
-    if selection_mode_s == "frontier_hash":
+    # Resolve EPQ mode before building the CUDA workspace so we can enforce constraints
+    # (frontier-hash and heat-bath selection require the no-EPQ path).
+    epq_mode_s = _normalize_epq_mode(epq_mode)
+    ws_kwargs = dict(workspace_kwargs or {})
+    if selection_mode_s in ("frontier_hash", "heat_bath"):
         if select_threshold is not None:
-            raise NotImplementedError("selection_mode='frontier_hash' does not currently support select_threshold")
+            raise NotImplementedError(f"selection_mode='{selection_mode_s}' does not currently support select_threshold")
         if not bool(has_cipsi_frontier_hash_device()):
-            raise RuntimeError("selection_mode='frontier_hash' requires CUDA extension with frontier-hash kernels")
-        if bool(getattr(ws, "use_epq_table", False)):
-            raise RuntimeError("selection_mode='frontier_hash' currently requires epq_mode='no_epq_support_aware' (no EPQ table)")
+            raise RuntimeError(f"selection_mode='{selection_mode_s}' requires CUDA extension with frontier-hash kernels")
+        if epq_mode_s != "no_epq_support_aware":
+            raise RuntimeError(f"selection_mode='{selection_mode_s}' requires epq_mode='no_epq_support_aware' (no EPQ table)")
+        ws_kwargs.setdefault("csr_capacity_mult", float(frontier_hash_csr_capacity_mult))
+        # Force no-EPQ even if the caller passed overrides.
+        ws_kwargs["use_epq_table"] = False
+        ws_kwargs["aggregate_offdiag_k"] = False
+        ws_kwargs["epq_streaming"] = False
 
-    frontier = None
-    if selection_mode_s == "frontier_hash":
+    ws, profile = _build_cuda_workspace(drt, h1e, eri, epq_mode=epq_mode_s, workspace_kwargs=ws_kwargs)
+    profile["selection_mode"] = str(selection_mode_s)
+    history: list[dict[str, Any]] = []
+    prev_c_sel: np.ndarray | None = None
+
+    frontier_selector: FrontierHashSelector | None = None
+    hb_index_obj = None
+    hb_frontier = None
+    if selection_mode_s == "heat_bath":
+        from asuka.sci.hb_integrals import build_hb_index, build_hb_index_from_df  # noqa: PLC0415
+        from asuka.sci.hb_selection import adaptive_epsilon as _adaptive_eps  # noqa: PLC0415
+
         norb = int(drt.norb)
         nops = norb * norb
-        tile = int(frontier_hash_tile)
-        if tile <= 0:
-            tile = 1024
-        # Ensure (tile * rs_block) <= workspace Kernel25Workspace.max_tasks.
-        tile = min(tile, int(getattr(ws, "j_tile", tile)))
-        tile = max(1, tile)
-        rs_block = int(frontier_hash_rs_block)
-        if rs_block <= 0:
-            rs_block = 128
-        rs_r_d = getattr(ws, "_rs_r_d", None)
-        rs_s_d = getattr(ws, "_rs_s_d", None)
-        if rs_r_d is None or rs_s_d is None:
-            raise RuntimeError("internal error: workspace missing rs pair tables")
-        n_pairs = int(rs_r_d.size)
-        rs_block = min(rs_block, max(1, n_pairs))
-        if int(tile) * int(rs_block) > int(getattr(getattr(ws, "_k25_ws", None), "max_tasks", 0)):
-            # Conservative fallback: shrink tile until it fits.
-            max_tasks = int(getattr(getattr(ws, "_k25_ws", None), "max_tasks", 0))
-            if max_tasks <= 0:
-                raise RuntimeError("Kernel25Workspace is unavailable on CUDA workspace")
-            tile = max(1, int(max_tasks // max(1, rs_block)))
 
-        # Selected mask for skipping internal CI-space entries during PT2/selection.
+        # Build the sorted integral index (one-time cost)
+        l_full_ws = getattr(ws, "l_full", None)
+        eri_mat_ws = getattr(ws, "eri_mat", None)
+        h_eff_flat = getattr(ws, "h_eff_flat", None)
+        if h_eff_flat is None:
+            raise RuntimeError("internal error: workspace h_eff_flat is missing")
+        h_eff_np = cp.asnumpy(h_eff_flat).reshape(norb, norb)
+
+        if l_full_ws is not None:
+            l_full_np = cp.asnumpy(l_full_ws)
+            hb_index_obj = build_hb_index_from_df(h_eff_np, l_full_np, norb)
+        elif eri_mat_ws is not None:
+            eri_mat_np = cp.asnumpy(eri_mat_ws).reshape(norb, norb, norb, norb)
+            hb_index_obj = build_hb_index(h_eff_np, eri_mat_np, norb)
+        else:
+            raise RuntimeError("internal error: workspace missing both eri_mat and l_full for HB-SCI")
+
+        # Set up frontier hash buffers for heat-bath mode
         selected_mask_d = cp.zeros((ncsf,), dtype=cp.uint8)
         selected_mask_d[cp.asarray(np.asarray(sel, dtype=np.int32), dtype=cp.int32)] = np.uint8(1)
         hdiag_d = cp.ascontiguousarray(cp.asarray(np.asarray(hdiag, dtype=np.float64), dtype=cp.float64))
 
-        # Two-body diagonal rs (r==s) ERI columns: eri_diag_t[r,pq] = eri[pq, rr].
-        diag_ids = cp.asarray([int(r) * int(norb) + int(r) for r in range(int(norb))], dtype=cp.int32)
-        l_full = getattr(ws, "l_full", None)
-        eri_mat = getattr(ws, "eri_mat", None)
-        if l_full is not None:
-            l_diag = l_full[diag_ids]
-            eri_diag_t = cp.ascontiguousarray(cp.dot(l_diag, l_full.T))
-        elif eri_mat is not None:
-            eri_diag_t = cp.ascontiguousarray(eri_mat[:, diag_ids].T.copy())
-        else:
-            raise RuntimeError("internal error: workspace missing both eri_mat and l_full")
-
-        # Scratch buffers reused across selection iterations.
-        occ_buf = cp.empty((tile, norb), dtype=cp.float64)
-        x_full = cp.empty((ncsf,), dtype=cp.float64)
-        g_rows = 4096
-        g_rows = max(256, min(int(g_rows), int(getattr(ws, "_csr_capacity", g_rows))))
-        g_buf = cp.empty((g_rows, nops), dtype=cp.float64)
-        gdf_ws = None
-        if l_full is not None:
-            naux = int(l_full.shape[1])
-            gdf_ws = Kernel3BuildGDFWorkspace(int(nops), int(naux), max_nrows=int(g_rows))
-
-        frontier = {
-            "tile": int(tile),
-            "rs_block": int(rs_block),
-            "rs_r_d": rs_r_d,
-            "rs_s_d": rs_s_d,
-            "n_pairs": int(n_pairs),
+        hb_frontier = {
             "selected_mask_d": selected_mask_d,
             "hdiag_d": hdiag_d,
-            "eri_diag_t": eri_diag_t,
-            "x_full": x_full,
-            "occ_buf": occ_buf,
-            "g_rows": int(g_rows),
-            "g_buf": g_buf,
-            "gdf_ws": gdf_ws,
             "hash_cap": 0,
             "hash_keys": None,
             "hash_vals": None,
@@ -615,332 +591,26 @@ def run_cipsi_trials(
             "out_idx": None,
             "out_vals": None,
             "out_nnz": None,
+            "max_retries": int(frontier_hash_max_retries),
+            "hb_dev": None,
         }
 
-        def _frontier_hash_select_and_pt2(
-            *,
-            sel_idx: np.ndarray,
-            c_sel: np.ndarray,
-            e_var: np.ndarray,
-            max_add: int,
-        ) -> tuple[list[int], np.ndarray]:
-            if frontier is None:  # pragma: no cover
-                raise RuntimeError("internal error: frontier workspace is missing")
-
-            stream = cp.cuda.get_current_stream()
-            norb_i = int(drt.norb)
-            nops_i = int(norb_i) * int(norb_i)
-            nsel = int(sel_idx.size)
-            if nsel <= 0:
-                return [], np.zeros((int(nroots),), dtype=np.float64)
-
-            sel_idx_i32 = np.asarray(sel_idx, dtype=np.int32)
-            sel_idx_d = cp.asarray(sel_idx_i32, dtype=cp.int32)
-            c_sel_d = cp.asarray(c_sel, dtype=cp.float64)
-            c_sel_d = cp.ascontiguousarray(c_sel_d)
-            e_var_d = cp.asarray(e_var, dtype=cp.float64).ravel()
-            e_var_d = cp.ascontiguousarray(e_var_d)
-            if e_var_d.shape != (int(nroots),):
-                raise RuntimeError("internal error: e_var has wrong shape")
-
-            h_eff_flat = getattr(ws, "h_eff_flat", None)
-            if h_eff_flat is None:
-                raise RuntimeError("internal error: workspace h_eff_flat is missing")
-
-            # Tile groups for diagonal rs term (contiguous occ build) and for off-diagonal tasks.
-            tile_size = int(frontier["tile"])
-            tile_id = (sel_idx_i32 // int(tile_size)).astype(np.int64, copy=False)
-            uniq_tiles, inv = np.unique(tile_id, return_inverse=True)
-            tile_groups: list[tuple[int, np.ndarray]] = []
-            for t_i, tval in enumerate(uniq_tiles.tolist()):
-                pos = np.nonzero(inv == int(t_i))[0].astype(np.int32, copy=False)
-                if pos.size:
-                    tile_groups.append((int(tval), pos))
-
-            # Hash capacity (power of two), grow on overflow.
-            cap_in = int(frontier_hash_cap) if frontier_hash_cap is not None else int(frontier.get("hash_cap", 0) or 0)
-            cap = int(cap_in)
-            if cap <= 0:
-                mult = min(256, max(32, nops_i // 4))
-                target = int(min(ncsf, max(1 << 20, int(mult) * int(nsel))))
-                cap = 1
-                while cap < target:
-                    cap <<= 1
-            else:
-                # Round up to a power-of-two (hash kernels require this).
-                cap = 1
-                while cap < int(cap_in):
-                    cap <<= 1
-            cap = max(1024, int(cap))
-            # Cap at ncsf (round down to pow2).
-            while cap > ncsf and cap > 1:
-                cap >>= 1
-
-            rs_r_d_loc = frontier["rs_r_d"]
-            rs_s_d_loc = frontier["rs_s_d"]
-            n_pairs_loc = int(frontier["n_pairs"])
-            rs_block_loc = int(frontier["rs_block"])
-            rs_block_loc = min(rs_block_loc, n_pairs_loc) if n_pairs_loc > 0 else 0
-            x_full = frontier["x_full"]
-            occ_buf = frontier["occ_buf"]
-            eri_diag_t = frontier["eri_diag_t"]
-            g_buf = frontier["g_buf"]
-            g_rows_loc = int(frontier["g_rows"])
-            selected_mask_d_loc = frontier["selected_mask_d"]
-            hdiag_d_loc = frontier["hdiag_d"]
-
-            # CSR staging buffers and Kernel25Workspace from the matvec workspace.
-            k25_ws = getattr(ws, "_k25_ws", None)
-            if k25_ws is None:
-                raise RuntimeError("Kernel25Workspace is unavailable on CUDA workspace")
-            row_j_buf = getattr(ws, "_csr_row_j", None)
-            row_k_buf = getattr(ws, "_csr_row_k", None)
-            indptr_buf = getattr(ws, "_csr_indptr", None)
-            indices_buf = getattr(ws, "_csr_indices", None)
-            data_buf = getattr(ws, "_csr_data", None)
-            overflow_buf = getattr(ws, "_csr_overflow", None)
-            if row_j_buf is None or row_k_buf is None or indptr_buf is None or indices_buf is None or data_buf is None or overflow_buf is None:
-                raise RuntimeError("internal error: missing Kernel25 staging buffers on workspace")
-
-            l_full_loc = getattr(ws, "l_full", None)
-            eri_mat_loc = getattr(ws, "eri_mat", None)
-            gdf_ws_loc = frontier.get("gdf_ws")
-
-            for attempt in range(int(frontier_hash_max_retries)):
-                # (Re)allocate hash buffers when cap changes.
-                if int(frontier.get("hash_cap", 0)) != int(cap) or frontier.get("hash_keys") is None:
-                    frontier["hash_cap"] = int(cap)
-                    frontier["hash_keys"] = cp.empty((int(cap),), dtype=cp.int32)
-                    frontier["hash_vals"] = cp.empty((int(nroots), int(cap)), dtype=cp.float64)
-                    frontier["hash_overflow"] = cp.empty((1,), dtype=cp.int32)
-                    frontier["out_idx"] = cp.empty((int(cap),), dtype=cp.int32)
-                    frontier["out_vals"] = cp.empty((int(nroots), int(cap)), dtype=cp.float64)
-                    frontier["out_nnz"] = cp.empty((1,), dtype=cp.int32)
-
-                hash_keys = frontier["hash_keys"]
-                hash_vals = frontier["hash_vals"]
-                hash_overflow = frontier["hash_overflow"]
-                out_idx = frontier["out_idx"]
-                out_vals = frontier["out_vals"]
-                out_nnz = frontier["out_nnz"]
-                if hash_keys is None or hash_vals is None or hash_overflow is None or out_idx is None or out_vals is None or out_nnz is None:
-                    raise RuntimeError("internal error: hash buffers missing after allocation")
-
-                cipsi_frontier_hash_clear_inplace_device(hash_keys, hash_vals, threads=256, stream=stream, sync=False)
-                cp.cuda.runtime.memsetAsync(int(hash_overflow.data.ptr), 0, 4, int(stream.ptr))
-
-                for r in range(int(nroots)):
-                    # x_full <- scatter selected coefficients for this root.
-                    cp.cuda.runtime.memsetAsync(int(x_full.data.ptr), 0, int(x_full.nbytes), int(stream.ptr))
-                    x_full[sel_idx_d] = c_sel_d[:, r]
-
-                    # One-body: g=h_eff (shared), apply on selected kets.
-                    apply_g_flat_scatter_atomic_frontier_hash_inplace_device(
-                        drt,
-                        ws.drt_dev,
-                        ws.state_dev,
-                        sel_idx_d,
-                        h_eff_flat,
-                        task_scale=cp.ascontiguousarray(c_sel_d[:, r]),
-                        hash_keys=hash_keys,
-                        hash_vals=hash_vals,
-                        root=int(r),
-                        overflow=hash_overflow,
-                        clear_overflow=False,
-                        threads=256,
-                        stream=stream,
-                        sync=False,
-                        check_overflow=False,
-                    )
-
-                    # Two-body diagonal rs (r==s): build occ blocks per active tile, then apply g_diag.
-                    for tile_id_val, pos in tile_groups:
-                        j_start = int(tile_id_val) * int(tile_size)
-                        j_count = min(int(tile_size), int(ncsf) - int(j_start))
-                        if j_count <= 0:
-                            continue
-                        build_occ_block_from_steps_inplace_device(
-                            ws.state_dev,
-                            j_start=int(j_start),
-                            j_count=int(j_count),
-                            occ_out=occ_buf[:j_count],
-                            threads=256,
-                            stream=stream,
-                            sync=False,
-                        )
-                        rel = cp.asarray(sel_idx_i32[pos] - int(j_start), dtype=cp.int32)
-                        occ_sel = cp.ascontiguousarray(occ_buf[rel])
-                        g_diag_sel = cp.dot(occ_sel, eri_diag_t)
-                        g_diag_sel *= 0.5
-                        task_csf_tile = cp.asarray(sel_idx_i32[pos], dtype=cp.int32)
-                        task_scale_tile = cp.ascontiguousarray(c_sel_d[pos, r])
-                        apply_g_flat_scatter_atomic_frontier_hash_inplace_device(
-                            drt,
-                            ws.drt_dev,
-                            ws.state_dev,
-                            task_csf_tile,
-                            g_diag_sel,
-                            task_scale=task_scale_tile,
-                            hash_keys=hash_keys,
-                            hash_vals=hash_vals,
-                            root=int(r),
-                            overflow=hash_overflow,
-                            clear_overflow=False,
-                            threads=256,
-                            stream=stream,
-                            sync=False,
-                            check_overflow=False,
-                        )
-
-                    # Two-body off-diagonal rs (r!=s): CSR build from tasks, build-g, apply to frontier hash.
-                    if rs_block_loc > 0 and n_pairs_loc > 0:
-                        for _tile_id_val, pos in tile_groups:
-                            task_csf_tile = cp.asarray(sel_idx_i32[pos], dtype=cp.int32)
-                            nsel_tile = int(task_csf_tile.size)
-                            if nsel_tile <= 0:
-                                continue
-                            for p0 in range(0, n_pairs_loc, rs_block_loc):
-                                p1 = min(n_pairs_loc, int(p0 + rs_block_loc))
-                                blk = int(p1 - p0)
-                                if blk <= 0:
-                                    continue
-
-                                task_csf = cp.ascontiguousarray(cp.repeat(task_csf_tile, blk))
-                                task_p = cp.ascontiguousarray(cp.tile(rs_r_d_loc[p0:p1], nsel_tile))
-                                task_q = cp.ascontiguousarray(cp.tile(rs_s_d_loc[p0:p1], nsel_tile))
-
-                                nrows, nnz, _nnz_in = k25_ws.build_from_tasks_deterministic_inplace_device(
-                                    ws.drt_dev,
-                                    ws.state_dev,
-                                    task_csf,
-                                    task_p,
-                                    task_q,
-                                    row_j_buf,
-                                    row_k_buf,
-                                    indptr_buf,
-                                    indices_buf,
-                                    data_buf,
-                                    overflow_buf,
-                                    int(getattr(ws, "threads_enum", 128)),
-                                    bool(getattr(ws, "coalesce", False)),
-                                    int(stream.ptr),
-                                    True,
-                                    True,
-                                )
-                                nrows = int(nrows)
-                                nnz = int(nnz)
-                                if nrows <= 0 or nnz <= 0:
-                                    continue
-
-                                row_j_d = row_j_buf[:nrows]
-                                row_k_d = row_k_buf[:nrows]
-                                indptr_d = indptr_buf[: nrows + 1]
-                                indices_d = indices_buf[:nnz]
-                                data_d = data_buf[:nnz]
-
-                                for row_start in range(0, nrows, g_rows_loc):
-                                    row_stop = min(nrows, int(row_start + g_rows_loc))
-                                    nb = int(row_stop - row_start)
-                                    if nb <= 0:
-                                        continue
-                                    g_b = g_buf[:nb]
-                                    if l_full_loc is not None:
-                                        if gdf_ws_loc is None:
-                                            raise RuntimeError("internal error: gdf_ws is missing for DF path")
-                                        gdf_ws_loc.build_g_from_csr_l_full_range_inplace_device(
-                                            indptr_d,
-                                            indices_d,
-                                            data_d,
-                                            row_start=int(row_start),
-                                            nrows=int(nb),
-                                            l_full=l_full_loc,
-                                            g_out=g_b,
-                                            threads=int(getattr(ws, "threads_g", 256)),
-                                            half=0.5,
-                                            stream=stream,
-                                            sync=False,
-                                        )
-                                    else:
-                                        if eri_mat_loc is None:
-                                            raise RuntimeError("internal error: eri_mat is missing for non-DF path")
-                                        kernel3_build_g_from_csr_eri_mat_range_inplace_device(
-                                            indptr_d,
-                                            indices_d,
-                                            data_d,
-                                            row_start=int(row_start),
-                                            nrows=int(nb),
-                                            eri_mat=eri_mat_loc,
-                                            g_out=g_b,
-                                            threads=int(getattr(ws, "threads_g", 256)),
-                                            half=0.5,
-                                            stream=stream,
-                                            sync=False,
-                                        )
-
-                                    row_j_b = row_j_d[int(row_start) : int(row_stop)]
-                                    row_k_b = row_k_d[int(row_start) : int(row_stop)]
-                                    task_scale_row = cp.ascontiguousarray(cp.take(x_full, row_j_b))
-                                    apply_g_flat_scatter_atomic_frontier_hash_inplace_device(
-                                        drt,
-                                        ws.drt_dev,
-                                        ws.state_dev,
-                                        row_k_b,
-                                        g_b,
-                                        task_scale=task_scale_row,
-                                        hash_keys=hash_keys,
-                                        hash_vals=hash_vals,
-                                        root=int(r),
-                                        overflow=hash_overflow,
-                                        clear_overflow=False,
-                                        threads=int(getattr(ws, "threads_apply", 256)),
-                                        stream=stream,
-                                        sync=False,
-                                        check_overflow=False,
-                                    )
-
-                # Overflow check: if set, grow cap and retry.
-                if int(hash_overflow.get()[0]) != 0:
-                    cap = min(int(cap) << 1, 1 << 30)
-                    continue
-
-                # Extract compact frontier for scoring.
-                cipsi_frontier_hash_extract_inplace_device(
-                    hash_keys,
-                    hash_vals,
-                    out_idx=out_idx,
-                    out_vals_root_major=out_vals,
-                    out_nnz=out_nnz,
-                    threads=256,
-                    stream=stream,
-                    sync=True,
-                )
-                nnz_out = int(out_nnz.get()[0])
-                out_new_idx = cp.empty((int(max_add),), dtype=cp.int32)
-                out_new_n = cp.empty((1,), dtype=cp.int32)
-                out_pt2 = cp.empty((int(nroots),), dtype=cp.float64)
-                cipsi_score_and_select_topk_inplace_device(
-                    out_idx,
-                    out_vals,
-                    nnz=int(nnz_out),
-                    e_var=e_var_d,
-                    hdiag=hdiag_d_loc,
-                    selected_mask=selected_mask_d_loc,
-                    denom_floor=float(denom_floor),
-                    out_new_idx=out_new_idx,
-                    out_new_n=out_new_n,
-                    out_pt2=out_pt2,
-                    threads=256,
-                    stream=stream,
-                    sync=True,
-                )
-                e_pt2_h = cp.asnumpy(out_pt2)
-                n_new = int(out_new_n.get()[0])
-                if n_new > 0:
-                    new_idx_h = cp.asnumpy(out_new_idx[:n_new]).astype(np.int64, copy=False).tolist()
-                    return [int(ii) for ii in new_idx_h], np.asarray(e_pt2_h, dtype=np.float64)
-                return [], np.asarray(e_pt2_h, dtype=np.float64)
-
-            raise RuntimeError("frontier-hash overflow: increase frontier_hash_cap or reduce grow_by")
+    if selection_mode_s == "frontier_hash":
+        frontier_selector = FrontierHashSelector(
+            drt,
+            ws,
+            nroots=int(nroots),
+            hdiag=hdiag,
+            denom_floor=float(denom_floor),
+            tile=int(frontier_hash_tile),
+            rs_block=int(frontier_hash_rs_block),
+            g_rows=None,
+            hash_cap=frontier_hash_cap,
+            max_retries=int(frontier_hash_max_retries),
+            nvtx=None,
+            profile=False,
+        )
+        frontier_selector.reset_selected_mask(np.asarray(sel, dtype=np.int64))
 
     for it in range(1, int(max_iter) + 1):
         sel_idx = np.asarray(sel, dtype=np.int64)
@@ -971,9 +641,28 @@ def run_cipsi_trials(
 
         max_add = min(int(grow_by), int(max_ncsf) - int(sel_idx.size))
         if selection_mode_s == "frontier_hash":
-            if frontier is None:  # pragma: no cover
-                raise RuntimeError("internal error: frontier workspace is missing for selection_mode='frontier_hash'")
-            new_idx, e_pt2 = _frontier_hash_select_and_pt2(sel_idx=sel_idx, c_sel=c_sel, e_var=e_var, max_add=int(max_add))
+            if frontier_selector is None:  # pragma: no cover
+                raise RuntimeError("internal error: frontier selector is missing for selection_mode='frontier_hash'")
+            new_idx, e_pt2, _stats = frontier_selector.build_and_score(
+                sel_idx=sel_idx,
+                c_sel=c_sel,
+                e_var=e_var,
+                max_add=int(max_add),
+            )
+        elif selection_mode_s == "heat_bath":
+            from asuka.sci.hb_selection import heat_bath_select_and_pt2 as _hb_select  # noqa: PLC0415
+            if hb_index_obj is None or hb_frontier is None:  # pragma: no cover
+                raise RuntimeError("internal error: HB-SCI index/buffers missing")
+            # Compute epsilon for this iteration
+            if str(hb_eps_schedule).lower() == "adaptive":
+                _eps = _adaptive_eps(it, int(sel_idx.size), int(max_ncsf), eps_init=float(hb_eps_init), eps_final=float(hb_eps_final))
+            else:
+                _eps = float(hb_epsilon)
+            new_idx, e_pt2 = _hb_select(
+                hb_index_obj, sel_idx, c_sel, e_var, int(max_add), _eps,
+                ws, drt, hb_frontier, nroots, ncsf, float(denom_floor),
+                verbose=verbose,
+            )
         else:
             c_sel_d = cp.asarray(c_sel, dtype=cp.float64)
             hc_full_d = hop.apply_full_block(c_sel_d)
@@ -995,8 +684,10 @@ def run_cipsi_trials(
             sel.append(int(ii))
             if len(sel) >= int(max_ncsf):
                 break
-        if selection_mode_s == "frontier_hash" and frontier is not None and len(new_idx) > 0:
-            selected_mask_d = frontier.get("selected_mask_d")
+        if selection_mode_s == "frontier_hash" and frontier_selector is not None and len(new_idx) > 0:
+            frontier_selector.mark_selected(new_idx)
+        if selection_mode_s == "heat_bath" and hb_frontier is not None and len(new_idx) > 0:
+            selected_mask_d = hb_frontier.get("selected_mask_d")
             if selected_mask_d is not None:
                 new_i32 = np.asarray(new_idx, dtype=np.int32)
                 selected_mask_d[cp.asarray(new_i32, dtype=cp.int32)] = np.uint8(1)
@@ -1052,10 +743,25 @@ def run_cipsi_trials(
         e_var = np.asarray(e_var[perm], dtype=np.float64)
         c_sel = np.asarray(c_sel[:, perm], dtype=np.float64)
     if selection_mode_s == "frontier_hash":
-        if frontier is None:  # pragma: no cover
-            raise RuntimeError("internal error: frontier workspace is missing for selection_mode='frontier_hash'")
-        _new_idx, e_pt2 = _frontier_hash_select_and_pt2(sel_idx=np.asarray(sel_idx, dtype=np.int64), c_sel=c_sel, e_var=e_var, max_add=0)
+        if frontier_selector is None:  # pragma: no cover
+            raise RuntimeError("internal error: frontier selector is missing for selection_mode='frontier_hash'")
+        _new_idx, e_pt2, _stats = frontier_selector.build_and_score(
+            sel_idx=np.asarray(sel_idx, dtype=np.int64),
+            c_sel=c_sel,
+            e_var=e_var,
+            max_add=0,
+        )
         assert len(_new_idx) == 0
+    elif selection_mode_s == "heat_bath":
+        from asuka.sci.hb_selection import heat_bath_select_and_pt2 as _hb_select  # noqa: PLC0415
+        if hb_index_obj is None or hb_frontier is None:  # pragma: no cover
+            raise RuntimeError("internal error: HB-SCI index/buffers missing")
+        _eps_final = float(hb_eps_final) if str(hb_eps_schedule).lower() == "adaptive" else float(hb_epsilon)
+        _new_idx, e_pt2 = _hb_select(
+            hb_index_obj, np.asarray(sel_idx, dtype=np.int64), c_sel, e_var, 0, _eps_final,
+            ws, drt, hb_frontier, nroots, ncsf, float(denom_floor),
+            verbose=verbose,
+        )
     else:
         c_sel_d = cp.asarray(c_sel, dtype=cp.float64)
         hc_full_d = hop.apply_full_block(c_sel_d)
