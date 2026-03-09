@@ -370,6 +370,233 @@ class DFJKWorkspace {
     if (sync) throw_on_cuda_error(cudaStreamSynchronize(stream), "cudaStreamSynchronize");
   }
 
+  void density_syrk(
+      const py::object& cw,
+      const py::object& out,
+      uint64_t stream_ptr,
+      int math_mode,
+      bool sync) {
+    const CudaArrayView cw_v = cuda_array_view_from_object(cw, "Cw");
+    const CudaArrayView out_v = cuda_array_view_from_object(out, "out");
+
+    require_typestr_f64(cw_v, "Cw");
+    require_typestr_f64(out_v, "out");
+
+    if (out_v.read_only) throw std::invalid_argument("out must be a writable CUDA array");
+    if (cw_v.shape.size() != 2) throw std::invalid_argument("Cw must have shape (nao, nocc)");
+    if (out_v.shape.size() != 2) throw std::invalid_argument("out must have shape (nao, nao)");
+
+    constexpr int64_t itemsize = (int64_t)sizeof(double);
+    require_c_contiguous(cw_v, "Cw", itemsize);
+    require_c_contiguous(out_v, "out", itemsize);
+
+    const int64_t nao = cw_v.shape[0];
+    const int64_t nocc = cw_v.shape[1];
+    if (out_v.shape[0] != nao || out_v.shape[1] != nao)
+      throw std::invalid_argument("out shape mismatch with Cw nao");
+    if (nao > (int64_t)std::numeric_limits<int>::max() ||
+        nocc > (int64_t)std::numeric_limits<int>::max())
+      throw std::invalid_argument("dimensions exceed int32 limits for cuBLAS");
+
+    const int nao_i = (int)nao;
+    const int nocc_i = (int)nocc;
+
+    auto* cw_ptr = reinterpret_cast<const double*>(cw_v.ptr);
+    auto* out_ptr = reinterpret_cast<double*>(out_v.ptr);
+
+    cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
+    throw_on_cublas_error(cublasSetStream(cublas_.h, stream), "cublasSetStream");
+    const ScopedCublasMathMode math_ctx(cublas_.h, math_mode);
+
+    throw_on_cuda_error(
+        cudaMemsetAsync(out_ptr, 0, (size_t)nao_i * nao_i * sizeof(double), stream),
+        "cudaMemsetAsync(out)");
+
+    if (nao_i <= 0 || nocc_i <= 0) {
+      if (sync) throw_on_cuda_error(cudaStreamSynchronize(stream), "cudaStreamSynchronize");
+      return;
+    }
+
+    // D = Cw @ Cw^T via DSYRK.
+    // Cw is row-major (nao, nocc). In cuBLAS col-major view, it is (nocc, nao) with lda=nocc.
+    // CUBLAS_FILL_MODE_LOWER in col-major = upper triangle in row-major (Python/C convention).
+    // CUBLAS_OP_T: C = alpha * A^T * A where A is (nocc x nao) col-major => C = Cw_rm * Cw_rm^T.
+    const double alpha = 1.0;
+    const double beta_zero = 0.0;
+    throw_on_cublas_error(
+        cublasDsyrk(cublas_.h,
+                    CUBLAS_FILL_MODE_LOWER,
+                    CUBLAS_OP_T,
+                    nao_i,
+                    nocc_i,
+                    &alpha,
+                    cw_ptr,
+                    nocc_i,
+                    &beta_zero,
+                    out_ptr,
+                    nao_i),
+        "cublasDsyrk");
+
+    // Fill lower triangle from upper (row-major convention).
+    hf_df_jk_fill_lower_from_upper_f64(out_ptr, nao_i, stream);
+
+    if (sync) throw_on_cuda_error(cudaStreamSynchronize(stream), "cudaStreamSynchronize");
+  }
+
+  void jk_from_bq_cw(
+      const py::object& bq,
+      const py::object& cw,
+      const py::object& d_mat,
+      const py::object& out_j,
+      const py::object& out_k,
+      int q_block,
+      uint64_t stream_ptr,
+      int math_mode,
+      bool sync) {
+    const CudaArrayView bq_v = cuda_array_view_from_object(bq, "BQ");
+    const CudaArrayView cw_v = cuda_array_view_from_object(cw, "Cw");
+    const CudaArrayView d_v = cuda_array_view_from_object(d_mat, "D");
+    const CudaArrayView j_v = cuda_array_view_from_object(out_j, "out_J");
+    const CudaArrayView k_v = cuda_array_view_from_object(out_k, "out_K");
+
+    require_typestr_f64(bq_v, "BQ");
+    require_typestr_f64(cw_v, "Cw");
+    require_typestr_f64(d_v, "D");
+    require_typestr_f64(j_v, "out_J");
+    require_typestr_f64(k_v, "out_K");
+
+    if (j_v.read_only) throw std::invalid_argument("out_J must be a writable CUDA array");
+    if (k_v.read_only) throw std::invalid_argument("out_K must be a writable CUDA array");
+    if (bq_v.shape.size() != 3) throw std::invalid_argument("BQ must have shape (naux, nao, nao)");
+    if (cw_v.shape.size() != 2) throw std::invalid_argument("Cw must have shape (nao, nocc)");
+    if (d_v.shape.size() != 2) throw std::invalid_argument("D must have shape (nao, nao)");
+    if (j_v.shape.size() != 2) throw std::invalid_argument("out_J must have shape (nao, nao)");
+    if (k_v.shape.size() != 2) throw std::invalid_argument("out_K must have shape (nao, nao)");
+
+    constexpr int64_t itemsize = (int64_t)sizeof(double);
+    require_c_contiguous(bq_v, "BQ", itemsize);
+    require_c_contiguous(cw_v, "Cw", itemsize);
+    require_c_contiguous(d_v, "D", itemsize);
+    require_c_contiguous(j_v, "out_J", itemsize);
+    require_c_contiguous(k_v, "out_K", itemsize);
+
+    const int64_t naux = bq_v.shape[0];
+    const int64_t nao0 = bq_v.shape[1];
+    const int64_t nao1 = bq_v.shape[2];
+    if (nao0 != nao1) throw std::invalid_argument("BQ must have shape (naux, nao, nao)");
+    const int64_t nao = nao0;
+
+    if (cw_v.shape[0] != nao) throw std::invalid_argument("Cw nao mismatch with BQ");
+    const int64_t nocc = cw_v.shape[1];
+    if (d_v.shape[0] != nao || d_v.shape[1] != nao)
+      throw std::invalid_argument("D shape mismatch with BQ nao");
+    if (j_v.shape[0] != nao || j_v.shape[1] != nao)
+      throw std::invalid_argument("out_J shape mismatch with BQ nao");
+    if (k_v.shape[0] != nao || k_v.shape[1] != nao)
+      throw std::invalid_argument("out_K shape mismatch with BQ nao");
+    if (q_block <= 0) throw std::invalid_argument("q_block must be > 0");
+
+    if (naux > (int64_t)std::numeric_limits<int>::max() ||
+        nao > (int64_t)std::numeric_limits<int>::max() ||
+        nocc > (int64_t)std::numeric_limits<int>::max())
+      throw std::invalid_argument("dimensions exceed int32 limits for cuBLAS");
+
+    const int naux_i = (int)naux;
+    const int nao_i = (int)nao;
+    const int nocc_i = (int)nocc;
+    if (naux_i < 0 || nao_i <= 0 || nocc_i < 0)
+      throw std::invalid_argument("invalid dimensions");
+
+    auto* bq_ptr = reinterpret_cast<const double*>(bq_v.ptr);
+    auto* cw_ptr = reinterpret_cast<const double*>(cw_v.ptr);
+    auto* d_ptr = reinterpret_cast<const double*>(d_v.ptr);
+    auto* j_ptr = reinterpret_cast<double*>(j_v.ptr);
+    auto* k_ptr = reinterpret_cast<double*>(k_v.ptr);
+
+    cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
+    throw_on_cublas_error(cublasSetStream(cublas_.h, stream), "cublasSetStream");
+    const ScopedCublasMathMode math_ctx(cublas_.h, math_mode);
+
+    const int64_t nn = (int64_t)nao_i * nao_i;
+    throw_on_cuda_error(
+        cudaMemsetAsync(j_ptr, 0, (size_t)nn * sizeof(double), stream), "cudaMemsetAsync(J)");
+    throw_on_cuda_error(
+        cudaMemsetAsync(k_ptr, 0, (size_t)nn * sizeof(double), stream), "cudaMemsetAsync(K)");
+
+    if (naux_i == 0 || nocc_i == 0) {
+      if (sync) throw_on_cuda_error(cudaStreamSynchronize(stream), "cudaStreamSynchronize");
+      return;
+    }
+
+    const int q_block_i = std::min(q_block, naux_i);
+    const int nao2 = nao_i * nao_i;
+    // v_buf_: K's U matrix (q*nao, nocc).
+    // bq_buf_: d_q vector for J (q doubles; much smaller than q*nao*nao).
+    const int64_t max_cols_k = (int64_t)q_block_i * nocc_i;
+    ensure_v_capacity((size_t)(max_cols_k * nao_i));
+    ensure_bq_capacity((size_t)q_block_i);
+
+    const double alpha = 1.0;
+    const double beta0 = 0.0;
+    const double beta1 = 1.0;
+
+    for (int q0 = 0; q0 < naux_i; q0 += q_block_i) {
+      const int q = std::min(q_block_i, naux_i - q0);
+      if (q <= 0) continue;
+
+      const double* BQc = bq_ptr + (int64_t)q0 * nao_i * nao_i;
+      double* d_q = bq_buf_;  // (q,) scratch for J
+      double* U = v_buf_;     // (q*nao, nocc) scratch for K
+
+      // --- J contribution ---
+      // d_q = BQc.reshape(q, nao²) @ d_flat
+      // In cuBLAS col-major: BQc is (nao², q), CUBLAS_OP_T: d_q = BQc^T @ d_flat.
+      throw_on_cublas_error(
+          cublasDgemv(cublas_.h, CUBLAS_OP_T,
+                      nao2, q,
+                      &alpha, BQc, nao2,
+                      d_ptr, 1,
+                      &beta0, d_q, 1),
+          "cublasDgemv(J_dQ)");
+
+      // J_flat += BQc.reshape(nao², q) @ d_q (accumulate all contributions)
+      throw_on_cublas_error(
+          cublasDgemv(cublas_.h, CUBLAS_OP_N,
+                      nao2, q,
+                      &alpha, BQc, nao2,
+                      d_q, 1,
+                      &beta1, j_ptr, 1),
+          "cublasDgemv(J_accum)");
+
+      // --- K contribution (same as k_from_bq_cw) ---
+      const int n_flat = q * nao_i;
+      throw_on_cublas_error(
+          gemm_f64(
+              CUBLAS_OP_T, CUBLAS_OP_T,
+              n_flat, nocc_i, nao_i,
+              &alpha, BQc, nao_i,
+              cw_ptr, nocc_i,
+              &beta0, U, n_flat),
+          "gemm_f64(K_U)");
+
+      const int64_t cols = (int64_t)q * nocc_i;
+      throw_on_cublas_error(
+          gemm_f64(
+              CUBLAS_OP_N, CUBLAS_OP_T,
+              nao_i, nao_i, (int)cols,
+              &alpha, U, nao_i,
+              U, nao_i,
+              &beta1, k_ptr, nao_i),
+          "gemm_f64(K_accum)");
+    }
+
+    // Enforce exact symmetry for both outputs.
+    hf_df_jk_fill_lower_from_upper_f64(j_ptr, nao_i, stream);
+    hf_df_jk_fill_lower_from_upper_f64(k_ptr, nao_i, stream);
+
+    if (sync) throw_on_cuda_error(cudaStreamSynchronize(stream), "cudaStreamSynchronize");
+  }
+
   void k_from_qp_cw(
       const py::object& b_qp,
       const py::object& cw,
@@ -944,6 +1171,46 @@ PYBIND11_MODULE(_hf_df_jk_cuda_ext, m) {
       py::arg("stream") = 0,
       py::arg("math_mode") = -1,
       py::arg("sync") = false);
+
+  cls.def(
+      "density_syrk",
+      [](DFJKWorkspace& self,
+         const py::object& cw,
+         const py::object& out,
+         uint64_t stream,
+         int math_mode,
+         bool sync) { self.density_syrk(cw, out, stream, math_mode, sync); },
+      py::arg("Cw"),
+      py::arg("out"),
+      py::arg("stream") = 0,
+      py::arg("math_mode") = -1,
+      py::arg("sync") = false,
+      "Compute density D = Cw @ Cw^T via cublasDsyrk (upper triangle) + fill_lower.");
+
+  cls.def(
+      "jk_from_bq_cw",
+      [](DFJKWorkspace& self,
+         const py::object& bq,
+         const py::object& cw,
+         const py::object& d_mat,
+         const py::object& out_j,
+         const py::object& out_k,
+         int q_block,
+         uint64_t stream,
+         int math_mode,
+         bool sync) {
+        self.jk_from_bq_cw(bq, cw, d_mat, out_j, out_k, q_block, stream, math_mode, sync);
+      },
+      py::arg("BQ"),
+      py::arg("Cw"),
+      py::arg("D"),
+      py::arg("out_J"),
+      py::arg("out_K"),
+      py::arg("q_block") = 128,
+      py::arg("stream") = 0,
+      py::arg("math_mode") = -1,
+      py::arg("sync") = false,
+      "Fused J+K build: reads BQ once per q-block, accumulates both Coulomb J and exchange K.");
 
   cls.def(
       "k_from_bmnq_cw",

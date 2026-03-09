@@ -6,6 +6,7 @@ import re
 import shutil
 import subprocess
 import sys
+import sysconfig
 from pathlib import Path
 
 
@@ -120,17 +121,32 @@ def main() -> None:
     print(f"Using CUDA root: {cuda_root}", file=sys.stderr)
     print(f"Using nvcc: {nvcc}", file=sys.stderr)
 
+    # Help CMake's FindPython3 stay consistent in Conda environments. Some
+    # toolchains can otherwise mix headers/libs from a different prefix even
+    # when Python3_EXECUTABLE is explicitly set.
+    py_root = os.path.abspath(sys.prefix)
+    py_inc = sysconfig.get_path("include")
+    py_libdir = sysconfig.get_config_var("LIBDIR") or os.path.join(py_root, "lib")
+    py_ldlib = sysconfig.get_config_var("LDLIBRARY") or ""
+    py_lib = os.path.join(py_libdir, py_ldlib) if py_ldlib else ""
+
     cmake_args = [
         "cmake",
         f"-S{src_dir}",
         f"-B{cmake_build_dir}",
         f"-DPython3_EXECUTABLE={sys.executable}",
+        f"-DPython3_ROOT_DIR={py_root}",
+        "-DPython3_FIND_VIRTUALENV=ONLY",
         f"-Dpybind11_DIR={_cmake_dir_for_pybind11()}",
         f"-DGUGA_CUDA_EXT_OUTPUT_DIR={out_dir}",
         f"-DCMAKE_CUDA_COMPILER={nvcc}",
         f"-DCUDAToolkit_ROOT={cuda_root}",
         "-DCMAKE_BUILD_TYPE=Release",
     ]
+    if py_inc:
+        cmake_args.append(f"-DPython3_INCLUDE_DIR={py_inc}")
+    if py_lib and os.path.exists(py_lib):
+        cmake_args.append(f"-DPython3_LIBRARY={py_lib}")
 
     cuda_arch_env = os.getenv("GUGA_CUDA_ARCH")
     if cuda_arch_env is None:
@@ -169,6 +185,15 @@ def main() -> None:
     # Enable ccache if available (speeds up incremental rebuilds)
     _ccache = shutil.which("ccache")
     if _ccache:
+        # Some environments (notably restricted sandboxes) can block ccache's
+        # default runtime dir temp path. Force a writable temp/cache location.
+        os.environ.setdefault("CCACHE_TEMPDIR", os.path.join(repo_root, "build", "ccache-tmp"))
+        os.environ.setdefault("CCACHE_DIR", os.path.join(repo_root, "build", "ccache"))
+        try:
+            os.makedirs(os.environ["CCACHE_TEMPDIR"], exist_ok=True)
+            os.makedirs(os.environ["CCACHE_DIR"], exist_ok=True)
+        except Exception:
+            pass
         cmake_args += [
             f"-DCMAKE_CUDA_COMPILER_LAUNCHER={_ccache}",
             f"-DCMAKE_CXX_COMPILER_LAUNCHER={_ccache}",
@@ -186,4 +211,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

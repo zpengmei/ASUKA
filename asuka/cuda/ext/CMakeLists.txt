@@ -14,7 +14,9 @@ set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 # mode and matches nvcc's default for standalone executables.
 set(CMAKE_CUDA_RUNTIME_LIBRARY Static)
 
-find_package(Python3 REQUIRED COMPONENTS Interpreter Development.Module)
+# CMake 4.x + some conda layouts can fail to populate Development.Module even when
+# headers/libs are present. Development is sufficient for pybind11 extension modules.
+find_package(Python3 REQUIRED COMPONENTS Interpreter Development)
 find_package(pybind11 CONFIG REQUIRED)
 find_package(CUDAToolkit REQUIRED)
 

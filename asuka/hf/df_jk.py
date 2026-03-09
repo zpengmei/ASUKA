@@ -965,10 +965,163 @@ def df_K_from_BmnQ_Cocc(
     return _symmetrize(xp, K)
 
 
+def df_density_from_Cw_syrk(Cw, *, nao: int, nocc: int):
+    """Compute density D = Cw @ Cw^T via cublasDsyrk on GPU.
+
+    Uses only the upper triangle (in Python/row-major convention) and fills
+    the lower with ``fill_lower_from_upper_f64`` so the result is fully
+    symmetric without paying for the redundant lower-triangle GEMM.
+
+    Falls back to ``Cw @ Cw.T`` if the CUDA extension is unavailable.
+
+    Inputs
+    - Cw: (nao, nocc) float64 C-contiguous CuPy array (= C_occ * sqrt(occ))
+    """
+    try:
+        import cupy as cp  # noqa: PLC0415
+    except Exception:
+        return Cw @ Cw.T
+
+    xp = cp
+    if not isinstance(Cw, cp.ndarray):
+        return Cw @ Cw.T
+
+    ext = _load_hf_df_jk_cuda_ext()
+    if ext is None:
+        return Cw @ Cw.T
+
+    if not bool(getattr(Cw, "flags", None) and Cw.flags.c_contiguous):
+        Cw = xp.ascontiguousarray(Cw)
+
+    ws = _get_hf_df_jk_workspace(xp)
+    if not hasattr(ws, "density_syrk"):
+        # CUDA extension predates density_syrk; fall back to DGEMM.
+        return Cw @ Cw.T
+    stream_ptr = int(xp.cuda.get_current_stream().ptr)
+    out = xp.empty((int(nao), int(nao)), dtype=xp.float64)
+    ws.density_syrk(Cw, out, stream=int(stream_ptr), math_mode=-1, sync=False)
+    return out
+
+
+def df_JK_fused_from_BQ_Cocc(
+    BQ,
+    C_occ,
+    occ_vals,
+    D,
+    *,
+    q_block: int = 128,
+    cublas_math_mode: str | None = None,
+    profile: dict | None = None,
+):
+    """Fused Coulomb J + exchange K build that reads BQ once per q-block.
+
+    Reads each q-block of BQ exactly once and simultaneously accumulates:
+    - J via two GEMVs (J = BQ @ d_Q, d_Q = BQ @ D_flat)
+    - K via two GEMMs (U = BQ @ Cw; K += U @ U^T)
+
+    This eliminates the separate J-pass over BQ, reducing total BQ reads
+    from 3x (J×2 + K×1) to 1x (one fused q-block scan).
+
+    Only available on GPU with the CUDA extension. Falls back to separate
+    ``df_J_from_BQ_D`` + ``df_K_from_BQ_Cocc`` otherwise.
+
+    Inputs
+    - BQ: (naux, nao, nao) float64 C-contiguous CuPy array
+    - C_occ: (nao, nocc) float64
+    - occ_vals: (nocc,) float64
+    - D: (nao, nao) float64 density matrix
+
+    Returns (J, K) each (nao, nao) float64.
+    """
+    xp, is_gpu = _get_xp(BQ, C_occ, occ_vals, D)
+
+    BQ = _as_xp(xp, BQ, dtype=xp.float64)
+    C_occ = _as_xp(xp, C_occ, dtype=xp.float64)
+    occ_vals = _as_xp(xp, occ_vals, dtype=xp.float64).ravel()
+    D = _as_xp(xp, D, dtype=xp.float64)
+
+    if BQ.ndim != 3:
+        raise ValueError("BQ must have shape (naux, nao, nao)")
+    naux, nao0, nao1 = map(int, BQ.shape)
+    if nao0 != nao1:
+        raise ValueError("BQ must have shape (naux, nao, nao)")
+    nao = int(nao0)
+    if int(C_occ.shape[0]) != nao:
+        raise ValueError("C_occ nao mismatch")
+    nocc = int(C_occ.shape[1])
+    if int(occ_vals.shape[0]) != nocc:
+        raise ValueError("occ_vals shape mismatch")
+
+    # Fall back to separate J+K if CUDA ext not available.
+    ext = _load_hf_df_jk_cuda_ext() if bool(is_gpu) else None
+    if ext is None or not bool(is_gpu):
+        J = df_J_from_BQ_D(BQ, D)
+        K = df_K_from_BQ_Cocc(BQ, C_occ, occ_vals, q_block=q_block,
+                               cublas_math_mode=cublas_math_mode, profile=profile)
+        return J, K
+
+    if nocc <= 0:
+        J = df_J_from_BQ_D(BQ, D)
+        K = xp.zeros((nao, nao), dtype=xp.float64)
+        return J, K
+
+    # Ensure BQ is C-contiguous.
+    if hasattr(BQ, "flags") and not bool(BQ.flags.c_contiguous):
+        BQ = xp.ascontiguousarray(BQ)
+    if hasattr(D, "flags") and not bool(D.flags.c_contiguous):
+        D = xp.ascontiguousarray(D)
+
+    sqrt_occ = xp.sqrt(occ_vals)
+    Cw = C_occ * sqrt_occ[None, :]
+    if hasattr(Cw, "flags") and not bool(Cw.flags.c_contiguous):
+        Cw = xp.ascontiguousarray(Cw)
+
+    q_block = int(q_block)
+    if q_block <= 0:
+        raise ValueError("q_block must be > 0")
+
+    ws = _get_hf_df_jk_workspace(xp)
+    if not hasattr(ws, "jk_from_bq_cw"):
+        # CUDA extension predates jk_from_bq_cw; fall back to separate J+K.
+        J = df_J_from_BQ_D(BQ, D)
+        K = df_K_from_BQ_Cocc(BQ, C_occ, occ_vals, q_block=q_block,
+                               cublas_math_mode=cublas_math_mode, profile=profile)
+        return J, K
+
+    stream_ptr = int(xp.cuda.get_current_stream().ptr)
+    math_mode = _cublas_math_mode_to_int(xp, cublas_math_mode)
+
+    q_block_eff = int(q_block)
+    if _hf_k_ext_tune_enabled():
+        q_block_eff = _pick_ext_q_block(
+            xp, layout="bq", naux=int(naux), nao=int(nao), nocc=int(nocc), requested=int(q_block)
+        )
+
+    J = xp.empty((nao, nao), dtype=xp.float64)
+    K = xp.empty((nao, nao), dtype=xp.float64)
+    ws.jk_from_bq_cw(
+        BQ, Cw, D, J, K,
+        q_block=int(q_block_eff),
+        stream=int(stream_ptr),
+        math_mode=int(math_mode),
+        sync=False,
+    )
+
+    if profile is not None:
+        jk_prof = profile.setdefault("jk", {})
+        jk_prof["jk_impl"] = "fused_bq_gemv2_gemm2"
+        jk_prof["jk_q_block"] = int(q_block_eff)
+        jk_prof["jk_nocc"] = int(nocc)
+
+    return J, K
+
+
 __all__ = [
     "df_J_from_B2_D",
     "df_J_from_BQ_D",
     "df_K_from_BQ_D",
     "df_K_from_BQ_Cocc",
     "df_K_from_BmnQ_Cocc",
+    "df_density_from_Cw_syrk",
+    "df_JK_fused_from_BQ_Cocc",
 ]

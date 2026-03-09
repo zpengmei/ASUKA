@@ -497,6 +497,22 @@ def _density_from_C_occ(C, occ):
     return (C * occ[None, :]) @ C.T
 
 
+def _density_from_C_occ_syrk(xp, C, occ, nocc: int):
+    """GPU DSYRK density: D = Cw @ Cw^T where Cw = C_occ * sqrt(occ).
+
+    Uses cublasDsyrk (upper triangle only) + fill_lower for ~1.5x speedup vs
+    full DGEMM. Falls back to standard path if extension unavailable.
+    """
+    C_occ = C[:, :int(nocc)]
+    occ_vals = occ[:int(nocc)]
+    sqrt_occ = xp.sqrt(occ_vals)
+    Cw = C_occ * sqrt_occ[None, :]
+    if hasattr(Cw, "flags") and not bool(Cw.flags.c_contiguous):
+        Cw = xp.ascontiguousarray(Cw)
+    nao = int(C.shape[0])
+    return df_jk.df_density_from_Cw_syrk(Cw, nao=nao, nocc=int(nocc))
+
+
 def _df_JK(B, D, *, want_J: bool = True, want_K: bool = True, B2=None, BQ=None, profile: dict | None = None):
     """Compute Coulomb J and (optionally) exchange K from DF factors and density.
 
@@ -647,8 +663,29 @@ def _df_JK(B, D, *, want_J: bool = True, want_K: bool = True, B2=None, BQ=None, 
 
 
 def _fock_error_rhf(F, D, S):
+    # FDS - SDF = FDS - (FDS)^T  (since F, D, S are symmetric)
+    # This halves the GEMMs: 4 → 2.
     xp, _ = _get_xp(F, D, S)
-    return F @ D @ S - S @ D @ F
+    M = F @ D @ S
+    return M - M.T
+
+
+def _check_fp64_tc_capable(xp) -> bool:
+    """Return True if GPU supports FP64 Tensor Core (Hopper sm_90+ with cuBLAS 13+)."""
+    if xp is np:
+        return False
+    try:
+        import cupy as cp  # noqa: PLC0415
+        from cupy_backends.cuda.libs import cublas as cublas_lib  # noqa: PLC0415
+
+        major, _ = cp.cuda.Device().compute_capability
+        if int(major) < 9:
+            return False
+        handle = int(cp.cuda.get_cublas_handle())
+        ver = int(cublas_lib.getVersion(handle))
+        return ver >= 130000
+    except Exception:
+        return False
 
 
 def _roothaan_fock_rohf(Fa, Fb, Da, Db, S):
@@ -1041,6 +1078,8 @@ def rhf_df(
         prof.setdefault("jk_ms", 0.0)
         prof.setdefault("diag_ms", 0.0)
         prof.setdefault("diis_ms", 0.0)
+        prof.setdefault("density_ms", 0.0)
+        prof.setdefault("fock_assembly_ms", 0.0)
         prof.setdefault("init_fock_ms", 0.0)
         prof.setdefault("init_fock_cycles", 0)
         prof.setdefault("init_fock_applied", False)
@@ -1153,8 +1192,24 @@ def rhf_df(
 
     _cx_main = 0.5 * float(xc_spec.cx_hf) if xc_spec is not None else 0.5
     _E_xc = 0.0  # Will be updated each cycle if DFT
+    # Adaptive FP64 Tensor Core: use lower-precision GEMM when dm_err is large,
+    # switch to exact FP64 once dm_err < threshold. Lazy-check GPU capability.
+    _fp64_tc_capable: bool | None = None
+    _tc_dm_thresh = 1e-4
+    _dm_err_prev = float("inf")
     for cycle in range(1, int(max_cycle) + 1):
         t = _time_ms_start(xp)
+        # Select effective cuBLAS math mode: TC FP64 during coarse iterations.
+        if cublas_math_mode is None and bool(is_gpu):
+            if _fp64_tc_capable is None:
+                _fp64_tc_capable = _check_fp64_tc_capable(xp)
+            _eff_math_mode: str | None = (
+                "fp64_emulated_fixedpoint"
+                if (_fp64_tc_capable and _dm_err_prev > _tc_dm_thresh)
+                else None
+            )
+        else:
+            _eff_math_mode = cublas_math_mode
         if use_streamed:
             if profile is not None:
                 jk_prof = profile.setdefault("jk", {})
@@ -1171,7 +1226,7 @@ def rhf_df(
                 C_occ,
                 occ_vals,
                 k_q_block=int(k_q_block),
-                cublas_math_mode=cublas_math_mode,
+                cublas_math_mode=_eff_math_mode,
                 work=jk_work,
                 profile=profile,
             )
@@ -1185,48 +1240,73 @@ def rhf_df(
                 jk_prof = profile.setdefault("jk", {})
                 jk_prof["calls"] = int(jk_prof.get("calls", 0)) + 1
 
-            tJ = _time_ms_start(xp) if profile is not None else None
-            if B2 is not None:
-                J = df_jk.df_J_from_B2_D(B2, D)
-            else:
-                J = df_jk.df_J_from_BQ_D(BQ, D)
-            J = _symmetrize_inplace(xp, J)
-            if profile is not None and tJ is not None:
-                jk_prof = profile.setdefault("jk", {})
-                jk_prof["j_ms"] = float(jk_prof.get("j_ms", 0.0)) + _time_ms_end(xp, tJ)
-
-            tK = _time_ms_start(xp) if profile is not None else None
             C_occ = C[:, :nocc]
             occ_vals = occ[:nocc]
-            if B_mnQ is not None:
-                K_pure = df_jk.df_K_from_BmnQ_Cocc(
-                    B_mnQ,
+
+            # Fused J+K: reads BQ once per q-block (vs 3x for separate J+K paths).
+            # Use when a C-contiguous BQ is available (direct Qmn input, or cached
+            # mnQ→BQ transform for tensors that fit in budget).
+            _bq_for_fused = None
+            if BQ is not None and B_mnQ is None:
+                _bq_for_fused = BQ  # direct Qmn input, already C-contiguous
+            elif B_mnQ is not None and bool(is_gpu):
+                _bq_for_fused = df_jk._cached_bq_from_mnq(xp, B_mnQ, nao=int(nao), naux=int(naux))
+
+            if _bq_for_fused is not None:
+                tJK = _time_ms_start(xp) if profile is not None else None
+                J, K_pure = df_jk.df_JK_fused_from_BQ_Cocc(
+                    _bq_for_fused,
                     C_occ,
                     occ_vals,
+                    D,
                     q_block=int(k_q_block),
-                    cublas_math_mode=cublas_math_mode,
+                    cublas_math_mode=_eff_math_mode,
                     profile=profile,
                 )
+                J = _symmetrize_inplace(xp, J)
+                if profile is not None and tJK is not None:
+                    jk_prof = profile.setdefault("jk", {})
+                    jk_prof["jk_fused_ms"] = float(jk_prof.get("jk_fused_ms", 0.0)) + _time_ms_end(xp, tJK)
             else:
-                K_pure = df_jk.df_K_from_BQ_Cocc(
-                    BQ,
-                    C_occ,
-                    occ_vals,
-                    q_block=int(k_q_block),
-                    cublas_math_mode=cublas_math_mode,
-                    profile=profile,
-                )
+                tJ = _time_ms_start(xp) if profile is not None else None
+                if B2 is not None:
+                    J = df_jk.df_J_from_B2_D(B2, D)
+                else:
+                    J = df_jk.df_J_from_BQ_D(BQ, D)
+                J = _symmetrize_inplace(xp, J)
+                if profile is not None and tJ is not None:
+                    jk_prof = profile.setdefault("jk", {})
+                    jk_prof["j_ms"] = float(jk_prof.get("j_ms", 0.0)) + _time_ms_end(xp, tJ)
+
+                tK = _time_ms_start(xp) if profile is not None else None
+                if B_mnQ is not None:
+                    K_pure = df_jk.df_K_from_BmnQ_Cocc(
+                        B_mnQ,
+                        C_occ,
+                        occ_vals,
+                        q_block=int(k_q_block),
+                        cublas_math_mode=_eff_math_mode,
+                        profile=profile,
+                    )
+                else:
+                    K_pure = df_jk.df_K_from_BQ_Cocc(
+                        BQ,
+                        C_occ,
+                        occ_vals,
+                        q_block=int(k_q_block),
+                        cublas_math_mode=_eff_math_mode,
+                        profile=profile,
+                    )
+                if profile is not None and tK is not None:
+                    jk_prof = profile.setdefault("jk", {})
+                    jk_prof["k_ms"] = float(jk_prof.get("k_ms", 0.0)) + _time_ms_end(xp, tK)
+                    jk_prof.setdefault("k_q_block", int(k_q_block))
+                    jk_prof.setdefault("k_nocc", int(nocc))
+
             if damping and K_prev is not None:
                 K = (1.0 - lam) * K_pure + lam * K_prev
             else:
                 K = K_pure
-
-            if profile is not None and tK is not None:
-                jk_prof = profile.setdefault("jk", {})
-                jk_prof["k_ms"] = float(jk_prof.get("k_ms", 0.0)) + _time_ms_end(xp, tK)
-                jk_prof.setdefault("k_q_block", int(k_q_block))
-                jk_prof.setdefault("k_nocc", int(nocc))
-
             K_prev = K
         else:
             if B_mnQ is not None:
@@ -1256,6 +1336,7 @@ def rhf_df(
                 K_prev = _symmetrize(xp, K) if (B_mnQ is not None) else K
         if profile is not None:
             profile["scf"]["jk_ms"] += _time_ms_end(xp, t)
+        t_fock = _time_ms_start(xp) if profile is not None else None
         F = h + J - _cx_main * K
         if xc_spec is not None:
             from asuka.xc.numint import build_vxc as _build_vxc
@@ -1264,6 +1345,8 @@ def rhf_df(
                                        sph_transform=xc_sph_transform)
             F = F + _Vxc
         F = _symmetrize_inplace(xp, F)
+        if profile is not None and t_fock is not None:
+            profile["scf"]["fock_assembly_ms"] += _time_ms_end(xp, t_fock)
 
         if level_shift:
             shift = float(level_shift)
@@ -1285,7 +1368,13 @@ def rhf_df(
         eps, C = _gen_eigh_with_X(F, X)
         if profile is not None:
             profile["scf"]["diag_ms"] += _time_ms_end(xp, t)
-        D_new = _density_from_C_occ(C, occ)
+        t_dens = _time_ms_start(xp) if profile is not None else None
+        if bool(is_gpu):
+            D_new = _density_from_C_occ_syrk(xp, C, occ, nocc)
+        else:
+            D_new = _density_from_C_occ(C, occ)
+        if profile is not None and t_dens is not None:
+            profile["scf"]["density_ms"] += _time_ms_end(xp, t_dens)
 
         if damping:
             D_new = (1.0 - lam) * D_new + lam * D
@@ -1311,6 +1400,7 @@ def rhf_df(
 
         D = D_new
         e_last = e_tot
+        _dm_err_prev = dm_err
 
     if profile is not None:
         profile["scf"]["iters"] = int(cycle)
@@ -1495,6 +1585,8 @@ def uhf_df(
         prof.setdefault("jk_ms", 0.0)
         prof.setdefault("diag_ms", 0.0)
         prof.setdefault("diis_ms", 0.0)
+        prof.setdefault("density_ms", 0.0)
+        prof.setdefault("fock_assembly_ms", 0.0)
         prof.setdefault("iters", 0)
 
     if profile is not None and use_k_cocc:
@@ -1707,8 +1799,15 @@ def uhf_df(
         eb, Cb = _gen_eigh_with_X(Fb, X)
         if profile is not None:
             profile["scf"]["diag_ms"] += _time_ms_end(xp, t)
-        Da_new = _density_from_C_occ(Ca, occ_a)
-        Db_new = _density_from_C_occ(Cb, occ_b)
+        t_dens = _time_ms_start(xp) if profile is not None else None
+        if bool(is_gpu):
+            Da_new = _density_from_C_occ_syrk(xp, Ca, occ_a, int(nalpha))
+            Db_new = _density_from_C_occ_syrk(xp, Cb, occ_b, int(nbeta))
+        else:
+            Da_new = _density_from_C_occ(Ca, occ_a)
+            Db_new = _density_from_C_occ(Cb, occ_b)
+        if profile is not None and t_dens is not None:
+            profile["scf"]["density_ms"] += _time_ms_end(xp, t_dens)
 
         if damping:
             Da_new = (1.0 - lam) * Da_new + lam * Da
@@ -1906,6 +2005,8 @@ def rohf_df(
         prof.setdefault("jk_ms", 0.0)
         prof.setdefault("diag_ms", 0.0)
         prof.setdefault("diis_ms", 0.0)
+        prof.setdefault("density_ms", 0.0)
+        prof.setdefault("fock_assembly_ms", 0.0)
         prof.setdefault("iters", 0)
 
     if profile is not None and use_k_cocc:
