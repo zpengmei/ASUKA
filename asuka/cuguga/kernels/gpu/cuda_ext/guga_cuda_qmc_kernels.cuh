@@ -1030,6 +1030,41 @@ extern "C" cudaError_t guga_qmc_pack_scaled_identity_i32_f64_launch_stream(
   return cudaGetLastError();
 }
 
+namespace {
+
+__global__ void qmc_pack_scaled_identity_u64_f64_kernel(
+    const uint64_t* __restrict__ x_key,
+    const double* __restrict__ x_val,
+    int n,
+    double scale,
+    uint64_t* __restrict__ key_out,
+    double* __restrict__ val_out) {
+  int i = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+  if (i >= n) return;
+  key_out[i] = x_key[i];
+  val_out[i] = scale * x_val[i];
+}
+
+}  // namespace
+
+extern "C" cudaError_t guga_qmc_pack_scaled_identity_u64_f64_launch_stream(
+    const uint64_t* x_key,
+    const double* x_val,
+    int n,
+    double scale,
+    uint64_t* key_out,
+    double* val_out,
+    cudaStream_t stream,
+    int threads) {
+  if (!x_key || !x_val || !key_out || !val_out) return cudaErrorInvalidValue;
+  if (n < 0) return cudaErrorInvalidValue;
+  if (threads <= 0 || threads > 1024) return cudaErrorInvalidValue;
+  if (n == 0) return cudaSuccess;
+  int blocks = (n + threads - 1) / threads;
+  qmc_pack_scaled_identity_u64_f64_kernel<<<blocks, threads, 0, stream>>>(x_key, x_val, n, scale, key_out, val_out);
+  return cudaGetLastError();
+}
+
 // -----------------------------------------------------------------------------
 // QMC: batched sorted-sparse dot products
 // -----------------------------------------------------------------------------
@@ -1792,6 +1827,194 @@ extern "C" cudaError_t guga_qmc_coalesce_coo_i32_f64_launch(
     int* out_nnz,
     int threads) {
   return guga_qmc_coalesce_coo_i32_f64_launch_stream(idx_in, val_in, n, idx_out, val_out, out_nnz, /*stream=*/0, threads);
+}
+
+// u64 key variant (used for composite keys and Key64 walker representation).
+
+namespace {
+
+struct QmcKeyValU64 {
+  uint64_t key;
+  double val;
+};
+
+struct QmcPairNonZeroU64 {
+  __host__ __device__ __forceinline__ bool operator()(const QmcKeyValU64& x) const { return x.val != 0.0; }
+};
+
+__global__ void qmc_pack_pairs_prefix_u64_kernel(
+    const uint64_t* __restrict__ key,
+    const double* __restrict__ val,
+    const int* __restrict__ nnz,  // scalar int on device
+    QmcKeyValU64* __restrict__ out,
+    int n) {
+  int i = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+  if (i >= n) return;
+  int m = nnz ? nnz[0] : 0;
+  if (i < m) {
+    out[i].key = key[i];
+    out[i].val = val[i];
+  } else {
+    out[i].key = 0xffffffffffffffffull;
+    out[i].val = 0.0;
+  }
+}
+
+__global__ void qmc_unpack_pairs_prefix_u64_kernel(
+    const QmcKeyValU64* __restrict__ in,
+    const int* __restrict__ nnz,  // scalar int on device
+    uint64_t* __restrict__ key,
+    double* __restrict__ val,
+    int n) {
+  int i = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+  if (i >= n) return;
+  int m = nnz ? nnz[0] : 0;
+  if (i < m) {
+    key[i] = in[i].key;
+    val[i] = in[i].val;
+  }
+}
+
+__global__ void qmc_sanitize_invalid_key_u64_kernel(uint64_t* key, double* val, int n) {
+  int i = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+  if (i >= n) return;
+  if (key[i] == 0xffffffffffffffffull) {
+    val[i] = 0.0;
+  }
+}
+
+}  // namespace
+
+extern "C" cudaError_t guga_qmc_coalesce_coo_u64_f64_launch_stream(
+    const uint64_t* key_in,
+    const double* val_in,
+    int n,
+    uint64_t* key_out,
+    double* val_out,
+    int* out_nnz,
+    cudaStream_t stream,
+    int threads) {
+  if (!key_in || !val_in || !key_out || !val_out || !out_nnz) return cudaErrorInvalidValue;
+  if (n < 0) return cudaErrorInvalidValue;
+  if (threads <= 0 || threads > 1024) return cudaErrorInvalidValue;
+
+  if (n == 0) {
+    return cudaMemsetAsync(out_nnz, 0, sizeof(int), stream);
+  }
+
+  // Scratch buffers (input copy) so we never mutate key_in/val_in.
+  uint64_t* d_key_tmp_raw = nullptr;
+  double* d_val_tmp_raw = nullptr;
+  cudaError_t err = guga_cuda_malloc(&d_key_tmp_raw, (size_t)n * sizeof(uint64_t), stream);
+  if (err != cudaSuccess) return err;
+  err = guga_cuda_malloc(&d_val_tmp_raw, (size_t)n * sizeof(double), stream);
+  if (err != cudaSuccess) return err;
+  cuda_unique_ptr_stream<uint64_t> d_key_tmp(d_key_tmp_raw, CudaFreeStreamDeleter<uint64_t>{stream});
+  cuda_unique_ptr_stream<double> d_val_tmp(d_val_tmp_raw, CudaFreeStreamDeleter<double>{stream});
+
+  err = cudaMemcpyAsync(d_key_tmp.get(), key_in, (size_t)n * sizeof(uint64_t), cudaMemcpyDeviceToDevice, stream);
+  if (err != cudaSuccess) return err;
+  err = cudaMemcpyAsync(d_val_tmp.get(), val_in, (size_t)n * sizeof(double), cudaMemcpyDeviceToDevice, stream);
+  if (err != cudaSuccess) return err;
+
+  // Ensure invalid entries (UINT64_MAX sentinel) contribute exactly zero.
+  {
+    int blocks = (n + threads - 1) / threads;
+    qmc_sanitize_invalid_key_u64_kernel<<<blocks, threads, 0, stream>>>(d_key_tmp.get(), d_val_tmp.get(), n);
+    err = cudaGetLastError();
+    if (err != cudaSuccess) return err;
+  }
+
+  cub::DoubleBuffer<uint64_t> keys(d_key_tmp.get(), key_out);
+  cub::DoubleBuffer<double> vals(d_val_tmp.get(), val_out);
+
+  size_t temp_sort = 0;
+  err = cub::DeviceRadixSort::SortPairs(nullptr, temp_sort, keys, vals, n, 0, 64, stream);
+  if (err != cudaSuccess) return err;
+
+  // Reduce output must not alias the sorted input. Prefer writing into key_out/val_out;
+  // if the sort output ends up in those buffers, reduce into the tmp buffers and copy back.
+  size_t temp_reduce = 0;
+  const uint64_t* d_key_sorted = keys.Current();
+  const double* d_val_sorted = vals.Current();
+  uint64_t* d_key_out = (d_key_sorted == key_out) ? d_key_tmp.get() : key_out;
+  double* d_val_out = (d_val_sorted == val_out) ? d_val_tmp.get() : val_out;
+
+  err = cub::DeviceReduce::ReduceByKey(
+      nullptr, temp_reduce, d_key_sorted, d_key_out, d_val_sorted, d_val_out, out_nnz, QmcF64Sum(), n, stream);
+  if (err != cudaSuccess) return err;
+
+  size_t temp_select = 0;
+  err = cub::DeviceSelect::If(
+      nullptr, temp_select, (const QmcKeyValU64*)nullptr, (QmcKeyValU64*)nullptr, out_nnz, n, QmcPairNonZeroU64(), stream);
+  if (err != cudaSuccess) return err;
+
+  size_t temp_bytes = temp_sort;
+  if (temp_reduce > temp_bytes) temp_bytes = temp_reduce;
+  if (temp_select > temp_bytes) temp_bytes = temp_select;
+  void* d_temp_raw = nullptr;
+  err = guga_cuda_malloc(&d_temp_raw, temp_bytes, stream);
+  if (err != cudaSuccess) return err;
+  cuda_unique_ptr_stream<void> d_temp((void*)d_temp_raw, CudaFreeStreamDeleter<void>{stream});
+
+  err = cub::DeviceRadixSort::SortPairs(d_temp.get(), temp_sort, keys, vals, n, 0, 64, stream);
+  if (err != cudaSuccess) return err;
+
+  d_key_sorted = keys.Current();
+  d_val_sorted = vals.Current();
+  d_key_out = (d_key_sorted == key_out) ? d_key_tmp.get() : key_out;
+  d_val_out = (d_val_sorted == val_out) ? d_val_tmp.get() : val_out;
+
+  err = cub::DeviceReduce::ReduceByKey(
+      d_temp.get(), temp_reduce, d_key_sorted, d_key_out, d_val_sorted, d_val_out, out_nnz, QmcF64Sum(), n, stream);
+  if (err != cudaSuccess) return err;
+
+  if (d_key_out != key_out) {
+    err = cudaMemcpyAsync(key_out, d_key_out, (size_t)n * sizeof(uint64_t), cudaMemcpyDeviceToDevice, stream);
+    if (err != cudaSuccess) return err;
+  }
+  if (d_val_out != val_out) {
+    err = cudaMemcpyAsync(val_out, d_val_out, (size_t)n * sizeof(double), cudaMemcpyDeviceToDevice, stream);
+    if (err != cudaSuccess) return err;
+  }
+
+  // Prune exact zeros after reduction.
+  {
+    QmcKeyValU64* d_pair_a_raw = nullptr;
+    QmcKeyValU64* d_pair_b_raw = nullptr;
+    err = guga_cuda_malloc(&d_pair_a_raw, (size_t)n * sizeof(QmcKeyValU64), stream);
+    if (err != cudaSuccess) return err;
+    err = guga_cuda_malloc(&d_pair_b_raw, (size_t)n * sizeof(QmcKeyValU64), stream);
+    if (err != cudaSuccess) return err;
+    cuda_unique_ptr_stream<QmcKeyValU64> d_pair_a(d_pair_a_raw, CudaFreeStreamDeleter<QmcKeyValU64>{stream});
+    cuda_unique_ptr_stream<QmcKeyValU64> d_pair_b(d_pair_b_raw, CudaFreeStreamDeleter<QmcKeyValU64>{stream});
+
+    int t = (threads > 0 ? threads : 256);
+    int blocks = (n + t - 1) / t;
+    qmc_pack_pairs_prefix_u64_kernel<<<blocks, t, 0, stream>>>(key_out, val_out, out_nnz, d_pair_a.get(), n);
+    err = cudaGetLastError();
+    if (err != cudaSuccess) return err;
+
+    err = cub::DeviceSelect::If(d_temp.get(), temp_bytes, d_pair_a.get(), d_pair_b.get(), out_nnz, n, QmcPairNonZeroU64(), stream);
+    if (err != cudaSuccess) return err;
+
+    qmc_unpack_pairs_prefix_u64_kernel<<<blocks, t, 0, stream>>>(d_pair_b.get(), out_nnz, key_out, val_out, n);
+    err = cudaGetLastError();
+    if (err != cudaSuccess) return err;
+  }
+
+  return cudaSuccess;
+}
+
+extern "C" cudaError_t guga_qmc_coalesce_coo_u64_f64_launch(
+    const uint64_t* key_in,
+    const double* val_in,
+    int n,
+    uint64_t* key_out,
+    double* val_out,
+    int* out_nnz,
+    int threads) {
+  return guga_qmc_coalesce_coo_u64_f64_launch_stream(key_in, val_in, n, key_out, val_out, out_nnz, /*stream=*/0, threads);
 }
 
 

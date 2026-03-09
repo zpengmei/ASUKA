@@ -209,6 +209,106 @@ __global__ void KernelERI_ssss(
   if (threadIdx.x == 0) eri_out[t] = sum;
 }
 
+// Fused ssss+JK kernel: evaluates (ss|ss) ERI scalar inline and immediately
+// accumulates J and K, eliminating the tile global-memory round-trip.
+// Uses 1 warp per task (ntasks blocks × 32 threads).  sp_A/sp_B/shell_ao_start
+// are the same arrays passed to cueri_contract_jk_warp_launch_stream.
+template <bool kFastBoys>
+__global__ void KernelFusedJKSsss(
+    const int32_t* task_spAB,
+    const int32_t* task_spCD,
+    int ntasks,
+    const int32_t* sp_pair_start,
+    const int32_t* sp_npair,
+    const double* pair_eta,
+    const double* pair_Px,
+    const double* pair_Py,
+    const double* pair_Pz,
+    const double* pair_cK,
+    const int32_t* sp_A,
+    const int32_t* sp_B,
+    const int32_t* shell_ao_start,
+    int nao,
+    const double* D_mat,
+    double* J_mat,
+    double* K_mat,
+    int warps_per_block) {
+  const int lane = static_cast<int>(threadIdx.x) & 31;
+  const int warp_id = static_cast<int>(threadIdx.x) >> 5;
+  const int t = static_cast<int>(blockIdx.x) * warps_per_block + warp_id;
+  if (t >= ntasks) return;
+
+  const int spAB = static_cast<int>(task_spAB[t]);
+  const int spCD = static_cast<int>(task_spCD[t]);
+  const int baseAB = static_cast<int>(sp_pair_start[spAB]);
+  const int baseCD = static_cast<int>(sp_pair_start[spCD]);
+  const int nAB = static_cast<int>(sp_npair[spAB]);
+  const int nCD = static_cast<int>(sp_npair[spCD]);
+  const int64_t nTot = static_cast<int64_t>(nAB) * static_cast<int64_t>(nCD);
+
+  // Compute ERI scalar via warp reduction (identical to KernelERI_ssss_warp)
+  double sum = 0.0;
+  for (int64_t u = static_cast<int64_t>(lane); u < nTot; u += 32) {
+    const int i = static_cast<int>(u / nCD);
+    const int j = static_cast<int>(u - static_cast<int64_t>(i) * nCD);
+    const int ki = baseAB + i;
+    const int kj = baseCD + j;
+    const double eta = pair_eta[ki];
+    const double zeta = pair_eta[kj];
+    const double dx = pair_Px[ki] - pair_Px[kj];
+    const double dy = pair_Py[ki] - pair_Py[kj];
+    const double dz = pair_Pz[ki] - pair_Pz[kj];
+    const double PQ2 = dx * dx + dy * dy + dz * dz;
+    const double denom = eta + zeta;
+    const double omega = eta * zeta / denom;
+    const double T = omega * PQ2;
+    const double pref = kTwoPiToFiveHalves / (eta * zeta * ::sqrt(denom));
+    sum += pref * pair_cK[ki] * pair_cK[kj] * boys_f0<kFastBoys>(T);
+  }
+  sum = warp_reduce_sum(sum);
+
+  // Only lane 0 has the correct reduction result
+  if (lane == 0 && sum != 0.0) {
+    const int A_sh = static_cast<int>(sp_A[spAB]);
+    const int B_sh = static_cast<int>(sp_B[spAB]);
+    const int C_sh = static_cast<int>(sp_A[spCD]);
+    const int D_sh = static_cast<int>(sp_B[spCD]);
+    const int a = static_cast<int>(shell_ao_start[A_sh]);
+    const int b = static_cast<int>(shell_ao_start[B_sh]);
+    const int c = static_cast<int>(shell_ao_start[C_sh]);
+    const int d = static_cast<int>(shell_ao_start[D_sh]);
+    const bool ab_neq = (A_sh != B_sh);
+    const bool cd_neq = (C_sh != D_sh);
+    const bool bk_swap = (spAB != spCD);
+    const double f_ab = ab_neq ? 2.0 : 1.0;
+    const double f_cd = cd_neq ? 2.0 : 1.0;
+    const int64_t N = static_cast<int64_t>(nao);
+
+    if (J_mat != nullptr) {
+      const double Dcd = D_mat[c * N + d];
+      atomicAdd(&J_mat[a * N + b], f_cd * sum * Dcd);
+      if (ab_neq) atomicAdd(&J_mat[b * N + a], f_cd * sum * Dcd);
+      if (bk_swap) {
+        const double Dab = D_mat[a * N + b];
+        atomicAdd(&J_mat[c * N + d], f_ab * sum * Dab);
+        if (cd_neq) atomicAdd(&J_mat[d * N + c], f_ab * sum * Dab);
+      }
+    }
+    if (K_mat != nullptr) {
+      atomicAdd(&K_mat[a * N + c], sum * D_mat[b * N + d]);
+      if (cd_neq) atomicAdd(&K_mat[a * N + d], sum * D_mat[b * N + c]);
+      if (ab_neq) atomicAdd(&K_mat[b * N + c], sum * D_mat[a * N + d]);
+      if (ab_neq && cd_neq) atomicAdd(&K_mat[b * N + d], sum * D_mat[a * N + c]);
+      if (bk_swap) {
+        atomicAdd(&K_mat[c * N + a], sum * D_mat[d * N + b]);
+        if (ab_neq) atomicAdd(&K_mat[d * N + a], sum * D_mat[c * N + b]);
+        if (cd_neq) atomicAdd(&K_mat[c * N + b], sum * D_mat[d * N + a]);
+        if (ab_neq && cd_neq) atomicAdd(&K_mat[d * N + b], sum * D_mat[c * N + a]);
+      }
+    }
+  }
+}
+
 template <bool kFastBoys>
 __global__ void KernelERI_ssss_warp(
     const int32_t* task_spAB,
@@ -634,6 +734,49 @@ extern "C" cudaError_t cueri_eri_ssss_multiblock_launch_stream(
   KernelERI_ssss_multiblock_reduce<<<static_cast<unsigned int>(ntasks), threads, 0, stream>>>(
       partial_sums, blocks_per_task, eri_out);
   return cudaGetLastError();
+}
+
+extern "C" cudaError_t cueri_fused_jk_ssss_launch_stream(
+    const int32_t* task_spAB,
+    const int32_t* task_spCD,
+    int ntasks,
+    const int32_t* sp_pair_start,
+    const int32_t* sp_npair,
+    const double* pair_eta,
+    const double* pair_Px,
+    const double* pair_Py,
+    const double* pair_Pz,
+    const double* pair_cK,
+    const int32_t* sp_A,
+    const int32_t* sp_B,
+    const int32_t* shell_ao_start,
+    int nao,
+    const double* D_mat,
+    double* J_mat,
+    double* K_mat,
+    cudaStream_t stream,
+    int threads,
+    bool use_fast_boys) {
+  if (ntasks <= 0) return cudaSuccess;
+  if (threads < 32 || (threads & 31) != 0) return cudaErrorInvalidValue;
+  const int warps_per_block = threads >> 5;
+  const int blocks = (ntasks + warps_per_block - 1) / warps_per_block;
+  if (use_fast_boys) {
+    KernelFusedJKSsss<true><<<static_cast<unsigned int>(blocks), threads, 0, stream>>>(
+        task_spAB, task_spCD, ntasks,
+        sp_pair_start, sp_npair,
+        pair_eta, pair_Px, pair_Py, pair_Pz, pair_cK,
+        sp_A, sp_B, shell_ao_start, nao,
+        D_mat, J_mat, K_mat, warps_per_block);
+  } else {
+    KernelFusedJKSsss<false><<<static_cast<unsigned int>(blocks), threads, 0, stream>>>(
+        task_spAB, task_spCD, ntasks,
+        sp_pair_start, sp_npair,
+        pair_eta, pair_Px, pair_Py, pair_Pz, pair_cK,
+        sp_A, sp_B, shell_ao_start, nao,
+        D_mat, J_mat, K_mat, warps_per_block);
+  }
+  return cudaPeekAtLastError();
 }
 
 extern "C" cudaError_t cueri_count_entries_launch_stream(

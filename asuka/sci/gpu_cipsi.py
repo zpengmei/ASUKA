@@ -467,7 +467,9 @@ def run_cipsi_trials(
     selection_mode: str = "dense",
     frontier_hash_cap: int | None = None,
     frontier_hash_tile: int = 1024,
-    frontier_hash_rs_block: int = 128,
+    frontier_hash_rs_block: int = 0,
+    frontier_hash_g_rows: int = 0,
+    frontier_hash_offdiag_kernel_mode: str | None = None,
     frontier_hash_csr_capacity_mult: float = 2.0,
     frontier_hash_max_retries: int = 8,
     hb_epsilon: float = 1e-4,
@@ -592,6 +594,9 @@ def run_cipsi_trials(
             "out_vals": None,
             "out_nnz": None,
             "max_retries": int(frontier_hash_max_retries),
+            "offdiag_rs_block": int(frontier_hash_rs_block),
+            "offdiag_g_rows": int(frontier_hash_g_rows),
+            "offdiag_kernel_mode": frontier_hash_offdiag_kernel_mode,
             "hb_dev": None,
         }
 
@@ -604,9 +609,10 @@ def run_cipsi_trials(
             denom_floor=float(denom_floor),
             tile=int(frontier_hash_tile),
             rs_block=int(frontier_hash_rs_block),
-            g_rows=None,
+            g_rows=int(frontier_hash_g_rows),
             hash_cap=frontier_hash_cap,
             max_retries=int(frontier_hash_max_retries),
+            offdiag_kernel_mode=frontier_hash_offdiag_kernel_mode,
             nvtx=None,
             profile=False,
         )

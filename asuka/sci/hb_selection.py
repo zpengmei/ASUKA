@@ -116,6 +116,71 @@ def _ensure_gdf_workspace(frontier_buffers: dict, *, nops: int, naux: int, nrows
     return gdf_ws
 
 
+def _ensure_g_buffer(frontier_buffers: dict, cp: Any, *, nrows: int, nops: int):
+    g_buf = frontier_buffers.get("hb_g_buf")
+    want = (int(max(1, nrows)), int(max(1, nops)))
+    if g_buf is None or tuple(getattr(g_buf, "shape", ())) != want:
+        g_buf = cp.empty(want, dtype=cp.float64)
+        frontier_buffers["hb_g_buf"] = g_buf
+    return g_buf
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = str(os.environ.get(name, "")).strip()
+    if raw == "":
+        return int(default)
+    try:
+        return int(raw)
+    except Exception as e:  # pragma: no cover
+        raise ValueError(f"{name} must be an integer") from e
+
+
+def _resolve_hb_offdiag_policy(frontier_buffers: dict, ws: Any, *, nops: int, n_pairs: int) -> tuple[int, int, int]:
+    mode_raw = str(
+        frontier_buffers.get("offdiag_kernel_mode")
+        if frontier_buffers.get("offdiag_kernel_mode") is not None
+        else os.environ.get("ASUKA_FH_OFFDIAG_KERNEL", "auto")
+    ).strip().lower()
+    if mode_raw in ("", "default"):
+        mode_raw = "auto"
+    mode = "legacy" if mode_raw == "legacy" else "auto"
+
+    rs_in = int(frontier_buffers.get("offdiag_rs_block", 0))
+    rs_in = _env_int("ASUKA_FH_RS_BLOCK", rs_in)
+    if rs_in <= 0:
+        rs_in = 128 if mode == "legacy" else max(1, int(n_pairs))
+    rs_eff = min(max(1, int(rs_in)), max(1, int(n_pairs)))
+    max_tasks = int(getattr(getattr(ws, "_k25_ws", None), "max_tasks", rs_eff))
+    rs_eff = min(int(rs_eff), max(1, int(max_tasks)))
+
+    g_in = int(frontier_buffers.get("offdiag_g_rows", 0))
+    g_in = _env_int("ASUKA_FH_G_ROWS", g_in)
+    if g_in <= 0:
+        if mode == "legacy":
+            g_eff = 4096
+        else:
+            cap_mb = _env_int("ASUKA_FH_G_ROWS_CAP_MB", 128)
+            cap_mb = max(1, int(cap_mb))
+            bytes_per_row = max(1, int(nops) * 8)
+            rows_from_cap = (int(cap_mb) * (1 << 20)) // bytes_per_row
+            g_eff = int(rows_from_cap)
+            g_eff = max(4096, g_eff)
+            g_eff = min(16384, g_eff)
+            g_eff = max(256, (int(g_eff) // 256) * 256)
+    else:
+        g_eff = int(g_in)
+    g_eff = max(256, int(g_eff))
+    g_eff = min(int(g_eff), int(getattr(ws, "_csr_capacity", g_eff)))
+
+    threads_apply = int(getattr(ws, "threads_apply", 256))
+    if mode != "legacy":
+        threads_cap = _env_int("ASUKA_FH_THREADS_APPLY_MAX", 64)
+        if threads_cap > 0:
+            threads_apply = min(int(threads_apply), int(threads_cap))
+    threads_apply = max(1, int(threads_apply))
+    return int(rs_eff), int(g_eff), int(threads_apply)
+
+
 def _heat_bath_select_screened_csr(
     hb_index: HeatBathIntegralIndex,
     sel_idx: np.ndarray,
@@ -217,6 +282,14 @@ def _heat_bath_select_screened_csr(
         while cap > ncsf and cap > 1:
             cap >>= 1
 
+    rs_block_eff, g_rows_eff, threads_apply_eff = _resolve_hb_offdiag_policy(
+        frontier_buffers,
+        ws,
+        nops=int(nops),
+        n_pairs=int(rs_r.size),
+    )
+    g_buf = _ensure_g_buffer(frontier_buffers, cp, nrows=int(g_rows_eff), nops=int(nops))
+
     frontier_hash_max_retries = int(frontier_buffers.get("max_retries", 8))
     for _attempt in range(frontier_hash_max_retries):
         _ensure_hash_buffers(frontier_buffers, cp, cap, int(nroots))
@@ -286,93 +359,104 @@ def _heat_bath_select_screened_csr(
             if nrs <= 0:
                 continue
 
-            task_csf_d = cp.asarray(np.full((nrs,), csf_j, dtype=np.int32), dtype=cp.int32)
-            task_p_d = cp.asarray(rs_r[:nrs], dtype=cp.int32)
-            task_q_d = cp.asarray(rs_s[:nrs], dtype=cp.int32)
-            nrows, nnz, _nnz_in = k25_ws.build_from_tasks_deterministic_inplace_device(
-                ws.drt_dev,
-                ws.state_dev,
-                task_csf_d,
-                task_p_d,
-                task_q_d,
-                row_j_buf,
-                row_k_buf,
-                indptr_buf,
-                indices_buf,
-                data_buf,
-                overflow_buf,
-                int(getattr(ws, "threads_enum", 128)),
-                bool(getattr(ws, "coalesce", False)),
-                int(stream.ptr),
-                True,
-                True,
-            )
-            nrows = int(nrows)
-            nnz = int(nnz)
-            if nrows <= 0 or nnz <= 0:
-                continue
-
-            row_k_d = row_k_buf[:nrows]
-            indptr_d = indptr_buf[: nrows + 1]
-            indices_d = indices_buf[:nnz]
-            data_d = data_buf[:nnz]
-            g_rows_d = cp.empty((nrows, nops), dtype=cp.float64)
-
-            if l_full is not None:
-                gdf_ws = _ensure_gdf_workspace(
-                    frontier_buffers,
-                    nops=int(nops),
-                    naux=int(l_full.shape[1]),
-                    nrows=int(nrows),
+            for rs0 in range(0, int(nrs), int(rs_block_eff)):
+                rs1 = min(int(nrs), int(rs0 + int(rs_block_eff)))
+                nb_rs = int(rs1 - rs0)
+                if nb_rs <= 0:
+                    continue
+                task_csf_d = cp.asarray(np.full((nb_rs,), csf_j, dtype=np.int32), dtype=cp.int32)
+                task_p_d = cp.asarray(rs_r[int(rs0) : int(rs1)], dtype=cp.int32)
+                task_q_d = cp.asarray(rs_s[int(rs0) : int(rs1)], dtype=cp.int32)
+                nrows, nnz, _nnz_in = k25_ws.build_from_tasks_deterministic_inplace_device(
+                    ws.drt_dev,
+                    ws.state_dev,
+                    task_csf_d,
+                    task_p_d,
+                    task_q_d,
+                    row_j_buf,
+                    row_k_buf,
+                    indptr_buf,
+                    indices_buf,
+                    data_buf,
+                    overflow_buf,
+                    int(getattr(ws, "threads_enum", 128)),
+                    bool(getattr(ws, "coalesce", False)),
+                    int(stream.ptr),
+                    True,
+                    True,
                 )
-                gdf_ws.build_g_from_csr_l_full_range_inplace_device(
-                    indptr_d,
-                    indices_d,
-                    data_d,
-                    row_start=0,
-                    nrows=int(nrows),
-                    l_full=l_full,
-                    g_out=g_rows_d,
-                    threads=int(getattr(ws, "threads_g", 256)),
-                    half=0.5,
-                    stream=stream,
-                    sync=False,
-                )
-            else:
-                kernel3_build_g_from_csr_eri_mat_range_inplace_device(
-                    indptr_d,
-                    indices_d,
-                    data_d,
-                    row_start=0,
-                    nrows=int(nrows),
-                    eri_mat=eri_mat,
-                    g_out=g_rows_d,
-                    threads=int(getattr(ws, "threads_g", 256)),
-                    half=0.5,
-                    stream=stream,
-                    sync=False,
-                )
+                nrows = int(nrows)
+                nnz = int(nnz)
+                if nrows <= 0 or nnz <= 0:
+                    continue
 
-            # many-roots apply accepts a broadcast row shape (1, nroots),
-            # avoiding materializing a repeated (nrows, nroots) coefficient matrix.
-            task_scale_rows = task_scale_row_d
-            apply_g_flat_scatter_atomic_frontier_hash_many_roots_inplace_device(
-                drt,
-                ws.drt_dev,
-                ws.state_dev,
-                row_k_d,
-                g_rows_d,
-                task_scale_task_major=task_scale_rows,
-                hash_keys=hash_keys,
-                hash_vals=hash_vals,
-                selected_mask=selected_mask_d,
-                overflow=hash_overflow,
-                clear_overflow=False,
-                threads=int(getattr(ws, "threads_apply", 256)),
-                stream=stream,
-                sync=False,
-                check_overflow=False,
-            )
+                row_k_d = row_k_buf[:nrows]
+                indptr_d = indptr_buf[: nrows + 1]
+                indices_d = indices_buf[:nnz]
+                data_d = data_buf[:nnz]
+
+                for row_start in range(0, int(nrows), int(g_rows_eff)):
+                    row_stop = min(int(nrows), int(row_start + int(g_rows_eff)))
+                    nb_rows = int(row_stop - row_start)
+                    if nb_rows <= 0:
+                        continue
+                    g_rows_d = g_buf[:nb_rows]
+                    if l_full is not None:
+                        gdf_ws = _ensure_gdf_workspace(
+                            frontier_buffers,
+                            nops=int(nops),
+                            naux=int(l_full.shape[1]),
+                            nrows=int(g_rows_eff),
+                        )
+                        gdf_ws.build_g_from_csr_l_full_range_inplace_device(
+                            indptr_d,
+                            indices_d,
+                            data_d,
+                            row_start=int(row_start),
+                            nrows=int(nb_rows),
+                            l_full=l_full,
+                            g_out=g_rows_d,
+                            threads=int(getattr(ws, "threads_g", 256)),
+                            half=0.5,
+                            stream=stream,
+                            sync=False,
+                        )
+                    else:
+                        kernel3_build_g_from_csr_eri_mat_range_inplace_device(
+                            indptr_d,
+                            indices_d,
+                            data_d,
+                            row_start=int(row_start),
+                            nrows=int(nb_rows),
+                            eri_mat=eri_mat,
+                            g_out=g_rows_d,
+                            threads=int(getattr(ws, "threads_g", 256)),
+                            half=0.5,
+                            stream=stream,
+                            sync=False,
+                        )
+
+                    # many-roots apply accepts a broadcast row shape (1, nroots),
+                    # avoiding materializing a repeated (nrows, nroots) coefficient matrix.
+                    task_scale_rows = task_scale_row_d
+                    row_k_b = row_k_d[int(row_start) : int(row_stop)]
+                    apply_g_flat_scatter_atomic_frontier_hash_many_roots_inplace_device(
+                        drt,
+                        ws.drt_dev,
+                        ws.state_dev,
+                        row_k_b,
+                        g_rows_d,
+                        task_scale_task_major=task_scale_rows,
+                        hash_keys=hash_keys,
+                        hash_vals=hash_vals,
+                        selected_mask=selected_mask_d,
+                        overflow=hash_overflow,
+                        clear_overflow=False,
+                        threads=int(threads_apply_eff),
+                        stream=stream,
+                        sync=False,
+                        check_overflow=False,
+                    )
 
         stream.synchronize()
         if int(hash_overflow.get()[0]) != 0:

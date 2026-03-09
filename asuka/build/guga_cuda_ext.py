@@ -173,20 +173,28 @@ def main() -> None:
 
     # Enable ccache if available (speeds up incremental rebuilds)
     _ccache = shutil.which("ccache")
+    env = os.environ.copy()
     if _ccache:
         cmake_args += [
             f"-DCMAKE_CUDA_COMPILER_LAUNCHER={_ccache}",
             f"-DCMAKE_CXX_COMPILER_LAUNCHER={_ccache}",
         ]
+        # ccache defaults its temp dir to /run/user/$UID, which may be unavailable in
+        # some sandboxed/containerized environments. Provide a safe default.
+        env.setdefault("CCACHE_TEMPDIR", os.path.join("/tmp", "ccache-tmp"))
+        try:
+            os.makedirs(env["CCACHE_TEMPDIR"], exist_ok=True)
+        except OSError:
+            pass
 
-    subprocess.check_call(cmake_args)
+    subprocess.check_call(cmake_args, env=env)
 
     n_jobs = int(os.getenv("ASUKA_CUDA_BUILD_JOBS") or os.cpu_count() or 4)
     build_args = ["cmake", "--build", build_dir, "-j", str(n_jobs)]
     extra_build = os.getenv("GUGA_CUDA_CMAKE_BUILD_ARGS")
     if extra_build:
         build_args.extend(extra_build.split())
-    subprocess.check_call(build_args)
+    subprocess.check_call(build_args, env=env)
 
 
 if __name__ == "__main__":

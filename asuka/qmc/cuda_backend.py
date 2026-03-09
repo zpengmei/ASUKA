@@ -578,14 +578,27 @@ class CudaBlockProjectorContext:
     det_idx_buf: Any | None = None  # device scratch for appending det events (global idx)
     det_val_buf: Any | None = None  # device scratch for appending det values
 
+    # Optional larger scratch/workspace for fused multi-root linear-combination ops
+    # (e.g., apply_right_matrix / fused MGS updates).
+    ws_big: Any | None = None
+    idx_all_big: Any | None = None
+    val_all_big: Any | None = None
+    idx_u_big: Any | None = None
+    val_u_big: Any | None = None
+    nnz_u_big: Any | None = None
+    nnz_out_big: Any | None = None
+
     def release(self) -> None:
         if self.ws is not None:
             self.ws.release()
+        if self.ws_big is not None:
+            self.ws_big.release()
         if self.state_dev is not None:
             self.state_dev.release()
         if self.drt_dev is not None:
             self.drt_dev.release()
         self.ws = None
+        self.ws_big = None
         self.state_dev = None
         self.drt_dev = None
 
@@ -1461,16 +1474,19 @@ def cuda_block_orthonormalize_mgs_ws(
     *,
     seeds_phi: list[int] | np.ndarray,
     sync: bool = True,
+    use_fused: bool = True,
 ) -> None:
     """Modified Gram-Schmidt orthonormalization on GPU with Φ compression.
 
     This mirrors `asuka.qmc.subspace.orthonormalize_mgs`, operating on the packed
     `(nroots, m)` sparse-column storage inside `CudaBlockProjectorContext`.
 
-    Implementation details (reference-oriented):
-    - overlaps are computed with a batched sorted-sparse dot kernel in the CUDA extension,
-    - updates use concatenate → coalesce (workspace) → Φ (workspace),
-    - output columns are written to the alternate ping-pong buffer, then swapped.
+    If `use_fused=True` (default), overlaps against all previous columns are computed
+    in one batched dot call and the projection is applied as a single sparse linear
+    combination (one `coalesce + Φ` per output column).
+
+    If `use_fused=False`, a legacy reference-oriented sequential MGS update is used
+    (projection + `coalesce + Φ` after each overlap).
 
     Notes
     -----
@@ -1494,7 +1510,10 @@ def cuda_block_orthonormalize_mgs_ws(
 
     seeds_phi = np.asarray(seeds_phi, dtype=np.int64).ravel()
     nroots = int(ctx.nroots)
-    need = nroots * (nroots - 1) // 2
+    if bool(use_fused):
+        need = nroots  # one Φ seed per output column (upper bound; used only when projections occur)
+    else:
+        need = nroots * (nroots - 1) // 2  # legacy sequential path
     if seeds_phi.size < need:
         raise ValueError(f"seeds_phi has wrong size: {seeds_phi.size} (need >= {need})")
 
@@ -1507,6 +1526,165 @@ def cuda_block_orthonormalize_mgs_ws(
 
     if ctx.stream is None:
         ctx.stream = int(cp.cuda.get_current_stream().ptr)
+
+    if bool(use_fused):
+        # Fused path: for each k, compute all overlaps r_ik = <q_i, x_k> in one batched dot call,
+        # then form y_k = x_k - sum_i r_ik q_i as a single sparse linear combination (one coalesce+Φ).
+        if not hasattr(ctx.ws, "sparse_dot_many_sorted_i32_f64_inplace_device"):
+            raise RuntimeError("QmcWorkspace.sparse_dot_many_sorted_i32_f64_inplace_device is unavailable (rebuild extension)")
+
+        seed_pos = 0
+        ctx.nnz_next[:] = 0
+
+        # Worst-case pack length: nnz(x_k) + sum_i nnz(q_i) <= (k+1)*m <= nroots*m.
+        max_all_len = int(nroots) * int(m)
+        ws = ctx.ws
+        idx_all = ctx.idx_all
+        val_all = ctx.val_all
+        idx_u = ctx.idx_u
+        val_u = ctx.val_u
+        nnz_u = ctx.nnz_u
+        nnz_out = ctx.nnz_out
+
+        if max_all_len > int(ws.max_n):
+            if ctx.ws_big is None or int(ctx.ws_big.max_n) < int(max_all_len):
+                ctx.ws_big = _guga_cuda_ext.QmcWorkspace(int(max_all_len), int(m))
+            ws = ctx.ws_big
+
+            if ctx.idx_all_big is None or ctx.val_all_big is None or int(ctx.idx_all_big.size) < int(max_all_len):
+                ctx.idx_all_big = cp.empty(int(max_all_len), dtype=cp.int32)
+                ctx.val_all_big = cp.empty(int(max_all_len), dtype=cp.float64)
+                ctx.idx_u_big = cp.empty(int(max_all_len), dtype=cp.int32)
+                ctx.val_u_big = cp.empty(int(max_all_len), dtype=cp.float64)
+            if ctx.idx_u_big is None or ctx.val_u_big is None:
+                raise RuntimeError("internal: big coalesce buffers missing")
+            if ctx.nnz_u_big is None or ctx.nnz_out_big is None:
+                ctx.nnz_u_big = cp.empty(1, dtype=cp.int32)
+                ctx.nnz_out_big = cp.empty(1, dtype=cp.int32)
+
+            idx_all = ctx.idx_all_big
+            val_all = ctx.val_all_big
+            idx_u = ctx.idx_u_big
+            val_u = ctx.val_u_big
+            nnz_u = ctx.nnz_u_big
+            nnz_out = ctx.nnz_out_big
+
+        # Reused buffers for overlap computation.
+        ov_buf = cp.empty((max(nroots - 1, 1), 1), dtype=cp.float64)
+        nnz_b = cp.empty((1,), dtype=cp.int32)
+
+        for k in range(nroots):
+            nnz_k_in = int(ctx.nnz[k])
+            if nnz_k_in <= 0:
+                raise ValueError(f"column {k} is empty")
+            if nnz_k_in > m:
+                raise ValueError(f"column {k} nnz exceeds m")
+
+            # First column: just normalize.
+            if k == 0:
+                ctx.x_idx_next[0, :nnz_k_in] = ctx.x_idx[0, :nnz_k_in]
+                ctx.x_val_next[0, :nnz_k_in] = ctx.x_val[0, :nnz_k_in]
+                n2 = float(cp.linalg.norm(ctx.x_val_next[0, :nnz_k_in]).get())
+                if n2 == 0.0:
+                    raise RuntimeError("column 0 collapsed to zero norm during orthonormalization")
+                ctx.x_val_next[0, :nnz_k_in] /= n2
+                ctx.nnz_next[0] = np.int32(nnz_k_in)
+                continue
+
+            # Overlaps r_ik = <q_i, x_k> for i<k (q_i are in the output buffer already).
+            q_nnz_dev = cp.asarray(np.asarray(ctx.nnz_next[:k], dtype=np.int32), dtype=cp.int32)
+            nnz_b[0] = np.int32(nnz_k_in)
+            ctx.ws.sparse_dot_many_sorted_i32_f64_inplace_device(
+                ctx.x_idx_next[:k],
+                ctx.x_val_next[:k],
+                q_nnz_dev,
+                ctx.x_idx[k],
+                ctx.x_val[k],
+                nnz_b,
+                ov_buf[:k],
+                int(ctx.threads_qmc),
+                int(ctx.stream),
+                False,
+            )
+            ov_host = cp.asnumpy(ov_buf[:k, 0]).astype(np.float64, copy=False)
+            nz = np.nonzero(ov_host != 0.0)[0]
+            if nz.size == 0:
+                # Already orthogonal in the sparse support sense; just normalize and move on.
+                ctx.x_idx_next[k, :nnz_k_in] = ctx.x_idx[k, :nnz_k_in]
+                ctx.x_val_next[k, :nnz_k_in] = ctx.x_val[k, :nnz_k_in]
+                n2 = float(cp.linalg.norm(ctx.x_val_next[k, :nnz_k_in]).get())
+                if n2 == 0.0:
+                    raise RuntimeError(f"column {k} collapsed to zero norm during orthonormalization")
+                ctx.x_val_next[k, :nnz_k_in] /= n2
+                ctx.nnz_next[k] = np.int32(nnz_k_in)
+                continue
+
+            # Pack y_k = x_k - sum_{i<k} ov_i * q_i.
+            all_len = nnz_k_in
+            for ii in nz:
+                all_len += int(ctx.nnz_next[int(ii)])
+            if all_len > int(ws.max_n):
+                raise RuntimeError("MGS fused update exceeds workspace capacity (increase max_n)")
+
+            idx_all[:nnz_k_in] = ctx.x_idx[k, :nnz_k_in]
+            val_all[:nnz_k_in] = ctx.x_val[k, :nnz_k_in]
+            pos = nnz_k_in
+            for ii in nz.tolist():
+                i = int(ii)
+                nnz_i = int(ctx.nnz_next[i])
+                if nnz_i <= 0:
+                    raise RuntimeError(f"column {i} is empty during orthonormalization")
+                idx_all[pos : pos + nnz_i] = ctx.x_idx_next[i, :nnz_i]
+                val_all[pos : pos + nnz_i] = (-float(ov_host[i])) * ctx.x_val_next[i, :nnz_i]
+                pos += nnz_i
+            if pos != all_len:
+                raise RuntimeError("internal: MGS fused pack length mismatch")
+
+            ws.coalesce_coo_i32_f64_inplace_device(
+                idx_all,
+                val_all,
+                idx_u,
+                val_u,
+                nnz_u,
+                int(all_len),
+                int(ctx.threads_qmc),
+                int(ctx.stream),
+                False,
+            )
+            n_in = int(cp.asnumpy(nnz_u)[0])
+            if n_in <= 0:
+                raise RuntimeError(f"column {k} annihilated during orthonormalization (after fused projection)")
+
+            seed_phi = int(seeds_phi[seed_pos])
+            seed_pos += 1
+            ws.phi_pivot_resample_i32_f64_inplace_device(
+                idx_u,
+                val_u,
+                ctx.x_idx_next[k],
+                ctx.x_val_next[k],
+                nnz_out,
+                int(n_in),
+                int(m),
+                int(pivot),
+                int(seed_phi),
+                int(ctx.threads_qmc),
+                int(ctx.stream),
+                bool(sync),
+            )
+            nnz_cur = int(cp.asnumpy(nnz_out)[0])
+            if nnz_cur <= 0:
+                raise RuntimeError(f"column {k} annihilated during orthonormalization (after Φ; fused)")
+
+            n2 = float(cp.linalg.norm(ctx.x_val_next[k, :nnz_cur]).get())
+            if n2 == 0.0:
+                raise RuntimeError(f"column {k} collapsed to zero norm during orthonormalization")
+            ctx.x_val_next[k, :nnz_cur] /= n2
+            ctx.nnz_next[k] = np.int32(nnz_cur)
+
+        # Swap buffers.
+        ctx.nnz[:] = ctx.nnz_next
+        ctx.use_a = not ctx.use_a
+        return
 
     if not hasattr(ctx.ws, "sparse_dot_many_sorted_i32_f64_inplace_device"):
         raise RuntimeError("QmcWorkspace.sparse_dot_many_sorted_i32_f64_inplace_device is unavailable (rebuild extension)")
@@ -1986,8 +2164,17 @@ def cuda_block_apply_right_matrix_phi_ws(
     mat: np.ndarray,
     seeds_phi: list[int] | np.ndarray,
     sync: bool = True,
+    use_fused: bool = True,
 ) -> None:
     """Apply `X <- Φ(X @ mat)` on GPU (column-wise), writing into the alternate buffer then swapping.
+
+    If `use_fused=True` (default), each output column is built as a single sparse
+    linear combination and then compressed once (`coalesce` + `Φ`). This reduces
+    `Φ` calls from O(nroots^2) to O(nroots).
+
+    If `use_fused=False`, the legacy incremental update is used:
+      `y <- Φ(y + w*x_j)`
+    which applies `Φ` after each contributing input column.
 
     Notes
     -----
@@ -2015,7 +2202,10 @@ def cuda_block_apply_right_matrix_phi_ws(
         raise ValueError(f"mat has wrong shape: {mat.shape} (expected {(nroots, nroots)})")
 
     seeds_phi = np.asarray(seeds_phi, dtype=np.int64).ravel()
-    need = nroots * (nroots - 1)
+    if bool(use_fused):
+        need = nroots  # one Φ seed per output column
+    else:
+        need = nroots * (nroots - 1)  # legacy incremental path
     if seeds_phi.size < need:
         raise ValueError(f"seeds_phi has wrong size: {seeds_phi.size} (need >= {need})")
 
@@ -2032,56 +2222,107 @@ def cuda_block_apply_right_matrix_phi_ws(
     seed_pos = 0
     ctx.nnz_next[:] = 0
 
-    # Build each output column incrementally: y <- Φ(y + w*x_j).
-    for k in range(nroots):
-        nnz_cur = 0
-        for j in range(nroots):
-            w = float(mat[j, k])
-            if w == 0.0:
-                continue
-            nnz_j = int(ctx.nnz[j])
-            if nnz_j <= 0:
-                continue
+    if bool(use_fused):
+        # Fused path: build each output column as a single linear combination, then coalesce+Φ once.
+        # This reduces Φ calls from O(nroots^2) to O(nroots).
+        nnz_host = np.asarray(ctx.nnz, dtype=np.int32).ravel()
 
-            if nnz_cur == 0:
-                ctx.x_idx_next[k, :nnz_j] = ctx.x_idx[j, :nnz_j]
-                ctx.x_val_next[k, :nnz_j] = float(w) * ctx.x_val[j, :nnz_j]
-                nnz_cur = nnz_j
-                continue
+        all_len_by_k = np.zeros(nroots, dtype=np.int64)
+        max_all_len = 0
+        for k in range(nroots):
+            total = 0
+            for j in range(nroots):
+                if float(mat[j, k]) == 0.0:
+                    continue
+                nnz_j = int(nnz_host[j])
+                if nnz_j <= 0:
+                    continue
+                total += nnz_j
+            all_len_by_k[k] = np.int64(total)
+            if total > max_all_len:
+                max_all_len = total
 
-            all_len = nnz_cur + nnz_j
-            if all_len > int(ctx.max_n):
-                raise RuntimeError("apply_right_matrix update exceeds workspace capacity (increase max_n)")
+        if max_all_len <= 0:
+            raise RuntimeError("apply_right_matrix: all output columns are empty (mat may be all zeros)")
 
-            ctx.idx_all[:nnz_cur] = ctx.x_idx_next[k, :nnz_cur]
-            ctx.idx_all[nnz_cur:all_len] = ctx.x_idx[j, :nnz_j]
-            ctx.val_all[:nnz_cur] = ctx.x_val_next[k, :nnz_cur]
-            ctx.val_all[nnz_cur:all_len] = float(w) * ctx.x_val[j, :nnz_j]
+        ws = ctx.ws
+        idx_all = ctx.idx_all
+        val_all = ctx.val_all
+        idx_u = ctx.idx_u
+        val_u = ctx.val_u
+        nnz_u = ctx.nnz_u
+        nnz_out = ctx.nnz_out
 
-            ctx.ws.coalesce_coo_i32_f64_inplace_device(
-                ctx.idx_all,
-                ctx.val_all,
-                ctx.idx_u,
-                ctx.val_u,
-                ctx.nnz_u,
+        if max_all_len > int(ws.max_n):
+            # Lazily allocate a larger workspace + scratch buffers for this operation.
+            if ctx.ws_big is None or int(ctx.ws_big.max_n) < int(max_all_len):
+                ctx.ws_big = _guga_cuda_ext.QmcWorkspace(int(max_all_len), int(m))
+            ws = ctx.ws_big
+
+            if ctx.idx_all_big is None or ctx.val_all_big is None or int(ctx.idx_all_big.size) < int(max_all_len):
+                ctx.idx_all_big = cp.empty(int(max_all_len), dtype=cp.int32)
+                ctx.val_all_big = cp.empty(int(max_all_len), dtype=cp.float64)
+                ctx.idx_u_big = cp.empty(int(max_all_len), dtype=cp.int32)
+                ctx.val_u_big = cp.empty(int(max_all_len), dtype=cp.float64)
+            if ctx.idx_u_big is None or ctx.val_u_big is None:
+                raise RuntimeError("internal: big coalesce buffers missing")
+            if ctx.nnz_u_big is None or ctx.nnz_out_big is None:
+                ctx.nnz_u_big = cp.empty(1, dtype=cp.int32)
+                ctx.nnz_out_big = cp.empty(1, dtype=cp.int32)
+
+            idx_all = ctx.idx_all_big
+            val_all = ctx.val_all_big
+            idx_u = ctx.idx_u_big
+            val_u = ctx.val_u_big
+            nnz_u = ctx.nnz_u_big
+            nnz_out = ctx.nnz_out_big
+
+        for k in range(nroots):
+            all_len = int(all_len_by_k[k])
+            if all_len <= 0:
+                raise RuntimeError("apply_right_matrix produced an empty column")
+            if all_len > int(ws.max_n):
+                raise RuntimeError("apply_right_matrix fused path exceeded workspace capacity (increase max_n)")
+
+            # Pack all contributions y <- sum_j mat[j,k] * x_j into (idx_all,val_all).
+            pos = 0
+            for j in range(nroots):
+                w = float(mat[j, k])
+                if w == 0.0:
+                    continue
+                nnz_j = int(nnz_host[j])
+                if nnz_j <= 0:
+                    continue
+                idx_all[pos : pos + nnz_j] = ctx.x_idx[j, :nnz_j]
+                val_all[pos : pos + nnz_j] = float(w) * ctx.x_val[j, :nnz_j]
+                pos += nnz_j
+            if pos != all_len:
+                raise RuntimeError("internal: apply_right_matrix pack length mismatch")
+
+            ws.coalesce_coo_i32_f64_inplace_device(
+                idx_all,
+                val_all,
+                idx_u,
+                val_u,
+                nnz_u,
                 int(all_len),
                 int(ctx.threads_qmc),
                 int(ctx.stream),
                 False,
             )
-            n_in = int(cp.asnumpy(ctx.nnz_u)[0])
+            n_in = int(cp.asnumpy(nnz_u)[0])
             if n_in <= 0:
                 raise RuntimeError("apply_right_matrix produced an empty intermediate column")
 
             seed_phi = int(seeds_phi[seed_pos])
             seed_pos += 1
 
-            ctx.ws.phi_pivot_resample_i32_f64_inplace_device(
-                ctx.idx_u,
-                ctx.val_u,
+            ws.phi_pivot_resample_i32_f64_inplace_device(
+                idx_u,
+                val_u,
                 ctx.x_idx_next[k],
                 ctx.x_val_next[k],
-                ctx.nnz_out,
+                nnz_out,
                 int(n_in),
                 int(m),
                 int(pivot),
@@ -2090,18 +2331,86 @@ def cuda_block_apply_right_matrix_phi_ws(
                 int(ctx.stream),
                 bool(sync),
             )
-            nnz_cur = int(cp.asnumpy(ctx.nnz_out)[0])
+            nnz_cur = int(cp.asnumpy(nnz_out)[0])
             if nnz_cur <= 0:
                 raise RuntimeError("apply_right_matrix annihilated a column during Φ compression")
 
-        if nnz_cur <= 0:
-            raise RuntimeError("apply_right_matrix produced an empty column")
+            n2 = float(cp.linalg.norm(ctx.x_val_next[k, :nnz_cur]).get())
+            if n2 == 0.0:
+                raise RuntimeError("apply_right_matrix produced a zero-norm column")
+            ctx.x_val_next[k, :nnz_cur] /= n2
+            ctx.nnz_next[k] = np.int32(nnz_cur)
+    else:
+        # Legacy incremental path: y <- Φ(y + w*x_j).
+        for k in range(nroots):
+            nnz_cur = 0
+            for j in range(nroots):
+                w = float(mat[j, k])
+                if w == 0.0:
+                    continue
+                nnz_j = int(ctx.nnz[j])
+                if nnz_j <= 0:
+                    continue
 
-        n2 = float(cp.linalg.norm(ctx.x_val_next[k, :nnz_cur]).get())
-        if n2 == 0.0:
-            raise RuntimeError("apply_right_matrix produced a zero-norm column")
-        ctx.x_val_next[k, :nnz_cur] /= n2
-        ctx.nnz_next[k] = np.int32(nnz_cur)
+                if nnz_cur == 0:
+                    ctx.x_idx_next[k, :nnz_j] = ctx.x_idx[j, :nnz_j]
+                    ctx.x_val_next[k, :nnz_j] = float(w) * ctx.x_val[j, :nnz_j]
+                    nnz_cur = nnz_j
+                    continue
+
+                all_len = nnz_cur + nnz_j
+                if all_len > int(ctx.max_n):
+                    raise RuntimeError("apply_right_matrix update exceeds workspace capacity (increase max_n)")
+
+                ctx.idx_all[:nnz_cur] = ctx.x_idx_next[k, :nnz_cur]
+                ctx.idx_all[nnz_cur:all_len] = ctx.x_idx[j, :nnz_j]
+                ctx.val_all[:nnz_cur] = ctx.x_val_next[k, :nnz_cur]
+                ctx.val_all[nnz_cur:all_len] = float(w) * ctx.x_val[j, :nnz_j]
+
+                ctx.ws.coalesce_coo_i32_f64_inplace_device(
+                    ctx.idx_all,
+                    ctx.val_all,
+                    ctx.idx_u,
+                    ctx.val_u,
+                    ctx.nnz_u,
+                    int(all_len),
+                    int(ctx.threads_qmc),
+                    int(ctx.stream),
+                    False,
+                )
+                n_in = int(cp.asnumpy(ctx.nnz_u)[0])
+                if n_in <= 0:
+                    raise RuntimeError("apply_right_matrix produced an empty intermediate column")
+
+                seed_phi = int(seeds_phi[seed_pos])
+                seed_pos += 1
+
+                ctx.ws.phi_pivot_resample_i32_f64_inplace_device(
+                    ctx.idx_u,
+                    ctx.val_u,
+                    ctx.x_idx_next[k],
+                    ctx.x_val_next[k],
+                    ctx.nnz_out,
+                    int(n_in),
+                    int(m),
+                    int(pivot),
+                    int(seed_phi),
+                    int(ctx.threads_qmc),
+                    int(ctx.stream),
+                    bool(sync),
+                )
+                nnz_cur = int(cp.asnumpy(ctx.nnz_out)[0])
+                if nnz_cur <= 0:
+                    raise RuntimeError("apply_right_matrix annihilated a column during Φ compression")
+
+            if nnz_cur <= 0:
+                raise RuntimeError("apply_right_matrix produced an empty column")
+
+            n2 = float(cp.linalg.norm(ctx.x_val_next[k, :nnz_cur]).get())
+            if n2 == 0.0:
+                raise RuntimeError("apply_right_matrix produced a zero-norm column")
+            ctx.x_val_next[k, :nnz_cur] /= n2
+            ctx.nnz_next[k] = np.int32(nnz_cur)
 
     ctx.nnz[:] = ctx.nnz_next
     ctx.use_a = not ctx.use_a

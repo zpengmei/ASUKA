@@ -79,6 +79,16 @@ def _round_up_pow2(x: int) -> int:
     return int(out)
 
 
+def _env_int(name: str, default: int) -> int:
+    raw = str(os.environ.get(name, "")).strip()
+    if raw == "":
+        return int(default)
+    try:
+        return int(raw)
+    except Exception as e:  # pragma: no cover
+        raise ValueError(f"{name} must be an integer") from e
+
+
 @dataclass
 class FrontierHashStats:
     hash_cap: int
@@ -103,10 +113,12 @@ class FrontierHashSelector:
         hdiag,
         denom_floor: float,
         tile: int = 1024,
-        rs_block: int = 128,
-        g_rows: int | None = None,
+        rs_block: int = 0,
+        g_rows: int | None = 0,
         hash_cap: int | None = None,
         max_retries: int = 8,
+        offdiag_kernel_mode: str | None = None,
+        g_rows_cap_mb: int | None = None,
         nvtx: bool | None = None,
         profile: bool = False,
     ) -> None:
@@ -136,15 +148,33 @@ class FrontierHashSelector:
             self.nvtx_enabled = bool(nvtx)
         self.profile_enabled = bool(profile)
 
+        mode_in = str(
+            offdiag_kernel_mode
+            if offdiag_kernel_mode is not None
+            else os.environ.get("ASUKA_FH_OFFDIAG_KERNEL", "auto")
+        ).strip().lower()
+        if mode_in in ("", "default"):
+            mode_in = "auto"
+        if mode_in not in ("auto", "legacy", "warp_coop", "fused_eri"):
+            raise ValueError("offdiag_kernel_mode must be one of: auto, legacy, warp_coop, fused_eri")
+        # For now, warp_coop/fused_eri share the same high-level scheduling policy.
+        self.offdiag_kernel_mode = "legacy" if mode_in == "legacy" else "auto"
+        self.offdiag_kernel_mode_raw = mode_in
+        grouping_in = str(os.environ.get("ASUKA_FH_OFFDIAG_GROUPING", "auto")).strip().lower()
+        if grouping_in in ("", "auto"):
+            grouping_in = "tile" if self.offdiag_kernel_mode == "legacy" else "chunk"
+        if grouping_in not in ("tile", "chunk"):
+            raise ValueError("ASUKA_FH_OFFDIAG_GROUPING must be one of: auto, tile, chunk")
+        self.offdiag_grouping = grouping_in
+
         # Tile sizing: ensure (tile * rs_block) fits Kernel25Workspace.max_tasks.
         tile_i = int(tile)
         if tile_i <= 0:
             tile_i = 1024
         tile_i = min(tile_i, int(getattr(ws, "j_tile", tile_i)))
         tile_i = max(1, tile_i)
-        rs_block_i = int(rs_block)
-        if rs_block_i <= 0:
-            rs_block_i = 128
+        rs_block_env = _env_int("ASUKA_FH_RS_BLOCK", int(rs_block))
+        rs_block_i = int(rs_block_env)
 
         k25_ws = getattr(ws, "_k25_ws", None)
         if k25_ws is None:
@@ -152,21 +182,36 @@ class FrontierHashSelector:
         max_tasks = int(getattr(k25_ws, "max_tasks", 0))
         if max_tasks <= 0:
             raise RuntimeError("Kernel25Workspace.max_tasks is unavailable (required for frontier-hash)")
+        self.max_tasks = int(max_tasks)
 
         rs_r_d = getattr(ws, "_rs_r_d", None)
         rs_s_d = getattr(ws, "_rs_s_d", None)
         if rs_r_d is None or rs_s_d is None:
             raise RuntimeError("internal error: workspace missing rs pair tables")
         n_pairs = int(rs_r_d.size)
+        if rs_block_i <= 0:
+            rs_block_i = 128 if self.offdiag_kernel_mode == "legacy" else max(1, n_pairs)
         rs_block_i = min(rs_block_i, max(1, n_pairs))
         if int(tile_i) * int(rs_block_i) > int(max_tasks):
             tile_i = max(1, int(max_tasks // max(1, rs_block_i)))
+
+        threads_apply_offdiag = int(getattr(ws, "threads_apply", 256))
+        if self.offdiag_kernel_mode != "legacy":
+            threads_apply_cap = _env_int("ASUKA_FH_THREADS_APPLY_MAX", 64)
+            if threads_apply_cap > 0:
+                threads_apply_offdiag = min(threads_apply_offdiag, int(threads_apply_cap))
 
         self.tile = int(tile_i)
         self.rs_block = int(rs_block_i)
         self.rs_r_d = rs_r_d
         self.rs_s_d = rs_s_d
         self.n_pairs = int(n_pairs)
+        self.threads_apply_offdiag = int(max(1, threads_apply_offdiag))
+        j_chunk_cap = max(1, int(self.max_tasks // max(1, self.rs_block)))
+        j_chunk_env = _env_int("ASUKA_FH_OFFDIAG_J_CHUNK", 0)
+        if j_chunk_env > 0:
+            j_chunk_cap = min(int(j_chunk_cap), int(j_chunk_env))
+        self.offdiag_j_chunk = int(max(1, j_chunk_cap))
 
         # Selected mask for skipping internal entries during PT2/selection.
         self.selected_mask_d = cp.zeros((self.ncsf,), dtype=cp.uint8)
@@ -194,13 +239,31 @@ class FrontierHashSelector:
         # Scratch buffers reused across calls.
         self.occ_buf = cp.empty((int(self.tile), int(self.norb)), dtype=cp.float64)
         self.x_full = cp.empty((int(self.ncsf),), dtype=cp.float64)
+        self.task_csf_buf = cp.empty((int(self.max_tasks),), dtype=cp.int32)
+        self.task_p_buf = cp.empty((int(self.max_tasks),), dtype=cp.int32)
+        self.task_q_buf = cp.empty((int(self.max_tasks),), dtype=cp.int32)
 
         # Offdiag build-g staging buffer.
-        g_rows_eff = int(g_rows) if g_rows is not None else 4096
+        g_rows_env = _env_int("ASUKA_FH_G_ROWS", int(0 if g_rows is None else g_rows))
+        g_rows_eff = int(g_rows_env)
+        if g_rows_eff <= 0:
+            if self.offdiag_kernel_mode == "legacy":
+                g_rows_eff = 4096
+            else:
+                cap_mb_eff = int(g_rows_cap_mb) if g_rows_cap_mb is not None else _env_int("ASUKA_FH_G_ROWS_CAP_MB", 128)
+                cap_mb_eff = max(1, cap_mb_eff)
+                bytes_per_row = max(1, int(self.nops) * 8)
+                rows_from_cap = (int(cap_mb_eff) * (1 << 20)) // bytes_per_row
+                g_rows_eff = int(rows_from_cap)
+                g_rows_eff = max(4096, g_rows_eff)
+                g_rows_eff = min(16384, g_rows_eff)
+                # Align row blocks to the same granularity used by CSR tile helpers.
+                g_rows_eff = max(256, (int(g_rows_eff) // 256) * 256)
         g_rows_eff = max(256, int(g_rows_eff))
         # Stay within workspace CSR capacity if available.
         g_rows_eff = min(g_rows_eff, int(getattr(ws, "_csr_capacity", g_rows_eff)))
         self.g_rows = int(g_rows_eff)
+        self.g_rows_cap_mb = int(g_rows_cap_mb) if g_rows_cap_mb is not None else int(_env_int("ASUKA_FH_G_ROWS_CAP_MB", 128))
         self.g_buf = cp.empty((int(self.g_rows), int(self.nops)), dtype=cp.float64)
 
         self.gdf_ws: Kernel3BuildGDFWorkspace | None = None
@@ -299,6 +362,12 @@ class FrontierHashSelector:
         e_var_d = cp.ascontiguousarray(cp.asarray(e_var, dtype=cp.float64).ravel())
         if e_var_d.shape != (int(self.nroots),):
             raise ValueError("e_var must have shape (nroots,)")
+        # One global order for offdiag processing so scattered selections do not
+        # force many tiny tile-id groups.
+        sel_order_h = np.argsort(sel_idx_i32, kind="stable").astype(np.int32, copy=False)
+        sel_idx_sorted_h = np.asarray(sel_idx_i32[sel_order_h], dtype=np.int32)
+        sel_order_d = cp.asarray(sel_order_h, dtype=cp.int32)
+        c_sel_sorted_d = cp.ascontiguousarray(c_sel_d[sel_order_d, :])
 
         h_eff_flat = getattr(self.ws, "h_eff_flat", None)
         if h_eff_flat is None:
@@ -421,28 +490,32 @@ class FrontierHashSelector:
                 with _nvtx_range("cipsi_two_body_offdiag", enabled=nvtx_enabled), _timed_phase(
                     "two_body_offdiag_apply", enabled=profile_enabled, timings_ms=timings, stream=stream
                 ):
-                    for _tile_id_val, pos in tile_groups:
-                        if int(pos.size) <= 0:
-                            continue
-                        pos_h = np.asarray(pos, dtype=np.int32)
-                        order = np.argsort(sel_idx_i32[pos_h], kind="stable")
-                        pos_sorted = pos_h[order]
-                        task_csf_tile_h = np.asarray(sel_idx_i32[pos_sorted], dtype=np.int32)
-                        task_csf_tile = cp.asarray(task_csf_tile_h, dtype=cp.int32)
-                        c_tile = cp.ascontiguousarray(c_sel_d[pos_sorted, :])
-                        nsel_tile = int(task_csf_tile.size)
+                    def _run_offdiag_group(task_csf_tile_h: np.ndarray, c_tile):
+                        nsel_tile = int(task_csf_tile_h.size)
                         if nsel_tile <= 0:
-                            continue
+                            return
+                        task_csf_tile = cp.asarray(task_csf_tile_h, dtype=cp.int32)
                         for p0 in range(0, int(self.n_pairs), int(self.rs_block)):
                             p1 = min(int(self.n_pairs), int(p0 + int(self.rs_block)))
                             blk = int(p1 - p0)
                             if blk <= 0:
                                 continue
+                            ntasks = int(nsel_tile) * int(blk)
+                            if ntasks <= 0:
+                                continue
+                            if ntasks > int(self.max_tasks):
+                                raise RuntimeError("internal error: offdiag task batch exceeds Kernel25 workspace max_tasks")
 
                             with _nvtx_range("cipsi_k25_csr_build", enabled=nvtx_enabled):
-                                task_csf = cp.ascontiguousarray(cp.repeat(task_csf_tile, blk))
-                                task_p = cp.ascontiguousarray(cp.tile(self.rs_r_d[int(p0) : int(p1)], nsel_tile))
-                                task_q = cp.ascontiguousarray(cp.tile(self.rs_s_d[int(p0) : int(p1)], nsel_tile))
+                                task_csf_2d = self.task_csf_buf[:ntasks].reshape(int(nsel_tile), int(blk))
+                                task_p_2d = self.task_p_buf[:ntasks].reshape(int(nsel_tile), int(blk))
+                                task_q_2d = self.task_q_buf[:ntasks].reshape(int(nsel_tile), int(blk))
+                                task_csf_2d[...] = task_csf_tile[:, None]
+                                task_p_2d[...] = self.rs_r_d[int(p0) : int(p1)][None, :]
+                                task_q_2d[...] = self.rs_s_d[int(p0) : int(p1)][None, :]
+                                task_csf = self.task_csf_buf[:ntasks]
+                                task_p = self.task_p_buf[:ntasks]
+                                task_q = self.task_q_buf[:ntasks]
                                 nrows, nnz, _nnz_in = k25_ws.build_from_tasks_deterministic_inplace_device(
                                     self.ws.drt_dev,
                                     self.ws.state_dev,
@@ -530,11 +603,31 @@ class FrontierHashSelector:
                                         selected_mask=self.selected_mask_d,
                                         overflow=self.hash_overflow,
                                         clear_overflow=False,
-                                        threads=int(getattr(self.ws, "threads_apply", 256)),
+                                        threads=int(self.threads_apply_offdiag),
                                         stream=stream,
                                         sync=False,
                                         check_overflow=False,
                                     )
+
+                    if self.offdiag_grouping == "tile":
+                        for _tile_id_val, pos in tile_groups:
+                            if int(pos.size) <= 0:
+                                continue
+                            pos_h = np.asarray(pos, dtype=np.int32)
+                            order = np.argsort(sel_idx_i32[pos_h], kind="stable")
+                            pos_sorted = pos_h[order]
+                            task_csf_tile_h = np.asarray(sel_idx_i32[pos_sorted], dtype=np.int32)
+                            c_tile = cp.ascontiguousarray(c_sel_d[pos_sorted, :])
+                            _run_offdiag_group(task_csf_tile_h, c_tile)
+                    else:
+                        for s0 in range(0, int(nsel), int(self.offdiag_j_chunk)):
+                            s1 = min(int(nsel), int(s0 + int(self.offdiag_j_chunk)))
+                            nsel_tile = int(s1 - s0)
+                            if nsel_tile <= 0:
+                                continue
+                            task_csf_tile_h = np.asarray(sel_idx_sorted_h[int(s0) : int(s1)], dtype=np.int32)
+                            c_tile = c_sel_sorted_d[int(s0) : int(s1), :]
+                            _run_offdiag_group(task_csf_tile_h, c_tile)
 
             # Overflow check: if set, grow cap and retry.
             if int(self.hash_overflow.get()[0]) != 0:

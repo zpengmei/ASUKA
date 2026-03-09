@@ -442,6 +442,48 @@ def direct_JK(
             kernel_spCD_full = ab_dev[j0:j1] if transpose else cd_dev[j0:j1]
 
             class_ntasks = j1 - j0
+
+            # --- Fused ssss+JK path (D3 partial): skip tile alloc entirely ---
+            if orig_cid == 0:
+                for c0 in range(0, class_ntasks, chunk_ntasks):
+                    c1 = min(class_ntasks, c0 + chunk_ntasks)
+                    if c1 <= c0:
+                        continue
+                    n_kernel_calls += 1
+                    if profile is not None:
+                        _tc0 = cp.cuda.Event()
+                        _tc1 = cp.cuda.Event()
+                        _tc0.record()
+                    _ext.fused_jk_ssss_inplace_device(
+                        kernel_spAB_full[c0:c1],
+                        kernel_spCD_full[c0:c1],
+                        ctx.dsp.sp_pair_start,
+                        ctx.dsp.sp_npair,
+                        ctx.pair_tables.pair_eta,
+                        ctx.pair_tables.pair_Px,
+                        ctx.pair_tables.pair_Py,
+                        ctx.pair_tables.pair_Pz,
+                        ctx.pair_tables.pair_cK,
+                        ctx.sp_A_dev,
+                        ctx.sp_B_dev,
+                        ctx.shell_ao_start_dev,
+                        int(nao),
+                        D_flat,
+                        J_flat,
+                        K_flat,
+                        int(threads),
+                        int(stream_ptr),
+                        False,
+                        False,  # fast_boys
+                    )
+                    if profile is not None:
+                        _tc1.record()
+                        _tc1.synchronize()
+                        profile["contract_ms"] = float(profile.get("contract_ms", 0.0)) + float(
+                            cp.cuda.get_elapsed_time(_tc0, _tc1)
+                        )
+                continue  # fused path handled, skip normal tile path for this class
+
             for c0 in range(0, class_ntasks, chunk_ntasks):
                 c1 = min(class_ntasks, c0 + chunk_ntasks)
                 if c1 <= c0:
@@ -480,7 +522,7 @@ def direct_JK(
                 # copying tiles, swap nA/nB/nC/nD and shell-pair arrays
                 # passed to the contraction kernel.
                 if transpose:
-                    _ext.contract_jk_tiles_ordered_inplace_device(
+                    _ext.contract_jk_tiles_ordered_warp_inplace_device(
                         cd_dev[j0 + c0: j0 + c1],
                         ab_dev[j0 + c0: j0 + c1],
                         ctx.sp_A_dev,
@@ -500,7 +542,7 @@ def direct_JK(
                         False,
                     )
                 else:
-                    _ext.contract_jk_tiles_ordered_inplace_device(
+                    _ext.contract_jk_tiles_ordered_warp_inplace_device(
                         ab_dev[j0 + c0: j0 + c1],
                         cd_dev[j0 + c0: j0 + c1],
                         ctx.sp_A_dev,
@@ -674,7 +716,7 @@ def direct_JK_multi(
                     _tc0.record()
 
                 if transpose:
-                    _ext.contract_jk_tiles_ordered_multi2_inplace_device(
+                    _ext.contract_jk_tiles_ordered_warp_multi2_inplace_device(
                         cd_dev[j0 + c0: j0 + c1],
                         ab_dev[j0 + c0: j0 + c1],
                         ctx.sp_A_dev,
@@ -697,7 +739,7 @@ def direct_JK_multi(
                         False,
                     )
                 else:
-                    _ext.contract_jk_tiles_ordered_multi2_inplace_device(
+                    _ext.contract_jk_tiles_ordered_warp_multi2_inplace_device(
                         ab_dev[j0 + c0: j0 + c1],
                         cd_dev[j0 + c0: j0 + c1],
                         ctx.sp_A_dev,

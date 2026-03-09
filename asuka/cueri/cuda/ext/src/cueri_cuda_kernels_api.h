@@ -2273,6 +2273,70 @@ extern "C" cudaError_t cueri_contract_jk_tiles_ordered_multi2_launch_stream(
     cudaStream_t stream,
     int threads);
 
+// Warp-reduce J/K contraction (D9): 1 warp per task, reduces atomic contention.
+// block=32 threads fixed; no `threads` parameter.
+extern "C" cudaError_t cueri_contract_jk_warp_launch_stream(
+    const int32_t* task_spAB,
+    const int32_t* task_spCD,
+    int ntasks,
+    const int32_t* sp_A,
+    const int32_t* sp_B,
+    const int32_t* shell_ao_start,
+    int nao,
+    int nA,
+    int nB,
+    int nC,
+    int nD,
+    const double* tile_vals,
+    const double* D_mat,
+    double* J_mat,
+    double* K_mat,
+    cudaStream_t stream);
+
+extern "C" cudaError_t cueri_contract_jk_warp_multi2_launch_stream(
+    const int32_t* task_spAB,
+    const int32_t* task_spCD,
+    int ntasks,
+    const int32_t* sp_A,
+    const int32_t* sp_B,
+    const int32_t* shell_ao_start,
+    int nao,
+    int nA,
+    int nB,
+    int nC,
+    int nD,
+    const double* tile_vals,
+    const double* Da_mat,
+    const double* Db_mat,
+    double* Ja_mat,
+    double* Ka_mat,
+    double* Jb_mat,
+    double* Kb_mat,
+    cudaStream_t stream);
+
+// Fused ssss+JK (D3 partial): evaluates (ss|ss) ERI inline, eliminates tile round-trip.
+extern "C" cudaError_t cueri_fused_jk_ssss_launch_stream(
+    const int32_t* task_spAB,
+    const int32_t* task_spCD,
+    int ntasks,
+    const int32_t* sp_pair_start,
+    const int32_t* sp_npair,
+    const double* pair_eta,
+    const double* pair_Px,
+    const double* pair_Py,
+    const double* pair_Pz,
+    const double* pair_cK,
+    const int32_t* sp_A,
+    const int32_t* sp_B,
+    const int32_t* shell_ao_start,
+    int nao,
+    const double* D_mat,
+    double* J_mat,
+    double* K_mat,
+    cudaStream_t stream,
+    int threads,
+    bool use_fast_boys);
+
 // Cartesian->spherical transform for ERI tiles.
 extern "C" cudaError_t cueri_cart2sph_eri_right_launch_stream(
     const double* tile_cart,  // size ntasks * (nA_cart*nB_cart) * (nC_cart*nD_cart)

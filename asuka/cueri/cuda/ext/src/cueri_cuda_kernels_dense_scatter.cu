@@ -405,6 +405,308 @@ extern "C" cudaError_t cueri_contract_jk_tiles_ordered_multi2_launch_stream(
   return cudaPeekAtLastError();
 }
 
+// ---------------------------------------------------------------------------
+// Warp-reduce J/K contraction (D9): 1 block per task, 32 threads (1 warp).
+// Inner loops are warp-strided; warp_reduce_sum then single lane-0 atomicAdd.
+// Reduces atomic contention: J has (nAB + nCD) writes vs nAB*nCD;
+// K has nA*nC + nA*nD + nB*nC + nB*nD outer iters vs nAB*nCD * 4-6 atomics.
+// ---------------------------------------------------------------------------
+namespace {
+
+// Local copy of warp_reduce_sum (defined in cueri_cuda_kernels.cu, not a shared header).
+__device__ inline double warp_reduce_sum_jk(double x) {
+  for (int off = 16; off > 0; off >>= 1)
+    x += __shfl_down_sync(0xffffffff, x, off);
+  return x;
+}
+
+__device__ __forceinline__ void _contract_jk_warp_single(
+    const double* __restrict__ tile,
+    const double* __restrict__ D_mat,
+    double* J_mat,
+    double* K_mat,
+    int lane,
+    int nAB,
+    int nCD,
+    int nA,
+    int nB,
+    int nC,
+    int nD,
+    int a0,
+    int b0,
+    int c0,
+    int d0,
+    bool ab_neq,
+    bool cd_neq,
+    bool bk_swap,
+    double f_ab,
+    double f_cd,
+    int64_t N) {
+  // --- J contributions ---
+  if (J_mat != nullptr) {
+    // Outer iab, inner warp-stride icd → J[a,b]
+    for (int iab = 0; iab < nAB; iab++) {
+      const int ia = iab / nB, ib = iab % nB;
+      const int a = a0 + ia, b = b0 + ib;
+      double pj = 0.0;
+      for (int icd = lane; icd < nCD; icd += 32) {
+        const int ic = icd / nD, id = icd % nD;
+        pj += tile[iab * nCD + icd] * D_mat[(c0 + ic) * N + (d0 + id)];
+      }
+      pj = warp_reduce_sum_jk(pj);
+      if (lane == 0 && pj != 0.0) {
+        atomicAdd(&J_mat[a * N + b], f_cd * pj);
+        if (ab_neq) atomicAdd(&J_mat[b * N + a], f_cd * pj);
+      }
+    }
+    // Bra-ket swap: outer icd, inner warp-stride iab → J[c,d]
+    if (bk_swap) {
+      for (int icd = 0; icd < nCD; icd++) {
+        const int ic = icd / nD, id = icd % nD;
+        const int c = c0 + ic, d = d0 + id;
+        double pj = 0.0;
+        for (int iab = lane; iab < nAB; iab += 32) {
+          const int ia = iab / nB, ib = iab % nB;
+          pj += tile[iab * nCD + icd] * D_mat[(a0 + ia) * N + (b0 + ib)];
+        }
+        pj = warp_reduce_sum_jk(pj);
+        if (lane == 0 && pj != 0.0) {
+          atomicAdd(&J_mat[c * N + d], f_ab * pj);
+          if (cd_neq) atomicAdd(&J_mat[d * N + c], f_ab * pj);
+        }
+      }
+    }
+  }
+
+  // --- K contributions ---
+  if (K_mat != nullptr) {
+    // K[a,c]: outer (ia,ic), inner warp (ib,id)
+    for (int iac = 0; iac < nA * nC; iac++) {
+      const int ia = iac / nC, ic = iac % nC;
+      const int a = a0 + ia, c = c0 + ic;
+      double pk = 0.0;
+      for (int ibd = lane; ibd < nB * nD; ibd += 32) {
+        const int ib = ibd / nD, id = ibd % nD;
+        pk += tile[(ia * nB + ib) * nCD + ic * nD + id] * D_mat[(b0 + ib) * N + (d0 + id)];
+      }
+      pk = warp_reduce_sum_jk(pk);
+      if (lane == 0 && pk != 0.0) {
+        atomicAdd(&K_mat[a * N + c], pk);
+        if (bk_swap) atomicAdd(&K_mat[c * N + a], pk);
+      }
+    }
+    // K[a,d]: outer (ia,id), inner warp (ib,ic) — only if cd_neq
+    if (cd_neq) {
+      for (int iad = 0; iad < nA * nD; iad++) {
+        const int ia = iad / nD, id = iad % nD;
+        const int a = a0 + ia, d = d0 + id;
+        double pk = 0.0;
+        for (int ibc = lane; ibc < nB * nC; ibc += 32) {
+          const int ib = ibc / nC, ic = ibc % nC;
+          pk += tile[(ia * nB + ib) * nCD + ic * nD + id] * D_mat[(b0 + ib) * N + (c0 + ic)];
+        }
+        pk = warp_reduce_sum_jk(pk);
+        if (lane == 0 && pk != 0.0) {
+          atomicAdd(&K_mat[a * N + d], pk);
+          if (bk_swap) atomicAdd(&K_mat[d * N + a], pk);
+        }
+      }
+    }
+    // K[b,c]: outer (ib,ic), inner warp (ia,id) — only if ab_neq
+    if (ab_neq) {
+      for (int ibc = 0; ibc < nB * nC; ibc++) {
+        const int ib = ibc / nC, ic = ibc % nC;
+        const int b = b0 + ib, c = c0 + ic;
+        double pk = 0.0;
+        for (int iad = lane; iad < nA * nD; iad += 32) {
+          const int ia = iad / nD, id = iad % nD;
+          pk += tile[(ia * nB + ib) * nCD + ic * nD + id] * D_mat[(a0 + ia) * N + (d0 + id)];
+        }
+        pk = warp_reduce_sum_jk(pk);
+        if (lane == 0 && pk != 0.0) {
+          atomicAdd(&K_mat[b * N + c], pk);
+          if (bk_swap) atomicAdd(&K_mat[c * N + b], pk);
+        }
+      }
+    }
+    // K[b,d]: outer (ib,id), inner warp (ia,ic) — only if ab_neq && cd_neq
+    if (ab_neq && cd_neq) {
+      for (int ibd = 0; ibd < nB * nD; ibd++) {
+        const int ib = ibd / nD, id = ibd % nD;
+        const int b = b0 + ib, d = d0 + id;
+        double pk = 0.0;
+        for (int iac = lane; iac < nA * nC; iac += 32) {
+          const int ia = iac / nC, ic = iac % nC;
+          pk += tile[(ia * nB + ib) * nCD + ic * nD + id] * D_mat[(a0 + ia) * N + (c0 + ic)];
+        }
+        pk = warp_reduce_sum_jk(pk);
+        if (lane == 0 && pk != 0.0) {
+          atomicAdd(&K_mat[b * N + d], pk);
+          if (bk_swap) atomicAdd(&K_mat[d * N + b], pk);
+        }
+      }
+    }
+  }
+}
+
+__global__ void KernelContractJKTilesOrderedWarp(
+    const int32_t* task_spAB,
+    const int32_t* task_spCD,
+    const int32_t* sp_A,
+    const int32_t* sp_B,
+    const int32_t* shell_ao_start,
+    int nao,
+    int nA,
+    int nB,
+    int nC,
+    int nD,
+    const double* tile_vals,
+    const double* D_mat,
+    double* J_mat,
+    double* K_mat,
+    int ntasks) {
+  const int t = static_cast<int>(blockIdx.x);
+  if (t >= ntasks) return;
+  const int lane = static_cast<int>(threadIdx.x);  // 0..31
+
+  const int nAB = nA * nB;
+  const int nCD = nC * nD;
+  const double* tile = tile_vals + static_cast<int64_t>(t) * nAB * nCD;
+  const int64_t N = static_cast<int64_t>(nao);
+
+  const int spab = static_cast<int>(task_spAB[t]);
+  const int spcd = static_cast<int>(task_spCD[t]);
+  const int A_sh = static_cast<int>(sp_A[spab]);
+  const int B_sh = static_cast<int>(sp_B[spab]);
+  const int C_sh = static_cast<int>(sp_A[spcd]);
+  const int D_sh = static_cast<int>(sp_B[spcd]);
+  const int a0 = static_cast<int>(shell_ao_start[A_sh]);
+  const int b0 = static_cast<int>(shell_ao_start[B_sh]);
+  const int c0 = static_cast<int>(shell_ao_start[C_sh]);
+  const int d0 = static_cast<int>(shell_ao_start[D_sh]);
+  const bool ab_neq = (A_sh != B_sh);
+  const bool cd_neq = (C_sh != D_sh);
+  const bool bk_swap = (spab != spcd);
+  const double f_ab = ab_neq ? 2.0 : 1.0;
+  const double f_cd = cd_neq ? 2.0 : 1.0;
+
+  _contract_jk_warp_single(tile, D_mat, J_mat, K_mat, lane,
+                            nAB, nCD, nA, nB, nC, nD,
+                            a0, b0, c0, d0,
+                            ab_neq, cd_neq, bk_swap, f_ab, f_cd, N);
+}
+
+__global__ void KernelContractJKTilesOrderedMulti2Warp(
+    const int32_t* task_spAB,
+    const int32_t* task_spCD,
+    const int32_t* sp_A,
+    const int32_t* sp_B,
+    const int32_t* shell_ao_start,
+    int nao,
+    int nA,
+    int nB,
+    int nC,
+    int nD,
+    const double* tile_vals,
+    const double* Da_mat,
+    const double* Db_mat,
+    double* Ja_mat,
+    double* Ka_mat,
+    double* Jb_mat,
+    double* Kb_mat,
+    int ntasks) {
+  const int t = static_cast<int>(blockIdx.x);
+  if (t >= ntasks) return;
+  const int lane = static_cast<int>(threadIdx.x);  // 0..31
+
+  const int nAB = nA * nB;
+  const int nCD = nC * nD;
+  const double* tile = tile_vals + static_cast<int64_t>(t) * nAB * nCD;
+  const int64_t N = static_cast<int64_t>(nao);
+
+  const int spab = static_cast<int>(task_spAB[t]);
+  const int spcd = static_cast<int>(task_spCD[t]);
+  const int A_sh = static_cast<int>(sp_A[spab]);
+  const int B_sh = static_cast<int>(sp_B[spab]);
+  const int C_sh = static_cast<int>(sp_A[spcd]);
+  const int D_sh = static_cast<int>(sp_B[spcd]);
+  const int a0 = static_cast<int>(shell_ao_start[A_sh]);
+  const int b0 = static_cast<int>(shell_ao_start[B_sh]);
+  const int c0 = static_cast<int>(shell_ao_start[C_sh]);
+  const int d0 = static_cast<int>(shell_ao_start[D_sh]);
+  const bool ab_neq = (A_sh != B_sh);
+  const bool cd_neq = (C_sh != D_sh);
+  const bool bk_swap = (spab != spcd);
+  const double f_ab = ab_neq ? 2.0 : 1.0;
+  const double f_cd = cd_neq ? 2.0 : 1.0;
+
+  _contract_jk_warp_single(tile, Da_mat, Ja_mat, Ka_mat, lane,
+                            nAB, nCD, nA, nB, nC, nD,
+                            a0, b0, c0, d0,
+                            ab_neq, cd_neq, bk_swap, f_ab, f_cd, N);
+  _contract_jk_warp_single(tile, Db_mat, Jb_mat, Kb_mat, lane,
+                            nAB, nCD, nA, nB, nC, nD,
+                            a0, b0, c0, d0,
+                            ab_neq, cd_neq, bk_swap, f_ab, f_cd, N);
+}
+
+}  // namespace (warp JK)
+
+extern "C" cudaError_t cueri_contract_jk_warp_launch_stream(
+    const int32_t* task_spAB,
+    const int32_t* task_spCD,
+    int ntasks,
+    const int32_t* sp_A,
+    const int32_t* sp_B,
+    const int32_t* shell_ao_start,
+    int nao,
+    int nA,
+    int nB,
+    int nC,
+    int nD,
+    const double* tile_vals,
+    const double* D_mat,
+    double* J_mat,
+    double* K_mat,
+    cudaStream_t stream) {
+  if (ntasks <= 0) return cudaSuccess;
+  if (nao <= 0 || nA <= 0 || nB <= 0 || nC <= 0 || nD <= 0) return cudaErrorInvalidValue;
+  KernelContractJKTilesOrderedWarp<<<static_cast<unsigned int>(ntasks), 32, 0, stream>>>(
+      task_spAB, task_spCD, sp_A, sp_B, shell_ao_start,
+      nao, nA, nB, nC, nD,
+      tile_vals, D_mat, J_mat, K_mat, ntasks);
+  return cudaPeekAtLastError();
+}
+
+extern "C" cudaError_t cueri_contract_jk_warp_multi2_launch_stream(
+    const int32_t* task_spAB,
+    const int32_t* task_spCD,
+    int ntasks,
+    const int32_t* sp_A,
+    const int32_t* sp_B,
+    const int32_t* shell_ao_start,
+    int nao,
+    int nA,
+    int nB,
+    int nC,
+    int nD,
+    const double* tile_vals,
+    const double* Da_mat,
+    const double* Db_mat,
+    double* Ja_mat,
+    double* Ka_mat,
+    double* Jb_mat,
+    double* Kb_mat,
+    cudaStream_t stream) {
+  if (ntasks <= 0) return cudaSuccess;
+  if (nao <= 0 || nA <= 0 || nB <= 0 || nC <= 0 || nD <= 0) return cudaErrorInvalidValue;
+  KernelContractJKTilesOrderedMulti2Warp<<<static_cast<unsigned int>(ntasks), 32, 0, stream>>>(
+      task_spAB, task_spCD, sp_A, sp_B, shell_ao_start,
+      nao, nA, nB, nC, nD,
+      tile_vals, Da_mat, Db_mat, Ja_mat, Ka_mat, Jb_mat, Kb_mat, ntasks);
+  return cudaPeekAtLastError();
+}
+
 extern "C" cudaError_t cueri_scatter_eri_tiles_ordered_launch_stream(
     const int32_t* task_spAB,
     const int32_t* task_spCD,

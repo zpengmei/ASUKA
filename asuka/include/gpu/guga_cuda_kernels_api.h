@@ -245,6 +245,16 @@ extern "C" cudaError_t guga_qmc_pack_scaled_identity_i32_f64_launch_stream(
     cudaStream_t stream,
     int threads);
 
+extern "C" cudaError_t guga_qmc_pack_scaled_identity_u64_f64_launch_stream(
+    const uint64_t* x_key,
+    const double* x_val,
+    int n,
+    double scale,
+    uint64_t* key_out,
+    double* val_out,
+    cudaStream_t stream,
+    int threads);
+
 // Batched dot products for many pairs of sorted sparse vectors.
 //
 // Inputs are packed row-major matrices. For A (nA, stride_a):
@@ -370,6 +380,16 @@ extern "C" cudaError_t guga_qmc_coalesce_coo_i32_f64_launch_stream(
     cudaStream_t stream,
     int threads);
 
+extern "C" cudaError_t guga_qmc_coalesce_coo_u64_f64_launch_stream(
+    const uint64_t* key_in,
+    const double* val_in,
+    int n,
+    uint64_t* key_out,
+    double* val_out,
+    int* out_nnz,
+    cudaStream_t stream,
+    int threads);
+
 extern "C" cudaError_t guga_qmc_phi_pivot_resample_i32_f64_launch_stream(
     const int32_t* idx_in,
     const double* val_in,
@@ -383,9 +403,26 @@ extern "C" cudaError_t guga_qmc_phi_pivot_resample_i32_f64_launch_stream(
     cudaStream_t stream,
     int threads);
 
+extern "C" cudaError_t guga_qmc_phi_pivot_resample_u64_f64_launch_stream(
+    const uint64_t* key_in,
+    const double* val_in,
+    int n_in,
+    uint64_t* key_out,
+    double* val_out,
+    int* out_nnz,
+    int m,
+    int pivot,
+    uint64_t seed,
+    cudaStream_t stream,
+    int threads);
+
 extern "C" void* guga_qmc_workspace_create(int max_n, int max_m);
 
 extern "C" void guga_qmc_workspace_destroy(void* ws_handle);
+
+extern "C" void* guga_qmc_workspace_u64_create(int max_n, int max_m);
+
+extern "C" void guga_qmc_workspace_u64_destroy(void* ws_handle);
 
 extern "C" cudaError_t guga_qmc_coalesce_coo_i32_f64_ws_launch_stream(
     void* ws_handle,
@@ -398,12 +435,37 @@ extern "C" cudaError_t guga_qmc_coalesce_coo_i32_f64_ws_launch_stream(
     cudaStream_t stream,
     int threads);
 
+extern "C" cudaError_t guga_qmc_coalesce_coo_u64_f64_ws_launch_stream(
+    void* ws_handle,
+    const uint64_t* key_in,
+    const double* val_in,
+    int n,
+    uint64_t* key_out,
+    double* val_out,
+    int* out_nnz,
+    cudaStream_t stream,
+    int threads);
+
 extern "C" cudaError_t guga_qmc_phi_pivot_resample_i32_f64_ws_launch_stream(
     void* ws_handle,
     const int32_t* idx_in,
     const double* val_in,
     int n_in,
     int32_t* idx_out,
+    double* val_out,
+    int* out_nnz,
+    int m,
+    int pivot,
+    uint64_t seed,
+    cudaStream_t stream,
+    int threads);
+
+extern "C" cudaError_t guga_qmc_phi_pivot_resample_u64_f64_ws_launch_stream(
+    void* ws_handle,
+    const uint64_t* key_in,
+    const double* val_in,
+    int n_in,
+    uint64_t* key_out,
     double* val_out,
     int* out_nnz,
     int m,
