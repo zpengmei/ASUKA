@@ -625,9 +625,34 @@ def _build_aux_basis_cart(
     basis_in: Any,
     auxbasis: Any,
     expand_contractions: bool,
+    ao_basis: Any = None,
 ) -> tuple[Any, str]:
-    """Build (aux_basis, auxbasis_name) as a cuERI packed cart basis."""
+    """Build (aux_basis, auxbasis_name) as a cuERI packed cart basis.
 
+    When *auxbasis* is an RICD alias (``"ricd"``, ``"acd"``, ``"accd"``) or an
+    :class:`~asuka.integrals.ricd_types.RICDOptions` instance, the auxiliary
+    basis is generated on-the-fly from the orbital basis via the aCD/acCD
+    Cholesky decomposition.  In that case *ao_basis* **must** be provided.
+    """
+
+    # --- RICD on-the-fly auxiliary basis generation ---
+    from asuka.integrals.ricd_types import is_ricd_request  # noqa: PLC0415
+
+    if is_ricd_request(auxbasis):
+        if ao_basis is None:
+            raise ValueError(
+                "ao_basis must be provided when using RICD auxiliary basis generation "
+                "(auxbasis='ricd'/'acd'/'accd' or an RICDOptions instance)"
+            )
+        from asuka.integrals.ricd_types import normalize_ricd_options  # noqa: PLC0415
+        from asuka.integrals.ricd_builder import build_ricd_aux_basis  # noqa: PLC0415
+
+        opts = normalize_ricd_options(auxbasis)
+        atoms_bohr = list(mol.atoms_bohr)
+        gen = build_ricd_aux_basis(ao_basis, atoms_bohr, options=opts)
+        return gen.packed_basis, gen.basis_name
+
+    # --- Standard auxiliary basis paths ---
     elements = _unique_elements(mol)
     auxbasis_name = ""
 
@@ -1046,6 +1071,7 @@ def run_rhf_df(
             basis_in=basis_in,
             auxbasis=auxbasis,
             expand_contractions=bool(expand_contractions),
+            ao_basis=ao_basis,
         )
 
         df_prof = None
@@ -1291,6 +1317,7 @@ def run_rhf_thc(
         basis_in=basis_in,
         auxbasis=auxbasis,
         expand_contractions=bool(expand_contractions),
+        ao_basis=ao_basis,
     )
 
     # SCF AO representation: cart or sph
@@ -1749,6 +1776,7 @@ def run_uhf_thc(
         basis_in=basis_in,
         auxbasis=auxbasis,
         expand_contractions=bool(expand_contractions),
+        ao_basis=ao_basis,
     )
 
     int1e_scf, _B_unused, sph_map = _apply_sph_transform(mol, int1e, None, ao_basis, df_B_layout="mnQ")
@@ -2137,6 +2165,7 @@ def run_rohf_thc(
         basis_in=basis_in,
         auxbasis=auxbasis,
         expand_contractions=bool(expand_contractions),
+        ao_basis=ao_basis,
     )
 
     int1e_scf, _B_unused, sph_map = _apply_sph_transform(mol, int1e, None, ao_basis, df_B_layout="mnQ")
@@ -2749,6 +2778,7 @@ def run_rks_df(
     # DF auxiliary basis + whitened DF factors
     aux_basis, auxbasis_name = _build_aux_basis_cart(
         mol, basis_in=basis_in, auxbasis=auxbasis, expand_contractions=bool(expand_contractions),
+        ao_basis=ao_basis,
     )
 
     df_prof = None
@@ -2936,6 +2966,7 @@ def run_rhf_df_cpu(
         basis_in=basis_in,
         auxbasis=auxbasis,
         expand_contractions=bool(expand_contractions),
+        ao_basis=ao_basis,
     )
 
     df_prof = None
@@ -3028,6 +3059,7 @@ def run_uhf_df_cpu(
         basis_in=basis_in,
         auxbasis=auxbasis,
         expand_contractions=bool(expand_contractions),
+        ao_basis=ao_basis,
     )
 
     df_prof = None
@@ -3118,6 +3150,7 @@ def run_rohf_df_cpu(
         basis_in=basis_in,
         auxbasis=auxbasis,
         expand_contractions=bool(expand_contractions),
+        ao_basis=ao_basis,
     )
 
     df_prof = None
@@ -3213,6 +3246,7 @@ def run_uhf_df(
         basis_in=basis_in,
         auxbasis=auxbasis,
         expand_contractions=bool(expand_contractions),
+        ao_basis=ao_basis,
     )
 
     df_prof = None
@@ -3353,6 +3387,7 @@ def run_uks_df(
 
     aux_basis, auxbasis_name = _build_aux_basis_cart(
         mol, basis_in=basis_in, auxbasis=auxbasis, expand_contractions=bool(expand_contractions),
+        ao_basis=ao_basis,
     )
 
     df_prof = None
@@ -3495,6 +3530,7 @@ def run_rohf_df(
         basis_in=basis_in,
         auxbasis=auxbasis,
         expand_contractions=bool(expand_contractions),
+        ao_basis=ao_basis,
     )
 
     df_prof = None

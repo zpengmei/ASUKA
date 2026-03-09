@@ -44,14 +44,9 @@ def _as_xp_f64(xp, a: Any):
 
 
 def _solve_triangular(xp, L, B, *, lower: bool, trans: str, overwrite_b: bool = False):
-    if xp is np:
-        from scipy.linalg import solve_triangular  # noqa: PLC0415
+    from asuka.linalg.triangular import solve_triangular  # noqa: PLC0415
 
-        return solve_triangular(L, B, lower=bool(lower), trans=str(trans), unit_diagonal=False, overwrite_b=bool(overwrite_b), check_finite=False)
-
-    import cupyx.scipy.linalg as cpx_linalg  # type: ignore[import-not-found]  # noqa: PLC0415
-
-    return cpx_linalg.solve_triangular(L, B, lower=bool(lower), trans=str(trans), unit_diagonal=False, overwrite_b=bool(overwrite_b))
+    return solve_triangular(L, B, lower=bool(lower), trans=str(trans), overwrite_b=bool(overwrite_b))
 
 
 def _solve_triangular_qp_inplace_cupy(L: Any, B_qp: Any) -> Any:

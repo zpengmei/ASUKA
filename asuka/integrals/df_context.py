@@ -190,8 +190,18 @@ def _build_df_bases_cart(mol: Any, *, auxbasis: Any, expand_contractions: bool) 
             raise TypeError("mol.basis must be a string name or an explicit per-element basis dict")
         ao_basis = pack_cart_basis(atoms_bohr, ao_shells, expand_contractions=bool(expand_contractions))
 
-    # Aux basis
-    if hasattr(auxbasis, "shell_cxyz") and hasattr(auxbasis, "shell_l") and hasattr(auxbasis, "prim_exp"):
+    # Aux basis — RICD on-the-fly generation
+    from asuka.integrals.ricd_types import is_ricd_request  # noqa: PLC0415
+
+    if is_ricd_request(auxbasis):
+        from asuka.integrals.ricd_types import normalize_ricd_options  # noqa: PLC0415
+        from asuka.integrals.ricd_builder import build_ricd_aux_basis  # noqa: PLC0415
+
+        opts = normalize_ricd_options(auxbasis)
+        gen = build_ricd_aux_basis(ao_basis, atoms_bohr, options=opts)
+        aux_basis = gen.packed_basis
+        auxbasis_name = gen.basis_name
+    elif hasattr(auxbasis, "shell_cxyz") and hasattr(auxbasis, "shell_l") and hasattr(auxbasis, "prim_exp"):
         aux_basis = auxbasis
         auxbasis_name = "<packed>"
     elif isinstance(auxbasis, dict):

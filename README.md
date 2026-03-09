@@ -58,6 +58,28 @@ Verify:
 python -c "import asuka; print(asuka.__version__)"
 ```
 
+### Bundled ma-XZVP basis sets
+
+ASUKA ships Minnesota ma-def2 orbital basis files directly under
+`asuka/frontend/basis_data` (no online download required for AO basis data):
+
+- `ma-SVP`, `ma-SVPP` (also accepts `ma-SV(P)`)
+- `ma-TZVP`, `ma-TZVPP`
+- `ma-QZVP`, `ma-QZVPP`
+
+Aliases with the `ma-def2-` prefix are accepted (for example
+`ma-def2-TZVP`, `ma-def2-SV(P)`).
+
+For `auxbasis=\"autoaux\"`, ASUKA maps these bundled bases to the matching
+`def2-*` family for BSE autoaux generation.
+
+### RICD (aCD/acCD) auxiliary basis (no JKFIT needed)
+
+ASUKA can generate an auxiliary basis on-the-fly from the AO basis (OpenMolcas-style aCD/acCD):
+use `auxbasis="ricd"` (alias for `auxbasis="accd"`) or `auxbasis="acd"` instead of a separate `*-jkfit` fitting basis.
+For repeated runs across processes, generated per-atom-type shells are cached to disk under
+`$ASUKA_RICD_CACHE_DIR` (defaults to `~/.cache/asuka/ricd`).
+
 ## Quick start
 
 ```python
@@ -289,10 +311,13 @@ active-space orbital tracking:
 ```python
 from asuka.frontend import make_df_sacasscf_properties_eval
 
+# Seed from a previously converged CASSCF result (e.g. equilibrium geometry).
 eval_fn = make_df_sacasscf_properties_eval(
     mol,
     casscf_kwargs=dict(ncore=4, ncas=4, nelecas=4, nroots=3,
                        root_weights=(1/3, 1/3, 1/3), backend="cuda", df=True),
+    mo_coeff_init=mc.mo_coeff,   # MO coefficients from a prior calculation
+    ci_init=mc.ci,               # CI vectors from a prior calculation
 )
 
 for coords in trajectory:

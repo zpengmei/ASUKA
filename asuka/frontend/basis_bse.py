@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 """Basis-set loading via Basis Set Exchange (optional dependency).
+
+Bundled basis sets (e.g. Minnesota ma-XZVP series) are loaded directly
+from ``.gbs`` files shipped in ``basis_data/`` without requiring BSE.
 """
 
 import json
@@ -8,6 +11,7 @@ from typing import Any
 
 import numpy as np
 
+from .basis_gbs import autoaux_fallback_name, is_bundled_basis, load_bundled_basis
 from .periodic_table import atomic_number
 
 
@@ -71,10 +75,20 @@ def _parse_bse_shell(shell: dict[str, Any]) -> list[tuple[int, np.ndarray, np.nd
 
 
 def load_element_basis_shells(basis_name: str, *, element: str) -> list[tuple[int, np.ndarray, np.ndarray]]:
-    """Load basis shells for one element using BSE (as (l, exps, coefs))."""
+    """Load basis shells for one element (as (l, exps, coefs)).
 
-    bse = _require_bse()
+    Bundled basis sets are loaded from ``.gbs`` files; others use BSE.
+    """
+
     sym = str(element).strip()
+
+    # --- bundled .gbs path ---
+    if is_bundled_basis(basis_name):
+        result = load_bundled_basis(basis_name, elements=[sym])
+        return result[sym]
+
+    # --- BSE path ---
+    bse = _require_bse()
     Z = atomic_number(sym)
     s = bse.get_basis(str(basis_name), elements=[sym], fmt="json", header=False)
     data = json.loads(s)
@@ -87,13 +101,22 @@ def load_element_basis_shells(basis_name: str, *, element: str) -> list[tuple[in
 
 
 def load_basis_shells(basis_name: str, *, elements: list[str]) -> dict[str, list[tuple[int, np.ndarray, np.ndarray]]]:
-    """Load per-element basis shells using BSE (as (l, exps, coefs))."""
+    """Load per-element basis shells (as (l, exps, coefs)).
 
-    bse = _require_bse()
+    Bundled basis sets (e.g. ``ma-TZVP``) are loaded from ``.gbs`` files
+    shipped with ASUKA.  All other names are forwarded to BSE.
+    """
+
     elements = [str(e).strip() for e in elements]
     if not elements:
         raise ValueError("elements must be non-empty")
 
+    # --- bundled .gbs path (no BSE needed) ---
+    if is_bundled_basis(basis_name):
+        return load_bundled_basis(basis_name, elements=elements)
+
+    # --- BSE path ---
+    bse = _require_bse()
     s = bse.get_basis(str(basis_name), elements=elements, fmt="json", header=False)
     data = json.loads(s)
     out: dict[str, list[tuple[int, np.ndarray, np.ndarray]]] = {}
@@ -112,14 +135,23 @@ def load_autoaux_shells(
     *,
     elements: list[str],
 ) -> tuple[str, dict[str, list[tuple[int, np.ndarray, np.ndarray]]]]:
-    """Load the BSE autoaux auxiliary basis corresponding to an orbital basis."""
+    """Load the BSE autoaux auxiliary basis corresponding to an orbital basis.
 
-    bse = _require_bse()
+    For bundled basis sets (e.g. ``ma-TZVP``), BSE does not know the name
+    directly.  We fall back to the corresponding ``def2-*`` basis for
+    autoaux generation (the diffuse augmentation in ma-XZVP does not
+    significantly affect the auxiliary basis choice).
+    """
+
     elements = [str(e).strip() for e in elements]
     if not elements:
         raise ValueError("elements must be non-empty")
 
-    s = bse.get_basis(str(orbital_basis_name), elements=elements, fmt="json", header=False, get_aux=1)
+    # For bundled bases, map to the def2 equivalent that BSE knows about.
+    lookup_name = autoaux_fallback_name(orbital_basis_name) or orbital_basis_name
+
+    bse = _require_bse()
+    s = bse.get_basis(str(lookup_name), elements=elements, fmt="json", header=False, get_aux=1)
     data = json.loads(s)
     aux_name = str(data.get("name", ""))
     if not aux_name:
@@ -137,4 +169,3 @@ def load_autoaux_shells(
 
 
 __all__ = ["load_autoaux_shells", "load_basis_shells", "load_element_basis_shells"]
-

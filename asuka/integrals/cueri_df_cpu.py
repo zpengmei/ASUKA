@@ -20,7 +20,7 @@ import time
 import warnings
 
 import numpy as np
-from scipy.linalg import solve_triangular
+from asuka.linalg.triangular import solve_triangular
 
 from asuka.cueri.basis_cart import BasisCartSoA
 from asuka.cueri.cart import ncart
@@ -152,6 +152,180 @@ def _build_df_combined_basis_and_shell_pairs(
 
     sp_all = ShellPairs(sp_A=sp_A, sp_B=sp_B, sp_npair=sp_npair, sp_pair_start=sp_pair_start)
     return basis_all, sp_all, int(nsp_ao), int(n_shell_ao), int(n_shell_aux)
+
+
+def _build_metric_basis_and_shell_pairs(
+    aux_basis: BasisCartSoA,
+) -> tuple[BasisCartSoA, ShellPairs, int]:
+    """Build combined (aux + dummy) basis and shell pairs for metric evaluation.
+
+    Returns ``(basis_all, sp_all, n_shell_aux)`` where each aux shell is
+    paired with a single dummy s-shell so that (P*dummy | Q*dummy) = (P|Q).
+    """
+    n_shell_aux = int(np.asarray(aux_basis.shell_cxyz, dtype=np.float64).shape[0])
+    aux_prim_n = int(np.asarray(aux_basis.prim_exp, dtype=np.float64).shape[0])
+    naux = nao_cart_from_basis(aux_basis)
+    dummy_shell = n_shell_aux
+
+    shell_cxyz = np.concatenate([
+        np.asarray(aux_basis.shell_cxyz, dtype=np.float64, order="C"),
+        np.zeros((1, 3), dtype=np.float64),
+    ], axis=0)
+    shell_prim_start = np.concatenate([
+        np.asarray(aux_basis.shell_prim_start, dtype=np.int32, order="C"),
+        np.asarray([aux_prim_n], dtype=np.int32),
+    ], axis=0)
+    shell_nprim = np.concatenate([
+        np.asarray(aux_basis.shell_nprim, dtype=np.int32, order="C"),
+        np.asarray([1], dtype=np.int32),
+    ], axis=0)
+    shell_l = np.concatenate([
+        np.asarray(aux_basis.shell_l, dtype=np.int32, order="C"),
+        np.asarray([0], dtype=np.int32),
+    ], axis=0)
+    shell_ao_start = np.concatenate([
+        np.asarray(aux_basis.shell_ao_start, dtype=np.int32, order="C"),
+        np.asarray([naux], dtype=np.int32),
+    ], axis=0)
+    prim_exp = np.concatenate([
+        np.asarray(aux_basis.prim_exp, dtype=np.float64, order="C"),
+        np.asarray([0.0], dtype=np.float64),
+    ], axis=0)
+    prim_coef = np.concatenate([
+        np.asarray(aux_basis.prim_coef, dtype=np.float64, order="C"),
+        np.asarray([1.0], dtype=np.float64),
+    ], axis=0)
+
+    basis_all = BasisCartSoA(
+        shell_cxyz=shell_cxyz,
+        shell_prim_start=shell_prim_start,
+        shell_nprim=shell_nprim,
+        shell_l=shell_l,
+        shell_ao_start=shell_ao_start,
+        prim_exp=prim_exp,
+        prim_coef=prim_coef,
+    )
+
+    aux_shell_idx = np.arange(n_shell_aux, dtype=np.int32)
+    sp_A = aux_shell_idx.copy()
+    sp_B = np.full((n_shell_aux,), int(dummy_shell), dtype=np.int32)
+    sp_npair = np.asarray(aux_basis.shell_nprim, dtype=np.int32, order="C").ravel().astype(np.int32, copy=False)
+    sp_pair_start = np.empty((n_shell_aux + 1,), dtype=np.int32)
+    sp_pair_start[0] = 0
+    sp_pair_start[1:] = np.cumsum(sp_npair, dtype=np.int32)
+
+    sp_all = ShellPairs(sp_A=sp_A, sp_B=sp_B, sp_npair=sp_npair, sp_pair_start=sp_pair_start)
+    return basis_all, sp_all, n_shell_aux
+
+
+def metric_2c2e_basis_cpu(
+    aux_basis: BasisCartSoA,
+    *,
+    threads: int = 0,
+    profile: dict | None = None,
+) -> np.ndarray:
+    """Compute the 2-center Coulomb metric ``V(P,Q) = (P|Q)`` on CPU.
+
+    Parameters
+    ----------
+    aux_basis : BasisCartSoA
+        Packed auxiliary (or candidate) basis.
+    threads : int
+        Number of OpenMP threads (0 = auto).
+    profile : dict or None
+        If not None, timing info is stored in this dict.
+
+    Returns
+    -------
+    np.ndarray, shape (naux, naux)
+        Symmetric Coulomb metric matrix.
+    """
+    threads_i = int(threads)
+    if threads_i < 0:
+        raise ValueError("threads must be >= 0")
+
+    naux = nao_cart_from_basis(aux_basis)
+    if naux == 0:
+        return np.empty((0, 0), dtype=np.float64)
+
+    _ext = _require_eri_cpu_ext()
+
+    basis_all, sp_all, n_shell_aux = _build_metric_basis_and_shell_pairs(aux_basis)
+
+    pt_prof = None
+    if profile is not None:
+        pt_prof = profile.setdefault("pair_tables", {})
+    pair_tables = build_pair_tables_cpu(basis_all, sp_all, threads=threads_i, profile=pt_prof)
+
+    shell_cxyz = np.asarray(basis_all.shell_cxyz, dtype=np.float64, order="C")
+    shell_l_all = np.asarray(basis_all.shell_l, dtype=np.int32, order="C")
+
+    sp_A = np.asarray(sp_all.sp_A, dtype=np.int32, order="C")
+    sp_B = np.asarray(sp_all.sp_B, dtype=np.int32, order="C")
+    sp_pair_start = np.asarray(sp_all.sp_pair_start, dtype=np.int32, order="C")
+    sp_npair = np.asarray(sp_all.sp_npair, dtype=np.int32, order="C")
+
+    pair_eta = np.asarray(pair_tables.pair_eta, dtype=np.float64, order="C")
+    pair_Px = np.asarray(pair_tables.pair_Px, dtype=np.float64, order="C")
+    pair_Py = np.asarray(pair_tables.pair_Py, dtype=np.float64, order="C")
+    pair_Pz = np.asarray(pair_tables.pair_Pz, dtype=np.float64, order="C")
+    pair_cK = np.asarray(pair_tables.pair_cK, dtype=np.float64, order="C")
+
+    eri_batch = getattr(_ext, "eri_rys_tile_cart_sp_batch_cy", None)
+    if eri_batch is None:  # pragma: no cover
+        raise RuntimeError("CPU ERI extension is missing batch tile entry points; rebuild the extension")
+
+    aux_shell_l = np.asarray(aux_basis.shell_l, dtype=np.int32, order="C").ravel()
+    aux_shell_ao_start = np.asarray(aux_basis.shell_ao_start, dtype=np.int32, order="C").ravel()
+
+    by_l: dict[int, list[int]] = {}
+    for sh in range(n_shell_aux):
+        by_l.setdefault(int(aux_shell_l[sh]), []).append(int(sh))
+
+    t0 = time.perf_counter() if profile is not None else 0.0
+    V = np.zeros((naux, naux), dtype=np.float64)
+    for psh in range(n_shell_aux):
+        lp = int(aux_shell_l[psh])
+        nP = int(ncart(lp))
+        p0 = int(aux_shell_ao_start[psh])
+        spAB = int(psh)
+
+        for lq, q_shells in by_l.items():
+            nQ = int(ncart(int(lq)))
+            q_list = [int(q) for q in q_shells if int(q) <= int(psh)]
+            if not q_list:
+                continue
+
+            spCD = np.asarray(q_list, dtype=np.int32)
+            tiles = eri_batch(
+                shell_cxyz,
+                shell_l_all,
+                sp_A,
+                sp_B,
+                sp_pair_start,
+                sp_npair,
+                pair_eta,
+                pair_Px,
+                pair_Py,
+                pair_Pz,
+                pair_cK,
+                int(spAB),
+                spCD,
+                int(threads_i),
+            )
+
+            for t, qsh in enumerate(q_list):
+                q0 = int(aux_shell_ao_start[qsh])
+                block = np.asarray(tiles[int(t)], dtype=np.float64, order="C").reshape((nP, nQ))
+                V[p0 : p0 + nP, q0 : q0 + nQ] = block
+                if qsh != psh:
+                    V[q0 : q0 + nQ, p0 : p0 + nP] = block.T
+
+    if profile is not None:
+        profile["t_metric_s"] = float(time.perf_counter() - t0)
+
+    V = 0.5 * (V + V.T)
+    return V
 
 
 def build_df_B_from_cueri_packed_bases_cpu(
@@ -363,4 +537,4 @@ def build_df_B_from_cueri_packed_bases_cpu(
     return B
 
 
-__all__ = ["build_df_B_from_cueri_packed_bases_cpu"]
+__all__ = ["build_df_B_from_cueri_packed_bases_cpu", "metric_2c2e_basis_cpu"]
