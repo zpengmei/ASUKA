@@ -1709,8 +1709,9 @@ def _weighted_trans_rdm12(
     nroots = int(len(ci0_list))
     if nroots != int(len(ci1_list)):
         raise ValueError("ci1_list length mismatch")
-    _rdm_kw: dict = dict(link_index=link_index, return_cupy=return_cupy)
+    _rdm_kw: dict = dict(link_index=link_index)
     if return_cupy:
+        _rdm_kw["return_cupy"] = True
         _rdm_kw["rdm_backend"] = "cuda"
     if nroots == 1:
         dm1, dm2 = fcisolver.trans_rdm12(ci1_list[0], ci0_list[0], int(ncas), nelecas, **_rdm_kw)
@@ -2771,8 +2772,9 @@ def gen_g_hop_internal(
         if _HOP_PROFILE:
             if on_gpu: xp.cuda.Stream.null.synchronize()
             _t1_hop = time.perf_counter()
-        _c2e_kw: dict = dict(link_index=linkstrl, return_cupy=on_gpu)
+        _c2e_kw: dict = dict(link_index=linkstrl)
         if on_gpu:
+            _c2e_kw["return_cupy"] = True
             _c2e_kw["contract_2e_backend"] = "cuda"
         with _ah_mixed_precision_ctx(fcisolver, ah_mixed_precision), _absorb_ctx():
             hci1 = [

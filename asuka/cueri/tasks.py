@@ -47,10 +47,18 @@ def build_tasks_screened(Q: np.ndarray, eps: float) -> TaskList:
 
 
 def build_tasks_screened_sorted_q(Q: np.ndarray, eps: float) -> TaskList:
-    """Sub-quadratic screened canonical task generation (Step 1.2).
+    """Vectorized screened canonical task generation.
 
-    Matches the set produced by `build_tasks_screened` but avoids enumerating all pairs when
-    screening is effective.
+    Produces the same set as ``build_tasks_screened`` (canonical: spCD ≤ spAB)
+    but avoids Python-level loops entirely.
+
+    Algorithm
+    ---------
+    1. Sort shell pairs by Q descending → perm, Qs.
+    2. For each rank-i, find jmax[i] = number of rank-j ≤ i whose
+       Qs[j] ≥ eps/Qs[i] via a vectorized np.searchsorted on -Qs.
+    3. Build i-array and j-array with np.repeat + offset arithmetic.
+    4. Map back to original shell-pair indices via perm and canonicalize.
     """
 
     Q = np.asarray(Q, dtype=np.float64).ravel()
@@ -58,34 +66,52 @@ def build_tasks_screened_sorted_q(Q: np.ndarray, eps: float) -> TaskList:
     if nsp == 0:
         return TaskList(task_spAB=np.empty((0,), dtype=np.int32), task_spCD=np.empty((0,), dtype=np.int32))
 
-    perm = np.argsort(-Q)  # descending
-    Qs = Q[perm]
+    perm = np.argsort(-Q, kind="stable")  # descending; shape (nsp,)
+    Qs = Q[perm]                          # sorted Q values
 
-    task_ab: list[int] = []
-    task_cd: list[int] = []
+    # Only consider ranks with Qs[i] > 0 (Q = 0 contributes nothing)
+    n_valid = int(np.searchsorted(-Qs, 0.0, side="left"))  # Qs[n_valid-1] > 0 >= Qs[n_valid]
+    if n_valid == 0:
+        return TaskList(task_spAB=np.empty((0,), dtype=np.int32), task_spCD=np.empty((0,), dtype=np.int32))
 
-    for i in range(nsp):
-        Qi = float(Qs[i])
-        if Qi <= 0.0:
-            break
-        thr = eps / Qi
-        # find jmax such that Qs[j] >= thr (descending array)
-        # np.searchsorted expects ascending; use on -Qs.
-        jmax = int(np.searchsorted(-Qs, -thr, side="right"))
-        jmax = min(jmax, i + 1)  # enforce canonical in rank-space
-        spAB = int(perm[i])
-        for j in range(jmax):
-            spCD = int(perm[j])
-            task_ab.append(spAB)
-            task_cd.append(spCD)
-    # Ensure spCD <= spAB for each pair by canonicalizing.
-    ab_arr = np.asarray(task_ab, dtype=np.int32)
-    cd_arr = np.asarray(task_cd, dtype=np.int32)
+    Qs_v = Qs[:n_valid]  # view: all positive Q values in descending order
+    neg_Qs_v = -Qs_v      # ascending, for searchsorted
+
+    # jmax[i] = number of rank-j (j=0..n_valid-1) with Qs[j] >= eps/Qs[i].
+    # Since Qs is descending, Qs[j] >= thr iff j < searchsorted(-Qs, -thr, 'right').
+    # Batch compute: thr[i] = eps / Qs[i]
+    thrs = float(eps) / np.maximum(Qs_v, 1e-300)  # (n_valid,)
+    jmax_uncapped = np.searchsorted(neg_Qs_v, -thrs, side="right").astype(np.int64)  # (n_valid,)
+    # Enforce canonical: j <= i  (in rank-space, i=0..n_valid-1 is the row index)
+    i_range = np.arange(n_valid, dtype=np.int64) + 1  # max allowed = i+1
+    jmax = np.minimum(jmax_uncapped, i_range)          # (n_valid,)
+
+    # Build pair arrays fully with numpy (no Python loops)
+    total = int(jmax.sum())
+    if total == 0:
+        return TaskList(task_spAB=np.empty((0,), dtype=np.int32), task_spCD=np.empty((0,), dtype=np.int32))
+
+    # i_arr[k] = rank i for the k-th pair; repeat i jmax[i] times
+    i_arr = np.repeat(np.arange(n_valid, dtype=np.int64), jmax)  # (total,)
+
+    # j_arr[k] = rank j for the k-th pair: within each group i, j runs 0..jmax[i]-1
+    group_offsets = np.empty(n_valid + 1, dtype=np.int64)
+    group_offsets[0] = 0
+    np.cumsum(jmax, out=group_offsets[1:])
+    j_arr = np.arange(total, dtype=np.int64) - group_offsets[i_arr]  # (total,)
+
+    # Map rank indices → original shell-pair indices
+    perm32 = perm[:n_valid].astype(np.int32)
+    ab_arr = perm32[i_arr]  # (total,) int32
+    cd_arr = perm32[j_arr]  # (total,) int32
+
+    # Canonicalize: ensure spCD <= spAB
     swap = cd_arr > ab_arr
     if np.any(swap):
         tmp = ab_arr[swap].copy()
         ab_arr[swap] = cd_arr[swap]
         cd_arr[swap] = tmp
+
     return TaskList(task_spAB=ab_arr, task_spCD=cd_arr)
 
 

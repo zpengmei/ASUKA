@@ -4,7 +4,14 @@ from __future__ import annotations
 
 Builds Coulomb (J) and exchange (K) matrices by evaluating 4-center integrals
 on-the-fly and contracting with the density matrix, without materializing the
-full ERI tensor.  Memory is O(nao^2) instead of O(nao^4).
+full ERI tensor.  Memory is O(nao^2) GPU + O(ntasks) CPU for large systems.
+
+For large systems (e.g. 100 H2O / 6-31g*) the number of screened shell-quartet
+tasks can reach 1-10 billion.  This module avoids storing all tasks on GPU by
+using *presorted slabs*: tasks are generated in Q-rank slabs on the GPU, sorted
+by ERI class, and stored as either GPU-resident CuPy arrays (small systems) or
+CPU numpy arrays (large systems).  Group offsets are computed on-GPU to avoid
+expensive D→H of large class-ID arrays.
 
 Uses specialized CUDA kernels (ssss, psss, pppp, dsds, ...) via the
 ``eri_dispatch`` infrastructure for optimal throughput, with automatic
@@ -17,25 +24,27 @@ Usage::
 """
 
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any
 
 import numpy as np
 
 
 @dataclass(frozen=True)
-class _BatchInfo:
-    """Pre-computed data for one kernel batch (one specialized kernel dispatch)."""
+class _SortedSlab:
+    """Precomputed sorted task slab (shell-pair index pairs grouped by ERI class).
 
-    batch: Any  # KernelBatch from eri_dispatch
-    # Device-resident original (un-swapped) task indices for J/K contraction
-    orig_spAB_dev: Any  # cp.ndarray int32 (batch_ntasks,)
-    orig_spCD_dev: Any  # cp.ndarray int32 (batch_ntasks,)
-    # Original angular momenta (before any bra/ket swap)
-    orig_la: int
-    orig_lb: int
-    orig_lc: int
-    orig_ld: int
+    If ``gpu_resident=True`` the arrays live on GPU (CuPy); otherwise they are
+    CPU numpy arrays that are uploaded to GPU on each J/K call.
+    """
+
+    # Task arrays — either CuPy (gpu_resident) or numpy (cpu)
+    ab_sorted: Any   # (ntasks_slab,) int32
+    cd_sorted: Any   # (ntasks_slab,) int32
+    # Class group metadata (always CPU numpy — tiny)
+    class_ids: np.ndarray  # (nclass,) int32
+    offsets: np.ndarray    # (nclass+1,) int32
+    gpu_resident: bool
 
 
 @dataclass(frozen=True)
@@ -44,21 +53,126 @@ class DirectJKContext:
 
     ao_basis: Any
     nao: int
-    # Kernel batch dispatch plan (specialized kernels with bra/ket swap)
-    batch_infos: tuple  # tuple[_BatchInfo, ...]
-    # Device-resident basis data
-    dbasis: Any  # DeviceBasisSS
-    dsp: Any  # DeviceShellPairs
-    pair_tables: Any  # DevicePairTables
-    sp_A_dev: Any  # cp.ndarray int32 (nsp,)
-    sp_B_dev: Any  # cp.ndarray int32 (nsp,)
-    shell_ao_start_dev: Any  # cp.ndarray int32 (nshell,)
-    # Backward compat / diagnostics
-    class_ids: np.ndarray  # (nclass,) int32
-    # Config
+    # GPU-resident basis data
+    dbasis: Any
+    dsp: Any
+    pair_tables: Any
+    sp_A_dev: Any           # cp.ndarray int32 (nsp,)
+    sp_B_dev: Any           # cp.ndarray int32 (nsp,)
+    shell_ao_start_dev: Any # cp.ndarray int32 (nshell,)
+    sp_class_lo_dev: Any    # cp.ndarray int32 (nsp,)
+    sp_class_lo_cpu: np.ndarray  # (nsp,) int32
+    # Presorted task slabs
+    slabs: tuple            # tuple[_SortedSlab, ...]
+    nsp: int
     ntasks: int
+    eps_schwarz: float
     threads: int
     max_tile_bytes: int
+
+
+def _build_sorted_slab(
+    perm32_dev,
+    jmax_dev,
+    sp_class_lo_dev,
+    i0: int,
+    i1: int,
+    gpu_budget_bytes: int,
+):
+    """Generate, sort, and return a task slab for Q-ranks [i0, i1).
+
+    Group offsets are computed on GPU (avoids D→H of large class-ID arrays).
+    Task arrays are kept GPU-resident if they fit within ``gpu_budget_bytes``;
+    otherwise they are transferred to CPU numpy.
+    """
+    import cupy as cp  # noqa: PLC0415
+
+    n_slab = i1 - i0
+    if n_slab <= 0:
+        return None
+
+    jmax_slab = jmax_dev[i0:i1]
+    total = int(jmax_slab.sum())
+    if total == 0:
+        return None
+
+    # --- Generate tasks on GPU ---
+    group_offsets = cp.empty(n_slab + 1, dtype=cp.int64)
+    group_offsets[0] = 0
+    cp.cumsum(jmax_slab, out=group_offsets[1:])
+
+    indices = cp.arange(total, dtype=cp.int64)
+    k_arr = cp.searchsorted(group_offsets, indices, side="right") - 1
+    j_arr = indices - group_offsets[k_arr]
+    del group_offsets, jmax_slab
+
+    ab = perm32_dev[k_arr + cp.int64(i0)]
+    cd = perm32_dev[j_arr]
+    del k_arr, j_arr, indices
+
+    swap = cd > ab
+    ab_out = cp.where(swap, cd, ab)
+    cd_out = cp.where(swap, ab, cd)
+    del ab, cd, swap
+
+    # --- Sort by class ID on GPU ---
+    class_id_dev = sp_class_lo_dev[ab_out] | (sp_class_lo_dev[cd_out] << cp.int32(16))
+    perm_dev = cp.argsort(class_id_dev, kind="stable")
+    ab_sorted_dev = cp.ascontiguousarray(ab_out[perm_dev])
+    cd_sorted_dev = cp.ascontiguousarray(cd_out[perm_dev])
+    class_id_sorted_dev = class_id_dev[perm_dev]
+    del ab_out, cd_out, class_id_dev, perm_dev
+
+    # --- Compute group offsets on GPU (avoids D→H of full class_id array) ---
+    slab_nt = total
+    if slab_nt > 1:
+        diff = class_id_sorted_dev[1:] != class_id_sorted_dev[:-1]
+        change_positions = cp.nonzero(diff)[0] + 1  # positions where class changes
+        del diff
+        # D→H only the small arrays: change_positions (nclass-1,) and first/last class IDs
+        change_cpu = cp.asnumpy(change_positions).astype(np.int32)
+        del change_positions
+    else:
+        change_cpu = np.empty((0,), dtype=np.int32)
+
+    # class IDs at group starts: D→H only nclass values (tiny)
+    if change_cpu.size == 0:
+        group_start_positions = cp.zeros(1, dtype=cp.int64)
+    else:
+        group_start_positions = cp.concatenate([
+            cp.zeros(1, dtype=cp.int64),
+            cp.asarray(change_cpu.astype(np.int64)),
+        ])
+    class_ids_dev_small = class_id_sorted_dev[cp.asarray(group_start_positions, dtype=cp.int64)]
+    class_ids_cpu = cp.asnumpy(class_ids_dev_small).astype(np.int32)
+    del class_id_sorted_dev, class_ids_dev_small, group_start_positions
+
+    offsets_cpu = np.concatenate(([0], change_cpu, [slab_nt])).astype(np.int32)
+    del change_cpu
+
+    # --- Decide storage: GPU or CPU ---
+    task_bytes = total * 2 * 4  # ab + cd as int32
+    if task_bytes <= gpu_budget_bytes:
+        # GPU-resident: keep CuPy arrays (zero per-iteration H→D)
+        return _SortedSlab(
+            ab_sorted=ab_sorted_dev,
+            cd_sorted=cd_sorted_dev,
+            class_ids=class_ids_cpu,
+            offsets=offsets_cpu,
+            gpu_resident=True,
+        )
+    else:
+        # CPU-resident: D→H task arrays (paid once per context build, not per iteration)
+        ab_cpu = cp.asnumpy(ab_sorted_dev).astype(np.int32)
+        cd_cpu = cp.asnumpy(cd_sorted_dev).astype(np.int32)
+        del ab_sorted_dev, cd_sorted_dev
+        return _SortedSlab(
+            ab_sorted=ab_cpu,
+            cd_sorted=cd_cpu,
+            class_ids=class_ids_cpu,
+            offsets=offsets_cpu,
+            gpu_resident=False,
+        )
 
 
 def make_direct_jk_context(
@@ -67,25 +181,31 @@ def make_direct_jk_context(
     eps_schwarz: float = 1e-12,
     threads: int = 256,
     max_tile_bytes: int = 256 << 20,
+    max_slab_tasks: int = 200_000_000,
+    gpu_task_budget_bytes: int = 2 << 30,
 ) -> DirectJKContext:
-    """One-time setup: build shell pairs, Schwarz bounds, screened task list.
+    """One-time setup: build shell pairs, Schwarz bounds, and presorted task slabs.
 
     Parameters
     ----------
     ao_basis
         Packed AO basis object (Cartesian).
     eps_schwarz
-        Schwarz screening threshold.  Quartets with ``Q_AB * Q_CD < eps``
-        are skipped.  Use 0 to disable screening.
+        Schwarz screening threshold.
     threads
         CUDA threads per block.
     max_tile_bytes
         Maximum bytes for the integral tile buffer per chunk.
+    max_slab_tasks
+        Maximum tasks per slab (bounds peak GPU memory during context build).
+        Default 200 M ≈ 3.2 GB peak GPU for task arrays + sort workspace.
+    gpu_task_budget_bytes
+        If a slab's task arrays fit within this budget (default 2 GB), they
+        are kept GPU-resident for zero per-iteration H→D overhead.
     """
 
     import cupy as cp  # noqa: PLC0415
 
-    from asuka.cueri.eri_dispatch import KernelBatch, resolve_kernel_class_id  # noqa: PLC0415
     from asuka.cueri.gpu import (  # noqa: PLC0415
         CUDA_MAX_L,
         CUDA_MAX_NROOTS,
@@ -95,18 +215,10 @@ def make_direct_jk_context(
         to_device_shell_pairs,
     )
     from asuka.cueri.shell_pairs import build_shell_pairs_l_order  # noqa: PLC0415
-    from asuka.cueri.tasks import (  # noqa: PLC0415
-        TaskList,
-        build_tasks_screened,
-        build_tasks_screened_sorted_q,
-        decode_eri_class_id,
-        group_tasks_by_class,
-        with_task_class_id,
-    )
     from asuka.integrals.int1e_cart import nao_cart_from_basis  # noqa: PLC0415
 
     if not has_cuda_ext():
-        raise RuntimeError("cuERI CUDA extension not available; build via `python -m asuka.cueri.build_cuda_ext`")
+        raise RuntimeError("cuERI CUDA extension not available")
 
     nao = int(nao_cart_from_basis(ao_basis))
     if nao <= 0:
@@ -130,90 +242,93 @@ def make_direct_jk_context(
         from asuka.cueri.screening import schwarz_shellpairs_device  # noqa: PLC0415
 
         Q_dev = schwarz_shellpairs_device(
-            ao_basis,
-            sp,
+            ao_basis, sp,
             threads=int(threads),
             max_tiles_bytes=int(max_tile_bytes),
         )
         Q_np = cp.asnumpy(Q_dev)
-        tasks = build_tasks_screened_sorted_q(Q_np, eps=eps_f)
+        del Q_dev
     else:
         Q_np = np.ones((nsp,), dtype=np.float64)
-        tasks = build_tasks_screened(Q_np, eps=0.0)
 
-    if tasks.ntasks == 0:
-        raise ValueError("All shell quartets screened out")
+    perm = np.argsort(-Q_np, kind="stable")
+    Q_sorted = Q_np[perm]
+    n_valid = int(np.searchsorted(-Q_sorted, 0.0, side="left"))
+    if n_valid == 0:
+        raise ValueError("All shell pairs have zero Schwarz bound")
 
-    tasks = with_task_class_id(tasks, sp, shell_l)
-    assert tasks.task_class_id is not None
+    Q_sorted = Q_sorted[:n_valid]
+    neg_Q_sorted = -Q_sorted
+    perm32_cpu = perm[:n_valid].astype(np.int32)
 
-    # Group tasks by class: O(N log N) sort — fast even for 46M tasks
-    perm, class_ids, offsets = group_tasks_by_class(tasks.task_class_id)
-    task_ab = tasks.task_spAB[perm]
-    task_cd = tasks.task_spCD[perm]
+    if eps_f > 0.0:
+        thrs = eps_f / np.maximum(Q_sorted, 1e-300)
+        jmax_uncapped = np.searchsorted(neg_Q_sorted, -thrs, side="right").astype(np.int64)
+        jmax_cpu = np.minimum(jmax_uncapped, np.arange(n_valid, dtype=np.int64) + 1)
+    else:
+        jmax_cpu = np.arange(1, n_valid + 1, dtype=np.int64)
 
-    # Upload all task arrays in ONE transfer instead of one per batch
-    task_ab_dev = cp.ascontiguousarray(cp.asarray(task_ab, dtype=cp.int32))
-    task_cd_dev = cp.ascontiguousarray(cp.asarray(task_cd, dtype=cp.int32))
+    ntasks = int(jmax_cpu.sum())
+    cumtasks_cpu = np.concatenate(([np.int64(0)], np.cumsum(jmax_cpu)))
 
-    # Build dispatch plan: O(1) per class (not O(57×ntasks) like plan_kernel_batches_spd).
-    # resolve_kernel_class_id() checks if a native kernel exists, possibly with bra/ket swap.
-    batch_infos = []
-    for g in range(int(class_ids.shape[0])):
-        orig_cid = int(class_ids[g])
-        j0, j1 = int(offsets[g]), int(offsets[g + 1])
-        if j1 <= j0:
-            continue
+    sp_A_np = np.asarray(sp.sp_A, dtype=np.int32)
+    sp_B_np = np.asarray(sp.sp_B, dtype=np.int32)
+    la_sp = shell_l[sp_A_np]
+    lb_sp = shell_l[sp_B_np]
+    sp_class_lo_cpu = ((la_sp & 0xFF) | ((lb_sp & 0xFF) << 8)).astype(np.int32)
 
-        la, lb, lc, ld = decode_eri_class_id(orig_cid)
-        kernel_cid, transpose = resolve_kernel_class_id(orig_cid)
+    sp_class_lo_dev = cp.ascontiguousarray(cp.asarray(sp_class_lo_cpu, dtype=cp.int32))
+    perm32_dev = cp.ascontiguousarray(cp.asarray(perm32_cpu, dtype=cp.int32))
+    jmax_dev = cp.ascontiguousarray(cp.asarray(jmax_cpu, dtype=cp.int64))
 
-        # Kernel tasks are CPU numpy arrays (slices, no copy)
-        if transpose:
-            kernel_spAB = task_cd[j0:j1]
-            kernel_spCD = task_ab[j0:j1]
-        else:
-            kernel_spAB = task_ab[j0:j1]
-            kernel_spCD = task_cd[j0:j1]
+    # Build presorted slabs
+    slabs = []
+    slab_i0 = 0
+    while slab_i0 < n_valid:
+        target = cumtasks_cpu[slab_i0] + max_slab_tasks
+        slab_i1 = int(np.searchsorted(cumtasks_cpu, target, side="right")) - 1
+        slab_i1 = max(slab_i0 + 1, slab_i1)
+        slab_i1 = min(slab_i1, n_valid)
 
-        batch = KernelBatch(
-            task_idx=perm[j0:j1],
-            kernel_tasks=TaskList(task_spAB=kernel_spAB, task_spCD=kernel_spCD),
-            kernel_class_id=np.int32(kernel_cid),
-            transpose=transpose,  # run_kernel_batch_spd transposes tiles back to (AB|CD) order
+        slab = _build_sorted_slab(
+            perm32_dev, jmax_dev, sp_class_lo_dev,
+            slab_i0, slab_i1,
+            gpu_budget_bytes=int(gpu_task_budget_bytes),
         )
+        if slab is not None:
+            slabs.append(slab)
 
-        batch_infos.append(_BatchInfo(
-            batch=batch,
-            orig_spAB_dev=task_ab_dev[j0:j1],  # view — no extra copy
-            orig_spCD_dev=task_cd_dev[j0:j1],  # view — no extra copy
-            orig_la=int(la),
-            orig_lb=int(lb),
-            orig_lc=int(lc),
-            orig_ld=int(ld),
-        ))
+        slab_i0 = slab_i1
+
+    del perm32_dev, jmax_dev
+    # Release slab-build temporaries from pool to avoid fragmentation during J/K
+    # (only non-resident blocks; GPU-resident slab arrays are kept)
+    cp.get_default_memory_pool().free_all_blocks()
 
     dbasis = to_device_basis_ss(ao_basis)
     dsp = to_device_shell_pairs(sp)
     pair_tables = build_pair_tables_ss_device(dbasis, dsp, stream=None, threads=int(threads))
 
-    sp_A_dev = cp.ascontiguousarray(cp.asarray(sp.sp_A, dtype=cp.int32))
-    sp_B_dev = cp.ascontiguousarray(cp.asarray(sp.sp_B, dtype=cp.int32))
+    sp_A_dev = cp.ascontiguousarray(cp.asarray(sp_A_np, dtype=cp.int32))
+    sp_B_dev = cp.ascontiguousarray(cp.asarray(sp_B_np, dtype=cp.int32))
     shell_ao_start_np = np.asarray(ao_basis.shell_ao_start, dtype=np.int32).ravel()
     shell_ao_start_dev = cp.ascontiguousarray(cp.asarray(shell_ao_start_np, dtype=cp.int32))
 
     return DirectJKContext(
         ao_basis=ao_basis,
         nao=int(nao),
-        batch_infos=tuple(batch_infos),
         dbasis=dbasis,
         dsp=dsp,
         pair_tables=pair_tables,
         sp_A_dev=sp_A_dev,
         sp_B_dev=sp_B_dev,
         shell_ao_start_dev=shell_ao_start_dev,
-        class_ids=class_ids,
-        ntasks=int(tasks.ntasks),
+        sp_class_lo_dev=sp_class_lo_dev,
+        sp_class_lo_cpu=sp_class_lo_cpu,
+        slabs=tuple(slabs),
+        nsp=int(nsp),
+        ntasks=int(ntasks),
+        eps_schwarz=float(eps_f),
         threads=int(threads),
         max_tile_bytes=int(max_tile_bytes),
     )
@@ -227,18 +342,17 @@ def direct_JK(
     want_K: bool = True,
     profile: dict | None = None,
 ):
-    """Build J and K via integral-direct 4-center evaluation.
+    """Build J and K via streaming integral-direct 4-center evaluation.
 
-    Uses specialized CUDA kernels (ssss, psss, pppp, dsds, ...) dispatched
-    via ``eri_dispatch`` for each shell class, with automatic bra/ket swap
-    and fallback to generic Rys for unsupported angular momenta.
+    GPU-resident slabs (small systems) incur zero H→D overhead.
+    CPU-resident slabs (large systems) are streamed to GPU one at a time.
 
     Parameters
     ----------
     ctx
         Pre-built context from :func:`make_direct_jk_context`.
     D
-        AO density matrix, shape ``(nao, nao)``, CuPy array.
+        AO density matrix, shape ``(nao, nao)``, CuPy or NumPy array.
     want_J, want_K
         Which matrices to compute.
     profile
@@ -247,7 +361,7 @@ def direct_JK(
     Returns
     -------
     (J, K) : tuple
-        Coulomb and exchange matrices, each ``(nao, nao)`` or ``None``.
+        Coulomb and exchange matrices, each ``(nao, nao)`` CuPy array, or None.
     """
 
     if not want_J and not want_K:
@@ -257,8 +371,8 @@ def direct_JK(
 
     from asuka.cueri import _cueri_cuda_ext as _ext  # noqa: PLC0415
     from asuka.cueri.cart import ncart  # noqa: PLC0415
-    from asuka.cueri.eri_dispatch import KernelBatch, run_kernel_batch_spd  # noqa: PLC0415
-    from asuka.cueri.tasks import TaskList  # noqa: PLC0415
+    from asuka.cueri.eri_dispatch import KernelBatch, resolve_kernel_class_id, run_kernel_batch_spd  # noqa: PLC0415
+    from asuka.cueri.tasks import TaskList, decode_eri_class_id  # noqa: PLC0415
 
     nao = ctx.nao
     threads = ctx.threads
@@ -271,85 +385,106 @@ def direct_JK(
 
     J_flat = cp.zeros((nao * nao,), dtype=cp.float64) if want_J else None
     K_flat = cp.zeros((nao * nao,), dtype=cp.float64) if want_K else None
+    J_dummy = cp.zeros((nao * nao,), dtype=cp.float64) if J_flat is None else None
 
     stream_ptr = int(cp.cuda.get_current_stream().ptr)
     n_kernel_calls = 0
     t0 = time.perf_counter()
 
-    for bi in ctx.batch_infos:
-        batch = bi.batch
-        la, lb, lc, ld = bi.orig_la, bi.orig_lb, bi.orig_lc, bi.orig_ld
-        nA = int(ncart(la))
-        nB = int(ncart(lb))
-        nC = int(ncart(lc))
-        nD = int(ncart(ld))
-        nAB = nA * nB
-        nCD = nC * nD
-        bytes_per_task = nAB * nCD * 8
-        chunk_ntasks = max(1, max_tile_bytes // max(bytes_per_task, 1))
+    for slab in ctx.slabs:
+        if slab.gpu_resident:
+            # Task arrays already on GPU — zero H→D cost
+            ab_dev = slab.ab_sorted
+            cd_dev = slab.cd_sorted
+            owned = False
+        else:
+            # H→D: upload presorted task indices from CPU
+            ab_dev = cp.ascontiguousarray(cp.asarray(slab.ab_sorted, dtype=cp.int32))
+            cd_dev = cp.ascontiguousarray(cp.asarray(slab.cd_sorted, dtype=cp.int32))
+            owned = True
 
-        batch_ntasks = int(batch.task_idx.shape[0])
-
-        for c0 in range(0, batch_ntasks, chunk_ntasks):
-            c1 = min(batch_ntasks, c0 + chunk_ntasks)
-            nt = c1 - c0
-            if nt == 0:
+        for g in range(int(slab.class_ids.shape[0])):
+            orig_cid = int(slab.class_ids[g])
+            j0, j1 = int(slab.offsets[g]), int(slab.offsets[g + 1])
+            if j1 <= j0:
                 continue
 
-            # Create sub-batch for this chunk
-            sub_batch = KernelBatch(
-                task_idx=batch.task_idx[c0:c1],
-                kernel_tasks=TaskList(
-                    task_spAB=batch.kernel_tasks.task_spAB[c0:c1],
-                    task_spCD=batch.kernel_tasks.task_spCD[c0:c1],
-                ),
-                kernel_class_id=batch.kernel_class_id,
-                transpose=batch.transpose,
-            )
+            la, lb, lc, ld = decode_eri_class_id(orig_cid)
+            kernel_cid, transpose = resolve_kernel_class_id(orig_cid)
 
-            # Evaluate ERI tiles using specialized kernel dispatch
-            tiles = run_kernel_batch_spd(
-                sub_batch,
-                dbasis=ctx.dbasis,
-                dsp=ctx.dsp,
-                pt=ctx.pair_tables,
-                stream=None,
-                threads=threads,
-                profile=profile,
-            )
-            n_kernel_calls += 1
+            nA = int(ncart(la))
+            nB = int(ncart(lb))
+            nC = int(ncart(lc))
+            nD = int(ncart(ld))
+            ncomp = nA * nB * nC * nD
+            chunk_ntasks = max(1, max_tile_bytes // max(ncomp * 8, 1))
+            use_warp_mode = ncomp <= 128
 
-            # Contract with D and accumulate into J/K
-            # tiles shape: (nt, nAB, nCD) in original bra/ket order
-            if profile is not None:
-                _t_contract0 = cp.cuda.Event()
-                _t_contract1 = cp.cuda.Event()
-                _t_contract0.record()
-            _ext.contract_jk_tiles_ordered_inplace_device(
-                bi.orig_spAB_dev[c0:c1],
-                bi.orig_spCD_dev[c0:c1],
-                ctx.sp_A_dev,
-                ctx.sp_B_dev,
-                ctx.shell_ao_start_dev,
-                int(nao),
-                int(nA),
-                int(nB),
-                int(nC),
-                int(nD),
-                tiles.ravel(),
-                D_flat,
-                J_flat if J_flat is not None else cp.zeros((nao * nao,), dtype=cp.float64),
-                K_flat,  # None → py::none → nullptr in C++
-                int(threads),
-                int(stream_ptr),
-                False,
-            )
-            if profile is not None:
-                _t_contract1.record()
-                _t_contract1.synchronize()
-                profile["contract_ms"] = float(profile.get("contract_ms", 0.0)) + float(
-                    cp.cuda.get_elapsed_time(_t_contract0, _t_contract1)
+            kernel_spAB_full = cd_dev[j0:j1] if transpose else ab_dev[j0:j1]
+            kernel_spCD_full = ab_dev[j0:j1] if transpose else cd_dev[j0:j1]
+
+            class_ntasks = j1 - j0
+            for c0 in range(0, class_ntasks, chunk_ntasks):
+                c1 = min(class_ntasks, c0 + chunk_ntasks)
+                if c1 <= c0:
+                    continue
+
+                sub_batch = KernelBatch(
+                    task_idx=np.empty(0, dtype=np.int32),  # unused by run_kernel_batch_spd
+                    kernel_tasks=TaskList(
+                        task_spAB=kernel_spAB_full[c0:c1],
+                        task_spCD=kernel_spCD_full[c0:c1],
+                    ),
+                    kernel_class_id=np.int32(kernel_cid),
+                    transpose=transpose,
                 )
+
+                tiles = run_kernel_batch_spd(
+                    sub_batch,
+                    dbasis=ctx.dbasis,
+                    dsp=ctx.dsp,
+                    pt=ctx.pair_tables,
+                    stream=None,
+                    threads=threads,
+                    mode="warp" if use_warp_mode else "auto",
+                    profile=profile,
+                )
+                n_kernel_calls += 1
+
+                if profile is not None:
+                    _tc0 = cp.cuda.Event()
+                    _tc1 = cp.cuda.Event()
+                    _tc0.record()
+
+                _ext.contract_jk_tiles_ordered_inplace_device(
+                    ab_dev[j0 + c0: j0 + c1],
+                    cd_dev[j0 + c0: j0 + c1],
+                    ctx.sp_A_dev,
+                    ctx.sp_B_dev,
+                    ctx.shell_ao_start_dev,
+                    int(nao),
+                    int(nA),
+                    int(nB),
+                    int(nC),
+                    int(nD),
+                    tiles.ravel(),
+                    D_flat,
+                    J_flat if J_flat is not None else J_dummy,
+                    K_flat,
+                    int(threads),
+                    int(stream_ptr),
+                    False,
+                )
+
+                if profile is not None:
+                    _tc1.record()
+                    _tc1.synchronize()
+                    profile["contract_ms"] = float(profile.get("contract_ms", 0.0)) + float(
+                        cp.cuda.get_elapsed_time(_tc0, _tc1)
+                    )
+
+        if owned:
+            del ab_dev, cd_dev
 
     cp.cuda.get_current_stream().synchronize()
 
