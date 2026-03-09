@@ -317,6 +317,10 @@ def run_fcifri_subspace(
     if backend not in ("stochastic", "exact", "cuda"):
         raise ValueError("backend must be 'stochastic', 'exact', or 'cuda'")
 
+    # Allow direct use of trial/result objects that expose a QMC sparse-vector export.
+    if x0 is not None and hasattr(x0, "to_qmc_x0"):
+        x0 = x0.to_qmc_x0()
+
     if backend == "cuda" and (compressor is not None or spawner is not None or spawner_kwargs is not None):
         warnings.warn(
             "backend='cuda' does not support custom compressor/spawner yet; falling back to CPU backend.",

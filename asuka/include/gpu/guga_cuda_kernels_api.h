@@ -2072,4 +2072,66 @@ extern "C" void dm3_6way_symmetry_launch_stream(
     const double* dm3_in, double* dm3_out, int n,
     cudaStream_t stream, int threads);
 
+// =============================================================================
+// CIPSI frontier-hash (GPU selection/PT2 without materializing y[ncsf])
+// =============================================================================
+
+extern "C" void guga_apply_g_flat_scatter_atomic_frontier_hash_launch_stream(
+    const int32_t* child,
+    const int16_t* node_twos,
+    const int64_t* child_prefix,
+    const int8_t* steps_table,
+    const int32_t* nodes_table,
+    int ncsf,
+    int norb,
+    const int32_t* task_csf,
+    const double* task_scale,
+    const double* task_g,
+    int64_t g_stride,
+    int ntasks,
+    int32_t* hash_keys,
+    double* hash_vals,
+    int cap,
+    int root,
+    int* overflow_flag,
+    cudaStream_t stream,
+    int threads);
+
+extern "C" cudaError_t guga_cipsi_frontier_hash_clear_launch_stream(
+    int32_t* keys,
+    double* vals_root_major,
+    int cap,
+    int nroots,
+    cudaStream_t stream,
+    int threads);
+
+extern "C" cudaError_t guga_cipsi_frontier_hash_extract_launch_stream(
+    const int32_t* keys,
+    const double* vals_root_major,
+    int cap,
+    int nroots,
+    int32_t* out_idx,
+    double* out_vals_root_major,
+    int* out_nnz,
+    cudaStream_t stream,
+    int threads);
+
+extern "C" cudaError_t guga_cipsi_score_and_select_topk_launch_stream(
+    const int32_t* idx,
+    const double* vals_root_major,
+    int64_t vals_stride,
+    int nnz,
+    int nroots,
+    const double* e_var,
+    const double* hdiag,
+    int ncsf,
+    const uint8_t* selected_mask,
+    double denom_floor,
+    int max_add,
+    int32_t* out_new_idx,
+    int* out_new_n,
+    double* out_pt2,
+    cudaStream_t stream,
+    int threads);
+
 #endif  // CUGUGA_GPU_GUGA_CUDA_KERNELS_API_H

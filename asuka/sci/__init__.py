@@ -8,10 +8,14 @@ sparse row-oracles to assemble the variational Hamiltonian and to generate the
 external space used for selection.
 """
 
+from asuka.sci.gpu_cipsi import CIPSITrialSpaceResult, build_cipsi_trials_from_scf, run_cipsi_trials
 from asuka.sci.selected_ci import GUGASelectedCISolver, SCIResult, selected_ci
 
 __all__ = [
+    "build_cipsi_trials_from_scf",
+    "CIPSITrialSpaceResult",
     "GUGASelectedCISolver",
+    "run_cipsi_trials",
     "SCIResult",
     "selected_ci",
 ]
