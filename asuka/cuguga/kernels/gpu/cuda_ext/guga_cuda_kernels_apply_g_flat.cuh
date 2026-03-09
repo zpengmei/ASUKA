@@ -285,6 +285,7 @@ void guga_apply_g_flat_scatter_atomic_frontier_hash_kernel_t(
     double* __restrict__ hash_vals,          // [nroots*cap] root-major
     int cap,
     int root,
+    const uint8_t* __restrict__ selected_mask,  // [ncsf] or NULL
     int* __restrict__ overflow_flag) {
   guga_maybe_enable_smem_spilling();
 
@@ -491,9 +492,273 @@ void guga_apply_g_flat_scatter_atomic_frontier_hash_kernel_t(
             continue;
           }
           if (csf_i == csf_idx) continue;
+          if (selected_mask && selected_mask[csf_i]) continue;
           if (w2 == 0.0) continue;
           double contrib = scale * wgt * w2;
           guga_frontier_hash_insert_add_f64(hash_keys, hash_vals, cap, root, csf_i, contrib, overflow_flag);
+        } else {
+          if (top >= MAX_NORB_T) {
+            overflow = 1;
+            continue;
+          }
+          st_k[top] = (int8_t)k_next;
+          st_node_seg[top] = ((uint64_t)(uint32_t)seg_idx2) | ((uint64_t)(uint32_t)child_k << 32);
+          st_w[top] = w2;
+          top++;
+        }
+      }
+    }
+
+    if (overflow) atomicExch(overflow_flag, 1);
+  }
+}
+
+template <int MAX_NORB_T>
+__global__ __launch_bounds__(256, 2)
+void guga_apply_g_flat_scatter_atomic_frontier_hash_many_roots_kernel_t(
+    const int32_t* __restrict__ child,
+    const int16_t* __restrict__ node_twos,
+    const int64_t* __restrict__ child_prefix,
+    const int8_t* __restrict__ steps_table,   // [ncsf,norb]
+    const int32_t* __restrict__ nodes_table,  // [ncsf,norb+1]
+    int ncsf,
+    int norb,
+    const int32_t* __restrict__ task_csf,              // [ntasks]
+    const double* __restrict__ task_scale_task_major,  // [ntasks,nroots]
+    int64_t task_scale_stride,                         // elements between task rows (0 => broadcast row0)
+    int nroots,
+    const double* __restrict__ task_g,  // [nops] or [ntasks,nops]
+    int64_t g_stride,                   // 0 (shared) or nops
+    int ntasks,
+    int32_t* __restrict__ hash_keys,    // [cap]
+    double* __restrict__ hash_vals,     // [nroots*cap] root-major
+    int cap,
+    const uint8_t* __restrict__ selected_mask,  // [ncsf] or NULL
+    int* __restrict__ overflow_flag) {
+  guga_maybe_enable_smem_spilling();
+
+  int task_id = (int)blockIdx.x;
+  if (task_id >= ntasks) return;
+  if (!task_scale_task_major || nroots <= 0) return;
+
+  if (norb > MAX_NORB_T) {
+    if (threadIdx.x == 0) atomicExch(overflow_flag, 1);
+    return;
+  }
+
+  int csf_idx = task_csf[task_id];
+  if ((unsigned)csf_idx >= (unsigned)ncsf) {
+    if (threadIdx.x == 0) atomicExch(overflow_flag, 1);
+    return;
+  }
+
+  const double* scale_by_root =
+      task_scale_task_major + (task_scale_stride == 0 ? 0 : ((int64_t)task_id * task_scale_stride));
+  __shared__ int task_active_s;
+  if ((int)threadIdx.x == 0) {
+    int any = 0;
+    for (int r = 0; r < nroots; r++) {
+      if (scale_by_root[r] != 0.0) {
+        any = 1;
+        break;
+      }
+    }
+    task_active_s = any;
+  }
+  if ((int)blockDim.x > 32) {
+    __syncthreads();
+  } else {
+    __syncwarp();
+  }
+  if (task_active_s == 0) return;
+
+  int nops = norb * norb;
+  const double* g_flat = task_g + (int64_t)task_id * g_stride;
+
+  __shared__ int8_t steps_s[MAX_NORB_T];
+  __shared__ int32_t nodes_s[MAX_NORB_T + 1];
+  __shared__ int8_t occ_s[MAX_NORB_T];
+  __shared__ int16_t b_s[MAX_NORB_T];
+  __shared__ int32_t idx_prefix_s[MAX_NORB_T + 1];
+  __shared__ int32_t idx_prefix_warp_sums[(MAX_NORB_T + 31) / 32];
+
+  for (int k = (int)threadIdx.x; k < norb; k += (int)blockDim.x) {
+    int8_t step = steps_table[(int64_t)csf_idx * (int64_t)norb + (int64_t)k];
+    steps_s[k] = step;
+    occ_s[k] = (int8_t)step_to_occ(step);
+    int32_t node_next = nodes_table[(int64_t)csf_idx * (int64_t)(norb + 1) + (int64_t)(k + 1)];
+    nodes_s[k + 1] = node_next;
+    b_s[k] = node_twos[node_next];
+  }
+  if ((int)blockDim.x > 32) {
+    __syncthreads();
+  } else {
+    __syncwarp();
+  }
+  if ((int)threadIdx.x == 0) {
+    nodes_s[0] = nodes_table[(int64_t)csf_idx * (int64_t)(norb + 1)];
+  }
+  if ((int)blockDim.x > 32) {
+    __syncthreads();
+  } else {
+    __syncwarp();
+  }
+
+  if (norb <= 32) {
+    int lane = (int)threadIdx.x;
+    if (lane < 32) {
+      int32_t delta = 0;
+      if (lane < norb) {
+        int node_k = nodes_s[lane];
+        int step_k = (int)steps_s[lane];
+        delta = (int32_t)child_prefix[node_k * 5 + step_k];
+      }
+      #pragma unroll
+      for (int off = 1; off < 32; off <<= 1) {
+        int32_t v = __shfl_up_sync(0xffffffffu, delta, off);
+        if (lane >= off) delta += v;
+      }
+      if (lane == 0) idx_prefix_s[0] = 0;
+      if (lane < norb) idx_prefix_s[lane + 1] = delta;
+    }
+    if ((int)blockDim.x > 32) {
+      __syncthreads();
+    } else {
+      __syncwarp();
+    }
+  } else {
+    if ((int)blockDim.x >= 64) {
+      int tid = (int)threadIdx.x;
+      int lane = tid & 31;
+      int warp = tid >> 5;
+      int warps_needed = (norb + 31) >> 5;
+      int k = warp * 32 + lane;
+
+      int32_t delta = 0;
+      if (warp < warps_needed && k < norb) {
+        int node_k = nodes_s[k];
+        int step_k = (int)steps_s[k];
+        delta = (int32_t)child_prefix[node_k * 5 + step_k];
+      }
+
+      #pragma unroll
+      for (int off = 1; off < 32; off <<= 1) {
+        int32_t v = __shfl_up_sync(0xffffffffu, delta, off);
+        if (lane >= off) delta += v;
+      }
+      if (warp < warps_needed && lane == 31) idx_prefix_warp_sums[warp] = delta;
+      __syncthreads();
+
+      int32_t warp_offset = 0;
+      if (warp < warps_needed && warp > 0) warp_offset = idx_prefix_warp_sums[0];
+      if (tid == 0) idx_prefix_s[0] = 0;
+      if (warp < warps_needed && k < norb) idx_prefix_s[k + 1] = delta + warp_offset;
+      __syncthreads();
+    } else {
+      if ((int)threadIdx.x == 0) {
+        idx_prefix_s[0] = 0;
+        int32_t acc = 0;
+        for (int k = 0; k < norb; k++) {
+          int node_k = nodes_s[k];
+          int step_k = (int)steps_s[k];
+          acc += (int32_t)child_prefix[node_k * 5 + step_k];
+          idx_prefix_s[k + 1] = acc;
+        }
+      }
+      __syncthreads();
+    }
+  }
+
+  for (int pq = (int)threadIdx.x; pq < nops; pq += (int)blockDim.x) {
+    int p = pq / norb;
+    int q = pq - p * norb;
+    if (p == q) continue;
+
+    double wgt = g_flat[pq];
+    if (wgt == 0.0) continue;
+
+    int occ_p = (int)occ_s[p];
+    int occ_q = (int)occ_s[q];
+    if (occ_q <= 0 || occ_p >= 2) continue;
+
+    int start;
+    int end;
+    int q_start;
+    int q_mid;
+    int q_end;
+    if (p < q) {
+      start = p;
+      end = q;
+      q_start = Q_uR;
+      q_mid = Q_R;
+      q_end = Q_oR;
+    } else {
+      start = q;
+      end = p;
+      q_start = Q_uL;
+      q_mid = Q_L;
+      q_end = Q_oL;
+    }
+
+    int32_t node_start = nodes_s[start];
+    int32_t node_end_target = nodes_s[end + 1];
+
+    int32_t prefix_offset = idx_prefix_s[start];
+    int32_t prefix_endplus1 = idx_prefix_s[end + 1];
+    int32_t suffix_offset = (int32_t)csf_idx - prefix_endplus1;
+
+    int8_t st_k[MAX_NORB_T];
+    uint64_t st_node_seg[MAX_NORB_T];
+    double st_w[MAX_NORB_T];
+    int top = 0;
+
+    int overflow = 0;
+    st_k[top] = (int8_t)start;
+    st_node_seg[top] = ((uint64_t)(uint32_t)0) | ((uint64_t)(uint32_t)node_start << 32);
+    st_w[top] = 1.0;
+    top++;
+
+    while (top) {
+      top--;
+      double w = st_w[top];
+      int kpos = (int)st_k[top];
+      uint64_t node_seg = st_node_seg[top];
+      int node_k = (int)(node_seg >> 32);
+      int32_t seg_idx = (int32_t)(uint32_t)node_seg;
+
+      int qk = (kpos == start) ? q_start : ((kpos == end) ? q_end : q_mid);
+      int dk = (int)steps_s[kpos];
+      int bk = (int)b_s[kpos];
+      int k_next = kpos + 1;
+
+      int dp0 = 0;
+      int dp1 = 0;
+      int ndp = candidate_dprimes(qk, dk, &dp0, &dp1);
+      if (ndp == 0) continue;
+
+      for (int which = 0; which < ndp; which++) {
+        int dprime = (which == 0) ? dp0 : dp1;
+        int child_k = child[node_k * 4 + dprime];
+        if (child_k < 0) continue;
+        int bprime = (int)node_twos[child_k];
+        int db = bk - bprime;
+        double seg = (double)segment_value_int(qk, dprime, dk, db, bk);
+        if (seg == 0.0) continue;
+        double w2 = w * seg;
+        int32_t seg_idx2 = seg_idx + (int32_t)child_prefix[node_k * 5 + dprime];
+
+        if (kpos == end) {
+          if (child_k != node_end_target) continue;
+          int32_t csf_i = prefix_offset + seg_idx2 + suffix_offset;
+          if ((unsigned)csf_i >= (unsigned)ncsf) {
+            overflow = 1;
+            continue;
+          }
+          if (csf_i == csf_idx) continue;
+          if (selected_mask && selected_mask[csf_i]) continue;
+          if (w2 == 0.0) continue;
+          guga_frontier_hash_insert_add_f64_many_roots(
+              hash_keys, hash_vals, cap, csf_i, scale_by_root, nroots, wgt * w2, overflow_flag);
         } else {
           if (top >= MAX_NORB_T) {
             overflow = 1;
@@ -6984,6 +7249,7 @@ extern "C" void guga_apply_g_flat_scatter_atomic_frontier_hash_launch_stream(
     double* hash_vals,
     int cap,
     int root,
+    const uint8_t* selected_mask,
     int* overflow_flag,
     cudaStream_t stream,
     int threads) {
@@ -7007,6 +7273,7 @@ extern "C" void guga_apply_g_flat_scatter_atomic_frontier_hash_launch_stream(
         hash_vals,
         cap,
         root,
+        selected_mask,
         overflow_flag);
   } else if (norb <= 24) {
     guga_apply_g_flat_scatter_atomic_frontier_hash_kernel_t<24><<<blocks, threads, 0, stream>>>(
@@ -7026,6 +7293,7 @@ extern "C" void guga_apply_g_flat_scatter_atomic_frontier_hash_launch_stream(
         hash_vals,
         cap,
         root,
+        selected_mask,
         overflow_flag);
   } else if (norb <= 32) {
     guga_apply_g_flat_scatter_atomic_frontier_hash_kernel_t<32><<<blocks, threads, 0, stream>>>(
@@ -7045,6 +7313,7 @@ extern "C" void guga_apply_g_flat_scatter_atomic_frontier_hash_launch_stream(
         hash_vals,
         cap,
         root,
+        selected_mask,
         overflow_flag);
   } else if (norb <= 48) {
     guga_apply_g_flat_scatter_atomic_frontier_hash_kernel_t<48><<<blocks, threads, 0, stream>>>(
@@ -7064,6 +7333,7 @@ extern "C" void guga_apply_g_flat_scatter_atomic_frontier_hash_launch_stream(
         hash_vals,
         cap,
         root,
+        selected_mask,
         overflow_flag);
   } else {
     guga_apply_g_flat_scatter_atomic_frontier_hash_kernel_t<MAX_NORB><<<blocks, threads, 0, stream>>>(
@@ -7083,6 +7353,140 @@ extern "C" void guga_apply_g_flat_scatter_atomic_frontier_hash_launch_stream(
         hash_vals,
         cap,
         root,
+        selected_mask,
+        overflow_flag);
+  }
+}
+
+extern "C" void guga_apply_g_flat_scatter_atomic_frontier_hash_many_roots_launch_stream(
+    const int32_t* child,
+    const int16_t* node_twos,
+    const int64_t* child_prefix,
+    const int8_t* steps_table,
+    const int32_t* nodes_table,
+    int ncsf,
+    int norb,
+    const int32_t* task_csf,
+    const double* task_scale_task_major,
+    int64_t task_scale_stride,
+    int nroots,
+    const double* task_g,
+    int64_t g_stride,
+    int ntasks,
+    int32_t* hash_keys,
+    double* hash_vals,
+    int cap,
+    const uint8_t* selected_mask,
+    int* overflow_flag,
+    cudaStream_t stream,
+    int threads) {
+  if (ntasks <= 0 || nroots <= 0) return;
+  int blocks = ntasks;
+  if (threads <= 0) threads = 256;
+  if (norb <= 16) {
+    guga_apply_g_flat_scatter_atomic_frontier_hash_many_roots_kernel_t<16><<<blocks, threads, 0, stream>>>(
+        child,
+        node_twos,
+        child_prefix,
+        steps_table,
+        nodes_table,
+        ncsf,
+        norb,
+        task_csf,
+        task_scale_task_major,
+        task_scale_stride,
+        nroots,
+        task_g,
+        g_stride,
+        ntasks,
+        hash_keys,
+        hash_vals,
+        cap,
+        selected_mask,
+        overflow_flag);
+  } else if (norb <= 24) {
+    guga_apply_g_flat_scatter_atomic_frontier_hash_many_roots_kernel_t<24><<<blocks, threads, 0, stream>>>(
+        child,
+        node_twos,
+        child_prefix,
+        steps_table,
+        nodes_table,
+        ncsf,
+        norb,
+        task_csf,
+        task_scale_task_major,
+        task_scale_stride,
+        nroots,
+        task_g,
+        g_stride,
+        ntasks,
+        hash_keys,
+        hash_vals,
+        cap,
+        selected_mask,
+        overflow_flag);
+  } else if (norb <= 32) {
+    guga_apply_g_flat_scatter_atomic_frontier_hash_many_roots_kernel_t<32><<<blocks, threads, 0, stream>>>(
+        child,
+        node_twos,
+        child_prefix,
+        steps_table,
+        nodes_table,
+        ncsf,
+        norb,
+        task_csf,
+        task_scale_task_major,
+        task_scale_stride,
+        nroots,
+        task_g,
+        g_stride,
+        ntasks,
+        hash_keys,
+        hash_vals,
+        cap,
+        selected_mask,
+        overflow_flag);
+  } else if (norb <= 48) {
+    guga_apply_g_flat_scatter_atomic_frontier_hash_many_roots_kernel_t<48><<<blocks, threads, 0, stream>>>(
+        child,
+        node_twos,
+        child_prefix,
+        steps_table,
+        nodes_table,
+        ncsf,
+        norb,
+        task_csf,
+        task_scale_task_major,
+        task_scale_stride,
+        nroots,
+        task_g,
+        g_stride,
+        ntasks,
+        hash_keys,
+        hash_vals,
+        cap,
+        selected_mask,
+        overflow_flag);
+  } else {
+    guga_apply_g_flat_scatter_atomic_frontier_hash_many_roots_kernel_t<MAX_NORB><<<blocks, threads, 0, stream>>>(
+        child,
+        node_twos,
+        child_prefix,
+        steps_table,
+        nodes_table,
+        ncsf,
+        norb,
+        task_csf,
+        task_scale_task_major,
+        task_scale_stride,
+        nroots,
+        task_g,
+        g_stride,
+        ntasks,
+        hash_keys,
+        hash_vals,
+        cap,
+        selected_mask,
         overflow_flag);
   }
 }

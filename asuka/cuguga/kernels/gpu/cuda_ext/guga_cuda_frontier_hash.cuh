@@ -64,4 +64,51 @@ __device__ __forceinline__ void guga_frontier_hash_insert_add_f64(
   if (overflow_flag) atomicExch(overflow_flag, 1);
 }
 
+template <int MAX_PROBES_T = 256>
+__device__ __forceinline__ void guga_frontier_hash_insert_add_f64_many_roots(
+    int32_t* __restrict__ keys,
+    double* __restrict__ vals_root_major,
+    int cap,
+    int32_t idx,
+    const double* __restrict__ scale_by_root,
+    int nroots,
+    double contrib_base,
+    int* __restrict__ overflow_flag) {
+  if (contrib_base == 0.0) return;
+  if (!keys || !vals_root_major || !scale_by_root || cap <= 0 || nroots <= 0) {
+    if (overflow_flag) atomicExch(overflow_flag, 1);
+    return;
+  }
+  uint32_t mask = (uint32_t)(cap - 1);
+  uint32_t h = guga_hash_u32((uint32_t)idx);
+  uint32_t slot = h & mask;
+
+  for (int probe = 0; probe < MAX_PROBES_T; probe++) {
+    int32_t cur = keys[slot];
+    if (cur == idx) {
+      for (int r = 0; r < nroots; r++) {
+        double v = contrib_base * scale_by_root[r];
+        if (v != 0.0) {
+          atomicAdd(&vals_root_major[(int64_t)r * (int64_t)cap + (int64_t)slot], v);
+        }
+      }
+      return;
+    }
+    if (cur == (int32_t)-1) {
+      int32_t prev = atomicCAS(&keys[slot], (int32_t)-1, idx);
+      if (prev == (int32_t)-1 || prev == idx) {
+        for (int r = 0; r < nroots; r++) {
+          double v = contrib_base * scale_by_root[r];
+          if (v != 0.0) {
+            atomicAdd(&vals_root_major[(int64_t)r * (int64_t)cap + (int64_t)slot], v);
+          }
+        }
+        return;
+      }
+    }
+    slot = (slot + 1) & mask;
+  }
+  if (overflow_flag) atomicExch(overflow_flag, 1);
+}
+
 }  // namespace

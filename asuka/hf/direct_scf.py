@@ -12,6 +12,7 @@ from .df_scf import (
     _DIIS,
     _as_xp,
     _density_from_C_occ,
+    _density_from_C_occ_syrk,
     _fock_error_rhf,
     _gen_eigh_with_X,
     _occ_rhf,
@@ -19,6 +20,7 @@ from .df_scf import (
     _orthogonalizer_from_S,
     _roothaan_fock_rohf,
     _symmetrize,
+    _symmetrize_inplace,
     _time_ms_end,
     _time_ms_start,
 )
@@ -73,15 +75,15 @@ def rhf_direct(
         D = _as_xp(xp, dm0, dtype=xp.float64)
         if D.shape != (nao, nao):
             raise ValueError("dm0 must have shape (nao, nao)")
-        D = _symmetrize(xp, D)
+        D = _symmetrize_inplace(xp, D)
     elif mo_coeff0 is not None:
         C0 = _as_xp(xp, mo_coeff0, dtype=xp.float64)
         if C0.shape != (nao, nao):
             raise ValueError("mo_coeff0 must have shape (nao, nao)")
         C = C0
-        D = _symmetrize(xp, _density_from_C_occ(C, occ))
+        D = _symmetrize_inplace(xp, _density_from_C_occ_syrk(xp, C, occ, nocc))
     else:
-        D = _symmetrize(xp, _density_from_C_occ(C, occ))
+        D = _symmetrize_inplace(xp, _density_from_C_occ_syrk(xp, C, occ, nocc))
 
     lam = float(damping) if damping else 0.0
     diis_obj = _DIIS(max_vec=diis_space) if diis else None
@@ -112,7 +114,7 @@ def rhf_direct(
             D_prev = D
             t_init = _time_ms_start(xp) if profile is not None else None
             J, K = direct_JK(jk_ctx, D_prev, want_J=True, want_K=True, profile=profile)
-            F = _symmetrize(xp, h + J - 0.5 * K)
+            F = _symmetrize_inplace(xp, h + J - 0.5 * K)
             if level_shift:
                 shift = float(level_shift)
                 if shift != 0.0:
@@ -120,7 +122,7 @@ def rhf_direct(
                     Fp = Fp + shift * xp.eye(nao, dtype=xp.float64)
                     F = X @ Fp @ X.T
             eps, C = _gen_eigh_with_X(F, X)
-            D = _symmetrize(xp, _density_from_C_occ(C, occ))
+            D = _symmetrize_inplace(xp, _density_from_C_occ_syrk(xp, C, occ, nocc))
             if damping:
                 D = (1.0 - lam) * D + lam * D_prev
             if profile is not None and t_init is not None:
@@ -134,7 +136,7 @@ def rhf_direct(
             profile["jk"]["calls"] = int(profile["jk"].get("calls", 0)) + 1
             profile["scf"]["jk_ms"] += _time_ms_end(xp, t)
 
-        F = _symmetrize(xp, h + J - 0.5 * K)
+        F = _symmetrize_inplace(xp, h + J - 0.5 * K)
         if level_shift:
             shift = float(level_shift)
             if shift != 0.0:
@@ -158,7 +160,7 @@ def rhf_direct(
                 if profile is not None:
                     profile["scf"]["diis_fallbacks"] = int(profile["scf"].get("diis_fallbacks", 0)) + 1
             else:
-                F = _symmetrize(xp, F_try)
+                F = _symmetrize_inplace(xp, F_try)
             if profile is not None and t is not None:
                 profile["scf"]["diis_ms"] += _time_ms_end(xp, t)
 
@@ -167,7 +169,7 @@ def rhf_direct(
         if profile is not None and t is not None:
             profile["scf"]["diag_ms"] += _time_ms_end(xp, t)
 
-        D_new = _symmetrize(xp, _density_from_C_occ(C, occ))
+        D_new = _symmetrize_inplace(xp, _density_from_C_occ_syrk(xp, C, occ, nocc))
         if damping:
             D_new = (1.0 - lam) * D_new + lam * D
 
@@ -242,8 +244,8 @@ def uhf_direct(
     if dm0 is not None:
         if not isinstance(dm0, (tuple, list)) or len(dm0) != 2:
             raise TypeError("dm0 for UHF must be a (Da, Db) tuple")
-        Da = _symmetrize(xp, _as_xp(xp, dm0[0], dtype=xp.float64))
-        Db = _symmetrize(xp, _as_xp(xp, dm0[1], dtype=xp.float64))
+        Da = _symmetrize_inplace(xp, _as_xp(xp, dm0[0], dtype=xp.float64))
+        Db = _symmetrize_inplace(xp, _as_xp(xp, dm0[1], dtype=xp.float64))
     elif mo_coeff0 is not None:
         if isinstance(mo_coeff0, (tuple, list)):
             if len(mo_coeff0) != 2:
@@ -253,11 +255,11 @@ def uhf_direct(
         else:
             Ca = _as_xp(xp, mo_coeff0, dtype=xp.float64)
             Cb = Ca
-        Da = _symmetrize(xp, _density_from_C_occ(Ca, occ_a))
-        Db = _symmetrize(xp, _density_from_C_occ(Cb, occ_b))
+        Da = _symmetrize_inplace(xp, _density_from_C_occ_syrk(xp, Ca, occ_a, nalpha))
+        Db = _symmetrize_inplace(xp, _density_from_C_occ_syrk(xp, Cb, occ_b, nbeta))
     else:
-        Da = _symmetrize(xp, _density_from_C_occ(Ca, occ_a))
-        Db = _symmetrize(xp, _density_from_C_occ(Cb, occ_b))
+        Da = _symmetrize_inplace(xp, _density_from_C_occ_syrk(xp, Ca, occ_a, nalpha))
+        Db = _symmetrize_inplace(xp, _density_from_C_occ_syrk(xp, Cb, occ_b, nbeta))
 
     lam = float(damping) if damping else 0.0
     diis_a = _DIIS(max_vec=diis_space) if diis else None
@@ -284,8 +286,8 @@ def uhf_direct(
             profile["jk"]["calls"] = int(profile["jk"].get("calls", 0)) + 1
             profile["scf"]["jk_ms"] += _time_ms_end(xp, t)
 
-        Fa = _symmetrize(xp, h + J - Ka)
-        Fb = _symmetrize(xp, h + J - Kb)
+        Fa = _symmetrize_inplace(xp, h + J - Ka)
+        Fb = _symmetrize_inplace(xp, h + J - Kb)
 
         if diis_a is not None and cycle >= int(diis_start_cycle):
             t = _time_ms_start(xp) if profile is not None else None
@@ -303,7 +305,7 @@ def uhf_direct(
                 if profile is not None:
                     profile["scf"]["diis_fallbacks"] = int(profile["scf"].get("diis_fallbacks", 0)) + 1
             else:
-                Fa = _symmetrize(xp, Fa_try)
+                Fa = _symmetrize_inplace(xp, Fa_try)
             if profile is not None and t is not None:
                 profile["scf"]["diis_ms"] += _time_ms_end(xp, t)
         if diis_b is not None and cycle >= int(diis_start_cycle):
@@ -322,7 +324,7 @@ def uhf_direct(
                 if profile is not None:
                     profile["scf"]["diis_fallbacks"] = int(profile["scf"].get("diis_fallbacks", 0)) + 1
             else:
-                Fb = _symmetrize(xp, Fb_try)
+                Fb = _symmetrize_inplace(xp, Fb_try)
             if profile is not None and t is not None:
                 profile["scf"]["diis_ms"] += _time_ms_end(xp, t)
 
@@ -332,8 +334,8 @@ def uhf_direct(
         if profile is not None and t is not None:
             profile["scf"]["diag_ms"] += _time_ms_end(xp, t)
 
-        Da_new = _symmetrize(xp, _density_from_C_occ(Ca, occ_a))
-        Db_new = _symmetrize(xp, _density_from_C_occ(Cb, occ_b))
+        Da_new = _symmetrize_inplace(xp, _density_from_C_occ_syrk(xp, Ca, occ_a, nalpha))
+        Db_new = _symmetrize_inplace(xp, _density_from_C_occ_syrk(xp, Cb, occ_b, nbeta))
         if damping:
             Da_new = (1.0 - lam) * Da_new + lam * Da
             Db_new = (1.0 - lam) * Db_new + lam * Db
@@ -415,16 +417,16 @@ def rohf_direct(
     if dm0 is not None:
         if not isinstance(dm0, (tuple, list)) or len(dm0) != 2:
             raise TypeError("dm0 for ROHF must be a (Da, Db) tuple")
-        Da = _symmetrize(xp, _as_xp(xp, dm0[0], dtype=xp.float64))
-        Db = _symmetrize(xp, _as_xp(xp, dm0[1], dtype=xp.float64))
+        Da = _symmetrize_inplace(xp, _as_xp(xp, dm0[0], dtype=xp.float64))
+        Db = _symmetrize_inplace(xp, _as_xp(xp, dm0[1], dtype=xp.float64))
     elif mo_coeff0 is not None:
         C0 = _as_xp(xp, mo_coeff0, dtype=xp.float64)
         C = C0
-        Da = _symmetrize(xp, _density_from_C_occ(C, occ_a))
-        Db = _symmetrize(xp, _density_from_C_occ(C, occ_b))
+        Da = _symmetrize_inplace(xp, _density_from_C_occ_syrk(xp, C, occ_a, nalpha))
+        Db = _symmetrize_inplace(xp, _density_from_C_occ_syrk(xp, C, occ_b, nbeta))
     else:
-        Da = _symmetrize(xp, _density_from_C_occ(C, occ_a))
-        Db = _symmetrize(xp, _density_from_C_occ(C, occ_b))
+        Da = _symmetrize_inplace(xp, _density_from_C_occ_syrk(xp, C, occ_a, nalpha))
+        Db = _symmetrize_inplace(xp, _density_from_C_occ_syrk(xp, C, occ_b, nbeta))
 
     lam = float(damping) if damping else 0.0
     diis_obj = _DIIS(max_vec=diis_space) if diis else None
@@ -450,8 +452,8 @@ def rohf_direct(
             profile["jk"]["calls"] = int(profile["jk"].get("calls", 0)) + 1
             profile["scf"]["jk_ms"] += _time_ms_end(xp, t)
 
-        Fa = _symmetrize(xp, h + J - Ka)
-        Fb = _symmetrize(xp, h + J - Kb)
+        Fa = _symmetrize_inplace(xp, h + J - Ka)
+        Fb = _symmetrize_inplace(xp, h + J - Kb)
         F = _roothaan_fock_rohf(Fa, Fb, Da, Db, S)
         Dtot = Da + Db
 
@@ -471,7 +473,7 @@ def rohf_direct(
                 if profile is not None:
                     profile["scf"]["diis_fallbacks"] = int(profile["scf"].get("diis_fallbacks", 0)) + 1
             else:
-                F = _symmetrize(xp, F_try)
+                F = _symmetrize_inplace(xp, F_try)
             if profile is not None and t is not None:
                 profile["scf"]["diis_ms"] += _time_ms_end(xp, t)
 
@@ -480,8 +482,8 @@ def rohf_direct(
         if profile is not None and t is not None:
             profile["scf"]["diag_ms"] += _time_ms_end(xp, t)
 
-        Da_new = _symmetrize(xp, _density_from_C_occ(C, occ_a))
-        Db_new = _symmetrize(xp, _density_from_C_occ(C, occ_b))
+        Da_new = _symmetrize_inplace(xp, _density_from_C_occ_syrk(xp, C, occ_a, nalpha))
+        Db_new = _symmetrize_inplace(xp, _density_from_C_occ_syrk(xp, C, occ_b, nbeta))
         if damping:
             Da_new = (1.0 - lam) * Da_new + lam * Da
             Db_new = (1.0 - lam) * Db_new + lam * Db

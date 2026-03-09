@@ -1002,11 +1002,13 @@ def cuda_projector_step_hamiltonian_ws(
     *,
     eps: float,
     initiator_t: float,
+    initiator_t_dev: Any | None = None,
     seed_spawn: int,
     seed_phi: int,
     scale_identity: float = 1.0,
     sync: bool = True,
     compressor: Callable[..., tuple[np.ndarray, np.ndarray]] | None = None,
+    use_fused: bool = True,
 ) -> int:
     """One projector step on GPU: spawn + identity merge + coalesce + Φ (workspace path).
 
@@ -1046,39 +1048,116 @@ def cuda_projector_step_hamiltonian_ws(
     nspawn_total = int(ctx.nspawn_one + ctx.nspawn_two)
     out_len = nnz * nspawn_total
 
-    # Spawn events into a length-(nnz*nspawn_total) view of the preallocated buffers.
-    evt_idx = ctx.evt_idx[:out_len]
-    evt_val = ctx.evt_val[:out_len]
     x_idx = ctx.x_idx[:nnz]
     x_val = ctx.x_val[:nnz]
-
-    _guga_cuda_ext.qmc_spawn_hamiltonian_inplace_device(
-        ctx.drt_dev,
-        ctx.state_dev,
-        x_idx,
-        x_val,
-        ctx.h_base_flat_dev,
-        ctx.eri_mat_dev,
-        evt_idx,
-        evt_val,
-        float(eps),
-        int(ctx.nspawn_one),
-        int(ctx.nspawn_two),
-        int(seed_spawn),
-        float(initiator_t),
-        int(ctx.threads_spawn),
-        int(ctx.stream),
-        False,
-    )
-
-    # Merge identity and events.
     all_len = nnz + out_len
+
+    # Fused extension entry point: spawn + identity pack + coalesce + Φ in one call.
+    # This avoids Python/CuPy-side orchestration and intermediate nnz reads.
+    if (
+        compressor is None
+        and bool(use_fused)
+        and hasattr(ctx.ws, "projector_step_hamiltonian_phi_i32_f64_inplace_device")
+    ):
+        if initiator_t_dev is not None:
+            if float(initiator_t) != 0.0:
+                raise ValueError("provide either initiator_t or initiator_t_dev (not both)")
+            initiator_t_dev = cp.asarray(initiator_t_dev, dtype=cp.float64)
+            if int(initiator_t_dev.size) != 1:
+                raise ValueError("initiator_t_dev must be a device scalar (shape () or (1,))")
+
+        nnz_out = int(
+            ctx.ws.projector_step_hamiltonian_phi_i32_f64_inplace_device(
+                ctx.drt_dev,
+                ctx.state_dev,
+                x_idx,
+                x_val,
+                int(nnz),
+                ctx.h_base_flat_dev,
+                ctx.eri_mat_dev,
+                ctx.idx_all,
+                ctx.val_all,
+                ctx.idx_u,
+                ctx.val_u,
+                ctx.nnz_u,
+                ctx.x_idx_next,
+                ctx.x_val_next,
+                ctx.nnz_out,
+                int(ctx.m),
+                int(ctx.pivot),
+                float(eps),
+                float(scale_identity),
+                int(ctx.nspawn_one),
+                int(ctx.nspawn_two),
+                int(seed_spawn),
+                int(seed_phi),
+                float(initiator_t),
+                initiator_t_dev,
+                int(ctx.threads_spawn),
+                int(ctx.threads_qmc),
+                int(ctx.stream),
+                bool(sync),
+            )
+        )
+        if nnz_out < 0:
+            nnz_out = 0
+        ctx.nnz = nnz_out
+        ctx.use_a = not ctx.use_a
+        return nnz_out
+
+    # Spawn events directly into the merged buffer tail to avoid an extra D2D copy.
     idx_all = ctx.idx_all
     val_all = ctx.val_all
+    evt_idx = idx_all[nnz:all_len]
+    evt_val = val_all[nnz:all_len]
+
+    if initiator_t_dev is not None:
+        if float(initiator_t) != 0.0:
+            raise ValueError("provide either initiator_t or initiator_t_dev (not both)")
+        initiator_t_dev = cp.asarray(initiator_t_dev, dtype=cp.float64)
+        if int(initiator_t_dev.size) != 1:
+            raise ValueError("initiator_t_dev must be a device scalar (shape () or (1,))")
+        _guga_cuda_ext.qmc_spawn_hamiltonian_inplace_device_initiator_dev(
+            ctx.drt_dev,
+            ctx.state_dev,
+            x_idx,
+            x_val,
+            ctx.h_base_flat_dev,
+            ctx.eri_mat_dev,
+            evt_idx,
+            evt_val,
+            float(eps),
+            int(ctx.nspawn_one),
+            int(ctx.nspawn_two),
+            int(seed_spawn),
+            initiator_t_dev,
+            int(ctx.threads_spawn),
+            int(ctx.stream),
+            False,
+        )
+    else:
+        _guga_cuda_ext.qmc_spawn_hamiltonian_inplace_device(
+            ctx.drt_dev,
+            ctx.state_dev,
+            x_idx,
+            x_val,
+            ctx.h_base_flat_dev,
+            ctx.eri_mat_dev,
+            evt_idx,
+            evt_val,
+            float(eps),
+            int(ctx.nspawn_one),
+            int(ctx.nspawn_two),
+            int(seed_spawn),
+            float(initiator_t),
+            int(ctx.threads_spawn),
+            int(ctx.stream),
+            False,
+        )
+
+    # Merge identity and events.
     idx_all[:nnz] = x_idx
-    idx_all[nnz:all_len] = evt_idx
     val_all[:nnz] = float(scale_identity) * x_val
-    val_all[nnz:all_len] = evt_val
 
     # Coalesce into (idx_u, val_u) with out_nnz in nnz_u.
     ctx.ws.coalesce_coo_i32_f64_inplace_device(
@@ -1211,8 +1290,11 @@ def cuda_block_projector_step_hamiltonian_ws(
 
         out_len = nnz_k * nspawn_total
 
-        evt_idx = ctx.evt_idx[:out_len]
-        evt_val = ctx.evt_val[:out_len]
+        # Spawn events directly into the merged buffer tail to avoid an extra D2D copy.
+        idx_all = ctx.idx_all
+        val_all = ctx.val_all
+        evt_idx = idx_all[nnz_k : nnz_k + out_len]
+        evt_val = val_all[nnz_k : nnz_k + out_len]
         x_idx = ctx.x_idx[k, :nnz_k]
         x_val = ctx.x_val[k, :nnz_k]
 
@@ -1284,12 +1366,8 @@ def cuda_block_projector_step_hamiltonian_ws(
                         evt_val[slot_dev[match]] = 0.0
 
         all_len = nnz_k + out_len + int(nnz_det)
-        idx_all = ctx.idx_all
-        val_all = ctx.val_all
         idx_all[:nnz_k] = x_idx
-        idx_all[nnz_k : nnz_k + out_len] = evt_idx
         val_all[:nnz_k] = float(si_k) * x_val
-        val_all[nnz_k : nnz_k + out_len] = evt_val
         if nnz_det:
             if ctx.det_idx_buf is None or ctx.det_val_buf is None:
                 raise RuntimeError("deterministic subspace buffers not initialized")
@@ -1390,7 +1468,7 @@ def cuda_block_orthonormalize_mgs_ws(
     `(nroots, m)` sparse-column storage inside `CudaBlockProjectorContext`.
 
     Implementation details (reference-oriented):
-    - overlaps are computed with `cupy.searchsorted` against sorted sparse indices,
+    - overlaps are computed with a batched sorted-sparse dot kernel in the CUDA extension,
     - updates use concatenate → coalesce (workspace) → Φ (workspace),
     - output columns are written to the alternate ping-pong buffer, then swapped.
 
@@ -1430,6 +1508,13 @@ def cuda_block_orthonormalize_mgs_ws(
     if ctx.stream is None:
         ctx.stream = int(cp.cuda.get_current_stream().ptr)
 
+    if not hasattr(ctx.ws, "sparse_dot_many_sorted_i32_f64_inplace_device"):
+        raise RuntimeError("QmcWorkspace.sparse_dot_many_sorted_i32_f64_inplace_device is unavailable (rebuild extension)")
+
+    _dot_out = cp.empty((1, 1), dtype=cp.float64)
+    _dot_nnz_a = cp.empty((1,), dtype=cp.int32)
+    _dot_nnz_b = cp.empty((1,), dtype=cp.int32)
+
     def dot_sparse_sorted(a_idx, a_val, b_idx, b_val) -> float:
         a_idx = a_idx.ravel()
         a_val = a_val.ravel()
@@ -1439,33 +1524,22 @@ def cuda_block_orthonormalize_mgs_ws(
         nb = int(b_idx.size)
         if na == 0 or nb == 0:
             return 0.0
-        if na <= nb:
-            pos = cp.searchsorted(b_idx, a_idx)
-            inb = pos < nb
-            if not bool(cp.any(inb)):
-                return 0.0
-            pos2 = pos[inb]
-            a_idx2 = a_idx[inb]
-            a_val2 = a_val[inb]
-            match = b_idx[pos2] == a_idx2
-            if not bool(cp.any(match)):
-                return 0.0
-            pos3 = pos2[match]
-            return float(cp.sum(a_val2[match] * b_val[pos3]).get())
 
-        # Swap to keep the left side smaller.
-        pos = cp.searchsorted(a_idx, b_idx)
-        ina = pos < na
-        if not bool(cp.any(ina)):
-            return 0.0
-        pos2 = pos[ina]
-        b_idx2 = b_idx[ina]
-        b_val2 = b_val[ina]
-        match = a_idx[pos2] == b_idx2
-        if not bool(cp.any(match)):
-            return 0.0
-        pos3 = pos2[match]
-        return float(cp.sum(b_val2[match] * a_val[pos3]).get())
+        _dot_nnz_a[0] = np.int32(na)
+        _dot_nnz_b[0] = np.int32(nb)
+        ctx.ws.sparse_dot_many_sorted_i32_f64_inplace_device(
+            a_idx,
+            a_val,
+            _dot_nnz_a,
+            b_idx,
+            b_val,
+            _dot_nnz_b,
+            _dot_out,
+            int(ctx.threads_qmc),
+            int(ctx.stream),
+            False,
+        )
+        return float(_dot_out[0, 0].get())
 
     seed_pos = 0
     ctx.nnz_next[:] = 0
@@ -1571,8 +1645,7 @@ def cuda_block_build_tmat_hamiltonian_stochastic_ws(
     - This is a reference-oriented implementation intended to replace the CPU row-oracle
       Ritz build in `run_fcifri_subspace(backend="cuda")`.
     - `initiator_t` defaults to 0.0 to avoid adding initiator bias to the Ritz estimator.
-    - This helper currently requires `sync=True`. It reads device-side nnz counters
-      back to the host during coalescing and returns a host NumPy array.
+    - This helper returns a host NumPy array, so it will synchronize before returning.
     """
 
     if cp is None or _guga_cuda_ext is None:  # pragma: no cover
@@ -1585,8 +1658,6 @@ def cuda_block_build_tmat_hamiltonian_stochastic_ws(
         raise RuntimeError("CudaBlockProjectorContext nnz buffers not initialized")
     if ctx.evt_idx is None or ctx.evt_val is None or ctx.idx_u is None or ctx.val_u is None or ctx.nnz_u is None:
         raise RuntimeError("CudaBlockProjectorContext scratch buffers not initialized")
-    if not sync:
-        raise ValueError("cuda_block_build_tmat_hamiltonian_stochastic_ws currently requires sync=True")
 
     seeds_spawn = np.asarray(seeds_spawn, dtype=np.int64).ravel()
     nroots = int(ctx.nroots)
@@ -1599,36 +1670,11 @@ def cuda_block_build_tmat_hamiltonian_stochastic_ws(
     # Accumulate T on device, then transfer once.
     tmat = cp.zeros((nroots, nroots), dtype=cp.float64)
 
-    def dot_sparse_sorted_scalar(a_idx, a_val, b_idx, b_val):
-        # Return a 0-d device scalar for the dot product of sorted sparse vectors.
-        a_idx = a_idx.ravel()
-        a_val = a_val.ravel()
-        b_idx = b_idx.ravel()
-        b_val = b_val.ravel()
-        na = int(a_idx.size)
-        nb = int(b_idx.size)
-        if na == 0 or nb == 0:
-            return cp.asarray(0.0, dtype=cp.float64)
+    if not hasattr(ctx.ws, "sparse_dot_many_sorted_i32_f64_inplace_device"):
+        raise RuntimeError("QmcWorkspace.sparse_dot_many_sorted_i32_f64_inplace_device is unavailable (rebuild extension)")
 
-        if na <= nb:
-            pos = cp.searchsorted(b_idx, a_idx)
-            inb = pos < nb
-            pos2 = pos[inb]
-            a_idx2 = a_idx[inb]
-            a_val2 = a_val[inb]
-            match = b_idx[pos2] == a_idx2
-            pos3 = pos2[match]
-            return cp.sum(a_val2[match] * b_val[pos3])
-
-        # Swap to keep the left side smaller.
-        pos = cp.searchsorted(a_idx, b_idx)
-        ina = pos < na
-        pos2 = pos[ina]
-        b_idx2 = b_idx[ina]
-        b_val2 = b_val[ina]
-        match = a_idx[pos2] == b_idx2
-        pos3 = pos2[match]
-        return cp.sum(b_val2[match] * a_val[pos3])
+    x_nnz_dev = cp.asarray(np.asarray(ctx.nnz, dtype=np.int32), dtype=cp.int32)
+    dots = cp.empty((nroots, 1), dtype=cp.float64)
 
     nspawn_total = int(ctx.nspawn_one + ctx.nspawn_two)
     for k in range(nroots):
@@ -1673,24 +1719,25 @@ def cuda_block_build_tmat_hamiltonian_stochastic_ws(
             int(out_len),
             int(ctx.threads_qmc),
             int(ctx.stream),
-            bool(sync),
+            False,
         )
-        n_hk = int(cp.asnumpy(ctx.nnz_u)[0])
-        if n_hk <= 0:
-            # Hx_k estimate is empty; leave column k of T as zeros.
-            continue
-
-        hk_idx = ctx.idx_u[:n_hk]
-        hk_val = ctx.val_u[:n_hk]
 
         # events represent (-eps * H x_k); for eps=1: hk = -(H x_k)
         # => <x_i, H x_k> = - <x_i, hk>
-        for i in range(nroots):
-            nnz_i = int(ctx.nnz[i])
-            if nnz_i <= 0:
-                raise ValueError(f"column {i} is empty")
-            dot = dot_sparse_sorted_scalar(ctx.x_idx[i, :nnz_i], ctx.x_val[i, :nnz_i], hk_idx, hk_val)
-            tmat[i, k] = -dot
+        # Avoid host sync: use device nnz_u and the full (idx_u,val_u) buffers.
+        ctx.ws.sparse_dot_many_sorted_i32_f64_inplace_device(
+            ctx.x_idx,
+            ctx.x_val,
+            x_nnz_dev,
+            ctx.idx_u,
+            ctx.val_u,
+            ctx.nnz_u,
+            dots,
+            int(ctx.threads_qmc),
+            int(ctx.stream),
+            False,
+        )
+        tmat[:, k] = -dots[:, 0]
 
     tmat = 0.5 * (tmat + tmat.T)
     return cp.asnumpy(tmat).astype(np.float64, copy=False)
@@ -1718,8 +1765,8 @@ def cuda_block_build_sk_uthx_stochastic_ws(
 
     Notes
     -----
-    This helper currently requires `sync=True`. It reads device-side nnz counters
-    back to the host during coalescing and returns host NumPy arrays.
+    This helper returns host NumPy arrays, so it will synchronize before returning.
+    If the optional deterministic subspace correction is enabled, `sync=True` is required.
     """
 
     if cp is None or _guga_cuda_ext is None:  # pragma: no cover
@@ -1732,8 +1779,6 @@ def cuda_block_build_sk_uthx_stochastic_ws(
         raise RuntimeError("CudaBlockProjectorContext nnz buffers not initialized")
     if ctx.evt_idx is None or ctx.evt_val is None or ctx.idx_u is None or ctx.val_u is None or ctx.nnz_u is None:
         raise RuntimeError("CudaBlockProjectorContext scratch buffers not initialized")
-    if not sync:
-        raise ValueError("cuda_block_build_sk_uthx_stochastic_ws currently requires sync=True")
 
     eps = float(eps)
     if eps == 0.0:
@@ -1750,9 +1795,14 @@ def cuda_block_build_sk_uthx_stochastic_ws(
     if ctx.stream is None:
         ctx.stream = int(cp.cuda.get_current_stream().ptr)
 
-    # Upload U columns once per call (nroots is small in RSI usage).
-    u_idx_dev: list[Any] = []
-    u_val_dev: list[Any] = []
+    if not hasattr(ctx.ws, "sparse_dot_many_sorted_i32_f64_inplace_device"):
+        raise RuntimeError("QmcWorkspace.sparse_dot_many_sorted_i32_f64_inplace_device is unavailable (rebuild extension)")
+
+    # Upload U columns once per call as packed (nroots, max_u) arrays.
+    u_nnz_host = np.zeros(nroots, dtype=np.int32)
+    max_u = 0
+    u_cols_i: list[np.ndarray] = []
+    u_cols_v: list[np.ndarray] = []
     for i, (idx_i, val_i) in enumerate(u_cols):
         idx_i = np.asarray(idx_i, dtype=np.int32).ravel()
         val_i = np.asarray(val_i, dtype=np.float64).ravel()
@@ -1760,49 +1810,45 @@ def cuda_block_build_sk_uthx_stochastic_ws(
             raise ValueError(f"u_cols[{i}] idx/val size mismatch")
         if idx_i.size <= 0:
             raise ValueError(f"u_cols[{i}] is empty")
-        u_idx_dev.append(cp.asarray(idx_i, dtype=cp.int32))
-        u_val_dev.append(cp.asarray(val_i, dtype=cp.float64))
+        u_cols_i.append(idx_i)
+        u_cols_v.append(val_i)
+        u_nnz_host[i] = np.int32(idx_i.size)
+        max_u = max(max_u, int(idx_i.size))
 
-    def dot_sparse_sorted_scalar(a_idx, a_val, b_idx, b_val):
-        # Return a 0-d device scalar for the dot product of sorted sparse vectors.
-        a_idx = a_idx.ravel()
-        a_val = a_val.ravel()
-        b_idx = b_idx.ravel()
-        b_val = b_val.ravel()
-        na = int(a_idx.size)
-        nb = int(b_idx.size)
-        if na == 0 or nb == 0:
-            return cp.asarray(0.0, dtype=cp.float64)
+    u_idx_host = np.zeros((nroots, max_u), dtype=np.int32)
+    u_val_host = np.zeros((nroots, max_u), dtype=np.float64)
+    for i in range(nroots):
+        nnz_i = int(u_nnz_host[i])
+        u_idx_host[i, :nnz_i] = u_cols_i[i]
+        u_val_host[i, :nnz_i] = u_cols_v[i]
 
-        if na <= nb:
-            pos = cp.searchsorted(b_idx, a_idx)
-            inb = pos < nb
-            pos2 = pos[inb]
-            a_idx2 = a_idx[inb]
-            a_val2 = a_val[inb]
-            match = b_idx[pos2] == a_idx2
-            pos3 = pos2[match]
-            return cp.sum(a_val2[match] * b_val[pos3])
+    u_idx_dev = cp.asarray(u_idx_host, dtype=cp.int32)
+    u_val_dev = cp.asarray(u_val_host, dtype=cp.float64)
+    u_nnz_dev = cp.asarray(u_nnz_host, dtype=cp.int32)
 
-        # Swap to keep the left side smaller.
-        pos = cp.searchsorted(a_idx, b_idx)
-        ina = pos < na
-        pos2 = pos[ina]
-        b_idx2 = b_idx[ina]
-        b_val2 = b_val[ina]
-        match = a_idx[pos2] == b_idx2
-        pos3 = pos2[match]
-        return cp.sum(b_val2[match] * a_val[pos3])
+    # Upload packed nnz for X once.
+    for j in range(nroots):
+        if int(ctx.nnz[j]) <= 0:
+            raise ValueError(f"column {j} is empty")
+    x_nnz_dev = cp.asarray(np.asarray(ctx.nnz, dtype=np.int32), dtype=cp.int32)
 
-    smat = cp.zeros((nroots, nroots), dtype=cp.float64)
+    smat = cp.empty((nroots, nroots), dtype=cp.float64)
     kmat = cp.zeros((nroots, nroots), dtype=cp.float64)
 
-    for i in range(nroots):
-        for j in range(nroots):
-            nnz_j = int(ctx.nnz[j])
-            if nnz_j <= 0:
-                raise ValueError(f"column {j} is empty")
-            smat[i, j] = dot_sparse_sorted_scalar(u_idx_dev[i], u_val_dev[i], ctx.x_idx[j, :nnz_j], ctx.x_val[j, :nnz_j])
+    ctx.ws.sparse_dot_many_sorted_i32_f64_inplace_device(
+        u_idx_dev,
+        u_val_dev,
+        u_nnz_dev,
+        ctx.x_idx,
+        ctx.x_val,
+        x_nnz_dev,
+        smat,
+        int(ctx.threads_qmc),
+        int(ctx.stream),
+        False,
+    )
+
+    dots = cp.empty((nroots, 1), dtype=cp.float64)
 
     nspawn_total = int(ctx.nspawn_one + ctx.nspawn_two)
     for k in range(nroots):
@@ -1911,18 +1957,22 @@ def cuda_block_build_sk_uthx_stochastic_ws(
             int(in_len),
             int(ctx.threads_qmc),
             int(ctx.stream),
-            bool(sync),
+            False,
         )
-        n_hk = int(cp.asnumpy(ctx.nnz_u)[0])
-        if n_hk <= 0:
-            continue
 
-        hk_idx = ctx.idx_u[:n_hk]
-        hk_val = ctx.val_u[:n_hk]
-
-        for i in range(nroots):
-            dot = dot_sparse_sorted_scalar(u_idx_dev[i], u_val_dev[i], hk_idx, hk_val)
-            kmat[i, k] = -(dot / eps)
+        ctx.ws.sparse_dot_many_sorted_i32_f64_inplace_device(
+            u_idx_dev,
+            u_val_dev,
+            u_nnz_dev,
+            ctx.idx_u,
+            ctx.val_u,
+            ctx.nnz_u,
+            dots,
+            int(ctx.threads_qmc),
+            int(ctx.stream),
+            False,
+        )
+        kmat[:, k] = -(dots[:, 0] / eps)
 
     return (
         cp.asnumpy(smat).astype(np.float64, copy=False),
@@ -2088,18 +2138,17 @@ class CudaFCIQMCContext:
     threads_qmc: int = 256
     stream: int | None = None
 
-    # Current sparse-vector buffers (capacity max_walker; only prefix [:nnz] valid).
-    x_idx: Any | None = None
-    x_val: Any | None = None
+    # Ping-pong merged buffers (capacity max_n):
+    # - prefix [:nnz] holds the current sparse vector x (sorted unique),
+    # - tail [nnz:nnz+nnz*(nspawn_one+nspawn_two)] is used for spawned events in-place.
+    x_idx_a: Any | None = None
+    x_val_a: Any | None = None
+    x_idx_b: Any | None = None
+    x_val_b: Any | None = None
     nnz: int = 0
+    use_a: bool = True
 
-    # Preallocated step buffers.
-    evt_idx: Any | None = None
-    evt_val: Any | None = None
-    idx_all: Any | None = None
-    val_all: Any | None = None
-    idx_u: Any | None = None
-    val_u: Any | None = None
+    # Device scalar written by coalesce kernels.
     nnz_u: Any | None = None
 
     def release(self) -> None:
@@ -2112,6 +2161,22 @@ class CudaFCIQMCContext:
         self.ws = None
         self.state_dev = None
         self.drt_dev = None
+
+    @property
+    def x_idx(self):
+        return self.x_idx_a if self.use_a else self.x_idx_b
+
+    @property
+    def x_val(self):
+        return self.x_val_a if self.use_a else self.x_val_b
+
+    @property
+    def x_idx_next(self):
+        return self.x_idx_b if self.use_a else self.x_idx_a
+
+    @property
+    def x_val_next(self):
+        return self.x_val_b if self.use_a else self.x_val_a
 
 
 def make_cuda_fciqmc_context(
@@ -2200,14 +2265,10 @@ def make_cuda_fciqmc_context(
         stream=int(stream),
     )
 
-    ctx.x_idx = cp.empty(max_walker, dtype=cp.int32)
-    ctx.x_val = cp.empty(max_walker, dtype=cp.float64)
-    ctx.evt_idx = cp.empty(max_evt, dtype=cp.int32)
-    ctx.evt_val = cp.empty(max_evt, dtype=cp.float64)
-    ctx.idx_all = cp.empty(max_n, dtype=cp.int32)
-    ctx.val_all = cp.empty(max_n, dtype=cp.float64)
-    ctx.idx_u = cp.empty(max_n, dtype=cp.int32)
-    ctx.val_u = cp.empty(max_n, dtype=cp.float64)
+    ctx.x_idx_a = cp.empty(max_n, dtype=cp.int32)
+    ctx.x_val_a = cp.empty(max_n, dtype=cp.float64)
+    ctx.x_idx_b = cp.empty(max_n, dtype=cp.int32)
+    ctx.x_val_b = cp.empty(max_n, dtype=cp.float64)
     ctx.nnz_u = cp.empty(1, dtype=cp.int32)
     return ctx
 
@@ -2220,6 +2281,7 @@ def cuda_fciqmc_step_hamiltonian_ws(
     initiator_t: float = 0.0,
     seed_spawn: int,
     sync: bool = True,
+    use_fused: bool = True,
 ) -> int:
     """One FCIQMC step on GPU: spawn + shift-scale + coalesce (no FRI compression).
 
@@ -2248,20 +2310,57 @@ def cuda_fciqmc_step_hamiltonian_ws(
     if ctx.stream is None:
         ctx.stream = int(cp.cuda.get_current_stream().ptr)
 
+    if ctx.x_idx is None or ctx.x_val is None or ctx.x_idx_next is None or ctx.x_val_next is None or ctx.nnz_u is None:
+        raise RuntimeError("CudaFCIQMCContext buffers not initialized")
+
+    if bool(use_fused) and hasattr(ctx.ws, "fciqmc_step_shift_i32_f64_inplace_device"):
+        n_out = int(
+            ctx.ws.fciqmc_step_shift_i32_f64_inplace_device(
+                ctx.drt_dev,
+                ctx.state_dev,
+                ctx.x_idx,
+                ctx.x_val,
+                int(nnz),
+                ctx.h_base_flat_dev,
+                ctx.eri_mat_dev,
+                ctx.x_idx_next,
+                ctx.x_val_next,
+                ctx.nnz_u,
+                float(dt),
+                float(shift),
+                float(initiator_t),
+                int(ctx.nspawn_one),
+                int(ctx.nspawn_two),
+                int(seed_spawn),
+                int(ctx.threads_spawn),
+                int(ctx.threads_qmc),
+                int(ctx.stream),
+                bool(sync),
+            )
+        )
+        ctx.nnz = n_out
+        ctx.use_a = not ctx.use_a
+        return n_out
+
     nspawn_total = int(ctx.nspawn_one + ctx.nspawn_two)
     out_len = nnz * nspawn_total
+    all_len = nnz + out_len
 
-    x_idx = ctx.x_idx[:nnz]
-    x_val = ctx.x_val[:nnz]
-    evt_idx = ctx.evt_idx[:out_len]
-    evt_val = ctx.evt_val[:out_len]
+    x_idx = ctx.x_idx
+    x_val = ctx.x_val
+    x_idx_cur = x_idx[:nnz]
+    x_val_cur = x_val[:nnz]
+
+    # Spawn events directly into the tail of the current buffer (merged input).
+    evt_idx = x_idx[nnz:all_len]
+    evt_val = x_val[nnz:all_len]
 
     # Spawn: fills evt_idx/evt_val with -dt*H*x events (-1 sentinel for invalid slots).
     _guga_cuda_ext.qmc_spawn_hamiltonian_inplace_device(
         ctx.drt_dev,
         ctx.state_dev,
-        x_idx,
-        x_val,
+        x_idx_cur,
+        x_val_cur,
         ctx.h_base_flat_dev,
         ctx.eri_mat_dev,
         evt_idx,
@@ -2276,19 +2375,15 @@ def cuda_fciqmc_step_hamiltonian_ws(
         False,
     )
 
-    # Merge: (1 + dt*S)*x_current alongside the spawned events.
-    all_len = nnz + out_len
-    ctx.idx_all[:nnz] = x_idx
-    ctx.idx_all[nnz:all_len] = evt_idx
-    ctx.val_all[:nnz] = float(1.0 + dt * shift) * x_val
-    ctx.val_all[nnz:all_len] = evt_val
+    # Merge: scale the identity term in-place in the prefix; events are already in the tail.
+    x_val_cur *= float(1.0 + dt * shift)
 
     # Coalesce (sort + reduce; idx < 0 sentinels contribute zero and are excluded).
     ctx.ws.coalesce_coo_i32_f64_inplace_device(
-        ctx.idx_all,
-        ctx.val_all,
-        ctx.idx_u,
-        ctx.val_u,
+        x_idx,
+        x_val,
+        ctx.x_idx_next,
+        ctx.x_val_next,
         ctx.nnz_u,
         int(all_len),
         int(ctx.threads_qmc),
@@ -2304,7 +2399,6 @@ def cuda_fciqmc_step_hamiltonian_ws(
             "Increase max_walker or tighten population control."
         )
 
-    ctx.x_idx[:n_out] = ctx.idx_u[:n_out]
-    ctx.x_val[:n_out] = ctx.val_u[:n_out]
     ctx.nnz = n_out
+    ctx.use_a = not ctx.use_a
     return n_out

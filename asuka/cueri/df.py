@@ -10,13 +10,15 @@ from .stream import stream_ctx, stream_ptr
 
 
 _DF_METRIC_CHOL_CACHE_MAX = 4
-_df_metric_chol_cache: dict[tuple, tuple[weakref.ref, object]] = {}
+_df_metric_chol_cache: dict[tuple, tuple[weakref.ref, object, object | None]] = {}
 
 _DF_STREAM_RYS_PLAN_CACHE_MAX = 2
 _df_stream_rys_plan_cache: dict[tuple, tuple[weakref.ref, weakref.ref, object]] = {}
 
 _DF_STREAM_XBLOCK_PLAN_CACHE_MAX = 2
 _df_stream_xblock_plan_cache: dict[tuple, tuple[weakref.ref, weakref.ref, object]] = {}
+_SCATTER_DF_INT3C2E_TO_QP_RAW_KERNEL = None
+_SCATTER_DF_INT3C2E_TO_X_RAW_KERNEL = None
 
 
 @dataclass(frozen=True)
@@ -27,6 +29,7 @@ class _DFStreamRysPlan:
     sp_all: object
     shell_l: np.ndarray
     nsp_ao: int
+    ready_event: object | None = None
 
 
 @dataclass(frozen=True)
@@ -57,6 +60,301 @@ class _DFStreamXBlockPlanBlock:
 class _DFStreamXBlockPlan:
     aux_block_naux: int
     blocks: list[_DFStreamXBlockPlanBlock]
+    ready_event: object | None = None
+
+
+def _scatter_df_int3c2e_tiles_to_qp_inplace_raw(
+    tile,
+    a0,
+    b0,
+    p0,
+    *,
+    nao: int,
+    naux: int,
+    nAB: int,
+    nB: int,
+    nP: int,
+    out_qp,
+    tile_transposed: bool = False,
+):
+    """Scatter DF 3c2e tiles directly into packed Qp rows on GPU.
+
+    Parameters
+    ----------
+    tile
+        CuPy array with shape (ntasks, nAB, nP) by default. When
+        `tile_transposed=True`, expects (ntasks, nP, nAB).
+    a0, b0, p0
+        CuPy int32 arrays of shape (ntasks,) with AO and aux offsets.
+        `p0` is relative to the current aux block.
+    nao, naux, nAB, nB, nP
+        Tile/scratch dimensions.
+    out_qp
+        CuPy array with shape (naux, ntri) where ntri=nao*(nao+1)//2.
+        Updated in place.
+    """
+
+    import cupy as cp
+    import numpy as np
+
+    global _SCATTER_DF_INT3C2E_TO_QP_RAW_KERNEL
+
+    nao_i = int(nao)
+    naux_i = int(naux)
+    nAB_i = int(nAB)
+    nB_i = int(nB)
+    nP_i = int(nP)
+    if nao_i < 0 or naux_i < 0 or nAB_i < 0 or nB_i < 0 or nP_i < 0:
+        raise ValueError("size args must be >= 0")
+
+    t = cp.asarray(tile, dtype=cp.float64)
+    a = cp.ascontiguousarray(cp.asarray(a0, dtype=cp.int32).ravel())
+    b = cp.ascontiguousarray(cp.asarray(b0, dtype=cp.int32).ravel())
+    p = cp.ascontiguousarray(cp.asarray(p0, dtype=cp.int32).ravel())
+    out = cp.asarray(out_qp, dtype=cp.float64)
+    if t.ndim != 3:
+        raise ValueError("tile must have shape (ntasks,nAB,nP)")
+    ntasks = int(a.shape[0])
+    if int(b.shape[0]) != ntasks or int(p.shape[0]) != ntasks:
+        raise ValueError("a0/b0/p0 must have identical shape (ntasks,)")
+    ttr = bool(tile_transposed)
+    exp_shape = (ntasks, nP_i, nAB_i) if ttr else (ntasks, nAB_i, nP_i)
+    if tuple(map(int, t.shape)) != tuple(map(int, exp_shape)):
+        raise ValueError(f"tile shape mismatch: got {tuple(map(int, t.shape))}, expected {tuple(map(int, exp_shape))}")
+
+    ntri = int(nao_i * (nao_i + 1) // 2)
+    if out.ndim != 2 or tuple(map(int, out.shape)) != (naux_i, ntri):
+        raise ValueError(f"out_qp must have shape {(naux_i, ntri)}")
+
+    if _SCATTER_DF_INT3C2E_TO_QP_RAW_KERNEL is None:
+        _SCATTER_DF_INT3C2E_TO_QP_RAW_KERNEL = cp.RawKernel(
+            r"""
+            extern "C" __global__
+            void scatter_df_int3c2e_tiles_to_qp_f64(
+              const double* tile,      // [ntasks, nAB, nP]
+              const int* a0,           // [ntasks]
+              const int* b0,           // [ntasks]
+              const int* p0,           // [ntasks]
+              int ntasks,
+              int nao,
+              int naux,
+              int nAB,
+              int nB,
+              int nP,
+              int ntri,
+              int tile_transposed,     // 0: [ntasks,nAB,nP], 1: [ntasks,nP,nAB]
+              double* out_qp           // [naux, ntri]
+            ) {
+              const long long tid = (long long)blockIdx.x * (long long)blockDim.x + (long long)threadIdx.x;
+              const long long stride = (long long)blockDim.x * (long long)gridDim.x;
+              const long long total = (long long)ntasks * (long long)nAB * (long long)nP;
+
+              for (long long x = tid; x < total; x += stride) {
+                const long long t = x / ((long long)nAB * (long long)nP);
+                const long long rem = x - t * (long long)nAB * (long long)nP;
+                int ab = 0;
+                int P = 0;
+                if (!tile_transposed) {
+                  ab = (int)(rem / (long long)nP);
+                  P = (int)(rem - (long long)ab * (long long)nP);
+                } else {
+                  P = (int)(rem / (long long)nAB);
+                  ab = (int)(rem - (long long)P * (long long)nAB);
+                }
+
+                const int i = ab / nB;
+                const int j = ab - i * nB;
+
+                const int a = a0[t] + i;
+                const int b = b0[t] + j;
+                const int q = p0[t] + P;
+                if (a < 0 || a >= nao || b < 0 || b >= nao || q < 0 || q >= naux) {
+                  continue;
+                }
+
+                const int hi = (a >= b) ? a : b;
+                const int lo = (a >= b) ? b : a;
+                const long long pair = ((long long)hi * (long long)(hi + 1)) / 2LL + (long long)lo;
+                out_qp[(long long)q * (long long)ntri + pair] = tile[x];
+              }
+            }
+            """,
+            "scatter_df_int3c2e_tiles_to_qp_f64",
+        )
+
+    total = int(ntasks) * int(nAB_i) * int(nP_i)
+    if total <= 0:
+        return out
+    threads = 256
+    blocks = int((int(total) + int(threads) - 1) // int(threads))
+    _SCATTER_DF_INT3C2E_TO_QP_RAW_KERNEL(
+        (blocks,),
+        (threads,),
+        (
+            t.reshape(-1),
+            a,
+            b,
+            p,
+            np.int32(ntasks),
+            np.int32(nao_i),
+            np.int32(naux_i),
+            np.int32(nAB_i),
+            np.int32(nB_i),
+            np.int32(nP_i),
+            np.int32(ntri),
+            np.int32(1 if ttr else 0),
+            out.reshape(-1),
+        ),
+    )
+    return out
+
+
+def _scatter_df_int3c2e_tiles_to_x_inplace_raw(
+    tile,
+    a0,
+    b0,
+    p0,
+    *,
+    nao: int,
+    naux: int,
+    nAB: int,
+    nB: int,
+    nP: int,
+    out_x,
+    tile_transposed: bool = False,
+):
+    """Scatter DF 3c2e tiles directly into dense X[a,b,p] on GPU.
+
+    Parameters
+    ----------
+    tile
+        CuPy array with shape (ntasks, nAB, nP) by default. When
+        `tile_transposed=True`, expects (ntasks, nP, nAB).
+    a0, b0, p0
+        CuPy int32 arrays of shape (ntasks,) with AO and aux offsets.
+        `p0` is relative to the current aux block.
+    nao, naux, nAB, nB, nP
+        Tile/scratch dimensions.
+    out_x
+        CuPy array with shape (nao, nao, naux). Updated in place.
+    """
+
+    import cupy as cp
+    import numpy as np
+
+    global _SCATTER_DF_INT3C2E_TO_X_RAW_KERNEL
+
+    nao_i = int(nao)
+    naux_i = int(naux)
+    nAB_i = int(nAB)
+    nB_i = int(nB)
+    nP_i = int(nP)
+    if nao_i < 0 or naux_i < 0 or nAB_i < 0 or nB_i < 0 or nP_i < 0:
+        raise ValueError("size args must be >= 0")
+
+    t = cp.asarray(tile, dtype=cp.float64)
+    a = cp.ascontiguousarray(cp.asarray(a0, dtype=cp.int32).ravel())
+    b = cp.ascontiguousarray(cp.asarray(b0, dtype=cp.int32).ravel())
+    p = cp.ascontiguousarray(cp.asarray(p0, dtype=cp.int32).ravel())
+    out = cp.asarray(out_x, dtype=cp.float64)
+    if t.ndim != 3:
+        raise ValueError("tile must have shape (ntasks,nAB,nP)")
+    ntasks = int(a.shape[0])
+    if int(b.shape[0]) != ntasks or int(p.shape[0]) != ntasks:
+        raise ValueError("a0/b0/p0 must have identical shape (ntasks,)")
+    ttr = bool(tile_transposed)
+    exp_shape = (ntasks, nP_i, nAB_i) if ttr else (ntasks, nAB_i, nP_i)
+    if tuple(map(int, t.shape)) != tuple(map(int, exp_shape)):
+        raise ValueError(f"tile shape mismatch: got {tuple(map(int, t.shape))}, expected {tuple(map(int, exp_shape))}")
+    if out.ndim != 3 or tuple(map(int, out.shape)) != (nao_i, nao_i, naux_i):
+        raise ValueError(f"out_x must have shape {(nao_i, nao_i, naux_i)}")
+
+    if _SCATTER_DF_INT3C2E_TO_X_RAW_KERNEL is None:
+        _SCATTER_DF_INT3C2E_TO_X_RAW_KERNEL = cp.RawKernel(
+            r"""
+            extern "C" __global__
+            void scatter_df_int3c2e_tiles_to_x_f64(
+              const double* tile,      // [ntasks, nAB, nP]
+              const int* a0,           // [ntasks]
+              const int* b0,           // [ntasks]
+              const int* p0,           // [ntasks]
+              int ntasks,
+              int nao,
+              int naux,
+              int nAB,
+              int nB,
+              int nP,
+              int tile_transposed,     // 0: [ntasks,nAB,nP], 1: [ntasks,nP,nAB]
+              double* out_x            // [nao,nao,naux]
+            ) {
+              const long long tid = (long long)blockIdx.x * (long long)blockDim.x + (long long)threadIdx.x;
+              const long long stride = (long long)blockDim.x * (long long)gridDim.x;
+              const long long total = (long long)ntasks * (long long)nAB * (long long)nP;
+
+              for (long long x = tid; x < total; x += stride) {
+                const long long t = x / ((long long)nAB * (long long)nP);
+                const long long rem = x - t * (long long)nAB * (long long)nP;
+                int ab = 0;
+                int P = 0;
+                if (!tile_transposed) {
+                  ab = (int)(rem / (long long)nP);
+                  P = (int)(rem - (long long)ab * (long long)nP);
+                } else {
+                  P = (int)(rem / (long long)nAB);
+                  ab = (int)(rem - (long long)P * (long long)nAB);
+                }
+
+                const int i = ab / nB;
+                const int j = ab - i * nB;
+
+                const int aa = a0[t] + i;
+                const int bb = b0[t] + j;
+                const int pp = p0[t] + P;
+                if (aa < 0 || aa >= nao || bb < 0 || bb >= nao || pp < 0 || pp >= naux) {
+                  continue;
+                }
+
+                long long idx_abp = ((long long)aa * (long long)nao + (long long)bb) * (long long)naux + (long long)pp;
+                long long idx_bap = ((long long)bb * (long long)nao + (long long)aa) * (long long)naux + (long long)pp;
+                double v;
+                if (!tile_transposed) {
+                  v = tile[((t * (long long)nAB + (long long)ab) * (long long)nP + (long long)P)];
+                } else {
+                  v = tile[((t * (long long)nP + (long long)P) * (long long)nAB + (long long)ab)];
+                }
+                out_x[idx_abp] = v;
+                out_x[idx_bap] = v;
+              }
+            }
+            """,
+            "scatter_df_int3c2e_tiles_to_x_f64",
+        )
+
+    total = int(ntasks * nAB_i * nP_i)
+    if total == 0:
+        return out
+
+    threads = 256
+    blocks = int(min(65535, max(1, (total + threads - 1) // threads)))
+    _SCATTER_DF_INT3C2E_TO_X_RAW_KERNEL(
+        (blocks,),
+        (threads,),
+        (
+            t.reshape(-1),
+            a,
+            b,
+            p,
+            np.int32(ntasks),
+            np.int32(nao_i),
+            np.int32(naux_i),
+            np.int32(nAB_i),
+            np.int32(nB_i),
+            np.int32(nP_i),
+            np.int32(1 if ttr else 0),
+            out.reshape(-1),
+        ),
+    )
+    return out
 
 
 def _trim_df_cache(cache: dict, max_items: int = _DF_METRIC_CHOL_CACHE_MAX) -> None:
@@ -94,8 +392,15 @@ def _get_cached_metric_cholesky(aux_basis, *, backend: str, stream=None, profile
     key = (dev, id(aux_basis), str(backend).lower().strip())
     hit = _df_metric_chol_cache.get(key)
     if hit is not None:
-        aux_ref, L = hit
+        if len(hit) == 3:
+            aux_ref, L, ready_event = hit
+        else:  # backward compatibility for older 2-tuple cache entries
+            aux_ref, L = hit  # type: ignore[misc]
+            ready_event = None
         if aux_ref() is aux_basis:
+            if ready_event is not None:
+                with stream_ctx(stream):
+                    cp.cuda.get_current_stream().wait_event(ready_event)
             if profile is not None:
                 prof = profile.setdefault("metric_cholesky", {})
                 prof["cache_hit"] = True
@@ -103,8 +408,8 @@ def _get_cached_metric_cholesky(aux_basis, *, backend: str, stream=None, profile
             return L
         del _df_metric_chol_cache[key]
 
-    # Compute on the requested stream (if provided) and synchronize before caching
-    # so that subsequent use on any stream is safe.
+    # Compute on the requested stream and cache a ready-event so later consumers
+    # can wait without forcing a host synchronization during cache population.
     if profile is not None:
         prof = profile.setdefault("metric_cholesky", {})
         prof["cache_hit"] = False
@@ -118,6 +423,7 @@ def _get_cached_metric_cholesky(aux_basis, *, backend: str, stream=None, profile
             prof["naux"] = None
     start = cp.cuda.Event() if profile is not None else None
     end = cp.cuda.Event() if profile is not None else None
+    ready_event = None
     with stream_ctx(stream):
         s = cp.cuda.get_current_stream()
         if start is not None and end is not None:
@@ -129,11 +435,10 @@ def _get_cached_metric_cholesky(aux_basis, *, backend: str, stream=None, profile
             end.synchronize()
             if profile is not None:
                 prof["ms"] = float(cp.cuda.get_elapsed_time(start, end))
+        ready_event = cp.cuda.Event()
+        ready_event.record(s)
 
-        # Synchronize before caching so later use on any stream is safe.
-        s.synchronize()
-
-    _df_metric_chol_cache[key] = (weakref.ref(aux_basis), L)
+    _df_metric_chol_cache[key] = (weakref.ref(aux_basis), L, ready_event)
     _trim_df_cache(_df_metric_chol_cache)
     return L
 
@@ -149,6 +454,9 @@ def _get_cached_df_stream_rys_plan(ao_basis, aux_basis, *, stream=None, threads:
     if hit is not None:
         ao_ref, aux_ref, plan = hit
         if ao_ref() is ao_basis and aux_ref() is aux_basis:
+            if plan.ready_event is not None:
+                with stream_ctx(stream):
+                    cp.cuda.get_current_stream().wait_event(plan.ready_event)
             if profile is not None:
                 prof = profile.setdefault("yt_stream", {})
                 prof["plan_cache_hit"] = True
@@ -235,6 +543,7 @@ def _get_cached_df_stream_rys_plan(ao_basis, aux_basis, *, stream=None, threads:
 
     t0 = cp.cuda.Event() if profile is not None else None
     t1 = cp.cuda.Event() if profile is not None else None
+    ready_event = None
     with stream_ctx(stream):
         s0 = cp.cuda.get_current_stream()
         if t0 is not None and t1 is not None:
@@ -250,10 +559,10 @@ def _get_cached_df_stream_rys_plan(ao_basis, aux_basis, *, stream=None, threads:
             if profile is not None:
                 prof = profile.setdefault("yt_stream", {})
                 prof["plan_build_ms"] = float(cp.cuda.get_elapsed_time(t0, t1))
+        ready_event = cp.cuda.Event()
+        ready_event.record(s0)
 
-        s0.synchronize()
-
-    plan = _DFStreamRysPlan(dbasis=dbasis, dsp=dsp, pt=pt, sp_all=sp_all, shell_l=shell_l, nsp_ao=nsp_ao)
+    plan = _DFStreamRysPlan(dbasis=dbasis, dsp=dsp, pt=pt, sp_all=sp_all, shell_l=shell_l, nsp_ao=nsp_ao, ready_event=ready_event)
     _df_stream_rys_plan_cache[key] = (weakref.ref(ao_basis), weakref.ref(aux_basis), plan)
     _trim_df_cache(_df_stream_rys_plan_cache, max_items=_DF_STREAM_RYS_PLAN_CACHE_MAX)
     return plan
@@ -286,6 +595,9 @@ def _get_cached_df_stream_xblock_plan(
     if hit is not None:
         ao_ref, aux_ref, plan = hit
         if ao_ref() is ao_basis and aux_ref() is aux_basis:
+            if plan.ready_event is not None:
+                with stream_ctx(stream):
+                    cp.cuda.get_current_stream().wait_event(plan.ready_event)
             if profile is not None:
                 prof = profile.setdefault("yt_stream", {})
                 prof["xblock_plan_cache_hit"] = True
@@ -297,62 +609,11 @@ def _get_cached_df_stream_xblock_plan(
         prof = profile.setdefault("yt_stream", {})
         prof["xblock_plan_cache_hit"] = False
 
-    from .eri_dispatch import plan_kernel_batches_spd
-    from .tasks import TaskList, decode_eri_class_id, eri_class_id
+    from .eri_dispatch import _NATIVE_CLASS_IDS, plan_kernel_batches_spd
+    from .tasks import TaskList, decode_eri_class_id
 
-    # Native kernel set (same as run_kernel_batch_spd dispatch).
-    native_set = {
-        int(eri_class_id(0, 0, 0, 0)),
-        int(eri_class_id(1, 0, 0, 0)),
-        int(eri_class_id(1, 1, 0, 0)),
-        int(eri_class_id(1, 0, 1, 0)),
-        int(eri_class_id(1, 1, 1, 0)),
-        int(eri_class_id(1, 1, 1, 1)),
-        int(eri_class_id(2, 0, 0, 0)),
-        int(eri_class_id(2, 2, 0, 0)),
-        int(eri_class_id(0, 0, 2, 1)),
-        int(eri_class_id(1, 0, 2, 0)),
-        int(eri_class_id(1, 0, 2, 1)),
-        int(eri_class_id(1, 0, 2, 2)),
-        int(eri_class_id(1, 1, 2, 0)),
-        int(eri_class_id(1, 1, 2, 1)),
-        int(eri_class_id(1, 1, 2, 2)),
-        int(eri_class_id(2, 0, 2, 0)),
-        int(eri_class_id(2, 0, 2, 1)),
-        int(eri_class_id(2, 0, 2, 2)),
-        int(eri_class_id(3, 1, 0, 0)),
-        int(eri_class_id(3, 2, 0, 0)),
-        int(eri_class_id(3, 3, 0, 0)),
-        int(eri_class_id(3, 1, 1, 0)),
-        int(eri_class_id(3, 2, 1, 0)),
-        int(eri_class_id(3, 3, 1, 0)),
-        int(eri_class_id(3, 1, 2, 0)),
-        int(eri_class_id(3, 2, 2, 0)),
-        int(eri_class_id(3, 3, 2, 0)),
-        int(eri_class_id(0, 0, 3, 0)),
-        int(eri_class_id(1, 0, 3, 0)),
-        int(eri_class_id(1, 1, 3, 0)),
-        int(eri_class_id(2, 0, 3, 0)),
-        int(eri_class_id(3, 0, 3, 0)),
-        int(eri_class_id(2, 1, 3, 0)),
-        int(eri_class_id(3, 1, 3, 0)),
-        int(eri_class_id(2, 2, 3, 0)),
-        int(eri_class_id(3, 2, 3, 0)),
-        int(eri_class_id(3, 3, 3, 0)),
-        int(eri_class_id(0, 0, 4, 0)),
-        int(eri_class_id(1, 0, 4, 0)),
-        int(eri_class_id(1, 1, 4, 0)),
-        int(eri_class_id(2, 0, 4, 0)),
-        int(eri_class_id(3, 0, 4, 0)),
-        int(eri_class_id(2, 1, 4, 0)),
-        int(eri_class_id(3, 1, 4, 0)),
-        int(eri_class_id(2, 2, 4, 0)),
-        int(eri_class_id(3, 2, 4, 0)),
-        int(eri_class_id(3, 3, 4, 0)),
-        int(eri_class_id(2, 1, 2, 1)),
-        int(eri_class_id(2, 1, 2, 2)),
-        int(eri_class_id(2, 2, 2, 2)),
-    }
+    # Shared native class set from central dispatch.
+    native_set = {int(cid) for cid in _NATIVE_CLASS_IDS}
 
     sp_all = base_plan.sp_all
     shell_l = base_plan.shell_l
@@ -366,6 +627,7 @@ def _get_cached_df_stream_xblock_plan(
 
     t0 = cp.cuda.Event() if profile is not None else None
     t1 = cp.cuda.Event() if profile is not None else None
+    ready_event = None
     with stream_ctx(stream):
         s0 = cp.cuda.get_current_stream()
         if t0 is not None and t1 is not None:
@@ -458,10 +720,10 @@ def _get_cached_df_stream_xblock_plan(
             if profile is not None:
                 prof = profile.setdefault("yt_stream", {})
                 prof["xblock_plan_build_ms"] = float(cp.cuda.get_elapsed_time(t0, t1))
+        ready_event = cp.cuda.Event()
+        ready_event.record(s0)
 
-        s0.synchronize()
-
-    plan = _DFStreamXBlockPlan(aux_block_naux=int(aux_block_naux), blocks=blocks)
+    plan = _DFStreamXBlockPlan(aux_block_naux=int(aux_block_naux), blocks=blocks, ready_event=ready_event)
     _df_stream_xblock_plan_cache[key] = (weakref.ref(ao_basis), weakref.ref(aux_basis), plan)
     _trim_df_cache(_df_stream_xblock_plan_cache, max_items=_DF_STREAM_XBLOCK_PLAN_CACHE_MAX)
     return plan
@@ -854,7 +1116,7 @@ def active_Lfull_from_B_Qp(B_Qp, C_active, *, aux_block_naux: int = 64):
     except Exception as e:  # pragma: no cover
         raise RuntimeError("CuPy is required for DF active_Lfull_from_B_Qp") from e
 
-    from asuka.integrals.df_packed_s2 import unpack_Qp_to_Qmn_block  # noqa: PLC0415
+    from asuka.integrals.df_packed_s2 import fused_qp_l_act_f64  # noqa: PLC0415
     from asuka.integrals.tri_packed import ntri_from_nao  # noqa: PLC0415
 
     B_qp = cp.asarray(B_Qp, dtype=cp.float64)
@@ -887,11 +1149,9 @@ def active_Lfull_from_B_Qp(B_Qp, C_active, *, aux_block_naux: int = 64):
         qb = int(q1 - q0)
         if qb <= 0:
             continue
-        B_qmn = unpack_Qp_to_Qmn_block(B_qp, nao=int(nao), q0=int(q0), q_count=int(qb))  # (qb,nao,nao)
-        tmp = cp.matmul(B_qmn, C_active)  # (qb,nao,norb)
-        L_blk = cp.matmul(C_active.T[None, :, :], tmp)  # (qb,norb,norb)
+        L_blk = fused_qp_l_act_f64(B_qp, C_active, nao=int(nao), q0=int(q0), q_count=int(qb))  # (qb,norb,norb)
         out[:, q0:q1] = L_blk.transpose(1, 2, 0).reshape(norb * norb, qb)
-        del B_qmn, tmp, L_blk
+        del L_blk
     return out
 
 
@@ -957,6 +1217,7 @@ def _active_YT_streamed_rys_basis(
     from .eri_utils import build_pair_coeff_ordered
     from .tasks import TaskList, decode_eri_class_id
     from .basis_utils import shell_nfunc_cart
+    from asuka.integrals.df_packed_s2 import ao_packed_s2_enabled
 
     from .gpu import CUDA_MAX_L, has_cuda_ext
     from .eri_dispatch import KernelBatch, plan_kernel_batches_spd, run_kernel_batch_spd
@@ -1157,11 +1418,25 @@ def _active_YT_streamed_rys_basis(
                     prof = profile.setdefault("yt_stream", {})
                     prof["full_x_int3c2e_ms"] = float(cp.cuda.get_elapsed_time(start, end))
 
+                # When packed-Qp is enabled, pack X → Qp and use the fused
+                # Qp → L_act transform to avoid materialising the full
+                # (nao, nao) GEMM intermediate inside active_Lfull_from_B.
+                _full_x_use_qp = bool(ao_packed_s2_enabled()) and hasattr(_ext, "df_pack_mnq_to_qp_device")
+
                 start2 = cp.cuda.Event() if profile is not None else None
                 end2 = cp.cuda.Event() if profile is not None else None
                 if start2 is not None and end2 is not None:
                     start2.record(s0)
-                L_full = active_Lfull_from_B(X, C_active)  # (nops, naux)
+
+                if _full_x_use_qp:
+                    from asuka.integrals.df_packed_s2 import pack_B_to_Qp  # noqa: PLC0415
+
+                    X_qp = pack_B_to_Qp(X, layout="mnQ", nao=int(nao))
+                    del X
+                    L_full = active_Lfull_from_B_Qp(X_qp, C_active)  # (nops, naux)
+                else:
+                    L_full = active_Lfull_from_B(X, C_active)  # (nops, naux)
+
                 if start2 is not None and end2 is not None:
                     end2.record(s0)
                     end2.synchronize()
@@ -1169,6 +1444,7 @@ def _active_YT_streamed_rys_basis(
                     prof["full_x_transform_ms"] = float(cp.cuda.get_elapsed_time(start2, end2))
                     prof["strategy"] = "full_x"
                     prof["use_x_block"] = True
+                    prof["full_x_use_qp"] = bool(_full_x_use_qp)
                 return cp.ascontiguousarray(L_full.T)
 
     plan = _get_cached_df_stream_rys_plan(ao_basis, aux_basis, stream=stream, threads=threads, profile=profile)
@@ -1188,6 +1464,8 @@ def _active_YT_streamed_rys_basis(
     xblock_transform_graph = None
     xblock_transform_graph_out = None
     xblock_transform_graph_disabled = False
+    xblock_qp_transform = bool(ao_packed_s2_enabled()) and hasattr(_ext, "df_pack_mnq_to_qp_device")
+    Qp_blk_scratch = None
 
     for block_id, (shell_start, shell_stop, p0_block, p1_block) in enumerate(aux_blocks):
         shell_start = int(shell_start)
@@ -1240,12 +1518,25 @@ def _active_YT_streamed_rys_basis(
             if profile is not None:
                 prof = profile.setdefault("yt_stream", {})
                 prof["use_x_block"] = True
+                prof["xblock_use_qp_transform"] = bool(xblock_qp_transform)
 
             if X_blk_scratch is None:
-                if int(xblock_scratch_naux) <= 0:
-                    raise RuntimeError("internal error: xblock_scratch_naux must be > 0 when use_x_block is True")
-                X_blk_scratch = cp.empty((nao, nao, int(xblock_scratch_naux)), dtype=cp.float64)
+                if bool(xblock_qp_transform):
+                    pass
+                else:
+                    if int(xblock_scratch_naux) <= 0:
+                        raise RuntimeError("internal error: xblock_scratch_naux must be > 0 when use_x_block is True")
+                    X_blk_scratch = cp.empty((nao, nao, int(xblock_scratch_naux)), dtype=cp.float64)
             X_blk = X_blk_scratch
+            if bool(xblock_qp_transform):
+                ntri = int(nao * (nao + 1) // 2)
+                if Qp_blk_scratch is None:
+                    if int(xblock_scratch_naux) <= 0:
+                        raise RuntimeError("internal error: xblock_scratch_naux must be > 0 when use_x_block is True")
+                    Qp_blk_scratch = cp.empty((int(xblock_scratch_naux), int(ntri)), dtype=cp.float64)
+                Qp_blk = Qp_blk_scratch
+            else:
+                Qp_blk = None
 
             for bp in blk.batches:
                 bytes_per_task = int(bp.nAB) * int(bp.nP) * 8
@@ -1289,6 +1580,7 @@ def _active_YT_streamed_rys_basis(
                         work_large_min=work_large_min,
                         blocks_per_task=blocks_per_task,
                         profile=dispatch_profile,
+                        skip_transpose=True,
                     )
                     if start_k is not None and end_k is not None:
                         end_k.record(s0)
@@ -1305,21 +1597,34 @@ def _active_YT_streamed_rys_basis(
 
                     if start_sc is not None and end_sc is not None:
                         start_sc.record(s0)
-                    _ext.scatter_df_int3c2e_tiles_inplace_device(
-                        tile.ravel(),
-                        bp.a0_dev[i0:i1],
-                        bp.b0_dev[i0:i1],
-                        bp.p0_dev[i0:i1],
-                        int(nao),
-                        int(xblock_scratch_naux),
-                        int(tile.shape[1]),
-                        int(bp.nB),
-                        int(tile.shape[2]),
-                        X_blk.ravel(),
-                        int(threads),
-                        int(sptr),
-                        False,
-                    )
+                    if bool(xblock_qp_transform):
+                        _scatter_df_int3c2e_tiles_to_qp_inplace_raw(
+                            tile,
+                            bp.a0_dev[i0:i1],
+                            bp.b0_dev[i0:i1],
+                            bp.p0_dev[i0:i1],
+                            nao=int(nao),
+                            naux=int(xblock_scratch_naux),
+                            nAB=int(bp.nAB),
+                            nB=int(bp.nB),
+                            nP=int(bp.nP),
+                            out_qp=Qp_blk,
+                            tile_transposed=bool(bp.transpose),
+                        )
+                    else:
+                        _scatter_df_int3c2e_tiles_to_x_inplace_raw(
+                            tile,
+                            bp.a0_dev[i0:i1],
+                            bp.b0_dev[i0:i1],
+                            bp.p0_dev[i0:i1],
+                            nao=int(nao),
+                            naux=int(xblock_scratch_naux),
+                            nAB=int(bp.nAB),
+                            nB=int(bp.nB),
+                            nP=int(bp.nP),
+                            out_x=X_blk,
+                            tile_transposed=bool(bp.transpose),
+                        )
                     if start_sc is not None and end_sc is not None:
                         end_sc.record(s0)
                         end_sc.synchronize()
@@ -1334,7 +1639,14 @@ def _active_YT_streamed_rys_basis(
             if start_tr is not None and end_tr is not None:
                 start_tr.record(s0)
             L_full_blk = None
-            if bool(graph_capture) and not bool(xblock_transform_graph_disabled):
+            if bool(xblock_qp_transform):
+                if Qp_blk is None:
+                    raise RuntimeError("internal error: missing Qp scratch for packed x-block transform")
+                L_full_blk = active_Lfull_from_B_Qp(Qp_blk[: int(naux_blk), :], C_active, aux_block_naux=int(aux_block_naux))
+                if profile is not None:
+                    prof = profile.setdefault("yt_stream", {})
+                    prof["xblock_qp_scatter_direct"] = True
+            elif bool(graph_capture) and not bool(xblock_transform_graph_disabled):
                 if xblock_transform_graph is None:
                     def _capture_body():
                         nonlocal xblock_transform_graph_out
@@ -1376,7 +1688,13 @@ def _active_YT_streamed_rys_basis(
                 end_tr.synchronize()
                 prof = profile.setdefault("yt_stream", {})
                 prof["transform_ms"] = float(prof.get("transform_ms", 0.0)) + float(cp.cuda.get_elapsed_time(start_tr, end_tr))
-            YT[p0_block:p1_block, :] = L_full_blk[:, : int(naux_blk)].T
+            if bool(xblock_qp_transform):
+                YT[p0_block:p1_block, :] = L_full_blk.T
+            else:
+                if profile is not None:
+                    prof = profile.setdefault("yt_stream", {})
+                    prof["xblock_dense_scatter_direct"] = True
+                YT[p0_block:p1_block, :] = L_full_blk[:, : int(naux_blk)].T
             continue
 
         if profile is not None:
@@ -1536,6 +1854,7 @@ def _active_YT_streamed_rys_basis(
         prof.setdefault("transform_ms", 0.0)
         prof.setdefault("batches", {})
         prof.setdefault("kernel_dispatch", {})
+        prof.setdefault("xblock_qp_scatter_direct", False)
         if "strategy" not in prof:
             use_x = bool(prof.get("use_x_block", False))
             use_d = bool(prof.get("use_digest", False))

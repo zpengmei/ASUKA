@@ -10,14 +10,14 @@ from .eri_utils import npair
 from .gpu import (
     CUDA_MAX_L,
     build_pair_tables_ss_device,
-    cart2sph_eri_tiles_device,
+    cart2sph_eri_tiles_scatter_sph_s4_inplace_device,
+    cart2sph_eri_tiles_scatter_sph_s8_inplace_device,
     has_cuda_ext,
-    scatter_eri_tiles_sph_s4_inplace_device,
-    scatter_eri_tiles_sph_s8_inplace_device,
     to_device_basis_ss,
     to_device_shell_pairs,
 )
 from .mol_basis import SphMapForCartBasis, pack_cart_shells_from_mol_with_sph_map
+from .screening import _diag_max_sqrt_from_square_tiles
 from .shell_pairs import ShellPairs, build_shell_pairs_l_order
 from .tasks import TaskList, build_tasks_screened_sorted_q, decode_eri_class_id
 from .tile_eval import iter_tile_batches_spd
@@ -163,62 +163,55 @@ class CuERISphERIEngine:
             blocks_per_task=blocks_per_task,
             max_tile_bytes=int(max_tiles_bytes),
             boys=boys,
+            preupload_tasks=True,
+            skip_transpose=True,
         ):
             if int(batch.task_spAB.shape[0]) == 0:
                 continue
 
             la, lb, lc, ld = decode_eri_class_id(int(batch.kernel_class_id))
 
-            nAB_cart = int(ncart(la)) * int(ncart(lb))
-            nCD_cart = int(ncart(lc)) * int(ncart(ld))
-            if tuple(batch.tiles.shape[1:]) != (nAB_cart, nCD_cart):
-                raise RuntimeError(
-                    f"internal error: unexpected tile shape {tuple(batch.tiles.shape)} for (la,lb,lc,ld)=({la},{lb},{lc},{ld})"
-                )
+            # When kernel ran in transposed orientation, tile is (m, nCD, nAB).
+            # Recover canonical (m, nAB, nCD) semantics by swapping bra/ket metadata;
+            # ERI 8-fold symmetry guarantees (AB|CD) == (CD|AB), so the scatter result is identical.
+            tile_transposed = bool(getattr(batch, "kernel_transposed", False))
+            if tile_transposed:
+                spAB_out = batch.task_spCD
+                spCD_out = batch.task_spAB
+                la_out, lb_out, lc_out, ld_out = lc, ld, la, lb
+            else:
+                spAB_out = batch.task_spAB
+                spCD_out = batch.task_spCD
+                la_out, lb_out, lc_out, ld_out = la, lb, lc, ld
 
-            tile_sph = cart2sph_eri_tiles_device(
-                batch.tiles,
-                la=la,
-                lb=lb,
-                lc=lc,
-                ld=ld,
-                stream=stream,
-                threads=threads,
-            )
-
-            nA_sph = 2 * la + 1
-            nB_sph = 2 * lb + 1
-            nC_sph = 2 * lc + 1
-            nD_sph = 2 * ld + 1
-
-            batch_tasks = TaskList(task_spAB=batch.task_spAB, task_spCD=batch.task_spCD)
+            batch_tasks = TaskList(task_spAB=spAB_out, task_spCD=spCD_out)
 
             if aosym == "s8":
-                scatter_eri_tiles_sph_s8_inplace_device(
+                cart2sph_eri_tiles_scatter_sph_s8_inplace_device(
                     batch_tasks,
                     self.dsp,
                     shell_ao_start_sph=shell_ao_start_sph,
                     nao_sph=nao_sph,
-                    nA=nA_sph,
-                    nB=nB_sph,
-                    nC=nC_sph,
-                    nD=nD_sph,
-                    tile_vals=tile_sph,
+                    la=la_out,
+                    lb=lb_out,
+                    lc=lc_out,
+                    ld=ld_out,
+                    tile_cart=batch.tiles,
                     out_s8=out,
                     stream=stream,
                     threads=threads,
                 )
             else:
-                scatter_eri_tiles_sph_s4_inplace_device(
+                cart2sph_eri_tiles_scatter_sph_s4_inplace_device(
                     batch_tasks,
                     self.dsp,
                     shell_ao_start_sph=shell_ao_start_sph,
                     nao_sph=nao_sph,
-                    nA=nA_sph,
-                    nB=nB_sph,
-                    nC=nC_sph,
-                    nD=nD_sph,
-                    tile_vals=tile_sph,
+                    la=la_out,
+                    lb=lb_out,
+                    lc=lc_out,
+                    ld=ld_out,
+                    tile_cart=batch.tiles,
                     out_s4=out,
                     stream=stream,
                     threads=threads,
@@ -267,12 +260,13 @@ class CuERISphERIEngine:
             blocks_per_task=blocks_per_task,
             max_tile_bytes=int(max_tiles_bytes),
             boys=boys,
+            skip_transpose=True,
+            preupload_tasks=True,
         ):
             if int(batch.task_spAB.shape[0]) == 0:
                 continue
             tile = batch.tiles
-            diag = cp.diagonal(tile, axis1=1, axis2=2)
-            q = cp.sqrt(cp.maximum(cp.max(diag, axis=1), 0.0))
+            q = _diag_max_sqrt_from_square_tiles(tile)
             Q_dev[cp.asarray(batch.task_spAB, dtype=cp.int32)] = q
 
         return cp.asnumpy(Q_dev)

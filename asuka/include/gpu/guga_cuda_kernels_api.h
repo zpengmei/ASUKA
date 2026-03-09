@@ -235,6 +235,38 @@ extern "C" void guga_epq_contribs_many_write_allpairs_recompute_warp_launch_stre
     cudaStream_t stream,
     int threads);
 
+extern "C" cudaError_t guga_qmc_pack_scaled_identity_i32_f64_launch_stream(
+    const int32_t* x_idx,
+    const double* x_val,
+    int n,
+    double scale,
+    int32_t* idx_out,
+    double* val_out,
+    cudaStream_t stream,
+    int threads);
+
+// Batched dot products for many pairs of sorted sparse vectors.
+//
+// Inputs are packed row-major matrices. For A (nA, stride_a):
+//   - vector i uses a_idx[i, :a_nnz[i]] and a_val[i, :a_nnz[i]] (sorted by idx).
+// Similarly for B (nB, stride_b).
+//
+// Output is dense row-major out (nA, nB): out[i, j] = dot(A_i, B_j).
+extern "C" cudaError_t guga_qmc_sparse_dot_many_sorted_i32_f64_launch_stream(
+    const int32_t* a_idx,
+    const double* a_val,
+    const int32_t* a_nnz,
+    int nA,
+    int stride_a,
+    const int32_t* b_idx,
+    const double* b_val,
+    const int32_t* b_nnz,
+    int nB,
+    int stride_b,
+    double* out,
+    cudaStream_t stream,
+    int threads);
+
 extern "C" cudaError_t guga_qmc_spawn_one_body_launch_stream(
     const int32_t* child,
     const int16_t* node_twos,
@@ -274,6 +306,31 @@ extern "C" cudaError_t guga_qmc_spawn_hamiltonian_launch_stream(
     int nspawn_two,
     uint64_t seed,
     double initiator_t,
+    int32_t* out_idx,
+    double* out_val,
+    cudaStream_t stream,
+    int threads);
+
+// Variant that reads initiator threshold from device memory (scalar double on device).
+// This allows callers to compute initiator_t on the GPU without a host sync.
+extern "C" cudaError_t guga_qmc_spawn_hamiltonian_initiator_dev_launch_stream(
+    const int32_t* child,
+    const int16_t* node_twos,
+    const int64_t* child_prefix,
+    const int8_t* steps_table,
+    const int32_t* nodes_table,
+    int ncsf,
+    int norb,
+    const int32_t* x_idx,
+    const double* x_val,
+    int m,
+    const double* h_base_flat,
+    const double* eri_mat,
+    double eps,
+    int nspawn_one,
+    int nspawn_two,
+    uint64_t seed,
+    const double* initiator_t_dev,
     int32_t* out_idx,
     double* out_val,
     cudaStream_t stream,
@@ -2093,6 +2150,30 @@ extern "C" void guga_apply_g_flat_scatter_atomic_frontier_hash_launch_stream(
     double* hash_vals,
     int cap,
     int root,
+    const uint8_t* selected_mask,
+    int* overflow_flag,
+    cudaStream_t stream,
+    int threads);
+
+extern "C" void guga_apply_g_flat_scatter_atomic_frontier_hash_many_roots_launch_stream(
+    const int32_t* child,
+    const int16_t* node_twos,
+    const int64_t* child_prefix,
+    const int8_t* steps_table,
+    const int32_t* nodes_table,
+    int ncsf,
+    int norb,
+    const int32_t* task_csf,
+    const double* task_scale_task_major,
+    int64_t task_scale_stride,
+    int nroots,
+    const double* task_g,
+    int64_t g_stride,
+    int ntasks,
+    int32_t* hash_keys,
+    double* hash_vals,
+    int cap,
+    const uint8_t* selected_mask,
     int* overflow_flag,
     cudaStream_t stream,
     int threads);
@@ -2121,6 +2202,23 @@ extern "C" cudaError_t guga_cipsi_score_and_select_topk_launch_stream(
     const double* vals_root_major,
     int64_t vals_stride,
     int nnz,
+    int nroots,
+    const double* e_var,
+    const double* hdiag,
+    int ncsf,
+    const uint8_t* selected_mask,
+    double denom_floor,
+    int max_add,
+    int32_t* out_new_idx,
+    int* out_new_n,
+    double* out_pt2,
+    cudaStream_t stream,
+    int threads);
+
+extern "C" cudaError_t guga_cipsi_score_and_select_topk_from_hash_slots_launch_stream(
+    const int32_t* keys,
+    const double* vals_root_major,
+    int cap,
     int nroots,
     const double* e_var,
     const double* hdiag,
@@ -2164,6 +2262,7 @@ extern "C" cudaError_t guga_hb_screen_and_apply_launch_stream(
     int32_t* hash_keys,
     double*  hash_vals,
     int cap,
+    const uint8_t* selected_mask,
     int* overflow_flag,
     cudaStream_t stream,
     int threads);

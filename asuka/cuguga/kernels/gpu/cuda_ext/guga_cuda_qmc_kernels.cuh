@@ -457,6 +457,9 @@ __global__ void qmc_spawn_one_body_kernel_t(
   }
 }
 
+__device__ __forceinline__ double qmc_initiator_load(double t) { return t; }
+__device__ __forceinline__ double qmc_initiator_load(const double* t_dev) { return t_dev ? *t_dev : 0.0; }
+
 template <int MAX_NORB_T>
 __global__ void qmc_spawn_hamiltonian_kernel_t(
     const int32_t* __restrict__ child,
@@ -576,6 +579,174 @@ __global__ void qmc_spawn_hamiltonian_kernel_t(
         inv_p_pair_rs = (double)(ns * nd);
       }
 
+      int rs_id = r_orb * norb + s_orb;
+
+      int k_csf = -1;
+      double coeff_rs = 0.0;
+      double inv_p_rs_epq = 0.0;
+      bool ok_rs = epq_sample_one_reservoir_t<MAX_NORB_T>(
+          child, node_twos, child_prefix, norb, j, steps_j, nodes_j, r_orb, s_orb, &st, &k_csf, &coeff_rs, &inv_p_rs_epq);
+      if (!ok_rs) continue;
+      if ((unsigned)k_csf >= (unsigned)ncsf) continue;
+
+      const int8_t* steps_k = steps_table + (int64_t)k_csf * (int64_t)norb;
+      const int32_t* nodes_k = nodes_table + (int64_t)k_csf * (int64_t)(norb + 1);
+
+      int src_k[MAX_NORB_T];
+      int ns_k = 0;
+      for (int orb = 0; orb < norb; orb++) {
+        if (steps_k[orb] != 0) {
+          src_k[ns_k] = orb;
+          ns_k++;
+        }
+      }
+      if (ns_k == 0) continue;
+
+      int q_orb = src_k[(int)rand_below_u32(&st, (uint32_t)ns_k)];
+      int p_orb = (int)rand_below_u32(&st, (uint32_t)norb);
+      int pq_id = p_orb * norb + q_orb;
+
+      double v_pqrs = 0.5 * eri_mat[(int64_t)pq_id * (int64_t)nops + (int64_t)rs_id];
+      if (v_pqrs == 0.0) continue;
+
+      int i_csf = -1;
+      double coeff_pq = 0.0;
+      double inv_p_pq_epq = 0.0;
+      bool ok_pq = epq_sample_one_reservoir_t<MAX_NORB_T>(
+          child, node_twos, child_prefix, norb, k_csf, steps_k, nodes_k, p_orb, q_orb, &st, &i_csf, &coeff_pq, &inv_p_pq_epq);
+      if (!ok_pq) continue;
+
+      if (!allow_new) {
+        if (!contains_sorted_i32(x_idx, m, (int32_t)i_csf)) continue;
+      }
+
+      double inv_p_pair_pq = (double)(ns_k * norb);
+      out_idx[base + (int64_t)nspawn_one + s] = (int32_t)i_csf;
+      out_val[base + (int64_t)nspawn_one + s] = scale_two * xj * v_pqrs * coeff_rs * inv_p_rs_epq * inv_p_pair_rs * coeff_pq * inv_p_pq_epq * inv_p_pair_pq;
+    }
+  }
+}
+
+// Variant that reads initiator threshold from device memory (scalar double on device).
+template <int MAX_NORB_T>
+__global__ void qmc_spawn_hamiltonian_initiator_dev_kernel_t(
+    const int32_t* __restrict__ child,
+    const int16_t* __restrict__ node_twos,
+    const int64_t* __restrict__ child_prefix,
+    const int8_t* __restrict__ steps_table,   // [ncsf,norb]
+    const int32_t* __restrict__ nodes_table,  // [ncsf,norb+1]
+    int ncsf,
+    int norb,
+    const int32_t* __restrict__ x_idx,  // [m] sorted unique
+    const double* __restrict__ x_val,   // [m]
+    int m,
+    const double* __restrict__ h_base_flat,  // [norb*norb] (p*norb+q)
+    const double* __restrict__ eri_mat,      // [nops*nops], nops=norb*norb (row-major)
+    double eps,
+    int nspawn_one,
+    int nspawn_two,
+    uint64_t seed,
+    const double* __restrict__ initiator_t_dev,
+    int32_t* __restrict__ out_idx,  // [m*(nspawn_one+nspawn_two)]
+    double* __restrict__ out_val) { // [m*(nspawn_one+nspawn_two)]
+  int parent_pos = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+  if (parent_pos >= m) return;
+  if (norb > MAX_NORB_T) return;
+
+  int j = (int)x_idx[parent_pos];
+  double xj = x_val[parent_pos];
+  if (xj == 0.0) return;
+  if ((unsigned)j >= (unsigned)ncsf) return;
+
+  const int8_t* steps_j = steps_table + (int64_t)j * (int64_t)norb;
+  const int32_t* nodes_j = nodes_table + (int64_t)j * (int64_t)(norb + 1);
+
+  int src[MAX_NORB_T];
+  int dst[MAX_NORB_T];
+  int ns = 0;
+  int nd = 0;
+  for (int orb = 0; orb < norb; orb++) {
+    int8_t st = steps_j[orb];
+    if (st != 0) {
+      src[ns] = orb;
+      ns++;
+    }
+    if (st != 3) {
+      dst[nd] = orb;
+      nd++;
+    }
+  }
+  if (ns == 0) return;
+
+  double initiator_t = qmc_initiator_load(initiator_t_dev);
+  bool allow_new = true;
+  if (initiator_t > 0.0 && fabs(xj) < initiator_t) allow_new = false;
+
+  uint64_t st = seed ^ ((uint64_t)(uint32_t)j * 0xD1B54A32D192ED03ull) ^ ((uint64_t)(uint32_t)parent_pos * 0x94D049BB133111EBull);
+
+  int nspawn_total = nspawn_one + nspawn_two;
+  int64_t base = (int64_t)parent_pos * (int64_t)nspawn_total;
+
+  int nops = norb * norb;
+
+  // One-body effective part: h_eff(j)[p,q] = h_base[p,q] + 0.5 * Σ_r (p q | r r) occ_j[r]
+  if (nspawn_one > 0) {
+    double scale_one = -eps / (double)nspawn_one;
+    double inv_p_pair_one = (double)(ns * norb);
+    for (int s = 0; s < nspawn_one; s++) {
+      int q = src[(int)rand_below_u32(&st, (uint32_t)ns)];
+      int p = (int)rand_below_u32(&st, (uint32_t)norb);
+      int pq_id = p * norb + q;
+
+      double w_eff = h_base_flat[pq_id];
+      double sum_rr = 0.0;
+      for (int t = 0; t < ns; t++) {
+        int r = src[t];
+        int occ_r = (steps_j[r] == 3) ? 2 : 1;
+        int rr_id = r * norb + r;
+        sum_rr += eri_mat[(int64_t)pq_id * (int64_t)nops + (int64_t)rr_id] * (double)occ_r;
+      }
+      w_eff += 0.5 * sum_rr;
+      if (w_eff == 0.0) continue;
+
+      int child_out = -1;
+      double coeff_out = 0.0;
+      double inv_p_out = 0.0;
+      bool ok = epq_sample_one_reservoir_t<MAX_NORB_T>(
+          child, node_twos, child_prefix, norb, j, steps_j, nodes_j, p, q, &st, &child_out, &coeff_out, &inv_p_out);
+      if (!ok) continue;
+
+      if (!allow_new) {
+        if (!contains_sorted_i32(x_idx, m, (int32_t)child_out)) continue;
+      }
+
+      out_idx[base + s] = (int32_t)child_out;
+      out_val[base + s] = scale_one * xj * w_eff * coeff_out * inv_p_out * inv_p_pair_one;
+    }
+  }
+
+  // Two-body product term, restricted to r!=s: (1/2) Σ_{pqrs, r!=s} (pq|rs) E_pq E_rs
+  if (nspawn_two > 0) {
+    if (norb <= 1 || nd == 0) return;
+    double scale_two = -eps / (double)nspawn_two;
+    for (int s = 0; s < nspawn_two; s++) {
+      int s_orb = src[(int)rand_below_u32(&st, (uint32_t)ns)];
+      int occ_s = (steps_j[s_orb] == 3) ? 2 : 1;
+
+      int r_orb = -1;
+      double inv_p_pair_rs = 0.0;
+      if (occ_s == 1) {
+        if (nd <= 1) continue;
+        while (true) {
+          r_orb = dst[(int)rand_below_u32(&st, (uint32_t)nd)];
+          if (r_orb != s_orb) break;
+        }
+        inv_p_pair_rs = (double)(ns * (nd - 1));
+      } else {
+        // occ_s == 2: s is not in dst.
+        r_orb = dst[(int)rand_below_u32(&st, (uint32_t)nd)];
+        inv_p_pair_rs = (double)(ns * nd);
+      }
       int rs_id = r_orb * norb + s_orb;
 
       int k_csf = -1;
@@ -826,7 +997,165 @@ __global__ void qmc_spawn_hamiltonian_u64_f64_kernel_t(
   }
 }
 
+__global__ void qmc_pack_scaled_identity_i32_f64_kernel(
+    const int32_t* __restrict__ x_idx,
+    const double* __restrict__ x_val,
+    int n,
+    double scale,
+    int32_t* __restrict__ idx_out,
+    double* __restrict__ val_out) {
+  int i = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+  if (i >= n) return;
+  idx_out[i] = x_idx[i];
+  val_out[i] = scale * x_val[i];
+}
+
 }  // namespace
+
+extern "C" cudaError_t guga_qmc_pack_scaled_identity_i32_f64_launch_stream(
+    const int32_t* x_idx,
+    const double* x_val,
+    int n,
+    double scale,
+    int32_t* idx_out,
+    double* val_out,
+    cudaStream_t stream,
+    int threads) {
+  if (!x_idx || !x_val || !idx_out || !val_out) return cudaErrorInvalidValue;
+  if (n < 0) return cudaErrorInvalidValue;
+  if (threads <= 0 || threads > 1024) return cudaErrorInvalidValue;
+  if (n == 0) return cudaSuccess;
+  int blocks = (n + threads - 1) / threads;
+  qmc_pack_scaled_identity_i32_f64_kernel<<<blocks, threads, 0, stream>>>(x_idx, x_val, n, scale, idx_out, val_out);
+  return cudaGetLastError();
+}
+
+// -----------------------------------------------------------------------------
+// QMC: batched sorted-sparse dot products
+// -----------------------------------------------------------------------------
+
+namespace {
+
+__device__ __forceinline__ int lower_bound_i32(const int32_t* __restrict__ a, int n, int32_t key) {
+  int lo = 0;
+  int hi = n;
+  while (lo < hi) {
+    int mid = lo + ((hi - lo) >> 1);
+    int32_t v = a[mid];
+    if (v < key) {
+      lo = mid + 1;
+    } else {
+      hi = mid;
+    }
+  }
+  return lo;
+}
+
+__global__ void qmc_sparse_dot_many_sorted_i32_f64_kernel(
+    const int32_t* __restrict__ a_idx,
+    const double* __restrict__ a_val,
+    const int32_t* __restrict__ a_nnz,
+    int nA,
+    int stride_a,
+    const int32_t* __restrict__ b_idx,
+    const double* __restrict__ b_val,
+    const int32_t* __restrict__ b_nnz,
+    int nB,
+    int stride_b,
+    double* __restrict__ out) {
+  int warp = (int)(threadIdx.x >> 5);
+  int lane = (int)(threadIdx.x & 31);
+  int warps_per_block = (int)(blockDim.x >> 5);
+
+  int64_t pair = (int64_t)blockIdx.x * (int64_t)warps_per_block + (int64_t)warp;
+  int64_t total = (int64_t)nA * (int64_t)nB;
+  if (pair >= total) return;
+
+  int i = (int)(pair / (int64_t)nB);
+  int j = (int)(pair - (int64_t)i * (int64_t)nB);
+
+  int na = a_nnz ? (int)a_nnz[i] : 0;
+  int nb = b_nnz ? (int)b_nnz[j] : 0;
+  if (na <= 0 || nb <= 0) {
+    if (lane == 0) out[pair] = 0.0;
+    return;
+  }
+
+  const int32_t* ai = a_idx + (int64_t)i * (int64_t)stride_a;
+  const double* av = a_val + (int64_t)i * (int64_t)stride_a;
+  const int32_t* bi = b_idx + (int64_t)j * (int64_t)stride_b;
+  const double* bv = b_val + (int64_t)j * (int64_t)stride_b;
+
+  // Binary-search into the larger vector to minimize work.
+  const int32_t* li = ai;
+  const double* lv = av;
+  int nl = na;
+  const int32_t* ri = bi;
+  const double* rv = bv;
+  int nr = nb;
+  if (na > nb) {
+    li = bi;
+    lv = bv;
+    nl = nb;
+    ri = ai;
+    rv = av;
+    nr = na;
+  }
+
+  double sum = 0.0;
+  for (int t = lane; t < nl; t += 32) {
+    int32_t key = li[t];
+    double v = lv[t];
+    if (key < 0 || v == 0.0) continue;
+    int pos = lower_bound_i32(ri, nr, key);
+    if (pos < nr && ri[pos] == key) {
+      sum += v * rv[pos];
+    }
+  }
+
+  // Warp reduction.
+  for (int offset = 16; offset > 0; offset >>= 1) {
+    sum += __shfl_down_sync(0xffffffff, sum, offset);
+  }
+  if (lane == 0) {
+    out[pair] = sum;
+  }
+}
+
+}  // namespace
+
+extern "C" cudaError_t guga_qmc_sparse_dot_many_sorted_i32_f64_launch_stream(
+    const int32_t* a_idx,
+    const double* a_val,
+    const int32_t* a_nnz,
+    int nA,
+    int stride_a,
+    const int32_t* b_idx,
+    const double* b_val,
+    const int32_t* b_nnz,
+    int nB,
+    int stride_b,
+    double* out,
+    cudaStream_t stream,
+    int threads) {
+  if (!a_idx || !a_val || !a_nnz || !b_idx || !b_val || !b_nnz || !out) return cudaErrorInvalidValue;
+  if (nA < 0 || nB < 0) return cudaErrorInvalidValue;
+  if (stride_a < 0 || stride_b < 0) return cudaErrorInvalidValue;
+  if (threads <= 0 || threads > 1024) return cudaErrorInvalidValue;
+  if ((threads & 31) != 0) return cudaErrorInvalidValue;  // must be a multiple of warp size
+  if (nA == 0 || nB == 0) return cudaSuccess;
+
+  int64_t total = (int64_t)nA * (int64_t)nB;
+  if (total > (int64_t)0x7fffffff) return cudaErrorInvalidValue;
+  int total_pairs = (int)total;
+
+  int warps_per_block = threads >> 5;
+  if (warps_per_block <= 0) return cudaErrorInvalidValue;
+  int blocks = (total_pairs + warps_per_block - 1) / warps_per_block;
+  qmc_sparse_dot_many_sorted_i32_f64_kernel<<<blocks, threads, 0, stream>>>(
+      a_idx, a_val, a_nnz, nA, stride_a, b_idx, b_val, b_nnz, nB, stride_b, out);
+  return cudaGetLastError();
+}
 
 extern "C" cudaError_t guga_qmc_spawn_one_body_launch_stream(
     const int32_t* child,
@@ -1018,6 +1347,85 @@ extern "C" cudaError_t guga_qmc_spawn_hamiltonian_launch_stream(
   return cudaGetLastError();
 }
 
+extern "C" cudaError_t guga_qmc_spawn_hamiltonian_initiator_dev_launch_stream(
+    const int32_t* child,
+    const int16_t* node_twos,
+    const int64_t* child_prefix,
+    const int8_t* steps_table,
+    const int32_t* nodes_table,
+    int ncsf,
+    int norb,
+    const int32_t* x_idx,
+    const double* x_val,
+    int m,
+    const double* h_base_flat,
+    const double* eri_mat,
+    double eps,
+    int nspawn_one,
+    int nspawn_two,
+    uint64_t seed,
+    const double* initiator_t_dev,
+    int32_t* out_idx,
+    double* out_val,
+    cudaStream_t stream,
+    int threads) {
+  if (!child || !node_twos || !child_prefix) return cudaErrorInvalidValue;
+  if (!steps_table || !nodes_table) return cudaErrorInvalidValue;
+  if (!x_idx || !x_val) return cudaErrorInvalidValue;
+  if (!h_base_flat || !eri_mat || !out_idx || !out_val) return cudaErrorInvalidValue;
+  // initiator_t_dev may be nullptr (treated as 0.0).
+  if (m < 0 || ncsf < 0 || norb <= 0 || norb > MAX_NORB) return cudaErrorInvalidValue;
+  if (nspawn_one < 0 || nspawn_two < 0) return cudaErrorInvalidValue;
+  if (nspawn_one == 0 && nspawn_two == 0) return cudaErrorInvalidValue;
+  if (threads <= 0 || threads > 1024) return cudaErrorInvalidValue;
+
+  int blocks = (m + threads - 1) / threads;
+  if (norb <= 32) {
+    qmc_spawn_hamiltonian_initiator_dev_kernel_t<32><<<blocks, threads, 0, stream>>>(
+        child,
+        node_twos,
+        child_prefix,
+        steps_table,
+        nodes_table,
+        ncsf,
+        norb,
+        x_idx,
+        x_val,
+        m,
+        h_base_flat,
+        eri_mat,
+        eps,
+        nspawn_one,
+        nspawn_two,
+        seed,
+        initiator_t_dev,
+        out_idx,
+        out_val);
+  } else {
+    qmc_spawn_hamiltonian_initiator_dev_kernel_t<64><<<blocks, threads, 0, stream>>>(
+        child,
+        node_twos,
+        child_prefix,
+        steps_table,
+        nodes_table,
+        ncsf,
+        norb,
+        x_idx,
+        x_val,
+        m,
+        h_base_flat,
+        eri_mat,
+        eps,
+        nspawn_one,
+        nspawn_two,
+        seed,
+        initiator_t_dev,
+        out_idx,
+        out_val);
+  }
+  return cudaGetLastError();
+}
+
 extern "C" cudaError_t guga_qmc_spawn_hamiltonian_launch(
     const int32_t* child,
     const int16_t* node_twos,
@@ -1176,6 +1584,49 @@ struct QmcF64Sum {
   __host__ __device__ __forceinline__ double operator()(double a, double b) const { return a + b; }
 };
 
+// Shared pair type used by Φ compression and by coalesce zero-pruning.
+struct QmcIdxVal {
+  int32_t idx;
+  double val;
+};
+
+struct QmcPairNonZero {
+  __host__ __device__ __forceinline__ bool operator()(const QmcIdxVal& x) const { return x.val != 0.0; }
+};
+
+__global__ void qmc_pack_pairs_prefix_kernel(
+    const int32_t* __restrict__ idx,
+    const double* __restrict__ val,
+    const int* __restrict__ nnz,  // scalar int on device
+    QmcIdxVal* __restrict__ out,
+    int n) {
+  int i = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+  if (i >= n) return;
+  int m = nnz ? nnz[0] : 0;
+  if (i < m) {
+    out[i].idx = idx[i];
+    out[i].val = val[i];
+  } else {
+    out[i].idx = (int32_t)-1;
+    out[i].val = 0.0;
+  }
+}
+
+__global__ void qmc_unpack_pairs_prefix_kernel(
+    const QmcIdxVal* __restrict__ in,
+    const int* __restrict__ nnz,  // scalar int on device
+    int32_t* __restrict__ idx,
+    double* __restrict__ val,
+    int n) {
+  int i = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+  if (i >= n) return;
+  int m = nnz ? nnz[0] : 0;
+  if (i < m) {
+    idx[i] = in[i].idx;
+    val[i] = in[i].val;
+  }
+}
+
 __global__ void qmc_sanitize_invalid_idx_kernel(int32_t* idx, double* val, int n) {
   int i = (int)(blockIdx.x * blockDim.x + threadIdx.x);
   if (i >= n) return;
@@ -1260,7 +1711,14 @@ extern "C" cudaError_t guga_qmc_coalesce_coo_i32_f64_launch_stream(
       nullptr, temp_reduce, d_key_sorted, d_key_out, d_val_sorted, d_val_out, out_nnz, QmcF64Sum(), n, stream);
   if (err != cudaSuccess) return err;
 
-  size_t temp_bytes = (temp_sort > temp_reduce) ? temp_sort : temp_reduce;
+  size_t temp_select = 0;
+  // Query DeviceSelect temp bytes (used later for exact-zero pruning).
+  err = cub::DeviceSelect::If(nullptr, temp_select, (const QmcIdxVal*)nullptr, (QmcIdxVal*)nullptr, out_nnz, n, QmcPairNonZero(), stream);
+  if (err != cudaSuccess) return err;
+
+  size_t temp_bytes = temp_sort;
+  if (temp_reduce > temp_bytes) temp_bytes = temp_reduce;
+  if (temp_select > temp_bytes) temp_bytes = temp_select;
   void* d_temp_raw = nullptr;
   err = guga_cuda_malloc(&d_temp_raw, temp_bytes, stream);
   if (err != cudaSuccess) return err;
@@ -1292,6 +1750,32 @@ extern "C" cudaError_t guga_qmc_coalesce_coo_i32_f64_launch_stream(
     int t = (threads > 0 ? threads : 256);
     int blocks = (n + t - 1) / t;
     qmc_strip_invalid_prefix_kernel<<<blocks, t, 0, stream>>>(idx_out, val_out, out_nnz);
+    err = cudaGetLastError();
+    if (err != cudaSuccess) return err;
+  }
+
+  // Prune exact zeros after reduction. This matters for initiator support checks
+  // that test only sparse support membership via indices.
+  {
+    QmcIdxVal* d_pair_a_raw = nullptr;
+    QmcIdxVal* d_pair_b_raw = nullptr;
+    err = guga_cuda_malloc(&d_pair_a_raw, (size_t)n * sizeof(QmcIdxVal), stream);
+    if (err != cudaSuccess) return err;
+    err = guga_cuda_malloc(&d_pair_b_raw, (size_t)n * sizeof(QmcIdxVal), stream);
+    if (err != cudaSuccess) return err;
+    cuda_unique_ptr_stream<QmcIdxVal> d_pair_a(d_pair_a_raw, CudaFreeStreamDeleter<QmcIdxVal>{stream});
+    cuda_unique_ptr_stream<QmcIdxVal> d_pair_b(d_pair_b_raw, CudaFreeStreamDeleter<QmcIdxVal>{stream});
+
+    int t = (threads > 0 ? threads : 256);
+    int blocks = (n + t - 1) / t;
+    qmc_pack_pairs_prefix_kernel<<<blocks, t, 0, stream>>>(idx_out, val_out, out_nnz, d_pair_a.get(), n);
+    err = cudaGetLastError();
+    if (err != cudaSuccess) return err;
+
+    err = cub::DeviceSelect::If(d_temp.get(), temp_bytes, d_pair_a.get(), d_pair_b.get(), out_nnz, n, QmcPairNonZero(), stream);
+    if (err != cudaSuccess) return err;
+
+    qmc_unpack_pairs_prefix_kernel<<<blocks, t, 0, stream>>>(d_pair_b.get(), out_nnz, idx_out, val_out, n);
     err = cudaGetLastError();
     if (err != cudaSuccess) return err;
   }
@@ -1416,11 +1900,6 @@ extern "C" cudaError_t guga_qmc_guided_thin_events_i32_f64_launch(
 // -----------------------------------------------------------------------------
 
 namespace {
-
-struct QmcIdxVal {
-  int32_t idx;
-  double val;
-};
 
 __global__ void qmc_pack_abs_and_pairs_kernel(const int32_t* idx, const double* val, double* abs_out, QmcIdxVal* pair_out, int n) {
   int i = (int)(blockIdx.x * blockDim.x + threadIdx.x);
@@ -2070,6 +2549,11 @@ struct QmcWorkspace {
         "cub::ReduceByKey(i32) query");
     temp_bytes = std::max(temp_bytes, tmp);
 
+    qmc_throw_on_cuda_error_ws(
+        cub::DeviceSelect::If(nullptr, tmp, d_pair_a, d_pair_b, d_nnz_tmp, max_n, QmcPairNonZero(), /*stream=*/0),
+        "cub::DeviceSelect::If(pair!=0) query");
+    temp_bytes = std::max(temp_bytes, tmp);
+
     cub::DoubleBuffer<double> keys_abs(d_abs_a, d_abs_b);
     cub::DoubleBuffer<QmcIdxVal> vals_abs(d_pair_a, d_pair_b);
     qmc_throw_on_cuda_error_ws(
@@ -2197,6 +2681,22 @@ extern "C" cudaError_t guga_qmc_coalesce_coo_i32_f64_ws_launch_stream(
   {
     int blocks = (n + threads - 1) / threads;
     qmc_strip_invalid_prefix_kernel<<<blocks, threads, 0, stream>>>(idx_out, val_out, out_nnz);
+    err = cudaGetLastError();
+    if (err != cudaSuccess) return err;
+  }
+
+  // Prune exact zeros after reduction. This matters for initiator support checks
+  // that test only sparse support membership via indices.
+  {
+    int blocks = (n + threads - 1) / threads;
+    qmc_pack_pairs_prefix_kernel<<<blocks, threads, 0, stream>>>(idx_out, val_out, out_nnz, ws->d_pair_a, n);
+    err = cudaGetLastError();
+    if (err != cudaSuccess) return err;
+
+    err = cub::DeviceSelect::If(ws->d_temp, ws->temp_bytes, ws->d_pair_a, ws->d_pair_b, out_nnz, n, QmcPairNonZero(), stream);
+    if (err != cudaSuccess) return err;
+
+    qmc_unpack_pairs_prefix_kernel<<<blocks, threads, 0, stream>>>(ws->d_pair_b, out_nnz, idx_out, val_out, n);
     err = cudaGetLastError();
     if (err != cudaSuccess) return err;
   }

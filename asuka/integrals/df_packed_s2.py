@@ -31,9 +31,13 @@ def _env_flag(name: str, default: bool = False) -> bool:
 
 
 def ao_packed_s2_enabled() -> bool:
-    """Global switch for packed DF tensors (ASUKA_DF_AO_PACKED_S2=1)."""
+    """Global switch for packed DF tensors (ASUKA_DF_AO_PACKED_S2=1).
 
-    return _env_flag("ASUKA_DF_AO_PACKED_S2", default=False)
+    Default is True (on). Set ASUKA_DF_AO_PACKED_S2=0 to fall back to the
+    legacy full-square (nao, nao, naux_blk) x-block scatter path.
+    """
+
+    return _env_flag("ASUKA_DF_AO_PACKED_S2", default=True)
 
 
 def is_df_qp(B: Any) -> bool:

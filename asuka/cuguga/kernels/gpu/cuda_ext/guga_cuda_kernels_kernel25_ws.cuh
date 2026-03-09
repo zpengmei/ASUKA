@@ -1236,14 +1236,7 @@ extern "C" void guga_kernel25_build_csr_from_tasks_deterministic_inplace_device_
       child, node_twos, child_prefix, steps_table, nodes_table, ncsf, norb, task_csf, task_p, task_q, ntasks, ws->d_counts, overflow_flag, stream, threads);
   throw_on_cuda_error_ws(cudaGetLastError(), "kernel launch(kernel2b_count)");
 
-  if (check_overflow) {
-    int h_overflow = 0;
-    throw_on_cuda_error_ws(cudaMemcpyAsync(&h_overflow, overflow_flag, sizeof(int), cudaMemcpyDeviceToHost, stream), "D2H overflow(count)");
-    throw_on_cuda_error_ws(cudaStreamSynchronize(stream), "cudaStreamSynchronize(kernel2b_count)");
-    if (h_overflow) {
-      throw std::runtime_error("Kernel 2B count kernel overflow (invalid indices or stack overflow)");
-    }
-  }
+  const bool check_overflow_deferred = bool(check_overflow);
 
   int64_t total_out_ll = counts_to_offsets_total_ws(ws, ntasks, stream);
   if (total_out_ll <= 0) {
@@ -1286,15 +1279,6 @@ extern "C" void guga_kernel25_build_csr_from_tasks_deterministic_inplace_device_
       threads);
   throw_on_cuda_error_ws(cudaGetLastError(), "kernel launch(kernel2b_write)");
 
-  if (check_overflow) {
-    int h_overflow = 0;
-    throw_on_cuda_error_ws(cudaMemcpyAsync(&h_overflow, overflow_flag, sizeof(int), cudaMemcpyDeviceToHost, stream), "D2H overflow(write)");
-    throw_on_cuda_error_ws(cudaStreamSynchronize(stream), "cudaStreamSynchronize(kernel2b_write)");
-    if (h_overflow) {
-      throw std::runtime_error("Kernel 2B write kernel overflow (count/write mismatch or output overflow)");
-    }
-  }
-
   throw_on_cuda_error_ws(cudaMemsetAsync(ws->d_nrows, 0, sizeof(int), stream), "cudaMemsetAsync(nrows=0)");
   throw_on_cuda_error_ws(cudaMemsetAsync(ws->d_nnz, 0, sizeof(int), stream), "cudaMemsetAsync(nnz=0)");
 
@@ -1307,9 +1291,18 @@ extern "C" void guga_kernel25_build_csr_from_tasks_deterministic_inplace_device_
 
   int h_nrows = 0;
   int h_nnz = 0;
+  int h_overflow_deferred = 0;
+  if (check_overflow_deferred) {
+    throw_on_cuda_error_ws(
+        cudaMemcpyAsync(&h_overflow_deferred, overflow_flag, sizeof(int), cudaMemcpyDeviceToHost, stream),
+        "D2H overflow(deferred_final)");
+  }
   throw_on_cuda_error_ws(cudaMemcpyAsync(&h_nrows, ws->d_nrows, sizeof(int), cudaMemcpyDeviceToHost, stream), "D2H nrows");
   throw_on_cuda_error_ws(cudaMemcpyAsync(&h_nnz, ws->d_nnz, sizeof(int), cudaMemcpyDeviceToHost, stream), "D2H nnz");
   throw_on_cuda_error_ws(cudaStreamSynchronize(stream), "cudaStreamSynchronize(kernel25_ws)");
+  if (check_overflow_deferred && h_overflow_deferred) {
+    throw std::runtime_error("Kernel 2B kernel overflow (invalid indices, stack overflow, or output overflow)");
+  }
   if (h_nrows < 0) h_nrows = 0;
   if (h_nnz < 0) h_nnz = 0;
   if (h_nrows > nnz_in || h_nrows > max_out) {

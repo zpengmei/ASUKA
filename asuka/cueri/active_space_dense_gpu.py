@@ -149,6 +149,9 @@ class CuERIActiveSpaceDenseGPUBuilder:
     d_ao2local_cart: Any | None = None
     d_shell_l: Any | None = None
     device_id: int | None = None
+    # CUDA event recorded when device artifacts are ready; consumers on other
+    # streams wait on this instead of a host synchronize().
+    ready_event: Any | None = None
 
     # Cached AO dimensions for runtime validation.
     nao_expected: int | None = None  # backwards-compatible alias of nao_expected_in
@@ -343,7 +346,7 @@ class CuERIActiveSpaceDenseGPUBuilder:
                     max_tiles_bytes=int(self.max_tile_bytes),
                 )
                 Q_np = cp.asnumpy(Q_dev)
-                cp.cuda.get_current_stream().synchronize()
+                # cp.asnumpy() is a synchronous D→H copy; no extra sync needed.
         else:
             Q_np = np.ones((nsp,), dtype=np.float64)
 
@@ -419,9 +422,11 @@ class CuERIActiveSpaceDenseGPUBuilder:
                 d_ao2local_cart = cp.ascontiguousarray(cp.asarray(ao2local_cart, dtype=cp.int32))
                 d_shell_l = cp.ascontiguousarray(cp.asarray(basis.shell_l, dtype=cp.int32))
 
-            # Synchronize before caching so later use on any stream is safe.
-            cp.cuda.get_current_stream().synchronize()
+            # Record a CUDA event so consumers on other streams can wait on it
+            # instead of a host-blocking synchronize().
+            ready_event = cp.cuda.get_current_stream().record()
 
+        object.__setattr__(self, "ready_event", ready_event)
         object.__setattr__(self, "dbasis", dbasis)
         object.__setattr__(self, "dsp", dsp)
         object.__setattr__(self, "pair_tables", pt)
@@ -478,6 +483,10 @@ class CuERIActiveSpaceDenseGPUBuilder:
             raise RuntimeError("CuERIActiveSpaceDenseGPUBuilder used on a different CUDA device")
 
         with stream_ctx(self.stream):
+            # Ensure device artifacts are visible on this stream before use.
+            if self.ready_event is not None:
+                cp.cuda.get_current_stream().wait_event(self.ready_event)
+
             C_active_dev = cp.asarray(C_active, dtype=cp.float64)
             C_active_dev = cp.ascontiguousarray(C_active_dev)
             if C_active_dev.ndim != 2:
@@ -587,6 +596,9 @@ class CuERIActiveSpaceDenseGPUBuilder:
             raise RuntimeError("CuERIActiveSpaceDenseGPUBuilder used on a different CUDA device")
 
         with stream_ctx(self.stream):
+            if self.ready_event is not None:
+                cp.cuda.get_current_stream().wait_event(self.ready_event)
+
             C_mo_dev = cp.asarray(C_mo, dtype=cp.float64)
             C_act_dev = cp.asarray(C_act, dtype=cp.float64)
             C_mo_dev = cp.ascontiguousarray(C_mo_dev)
@@ -715,6 +727,9 @@ class CuERIActiveSpaceDenseGPUBuilder:
             raise RuntimeError("CuERIActiveSpaceDenseGPUBuilder used on a different CUDA device")
 
         with stream_ctx(self.stream):
+            if self.ready_event is not None:
+                cp.cuda.get_current_stream().wait_event(self.ready_event)
+
             C_mo_dev = cp.ascontiguousarray(cp.asarray(C_mo, dtype=cp.float64))
             C_act_dev = cp.ascontiguousarray(cp.asarray(C_act, dtype=cp.float64))
             if C_mo_dev.ndim != 2 or C_act_dev.ndim != 2:

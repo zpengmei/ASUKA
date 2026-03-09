@@ -11,11 +11,10 @@ from asuka.cuguga.drt import DRT
 from asuka.cuda.cuda_backend import (
     GugaMatvecEriMatWorkspace,
     Kernel3BuildGDFWorkspace,
-    apply_g_flat_scatter_atomic_frontier_hash_inplace_device,
+    apply_g_flat_scatter_atomic_frontier_hash_many_roots_inplace_device,
     build_occ_block_from_steps_inplace_device,
     cipsi_frontier_hash_clear_inplace_device,
-    cipsi_frontier_hash_extract_inplace_device,
-    cipsi_score_and_select_topk_inplace_device,
+    cipsi_score_and_select_topk_from_hash_slots_inplace_device,
     kernel3_build_g_from_csr_eri_mat_range_inplace_device,
 )
 
@@ -353,24 +352,61 @@ class FrontierHashSelector:
                 cipsi_frontier_hash_clear_inplace_device(self.hash_keys, self.hash_vals, threads=256, stream=stream, sync=False)
                 cp.cuda.runtime.memsetAsync(int(self.hash_overflow.data.ptr), 0, 4, int(stream.ptr))
 
-            for r in range(int(self.nroots)):
-                # x_full <- scatter selected coefficients for this root.
-                cp.cuda.runtime.memsetAsync(int(self.x_full.data.ptr), 0, int(self.x_full.nbytes), int(stream.ptr))
-                self.x_full[sel_idx_d] = c_sel_d[:, int(r)]
+            with _nvtx_range("cipsi_one_body", enabled=nvtx_enabled), _timed_phase(
+                "one_body_apply", enabled=profile_enabled, timings_ms=timings, stream=stream
+            ):
+                apply_g_flat_scatter_atomic_frontier_hash_many_roots_inplace_device(
+                    self.drt,
+                    self.ws.drt_dev,
+                    self.ws.state_dev,
+                    sel_idx_d,
+                    h_eff_flat,
+                    task_scale_task_major=c_sel_d,
+                    hash_keys=self.hash_keys,
+                    hash_vals=self.hash_vals,
+                    selected_mask=self.selected_mask_d,
+                    overflow=self.hash_overflow,
+                    clear_overflow=False,
+                    threads=256,
+                    stream=stream,
+                    sync=False,
+                    check_overflow=False,
+                )
 
-                with _nvtx_range("cipsi_one_body", enabled=nvtx_enabled), _timed_phase(
-                    "one_body_apply", enabled=profile_enabled, timings_ms=timings, stream=stream
-                ):
-                    apply_g_flat_scatter_atomic_frontier_hash_inplace_device(
+            # Two-body diagonal rs (r==s): build occ blocks once per tile and apply across roots.
+            with _nvtx_range("cipsi_two_body_diag", enabled=nvtx_enabled), _timed_phase(
+                "two_body_diag_apply", enabled=profile_enabled, timings_ms=timings, stream=stream
+            ):
+                for tile_id_val, pos in tile_groups:
+                    j_start = int(tile_id_val) * int(tile_size)
+                    j_count = min(int(tile_size), int(self.ncsf) - int(j_start))
+                    if j_count <= 0:
+                        continue
+                    build_occ_block_from_steps_inplace_device(
+                        self.ws.state_dev,
+                        j_start=int(j_start),
+                        j_count=int(j_count),
+                        occ_out=self.occ_buf[:j_count],
+                        threads=256,
+                        stream=stream,
+                        sync=False,
+                    )
+                    rel = cp.asarray(sel_idx_i32[pos] - int(j_start), dtype=cp.int32)
+                    occ_sel = cp.ascontiguousarray(self.occ_buf[rel])
+                    g_diag_sel = cp.dot(occ_sel, self.eri_diag_t)
+                    g_diag_sel *= 0.5
+                    task_csf_tile = cp.asarray(sel_idx_i32[pos], dtype=cp.int32)
+                    c_tile = cp.ascontiguousarray(c_sel_d[pos, :])
+                    apply_g_flat_scatter_atomic_frontier_hash_many_roots_inplace_device(
                         self.drt,
                         self.ws.drt_dev,
                         self.ws.state_dev,
-                        sel_idx_d,
-                        h_eff_flat,
-                        task_scale=cp.ascontiguousarray(c_sel_d[:, int(r)]),
+                        task_csf_tile,
+                        g_diag_sel,
+                        task_scale_task_major=c_tile,
                         hash_keys=self.hash_keys,
                         hash_vals=self.hash_vals,
-                        root=int(r),
+                        selected_mask=self.selected_mask_d,
                         overflow=self.hash_overflow,
                         clear_overflow=False,
                         threads=256,
@@ -379,186 +415,132 @@ class FrontierHashSelector:
                         check_overflow=False,
                     )
 
-                # Two-body diagonal rs (r==s): build occ blocks per active tile, then apply g_diag.
-                with _nvtx_range("cipsi_two_body_diag", enabled=nvtx_enabled), _timed_phase(
-                    "two_body_diag_apply", enabled=profile_enabled, timings_ms=timings, stream=stream
+            # Two-body off-diagonal rs (r!=s): build CSR/build-g once per tile/pair block,
+            # then apply across roots.
+            if int(self.rs_block) > 0 and int(self.n_pairs) > 0:
+                with _nvtx_range("cipsi_two_body_offdiag", enabled=nvtx_enabled), _timed_phase(
+                    "two_body_offdiag_apply", enabled=profile_enabled, timings_ms=timings, stream=stream
                 ):
-                    for tile_id_val, pos in tile_groups:
-                        j_start = int(tile_id_val) * int(tile_size)
-                        j_count = min(int(tile_size), int(self.ncsf) - int(j_start))
-                        if j_count <= 0:
+                    for _tile_id_val, pos in tile_groups:
+                        if int(pos.size) <= 0:
                             continue
-                        build_occ_block_from_steps_inplace_device(
-                            self.ws.state_dev,
-                            j_start=int(j_start),
-                            j_count=int(j_count),
-                            occ_out=self.occ_buf[:j_count],
-                            threads=256,
-                            stream=stream,
-                            sync=False,
-                        )
-                        rel = cp.asarray(sel_idx_i32[pos] - int(j_start), dtype=cp.int32)
-                        occ_sel = cp.ascontiguousarray(self.occ_buf[rel])
-                        g_diag_sel = cp.dot(occ_sel, self.eri_diag_t)
-                        g_diag_sel *= 0.5
-                        task_csf_tile = cp.asarray(sel_idx_i32[pos], dtype=cp.int32)
-                        task_scale_tile = cp.ascontiguousarray(c_sel_d[pos, int(r)])
-                        apply_g_flat_scatter_atomic_frontier_hash_inplace_device(
-                            self.drt,
-                            self.ws.drt_dev,
-                            self.ws.state_dev,
-                            task_csf_tile,
-                            g_diag_sel,
-                            task_scale=task_scale_tile,
-                            hash_keys=self.hash_keys,
-                            hash_vals=self.hash_vals,
-                            root=int(r),
-                            overflow=self.hash_overflow,
-                            clear_overflow=False,
-                            threads=256,
-                            stream=stream,
-                            sync=False,
-                            check_overflow=False,
-                        )
-
-                # Two-body off-diagonal rs (r!=s): CSR build from tasks, build-g, apply to frontier hash.
-                if int(self.rs_block) > 0 and int(self.n_pairs) > 0:
-                    # Important: keep timing coarse here. Fine-grained timing inside the inner
-                    # row-block loops would introduce a device sync per block and completely
-                    # distort the actual runtime. For kernel-level hotspot work use Nsight
-                    # (NVTX ranges + kernel names) instead.
-                    with _nvtx_range("cipsi_two_body_offdiag", enabled=nvtx_enabled), _timed_phase(
-                        "two_body_offdiag_apply", enabled=profile_enabled, timings_ms=timings, stream=stream
-                    ):
-                        for _tile_id_val, pos in tile_groups:
-                            task_csf_tile = cp.asarray(sel_idx_i32[pos], dtype=cp.int32)
-                            nsel_tile = int(task_csf_tile.size)
-                            if nsel_tile <= 0:
+                        pos_h = np.asarray(pos, dtype=np.int32)
+                        order = np.argsort(sel_idx_i32[pos_h], kind="stable")
+                        pos_sorted = pos_h[order]
+                        task_csf_tile_h = np.asarray(sel_idx_i32[pos_sorted], dtype=np.int32)
+                        task_csf_tile = cp.asarray(task_csf_tile_h, dtype=cp.int32)
+                        c_tile = cp.ascontiguousarray(c_sel_d[pos_sorted, :])
+                        nsel_tile = int(task_csf_tile.size)
+                        if nsel_tile <= 0:
+                            continue
+                        for p0 in range(0, int(self.n_pairs), int(self.rs_block)):
+                            p1 = min(int(self.n_pairs), int(p0 + int(self.rs_block)))
+                            blk = int(p1 - p0)
+                            if blk <= 0:
                                 continue
-                            for p0 in range(0, int(self.n_pairs), int(self.rs_block)):
-                                p1 = min(int(self.n_pairs), int(p0 + int(self.rs_block)))
-                                blk = int(p1 - p0)
-                                if blk <= 0:
+
+                            with _nvtx_range("cipsi_k25_csr_build", enabled=nvtx_enabled):
+                                task_csf = cp.ascontiguousarray(cp.repeat(task_csf_tile, blk))
+                                task_p = cp.ascontiguousarray(cp.tile(self.rs_r_d[int(p0) : int(p1)], nsel_tile))
+                                task_q = cp.ascontiguousarray(cp.tile(self.rs_s_d[int(p0) : int(p1)], nsel_tile))
+                                nrows, nnz, _nnz_in = k25_ws.build_from_tasks_deterministic_inplace_device(
+                                    self.ws.drt_dev,
+                                    self.ws.state_dev,
+                                    task_csf,
+                                    task_p,
+                                    task_q,
+                                    row_j_buf,
+                                    row_k_buf,
+                                    indptr_buf,
+                                    indices_buf,
+                                    data_buf,
+                                    overflow_buf,
+                                    int(getattr(self.ws, "threads_enum", 128)),
+                                    bool(getattr(self.ws, "coalesce", False)),
+                                    int(stream.ptr),
+                                    True,
+                                    True,
+                                )
+                            nrows = int(nrows)
+                            nnz = int(nnz)
+                            if nrows <= 0 or nnz <= 0:
+                                continue
+
+                            row_j_d = row_j_buf[:nrows]
+                            row_k_d = row_k_buf[:nrows]
+                            indptr_d = indptr_buf[: nrows + 1]
+                            indices_d = indices_buf[:nnz]
+                            data_d = data_buf[:nnz]
+
+                            for row_start in range(0, nrows, int(self.g_rows)):
+                                row_stop = min(nrows, int(row_start + int(self.g_rows)))
+                                nb = int(row_stop - row_start)
+                                if nb <= 0:
                                     continue
+                                g_b = self.g_buf[:nb]
 
-                                with _nvtx_range("cipsi_k25_csr_build", enabled=nvtx_enabled):
-                                    task_csf = cp.ascontiguousarray(cp.repeat(task_csf_tile, blk))
-                                    task_p = cp.ascontiguousarray(cp.tile(self.rs_r_d[int(p0) : int(p1)], nsel_tile))
-                                    task_q = cp.ascontiguousarray(cp.tile(self.rs_s_d[int(p0) : int(p1)], nsel_tile))
-                                    nrows, nnz, _nnz_in = k25_ws.build_from_tasks_deterministic_inplace_device(
-                                        self.ws.drt_dev,
-                                        self.ws.state_dev,
-                                        task_csf,
-                                        task_p,
-                                        task_q,
-                                        row_j_buf,
-                                        row_k_buf,
-                                        indptr_buf,
-                                        indices_buf,
-                                        data_buf,
-                                        overflow_buf,
-                                        int(getattr(self.ws, "threads_enum", 128)),
-                                        bool(getattr(self.ws, "coalesce", False)),
-                                        int(stream.ptr),
-                                        True,
-                                        True,
-                                    )
-                                nrows = int(nrows)
-                                nnz = int(nnz)
-                                if nrows <= 0 or nnz <= 0:
-                                    continue
-
-                                row_j_d = row_j_buf[:nrows]
-                                row_k_d = row_k_buf[:nrows]
-                                indptr_d = indptr_buf[: nrows + 1]
-                                indices_d = indices_buf[:nnz]
-                                data_d = data_buf[:nnz]
-
-                                for row_start in range(0, nrows, int(self.g_rows)):
-                                    row_stop = min(nrows, int(row_start + int(self.g_rows)))
-                                    nb = int(row_stop - row_start)
-                                    if nb <= 0:
-                                        continue
-                                    g_b = self.g_buf[:nb]
-
-                                    with _nvtx_range("cipsi_kernel3_build_g", enabled=nvtx_enabled):
-                                        if l_full is not None:
-                                            if self.gdf_ws is None:
-                                                raise RuntimeError("internal error: gdf_ws is missing for DF path")
-                                            self.gdf_ws.build_g_from_csr_l_full_range_inplace_device(
-                                                indptr_d,
-                                                indices_d,
-                                                data_d,
-                                                row_start=int(row_start),
-                                                nrows=int(nb),
-                                                l_full=l_full,
-                                                g_out=g_b,
-                                                threads=int(getattr(self.ws, "threads_g", 256)),
-                                                half=0.5,
-                                                stream=stream,
-                                                sync=False,
-                                            )
-                                        else:
-                                            if eri_mat is None:
-                                                raise RuntimeError("internal error: eri_mat is missing for non-DF path")
-                                            kernel3_build_g_from_csr_eri_mat_range_inplace_device(
-                                                indptr_d,
-                                                indices_d,
-                                                data_d,
-                                                row_start=int(row_start),
-                                                nrows=int(nb),
-                                                eri_mat=eri_mat,
-                                                g_out=g_b,
-                                                threads=int(getattr(self.ws, "threads_g", 256)),
-                                                half=0.5,
-                                                stream=stream,
-                                                sync=False,
-                                            )
-
-                                    row_j_b = row_j_d[int(row_start) : int(row_stop)]
-                                    row_k_b = row_k_d[int(row_start) : int(row_stop)]
-                                    task_scale_row = cp.ascontiguousarray(cp.take(self.x_full, row_j_b))
-
-                                    with _nvtx_range("cipsi_apply_to_hash_offdiag", enabled=nvtx_enabled):
-                                        apply_g_flat_scatter_atomic_frontier_hash_inplace_device(
-                                            self.drt,
-                                            self.ws.drt_dev,
-                                            self.ws.state_dev,
-                                            row_k_b,
-                                            g_b,
-                                            task_scale=task_scale_row,
-                                            hash_keys=self.hash_keys,
-                                            hash_vals=self.hash_vals,
-                                            root=int(r),
-                                            overflow=self.hash_overflow,
-                                            clear_overflow=False,
-                                            threads=int(getattr(self.ws, "threads_apply", 256)),
+                                with _nvtx_range("cipsi_kernel3_build_g", enabled=nvtx_enabled):
+                                    if l_full is not None:
+                                        if self.gdf_ws is None:
+                                            raise RuntimeError("internal error: gdf_ws is missing for DF path")
+                                        self.gdf_ws.build_g_from_csr_l_full_range_inplace_device(
+                                            indptr_d,
+                                            indices_d,
+                                            data_d,
+                                            row_start=int(row_start),
+                                            nrows=int(nb),
+                                            l_full=l_full,
+                                            g_out=g_b,
+                                            threads=int(getattr(self.ws, "threads_g", 256)),
+                                            half=0.5,
                                             stream=stream,
                                             sync=False,
-                                            check_overflow=False,
                                         )
+                                    else:
+                                        if eri_mat is None:
+                                            raise RuntimeError("internal error: eri_mat is missing for non-DF path")
+                                        kernel3_build_g_from_csr_eri_mat_range_inplace_device(
+                                            indptr_d,
+                                            indices_d,
+                                            data_d,
+                                            row_start=int(row_start),
+                                            nrows=int(nb),
+                                            eri_mat=eri_mat,
+                                            g_out=g_b,
+                                            threads=int(getattr(self.ws, "threads_g", 256)),
+                                            half=0.5,
+                                            stream=stream,
+                                            sync=False,
+                                        )
+
+                                row_j_b = row_j_d[int(row_start) : int(row_stop)]
+                                row_k_b = row_k_d[int(row_start) : int(row_stop)]
+                                row_local = cp.searchsorted(task_csf_tile, row_j_b)
+                                task_scale_rows = cp.ascontiguousarray(c_tile[row_local, :])
+                                with _nvtx_range("cipsi_apply_to_hash_offdiag", enabled=nvtx_enabled):
+                                    apply_g_flat_scatter_atomic_frontier_hash_many_roots_inplace_device(
+                                        self.drt,
+                                        self.ws.drt_dev,
+                                        self.ws.state_dev,
+                                        row_k_b,
+                                        g_b,
+                                        task_scale_task_major=task_scale_rows,
+                                        hash_keys=self.hash_keys,
+                                        hash_vals=self.hash_vals,
+                                        selected_mask=self.selected_mask_d,
+                                        overflow=self.hash_overflow,
+                                        clear_overflow=False,
+                                        threads=int(getattr(self.ws, "threads_apply", 256)),
+                                        stream=stream,
+                                        sync=False,
+                                        check_overflow=False,
+                                    )
 
             # Overflow check: if set, grow cap and retry.
             if int(self.hash_overflow.get()[0]) != 0:
                 cap = min(int(cap) << 1, 1 << 30)
                 overflow_retries += 1
                 continue
-
-            # Extract compact frontier for scoring.
-            with _nvtx_range("cipsi_hash_extract", enabled=nvtx_enabled), _timed_phase(
-                "hash_extract", enabled=profile_enabled, timings_ms=timings, stream=stream
-            ):
-                cipsi_frontier_hash_extract_inplace_device(
-                    self.hash_keys,
-                    self.hash_vals,
-                    out_idx=self.out_idx,
-                    out_vals_root_major=self.out_vals,
-                    out_nnz=self.out_nnz,
-                    threads=256,
-                    stream=stream,
-                    sync=True,
-                )
-            nnz_out = int(self.out_nnz.get()[0])
 
             out_new_idx = cp.empty((int(max_add),), dtype=cp.int32) if int(max_add) > 0 else cp.empty((0,), dtype=cp.int32)
             out_new_n = cp.empty((1,), dtype=cp.int32)
@@ -567,10 +549,9 @@ class FrontierHashSelector:
             with _nvtx_range("cipsi_score_select", enabled=nvtx_enabled), _timed_phase(
                 "score_pt2_select", enabled=profile_enabled, timings_ms=timings, stream=stream
             ):
-                cipsi_score_and_select_topk_inplace_device(
-                    self.out_idx,
-                    self.out_vals,
-                    nnz=int(nnz_out),
+                cipsi_score_and_select_topk_from_hash_slots_inplace_device(
+                    self.hash_keys,
+                    self.hash_vals,
                     e_var=e_var_d,
                     hdiag=self.hdiag_d,
                     selected_mask=self.selected_mask_d,
@@ -582,6 +563,8 @@ class FrontierHashSelector:
                     stream=stream,
                     sync=True,
                 )
+            with _timed_phase("hash_count_nnz", enabled=profile_enabled, timings_ms=timings, stream=stream):
+                nnz_out = int(cp.count_nonzero(self.hash_keys >= 0).get())
 
             e_pt2_h = cp.asnumpy(out_pt2)
             n_new = int(out_new_n.get()[0])

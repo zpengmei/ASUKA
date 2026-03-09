@@ -763,8 +763,6 @@ void cueri_bind_part9(py::module_& m) {
         auto tile = cuda_array_view_from_object(tile_vals, "tile_vals");
         auto da = cuda_array_view_from_object(Da_mat, "Da_mat");
         auto db = cuda_array_view_from_object(Db_mat, "Db_mat");
-        auto ja = cuda_array_view_from_object(Ja_mat, "Ja_mat");
-        auto jb = cuda_array_view_from_object(Jb_mat, "Jb_mat");
 
         require_typestr(ab, "task_spAB", "<i4");
         require_typestr(cd, "task_spCD", "<i4");
@@ -774,8 +772,6 @@ void cueri_bind_part9(py::module_& m) {
         require_typestr(tile, "tile_vals", "<f8");
         require_typestr(da, "Da_mat", "<f8");
         require_typestr(db, "Db_mat", "<f8");
-        require_typestr(ja, "Ja_mat", "<f8");
-        require_typestr(jb, "Jb_mat", "<f8");
 
         const int64_t ntasks = require_1d(ab, "task_spAB");
         if (require_1d(cd, "task_spCD") != ntasks) {
@@ -797,8 +793,22 @@ void cueri_bind_part9(py::module_& m) {
         const int64_t nao2 = static_cast<int64_t>(nao) * static_cast<int64_t>(nao);
         if (require_1d(da, "Da_mat") != nao2) throw std::invalid_argument("Da_mat must have shape (nao*nao,)");
         if (require_1d(db, "Db_mat") != nao2) throw std::invalid_argument("Db_mat must have shape (nao*nao,)");
-        if (require_1d(ja, "Ja_mat") != nao2) throw std::invalid_argument("Ja_mat must have shape (nao*nao,)");
-        if (require_1d(jb, "Jb_mat") != nao2) throw std::invalid_argument("Jb_mat must have shape (nao*nao,)");
+
+        // Ja, Jb optional (pass None → nullptr to skip Coulomb)
+        double* ja_ptr = nullptr;
+        if (!Ja_mat.is_none()) {
+          auto ja = cuda_array_view_from_object(Ja_mat, "Ja_mat");
+          require_typestr(ja, "Ja_mat", "<f8");
+          if (require_1d(ja, "Ja_mat") != nao2) throw std::invalid_argument("Ja_mat must have shape (nao*nao,)");
+          ja_ptr = static_cast<double*>(ja.ptr);
+        }
+        double* jb_ptr = nullptr;
+        if (!Jb_mat.is_none()) {
+          auto jb = cuda_array_view_from_object(Jb_mat, "Jb_mat");
+          require_typestr(jb, "Jb_mat", "<f8");
+          if (require_1d(jb, "Jb_mat") != nao2) throw std::invalid_argument("Jb_mat must have shape (nao*nao,)");
+          jb_ptr = static_cast<double*>(jb.ptr);
+        }
 
         // Ka, Kb optional (pass None → nullptr to skip exchange)
         double* ka_ptr = nullptr;
@@ -833,9 +843,9 @@ void cueri_bind_part9(py::module_& m) {
                 static_cast<const double*>(tile.ptr),
                 static_cast<const double*>(da.ptr),
                 static_cast<const double*>(db.ptr),
-                static_cast<double*>(ja.ptr),
+                ja_ptr,
                 ka_ptr,
-                static_cast<double*>(jb.ptr),
+                jb_ptr,
                 kb_ptr,
                 stream,
                 threads),
@@ -976,6 +986,205 @@ void cueri_bind_part9(py::module_& m) {
       py::arg("lb"),
       py::arg("lc"),
       py::arg("ld"),
+      py::arg("threads") = 256,
+      py::arg("stream") = 0,
+      py::arg("sync") = true);
+
+  // Fused left cart->sph transform + scatter (consumes right-transform output).
+  m.def(
+      "cart2sph_eri_left_scatter_s8_inplace_device",
+      [](py::object task_spAB,
+         py::object task_spCD,
+         py::object sp_A,
+         py::object sp_B,
+         py::object shell_ao_start_sph,
+         int nao_sph,
+         int la,
+         int lb,
+         int lc,
+         int ld,
+         py::object tile_tmp,
+         py::object out_s8,
+         int threads,
+         uint64_t stream_ptr,
+         bool sync) {
+        require_threads_multiple_of_32(threads, "cart2sph_eri_left_scatter_s8_inplace_device");
+        if (nao_sph < 0) throw std::invalid_argument("nao_sph must be >= 0");
+        if (la < 0 || lb < 0 || lc < 0 || ld < 0) throw std::invalid_argument("negative l is invalid");
+
+        auto ab = cuda_array_view_from_object(task_spAB, "task_spAB");
+        auto cd = cuda_array_view_from_object(task_spCD, "task_spCD");
+        auto spa = cuda_array_view_from_object(sp_A, "sp_A");
+        auto spb = cuda_array_view_from_object(sp_B, "sp_B");
+        auto sh0 = cuda_array_view_from_object(shell_ao_start_sph, "shell_ao_start_sph");
+        auto tin = cuda_array_view_from_object(tile_tmp, "tile_tmp");
+        auto out = cuda_array_view_from_object(out_s8, "out_s8");
+
+        require_typestr(ab, "task_spAB", "<i4");
+        require_typestr(cd, "task_spCD", "<i4");
+        require_typestr(spa, "sp_A", "<i4");
+        require_typestr(spb, "sp_B", "<i4");
+        require_typestr(sh0, "shell_ao_start_sph", "<i4");
+        require_typestr(tin, "tile_tmp", "<f8");
+        require_typestr(out, "out_s8", "<f8");
+
+        const int64_t ntasks = require_1d(ab, "task_spAB");
+        if (require_1d(cd, "task_spCD") != ntasks) {
+          throw std::invalid_argument("task_spAB/task_spCD must have identical shape (ntasks,)");
+        }
+        const int64_t nsp = require_1d(spa, "sp_A");
+        if (require_1d(spb, "sp_B") != nsp) {
+          throw std::invalid_argument("sp_A/sp_B must have identical shape (nsp,)");
+        }
+        (void)require_1d(sh0, "shell_ao_start_sph");
+
+        const int64_t nA_cart = (static_cast<int64_t>(la + 1) * static_cast<int64_t>(la + 2)) >> 1;
+        const int64_t nB_cart = (static_cast<int64_t>(lb + 1) * static_cast<int64_t>(lb + 2)) >> 1;
+        const int64_t nAB_cart = nA_cart * nB_cart;
+        const int64_t nCD_sph = static_cast<int64_t>(2 * lc + 1) * static_cast<int64_t>(2 * ld + 1);
+        const int64_t need_tmp = ntasks * nAB_cart * nCD_sph;
+        if (require_1d(tin, "tile_tmp") != need_tmp) {
+          throw std::invalid_argument("tile_tmp must have shape (ntasks*nAB_cart*nCD_sph,)");
+        }
+
+        const int64_t nao_pair = (static_cast<int64_t>(nao_sph) * static_cast<int64_t>(nao_sph + 1)) / 2;
+        const int64_t need_out = (nao_pair * (nao_pair + 1)) / 2;
+        if (require_1d(out, "out_s8") != need_out) {
+          throw std::invalid_argument("out_s8 must have shape (nao_pair*(nao_pair+1)/2,)");
+        }
+
+        cudaStream_t stream = stream_from_uint(stream_ptr);
+        throw_on_cuda_error(
+            cueri_cart2sph_eri_left_scatter_s8_launch_stream(
+                static_cast<const int32_t*>(ab.ptr),
+                static_cast<const int32_t*>(cd.ptr),
+                static_cast<int>(ntasks),
+                static_cast<const int32_t*>(spa.ptr),
+                static_cast<const int32_t*>(spb.ptr),
+                static_cast<const int32_t*>(sh0.ptr),
+                static_cast<int>(nao_sph),
+                la,
+                lb,
+                lc,
+                ld,
+                static_cast<const double*>(tin.ptr),
+                static_cast<double*>(out.ptr),
+                stream,
+                threads),
+            "cueri_cart2sph_eri_left_scatter_s8_launch_stream");
+        if (sync) throw_on_cuda_error(cudaStreamSynchronize(stream), "cudaStreamSynchronize");
+      },
+      py::arg("task_spAB"),
+      py::arg("task_spCD"),
+      py::arg("sp_A"),
+      py::arg("sp_B"),
+      py::arg("shell_ao_start_sph"),
+      py::arg("nao_sph"),
+      py::arg("la"),
+      py::arg("lb"),
+      py::arg("lc"),
+      py::arg("ld"),
+      py::arg("tile_tmp"),
+      py::arg("out_s8"),
+      py::arg("threads") = 256,
+      py::arg("stream") = 0,
+      py::arg("sync") = true);
+
+  m.def(
+      "cart2sph_eri_left_scatter_s4_inplace_device",
+      [](py::object task_spAB,
+         py::object task_spCD,
+         py::object sp_A,
+         py::object sp_B,
+         py::object shell_ao_start_sph,
+         int nao_sph,
+         int la,
+         int lb,
+         int lc,
+         int ld,
+         py::object tile_tmp,
+         py::object out_s4,
+         int threads,
+         uint64_t stream_ptr,
+         bool sync) {
+        require_threads_multiple_of_32(threads, "cart2sph_eri_left_scatter_s4_inplace_device");
+        if (nao_sph < 0) throw std::invalid_argument("nao_sph must be >= 0");
+        if (la < 0 || lb < 0 || lc < 0 || ld < 0) throw std::invalid_argument("negative l is invalid");
+
+        auto ab = cuda_array_view_from_object(task_spAB, "task_spAB");
+        auto cd = cuda_array_view_from_object(task_spCD, "task_spCD");
+        auto spa = cuda_array_view_from_object(sp_A, "sp_A");
+        auto spb = cuda_array_view_from_object(sp_B, "sp_B");
+        auto sh0 = cuda_array_view_from_object(shell_ao_start_sph, "shell_ao_start_sph");
+        auto tin = cuda_array_view_from_object(tile_tmp, "tile_tmp");
+        auto out = cuda_array_view_from_object(out_s4, "out_s4");
+
+        require_typestr(ab, "task_spAB", "<i4");
+        require_typestr(cd, "task_spCD", "<i4");
+        require_typestr(spa, "sp_A", "<i4");
+        require_typestr(spb, "sp_B", "<i4");
+        require_typestr(sh0, "shell_ao_start_sph", "<i4");
+        require_typestr(tin, "tile_tmp", "<f8");
+        require_typestr(out, "out_s4", "<f8");
+
+        const int64_t ntasks = require_1d(ab, "task_spAB");
+        if (require_1d(cd, "task_spCD") != ntasks) {
+          throw std::invalid_argument("task_spAB/task_spCD must have identical shape (ntasks,)");
+        }
+        const int64_t nsp = require_1d(spa, "sp_A");
+        if (require_1d(spb, "sp_B") != nsp) {
+          throw std::invalid_argument("sp_A/sp_B must have identical shape (nsp,)");
+        }
+        (void)require_1d(sh0, "shell_ao_start_sph");
+
+        const int64_t nA_cart = (static_cast<int64_t>(la + 1) * static_cast<int64_t>(la + 2)) >> 1;
+        const int64_t nB_cart = (static_cast<int64_t>(lb + 1) * static_cast<int64_t>(lb + 2)) >> 1;
+        const int64_t nAB_cart = nA_cart * nB_cart;
+        const int64_t nCD_sph = static_cast<int64_t>(2 * lc + 1) * static_cast<int64_t>(2 * ld + 1);
+        const int64_t need_tmp = ntasks * nAB_cart * nCD_sph;
+        if (require_1d(tin, "tile_tmp") != need_tmp) {
+          throw std::invalid_argument("tile_tmp must have shape (ntasks*nAB_cart*nCD_sph,)");
+        }
+
+        const int64_t nao_pair = (static_cast<int64_t>(nao_sph) * static_cast<int64_t>(nao_sph + 1)) / 2;
+        const int64_t need_out = nao_pair * nao_pair;
+        if (require_1d(out, "out_s4") != need_out) {
+          throw std::invalid_argument("out_s4 must have shape (nao_pair*nao_pair,)");
+        }
+
+        cudaStream_t stream = stream_from_uint(stream_ptr);
+        throw_on_cuda_error(
+            cueri_cart2sph_eri_left_scatter_s4_launch_stream(
+                static_cast<const int32_t*>(ab.ptr),
+                static_cast<const int32_t*>(cd.ptr),
+                static_cast<int>(ntasks),
+                static_cast<const int32_t*>(spa.ptr),
+                static_cast<const int32_t*>(spb.ptr),
+                static_cast<const int32_t*>(sh0.ptr),
+                static_cast<int>(nao_sph),
+                la,
+                lb,
+                lc,
+                ld,
+                static_cast<const double*>(tin.ptr),
+                static_cast<double*>(out.ptr),
+                stream,
+                threads),
+            "cueri_cart2sph_eri_left_scatter_s4_launch_stream");
+        if (sync) throw_on_cuda_error(cudaStreamSynchronize(stream), "cudaStreamSynchronize");
+      },
+      py::arg("task_spAB"),
+      py::arg("task_spCD"),
+      py::arg("sp_A"),
+      py::arg("sp_B"),
+      py::arg("shell_ao_start_sph"),
+      py::arg("nao_sph"),
+      py::arg("la"),
+      py::arg("lb"),
+      py::arg("lc"),
+      py::arg("ld"),
+      py::arg("tile_tmp"),
+      py::arg("out_s4"),
       py::arg("threads") = 256,
       py::arg("stream") = 0,
       py::arg("sync") = true);

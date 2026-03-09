@@ -12,6 +12,7 @@ from .shell_pairs import ShellPairs
 from .shell_pairs import build_shell_pairs
 from .shell_pairs import build_shell_pairs_l_order
 from .stream import stream_ctx, stream_ptr
+from .native_class_sets import STEP2_NATIVE_CLASS_IDS
 from .tasks import TaskList
 from .tasks import decode_eri_class_id, eri_class_id, group_tasks_by_class, with_task_class_id
 
@@ -137,6 +138,7 @@ class _DFMetric2c2eRysPlan:
     batch_p0_dev: list[object]
     batch_q0_dev: list[object]
     naux: int
+    ready_event: object | None = None
 
 
 @dataclass(frozen=True)
@@ -156,6 +158,7 @@ class _DFInt3c2eRysPlan:
     nao: int
     nao_sph: int
     naux: int
+    ready_event: object | None = None
 
 
 _DF_PLAN_CACHE_MAX = 4
@@ -182,6 +185,7 @@ class _DFInt3c2eRysContractedAOPlan:
     n_shell_ao: int
     nao: int
     naux: int
+    ready_event: object | None = None
 
 
 _df_int3c2e_rys_contracted_ao_plan_cache: dict[tuple, tuple[weakref.ref, weakref.ref, _DFInt3c2eRysContractedAOPlan]] = {}
@@ -193,59 +197,68 @@ _df_int3c2e_rys_contracted_ao_plan_cache: dict[tuple, tuple[weakref.ref, weakref
 # `_get_df_int3c2e_rys_plan` cache effective (it keys by id(ao_basis)).
 _expanded_cart_basis_cache: dict[int, tuple[weakref.ref, object]] = {}
 
-# Kernel classes with native Step-2 kernels (see `cueri/eri_dispatch.py`).
-_STEP2_BASE_CLASS_IDS: set[int] = {
-    int(eri_class_id(0, 0, 0, 0)),  # ssss
-    int(eri_class_id(1, 0, 0, 0)),  # psss
-    int(eri_class_id(1, 1, 0, 0)),  # ppss
-    int(eri_class_id(1, 0, 1, 0)),  # psps
-    int(eri_class_id(1, 1, 1, 0)),  # ppps
-    int(eri_class_id(1, 1, 1, 1)),  # pppp
-    int(eri_class_id(2, 0, 0, 0)),  # dsss
-    int(eri_class_id(2, 2, 0, 0)),  # ddss
-    int(eri_class_id(0, 0, 2, 1)),  # ssdp
-    int(eri_class_id(1, 0, 2, 0)),  # psds
-    int(eri_class_id(1, 0, 2, 1)),  # psdp
-    int(eri_class_id(1, 0, 2, 2)),  # psdd
-    int(eri_class_id(1, 1, 2, 0)),  # ppds
-    int(eri_class_id(1, 1, 2, 1)),  # ppdp
-    int(eri_class_id(1, 1, 2, 2)),  # ppdd
-    int(eri_class_id(2, 0, 2, 0)),  # dsds
-    int(eri_class_id(2, 0, 2, 1)),  # dsdp
-    int(eri_class_id(2, 0, 2, 2)),  # dsdd
-    int(eri_class_id(3, 1, 0, 0)),  # fpss
-    int(eri_class_id(3, 2, 0, 0)),  # fdss
-    int(eri_class_id(3, 3, 0, 0)),  # ffss
-    int(eri_class_id(3, 1, 1, 0)),  # fpps
-    int(eri_class_id(3, 2, 1, 0)),  # fdps
-    int(eri_class_id(3, 3, 1, 0)),  # ffps
-    int(eri_class_id(3, 1, 2, 0)),  # fpds
-    int(eri_class_id(3, 2, 2, 0)),  # fdds
-    int(eri_class_id(3, 3, 2, 0)),  # ffds
-    int(eri_class_id(0, 0, 3, 0)),  # ssfs
-    int(eri_class_id(1, 0, 3, 0)),  # psfs
-    int(eri_class_id(1, 1, 3, 0)),  # ppfs
-    int(eri_class_id(2, 0, 3, 0)),  # dsfs
-    int(eri_class_id(3, 0, 3, 0)),  # fsfs
-    int(eri_class_id(2, 1, 3, 0)),  # dpfs
-    int(eri_class_id(3, 1, 3, 0)),  # fpfs
-    int(eri_class_id(2, 2, 3, 0)),  # ddfs
-    int(eri_class_id(3, 2, 3, 0)),  # fdfs
-    int(eri_class_id(3, 3, 3, 0)),  # fffs
-    int(eri_class_id(0, 0, 4, 0)),  # ssgs
-    int(eri_class_id(1, 0, 4, 0)),  # psgs
-    int(eri_class_id(1, 1, 4, 0)),  # ppgs
-    int(eri_class_id(2, 0, 4, 0)),  # dsgs
-    int(eri_class_id(3, 0, 4, 0)),  # fsgs
-    int(eri_class_id(2, 1, 4, 0)),  # dpgs
-    int(eri_class_id(3, 1, 4, 0)),  # fpgs
-    int(eri_class_id(2, 2, 4, 0)),  # ddgs
-    int(eri_class_id(3, 2, 4, 0)),  # fdgs
-    int(eri_class_id(3, 3, 4, 0)),  # ffgs
-    int(eri_class_id(2, 1, 2, 1)),  # dpdp
-    int(eri_class_id(2, 1, 2, 2)),  # dpdd
-    int(eri_class_id(2, 2, 2, 2)),  # dddd
-}
+# Kernel classes with native Step-2 kernels (centralized in native_class_sets.py).
+_STEP2_BASE_CLASS_IDS: set[int] = {int(cid) for cid in STEP2_NATIVE_CLASS_IDS}
+
+
+def _task_arrays_device_cached(tasks: TaskList):
+    """Return device-resident, contiguous int32 task arrays with per-TaskList caching.
+
+    The TaskList object is treated as immutable (frozen dataclass contract). We cache
+    uploaded `task_spAB/task_spCD` arrays on the TaskList instance and reuse them on
+    subsequent launches on the same CUDA device.
+    """
+
+    import cupy as cp
+
+    task_ab_src = tasks.task_spAB
+    task_cd_src = tasks.task_spCD
+    device_id = int(cp.cuda.runtime.getDevice())
+
+    def _is_valid_dev_arr(x) -> bool:
+        return (
+            isinstance(x, cp.ndarray)
+            and x.dtype == cp.int32
+            and bool(x.flags.c_contiguous)
+            and int(x.device.id) == device_id
+        )
+
+    # Already device-resident and contiguous: no upload needed.
+    if _is_valid_dev_arr(task_ab_src) and _is_valid_dev_arr(task_cd_src):
+        return task_ab_src, task_cd_src
+
+    cached_dev = getattr(tasks, "_task_dev_device_id", None)
+    cached_src_ab_id = getattr(tasks, "_task_dev_src_ab_id", None)
+    cached_src_cd_id = getattr(tasks, "_task_dev_src_cd_id", None)
+    cached_ab = getattr(tasks, "_task_spAB_dev", None)
+    cached_cd = getattr(tasks, "_task_spCD_dev", None)
+    if (
+        cached_dev is not None
+        and cached_src_ab_id is not None
+        and cached_src_cd_id is not None
+        and int(cached_dev) == device_id
+        and int(cached_src_ab_id) == id(task_ab_src)
+        and int(cached_src_cd_id) == id(task_cd_src)
+        and _is_valid_dev_arr(cached_ab)
+        and _is_valid_dev_arr(cached_cd)
+    ):
+        return cached_ab, cached_cd
+
+    task_ab_dev = cp.ascontiguousarray(cp.asarray(task_ab_src, dtype=cp.int32))
+    task_cd_dev = cp.ascontiguousarray(cp.asarray(task_cd_src, dtype=cp.int32))
+
+    try:
+        # TaskList is frozen, but object.__setattr__ is safe for internal caches.
+        object.__setattr__(tasks, "_task_dev_device_id", int(device_id))
+        object.__setattr__(tasks, "_task_dev_src_ab_id", int(id(task_ab_src)))
+        object.__setattr__(tasks, "_task_dev_src_cd_id", int(id(task_cd_src)))
+        object.__setattr__(tasks, "_task_spAB_dev", task_ab_dev)
+        object.__setattr__(tasks, "_task_spCD_dev", task_cd_dev)
+    except Exception:
+        # If the object does not allow attribute assignment, keep behavior correct
+        # without persistence.
+        pass
+    return task_ab_dev, task_cd_dev
 
 
 def clear_plan_caches() -> None:
@@ -556,6 +569,274 @@ def cart2sph_eri_tiles_device(
         return out
 
 
+def cart2sph_eri_tiles_scatter_sph_s8_inplace_device(
+    tasks: TaskList,
+    shell_pairs: DeviceShellPairs,
+    *,
+    shell_ao_start_sph,
+    nao_sph: int,
+    la: int,
+    lb: int,
+    lc: int,
+    ld: int,
+    tile_cart,
+    out_s8,
+    tmp=None,
+    stream=None,
+    threads: int = 256,
+):
+    """Right-transform Cartesian ERI tiles and fused-scatter to spherical s8 output."""
+
+    import cupy as cp
+
+    _require_cuda_ext()
+    nao_sph = int(nao_sph)
+    la = int(la)
+    lb = int(lb)
+    lc = int(lc)
+    ld = int(ld)
+
+    with stream_ctx(stream):
+        task_ab, task_cd = _task_arrays_device_cached(tasks)
+
+        shell_ao_start_sph = cp.asarray(shell_ao_start_sph, dtype=cp.int32)
+        shell_ao_start_sph = cp.ascontiguousarray(shell_ao_start_sph)
+
+        tile_cart = cp.asarray(tile_cart, dtype=cp.float64)
+        tile_cart = cp.ascontiguousarray(tile_cart)
+        if tile_cart.ndim != 3:
+            raise ValueError("tile_cart must have shape (ntasks, nAB_cart, nCD_cart)")
+
+        ntasks = int(tile_cart.shape[0])
+        if int(task_ab.size) != ntasks or int(task_cd.size) != ntasks:
+            raise ValueError("tasks length mismatch with tile_cart batch dimension")
+
+        nA_cart = int(ncart(la))
+        nB_cart = int(ncart(lb))
+        nC_cart = int(ncart(lc))
+        nD_cart = int(ncart(ld))
+        nAB_cart = nA_cart * nB_cart
+        nCD_cart = nC_cart * nD_cart
+        if tuple(tile_cart.shape[1:]) != (nAB_cart, nCD_cart):
+            raise ValueError(
+                f"tile_cart has shape {tuple(tile_cart.shape)}, expected (nt, {nAB_cart}, {nCD_cart}) for (la,lb,lc,ld)=({la},{lb},{lc},{ld})"
+            )
+
+        nC_sph = 2 * lc + 1
+        nD_sph = 2 * ld + 1
+        nCD_sph = nC_sph * nD_sph
+
+        if tmp is None:
+            tmp = cp.empty((ntasks, nAB_cart, nCD_sph), dtype=cp.float64)
+        else:
+            tmp = cp.asarray(tmp, dtype=cp.float64)
+            if tuple(tmp.shape) != (ntasks, nAB_cart, nCD_sph):
+                raise ValueError(f"tmp must have shape {(ntasks, nAB_cart, nCD_sph)}, got {tuple(tmp.shape)}")
+            tmp = cp.ascontiguousarray(tmp)
+
+        out_s8 = cp.asarray(out_s8, dtype=cp.float64)
+        out_s8 = cp.ascontiguousarray(out_s8).ravel()
+
+        _ext.cart2sph_eri_right_device(
+            tile_cart.ravel(),
+            tmp.ravel(),
+            int(la),
+            int(lb),
+            int(lc),
+            int(ld),
+            int(threads),
+            int(_stream_ptr(stream)),
+            False,
+        )
+
+        if hasattr(_ext, "cart2sph_eri_left_scatter_s8_inplace_device"):
+            _ext.cart2sph_eri_left_scatter_s8_inplace_device(
+                task_ab,
+                task_cd,
+                shell_pairs.sp_A,
+                shell_pairs.sp_B,
+                shell_ao_start_sph,
+                int(nao_sph),
+                int(la),
+                int(lb),
+                int(lc),
+                int(ld),
+                tmp.ravel(),
+                out_s8,
+                int(threads),
+                int(_stream_ptr(stream)),
+                False,
+            )
+        else:
+            # Backward-compatible fallback when running against an older extension.
+            nA_sph = 2 * la + 1
+            nB_sph = 2 * lb + 1
+            tile_sph = cp.empty((ntasks, nA_sph * nB_sph, nCD_sph), dtype=cp.float64)
+            _ext.cart2sph_eri_left_device(
+                tmp.ravel(),
+                tile_sph.ravel(),
+                int(la),
+                int(lb),
+                int(lc),
+                int(ld),
+                int(threads),
+                int(_stream_ptr(stream)),
+                False,
+            )
+            _ext.scatter_eri_tiles_sph_s8_inplace_device(
+                task_ab,
+                task_cd,
+                shell_pairs.sp_A,
+                shell_pairs.sp_B,
+                shell_ao_start_sph,
+                int(nao_sph),
+                int(nA_sph),
+                int(nB_sph),
+                int(nC_sph),
+                int(nD_sph),
+                tile_sph.ravel(),
+                out_s8,
+                int(threads),
+                int(_stream_ptr(stream)),
+                False,
+            )
+        return out_s8
+
+
+def cart2sph_eri_tiles_scatter_sph_s4_inplace_device(
+    tasks: TaskList,
+    shell_pairs: DeviceShellPairs,
+    *,
+    shell_ao_start_sph,
+    nao_sph: int,
+    la: int,
+    lb: int,
+    lc: int,
+    ld: int,
+    tile_cart,
+    out_s4,
+    tmp=None,
+    stream=None,
+    threads: int = 256,
+):
+    """Right-transform Cartesian ERI tiles and fused-scatter to spherical s4 output."""
+
+    import cupy as cp
+
+    _require_cuda_ext()
+    nao_sph = int(nao_sph)
+    la = int(la)
+    lb = int(lb)
+    lc = int(lc)
+    ld = int(ld)
+
+    with stream_ctx(stream):
+        task_ab, task_cd = _task_arrays_device_cached(tasks)
+
+        shell_ao_start_sph = cp.asarray(shell_ao_start_sph, dtype=cp.int32)
+        shell_ao_start_sph = cp.ascontiguousarray(shell_ao_start_sph)
+
+        tile_cart = cp.asarray(tile_cart, dtype=cp.float64)
+        tile_cart = cp.ascontiguousarray(tile_cart)
+        if tile_cart.ndim != 3:
+            raise ValueError("tile_cart must have shape (ntasks, nAB_cart, nCD_cart)")
+
+        ntasks = int(tile_cart.shape[0])
+        if int(task_ab.size) != ntasks or int(task_cd.size) != ntasks:
+            raise ValueError("tasks length mismatch with tile_cart batch dimension")
+
+        nA_cart = int(ncart(la))
+        nB_cart = int(ncart(lb))
+        nC_cart = int(ncart(lc))
+        nD_cart = int(ncart(ld))
+        nAB_cart = nA_cart * nB_cart
+        nCD_cart = nC_cart * nD_cart
+        if tuple(tile_cart.shape[1:]) != (nAB_cart, nCD_cart):
+            raise ValueError(
+                f"tile_cart has shape {tuple(tile_cart.shape)}, expected (nt, {nAB_cart}, {nCD_cart}) for (la,lb,lc,ld)=({la},{lb},{lc},{ld})"
+            )
+
+        nC_sph = 2 * lc + 1
+        nD_sph = 2 * ld + 1
+        nCD_sph = nC_sph * nD_sph
+
+        if tmp is None:
+            tmp = cp.empty((ntasks, nAB_cart, nCD_sph), dtype=cp.float64)
+        else:
+            tmp = cp.asarray(tmp, dtype=cp.float64)
+            if tuple(tmp.shape) != (ntasks, nAB_cart, nCD_sph):
+                raise ValueError(f"tmp must have shape {(ntasks, nAB_cart, nCD_sph)}, got {tuple(tmp.shape)}")
+            tmp = cp.ascontiguousarray(tmp)
+
+        out_s4 = cp.asarray(out_s4, dtype=cp.float64)
+        out_s4 = cp.ascontiguousarray(out_s4).ravel()
+
+        _ext.cart2sph_eri_right_device(
+            tile_cart.ravel(),
+            tmp.ravel(),
+            int(la),
+            int(lb),
+            int(lc),
+            int(ld),
+            int(threads),
+            int(_stream_ptr(stream)),
+            False,
+        )
+
+        if hasattr(_ext, "cart2sph_eri_left_scatter_s4_inplace_device"):
+            _ext.cart2sph_eri_left_scatter_s4_inplace_device(
+                task_ab,
+                task_cd,
+                shell_pairs.sp_A,
+                shell_pairs.sp_B,
+                shell_ao_start_sph,
+                int(nao_sph),
+                int(la),
+                int(lb),
+                int(lc),
+                int(ld),
+                tmp.ravel(),
+                out_s4,
+                int(threads),
+                int(_stream_ptr(stream)),
+                False,
+            )
+        else:
+            # Backward-compatible fallback when running against an older extension.
+            nA_sph = 2 * la + 1
+            nB_sph = 2 * lb + 1
+            tile_sph = cp.empty((ntasks, nA_sph * nB_sph, nCD_sph), dtype=cp.float64)
+            _ext.cart2sph_eri_left_device(
+                tmp.ravel(),
+                tile_sph.ravel(),
+                int(la),
+                int(lb),
+                int(lc),
+                int(ld),
+                int(threads),
+                int(_stream_ptr(stream)),
+                False,
+            )
+            _ext.scatter_eri_tiles_sph_s4_inplace_device(
+                task_ab,
+                task_cd,
+                shell_pairs.sp_A,
+                shell_pairs.sp_B,
+                shell_ao_start_sph,
+                int(nao_sph),
+                int(nA_sph),
+                int(nB_sph),
+                int(nC_sph),
+                int(nD_sph),
+                tile_sph.ravel(),
+                out_s4,
+                int(threads),
+                int(_stream_ptr(stream)),
+                False,
+            )
+        return out_s4
+
+
 def scatter_eri_tiles_sph_s8_inplace_device(
     tasks: TaskList,
     shell_pairs: DeviceShellPairs,
@@ -583,10 +864,7 @@ def scatter_eri_tiles_sph_s8_inplace_device(
     nD = int(nD)
 
     with stream_ctx(stream):
-        task_ab = cp.asarray(tasks.task_spAB, dtype=cp.int32)
-        task_cd = cp.asarray(tasks.task_spCD, dtype=cp.int32)
-        task_ab = cp.ascontiguousarray(task_ab)
-        task_cd = cp.ascontiguousarray(task_cd)
+        task_ab, task_cd = _task_arrays_device_cached(tasks)
 
         shell_ao_start_sph = cp.asarray(shell_ao_start_sph, dtype=cp.int32)
         shell_ao_start_sph = cp.ascontiguousarray(shell_ao_start_sph)
@@ -644,10 +922,7 @@ def scatter_eri_tiles_sph_s4_inplace_device(
     nD = int(nD)
 
     with stream_ctx(stream):
-        task_ab = cp.asarray(tasks.task_spAB, dtype=cp.int32)
-        task_cd = cp.asarray(tasks.task_spCD, dtype=cp.int32)
-        task_ab = cp.ascontiguousarray(task_ab)
-        task_cd = cp.ascontiguousarray(task_cd)
+        task_ab, task_cd = _task_arrays_device_cached(tasks)
 
         shell_ao_start_sph = cp.asarray(shell_ao_start_sph, dtype=cp.int32)
         shell_ao_start_sph = cp.ascontiguousarray(shell_ao_start_sph)
@@ -800,10 +1075,7 @@ def eri_ssss_device(
 
     _require_cuda_ext()
     with stream_ctx(stream):
-        task_ab = cp.asarray(tasks.task_spAB, dtype=cp.int32)
-        task_cd = cp.asarray(tasks.task_spCD, dtype=cp.int32)
-        task_ab = cp.ascontiguousarray(task_ab)
-        task_cd = cp.ascontiguousarray(task_cd)
+        task_ab, task_cd = _task_arrays_device_cached(tasks)
 
         eri_out = cp.empty((tasks.ntasks,), dtype=cp.float64)
         if tasks.ntasks == 0:
@@ -1151,6 +1423,8 @@ def _get_df_metric_2c2e_rys_plan(
     if hit is not None:
         aux_ref, plan = hit
         if aux_ref() is aux_basis:
+            if plan.ready_event is not None:
+                cp.cuda.get_current_stream().wait_event(plan.ready_event)
             return plan
         del _df_metric_2c2e_rys_plan_cache[key]
 
@@ -1230,7 +1504,9 @@ def _get_df_metric_2c2e_rys_plan(
         batch_p0_dev.append(cp.ascontiguousarray(cp.asarray(p0, dtype=cp.int32)))
         batch_q0_dev.append(cp.ascontiguousarray(cp.asarray(q0, dtype=cp.int32)))
 
-    cp.cuda.get_current_stream().synchronize()
+    s0 = cp.cuda.get_current_stream()
+    ready_event = cp.cuda.Event()
+    ready_event.record(s0)
 
     plan = _DFMetric2c2eRysPlan(
         dbasis=dbasis,
@@ -1240,6 +1516,7 @@ def _get_df_metric_2c2e_rys_plan(
         batch_p0_dev=batch_p0_dev,
         batch_q0_dev=batch_q0_dev,
         naux=int(naux),
+        ready_event=ready_event,
     )
     _df_metric_2c2e_rys_plan_cache[key] = (weakref.ref(aux_basis), plan)
     _trim_plan_cache(_df_metric_2c2e_rys_plan_cache)
@@ -1275,6 +1552,8 @@ def _get_df_int3c2e_rys_plan(
     if hit is not None:
         ao_ref, aux_ref, plan = hit
         if ao_ref() is ao_basis and aux_ref() is aux_basis:
+            if plan.ready_event is not None:
+                cp.cuda.get_current_stream().wait_event(plan.ready_event)
             return plan
         del _df_int3c2e_rys_plan_cache[key]
 
@@ -1431,7 +1710,9 @@ def _get_df_int3c2e_rys_plan(
         batch_la.append(int(la))
         batch_lb.append(int(lb))
 
-    cp.cuda.get_current_stream().synchronize()
+    s0 = cp.cuda.get_current_stream()
+    ready_event = cp.cuda.Event()
+    ready_event.record(s0)
 
     plan = _DFInt3c2eRysPlan(
         dbasis=dbasis,
@@ -1449,6 +1730,7 @@ def _get_df_int3c2e_rys_plan(
         nao=int(nao),
         nao_sph=int(nao_sph),
         naux=int(naux),
+        ready_event=ready_event,
     )
     _df_int3c2e_rys_plan_cache[key] = (weakref.ref(ao_basis), weakref.ref(aux_basis), plan)
     _trim_plan_cache(_df_int3c2e_rys_plan_cache)
@@ -1473,6 +1755,8 @@ def _get_df_int3c2e_rys_contracted_ao_plan(
     if hit is not None:
         ao_ref, aux_ref, plan = hit
         if ao_ref() is ao_basis and aux_ref() is aux_basis:
+            if plan.ready_event is not None:
+                cp.cuda.get_current_stream().wait_event(plan.ready_event)
             return plan
         del _df_int3c2e_rys_contracted_ao_plan_cache[key]
 
@@ -1594,7 +1878,9 @@ def _get_df_int3c2e_rys_contracted_ao_plan(
     ao_prim_coef_dev = cp.ascontiguousarray(cp.asarray(np.asarray(ao_basis.prim_coef_flat, dtype=np.float64), dtype=cp.float64))
     aux_shell_ao_start_dev = cp.ascontiguousarray(cp.asarray(aux_start, dtype=cp.int32))
 
-    cp.cuda.get_current_stream().synchronize()
+    s0 = cp.cuda.get_current_stream()
+    ready_event = cp.cuda.Event()
+    ready_event.record(s0)
 
     plan = _DFInt3c2eRysContractedAOPlan(
         dbasis=dbasis,
@@ -1612,6 +1898,7 @@ def _get_df_int3c2e_rys_contracted_ao_plan(
         n_shell_ao=int(n_shell_ao),
         nao=int(nao),
         naux=int(naux),
+        ready_event=ready_event,
     )
     _df_int3c2e_rys_contracted_ao_plan_cache[key] = (weakref.ref(ao_basis), weakref.ref(aux_basis), plan)
     _trim_plan_cache(_df_int3c2e_rys_contracted_ao_plan_cache)
@@ -1933,6 +2220,7 @@ def df_int3c2e_rys_contracted_ao_device_block(
                         work_large_min=200_000,
                         blocks_per_task=4,
                         profile=dispatch_profile,
+                        skip_transpose=True,
                     )
 
                     if start_k is not None and end_k is not None:
@@ -1964,7 +2252,7 @@ def df_int3c2e_rys_contracted_ao_device_block(
                         X.ravel(),
                         int(threads),
                         int(_stream_ptr(stream)),
-                        False,
+                        bool(batch.transpose),
                     )
 
                     if start_sc is not None and end_sc is not None:
@@ -1977,6 +2265,7 @@ def df_int3c2e_rys_contracted_ao_device_block(
                         row = prof.setdefault("batches", {}).setdefault(key, {"kernel_ms": 0.0, "scatter_ms": 0.0, "ntasks": 0})
                         row["scatter_ms"] = float(row.get("scatter_ms", 0.0)) + sc_ms
 
+            task_ab_all_dev, task_cd_all_dev = _task_arrays_device_cached(plan.tasks)
             for gid, cid in enumerate(np.asarray(plan.class_ids, dtype=np.int32).ravel()):
                 # Avoid double-computing Step-2-eligible classes when the hybrid path is enabled.
                 if use_step2_hybrid and _df_int3c2e_class_id_step2_eligible(int(cid)):
@@ -1993,8 +2282,9 @@ def df_int3c2e_rys_contracted_ao_device_block(
                 if ld != 0:
                     continue  # should not happen for DF int3c2e
 
-                task_ab = cp.ascontiguousarray(cp.asarray(plan.tasks.task_spAB[idx], dtype=cp.int32))
-                task_cd = cp.ascontiguousarray(cp.asarray(plan.tasks.task_spCD[idx], dtype=cp.int32))
+                idx_dev = cp.asarray(idx, dtype=cp.int32)
+                task_ab = cp.ascontiguousarray(task_ab_all_dev[idx_dev])
+                task_cd = cp.ascontiguousarray(task_cd_all_dev[idx_dev])
 
                 start_k = cp.cuda.Event() if profile is not None else None
                 end_k = cp.cuda.Event() if profile is not None else None
@@ -2153,6 +2443,7 @@ def df_int3c2e_rys_contracted_ao_device_block(
         ao_prim_coef_dev = cp.ascontiguousarray(cp.asarray(np.asarray(ao_basis.prim_coef_flat, dtype=np.float64), dtype=cp.float64))
         aux_shell_ao_start_dev = cp.ascontiguousarray(cp.asarray(aux_start[aux_shell_start:aux_shell_stop], dtype=cp.int32))
 
+        task_ab_all_dev, task_cd_all_dev = _task_arrays_device_cached(tasks)
         s0 = cp.cuda.get_current_stream()
         for gid, cid in enumerate(np.asarray(class_ids, dtype=np.int32).ravel()):
             i0 = int(offsets[gid])
@@ -2165,8 +2456,9 @@ def df_int3c2e_rys_contracted_ao_device_block(
             la, lb, lc, ld = decode_eri_class_id(int(cid))
             if ld != 0:
                 continue
-            task_ab = cp.ascontiguousarray(cp.asarray(tasks.task_spAB[idx], dtype=cp.int32))
-            task_cd = cp.ascontiguousarray(cp.asarray(tasks.task_spCD[idx], dtype=cp.int32))
+            idx_dev = cp.asarray(idx, dtype=cp.int32)
+            task_ab = cp.ascontiguousarray(task_ab_all_dev[idx_dev])
+            task_cd = cp.ascontiguousarray(task_cd_all_dev[idx_dev])
 
             fn = (
                 _ext.df_int3c2e_rys_contracted_ctr2_inplace_device
@@ -2708,10 +3000,7 @@ def eri_psss_device(
 
     _require_cuda_ext()
     with stream_ctx(stream):
-        task_ab = cp.asarray(tasks.task_spAB, dtype=cp.int32)
-        task_cd = cp.asarray(tasks.task_spCD, dtype=cp.int32)
-        task_ab = cp.ascontiguousarray(task_ab)
-        task_cd = cp.ascontiguousarray(task_cd)
+        task_ab, task_cd = _task_arrays_device_cached(tasks)
 
         out = cp.empty((tasks.ntasks, 3), dtype=cp.float64)
         if tasks.ntasks == 0:
@@ -2918,10 +3207,7 @@ def eri_ppss_device(
 
     _require_cuda_ext()
     with stream_ctx(stream):
-        task_ab = cp.asarray(tasks.task_spAB, dtype=cp.int32)
-        task_cd = cp.asarray(tasks.task_spCD, dtype=cp.int32)
-        task_ab = cp.ascontiguousarray(task_ab)
-        task_cd = cp.ascontiguousarray(task_cd)
+        task_ab, task_cd = _task_arrays_device_cached(tasks)
 
         out = cp.empty((tasks.ntasks, 9), dtype=cp.float64)
         if tasks.ntasks == 0:
@@ -3128,10 +3414,7 @@ def eri_psps_device(
 
     _require_cuda_ext()
     with stream_ctx(stream):
-        task_ab = cp.asarray(tasks.task_spAB, dtype=cp.int32)
-        task_cd = cp.asarray(tasks.task_spCD, dtype=cp.int32)
-        task_ab = cp.ascontiguousarray(task_ab)
-        task_cd = cp.ascontiguousarray(task_cd)
+        task_ab, task_cd = _task_arrays_device_cached(tasks)
 
         out = cp.empty((tasks.ntasks, 9), dtype=cp.float64)
         if tasks.ntasks == 0:
@@ -3338,10 +3621,7 @@ def eri_ppps_device(
 
     _require_cuda_ext()
     with stream_ctx(stream):
-        task_ab = cp.asarray(tasks.task_spAB, dtype=cp.int32)
-        task_cd = cp.asarray(tasks.task_spCD, dtype=cp.int32)
-        task_ab = cp.ascontiguousarray(task_ab)
-        task_cd = cp.ascontiguousarray(task_cd)
+        task_ab, task_cd = _task_arrays_device_cached(tasks)
 
         out = cp.empty((tasks.ntasks, 27), dtype=cp.float64)
         if tasks.ntasks == 0:
@@ -3548,10 +3828,7 @@ def eri_pppp_device(
 
     _require_cuda_ext()
     with stream_ctx(stream):
-        task_ab = cp.asarray(tasks.task_spAB, dtype=cp.int32)
-        task_cd = cp.asarray(tasks.task_spCD, dtype=cp.int32)
-        task_ab = cp.ascontiguousarray(task_ab)
-        task_cd = cp.ascontiguousarray(task_cd)
+        task_ab, task_cd = _task_arrays_device_cached(tasks)
 
         out = cp.empty((tasks.ntasks, 81), dtype=cp.float64)
         if tasks.ntasks == 0:
@@ -3757,10 +4034,7 @@ def eri_dsss_device(
 
     _require_cuda_ext()
     with stream_ctx(stream):
-        task_ab = cp.asarray(tasks.task_spAB, dtype=cp.int32)
-        task_cd = cp.asarray(tasks.task_spCD, dtype=cp.int32)
-        task_ab = cp.ascontiguousarray(task_ab)
-        task_cd = cp.ascontiguousarray(task_cd)
+        task_ab, task_cd = _task_arrays_device_cached(tasks)
 
         out = cp.empty((tasks.ntasks, 6), dtype=cp.float64)
         if tasks.ntasks == 0:
@@ -4111,10 +4385,7 @@ def _eri_fixed_class_specialized_device(
     multiblock_fn = getattr(_ext, ext_multiblock_name)
 
     with stream_ctx(stream):
-        task_ab = cp.asarray(tasks.task_spAB, dtype=cp.int32)
-        task_cd = cp.asarray(tasks.task_spCD, dtype=cp.int32)
-        task_ab = cp.ascontiguousarray(task_ab)
-        task_cd = cp.ascontiguousarray(task_cd)
+        task_ab, task_cd = _task_arrays_device_cached(tasks)
 
         out = cp.empty((tasks.ntasks, ncomp), dtype=cp.float64)
         if tasks.ntasks == 0:
@@ -5789,10 +6060,7 @@ def eri_rys_generic_device(
         )
 
     with stream_ctx(stream):
-        task_ab = cp.asarray(tasks.task_spAB, dtype=cp.int32)
-        task_cd = cp.asarray(tasks.task_spCD, dtype=cp.int32)
-        task_ab = cp.ascontiguousarray(task_ab)
-        task_cd = cp.ascontiguousarray(task_cd)
+        task_ab, task_cd = _task_arrays_device_cached(tasks)
 
         nAB = int(ncart(la)) * int(ncart(lb))
         nCD = int(ncart(lc)) * int(ncart(ld))
@@ -5893,10 +6161,7 @@ def eri_rys_generic_warp_device(
         raise ValueError("threads must be a multiple of 32")
 
     with stream_ctx(stream):
-        task_ab = cp.asarray(tasks.task_spAB, dtype=cp.int32)
-        task_cd = cp.asarray(tasks.task_spCD, dtype=cp.int32)
-        task_ab = cp.ascontiguousarray(task_ab)
-        task_cd = cp.ascontiguousarray(task_cd)
+        task_ab, task_cd = _task_arrays_device_cached(tasks)
 
         out = cp.empty((tasks.ntasks, nAB * nCD), dtype=cp.float64)
         if tasks.ntasks == 0:
@@ -6191,10 +6456,7 @@ def eri_rys_df_ld0_warp_device(
         raise ValueError("threads must be a multiple of 32")
 
     with stream_ctx(stream):
-        task_ab = cp.asarray(tasks.task_spAB, dtype=cp.int32)
-        task_cd = cp.asarray(tasks.task_spCD, dtype=cp.int32)
-        task_ab = cp.ascontiguousarray(task_ab)
-        task_cd = cp.ascontiguousarray(task_cd)
+        task_ab, task_cd = _task_arrays_device_cached(tasks)
 
         out = cp.empty((tasks.ntasks, nAB * nC), dtype=cp.float64)
         if tasks.ntasks == 0:
@@ -6267,10 +6529,7 @@ def build_entry_csr_device(tasks: TaskList, *, nkey: int, stream=None, threads: 
 
     _require_cuda_ext()
     with stream_ctx(stream):
-        task_ab = cp.asarray(tasks.task_spAB, dtype=cp.int32)
-        task_cd = cp.asarray(tasks.task_spCD, dtype=cp.int32)
-        task_ab = cp.ascontiguousarray(task_ab)
-        task_cd = cp.ascontiguousarray(task_cd)
+        task_ab, task_cd = _task_arrays_device_cached(tasks)
 
         counts = cp.zeros((nkey,), dtype=cp.int32)
         _ext.count_entries_inplace_device(task_ab, task_cd, counts, int(threads), int(_stream_ptr(stream)), False)
@@ -6352,6 +6611,8 @@ __all__ = [
     "df_metric_2c2e_sp_device",
     "df_metric_2c2e_rys_device",
     "cart2sph_eri_tiles_device",
+    "cart2sph_eri_tiles_scatter_sph_s4_inplace_device",
+    "cart2sph_eri_tiles_scatter_sph_s8_inplace_device",
     "eri_dddd_device",
     "eri_dpdd_device",
     "eri_dpdp_device",

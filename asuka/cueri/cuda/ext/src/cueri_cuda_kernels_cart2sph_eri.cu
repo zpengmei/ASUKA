@@ -268,6 +268,179 @@ __global__ void KernelScatterEriTilesSphS4(
   }
 }
 
+__global__ void KernelCart2SphEriLeftScatterS8(
+    const int32_t* __restrict__ task_spAB,
+    const int32_t* __restrict__ task_spCD,
+    const int32_t* __restrict__ sp_A,
+    const int32_t* __restrict__ sp_B,
+    const int32_t* __restrict__ shell_ao_start_sph,
+    int nao_sph,
+    int la,
+    int lb,
+    int lc,
+    int ld,
+    const double* __restrict__ tile_tmp,  // (nt, nAB_cart, nCD_sph)
+    double* __restrict__ out_s8,
+    int64_t total) {
+  (void)nao_sph;
+  const int nA_cart = ncart(la);
+  const int nB_cart = ncart(lb);
+  const int nAB_cart = nA_cart * nB_cart;
+
+  const int nA_sph = nsph(la);
+  const int nB_sph = nsph(lb);
+  const int nAB_sph = nA_sph * nB_sph;
+
+  const int nC_sph = nsph(lc);
+  const int nD_sph = nsph(ld);
+  const int nCD_sph = nC_sph * nD_sph;
+
+  const int64_t tile_stride_in = static_cast<int64_t>(nAB_cart) * static_cast<int64_t>(nCD_sph);
+  const int64_t tile_stride_out = static_cast<int64_t>(nAB_sph) * static_cast<int64_t>(nCD_sph);
+
+  for (int64_t idx = static_cast<int64_t>(blockIdx.x) * static_cast<int64_t>(blockDim.x) + threadIdx.x; idx < total;
+       idx += static_cast<int64_t>(blockDim.x) * static_cast<int64_t>(gridDim.x)) {
+    const int64_t t64 = idx / tile_stride_out;
+    const int t = static_cast<int>(t64);
+    const int64_t rem = idx - t64 * tile_stride_out;
+    const int sab = static_cast<int>(rem / static_cast<int64_t>(nCD_sph));
+    const int scd = static_cast<int>(rem - static_cast<int64_t>(sab) * static_cast<int64_t>(nCD_sph));
+
+    const int isA = sab / nB_sph;
+    const int isB = sab - isA * nB_sph;
+    const int isC = scd / nD_sph;
+    const int isD = scd - isC * nD_sph;
+
+    const int spab = static_cast<int>(task_spAB[t]);
+    const int spcd = static_cast<int>(task_spCD[t]);
+    const int A = static_cast<int>(sp_A[spab]);
+    const int B = static_cast<int>(sp_B[spab]);
+    const int C = static_cast<int>(sp_A[spcd]);
+    const int D = static_cast<int>(sp_B[spcd]);
+
+    if (A == B && isA < isB) continue;
+    if (C == D && isC < isD) continue;
+
+    const double* __restrict__ in_t = tile_tmp + t64 * tile_stride_in;
+
+    double acc = 0.0;
+#pragma unroll
+    for (int ia = 0; ia < 21; ++ia) {
+      if (ia >= nA_cart) break;
+      const double ta = cart2sph_coeff(la, ia, isA);
+      if (ta == 0.0) continue;
+#pragma unroll
+      for (int ib = 0; ib < 21; ++ib) {
+        if (ib >= nB_cart) break;
+        const double tb = cart2sph_coeff(lb, ib, isB);
+        if (tb == 0.0) continue;
+        const int iab = ia * nB_cart + ib;
+        acc += (ta * tb) * in_t[static_cast<int64_t>(iab) * static_cast<int64_t>(nCD_sph) + scd];
+      }
+    }
+    if (acc == 0.0) continue;
+
+    const int a = static_cast<int>(shell_ao_start_sph[A]) + isA;
+    const int b = static_cast<int>(shell_ao_start_sph[B]) + isB;
+    const int c = static_cast<int>(shell_ao_start_sph[C]) + isC;
+    const int d = static_cast<int>(shell_ao_start_sph[D]) + isD;
+
+    const int64_t p = pair_index(a, b);
+    const int64_t q = pair_index(c, d);
+    if (spab == spcd && p < q) continue;
+
+    const int64_t out_idx = pairpair_index(p, q);
+    out_s8[out_idx] = acc;
+  }
+}
+
+__global__ void KernelCart2SphEriLeftScatterS4(
+    const int32_t* __restrict__ task_spAB,
+    const int32_t* __restrict__ task_spCD,
+    const int32_t* __restrict__ sp_A,
+    const int32_t* __restrict__ sp_B,
+    const int32_t* __restrict__ shell_ao_start_sph,
+    int nao_sph,
+    int la,
+    int lb,
+    int lc,
+    int ld,
+    const double* __restrict__ tile_tmp,  // (nt, nAB_cart, nCD_sph)
+    double* __restrict__ out_s4,
+    int64_t total,
+    int64_t nao_pair) {
+  (void)nao_sph;
+  const int nA_cart = ncart(la);
+  const int nB_cart = ncart(lb);
+  const int nAB_cart = nA_cart * nB_cart;
+
+  const int nA_sph = nsph(la);
+  const int nB_sph = nsph(lb);
+  const int nAB_sph = nA_sph * nB_sph;
+
+  const int nC_sph = nsph(lc);
+  const int nD_sph = nsph(ld);
+  const int nCD_sph = nC_sph * nD_sph;
+
+  const int64_t tile_stride_in = static_cast<int64_t>(nAB_cart) * static_cast<int64_t>(nCD_sph);
+  const int64_t tile_stride_out = static_cast<int64_t>(nAB_sph) * static_cast<int64_t>(nCD_sph);
+
+  for (int64_t idx = static_cast<int64_t>(blockIdx.x) * static_cast<int64_t>(blockDim.x) + threadIdx.x; idx < total;
+       idx += static_cast<int64_t>(blockDim.x) * static_cast<int64_t>(gridDim.x)) {
+    const int64_t t64 = idx / tile_stride_out;
+    const int t = static_cast<int>(t64);
+    const int64_t rem = idx - t64 * tile_stride_out;
+    const int sab = static_cast<int>(rem / static_cast<int64_t>(nCD_sph));
+    const int scd = static_cast<int>(rem - static_cast<int64_t>(sab) * static_cast<int64_t>(nCD_sph));
+
+    const int isA = sab / nB_sph;
+    const int isB = sab - isA * nB_sph;
+    const int isC = scd / nD_sph;
+    const int isD = scd - isC * nD_sph;
+
+    const int spab = static_cast<int>(task_spAB[t]);
+    const int spcd = static_cast<int>(task_spCD[t]);
+    const int A = static_cast<int>(sp_A[spab]);
+    const int B = static_cast<int>(sp_B[spab]);
+    const int C = static_cast<int>(sp_A[spcd]);
+    const int D = static_cast<int>(sp_B[spcd]);
+
+    if (A == B && isA < isB) continue;
+    if (C == D && isC < isD) continue;
+
+    const double* __restrict__ in_t = tile_tmp + t64 * tile_stride_in;
+
+    double acc = 0.0;
+#pragma unroll
+    for (int ia = 0; ia < 21; ++ia) {
+      if (ia >= nA_cart) break;
+      const double ta = cart2sph_coeff(la, ia, isA);
+      if (ta == 0.0) continue;
+#pragma unroll
+      for (int ib = 0; ib < 21; ++ib) {
+        if (ib >= nB_cart) break;
+        const double tb = cart2sph_coeff(lb, ib, isB);
+        if (tb == 0.0) continue;
+        const int iab = ia * nB_cart + ib;
+        acc += (ta * tb) * in_t[static_cast<int64_t>(iab) * static_cast<int64_t>(nCD_sph) + scd];
+      }
+    }
+    if (acc == 0.0) continue;
+
+    const int a = static_cast<int>(shell_ao_start_sph[A]) + isA;
+    const int b = static_cast<int>(shell_ao_start_sph[B]) + isB;
+    const int c = static_cast<int>(shell_ao_start_sph[C]) + isC;
+    const int d = static_cast<int>(shell_ao_start_sph[D]) + isD;
+
+    const int64_t p = pair_index(a, b);
+    const int64_t q = pair_index(c, d);
+    if (spab == spcd && p < q) continue;
+
+    out_s4[p * nao_pair + q] = acc;
+    out_s4[q * nao_pair + p] = acc;
+  }
+}
+
 }  // namespace
 
 extern "C" cudaError_t cueri_cart2sph_eri_right_launch_stream(
@@ -375,6 +548,108 @@ extern "C" cudaError_t cueri_scatter_eri_tiles_sph_s8_launch_stream(
       tile_vals,
       out_s8,
       total);
+  return cudaPeekAtLastError();
+}
+
+extern "C" cudaError_t cueri_cart2sph_eri_left_scatter_s8_launch_stream(
+    const int32_t* task_spAB,
+    const int32_t* task_spCD,
+    int ntasks,
+    const int32_t* sp_A,
+    const int32_t* sp_B,
+    const int32_t* shell_ao_start_sph,
+    int nao_sph,
+    int la,
+    int lb,
+    int lc,
+    int ld,
+    const double* tile_tmp,
+    double* out_s8,
+    cudaStream_t stream,
+    int threads) {
+  if (ntasks < 0 || nao_sph < 0) return cudaErrorInvalidValue;
+  if (threads <= 0 || threads > 1024) return cudaErrorInvalidValue;
+  if (ntasks == 0) return cudaSuccess;
+  if (la < 0 || la > 5 || lb < 0 || lb > 5 || lc < 0 || lc > 5 || ld < 0 || ld > 5) {
+    return cudaErrorInvalidValue;
+  }
+
+  const int nAB_sph = (2 * la + 1) * (2 * lb + 1);
+  const int nCD_sph = (2 * lc + 1) * (2 * ld + 1);
+  const int64_t total = static_cast<int64_t>(ntasks) * static_cast<int64_t>(nAB_sph) * static_cast<int64_t>(nCD_sph);
+  if (total <= 0) return cudaErrorInvalidValue;
+
+  int64_t blocks64 = (total + static_cast<int64_t>(threads) - 1) / static_cast<int64_t>(threads);
+  if (blocks64 < 1) blocks64 = 1;
+  if (blocks64 > 65535) blocks64 = 65535;
+
+  KernelCart2SphEriLeftScatterS8<<<static_cast<unsigned int>(blocks64), threads, 0, stream>>>(
+      task_spAB,
+      task_spCD,
+      sp_A,
+      sp_B,
+      shell_ao_start_sph,
+      nao_sph,
+      la,
+      lb,
+      lc,
+      ld,
+      tile_tmp,
+      out_s8,
+      total);
+  return cudaPeekAtLastError();
+}
+
+extern "C" cudaError_t cueri_cart2sph_eri_left_scatter_s4_launch_stream(
+    const int32_t* task_spAB,
+    const int32_t* task_spCD,
+    int ntasks,
+    const int32_t* sp_A,
+    const int32_t* sp_B,
+    const int32_t* shell_ao_start_sph,
+    int nao_sph,
+    int la,
+    int lb,
+    int lc,
+    int ld,
+    const double* tile_tmp,
+    double* out_s4,
+    cudaStream_t stream,
+    int threads) {
+  if (ntasks < 0 || nao_sph < 0) return cudaErrorInvalidValue;
+  if (threads <= 0 || threads > 1024) return cudaErrorInvalidValue;
+  if (ntasks == 0) return cudaSuccess;
+  if (la < 0 || la > 5 || lb < 0 || lb > 5 || lc < 0 || lc > 5 || ld < 0 || ld > 5) {
+    return cudaErrorInvalidValue;
+  }
+
+  const int64_t nao_pair = (static_cast<int64_t>(nao_sph) * static_cast<int64_t>(nao_sph + 1)) / 2;
+  if (nao_pair <= 0) return cudaErrorInvalidValue;
+
+  const int nAB_sph = (2 * la + 1) * (2 * lb + 1);
+  const int nCD_sph = (2 * lc + 1) * (2 * ld + 1);
+  const int64_t total = static_cast<int64_t>(ntasks) * static_cast<int64_t>(nAB_sph) * static_cast<int64_t>(nCD_sph);
+  if (total <= 0) return cudaErrorInvalidValue;
+
+  int64_t blocks64 = (total + static_cast<int64_t>(threads) - 1) / static_cast<int64_t>(threads);
+  if (blocks64 < 1) blocks64 = 1;
+  if (blocks64 > 65535) blocks64 = 65535;
+
+  KernelCart2SphEriLeftScatterS4<<<static_cast<unsigned int>(blocks64), threads, 0, stream>>>(
+      task_spAB,
+      task_spCD,
+      sp_A,
+      sp_B,
+      shell_ao_start_sph,
+      nao_sph,
+      la,
+      lb,
+      lc,
+      ld,
+      tile_tmp,
+      out_s4,
+      total,
+      nao_pair);
   return cudaPeekAtLastError();
 }
 

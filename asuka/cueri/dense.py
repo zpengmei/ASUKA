@@ -294,6 +294,53 @@ def _build_pair_coeff_ordered_batch(CA, CB, *, same_shell: np.ndarray | None):
     return K.reshape((nt, nA * nB, norb * norb))
 
 
+def _build_pair_coeff_packed_batch(CA, CB, *, same_shell: np.ndarray | None):
+    """Batch analogue of :func:`asuka.cueri.eri_utils.build_pair_coeff_packed`.
+
+    Parameters
+    ----------
+    CA, CB
+        CuPy arrays with shapes (nt, nA, norb) and (nt, nB, norb).
+    same_shell
+        Boolean vector with shape (nt,) where True indicates A==B (no swapped AO-product term).
+
+    Returns
+    -------
+    K
+        CuPy array with shape (nt, nA*nB, npair), where npair=norb*(norb+1)//2.
+    """
+
+    import cupy as cp
+
+    CA = cp.asarray(CA)
+    CB = cp.asarray(CB)
+    if CA.ndim != 3 or CB.ndim != 3:
+        raise ValueError("CA/CB must be 3D arrays with shape (nt, nAO_in_shell, norb)")
+    if int(CA.shape[0]) != int(CB.shape[0]) or int(CA.shape[2]) != int(CB.shape[2]):
+        raise ValueError("CA/CB must agree on batch size (nt) and norb")
+
+    nt, nA, norb = map(int, CA.shape)
+    nB = int(CB.shape[1])
+    tri_p, tri_q = cp.tril_indices(int(norb))
+
+    # K[t,a,b,p,q] = CA[t,a,p] * CB[t,b,q]
+    K = cp.einsum("tap,tbq->tabpq", CA, CB, optimize=True)
+    if same_shell is None:
+        K = K + cp.einsum("tbp,taq->tabpq", CB, CA, optimize=True)
+    else:
+        same = np.asarray(same_shell, dtype=bool).ravel()
+        if same.shape != (nt,):
+            raise ValueError(f"same_shell must have shape ({nt},), got {same.shape}")
+        if not bool(np.all(same)):
+            off = np.nonzero(~same)[0]
+            if int(off.size):
+                K[off] = K[off] + cp.einsum("tbp,taq->tabpq", CB[off], CA[off], optimize=True)
+
+    K = K[:, :, :, tri_p, tri_q]
+    npair = int(norb * (norb + 1) // 2)
+    return K.reshape((nt, nA * nB, npair))
+
+
 def _accum_KtB_ordered_blocked(out_eri_mat, K_AB, B, *, add_transpose: bool, pair_block: int) -> None:
     """Accumulate out_eri_mat += K_AB^T @ B, optionally adding transpose, in column blocks."""
 
@@ -412,16 +459,24 @@ def _build_active_eri_mat_dense_rys_from_cached_direct(*, builder, C_active, out
             blocks_per_task=int(blocks_per_task),
             max_tile_bytes=int(max_tile_bytes_i),
             boys=boys,
+            skip_transpose=True,
+            task_class_id=int(class_ids[g]),
+            preupload_tasks=True,
         ):
             tile = tb.tiles
+            tile_transposed = bool(getattr(tb, "kernel_transposed", False))
             spab_batch = np.asarray(tb.task_spAB, dtype=np.int32)
             spcd_batch = np.asarray(tb.task_spCD, dtype=np.int32)
             nt = int(spab_batch.shape[0])
             if nt == 0:
                 continue
 
-            nAB = int(tile.shape[1])
-            nCD = int(tile.shape[2])
+            if tile_transposed:
+                nCD = int(tile.shape[1])
+                nAB = int(tile.shape[2])
+            else:
+                nAB = int(tile.shape[1])
+                nCD = int(tile.shape[2])
             bytes_work_task = (int(nCD) * n_pair + 2 * int(nAB) * n_pair) * 8
             max_tasks = int(max(1, max_work_bytes // max(bytes_work_task, 1)))
 
@@ -463,7 +518,11 @@ def _build_active_eri_mat_dense_rys_from_cached_direct(*, builder, C_active, out
                 K_AB = _build_pair_coeff_ordered_batch(CA, CB, same_shell=same_ab)
                 K_CD = _build_pair_coeff_ordered_batch(CC, CD, same_shell=same_cd)
 
-                tmp = cp.matmul(tile_chunk, K_CD)
+                if tile_transposed:
+                    # tile_chunk is (m, nCD, nAB); contract over CD without materializing tile.transpose(...)
+                    tmp = cp.einsum("mca,mcp->map", tile_chunk, K_CD)
+                else:
+                    tmp = cp.matmul(tile_chunk, K_CD)
                 out_eri_mat += K_AB.reshape((m * nAB, n_pair)).T @ tmp.reshape((m * nAB, n_pair))
 
                 off = spab != spcd
@@ -473,7 +532,10 @@ def _build_active_eri_mat_dense_rys_from_cached_direct(*, builder, C_active, out
                     K_CD_off = K_CD[off]
                     noff = int(tile_off.shape[0])
                     if noff:
-                        tmp2 = cp.matmul(tile_off.transpose((0, 2, 1)), K_AB_off)
+                        if tile_transposed:
+                            tmp2 = cp.matmul(tile_off, K_AB_off)
+                        else:
+                            tmp2 = cp.matmul(tile_off.transpose((0, 2, 1)), K_AB_off)
                         out_eri_mat += K_CD_off.reshape((noff * nCD, n_pair)).T @ tmp2.reshape((noff * nCD, n_pair))
 
     if prof is not None and t0 is not None:
@@ -604,14 +666,17 @@ def _build_active_eri_mat_dense_rys_from_cached_ab_group(*, builder, C_active, o
             blocks_per_task=int(blocks_per_task),
             max_tile_bytes=int(max_tile_bytes_i),
             boys=boys,
+            skip_transpose=True,
+            preupload_tasks=True,
         ):
             tile = tb.tiles
+            tile_transposed = bool(getattr(tb, "kernel_transposed", False))
             spcd_batch = np.asarray(tb.task_spCD, dtype=np.int32)
             nt = int(spcd_batch.shape[0])
             if nt == 0:
                 continue
 
-            nCD = int(tile.shape[2])
+            nCD = int(tile.shape[1] if tile_transposed else tile.shape[2])
             bytes_work_task = (int(nCD) + 2 * int(nAB)) * n_pair * 8
             max_tasks = int(max(1, max_work_bytes // max(bytes_work_task, 1)))
 
@@ -637,7 +702,11 @@ def _build_active_eri_mat_dense_rys_from_cached_ab_group(*, builder, C_active, o
 
                 same_cd = C_shell == D_shell
                 K_CD = _build_pair_coeff_ordered_batch(CC, CD, same_shell=same_cd)
-                tmp = cp.matmul(tile_chunk, K_CD)
+                if tile_transposed:
+                    # tile_chunk is (m, nCD, nAB); contract over CD without materializing tile.transpose(...)
+                    tmp = cp.einsum("mca,mcp->map", tile_chunk, K_CD)
+                else:
+                    tmp = cp.matmul(tile_chunk, K_CD)
                 tmp_sum = tmp.sum(axis=0)
 
                 diag_idx = np.nonzero(spcd == np.int32(spab))[0]
@@ -667,6 +736,193 @@ def _build_active_eri_mat_dense_rys_from_cached_ab_group(*, builder, C_active, o
         prof["max_tile_bytes"] = int(max_tile_bytes_i)
         prof["algorithm"] = "ab_group"
         prof["pair_block"] = int(pair_block)
+
+
+def _build_active_eri_packed_dense_rys_from_cached_ab_group(*, builder, C_active, out_eri_packed, profile: dict | None = None) -> None:
+    """AB-group packed executor: accumulate ERIs directly in packed pair space."""
+
+    import time
+    import cupy as cp
+
+    if profile is not None:
+        profile.clear()
+        prof = profile.setdefault("cueri_dense_rys_cached_packed", {})
+        prof["plan_cache_hit"] = True
+        t0 = time.perf_counter()
+    else:
+        prof = None
+        t0 = None
+
+    sp = getattr(builder, "sp", None)
+    basis = getattr(builder, "ao_basis", None)
+    dbasis = getattr(builder, "dbasis", None)
+    dsp = getattr(builder, "dsp", None)
+    pt = getattr(builder, "pair_tables", None)
+    tasks = getattr(builder, "tasks", None)
+    if any(x is None for x in (sp, basis, dbasis, dsp, pt, tasks)):
+        raise RuntimeError("builder is missing cached preprocessing/device artifacts")
+
+    ab_offsets = getattr(builder, "ab_offsets", None)
+    task_cd_by_ab = getattr(builder, "task_cd_by_ab", None)
+    if ab_offsets is None or task_cd_by_ab is None:
+        perm_ab, ab_offsets = group_tasks_by_spab(tasks.task_spAB, nsp=int(np.asarray(sp.sp_A, dtype=np.int32).shape[0]))
+        task_cd_by_ab = np.asarray(tasks.task_spCD[perm_ab], dtype=np.int32)
+
+    C_active = cp.asarray(C_active, dtype=cp.float64)
+    C_active = cp.ascontiguousarray(C_active)
+    if C_active.ndim != 2:
+        raise ValueError("C_active must have shape (nao, norb)")
+    nao, norb = map(int, C_active.shape)
+    n_pair = int(norb * (norb + 1) // 2)
+    if out_eri_packed.shape != (n_pair, n_pair):
+        raise ValueError(f"out_eri_packed must have shape ({n_pair},{n_pair}), got {out_eri_packed.shape}")
+    out_eri_packed.fill(0)
+
+    shell_ao_start = np.asarray(basis.shell_ao_start, dtype=np.int64)
+    shell_l = np.asarray(basis.shell_l, dtype=np.int32)
+    spA = np.asarray(sp.sp_A, dtype=np.int32)
+    spB = np.asarray(sp.sp_B, dtype=np.int32)
+    sp_a0 = shell_ao_start[spA]
+    sp_b0 = shell_ao_start[spB]
+    nsp = int(spA.shape[0])
+
+    threads = int(getattr(builder, "threads", 256))
+    max_tile_bytes_i = int(getattr(builder, "max_tile_bytes", 256 << 20))
+    max_work_bytes = int(max_tile_bytes_i)
+    mode = str(getattr(builder, "mode", "auto")).lower().strip()
+    work_small_max = int(getattr(builder, "work_small_max", 512))
+    work_large_min = int(getattr(builder, "work_large_min", 200_000))
+    blocks_per_task = int(getattr(builder, "blocks_per_task", 8))
+    boys = str(getattr(builder, "boys", "ref")).lower().strip()
+
+    n_tasks_total = int(getattr(tasks, "ntasks", int(np.asarray(task_cd_by_ab).shape[0])))
+    arange_cache: dict[int, cp.ndarray] = {}
+
+    def _arange(n: int):
+        arr = arange_cache.get(int(n))
+        if arr is None:
+            arr = cp.arange(int(n), dtype=cp.int32)
+            arange_cache[int(n)] = arr
+        return arr
+
+    for spab in range(nsp):
+        j0 = int(ab_offsets[spab])
+        j1 = int(ab_offsets[spab + 1])
+        if j1 <= j0:
+            continue
+
+        spcd_all = np.asarray(task_cd_by_ab[j0:j1], dtype=np.int32)
+        nt_ab = int(spcd_all.size)
+        if nt_ab == 0:
+            continue
+
+        A = int(spA[spab])
+        B = int(spB[spab])
+        a0 = int(shell_ao_start[A])
+        b0 = int(shell_ao_start[B])
+        nA = int(ncart(int(shell_l[A])))
+        nB = int(ncart(int(shell_l[B])))
+        nAB = int(nA * nB)
+
+        CA = C_active[a0 : a0 + nA, :]
+        CB = C_active[b0 : b0 + nB, :]
+        K_AB = build_pair_coeff_packed(CA, CB, same_shell=(A == B))
+
+        B_off = cp.zeros((nAB, n_pair), dtype=cp.float64)
+        B_diag = cp.zeros((nAB, n_pair), dtype=cp.float64)
+        has_off = False
+        has_diag = False
+
+        task_group = TaskList(
+            task_spAB=np.full((nt_ab,), np.int32(spab), dtype=np.int32),
+            task_spCD=spcd_all,
+        )
+
+        for tb in iter_tile_batches_spd(
+            task_group,
+            shell_pairs=sp,
+            shell_l=shell_l,
+            dbasis=dbasis,
+            dsp=dsp,
+            pt=pt,
+            stream=None,
+            threads=int(threads),
+            mode=mode,
+            work_small_max=int(work_small_max),
+            work_large_min=int(work_large_min),
+            blocks_per_task=int(blocks_per_task),
+            max_tile_bytes=int(max_tile_bytes_i),
+            boys=boys,
+            skip_transpose=True,
+            preupload_tasks=True,
+        ):
+            tile = tb.tiles
+            tile_transposed = bool(getattr(tb, "kernel_transposed", False))
+            spcd_batch = np.asarray(tb.task_spCD, dtype=np.int32)
+            nt = int(spcd_batch.shape[0])
+            if nt == 0:
+                continue
+
+            nCD = int(tile.shape[1] if tile_transposed else tile.shape[2])
+            bytes_work_task = (int(nCD) + 2 * int(nAB)) * n_pair * 8
+            max_tasks = int(max(1, max_work_bytes // max(bytes_work_task, 1)))
+
+            for i0 in range(0, nt, max_tasks):
+                i1 = min(nt, i0 + max_tasks)
+                spcd = np.asarray(spcd_batch[i0:i1], dtype=np.int32)
+                m = int(spcd.size)
+                if m == 0:
+                    continue
+
+                tile_chunk = tile[i0:i1]
+                C_shell = spA[spcd]
+                D_shell = spB[spcd]
+                nC = int(ncart(int(shell_l[int(C_shell[0])])))
+                nD = int(ncart(int(shell_l[int(D_shell[0])])))
+
+                c0 = sp_a0[spcd]
+                d0 = sp_b0[spcd]
+                ic = cp.asarray(c0, dtype=cp.int32)[:, None] + _arange(nC)[None, :]
+                id_ = cp.asarray(d0, dtype=cp.int32)[:, None] + _arange(nD)[None, :]
+                CC = C_active[ic, :]
+                CD = C_active[id_, :]
+
+                same_cd = C_shell == D_shell
+                K_CD = _build_pair_coeff_packed_batch(CC, CD, same_shell=same_cd)
+                if tile_transposed:
+                    tmp = cp.einsum("mca,mcp->map", tile_chunk, K_CD)
+                else:
+                    tmp = cp.matmul(tile_chunk, K_CD)
+                tmp_sum = tmp.sum(axis=0)
+
+                diag_idx = np.nonzero(spcd == np.int32(spab))[0]
+                if int(diag_idx.size):
+                    has_diag = True
+                    k = int(diag_idx[0])
+                    B_diag += tmp[k]
+                    if m > 1:
+                        has_off = True
+                        B_off += tmp_sum - tmp[k]
+                else:
+                    has_off = True
+                    B_off += tmp_sum
+
+        if has_diag:
+            out_eri_packed += cp.matmul(K_AB.T, B_diag)
+        if has_off:
+            contrib_off = cp.matmul(K_AB.T, B_off)
+            out_eri_packed += contrib_off + contrib_off.T
+
+    if prof is not None and t0 is not None:
+        cp.cuda.get_current_stream().synchronize()
+        prof["t_eri_packed_s"] = float(time.perf_counter() - float(t0))
+        prof["nao"] = int(nao)
+        prof["norb"] = int(norb)
+        prof["npair"] = int(n_pair)
+        prof["n_tasks"] = int(n_tasks_total)
+        prof["threads"] = int(threads)
+        prof["max_tile_bytes"] = int(max_tile_bytes_i)
+        prof["algorithm"] = "ab_group_packed"
 
 
 def _build_active_eri_mat_dense_rys_from_cached(*, builder, C_active, out_eri_mat, profile: dict | None = None) -> None:
@@ -764,10 +1020,13 @@ def _build_pu_wx_eri_mat_dense_rys_from_cached(*, builder, C_mo, C_act, out_eri_
 
     n_pair_left = int(nmo) * int(ncas)
     n_pair_right = int(ncas) * int(ncas)
+    npair_act = int(ncas * (ncas + 1) // 2)
     if out_eri_puwx.shape != (n_pair_left, n_pair_right):
         raise ValueError(f"out_eri_puwx must have shape ({n_pair_left},{n_pair_right}), got {out_eri_puwx.shape}")
 
     out_eri_puwx.fill(0)
+    # Accumulate into packed ket space (active-active symmetry: (w,x)=(x,w)); unpack at end.
+    acc_ket = cp.zeros((n_pair_left, npair_act), dtype=cp.float64)
 
     shell_ao_start = np.asarray(basis.shell_ao_start, dtype=np.int64)
     spA = np.asarray(sp.sp_A, dtype=np.int32)
@@ -825,17 +1084,25 @@ def _build_pu_wx_eri_mat_dense_rys_from_cached(*, builder, C_mo, C_act, out_eri_
             blocks_per_task=int(blocks_per_task),
             max_tile_bytes=int(max_tile_bytes_i),
             boys=boys,
+            skip_transpose=True,
+            task_class_id=int(class_ids[g]),
+            preupload_tasks=True,
         ):
             tile = tb.tiles
+            tile_transposed = bool(getattr(tb, "kernel_transposed", False))
             spab_batch = np.asarray(tb.task_spAB, dtype=np.int32)
             spcd_batch = np.asarray(tb.task_spCD, dtype=np.int32)
             nt = int(spab_batch.shape[0])
             if nt == 0:
                 continue
 
-            nAB = int(tile.shape[1])
-            nCD = int(tile.shape[2])
-            bytes_work = (int(nAB) * n_pair_left + int(nCD) * n_pair_right + int(nAB) * n_pair_right) * 8
+            if tile_transposed:
+                nCD = int(tile.shape[1])
+                nAB = int(tile.shape[2])
+            else:
+                nAB = int(tile.shape[1])
+                nCD = int(tile.shape[2])
+            bytes_work = (int(nAB) * n_pair_left + int(nCD) * npair_act + int(nAB) * npair_act) * 8
             max_tasks = int(max(1, max_work_bytes // max(bytes_work, 1)))
 
             for i0 in range(0, nt, max_tasks):
@@ -877,10 +1144,13 @@ def _build_pu_wx_eri_mat_dense_rys_from_cached(*, builder, C_mo, C_act, out_eri_
                 same_cd = sp_same[spcd]
 
                 K_AB_mixed = _build_pair_coeff_ordered_mixed_batch(CA_p, CB_p, CA_u, CB_u, same_shell=same_ab)
-                K_CD_act = _build_pair_coeff_ordered_batch(CC_u, CD_u, same_shell=same_cd)
+                K_CD_act = _build_pair_coeff_packed_batch(CC_u, CD_u, same_shell=same_cd)
 
-                tmp = cp.matmul(tile_chunk, K_CD_act)
-                out_eri_puwx += K_AB_mixed.reshape((m * nAB, n_pair_left)).T @ tmp.reshape((m * nAB, n_pair_right))
+                if tile_transposed:
+                    tmp = cp.einsum("mca,mcp->map", tile_chunk, K_CD_act)
+                else:
+                    tmp = cp.matmul(tile_chunk, K_CD_act)
+                acc_ket += K_AB_mixed.reshape((m * nAB, n_pair_left)).T @ tmp.reshape((m * nAB, npair_act))
 
                 off = spab != spcd
                 if bool(np.any(off)):
@@ -892,7 +1162,7 @@ def _build_pu_wx_eri_mat_dense_rys_from_cached(*, builder, C_mo, C_act, out_eri_
 
                         CA_u_off = CA_u[off_dev]
                         CB_u_off = CB_u[off_dev]
-                        K_AB_act_off = _build_pair_coeff_ordered_batch(
+                        K_AB_act_off = _build_pair_coeff_packed_batch(
                             CA_u_off,
                             CB_u_off,
                             same_shell=sp_same[spab[off_idx]],
@@ -910,8 +1180,17 @@ def _build_pu_wx_eri_mat_dense_rys_from_cached(*, builder, C_mo, C_act, out_eri_
                             same_shell=sp_same[spcd[off_idx]],
                         )
 
-                        tmp2 = cp.matmul(tile_off.transpose((0, 2, 1)), K_AB_act_off)
-                        out_eri_puwx += K_CD_mixed_off.reshape((noff * nCD, n_pair_left)).T @ tmp2.reshape((noff * nCD, n_pair_right))
+                        if tile_transposed:
+                            tmp2 = cp.matmul(tile_off, K_AB_act_off)
+                        else:
+                            tmp2 = cp.matmul(tile_off.transpose((0, 2, 1)), K_AB_act_off)
+                        acc_ket += K_CD_mixed_off.reshape((noff * nCD, n_pair_left)).T @ tmp2.reshape((noff * nCD, npair_act))
+
+    # Unpack packed ket (active-active symmetry: (w,x) = (x,w)) into the ordered output.
+    tri_w, tri_x = cp.tril_indices(ncas)
+    out_eri_puwx[:, tri_w * ncas + tri_x] = acc_ket
+    out_eri_puwx[:, tri_x * ncas + tri_w] = acc_ket
+    del acc_ket
 
     if profile is not None:
         try:
@@ -981,10 +1260,15 @@ def _build_pq_uv_eri_mat_dense_rys_from_cached(
 
     n_pair_left = int(nmo) * int(nmo)
     n_pair_right = int(ncas) * int(ncas)
+    npair_mo = int(nmo * (nmo + 1) // 2)
+    npair_act = int(ncas * (ncas + 1) // 2)
     if out_eri_pquv.shape != (n_pair_left, n_pair_right):
         raise ValueError(f"out shape mismatch: expected ({n_pair_left},{n_pair_right}), got {out_eri_pquv.shape}")
 
     out_eri_pquv.fill(0)
+    # Accumulate into packed bra+ket space; unpack both at end.
+    # bra (pq|..) symmetry: (pq)=(qp). ket (..|uv) symmetry: (uv)=(vu).
+    acc = cp.zeros((npair_mo, npair_act), dtype=cp.float64)
 
     shell_ao_start = np.asarray(basis.shell_ao_start, dtype=np.int64)
     spA = np.asarray(sp.sp_A, dtype=np.int32)
@@ -1034,17 +1318,25 @@ def _build_pq_uv_eri_mat_dense_rys_from_cached(
             work_large_min=int(work_large_min),
             blocks_per_task=int(blocks_per_task),
             max_tile_bytes=int(max_tile_bytes_i), boys=boys,
+            skip_transpose=True,
+            task_class_id=int(class_ids[g]),
+            preupload_tasks=True,
         ):
             tile = tb.tiles
+            tile_transposed = bool(getattr(tb, "kernel_transposed", False))
             spab_batch = np.asarray(tb.task_spAB, dtype=np.int32)
             spcd_batch = np.asarray(tb.task_spCD, dtype=np.int32)
             nt = int(spab_batch.shape[0])
             if nt == 0:
                 continue
 
-            nAB = int(tile.shape[1])
-            nCD = int(tile.shape[2])
-            bytes_work = (int(nAB) * n_pair_left + int(nCD) * n_pair_right + int(nAB) * n_pair_right) * 8
+            if tile_transposed:
+                nCD = int(tile.shape[1])
+                nAB = int(tile.shape[2])
+            else:
+                nAB = int(tile.shape[1])
+                nCD = int(tile.shape[2])
+            bytes_work = (int(nAB) * npair_mo + int(nCD) * npair_act + int(nAB) * npair_act) * 8
             max_tasks = int(max(1, max_work_bytes // max(bytes_work, 1)))
 
             for i0 in range(0, nt, max_tasks):
@@ -1066,18 +1358,21 @@ def _build_pq_uv_eri_mat_dense_rys_from_cached(
                 ic = cp.asarray(sp_a0[spcd], dtype=cp.int32)[:, None] + _arange(ncart(int(shell_l[C0])))[None, :]
                 id_ = cp.asarray(sp_b0[spcd], dtype=cp.int32)[:, None] + _arange(ncart(int(shell_l[D0])))[None, :]
 
-                # AB pair: both use C_mo
+                # AB pair: both use C_mo — packed since (pq|..) = (qp|..)
                 CA_p = C_mo[ia, :]
                 CB_p = C_mo[ib, :]
-                K_AB_mo = _build_pair_coeff_ordered_batch(CA_p, CB_p, same_shell=sp_same[spab])
+                K_AB_mo = _build_pair_coeff_packed_batch(CA_p, CB_p, same_shell=sp_same[spab])
 
-                # CD pair: both use C_act
+                # CD pair: both use C_act — packed since (..|uv) = (..|vu)
                 CC_u = C_act[ic, :]
                 CD_u = C_act[id_, :]
-                K_CD_act = _build_pair_coeff_ordered_batch(CC_u, CD_u, same_shell=sp_same[spcd])
+                K_CD_act = _build_pair_coeff_packed_batch(CC_u, CD_u, same_shell=sp_same[spcd])
 
-                tmp = cp.matmul(tile_chunk, K_CD_act)
-                out_eri_pquv += K_AB_mo.reshape((m * nAB, n_pair_left)).T @ tmp.reshape((m * nAB, n_pair_right))
+                if tile_transposed:
+                    tmp = cp.einsum("mca,mcp->map", tile_chunk, K_CD_act)
+                else:
+                    tmp = cp.matmul(tile_chunk, K_CD_act)
+                acc += K_AB_mo.reshape((m * nAB, npair_mo)).T @ tmp.reshape((m * nAB, npair_act))
 
                 off = spab != spcd
                 if bool(np.any(off)):
@@ -1087,17 +1382,34 @@ def _build_pq_uv_eri_mat_dense_rys_from_cached(
                         off_dev = cp.asarray(off_idx, dtype=cp.int32)
                         tile_off = tile_chunk[off_dev]
 
-                        # Swapped: AB uses C_act, CD uses C_mo
+                        # Swapped: AB uses C_act (packed), CD uses C_mo (packed)
                         CA_u_off = C_act[ia[off_dev], :]
                         CB_u_off = C_act[ib[off_dev], :]
-                        K_AB_act_off = _build_pair_coeff_ordered_batch(CA_u_off, CB_u_off, same_shell=sp_same[spab[off_idx]])
+                        K_AB_act_off = _build_pair_coeff_packed_batch(CA_u_off, CB_u_off, same_shell=sp_same[spab[off_idx]])
 
                         CC_p_off = C_mo[ic[off_dev], :]
                         CD_p_off = C_mo[id_[off_dev], :]
-                        K_CD_mo_off = _build_pair_coeff_ordered_batch(CC_p_off, CD_p_off, same_shell=sp_same[spcd[off_idx]])
+                        K_CD_mo_off = _build_pair_coeff_packed_batch(CC_p_off, CD_p_off, same_shell=sp_same[spcd[off_idx]])
 
-                        tmp2 = cp.matmul(tile_off.transpose((0, 2, 1)), K_AB_act_off)
-                        out_eri_pquv += K_CD_mo_off.reshape((noff * nCD, n_pair_left)).T @ tmp2.reshape((noff * nCD, n_pair_right))
+                        if tile_transposed:
+                            tmp2 = cp.matmul(tile_off, K_AB_act_off)
+                        else:
+                            tmp2 = cp.matmul(tile_off.transpose((0, 2, 1)), K_AB_act_off)
+                        acc += K_CD_mo_off.reshape((noff * nCD, npair_mo)).T @ tmp2.reshape((noff * nCD, npair_act))
+
+    # Unpack packed (npair_mo, npair_act) → ordered (nmo*nmo, ncas*ncas).
+    # Fill both triangle positions using bra symmetry (pq)=(qp) and ket symmetry (uv)=(vu).
+    tri_p, tri_q = cp.tril_indices(nmo)
+    tri_u, tri_v = cp.tril_indices(ncas)
+    # Unpack ket first: (npair_mo, npair_act) → (npair_mo, ncas*ncas)
+    acc_full_ket = cp.zeros((npair_mo, ncas * ncas), dtype=cp.float64)
+    acc_full_ket[:, tri_u * ncas + tri_v] = acc
+    acc_full_ket[:, tri_v * ncas + tri_u] = acc
+    del acc
+    # Unpack bra: (npair_mo, ncas*ncas) → (nmo*nmo, ncas*ncas)
+    out_eri_pquv[tri_p * nmo + tri_q, :] = acc_full_ket
+    out_eri_pquv[tri_q * nmo + tri_p, :] = acc_full_ket
+    del acc_full_ket
 
     if profile is not None:
         try:
@@ -1352,12 +1664,17 @@ def build_active_eri_packed_dense_sp_only(
     eps_ao: float = 0.0,
     eps_mo: float = 0.0,
     sp_Q=None,
-    algorithm: str = "direct",
+    algorithm: str = "ab_group",
 ):
     """Compute active-space ERIs as a packed pair matrix on GPU.
 
     Uses the cached general dense builder for all angular momenta. For `eps_mo>0`,
     additional shell-pair screening is applied before dense accumulation.
+
+    algorithm : "ab_group" (default) or "direct".
+        "ab_group" accumulates directly into the packed lower-triangular output
+        without building a full ordered-pair intermediate.
+        "direct" builds the full ordered-pair matrix first, then packs.
     """
 
     try:
@@ -1404,6 +1721,16 @@ def build_active_eri_packed_dense_sp_only(
 
     if float(eps_mo) > 0.0:
         b_exec = _filter_builder_tasks_by_eps_mo(builder, C_active, eps_mo=float(eps_mo))
+        if str(algorithm) == "ab_group":
+            n_pair_packed = int(norb * (norb + 1) // 2)
+            eri_packed = cp.zeros((n_pair_packed, n_pair_packed), dtype=cp.float64)
+            _build_active_eri_packed_dense_rys_from_cached_ab_group(
+                builder=b_exec,
+                C_active=C_active,
+                out_eri_packed=eri_packed,
+                profile=None,
+            )
+            return eri_packed
         n_pair = int(norb) * int(norb)
         eri_ordered = cp.zeros((n_pair, n_pair), dtype=cp.float64)
         _build_active_eri_mat_dense_rys_from_cached(
@@ -1413,6 +1740,16 @@ def build_active_eri_packed_dense_sp_only(
             profile=None,
         )
     else:
+        if str(algorithm) == "ab_group":
+            n_pair_packed = int(norb * (norb + 1) // 2)
+            eri_packed = cp.zeros((n_pair_packed, n_pair_packed), dtype=cp.float64)
+            _build_active_eri_packed_dense_rys_from_cached_ab_group(
+                builder=builder,
+                C_active=C_active,
+                out_eri_packed=eri_packed,
+                profile=None,
+            )
+            return eri_packed
         eri_ordered = builder.build(C_active).eri_mat
 
     tri_p, tri_q = cp.tril_indices(int(norb))

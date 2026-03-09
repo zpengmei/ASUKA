@@ -162,10 +162,22 @@ def _build_sorted_slab(
             gpu_resident=True,
         )
     else:
-        # CPU-resident: D→H task arrays (paid once per context build, not per iteration)
+        # CPU-resident: D→H task arrays (paid once per context build, not per iteration).
+        # Use pinned (page-locked) host memory for faster H→D transfers.
         ab_cpu = cp.asnumpy(ab_sorted_dev).astype(np.int32)
         cd_cpu = cp.asnumpy(cd_sorted_dev).astype(np.int32)
         del ab_sorted_dev, cd_sorted_dev
+        try:
+            ab_pinned = cp.cuda.alloc_pinned_memory(ab_cpu.nbytes)
+            cd_pinned = cp.cuda.alloc_pinned_memory(cd_cpu.nbytes)
+            ab_host = np.frombuffer(ab_pinned, dtype=np.int32, count=ab_cpu.size)
+            cd_host = np.frombuffer(cd_pinned, dtype=np.int32, count=cd_cpu.size)
+            ab_host[:] = ab_cpu
+            cd_host[:] = cd_cpu
+            ab_cpu = ab_host
+            cd_cpu = cd_host
+        except Exception:
+            pass  # fall back to regular (pageable) numpy arrays
         return _SortedSlab(
             ab_sorted=ab_cpu,
             cd_sorted=cd_cpu,
@@ -454,6 +466,7 @@ def direct_JK(
                     threads=threads,
                     mode="warp" if use_warp_mode else "auto",
                     profile=profile,
+                    skip_transpose=True,
                 )
                 n_kernel_calls += 1
 
@@ -462,25 +475,50 @@ def direct_JK(
                     _tc1 = cp.cuda.Event()
                     _tc0.record()
 
-                _ext.contract_jk_tiles_ordered_inplace_device(
-                    ab_dev[j0 + c0: j0 + c1],
-                    cd_dev[j0 + c0: j0 + c1],
-                    ctx.sp_A_dev,
-                    ctx.sp_B_dev,
-                    ctx.shell_ao_start_dev,
-                    int(nao),
-                    int(nA),
-                    int(nB),
-                    int(nC),
-                    int(nD),
-                    tiles.ravel(),
-                    D_flat,
-                    J_flat,
-                    K_flat,
-                    int(threads),
-                    int(stream_ptr),
-                    False,
-                )
+                # When transpose=True, the kernel produced tiles in
+                # (nCD_orig, nAB_orig) layout.  Instead of transposing +
+                # copying tiles, swap nA/nB/nC/nD and shell-pair arrays
+                # passed to the contraction kernel.
+                if transpose:
+                    _ext.contract_jk_tiles_ordered_inplace_device(
+                        cd_dev[j0 + c0: j0 + c1],
+                        ab_dev[j0 + c0: j0 + c1],
+                        ctx.sp_A_dev,
+                        ctx.sp_B_dev,
+                        ctx.shell_ao_start_dev,
+                        int(nao),
+                        int(nC),
+                        int(nD),
+                        int(nA),
+                        int(nB),
+                        tiles.ravel(),
+                        D_flat,
+                        J_flat,
+                        K_flat,
+                        int(threads),
+                        int(stream_ptr),
+                        False,
+                    )
+                else:
+                    _ext.contract_jk_tiles_ordered_inplace_device(
+                        ab_dev[j0 + c0: j0 + c1],
+                        cd_dev[j0 + c0: j0 + c1],
+                        ctx.sp_A_dev,
+                        ctx.sp_B_dev,
+                        ctx.shell_ao_start_dev,
+                        int(nao),
+                        int(nA),
+                        int(nB),
+                        int(nC),
+                        int(nD),
+                        tiles.ravel(),
+                        D_flat,
+                        J_flat,
+                        K_flat,
+                        int(threads),
+                        int(stream_ptr),
+                        False,
+                    )
 
                 if profile is not None:
                     _tc1.record()
@@ -567,10 +605,6 @@ def direct_JK_multi(
     Jb_flat = cp.zeros((nao2,), dtype=cp.float64) if want_J else None
     Kb_flat = cp.zeros((nao2,), dtype=cp.float64) if want_K else None
 
-    # Dummies for want_J=False (kernel needs a non-NULL J pointer)
-    Ja_dummy = cp.zeros((nao2,), dtype=cp.float64) if Ja_flat is None else None
-    Jb_dummy = cp.zeros((nao2,), dtype=cp.float64) if Jb_flat is None else None
-
     stream_ptr = int(cp.cuda.get_current_stream().ptr)
     n_kernel_calls = 0
     t0 = time.perf_counter()
@@ -630,6 +664,7 @@ def direct_JK_multi(
                     threads=threads,
                     mode="warp" if use_warp_mode else "auto",
                     profile=profile,
+                    skip_transpose=True,
                 )
                 n_kernel_calls += 1
 
@@ -638,28 +673,52 @@ def direct_JK_multi(
                     _tc1 = cp.cuda.Event()
                     _tc0.record()
 
-                _ext.contract_jk_tiles_ordered_multi2_inplace_device(
-                    ab_dev[j0 + c0: j0 + c1],
-                    cd_dev[j0 + c0: j0 + c1],
-                    ctx.sp_A_dev,
-                    ctx.sp_B_dev,
-                    ctx.shell_ao_start_dev,
-                    int(nao),
-                    int(nA),
-                    int(nB),
-                    int(nC),
-                    int(nD),
-                    tiles.ravel(),
-                    Da_flat,
-                    Db_flat,
-                    Ja_flat if Ja_flat is not None else Ja_dummy,
-                    Ka_flat,
-                    Jb_flat if Jb_flat is not None else Jb_dummy,
-                    Kb_flat,
-                    int(threads),
-                    int(stream_ptr),
-                    False,
-                )
+                if transpose:
+                    _ext.contract_jk_tiles_ordered_multi2_inplace_device(
+                        cd_dev[j0 + c0: j0 + c1],
+                        ab_dev[j0 + c0: j0 + c1],
+                        ctx.sp_A_dev,
+                        ctx.sp_B_dev,
+                        ctx.shell_ao_start_dev,
+                        int(nao),
+                        int(nC),
+                        int(nD),
+                        int(nA),
+                        int(nB),
+                        tiles.ravel(),
+                        Da_flat,
+                        Db_flat,
+                        Ja_flat,
+                        Ka_flat,
+                        Jb_flat,
+                        Kb_flat,
+                        int(threads),
+                        int(stream_ptr),
+                        False,
+                    )
+                else:
+                    _ext.contract_jk_tiles_ordered_multi2_inplace_device(
+                        ab_dev[j0 + c0: j0 + c1],
+                        cd_dev[j0 + c0: j0 + c1],
+                        ctx.sp_A_dev,
+                        ctx.sp_B_dev,
+                        ctx.shell_ao_start_dev,
+                        int(nao),
+                        int(nA),
+                        int(nB),
+                        int(nC),
+                        int(nD),
+                        tiles.ravel(),
+                        Da_flat,
+                        Db_flat,
+                        Ja_flat,
+                        Ka_flat,
+                        Jb_flat,
+                        Kb_flat,
+                        int(threads),
+                        int(stream_ptr),
+                        False,
+                    )
 
                 if profile is not None:
                     _tc1.record()

@@ -178,6 +178,15 @@ __global__ void cipsi_take_topk_kernel(
   out_new_n[0] = out_n;
 }
 
+__global__ void cipsi_score_nonzero_flags_kernel(
+    const uint64_t* __restrict__ score_bits,
+    int n,
+    int* __restrict__ flags) {
+  int i = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+  if (i >= n) return;
+  flags[i] = (score_bits[i] != 0) ? 1 : 0;
+}
+
 inline bool is_pow2_i32(int x) {
   return (x > 0) && ((x & (x - 1)) == 0);
 }
@@ -197,15 +206,11 @@ extern "C" cudaError_t guga_cipsi_frontier_hash_clear_launch_stream(
   if (cap == 0 || nroots == 0) return cudaSuccess;
   if (!is_pow2_i32(cap)) return cudaErrorInvalidValue;
 
-  int blocks_keys = (cap + threads - 1) / threads;
-  cipsi_frontier_hash_clear_keys_kernel<<<blocks_keys, threads, 0, stream>>>(keys, cap);
-  cudaError_t err = cudaGetLastError();
+  // keys are int32 with sentinel -1, so 0xFF byte pattern is correct.
+  cudaError_t err = cudaMemsetAsync(keys, 0xFF, (size_t)cap * sizeof(int32_t), stream);
   if (err != cudaSuccess) return err;
-
-  int64_t n = (int64_t)cap * (int64_t)nroots;
-  int blocks_vals = (int)((n + (int64_t)threads - 1) / (int64_t)threads);
-  cipsi_frontier_hash_clear_vals_kernel<<<blocks_vals, threads, 0, stream>>>(vals_root_major, n);
-  return cudaGetLastError();
+  // vals are float64 and zero-initialized with normal memset.
+  return cudaMemsetAsync(vals_root_major, 0, (size_t)cap * (size_t)nroots * sizeof(double), stream);
 }
 
 extern "C" cudaError_t guga_cipsi_frontier_hash_extract_launch_stream(
@@ -368,5 +373,157 @@ extern "C" cudaError_t guga_cipsi_score_and_select_topk_launch_stream(
   // Take first max_add nonzero scores.
   cipsi_take_topk_kernel<<<1, 1, 0, stream>>>(
       keys_score.Current(), vals_tie.Current(), nnz, max_add, out_new_idx, out_new_n);
+  return cudaGetLastError();
+}
+
+extern "C" cudaError_t guga_cipsi_score_and_select_topk_from_hash_slots_launch_stream(
+    const int32_t* keys,           // [cap]
+    const double* vals_root_major, // [nroots*cap]
+    int cap,
+    int nroots,
+    const double* e_var,           // [nroots]
+    const double* hdiag,           // [ncsf]
+    int ncsf,
+    const uint8_t* selected_mask,  // [ncsf] or NULL
+    double denom_floor,
+    int max_add,
+    int32_t* out_new_idx,          // [max_add]
+    int* out_new_n,                // [1]
+    double* out_pt2,               // [nroots]
+    cudaStream_t stream,
+    int threads) {
+  if (!keys || !vals_root_major || !e_var || !hdiag || !out_new_n || !out_pt2) return cudaErrorInvalidValue;
+  if (max_add > 0 && !out_new_idx) return cudaErrorInvalidValue;
+  if (cap < 0 || nroots < 0 || ncsf < 0 || max_add < 0) return cudaErrorInvalidValue;
+  if (threads <= 0 || threads > 1024) return cudaErrorInvalidValue;
+  if (cap == 0 || nroots == 0) {
+    cudaError_t err0 = cudaMemsetAsync(out_new_n, 0, sizeof(int), stream);
+    if (err0 != cudaSuccess) return err0;
+    return cudaMemsetAsync(out_pt2, 0, (size_t)std::max(0, nroots) * sizeof(double), stream);
+  }
+
+  // PT2-only mode: avoid sort/selection work.
+  if (max_add == 0) {
+    cudaError_t err0 = cudaMemsetAsync(out_pt2, 0, (size_t)nroots * sizeof(double), stream);
+    if (err0 != cudaSuccess) return err0;
+    int blocks0 = (cap + threads - 1) / threads;
+    cipsi_pt2_only_kernel<<<blocks0, threads, 0, stream>>>(
+        keys, vals_root_major, (int64_t)cap, cap, nroots, e_var, hdiag, ncsf, selected_mask, denom_floor, out_pt2);
+    cudaError_t err1 = cudaGetLastError();
+    if (err1 != cudaSuccess) return err1;
+    return cudaMemsetAsync(out_new_n, 0, sizeof(int), stream);
+  }
+
+  // score/tie buffers.
+  uint64_t* d_score_a_raw = nullptr;
+  uint64_t* d_score_b_raw = nullptr;
+  uint64_t* d_tie_a_raw = nullptr;
+  uint64_t* d_tie_b_raw = nullptr;
+  cudaError_t err = guga_cuda_malloc(&d_score_a_raw, (size_t)cap * sizeof(uint64_t), stream);
+  if (err != cudaSuccess) return err;
+  err = guga_cuda_malloc(&d_score_b_raw, (size_t)cap * sizeof(uint64_t), stream);
+  if (err != cudaSuccess) return err;
+  err = guga_cuda_malloc(&d_tie_a_raw, (size_t)cap * sizeof(uint64_t), stream);
+  if (err != cudaSuccess) return err;
+  err = guga_cuda_malloc(&d_tie_b_raw, (size_t)cap * sizeof(uint64_t), stream);
+  if (err != cudaSuccess) return err;
+  cuda_unique_ptr_stream<uint64_t> d_score_a(d_score_a_raw, CudaFreeStreamDeleter<uint64_t>{stream});
+  cuda_unique_ptr_stream<uint64_t> d_score_b(d_score_b_raw, CudaFreeStreamDeleter<uint64_t>{stream});
+  cuda_unique_ptr_stream<uint64_t> d_tie_a(d_tie_a_raw, CudaFreeStreamDeleter<uint64_t>{stream});
+  cuda_unique_ptr_stream<uint64_t> d_tie_b(d_tie_b_raw, CudaFreeStreamDeleter<uint64_t>{stream});
+
+  // flags + selected count for compaction.
+  int* d_flags_raw = nullptr;
+  int* d_nsel_raw = nullptr;
+  err = guga_cuda_malloc(&d_flags_raw, (size_t)cap * sizeof(int), stream);
+  if (err != cudaSuccess) return err;
+  err = guga_cuda_malloc(&d_nsel_raw, sizeof(int), stream);
+  if (err != cudaSuccess) return err;
+  cuda_unique_ptr_stream<int> d_flags(d_flags_raw, CudaFreeStreamDeleter<int>{stream});
+  cuda_unique_ptr_stream<int> d_nsel(d_nsel_raw, CudaFreeStreamDeleter<int>{stream});
+
+  // Zero pt2.
+  err = cudaMemsetAsync(out_pt2, 0, (size_t)nroots * sizeof(double), stream);
+  if (err != cudaSuccess) return err;
+
+  // Score all hash slots in-place (invalid/empty slots produce score 0).
+  int blocks = (cap + threads - 1) / threads;
+  cipsi_score_owner_pt2_kernel<<<blocks, threads, 0, stream>>>(
+      keys, vals_root_major, (int64_t)cap, cap, nroots, e_var, hdiag, ncsf, selected_mask, denom_floor,
+      d_score_a.get(), d_tie_a.get(), out_pt2);
+  err = cudaGetLastError();
+  if (err != cudaSuccess) return err;
+
+  cipsi_score_nonzero_flags_kernel<<<blocks, threads, 0, stream>>>(d_score_a.get(), cap, d_flags.get());
+  err = cudaGetLastError();
+  if (err != cudaSuccess) return err;
+
+  // Compact nonzero scores/ties so radix sorts run on nnz instead of full cap.
+  size_t temp_select_score = 0;
+  size_t temp_select_tie = 0;
+  err = cub::DeviceSelect::Flagged(
+      nullptr, temp_select_score, d_score_a.get(), d_flags.get(), d_score_b.get(), d_nsel.get(), cap, stream);
+  if (err != cudaSuccess) return err;
+  err = cub::DeviceSelect::Flagged(
+      nullptr, temp_select_tie, d_tie_a.get(), d_flags.get(), d_tie_b.get(), d_nsel.get(), cap, stream);
+  if (err != cudaSuccess) return err;
+
+  size_t temp_select = (temp_select_score > temp_select_tie) ? temp_select_score : temp_select_tie;
+  void* d_temp_select_raw = nullptr;
+  err = guga_cuda_malloc(&d_temp_select_raw, temp_select, stream);
+  if (err != cudaSuccess) return err;
+  cuda_unique_ptr_stream<void> d_temp_select((void*)d_temp_select_raw, CudaFreeStreamDeleter<void>{stream});
+
+  err = cub::DeviceSelect::Flagged(
+      d_temp_select.get(), temp_select_score, d_score_a.get(), d_flags.get(), d_score_b.get(), d_nsel.get(), cap, stream);
+  if (err != cudaSuccess) return err;
+  err = cub::DeviceSelect::Flagged(
+      d_temp_select.get(), temp_select_tie, d_tie_a.get(), d_flags.get(), d_tie_b.get(), d_nsel.get(), cap, stream);
+  if (err != cudaSuccess) return err;
+
+  int h_nsel = 0;
+  err = cudaMemcpyAsync(&h_nsel, d_nsel.get(), sizeof(int), cudaMemcpyDeviceToHost, stream);
+  if (err != cudaSuccess) return err;
+  err = cudaStreamSynchronize(stream);
+  if (err != cudaSuccess) return err;
+
+  if (h_nsel <= 0) {
+    return cudaMemsetAsync(out_new_n, 0, sizeof(int), stream);
+  }
+  if (h_nsel > cap) h_nsel = cap;
+
+  // Pass 1: stable sort compacted entries by tie_key ascending.
+  cub::DoubleBuffer<uint64_t> keys_tie(d_tie_b.get(), d_tie_a.get());
+  cub::DoubleBuffer<uint64_t> vals_score(d_score_b.get(), d_score_a.get());
+  size_t temp_sort1 = 0;
+  err = cub::DeviceRadixSort::SortPairs(nullptr, temp_sort1, keys_tie, vals_score, h_nsel, 0, 64, stream);
+  if (err != cudaSuccess) return err;
+
+  // Pass 2: stable sort by score descending.
+  cub::DoubleBuffer<uint64_t> keys_score(vals_score.Current(), vals_score.Alternate());
+  cub::DoubleBuffer<uint64_t> vals_tie(keys_tie.Current(), keys_tie.Alternate());
+  size_t temp_sort2 = 0;
+  err = cub::DeviceRadixSort::SortPairsDescending(nullptr, temp_sort2, keys_score, vals_tie, h_nsel, 0, 64, stream);
+  if (err != cudaSuccess) return err;
+
+  size_t temp_sort = (temp_sort1 > temp_sort2) ? temp_sort1 : temp_sort2;
+  void* d_temp_sort_raw = nullptr;
+  err = guga_cuda_malloc(&d_temp_sort_raw, temp_sort, stream);
+  if (err != cudaSuccess) return err;
+  cuda_unique_ptr_stream<void> d_temp_sort((void*)d_temp_sort_raw, CudaFreeStreamDeleter<void>{stream});
+
+  err = cub::DeviceRadixSort::SortPairs(
+      d_temp_sort.get(), temp_sort1, keys_tie, vals_score, h_nsel, 0, 64, stream);
+  if (err != cudaSuccess) return err;
+
+  keys_score = cub::DoubleBuffer<uint64_t>(vals_score.Current(), vals_score.Alternate());
+  vals_tie = cub::DoubleBuffer<uint64_t>(keys_tie.Current(), keys_tie.Alternate());
+
+  err = cub::DeviceRadixSort::SortPairsDescending(
+      d_temp_sort.get(), temp_sort2, keys_score, vals_tie, h_nsel, 0, 64, stream);
+  if (err != cudaSuccess) return err;
+
+  cipsi_take_topk_kernel<<<1, 1, 0, stream>>>(
+      keys_score.Current(), vals_tie.Current(), h_nsel, max_add, out_new_idx, out_new_n);
   return cudaGetLastError();
 }

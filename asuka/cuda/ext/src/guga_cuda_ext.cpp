@@ -1057,11 +1057,11 @@ struct QmcWorkspace {
     }
   }
 
-  void phi_pivot_resample_i32_f64_inplace_device(
-      py::object idx_in,
-      py::object val_in,
-      py::object idx_out,
-      py::object val_out,
+	  void phi_pivot_resample_i32_f64_inplace_device(
+	      py::object idx_in,
+	      py::object val_in,
+	      py::object idx_out,
+	      py::object val_out,
       py::object out_nnz,
       int n_in,
       int m,
@@ -1169,11 +1169,740 @@ struct QmcWorkspace {
             threads),
         "guga_qmc_phi_pivot_resample_i32_f64_ws_launch_stream");
 
-    if (sync) {
-      throw_on_cuda_error(cudaStreamSynchronize(stream_t), "cudaStreamSynchronize(qmc_ws_phi)");
-    }
-  }
-};
+	    if (sync) {
+	      throw_on_cuda_error(cudaStreamSynchronize(stream_t), "cudaStreamSynchronize(qmc_ws_phi)");
+	    }
+	  }
+
+	  void sparse_dot_many_sorted_i32_f64_inplace_device(
+	      py::object a_idx,
+	      py::object a_val,
+	      py::object a_nnz,
+	      py::object b_idx,
+	      py::object b_val,
+	      py::object b_nnz,
+	      py::object out,
+	      int threads,
+	      uint64_t stream,
+	      bool sync) const {
+	    if (!ws) throw std::runtime_error("QmcWorkspace has been released");
+	    if (threads <= 0 || threads > 1024 || (threads & 31) != 0) {
+	      throw std::invalid_argument("threads must be in 32..1024 and a multiple of 32");
+	    }
+	    if (a_idx.is_none() || a_val.is_none() || a_nnz.is_none() || b_idx.is_none() || b_val.is_none() || b_nnz.is_none() || out.is_none()) {
+	      throw std::invalid_argument("a_idx/a_val/a_nnz/b_idx/b_val/b_nnz/out must be device arrays (cannot be None)");
+	    }
+
+	    CudaArrayView a_idx_dev = cuda_array_view_from_object(a_idx, "a_idx");
+	    CudaArrayView a_val_dev = cuda_array_view_from_object(a_val, "a_val");
+	    CudaArrayView a_nnz_dev = cuda_array_view_from_object(a_nnz, "a_nnz");
+	    CudaArrayView b_idx_dev = cuda_array_view_from_object(b_idx, "b_idx");
+	    CudaArrayView b_val_dev = cuda_array_view_from_object(b_val, "b_val");
+	    CudaArrayView b_nnz_dev = cuda_array_view_from_object(b_nnz, "b_nnz");
+	    CudaArrayView out_dev = cuda_array_view_from_object(out, "out");
+
+	    require_typestr(a_idx_dev, "a_idx", "<i4");
+	    require_typestr(a_val_dev, "a_val", "<f8");
+	    require_typestr(a_nnz_dev, "a_nnz", "<i4");
+	    require_typestr(b_idx_dev, "b_idx", "<i4");
+	    require_typestr(b_val_dev, "b_val", "<f8");
+	    require_typestr(b_nnz_dev, "b_nnz", "<i4");
+	    require_typestr(out_dev, "out", "<f8");
+
+	    if (out_dev.read_only) {
+	      throw std::invalid_argument("out must be writable");
+	    }
+
+	    int nA = 0;
+	    int stride_a = 0;
+	    if (a_idx_dev.shape.size() == 1) {
+	      nA = 1;
+	      stride_a = (int)a_idx_dev.shape[0];
+	    } else if (a_idx_dev.shape.size() == 2) {
+	      nA = (int)a_idx_dev.shape[0];
+	      stride_a = (int)a_idx_dev.shape[1];
+	    } else {
+	      throw std::invalid_argument("a_idx must be a 1D or 2D device array");
+	    }
+
+	    int nB = 0;
+	    int stride_b = 0;
+	    if (b_idx_dev.shape.size() == 1) {
+	      nB = 1;
+	      stride_b = (int)b_idx_dev.shape[0];
+	    } else if (b_idx_dev.shape.size() == 2) {
+	      nB = (int)b_idx_dev.shape[0];
+	      stride_b = (int)b_idx_dev.shape[1];
+	    } else {
+	      throw std::invalid_argument("b_idx must be a 1D or 2D device array");
+	    }
+
+	    // Validate shapes match for idx/val pairs.
+	    if (a_val_dev.shape != a_idx_dev.shape) {
+	      throw std::invalid_argument("a_val must have the same shape as a_idx");
+	    }
+	    if (b_val_dev.shape != b_idx_dev.shape) {
+	      throw std::invalid_argument("b_val must have the same shape as b_idx");
+	    }
+
+	    // Row-major contiguous checks.
+	    if (!a_idx_dev.strides_bytes.empty()) {
+	      if (a_idx_dev.shape.size() == 1) {
+	        if (a_idx_dev.strides_bytes.size() != 1 || a_idx_dev.strides_bytes[0] != (int64_t)sizeof(int32_t)) {
+	          throw std::invalid_argument("a_idx must be contiguous");
+	        }
+	      } else {
+	        if (a_idx_dev.strides_bytes.size() != 2) throw std::invalid_argument("a_idx strides must have length 2");
+	        int64_t s0 = a_idx_dev.strides_bytes[0];
+	        int64_t s1 = a_idx_dev.strides_bytes[1];
+	        if (s0 != (int64_t)stride_a * (int64_t)sizeof(int32_t) || s1 != (int64_t)sizeof(int32_t)) {
+	          throw std::invalid_argument("a_idx must be C-contiguous with no padding");
+	        }
+	      }
+	    }
+	    if (!a_val_dev.strides_bytes.empty()) {
+	      if (a_val_dev.shape.size() == 1) {
+	        if (a_val_dev.strides_bytes.size() != 1 || a_val_dev.strides_bytes[0] != (int64_t)sizeof(double)) {
+	          throw std::invalid_argument("a_val must be contiguous");
+	        }
+	      } else {
+	        if (a_val_dev.strides_bytes.size() != 2) throw std::invalid_argument("a_val strides must have length 2");
+	        int64_t s0 = a_val_dev.strides_bytes[0];
+	        int64_t s1 = a_val_dev.strides_bytes[1];
+	        if (s0 != (int64_t)stride_a * (int64_t)sizeof(double) || s1 != (int64_t)sizeof(double)) {
+	          throw std::invalid_argument("a_val must be C-contiguous with no padding");
+	        }
+	      }
+	    }
+	    if (!b_idx_dev.strides_bytes.empty()) {
+	      if (b_idx_dev.shape.size() == 1) {
+	        if (b_idx_dev.strides_bytes.size() != 1 || b_idx_dev.strides_bytes[0] != (int64_t)sizeof(int32_t)) {
+	          throw std::invalid_argument("b_idx must be contiguous");
+	        }
+	      } else {
+	        if (b_idx_dev.strides_bytes.size() != 2) throw std::invalid_argument("b_idx strides must have length 2");
+	        int64_t s0 = b_idx_dev.strides_bytes[0];
+	        int64_t s1 = b_idx_dev.strides_bytes[1];
+	        if (s0 != (int64_t)stride_b * (int64_t)sizeof(int32_t) || s1 != (int64_t)sizeof(int32_t)) {
+	          throw std::invalid_argument("b_idx must be C-contiguous with no padding");
+	        }
+	      }
+	    }
+	    if (!b_val_dev.strides_bytes.empty()) {
+	      if (b_val_dev.shape.size() == 1) {
+	        if (b_val_dev.strides_bytes.size() != 1 || b_val_dev.strides_bytes[0] != (int64_t)sizeof(double)) {
+	          throw std::invalid_argument("b_val must be contiguous");
+	        }
+	      } else {
+	        if (b_val_dev.strides_bytes.size() != 2) throw std::invalid_argument("b_val strides must have length 2");
+	        int64_t s0 = b_val_dev.strides_bytes[0];
+	        int64_t s1 = b_val_dev.strides_bytes[1];
+	        if (s0 != (int64_t)stride_b * (int64_t)sizeof(double) || s1 != (int64_t)sizeof(double)) {
+	          throw std::invalid_argument("b_val must be C-contiguous with no padding");
+	        }
+	      }
+	    }
+
+	    // nnz arrays: shape (n,) or scalar (only allowed when n==1).
+	    if (a_nnz_dev.shape.size() == 1) {
+	      if (a_nnz_dev.shape[0] != (int64_t)nA) throw std::invalid_argument("a_nnz must have length nA");
+	      if (!a_nnz_dev.strides_bytes.empty()) {
+	        if (a_nnz_dev.strides_bytes.size() != 1 || a_nnz_dev.strides_bytes[0] != (int64_t)sizeof(int32_t)) {
+	          throw std::invalid_argument("a_nnz must be contiguous");
+	        }
+	      }
+	    } else if (a_nnz_dev.shape.size() == 0) {
+	      if (nA != 1) throw std::invalid_argument("a_nnz scalar is only valid for nA==1");
+	    } else {
+	      throw std::invalid_argument("a_nnz must have shape (nA,) or ()");
+	    }
+
+	    if (b_nnz_dev.shape.size() == 1) {
+	      if (b_nnz_dev.shape[0] != (int64_t)nB) throw std::invalid_argument("b_nnz must have length nB");
+	      if (!b_nnz_dev.strides_bytes.empty()) {
+	        if (b_nnz_dev.strides_bytes.size() != 1 || b_nnz_dev.strides_bytes[0] != (int64_t)sizeof(int32_t)) {
+	          throw std::invalid_argument("b_nnz must be contiguous");
+	        }
+	      }
+	    } else if (b_nnz_dev.shape.size() == 0) {
+	      if (nB != 1) throw std::invalid_argument("b_nnz scalar is only valid for nB==1");
+	    } else {
+	      throw std::invalid_argument("b_nnz must have shape (nB,) or ()");
+	    }
+
+	    // Output: (nA,nB) row-major.
+	    if (out_dev.shape.size() != 2 || out_dev.shape[0] != (int64_t)nA || out_dev.shape[1] != (int64_t)nB) {
+	      throw std::invalid_argument("out must have shape (nA,nB)");
+	    }
+	    if (!out_dev.strides_bytes.empty()) {
+	      if (out_dev.strides_bytes.size() != 2) throw std::invalid_argument("out strides must have length 2");
+	      int64_t s0 = out_dev.strides_bytes[0];
+	      int64_t s1 = out_dev.strides_bytes[1];
+	      if (s0 != (int64_t)nB * (int64_t)sizeof(double) || s1 != (int64_t)sizeof(double)) {
+	        throw std::invalid_argument("out must be C-contiguous with no padding");
+	      }
+	    }
+
+	    cudaStream_t stream_t = (cudaStream_t)stream;
+	    throw_on_cuda_error(
+	        guga_qmc_sparse_dot_many_sorted_i32_f64_launch_stream(
+	            (const int32_t*)a_idx_dev.ptr,
+	            (const double*)a_val_dev.ptr,
+	            (const int32_t*)a_nnz_dev.ptr,
+	            nA,
+	            stride_a,
+	            (const int32_t*)b_idx_dev.ptr,
+	            (const double*)b_val_dev.ptr,
+	            (const int32_t*)b_nnz_dev.ptr,
+	            nB,
+	            stride_b,
+	            (double*)out_dev.ptr,
+	            stream_t,
+	            int(threads)),
+	        "guga_qmc_sparse_dot_many_sorted_i32_f64_launch_stream");
+
+	    if (sync) {
+	      throw_on_cuda_error(cudaStreamSynchronize(stream_t), "cudaStreamSynchronize(qmc_ws_sparse_dot_many)");
+	    }
+	  }
+
+	  int projector_step_hamiltonian_phi_i32_f64_inplace_device(
+	      const DeviceDRT& drt,
+	      const DeviceStateCache& state,
+	      py::object x_idx,
+	      py::object x_val,
+	      int nnz,
+	      py::object h_base_flat,
+	      py::object eri_mat,
+	      py::object idx_all,
+	      py::object val_all,
+	      py::object idx_u,
+	      py::object val_u,
+	      py::object nnz_u,
+	      py::object x_idx_out,
+	      py::object x_val_out,
+	      py::object nnz_out,
+	      int m,
+	      int pivot,
+	      double eps,
+	      double scale_identity,
+	      int nspawn_one,
+	      int nspawn_two,
+	      uint64_t seed_spawn,
+	      uint64_t seed_phi,
+	      double initiator_t,
+	      py::object initiator_t_dev,
+	      int threads_spawn,
+	      int threads_qmc,
+	      uint64_t stream,
+	      bool sync) const {
+	    if (!ws) throw std::runtime_error("QmcWorkspace has been released");
+	    if (drt.child == nullptr || drt.node_twos == nullptr || drt.child_prefix == nullptr) {
+	      throw std::runtime_error("DeviceDRT is not initialized");
+	    }
+	    if (state.steps == nullptr || state.nodes == nullptr) {
+	      throw std::runtime_error("DeviceStateCache is not initialized");
+	    }
+	    if (drt.norb != state.norb) {
+	      throw std::invalid_argument("DeviceDRT and DeviceStateCache have inconsistent norb");
+	    }
+	    if (drt.norb <= 0 || drt.norb > MAX_NORB) {
+	      throw std::invalid_argument("norb out of supported range for current kernels");
+	    }
+	    if (threads_spawn <= 0 || threads_spawn > 1024) {
+	      throw std::invalid_argument("threads_spawn must be in 1..1024");
+	    }
+	    if (threads_qmc <= 0 || threads_qmc > 1024) {
+	      throw std::invalid_argument("threads_qmc must be in 1..1024");
+	    }
+
+	    nnz = int(nnz);
+	    m = int(m);
+	    pivot = int(pivot);
+	    nspawn_one = int(nspawn_one);
+	    nspawn_two = int(nspawn_two);
+	    if (nnz < 0 || nnz > max_m) {
+	      throw std::invalid_argument("nnz out of range for workspace max_m");
+	    }
+	    if (m < 0 || m > max_m) {
+	      throw std::invalid_argument("m out of range for workspace max_m");
+	    }
+	    if (pivot < 0) {
+	      throw std::invalid_argument("pivot must be >= 0");
+	    }
+	    if (nspawn_one < 0 || nspawn_two < 0) {
+	      throw std::invalid_argument("nspawn_one/nspawn_two must be >= 0");
+	    }
+	    int nspawn_total = nspawn_one + nspawn_two;
+	    if (nspawn_total <= 0) {
+	      throw std::invalid_argument("at least one of nspawn_one or nspawn_two must be > 0");
+	    }
+	    if (nnz == 0 || m == 0) {
+	      return 0;
+	    }
+
+	    if (x_idx.is_none() || x_val.is_none() || h_base_flat.is_none() || eri_mat.is_none() || idx_all.is_none() || val_all.is_none() ||
+	        idx_u.is_none() || val_u.is_none() || nnz_u.is_none() || x_idx_out.is_none() || x_val_out.is_none() || nnz_out.is_none()) {
+	      throw std::invalid_argument("inputs/outputs must be device arrays (cannot be None)");
+	    }
+
+	    CudaArrayView x_idx_dev = cuda_array_view_from_object(x_idx, "x_idx");
+	    CudaArrayView x_val_dev = cuda_array_view_from_object(x_val, "x_val");
+	    CudaArrayView h_base_dev = cuda_array_view_from_object(h_base_flat, "h_base_flat");
+	    CudaArrayView eri_dev = cuda_array_view_from_object(eri_mat, "eri_mat");
+	    CudaArrayView idx_all_dev = cuda_array_view_from_object(idx_all, "idx_all");
+	    CudaArrayView val_all_dev = cuda_array_view_from_object(val_all, "val_all");
+	    CudaArrayView idx_u_dev = cuda_array_view_from_object(idx_u, "idx_u");
+	    CudaArrayView val_u_dev = cuda_array_view_from_object(val_u, "val_u");
+	    CudaArrayView nnz_u_dev = cuda_array_view_from_object(nnz_u, "nnz_u");
+	    CudaArrayView x_idx_out_dev = cuda_array_view_from_object(x_idx_out, "x_idx_out");
+	    CudaArrayView x_val_out_dev = cuda_array_view_from_object(x_val_out, "x_val_out");
+	    CudaArrayView nnz_out_dev = cuda_array_view_from_object(nnz_out, "nnz_out");
+
+	    require_typestr(x_idx_dev, "x_idx", "<i4");
+	    require_typestr(x_val_dev, "x_val", "<f8");
+	    require_typestr(h_base_dev, "h_base_flat", "<f8");
+	    require_typestr(eri_dev, "eri_mat", "<f8");
+	    require_typestr(idx_all_dev, "idx_all", "<i4");
+	    require_typestr(val_all_dev, "val_all", "<f8");
+	    require_typestr(idx_u_dev, "idx_u", "<i4");
+	    require_typestr(val_u_dev, "val_u", "<f8");
+	    require_typestr(nnz_u_dev, "nnz_u", "<i4");
+	    require_typestr(x_idx_out_dev, "x_idx_out", "<i4");
+	    require_typestr(x_val_out_dev, "x_val_out", "<f8");
+	    require_typestr(nnz_out_dev, "nnz_out", "<i4");
+
+	    if (idx_all_dev.read_only || val_all_dev.read_only || idx_u_dev.read_only || val_u_dev.read_only || nnz_u_dev.read_only ||
+	        x_idx_out_dev.read_only || x_val_out_dev.read_only || nnz_out_dev.read_only) {
+	      throw std::invalid_argument("output buffers must be writable");
+	    }
+
+	    if (x_idx_dev.shape.size() != 1 || x_val_dev.shape.size() != 1) {
+	      throw std::invalid_argument("x_idx and x_val must be 1D arrays");
+	    }
+	    if (x_idx_dev.shape[0] < (int64_t)nnz || x_val_dev.shape[0] < (int64_t)nnz) {
+	      throw std::invalid_argument("x_idx/x_val length must be >= nnz");
+	    }
+	    if (h_base_dev.shape.size() != 1) {
+	      throw std::invalid_argument("h_base_flat must be a 1D array");
+	    }
+	    if (eri_dev.shape.size() != 2 || eri_dev.shape[0] != eri_dev.shape[1]) {
+	      throw std::invalid_argument("eri_mat must have shape (nops,nops)");
+	    }
+
+	    int64_t nops64 = (int64_t)drt.norb * (int64_t)drt.norb;
+	    if (h_base_dev.shape[0] != nops64) {
+	      throw std::invalid_argument("h_base_flat must have shape (norb*norb,)");
+	    }
+	    if (eri_dev.shape[0] != nops64) {
+	      throw std::invalid_argument("eri_mat must have shape (norb*norb, norb*norb)");
+	    }
+
+	    int64_t out_len64 = (int64_t)nnz * (int64_t)nspawn_total;
+	    if (out_len64 < 0 || out_len64 > (int64_t)std::numeric_limits<int>::max()) {
+	      throw std::invalid_argument("event buffer length out of supported range");
+	    }
+	    int out_len = (int)out_len64;
+	    int64_t all_len64 = (int64_t)nnz + (int64_t)out_len;
+	    if (all_len64 < 0 || all_len64 > (int64_t)max_n) {
+	      throw std::invalid_argument("merged buffer length out of range for workspace max_n");
+	    }
+	    int all_len = (int)all_len64;
+
+	    if (idx_all_dev.shape.size() != 1 || val_all_dev.shape.size() != 1) {
+	      throw std::invalid_argument("idx_all and val_all must be 1D arrays");
+	    }
+	    if (idx_all_dev.shape[0] < (int64_t)all_len || val_all_dev.shape[0] < (int64_t)all_len) {
+	      throw std::invalid_argument("idx_all/val_all must have length >= nnz + nnz*(nspawn_one+nspawn_two)");
+	    }
+	    if (idx_u_dev.shape.size() != 1 || val_u_dev.shape.size() != 1) {
+	      throw std::invalid_argument("idx_u and val_u must be 1D arrays");
+	    }
+	    if (idx_u_dev.shape[0] < (int64_t)all_len || val_u_dev.shape[0] < (int64_t)all_len) {
+	      throw std::invalid_argument("idx_u/val_u must have length >= merged length");
+	    }
+	    if (x_idx_out_dev.shape.size() != 1 || x_val_out_dev.shape.size() != 1) {
+	      throw std::invalid_argument("x_idx_out and x_val_out must be 1D arrays");
+	    }
+	    if (x_idx_out_dev.shape[0] < (int64_t)m || x_val_out_dev.shape[0] < (int64_t)m) {
+	      throw std::invalid_argument("x_idx_out/x_val_out must have length >= m");
+	    }
+
+	    // Device scalar checks for nnz_u/nnz_out.
+	    auto require_i32_scalar = [](const CudaArrayView& v, const char* name) {
+	      if (v.shape.size() == 1) {
+	        if (v.shape[0] != 1) throw std::invalid_argument(std::string(name) + " must have shape (1,) or ()");
+	        if (!v.strides_bytes.empty()) {
+	          if (v.strides_bytes.size() != 1) throw std::invalid_argument(std::string(name) + " must be 1D with valid strides");
+	          if (v.strides_bytes[0] != (int64_t)sizeof(int32_t)) throw std::invalid_argument(std::string(name) + " must be contiguous");
+	        }
+	      } else if (v.shape.size() == 0) {
+	        // ok
+	      } else {
+	        throw std::invalid_argument(std::string(name) + " must have shape (1,) or ()");
+	      }
+	    };
+	    require_i32_scalar(nnz_u_dev, "nnz_u");
+	    require_i32_scalar(nnz_out_dev, "nnz_out");
+
+	    // Optional device scalar for initiator threshold.
+	    const double* d_initiator_t = nullptr;
+	    if (!initiator_t_dev.is_none()) {
+	      CudaArrayView t_dev = cuda_array_view_from_object(initiator_t_dev, "initiator_t_dev");
+	      require_typestr(t_dev, "initiator_t_dev", "<f8");
+	      if (t_dev.shape.size() == 1) {
+	        if (t_dev.shape[0] != 1) throw std::invalid_argument("initiator_t_dev must have shape (1,) or ()");
+	        if (!t_dev.strides_bytes.empty()) {
+	          if (t_dev.strides_bytes.size() != 1) throw std::invalid_argument("initiator_t_dev must be 1D with valid strides");
+	          if (t_dev.strides_bytes[0] != (int64_t)sizeof(double)) throw std::invalid_argument("initiator_t_dev must be contiguous");
+	        }
+	      } else if (t_dev.shape.size() == 0) {
+	        // ok
+	      } else {
+	        throw std::invalid_argument("initiator_t_dev must have shape (1,) or ()");
+	      }
+	      d_initiator_t = (const double*)t_dev.ptr;
+	      if (initiator_t != 0.0) {
+	        throw std::invalid_argument("provide either initiator_t or initiator_t_dev (not both)");
+	      }
+	    }
+
+	    cudaStream_t stream_t = (cudaStream_t)stream;
+
+	    // Event buffer is the tail of the merged input.
+	    int32_t* d_idx_all = (int32_t*)idx_all_dev.ptr;
+	    double* d_val_all = (double*)val_all_dev.ptr;
+	    int32_t* d_evt_idx = d_idx_all + nnz;
+	    double* d_evt_val = d_val_all + nnz;
+	    throw_on_cuda_error(cudaMemsetAsync(d_evt_idx, 0xFF, (size_t)out_len * sizeof(int32_t), stream_t), "cudaMemsetAsync(evt_idx=-1)");
+	    throw_on_cuda_error(cudaMemsetAsync(d_evt_val, 0, (size_t)out_len * sizeof(double), stream_t), "cudaMemsetAsync(evt_val=0)");
+
+	    // Spawn into tail.
+	    if (d_initiator_t) {
+	      throw_on_cuda_error(
+	          guga_qmc_spawn_hamiltonian_initiator_dev_launch_stream(
+	              drt.child,
+	              drt.node_twos,
+	              drt.child_prefix,
+	              state.steps,
+	              state.nodes,
+	              state.ncsf,
+	              drt.norb,
+	              (const int32_t*)x_idx_dev.ptr,
+	              (const double*)x_val_dev.ptr,
+	              nnz,
+	              (const double*)h_base_dev.ptr,
+	              (const double*)eri_dev.ptr,
+	              eps,
+	              nspawn_one,
+	              nspawn_two,
+	              seed_spawn,
+	              d_initiator_t,
+	              d_evt_idx,
+	              d_evt_val,
+	              stream_t,
+	              threads_spawn),
+	          "guga_qmc_spawn_hamiltonian_initiator_dev_launch_stream");
+	    } else {
+	      throw_on_cuda_error(
+	          guga_qmc_spawn_hamiltonian_launch_stream(
+	              drt.child,
+	              drt.node_twos,
+	              drt.child_prefix,
+	              state.steps,
+	              state.nodes,
+	              state.ncsf,
+	              drt.norb,
+	              (const int32_t*)x_idx_dev.ptr,
+	              (const double*)x_val_dev.ptr,
+	              nnz,
+	              (const double*)h_base_dev.ptr,
+	              (const double*)eri_dev.ptr,
+	              eps,
+	              nspawn_one,
+	              nspawn_two,
+	              seed_spawn,
+	              initiator_t,
+	              d_evt_idx,
+	              d_evt_val,
+	              stream_t,
+	              threads_spawn),
+	          "guga_qmc_spawn_hamiltonian_launch_stream");
+	    }
+
+	    // Pack scaled identity into the prefix.
+	    throw_on_cuda_error(
+	        guga_qmc_pack_scaled_identity_i32_f64_launch_stream(
+	            (const int32_t*)x_idx_dev.ptr,
+	            (const double*)x_val_dev.ptr,
+	            nnz,
+	            scale_identity,
+	            d_idx_all,
+	            d_val_all,
+	            stream_t,
+	            threads_qmc),
+	        "guga_qmc_pack_scaled_identity_i32_f64_launch_stream");
+
+	    // Coalesce into (idx_u, val_u).
+	    throw_on_cuda_error(
+	        guga_qmc_coalesce_coo_i32_f64_ws_launch_stream(
+	            ws,
+	            d_idx_all,
+	            d_val_all,
+	            all_len,
+	            (int32_t*)idx_u_dev.ptr,
+	            (double*)val_u_dev.ptr,
+	            (int*)nnz_u_dev.ptr,
+	            stream_t,
+	            threads_qmc),
+	        "guga_qmc_coalesce_coo_i32_f64_ws_launch_stream");
+
+	    // Read n_in for Φ.
+	    int n_in = 0;
+	    throw_on_cuda_error(cudaMemcpyAsync(&n_in, nnz_u_dev.ptr, sizeof(int), cudaMemcpyDeviceToHost, stream_t), "cudaMemcpyAsync(nnz_u)");
+	    throw_on_cuda_error(cudaStreamSynchronize(stream_t), "cudaStreamSynchronize(read nnz_u)");
+	    if (n_in < 0) n_in = 0;
+
+	    // Φ compression into output vector.
+	    throw_on_cuda_error(
+	        guga_qmc_phi_pivot_resample_i32_f64_ws_launch_stream(
+	            ws,
+	            (const int32_t*)idx_u_dev.ptr,
+	            (const double*)val_u_dev.ptr,
+	            n_in,
+	            (int32_t*)x_idx_out_dev.ptr,
+	            (double*)x_val_out_dev.ptr,
+	            (int*)nnz_out_dev.ptr,
+	            m,
+	            pivot,
+	            seed_phi,
+	            stream_t,
+	            threads_qmc),
+	        "guga_qmc_phi_pivot_resample_i32_f64_ws_launch_stream");
+
+	    // Read final nnz (always required since we return it).
+	    int n_out = 0;
+	    throw_on_cuda_error(cudaMemcpyAsync(&n_out, nnz_out_dev.ptr, sizeof(int), cudaMemcpyDeviceToHost, stream_t), "cudaMemcpyAsync(nnz_out)");
+	    throw_on_cuda_error(cudaStreamSynchronize(stream_t), "cudaStreamSynchronize(read nnz_out)");
+	    if (n_out < 0) n_out = 0;
+	    if (n_out > m) n_out = m;
+
+	    (void)sync;  // Return value requires synchronization regardless of this flag.
+	    return n_out;
+	  }
+
+	  int fciqmc_step_shift_i32_f64_inplace_device(
+	      const DeviceDRT& drt,
+	      const DeviceStateCache& state,
+	      py::object x_idx,
+	      py::object x_val,
+	      int nnz,
+	      py::object h_base_flat,
+	      py::object eri_mat,
+	      py::object x_idx_out,
+	      py::object x_val_out,
+	      py::object nnz_out,
+	      double dt,
+	      double shift,
+	      double initiator_t,
+	      int nspawn_one,
+	      int nspawn_two,
+	      uint64_t seed_spawn,
+	      int threads_spawn,
+	      int threads_qmc,
+	      uint64_t stream,
+	      bool sync) const {
+	    if (!ws) throw std::runtime_error("QmcWorkspace has been released");
+	    if (drt.child == nullptr || drt.node_twos == nullptr || drt.child_prefix == nullptr) {
+	      throw std::runtime_error("DeviceDRT is not initialized");
+	    }
+	    if (state.steps == nullptr || state.nodes == nullptr) {
+	      throw std::runtime_error("DeviceStateCache is not initialized");
+	    }
+	    if (drt.norb != state.norb) {
+	      throw std::invalid_argument("DeviceDRT and DeviceStateCache have inconsistent norb");
+	    }
+	    if (drt.norb <= 0 || drt.norb > MAX_NORB) {
+	      throw std::invalid_argument("norb out of supported range for current kernels");
+	    }
+	    if (threads_spawn <= 0 || threads_spawn > 1024) {
+	      throw std::invalid_argument("threads_spawn must be in 1..1024");
+	    }
+	    if (threads_qmc <= 0 || threads_qmc > 1024) {
+	      throw std::invalid_argument("threads_qmc must be in 1..1024");
+	    }
+
+	    nnz = int(nnz);
+	    nspawn_one = int(nspawn_one);
+	    nspawn_two = int(nspawn_two);
+	    if (nnz < 0 || nnz > max_m) {
+	      throw std::invalid_argument("nnz out of range for workspace max_m");
+	    }
+	    int nspawn_total = nspawn_one + nspawn_two;
+	    if (nspawn_total <= 0) {
+	      throw std::invalid_argument("at least one of nspawn_one or nspawn_two must be > 0");
+	    }
+	    if (nnz == 0) {
+	      return 0;
+	    }
+
+	    if (x_idx.is_none() || x_val.is_none() || h_base_flat.is_none() || eri_mat.is_none() || x_idx_out.is_none() || x_val_out.is_none() ||
+	        nnz_out.is_none()) {
+	      throw std::invalid_argument("inputs/outputs must be device arrays (cannot be None)");
+	    }
+
+	    CudaArrayView x_idx_dev = cuda_array_view_from_object(x_idx, "x_idx");
+	    CudaArrayView x_val_dev = cuda_array_view_from_object(x_val, "x_val");
+	    CudaArrayView h_base_dev = cuda_array_view_from_object(h_base_flat, "h_base_flat");
+	    CudaArrayView eri_dev = cuda_array_view_from_object(eri_mat, "eri_mat");
+	    CudaArrayView x_idx_out_dev = cuda_array_view_from_object(x_idx_out, "x_idx_out");
+	    CudaArrayView x_val_out_dev = cuda_array_view_from_object(x_val_out, "x_val_out");
+	    CudaArrayView nnz_out_dev = cuda_array_view_from_object(nnz_out, "nnz_out");
+
+	    require_typestr(x_idx_dev, "x_idx", "<i4");
+	    require_typestr(x_val_dev, "x_val", "<f8");
+	    require_typestr(h_base_dev, "h_base_flat", "<f8");
+	    require_typestr(eri_dev, "eri_mat", "<f8");
+	    require_typestr(x_idx_out_dev, "x_idx_out", "<i4");
+	    require_typestr(x_val_out_dev, "x_val_out", "<f8");
+	    require_typestr(nnz_out_dev, "nnz_out", "<i4");
+
+	    if (x_idx_out_dev.read_only || x_val_out_dev.read_only || nnz_out_dev.read_only) {
+	      throw std::invalid_argument("output buffers must be writable");
+	    }
+
+	    if (x_idx_dev.shape.size() != 1 || x_val_dev.shape.size() != 1) {
+	      throw std::invalid_argument("x_idx and x_val must be 1D arrays");
+	    }
+	    if (x_idx_dev.shape[0] < (int64_t)nnz || x_val_dev.shape[0] < (int64_t)nnz) {
+	      throw std::invalid_argument("x_idx/x_val length must be >= nnz");
+	    }
+	    if (h_base_dev.shape.size() != 1) {
+	      throw std::invalid_argument("h_base_flat must be a 1D array");
+	    }
+	    if (eri_dev.shape.size() != 2 || eri_dev.shape[0] != eri_dev.shape[1]) {
+	      throw std::invalid_argument("eri_mat must have shape (nops,nops)");
+	    }
+
+	    int64_t nops64 = (int64_t)drt.norb * (int64_t)drt.norb;
+	    if (h_base_dev.shape[0] != nops64) {
+	      throw std::invalid_argument("h_base_flat must have shape (norb*norb,)");
+	    }
+	    if (eri_dev.shape[0] != nops64) {
+	      throw std::invalid_argument("eri_mat must have shape (norb*norb, norb*norb)");
+	    }
+
+	    int64_t out_len64 = (int64_t)nnz * (int64_t)nspawn_total;
+	    if (out_len64 < 0 || out_len64 > (int64_t)std::numeric_limits<int>::max()) {
+	      throw std::invalid_argument("event buffer length out of supported range");
+	    }
+	    int out_len = (int)out_len64;
+	    int64_t all_len64 = (int64_t)nnz + (int64_t)out_len;
+	    if (all_len64 < 0 || all_len64 > (int64_t)max_n) {
+	      throw std::invalid_argument("merged buffer length out of range for workspace max_n");
+	    }
+	    int all_len = (int)all_len64;
+
+	    if (x_idx_dev.shape[0] < (int64_t)all_len || x_val_dev.shape[0] < (int64_t)all_len) {
+	      throw std::invalid_argument("x_idx/x_val buffers must have length >= nnz + nnz*(nspawn_one+nspawn_two)");
+	    }
+	    if (x_idx_out_dev.shape.size() != 1 || x_val_out_dev.shape.size() != 1) {
+	      throw std::invalid_argument("x_idx_out and x_val_out must be 1D arrays");
+	    }
+	    if (x_idx_out_dev.shape[0] < (int64_t)all_len || x_val_out_dev.shape[0] < (int64_t)all_len) {
+	      throw std::invalid_argument("x_idx_out/x_val_out buffers must have length >= merged length");
+	    }
+
+	    // Device scalar checks for nnz_out.
+	    if (nnz_out_dev.shape.size() == 1) {
+	      if (nnz_out_dev.shape[0] != 1) throw std::invalid_argument("nnz_out must have shape (1,) or ()");
+	      if (!nnz_out_dev.strides_bytes.empty()) {
+	        if (nnz_out_dev.strides_bytes.size() != 1) throw std::invalid_argument("nnz_out must be 1D with valid strides");
+	        if (nnz_out_dev.strides_bytes[0] != (int64_t)sizeof(int32_t)) throw std::invalid_argument("nnz_out must be contiguous");
+	      }
+	    } else if (nnz_out_dev.shape.size() == 0) {
+	      // ok
+	    } else {
+	      throw std::invalid_argument("nnz_out must have shape (1,) or ()");
+	    }
+
+	    cudaStream_t stream_t = (cudaStream_t)stream;
+
+	    // Event buffer is the tail of the merged input.
+	    int32_t* d_x_idx = (int32_t*)x_idx_dev.ptr;
+	    double* d_x_val = (double*)x_val_dev.ptr;
+	    int32_t* d_evt_idx = d_x_idx + nnz;
+	    double* d_evt_val = d_x_val + nnz;
+	    throw_on_cuda_error(cudaMemsetAsync(d_evt_idx, 0xFF, (size_t)out_len * sizeof(int32_t), stream_t), "cudaMemsetAsync(evt_idx=-1)");
+	    throw_on_cuda_error(cudaMemsetAsync(d_evt_val, 0, (size_t)out_len * sizeof(double), stream_t), "cudaMemsetAsync(evt_val=0)");
+
+	    // Spawn into tail (uses original x_val prefix).
+	    throw_on_cuda_error(
+	        guga_qmc_spawn_hamiltonian_launch_stream(
+	            drt.child,
+	            drt.node_twos,
+	            drt.child_prefix,
+	            state.steps,
+	            state.nodes,
+	            state.ncsf,
+	            drt.norb,
+	            (const int32_t*)x_idx_dev.ptr,
+	            (const double*)x_val_dev.ptr,
+	            nnz,
+	            (const double*)h_base_dev.ptr,
+	            (const double*)eri_dev.ptr,
+	            dt,
+	            nspawn_one,
+	            nspawn_two,
+	            seed_spawn,
+	            initiator_t,
+	            d_evt_idx,
+	            d_evt_val,
+	            stream_t,
+	            threads_spawn),
+	        "guga_qmc_spawn_hamiltonian_launch_stream");
+
+	    // Scale identity term in-place in the prefix: x <- (1 + dt*shift) * x.
+	    double scale = 1.0 + dt * shift;
+	    throw_on_cuda_error(
+	        guga_qmc_pack_scaled_identity_i32_f64_launch_stream(
+	            (const int32_t*)x_idx_dev.ptr,
+	            (const double*)x_val_dev.ptr,
+	            nnz,
+	            scale,
+	            d_x_idx,
+	            d_x_val,
+	            stream_t,
+	            threads_qmc),
+	        "guga_qmc_pack_scaled_identity_i32_f64_launch_stream");
+
+	    // Coalesce into output vector.
+	    throw_on_cuda_error(
+	        guga_qmc_coalesce_coo_i32_f64_ws_launch_stream(
+	            ws,
+	            d_x_idx,
+	            d_x_val,
+	            all_len,
+	            (int32_t*)x_idx_out_dev.ptr,
+	            (double*)x_val_out_dev.ptr,
+	            (int*)nnz_out_dev.ptr,
+	            stream_t,
+	            threads_qmc),
+	        "guga_qmc_coalesce_coo_i32_f64_ws_launch_stream");
+
+	    // Read final nnz (required since we return it).
+	    int n_out = 0;
+	    throw_on_cuda_error(cudaMemcpyAsync(&n_out, nnz_out_dev.ptr, sizeof(int), cudaMemcpyDeviceToHost, stream_t), "cudaMemcpyAsync(nnz_out)");
+	    throw_on_cuda_error(cudaStreamSynchronize(stream_t), "cudaStreamSynchronize(read nnz_out)");
+	    if (n_out < 0) n_out = 0;
+	    if (n_out > max_m) {
+	      throw std::runtime_error("walker population after coalescing exceeds max_m for workspace");
+	    }
+
+	    (void)sync;  // Return value requires synchronization regardless of this flag.
+	    return n_out;
+	  }
+	};
 
 struct Kernel3BuildGGemmExWorkspace {
   int nops = 0;
@@ -8362,6 +9091,7 @@ void apply_g_flat_scatter_atomic_frontier_hash_inplace_device(
     py::object hash_keys,
     py::object hash_vals,
     int root,
+    py::object selected_mask,
     py::object overflow,
     int threads,
     uint64_t stream,
@@ -8532,6 +9262,23 @@ void apply_g_flat_scatter_atomic_frontier_hash_inplace_device(
     }
   }
 
+  const uint8_t* d_selected_mask = nullptr;
+  uint64_t selected_stream = 0;
+  if (!selected_mask.is_none()) {
+    auto sel_dev = cuda_array_view_from_object(selected_mask, "selected_mask");
+    require_typestr(sel_dev, "selected_mask", "|u1");
+    if (sel_dev.shape.size() != 1 || sel_dev.shape[0] != (int64_t)state.ncsf) {
+      throw std::invalid_argument("selected_mask must have shape (ncsf,)");
+    }
+    if (!sel_dev.strides_bytes.empty()) {
+      if (sel_dev.strides_bytes.size() != 1 || sel_dev.strides_bytes[0] != (int64_t)sizeof(uint8_t)) {
+        throw std::invalid_argument("selected_mask must be contiguous");
+      }
+    }
+    d_selected_mask = reinterpret_cast<const uint8_t*>(sel_dev.ptr);
+    selected_stream = sel_dev.stream;
+  }
+
   auto overflow_dev = cuda_array_view_from_object(overflow, "overflow");
   require_typestr(overflow_dev, "overflow", "<i4");
   if (overflow_dev.read_only) {
@@ -8553,6 +9300,7 @@ void apply_g_flat_scatter_atomic_frontier_hash_inplace_device(
     else if (task_g_dev.stream) stream_u = task_g_dev.stream;
     else if (task_csf_dev.stream) stream_u = task_csf_dev.stream;
     else if (task_scale_stream) stream_u = task_scale_stream;
+    else if (selected_stream) stream_u = selected_stream;
     else if (overflow_dev.stream) stream_u = overflow_dev.stream;
   }
   cudaStream_t stream_t = reinterpret_cast<cudaStream_t>(stream_u);
@@ -8586,6 +9334,7 @@ void apply_g_flat_scatter_atomic_frontier_hash_inplace_device(
         d_hash_vals,
         cap,
         int(root),
+        d_selected_mask,
         d_overflow,
         stream_t,
         threads);
@@ -8602,6 +9351,282 @@ void apply_g_flat_scatter_atomic_frontier_hash_inplace_device(
   }
   if (check_overflow && h_overflow) {
     throw std::runtime_error("apply_g_flat_scatter_atomic_frontier_hash overflow (hash full or segment-walk overflow)");
+  }
+}
+
+void apply_g_flat_scatter_atomic_frontier_hash_many_roots_inplace_device(
+    const DeviceDRT& drt,
+    const DeviceStateCache& state,
+    py::object task_csf,
+    py::object task_g,
+    py::object task_scale_task_major,
+    py::object hash_keys,
+    py::object hash_vals,
+    py::object selected_mask,
+    py::object overflow,
+    int threads,
+    uint64_t stream,
+    bool sync,
+    bool check_overflow) {
+  if (drt.child == nullptr || drt.node_twos == nullptr || drt.child_prefix == nullptr) {
+    throw std::runtime_error("DeviceDRT is not initialized");
+  }
+  if (state.steps == nullptr || state.nodes == nullptr) {
+    throw std::runtime_error("DeviceStateCache is not initialized");
+  }
+  if (drt.norb != state.norb) {
+    throw std::invalid_argument("DeviceDRT and DeviceStateCache have inconsistent norb");
+  }
+  if (drt.norb <= 0 || drt.norb > MAX_NORB) {
+    throw std::invalid_argument("norb out of supported range for current kernels");
+  }
+  if (threads <= 0 || threads > 1024) {
+    throw std::invalid_argument("threads must be in 1..1024");
+  }
+  if (check_overflow && !sync) {
+    throw std::invalid_argument("check_overflow=True requires sync=True");
+  }
+  if (task_scale_task_major.is_none()) {
+    throw std::invalid_argument("task_scale_task_major must be provided");
+  }
+  if (hash_keys.is_none() || hash_vals.is_none()) {
+    throw std::invalid_argument("hash_keys and hash_vals must be device arrays (cannot be None)");
+  }
+  if (overflow.is_none()) {
+    throw std::invalid_argument("overflow must be a device array of shape (1,) (cannot be None)");
+  }
+
+  auto task_csf_dev = cuda_array_view_from_object(task_csf, "task_csf");
+  require_typestr(task_csf_dev, "task_csf", "<i4");
+  if (task_csf_dev.shape.size() != 1) {
+    throw std::invalid_argument("task_csf must be 1D device array");
+  }
+  if (!task_csf_dev.strides_bytes.empty()) {
+    if (task_csf_dev.strides_bytes.size() != 1 || task_csf_dev.strides_bytes[0] != (int64_t)sizeof(int32_t)) {
+      throw std::invalid_argument("task_csf must be contiguous");
+    }
+  }
+  int64_t ntasks_ll = task_csf_dev.shape[0];
+  if (ntasks_ll > (int64_t)std::numeric_limits<int>::max()) {
+    throw std::invalid_argument("task_csf too large");
+  }
+  int ntasks = (int)ntasks_ll;
+
+  auto task_g_dev = cuda_array_view_from_object(task_g, "task_g");
+  require_typestr(task_g_dev, "task_g", "<f8");
+  int64_t fp_itemsize = (int64_t)sizeof(double);
+  int64_t nops_ll = (int64_t)drt.norb * (int64_t)drt.norb;
+  if (nops_ll <= 0) {
+    throw std::invalid_argument("invalid nops");
+  }
+  int64_t g_stride = 0;
+  if (task_g_dev.shape.size() == 1) {
+    if (task_g_dev.shape[0] != nops_ll) {
+      throw std::invalid_argument("task_g (1D) must have shape (norb*norb,)");
+    }
+    g_stride = 0;
+    if (!task_g_dev.strides_bytes.empty()) {
+      if (task_g_dev.strides_bytes.size() != 1 || task_g_dev.strides_bytes[0] != fp_itemsize) {
+        throw std::invalid_argument("task_g (1D) must be contiguous");
+      }
+    }
+  } else if (task_g_dev.shape.size() == 2) {
+    if (task_g_dev.shape[0] != ntasks_ll || task_g_dev.shape[1] != nops_ll) {
+      throw std::invalid_argument("task_g (2D) must have shape (ntasks,norb*norb)");
+    }
+    if (task_g_dev.strides_bytes.empty()) {
+      g_stride = nops_ll;
+    } else {
+      if (task_g_dev.strides_bytes.size() != 2) {
+        throw std::invalid_argument("task_g (2D) strides must have length 2");
+      }
+      int64_t s0 = task_g_dev.strides_bytes[0];
+      int64_t s1 = task_g_dev.strides_bytes[1];
+      if (s0 <= 0 || s1 <= 0) {
+        throw std::invalid_argument("task_g (2D) must have positive strides");
+      }
+      if (s1 != fp_itemsize) {
+        throw std::invalid_argument("task_g (2D) must be C-contiguous along last dimension");
+      }
+      if (s0 < nops_ll * fp_itemsize) {
+        throw std::invalid_argument("task_g (2D) row stride too small");
+      }
+      if (s0 % fp_itemsize != 0) {
+        throw std::invalid_argument("task_g (2D) row stride must be a multiple of itemsize");
+      }
+      g_stride = s0 / fp_itemsize;
+    }
+  } else {
+    throw std::invalid_argument("task_g must be 1D or 2D device array");
+  }
+
+  auto scale_dev = cuda_array_view_from_object(task_scale_task_major, "task_scale_task_major");
+  require_typestr(scale_dev, "task_scale_task_major", "<f8");
+  uint64_t scale_stream = scale_dev.stream;
+  if (scale_dev.shape.size() != 2 || (scale_dev.shape[0] != ntasks_ll && scale_dev.shape[0] != 1)) {
+    throw std::invalid_argument("task_scale_task_major must have shape (ntasks, nroots) or (1, nroots)");
+  }
+  if (!scale_dev.strides_bytes.empty()) {
+    if (scale_dev.strides_bytes.size() != 2) {
+      throw std::invalid_argument("task_scale_task_major strides must have length 2");
+    }
+    int64_t s0 = scale_dev.strides_bytes[0];
+    int64_t s1 = scale_dev.strides_bytes[1];
+    if (s0 <= 0 || s1 <= 0) {
+      throw std::invalid_argument("task_scale_task_major must have positive strides");
+    }
+    if (s1 != fp_itemsize) {
+      throw std::invalid_argument("task_scale_task_major must be C-contiguous along last dimension");
+    }
+    if (s0 != (int64_t)scale_dev.shape[1] * fp_itemsize) {
+      throw std::invalid_argument("task_scale_task_major must be C-contiguous with no padding");
+    }
+  }
+  int64_t nroots_ll = scale_dev.shape[1];
+  if (nroots_ll <= 0 || nroots_ll > (int64_t)std::numeric_limits<int>::max()) {
+    throw std::invalid_argument("task_scale_task_major second dimension out of supported range");
+  }
+  int nroots = (int)nroots_ll;
+  int64_t task_scale_stride = (scale_dev.shape[0] == 1) ? 0 : (int64_t)nroots;
+
+  auto hash_keys_dev = cuda_array_view_from_object(hash_keys, "hash_keys");
+  require_typestr(hash_keys_dev, "hash_keys", "<i4");
+  if (hash_keys_dev.read_only) {
+    throw std::invalid_argument("hash_keys must be writable");
+  }
+  if (hash_keys_dev.shape.size() != 1) {
+    throw std::invalid_argument("hash_keys must be 1D device array");
+  }
+  if (!hash_keys_dev.strides_bytes.empty()) {
+    if (hash_keys_dev.strides_bytes.size() != 1 || hash_keys_dev.strides_bytes[0] != (int64_t)sizeof(int32_t)) {
+      throw std::invalid_argument("hash_keys must be contiguous");
+    }
+  }
+  int64_t cap_ll = hash_keys_dev.shape[0];
+  if (cap_ll <= 0 || cap_ll > (int64_t)std::numeric_limits<int>::max()) {
+    throw std::invalid_argument("hash_keys capacity out of supported range");
+  }
+  int cap = (int)cap_ll;
+  if ((cap & (cap - 1)) != 0) {
+    throw std::invalid_argument("hash_keys capacity must be a power of two");
+  }
+
+  auto hash_vals_dev = cuda_array_view_from_object(hash_vals, "hash_vals");
+  require_typestr(hash_vals_dev, "hash_vals", "<f8");
+  if (hash_vals_dev.read_only) {
+    throw std::invalid_argument("hash_vals must be writable");
+  }
+  if (hash_vals_dev.shape.size() != 2) {
+    throw std::invalid_argument("hash_vals must be a 2D device array with shape (nroots, cap)");
+  }
+  if (hash_vals_dev.shape[0] != (int64_t)nroots || hash_vals_dev.shape[1] != (int64_t)cap) {
+    throw std::invalid_argument("hash_vals must have shape (nroots, cap) matching task_scale_task_major and hash_keys");
+  }
+  if (!hash_vals_dev.strides_bytes.empty()) {
+    if (hash_vals_dev.strides_bytes.size() != 2) {
+      throw std::invalid_argument("hash_vals strides must have length 2");
+    }
+    int64_t s0 = hash_vals_dev.strides_bytes[0];
+    int64_t s1 = hash_vals_dev.strides_bytes[1];
+    if (s0 <= 0 || s1 <= 0) {
+      throw std::invalid_argument("hash_vals must have positive strides");
+    }
+    if (s1 != (int64_t)sizeof(double)) {
+      throw std::invalid_argument("hash_vals must be C-contiguous along last dimension");
+    }
+    if (s0 != (int64_t)cap * (int64_t)sizeof(double)) {
+      throw std::invalid_argument("hash_vals must be C-contiguous with no padding");
+    }
+  }
+
+  const uint8_t* d_selected_mask = nullptr;
+  uint64_t selected_stream = 0;
+  if (!selected_mask.is_none()) {
+    auto sel_dev = cuda_array_view_from_object(selected_mask, "selected_mask");
+    require_typestr(sel_dev, "selected_mask", "|u1");
+    if (sel_dev.shape.size() != 1 || sel_dev.shape[0] != (int64_t)state.ncsf) {
+      throw std::invalid_argument("selected_mask must have shape (ncsf,)");
+    }
+    if (!sel_dev.strides_bytes.empty()) {
+      if (sel_dev.strides_bytes.size() != 1 || sel_dev.strides_bytes[0] != (int64_t)sizeof(uint8_t)) {
+        throw std::invalid_argument("selected_mask must be contiguous");
+      }
+    }
+    d_selected_mask = reinterpret_cast<const uint8_t*>(sel_dev.ptr);
+    selected_stream = sel_dev.stream;
+  }
+
+  auto overflow_dev = cuda_array_view_from_object(overflow, "overflow");
+  require_typestr(overflow_dev, "overflow", "<i4");
+  if (overflow_dev.read_only) {
+    throw std::invalid_argument("overflow must be writable");
+  }
+  if (overflow_dev.shape.size() != 1 || overflow_dev.shape[0] != 1) {
+    throw std::invalid_argument("overflow must have shape (1,)");
+  }
+  if (!overflow_dev.strides_bytes.empty()) {
+    if (overflow_dev.strides_bytes.size() != 1 || overflow_dev.strides_bytes[0] != (int64_t)sizeof(int32_t)) {
+      throw std::invalid_argument("overflow must be contiguous");
+    }
+  }
+
+  uint64_t stream_u = stream;
+  if (stream_u == 0) {
+    if (hash_vals_dev.stream) stream_u = hash_vals_dev.stream;
+    else if (hash_keys_dev.stream) stream_u = hash_keys_dev.stream;
+    else if (task_g_dev.stream) stream_u = task_g_dev.stream;
+    else if (task_csf_dev.stream) stream_u = task_csf_dev.stream;
+    else if (scale_stream) stream_u = scale_stream;
+    else if (selected_stream) stream_u = selected_stream;
+    else if (overflow_dev.stream) stream_u = overflow_dev.stream;
+  }
+  cudaStream_t stream_t = reinterpret_cast<cudaStream_t>(stream_u);
+  maybe_set_drt_access_policy_window(drt, stream_t);
+
+  const int32_t* d_task_csf = reinterpret_cast<const int32_t*>(task_csf_dev.ptr);
+  const double* d_task_g = reinterpret_cast<const double*>(task_g_dev.ptr);
+  const double* d_task_scale_task_major = reinterpret_cast<const double*>(scale_dev.ptr);
+  int32_t* d_hash_keys = reinterpret_cast<int32_t*>(hash_keys_dev.ptr);
+  double* d_hash_vals = reinterpret_cast<double*>(hash_vals_dev.ptr);
+  int* d_overflow = reinterpret_cast<int*>(overflow_dev.ptr);
+
+  if (ntasks > 0) {
+    guga_apply_g_flat_scatter_atomic_frontier_hash_many_roots_launch_stream(
+        drt.child,
+        drt.node_twos,
+        drt.child_prefix,
+        state.steps,
+        state.nodes,
+        state.ncsf,
+        drt.norb,
+        d_task_csf,
+        d_task_scale_task_major,
+        task_scale_stride,
+        nroots,
+        d_task_g,
+        g_stride,
+        ntasks,
+        d_hash_keys,
+        d_hash_vals,
+        cap,
+        d_selected_mask,
+        d_overflow,
+        stream_t,
+        threads);
+    throw_on_cuda_error(cudaGetLastError(), "kernel launch(apply_g_flat_scatter_atomic_frontier_hash_many_roots)");
+  }
+
+  int h_overflow = 0;
+  if (check_overflow) {
+    throw_on_cuda_error(cudaMemcpyAsync(&h_overflow, d_overflow, sizeof(int), cudaMemcpyDeviceToHost, stream_t),
+                        "D2H overflow(frontier_hash_many_roots)");
+  }
+  if (sync) {
+    throw_on_cuda_error(
+        cudaStreamSynchronize(stream_t), "cudaStreamSynchronize(apply_g_flat_scatter_atomic_frontier_hash_many_roots)");
+  }
+  if (check_overflow && h_overflow) {
+    throw std::runtime_error("apply_g_flat_scatter_atomic_frontier_hash_many_roots overflow (hash full or segment-walk overflow)");
   }
 }
 
@@ -8906,6 +9931,206 @@ void cipsi_score_and_select_topk_inplace_device(
   }
 }
 
+void cipsi_score_and_select_topk_from_hash_slots_inplace_device(
+    py::object keys_obj,
+    py::object vals_root_major_obj,
+    py::object e_var_obj,
+    py::object hdiag_obj,
+    py::object selected_mask_obj,
+    double denom_floor,
+    py::object out_new_idx_obj,
+    py::object out_new_n_obj,
+    py::object out_pt2_obj,
+    int threads,
+    uint64_t stream,
+    bool sync) {
+  if (threads <= 0 || threads > 1024) {
+    throw std::invalid_argument("threads must be in 1..1024");
+  }
+  if (keys_obj.is_none() || vals_root_major_obj.is_none() || e_var_obj.is_none() || hdiag_obj.is_none() ||
+      out_new_idx_obj.is_none() || out_new_n_obj.is_none() || out_pt2_obj.is_none()) {
+    throw std::invalid_argument("inputs/outputs must be device arrays (cannot be None)");
+  }
+
+  auto keys_dev = cuda_array_view_from_object(keys_obj, "keys");
+  auto vals_dev = cuda_array_view_from_object(vals_root_major_obj, "vals_root_major");
+  auto e_var_dev = cuda_array_view_from_object(e_var_obj, "e_var");
+  auto hdiag_dev = cuda_array_view_from_object(hdiag_obj, "hdiag");
+  auto out_new_idx_dev = cuda_array_view_from_object(out_new_idx_obj, "out_new_idx");
+  auto out_new_n_dev = cuda_array_view_from_object(out_new_n_obj, "out_new_n");
+  auto out_pt2_dev = cuda_array_view_from_object(out_pt2_obj, "out_pt2");
+
+  require_typestr(keys_dev, "keys", "<i4");
+  require_typestr(vals_dev, "vals_root_major", "<f8");
+  require_typestr(e_var_dev, "e_var", "<f8");
+  require_typestr(hdiag_dev, "hdiag", "<f8");
+  require_typestr(out_new_idx_dev, "out_new_idx", "<i4");
+  require_typestr(out_new_n_dev, "out_new_n", "<i4");
+  require_typestr(out_pt2_dev, "out_pt2", "<f8");
+
+  if (keys_dev.shape.size() != 1) {
+    throw std::invalid_argument("keys must be 1D");
+  }
+  if (vals_dev.shape.size() != 2) {
+    throw std::invalid_argument("vals_root_major must have shape (nroots, cap)");
+  }
+  if (e_var_dev.shape.size() != 1 || hdiag_dev.shape.size() != 1) {
+    throw std::invalid_argument("e_var and hdiag must be 1D");
+  }
+  if (out_new_idx_dev.shape.size() != 1) {
+    throw std::invalid_argument("out_new_idx must be 1D");
+  }
+  if (out_new_n_dev.shape.size() != 1 || out_new_n_dev.shape[0] != 1) {
+    throw std::invalid_argument("out_new_n must have shape (1,)");
+  }
+  if (out_pt2_dev.shape.size() != 1) {
+    throw std::invalid_argument("out_pt2 must be 1D");
+  }
+
+  int64_t cap_ll = keys_dev.shape[0];
+  if (cap_ll <= 0 || cap_ll > (int64_t)std::numeric_limits<int>::max()) {
+    throw std::invalid_argument("keys capacity out of supported range");
+  }
+  int cap = (int)cap_ll;
+  int nroots = (int)vals_dev.shape[0];
+  int cap2 = (int)vals_dev.shape[1];
+  if (cap2 != cap) {
+    throw std::invalid_argument("vals_root_major must have shape (nroots, cap) with cap matching keys");
+  }
+  if ((int)e_var_dev.shape[0] != nroots) {
+    throw std::invalid_argument("e_var must have shape (nroots,)");
+  }
+  int ncsf = (int)hdiag_dev.shape[0];
+  if ((int)out_pt2_dev.shape[0] != nroots) {
+    throw std::invalid_argument("out_pt2 must have shape (nroots,)");
+  }
+  int max_add = (int)out_new_idx_dev.shape[0];
+  if (max_add < 0) max_add = 0;
+
+  if (!keys_dev.strides_bytes.empty() &&
+      (keys_dev.strides_bytes.size() != 1 || keys_dev.strides_bytes[0] != (int64_t)sizeof(int32_t))) {
+    throw std::invalid_argument("keys must be contiguous");
+  }
+  if (!vals_dev.strides_bytes.empty()) {
+    if (vals_dev.strides_bytes.size() != 2) {
+      throw std::invalid_argument("vals_root_major strides must have length 2");
+    }
+    int64_t s0 = vals_dev.strides_bytes[0];
+    int64_t s1 = vals_dev.strides_bytes[1];
+    if (s0 <= 0 || s1 <= 0) {
+      throw std::invalid_argument("vals_root_major must have positive strides");
+    }
+    if (s1 != (int64_t)sizeof(double)) {
+      throw std::invalid_argument("vals_root_major must be C-contiguous along last dimension");
+    }
+    if (s0 != (int64_t)cap * (int64_t)sizeof(double)) {
+      throw std::invalid_argument("vals_root_major must be C-contiguous with no padding");
+    }
+  }
+  if (!e_var_dev.strides_bytes.empty() &&
+      (e_var_dev.strides_bytes.size() != 1 || e_var_dev.strides_bytes[0] != (int64_t)sizeof(double))) {
+    throw std::invalid_argument("e_var must be contiguous");
+  }
+  if (!hdiag_dev.strides_bytes.empty() &&
+      (hdiag_dev.strides_bytes.size() != 1 || hdiag_dev.strides_bytes[0] != (int64_t)sizeof(double))) {
+    throw std::invalid_argument("hdiag must be contiguous");
+  }
+  if (!out_new_idx_dev.strides_bytes.empty() &&
+      (out_new_idx_dev.strides_bytes.size() != 1 || out_new_idx_dev.strides_bytes[0] != (int64_t)sizeof(int32_t))) {
+    throw std::invalid_argument("out_new_idx must be contiguous");
+  }
+  if (!out_new_n_dev.strides_bytes.empty() &&
+      (out_new_n_dev.strides_bytes.size() != 1 || out_new_n_dev.strides_bytes[0] != (int64_t)sizeof(int32_t))) {
+    throw std::invalid_argument("out_new_n must be contiguous");
+  }
+  if (!out_pt2_dev.strides_bytes.empty() &&
+      (out_pt2_dev.strides_bytes.size() != 1 || out_pt2_dev.strides_bytes[0] != (int64_t)sizeof(double))) {
+    throw std::invalid_argument("out_pt2 must be contiguous");
+  }
+
+  const uint8_t* d_selected_mask = nullptr;
+  uint64_t selected_stream = 0;
+  if (!selected_mask_obj.is_none()) {
+    auto sel_dev = cuda_array_view_from_object(selected_mask_obj, "selected_mask");
+    require_typestr(sel_dev, "selected_mask", "|u1");
+    if (sel_dev.shape.size() != 1 || sel_dev.shape[0] != (int64_t)ncsf) {
+      throw std::invalid_argument("selected_mask must have shape (ncsf,)");
+    }
+    if (!sel_dev.strides_bytes.empty()) {
+      if (sel_dev.strides_bytes.size() != 1 || sel_dev.strides_bytes[0] != (int64_t)sizeof(uint8_t)) {
+        throw std::invalid_argument("selected_mask must be contiguous");
+      }
+    }
+    d_selected_mask = reinterpret_cast<const uint8_t*>(sel_dev.ptr);
+    selected_stream = sel_dev.stream;
+  }
+
+  uint64_t stream_u = stream;
+  if (stream_u == 0) {
+    if (out_pt2_dev.stream) stream_u = out_pt2_dev.stream;
+    else if (out_new_n_dev.stream) stream_u = out_new_n_dev.stream;
+    else if (out_new_idx_dev.stream) stream_u = out_new_idx_dev.stream;
+    else if (vals_dev.stream) stream_u = vals_dev.stream;
+    else if (keys_dev.stream) stream_u = keys_dev.stream;
+    else if (e_var_dev.stream) stream_u = e_var_dev.stream;
+    else if (hdiag_dev.stream) stream_u = hdiag_dev.stream;
+    else if (selected_stream) stream_u = selected_stream;
+  }
+  cudaStream_t stream_t = reinterpret_cast<cudaStream_t>(stream_u);
+
+  const int32_t* d_keys = reinterpret_cast<const int32_t*>(keys_dev.ptr);
+  const double* d_vals = reinterpret_cast<const double*>(vals_dev.ptr);
+  const double* d_e_var = reinterpret_cast<const double*>(e_var_dev.ptr);
+  const double* d_hdiag = reinterpret_cast<const double*>(hdiag_dev.ptr);
+  int32_t* d_out_new_idx = reinterpret_cast<int32_t*>(out_new_idx_dev.ptr);
+  int* d_out_new_n = reinterpret_cast<int*>(out_new_n_dev.ptr);
+  double* d_out_pt2 = reinterpret_cast<double*>(out_pt2_dev.ptr);
+
+  if (sync) {
+    throw_on_cuda_error(
+        guga_cipsi_score_and_select_topk_from_hash_slots_launch_stream(
+            d_keys,
+            d_vals,
+            cap,
+            nroots,
+            d_e_var,
+            d_hdiag,
+            ncsf,
+            d_selected_mask,
+            double(denom_floor),
+            int(max_add),
+            d_out_new_idx,
+            d_out_new_n,
+            d_out_pt2,
+            stream_t,
+            int(threads)),
+        "guga_cipsi_score_and_select_topk_from_hash_slots_launch_stream");
+    throw_on_cuda_error(
+        cudaStreamSynchronize(stream_t), "cudaStreamSynchronize(cipsi_score_and_select_topk_from_hash_slots)");
+  } else {
+    // Async fallback: avoid any host-side synchronization in the direct hash-slot API.
+    throw_on_cuda_error(
+        guga_cipsi_score_and_select_topk_launch_stream(
+            d_keys,
+            d_vals,
+            (int64_t)cap,
+            cap,
+            nroots,
+            d_e_var,
+            d_hdiag,
+            ncsf,
+            d_selected_mask,
+            double(denom_floor),
+            int(max_add),
+            d_out_new_idx,
+            d_out_new_n,
+            d_out_pt2,
+            stream_t,
+            int(threads)),
+        "guga_cipsi_score_and_select_topk_launch_stream(async_from_hash_slots)");
+  }
+}
+
 void hb_screen_and_apply_inplace_device(
     const DeviceDRT& drt,
     const DeviceStateCache& state,
@@ -8926,6 +10151,7 @@ void hb_screen_and_apply_inplace_device(
     double eps,
     py::object hash_keys_obj,
     py::object hash_vals_obj,
+    py::object selected_mask_obj,
     py::object overflow_obj,
     int threads,
     uint64_t stream,
@@ -8975,10 +10201,27 @@ void hb_screen_and_apply_inplace_device(
   int norb = drt.norb;
   int ncsf = state.ncsf;
   int cap = (int)hash_keys_dev.shape[0];
+  const uint8_t* d_selected_mask = nullptr;
+  uint64_t selected_stream = 0;
+  if (!selected_mask_obj.is_none()) {
+    auto sel_dev = cuda_array_view_from_object(selected_mask_obj, "selected_mask");
+    require_typestr(sel_dev, "selected_mask", "|u1");
+    if (sel_dev.shape.size() != 1 || sel_dev.shape[0] != (int64_t)ncsf) {
+      throw std::invalid_argument("selected_mask must have shape (ncsf,)");
+    }
+    if (!sel_dev.strides_bytes.empty()) {
+      if (sel_dev.strides_bytes.size() != 1 || sel_dev.strides_bytes[0] != (int64_t)sizeof(uint8_t)) {
+        throw std::invalid_argument("selected_mask must be contiguous");
+      }
+    }
+    d_selected_mask = reinterpret_cast<const uint8_t*>(sel_dev.ptr);
+    selected_stream = sel_dev.stream;
+  }
 
   uint64_t stream_u = stream;
   if (stream_u == 0) {
     if (sel_idx_dev.stream) stream_u = sel_idx_dev.stream;
+    else if (selected_stream) stream_u = selected_stream;
   }
   cudaStream_t stream_t = reinterpret_cast<cudaStream_t>(stream_u);
 
@@ -9004,6 +10247,7 @@ void hb_screen_and_apply_inplace_device(
           reinterpret_cast<int32_t*>(hash_keys_dev.ptr),
           reinterpret_cast<double*>(hash_vals_dev.ptr),
           cap,
+          d_selected_mask,
           reinterpret_cast<int*>(overflow_dev.ptr),
           stream_t,
           threads),
@@ -16762,6 +18006,198 @@ void qmc_spawn_hamiltonian_inplace_device(
   }
 }
 
+void qmc_spawn_hamiltonian_inplace_device_initiator_dev(
+    const DeviceDRT& drt,
+    const DeviceStateCache& state,
+    py::object x_idx,
+    py::object x_val,
+    py::object h_base_flat,
+    py::object eri_mat,
+    py::object out_idx,
+    py::object out_val,
+    double eps,
+    int nspawn_one,
+    int nspawn_two,
+    uint64_t seed,
+    py::object initiator_t_dev,
+    int threads,
+    uint64_t stream,
+    bool sync) {
+  if (drt.child == nullptr || drt.node_twos == nullptr || drt.child_prefix == nullptr) {
+    throw std::runtime_error("DeviceDRT is not initialized");
+  }
+  if (state.steps == nullptr || state.nodes == nullptr) {
+    throw std::runtime_error("DeviceStateCache is not initialized");
+  }
+  if (drt.norb != state.norb) {
+    throw std::invalid_argument("DeviceDRT and DeviceStateCache have inconsistent norb");
+  }
+  if (drt.norb <= 0 || drt.norb > MAX_NORB) {
+    throw std::invalid_argument("norb out of supported range for current kernels");
+  }
+  if (threads <= 0 || threads > 1024) {
+    throw std::invalid_argument("threads must be in 1..1024");
+  }
+  if (nspawn_one < 0 || nspawn_two < 0) {
+    throw std::invalid_argument("nspawn_one/nspawn_two must be >= 0");
+  }
+  if (nspawn_one == 0 && nspawn_two == 0) {
+    throw std::invalid_argument("at least one of nspawn_one or nspawn_two must be > 0");
+  }
+
+  if (x_idx.is_none() || x_val.is_none() || h_base_flat.is_none() || eri_mat.is_none() || out_idx.is_none() || out_val.is_none()) {
+    throw std::invalid_argument("x_idx/x_val/h_base_flat/eri_mat/out_idx/out_val must be device arrays (cannot be None)");
+  }
+
+  CudaArrayView x_idx_dev = cuda_array_view_from_object(x_idx, "x_idx");
+  CudaArrayView x_val_dev = cuda_array_view_from_object(x_val, "x_val");
+  CudaArrayView h_base_dev = cuda_array_view_from_object(h_base_flat, "h_base_flat");
+  CudaArrayView eri_dev = cuda_array_view_from_object(eri_mat, "eri_mat");
+  CudaArrayView out_idx_dev = cuda_array_view_from_object(out_idx, "out_idx");
+  CudaArrayView out_val_dev = cuda_array_view_from_object(out_val, "out_val");
+
+  require_typestr(x_idx_dev, "x_idx", "<i4");
+  require_typestr(x_val_dev, "x_val", "<f8");
+  require_typestr(h_base_dev, "h_base_flat", "<f8");
+  require_typestr(eri_dev, "eri_mat", "<f8");
+  require_typestr(out_idx_dev, "out_idx", "<i4");
+  require_typestr(out_val_dev, "out_val", "<f8");
+
+  if (out_idx_dev.read_only || out_val_dev.read_only) {
+    throw std::invalid_argument("out_idx/out_val must be writable");
+  }
+
+  const double* d_initiator_t = nullptr;
+  if (!initiator_t_dev.is_none()) {
+    CudaArrayView t_dev = cuda_array_view_from_object(initiator_t_dev, "initiator_t_dev");
+    require_typestr(t_dev, "initiator_t_dev", "<f8");
+    if (t_dev.shape.size() == 1) {
+      if (t_dev.shape[0] != 1) throw std::invalid_argument("initiator_t_dev must have shape (1,) or ()");
+      if (!t_dev.strides_bytes.empty()) {
+        if (t_dev.strides_bytes.size() != 1) throw std::invalid_argument("initiator_t_dev must be 1D with valid strides");
+        if (t_dev.strides_bytes[0] != (int64_t)sizeof(double)) throw std::invalid_argument("initiator_t_dev must be contiguous");
+      }
+    } else if (t_dev.shape.size() == 0) {
+      // scalar: ok
+    } else {
+      throw std::invalid_argument("initiator_t_dev must have shape (1,) or ()");
+    }
+    d_initiator_t = (const double*)t_dev.ptr;
+  }
+
+  if (x_idx_dev.shape.size() != 1 || x_val_dev.shape.size() != 1) {
+    throw std::invalid_argument("x_idx and x_val must be 1D arrays");
+  }
+  if (h_base_dev.shape.size() != 1) {
+    throw std::invalid_argument("h_base_flat must be a 1D array");
+  }
+  if (eri_dev.shape.size() != 2 || eri_dev.shape[0] != eri_dev.shape[1]) {
+    throw std::invalid_argument("eri_mat must have shape (nops,nops)");
+  }
+  if (out_idx_dev.shape.size() != 1 || out_val_dev.shape.size() != 1) {
+    throw std::invalid_argument("out_idx and out_val must be 1D arrays");
+  }
+
+  int64_t m64 = x_idx_dev.shape[0];
+  if (m64 < 0) {
+    throw std::invalid_argument("invalid x_idx shape");
+  }
+  if (x_val_dev.shape[0] != m64) {
+    throw std::invalid_argument("x_val must have the same length as x_idx");
+  }
+  if (m64 > (int64_t)std::numeric_limits<int>::max()) {
+    throw std::invalid_argument("x_idx length too large for int32 kernel interface");
+  }
+  int m = (int)m64;
+
+  int64_t nops64 = (int64_t)drt.norb * (int64_t)drt.norb;
+  if (h_base_dev.shape[0] != nops64) {
+    throw std::invalid_argument("h_base_flat must have shape (norb*norb,)");
+  }
+  if (eri_dev.shape[0] != nops64) {
+    throw std::invalid_argument("eri_mat must have shape (norb*norb, norb*norb)");
+  }
+
+  int nspawn_total = nspawn_one + nspawn_two;
+  int64_t out_len64 = m64 * (int64_t)nspawn_total;
+  if (out_len64 < 0) {
+    throw std::invalid_argument("invalid output length");
+  }
+  if (out_idx_dev.shape[0] != out_len64 || out_val_dev.shape[0] != out_len64) {
+    throw std::invalid_argument("out_idx/out_val must have shape (len(x_idx)*(nspawn_one+nspawn_two),)");
+  }
+  if (m == 0) return;
+
+  if (!x_idx_dev.strides_bytes.empty()) {
+    if (x_idx_dev.strides_bytes.size() != 1 || x_idx_dev.strides_bytes[0] != (int64_t)sizeof(int32_t)) {
+      throw std::invalid_argument("x_idx must be contiguous");
+    }
+  }
+  if (!x_val_dev.strides_bytes.empty()) {
+    if (x_val_dev.strides_bytes.size() != 1 || x_val_dev.strides_bytes[0] != (int64_t)sizeof(double)) {
+      throw std::invalid_argument("x_val must be contiguous");
+    }
+  }
+  if (!h_base_dev.strides_bytes.empty()) {
+    if (h_base_dev.strides_bytes.size() != 1 || h_base_dev.strides_bytes[0] != (int64_t)sizeof(double)) {
+      throw std::invalid_argument("h_base_flat must be contiguous");
+    }
+  }
+  if (!eri_dev.strides_bytes.empty()) {
+    if (eri_dev.strides_bytes.size() != 2) {
+      throw std::invalid_argument("eri_mat strides must have length 2");
+    }
+    int64_t s0 = eri_dev.strides_bytes[0];
+    int64_t s1 = eri_dev.strides_bytes[1];
+    if (s0 != (int64_t)nops64 * (int64_t)sizeof(double) || s1 != (int64_t)sizeof(double)) {
+      throw std::invalid_argument("eri_mat must be C-contiguous with no padding");
+    }
+  }
+  if (!out_idx_dev.strides_bytes.empty()) {
+    if (out_idx_dev.strides_bytes.size() != 1 || out_idx_dev.strides_bytes[0] != (int64_t)sizeof(int32_t)) {
+      throw std::invalid_argument("out_idx must be contiguous");
+    }
+  }
+  if (!out_val_dev.strides_bytes.empty()) {
+    if (out_val_dev.strides_bytes.size() != 1 || out_val_dev.strides_bytes[0] != (int64_t)sizeof(double)) {
+      throw std::invalid_argument("out_val must be contiguous");
+    }
+  }
+
+  cudaStream_t stream_t = reinterpret_cast<cudaStream_t>(stream);
+  throw_on_cuda_error(cudaMemsetAsync(out_idx_dev.ptr, 0xFF, (size_t)out_len64 * sizeof(int32_t), stream_t), "cudaMemsetAsync(out_idx=-1)");
+  throw_on_cuda_error(cudaMemsetAsync(out_val_dev.ptr, 0, (size_t)out_len64 * sizeof(double), stream_t), "cudaMemsetAsync(out_val=0)");
+
+  throw_on_cuda_error(
+      guga_qmc_spawn_hamiltonian_initiator_dev_launch_stream(
+          drt.child,
+          drt.node_twos,
+          drt.child_prefix,
+          state.steps,
+          state.nodes,
+          state.ncsf,
+          drt.norb,
+          (const int32_t*)x_idx_dev.ptr,
+          (const double*)x_val_dev.ptr,
+          m,
+          (const double*)h_base_dev.ptr,
+          (const double*)eri_dev.ptr,
+          eps,
+          nspawn_one,
+          nspawn_two,
+          seed,
+          d_initiator_t,
+          (int32_t*)out_idx_dev.ptr,
+          (double*)out_val_dev.ptr,
+          stream_t,
+          threads),
+      "guga_qmc_spawn_hamiltonian_initiator_dev_launch_stream");
+
+  if (sync) {
+    throw_on_cuda_error(cudaStreamSynchronize(stream_t), "cudaStreamSynchronize(qmc_spawn_hamiltonian_initiator_dev)");
+  }
+}
+
 void qmc_spawn_hamiltonian_u64_inplace_device(
     const DeviceDRT& drt,
     py::object x_key,
@@ -18364,6 +19800,26 @@ PYBIND11_MODULE(_guga_cuda_ext, m) {
       py::arg("sync") = true);
 
   m.def(
+      "qmc_spawn_hamiltonian_inplace_device_initiator_dev",
+      &qmc_spawn_hamiltonian_inplace_device_initiator_dev,
+      py::arg("drt"),
+      py::arg("state"),
+      py::arg("x_idx"),
+      py::arg("x_val"),
+      py::arg("h_base_flat"),
+      py::arg("eri_mat"),
+      py::arg("out_idx"),
+      py::arg("out_val"),
+      py::arg("eps"),
+      py::arg("nspawn_one"),
+      py::arg("nspawn_two"),
+      py::arg("seed"),
+      py::arg("initiator_t_dev") = py::none(),
+      py::arg("threads") = 128,
+      py::arg("stream") = 0,
+      py::arg("sync") = true);
+
+  m.def(
       "qmc_spawn_hamiltonian_u64_inplace_device",
       &qmc_spawn_hamiltonian_u64_inplace_device,
       py::arg("drt"),
@@ -18414,11 +19870,11 @@ PYBIND11_MODULE(_guga_cuda_ext, m) {
       py::arg("stream") = 0,
       py::arg("sync") = true);
 
-  py::class_<QmcWorkspace>(m, "QmcWorkspace")
-      .def(py::init<int, int>(), py::arg("max_n"), py::arg("max_m"))
-      .def("release", &QmcWorkspace::release)
-      .def_property_readonly("max_n", [](const QmcWorkspace& self) { return self.max_n; })
-      .def_property_readonly("max_m", [](const QmcWorkspace& self) { return self.max_m; })
+	  py::class_<QmcWorkspace>(m, "QmcWorkspace")
+	      .def(py::init<int, int>(), py::arg("max_n"), py::arg("max_m"))
+	      .def("release", &QmcWorkspace::release)
+	      .def_property_readonly("max_n", [](const QmcWorkspace& self) { return self.max_n; })
+	      .def_property_readonly("max_m", [](const QmcWorkspace& self) { return self.max_m; })
       .def(
           "coalesce_coo_i32_f64_inplace_device",
           &QmcWorkspace::coalesce_coo_i32_f64_inplace_device,
@@ -18440,12 +19896,80 @@ PYBIND11_MODULE(_guga_cuda_ext, m) {
           py::arg("val_out"),
           py::arg("out_nnz"),
           py::arg("n_in"),
-          py::arg("m"),
-          py::arg("pivot"),
-          py::arg("seed"),
+	          py::arg("m"),
+	          py::arg("pivot"),
+	          py::arg("seed"),
+	          py::arg("threads") = 256,
+	          py::arg("stream") = 0,
+	          py::arg("sync") = true)
+      .def(
+          "sparse_dot_many_sorted_i32_f64_inplace_device",
+          &QmcWorkspace::sparse_dot_many_sorted_i32_f64_inplace_device,
+          py::arg("a_idx"),
+          py::arg("a_val"),
+          py::arg("a_nnz"),
+          py::arg("b_idx"),
+          py::arg("b_val"),
+          py::arg("b_nnz"),
+          py::arg("out"),
           py::arg("threads") = 256,
           py::arg("stream") = 0,
-          py::arg("sync") = true);
+          py::arg("sync") = true)
+	      .def(
+	          "projector_step_hamiltonian_phi_i32_f64_inplace_device",
+	          &QmcWorkspace::projector_step_hamiltonian_phi_i32_f64_inplace_device,
+	          py::arg("drt"),
+	          py::arg("state"),
+	          py::arg("x_idx"),
+	          py::arg("x_val"),
+	          py::arg("nnz"),
+	          py::arg("h_base_flat"),
+	          py::arg("eri_mat"),
+	          py::arg("idx_all"),
+	          py::arg("val_all"),
+	          py::arg("idx_u"),
+	          py::arg("val_u"),
+	          py::arg("nnz_u"),
+	          py::arg("x_idx_out"),
+	          py::arg("x_val_out"),
+	          py::arg("nnz_out"),
+	          py::arg("m"),
+	          py::arg("pivot"),
+	          py::arg("eps"),
+	          py::arg("scale_identity"),
+	          py::arg("nspawn_one"),
+	          py::arg("nspawn_two"),
+	          py::arg("seed_spawn"),
+	          py::arg("seed_phi"),
+	          py::arg("initiator_t") = 0.0,
+	          py::arg("initiator_t_dev") = py::none(),
+	          py::arg("threads_spawn") = 128,
+	          py::arg("threads_qmc") = 256,
+	          py::arg("stream") = 0,
+	          py::arg("sync") = true)
+	      .def(
+	          "fciqmc_step_shift_i32_f64_inplace_device",
+	          &QmcWorkspace::fciqmc_step_shift_i32_f64_inplace_device,
+	          py::arg("drt"),
+	          py::arg("state"),
+	          py::arg("x_idx"),
+	          py::arg("x_val"),
+	          py::arg("nnz"),
+	          py::arg("h_base_flat"),
+	          py::arg("eri_mat"),
+	          py::arg("x_idx_out"),
+	          py::arg("x_val_out"),
+	          py::arg("nnz_out"),
+	          py::arg("dt"),
+	          py::arg("shift"),
+	          py::arg("initiator_t") = 0.0,
+	          py::arg("nspawn_one") = 0,
+	          py::arg("nspawn_two") = 0,
+	          py::arg("seed_spawn") = 0,
+	          py::arg("threads_spawn") = 128,
+	          py::arg("threads_qmc") = 256,
+	          py::arg("stream") = 0,
+	          py::arg("sync") = true);
 
   py::class_<Kernel25Workspace>(m, "Kernel25Workspace")
       .def(py::init<int, int>(), py::arg("max_tasks"), py::arg("max_nnz_in"))
@@ -18913,6 +20437,24 @@ PYBIND11_MODULE(_guga_cuda_ext, m) {
       py::arg("hash_keys"),
       py::arg("hash_vals"),
       py::arg("root"),
+      py::arg("selected_mask") = py::none(),
+      py::arg("overflow"),
+      py::arg("threads") = 256,
+      py::arg("stream") = 0,
+      py::arg("sync") = true,
+      py::arg("check_overflow") = true);
+
+  m.def(
+      "apply_g_flat_scatter_atomic_frontier_hash_many_roots_inplace_device",
+      &apply_g_flat_scatter_atomic_frontier_hash_many_roots_inplace_device,
+      py::arg("drt"),
+      py::arg("state"),
+      py::arg("task_csf"),
+      py::arg("task_g"),
+      py::arg("task_scale_task_major"),
+      py::arg("hash_keys"),
+      py::arg("hash_vals"),
+      py::arg("selected_mask") = py::none(),
       py::arg("overflow"),
       py::arg("threads") = 256,
       py::arg("stream") = 0,
@@ -18958,6 +20500,22 @@ PYBIND11_MODULE(_guga_cuda_ext, m) {
       py::arg("sync") = true);
 
   m.def(
+      "cipsi_score_and_select_topk_from_hash_slots_inplace_device",
+      &cipsi_score_and_select_topk_from_hash_slots_inplace_device,
+      py::arg("keys"),
+      py::arg("vals_root_major"),
+      py::arg("e_var"),
+      py::arg("hdiag"),
+      py::arg("selected_mask"),
+      py::arg("denom_floor"),
+      py::arg("out_new_idx"),
+      py::arg("out_new_n"),
+      py::arg("out_pt2"),
+      py::arg("threads") = 256,
+      py::arg("stream") = 0,
+      py::arg("sync") = true);
+
+  m.def(
       "hb_screen_and_apply_inplace_device",
       &hb_screen_and_apply_inplace_device,
       py::arg("drt"),
@@ -18979,6 +20537,7 @@ PYBIND11_MODULE(_guga_cuda_ext, m) {
       py::arg("eps"),
       py::arg("hash_keys"),
       py::arg("hash_vals"),
+      py::arg("selected_mask") = py::none(),
       py::arg("overflow"),
       py::arg("threads") = 256,
       py::arg("stream") = 0,

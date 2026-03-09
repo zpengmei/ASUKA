@@ -34,6 +34,10 @@ class HeatBathIntegralIndex:
     # Row-level max for fast skip
     pq_max_v: np.ndarray  # float64 [norb^2]
 
+    # Generator-pair maxima: rs_flat[k] = r*norb+s sorted by max_pq |v_{pq,rs}| descending.
+    rs_flat: np.ndarray  # int32 [n_rs]
+    rs_max_v: np.ndarray  # float64 [n_rs]
+
     # Diagonal ERI: eri_diag_t[r, pq] = v[pq, r*norb+r]  (for occupancy-weighted g)
     eri_diag_t: np.ndarray  # float64 [norb, norb^2]
 
@@ -46,6 +50,10 @@ class HeatBathIntegralIndex:
     @property
     def nnz_2e(self) -> int:
         return int(self.v_abs.shape[0])
+
+    @property
+    def n_rs(self) -> int:
+        return int(self.rs_flat.shape[0])
 
 
 def build_hb_index(h1e_eff: np.ndarray, eri_4d: np.ndarray, norb: int) -> HeatBathIntegralIndex:
@@ -111,6 +119,14 @@ def build_hb_index(h1e_eff: np.ndarray, eri_4d: np.ndarray, norb: int) -> HeatBa
         v_abs = np.zeros(0, dtype=np.float64)
         v_signed = np.zeros(0, dtype=np.float64)
 
+    # --- Generator-pair maxima for rs-screening ---
+    rs_max_all = abs_eri.max(axis=0)
+    order_rs = np.argsort(rs_max_all)[::-1]
+    mask_rs = rs_max_all[order_rs] > 0.0
+    order_rs = order_rs[mask_rs]
+    rs_flat = order_rs.astype(np.int32, copy=False)
+    rs_max_v = rs_max_all[order_rs].astype(np.float64, copy=False)
+
     # --- Diagonal ERI: eri_diag_t[r, pq] = v[pq, rr] ---
     # Used for vectorized occupancy-weighted g_flat: g_diag = occ @ eri_diag_t
     diag_ids = np.arange(norb) * (norb + 1)  # flat indices of (r,r): r*norb+r
@@ -125,6 +141,8 @@ def build_hb_index(h1e_eff: np.ndarray, eri_4d: np.ndarray, norb: int) -> HeatBa
         v_abs=v_abs,
         v_signed=v_signed,
         pq_max_v=pq_max_v,
+        rs_flat=rs_flat,
+        rs_max_v=rs_max_v,
         eri_diag_t=eri_diag_t,
         norb=norb,
     )
@@ -207,8 +225,12 @@ def build_g_base(
             v_filtered = np.where(offdiag_above, 0.5 * hb_index.v_signed, 0.0)  # [nnz]
             # add.reduceat: for each pq, sum v_filtered[pq_ptr[pq]:pq_ptr[pq+1]]
             starts = hb_index.pq_ptr[:-1].astype(np.intp)
-            row_sums = np.add.reduceat(v_filtered, starts)  # [nops]
-            g_base += row_sums
+            stops = hb_index.pq_ptr[1:].astype(np.intp)
+            nonempty = starts < stops
+            if np.any(nonempty):
+                row_sums = np.zeros(nops, dtype=np.float64)
+                row_sums[nonempty] = np.add.reduceat(v_filtered, starts[nonempty])
+                g_base += row_sums
 
     return g_base
 
@@ -224,6 +246,8 @@ def upload_hb_index(hb_index: HeatBathIntegralIndex, cp: Any) -> dict:
         "v_abs": cp.asarray(hb_index.v_abs, dtype=cp.float64),
         "v_signed": cp.asarray(hb_index.v_signed, dtype=cp.float64),
         "pq_max_v": cp.asarray(hb_index.pq_max_v, dtype=cp.float64),
+        "rs_flat": cp.asarray(hb_index.rs_flat, dtype=cp.int32),
+        "rs_max_v": cp.asarray(hb_index.rs_max_v, dtype=cp.float64),
         "eri_diag_t": cp.asarray(hb_index.eri_diag_t, dtype=cp.float64),
         "norb": int(hb_index.norb),
     }
@@ -282,7 +306,12 @@ def build_g_base_gpu(hb_dev: dict, cutoff: float, norb: int, cp: Any) -> Any:
         if bool(offdiag_above.any()):
             v_filtered = cp.where(offdiag_above, 0.5 * hb_dev["v_signed"], 0.0)
             starts = hb_dev["pq_ptr"][:-1].astype(cp.intp)
-            g_base += cp.add.reduceat(v_filtered, starts)
+            stops = hb_dev["pq_ptr"][1:].astype(cp.intp)
+            nonempty = starts < stops
+            if bool(nonempty.any()):
+                row_sums = cp.zeros(nops, dtype=cp.float64)
+                row_sums[nonempty] = cp.add.reduceat(v_filtered, starts[nonempty])
+                g_base += row_sums
 
     return g_base
 

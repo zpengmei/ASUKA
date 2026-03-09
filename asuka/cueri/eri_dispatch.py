@@ -6,6 +6,7 @@ import os
 import numpy as np
 
 from .cart import ncart
+from .native_class_sets import DISPATCH_NATIVE_CLASS_IDS
 from .gpu import (
     DeviceBasisSS,
     DevicePairTables,
@@ -93,56 +94,9 @@ _GENERIC_WARP_CAP_LARGE = max(1, _env_int("ASUKA_CUERI_GENERIC_WARP_CAP_LARGE", 
 _GENERIC_WARP_CAP_THRESHOLD = max(1, _env_int("ASUKA_CUERI_GENERIC_WARP_CAP_THRESHOLD", 1024))
 
 
-# Set of class IDs that have native CUDA kernels (excluding ff* which are opt-in).
-# Used by make_direct_jk_context to resolve kernel dispatch in O(1) per class
-# instead of the O(57*ntasks) vectorized loop in plan_kernel_batches_spd.
-_NATIVE_CLASS_IDS: frozenset[int] = frozenset([
-    int(eri_class_id(0, 0, 0, 0)),
-    int(eri_class_id(1, 0, 0, 0)),
-    int(eri_class_id(1, 1, 0, 0)),
-    int(eri_class_id(1, 0, 1, 0)),
-    int(eri_class_id(1, 1, 1, 0)),
-    int(eri_class_id(1, 1, 1, 1)),
-    int(eri_class_id(2, 0, 0, 0)),
-    int(eri_class_id(2, 2, 0, 0)),
-    int(eri_class_id(0, 0, 2, 1)),
-    int(eri_class_id(1, 0, 2, 0)),
-    int(eri_class_id(1, 0, 2, 1)),
-    int(eri_class_id(1, 0, 2, 2)),
-    int(eri_class_id(1, 1, 2, 0)),
-    int(eri_class_id(1, 1, 2, 1)),
-    int(eri_class_id(1, 1, 2, 2)),
-    int(eri_class_id(2, 0, 2, 0)),
-    int(eri_class_id(2, 0, 2, 1)),
-    int(eri_class_id(2, 0, 2, 2)),
-    int(eri_class_id(3, 1, 0, 0)),
-    int(eri_class_id(3, 2, 0, 0)),
-    int(eri_class_id(3, 1, 1, 0)),
-    int(eri_class_id(3, 2, 1, 0)),
-    int(eri_class_id(3, 1, 2, 0)),
-    int(eri_class_id(3, 2, 2, 0)),
-    int(eri_class_id(0, 0, 3, 0)),
-    int(eri_class_id(1, 0, 3, 0)),
-    int(eri_class_id(1, 1, 3, 0)),
-    int(eri_class_id(2, 0, 3, 0)),
-    int(eri_class_id(3, 0, 3, 0)),
-    int(eri_class_id(2, 1, 3, 0)),
-    int(eri_class_id(3, 1, 3, 0)),
-    int(eri_class_id(2, 2, 3, 0)),
-    int(eri_class_id(3, 2, 3, 0)),
-    int(eri_class_id(0, 0, 4, 0)),
-    int(eri_class_id(1, 0, 4, 0)),
-    int(eri_class_id(1, 1, 4, 0)),
-    int(eri_class_id(2, 0, 4, 0)),
-    int(eri_class_id(3, 0, 4, 0)),
-    int(eri_class_id(2, 1, 4, 0)),
-    int(eri_class_id(3, 1, 4, 0)),
-    int(eri_class_id(2, 2, 4, 0)),
-    int(eri_class_id(3, 2, 4, 0)),
-    int(eri_class_id(2, 1, 2, 1)),
-    int(eri_class_id(2, 1, 2, 2)),
-    int(eri_class_id(2, 2, 2, 2)),
-])
+# Set of class IDs that have native CUDA kernels in 4e dispatch (excluding ff*,
+# which remain opt-in via _USE_NATIVE_FF_QUARTETS).
+_NATIVE_CLASS_IDS: frozenset[int] = frozenset(int(cid) for cid in DISPATCH_NATIVE_CLASS_IDS)
 
 
 def resolve_kernel_class_id(cid: int) -> tuple[int, bool]:
@@ -299,9 +253,8 @@ def plan_kernel_batches_spd(tasks: TaskList, *, shell_pairs, shell_l: np.ndarray
     # This is hot for large screened workloads; avoid per-task Python loops.
     base_ids = np.asarray(list(base.keys()), dtype=np.int32)
 
-    in_base = np.zeros((nt,), dtype=bool)
-    for b in base_ids:
-        in_base |= cid == np.int32(b)
+    # O(N log K) membership test via np.isin — avoids K serial passes over N tasks.
+    in_base = np.isin(cid, base_ids)
 
     cid_u32 = cid.astype(np.uint32, copy=False)
     la = cid_u32 & np.uint32(0xFF)
@@ -310,9 +263,7 @@ def plan_kernel_batches_spd(tasks: TaskList, *, shell_pairs, shell_l: np.ndarray
     ld = (cid_u32 >> np.uint32(24)) & np.uint32(0xFF)
     swap_cid = (lc | (ld << np.uint32(8)) | (la << np.uint32(16)) | (lb << np.uint32(24))).astype(np.int32, copy=False)
 
-    in_swap_base = np.zeros((nt,), dtype=bool)
-    for b in base_ids:
-        in_swap_base |= swap_cid == np.int32(b)
+    in_swap_base = np.isin(swap_cid, base_ids)
 
     swap_mask = (~in_base) & in_swap_base
 
@@ -364,12 +315,17 @@ def run_kernel_batch_spd(
     blocks_per_task: int = 8,
     boys: str = "ref",
     profile: dict | None = None,
+    skip_transpose: bool = False,
 ):
     """Execute a single kernel batch on the GPU.
 
     Dispatches the appropriate CUDA kernel for the given batch of tasks. Handles
     native kernels (ssss, psss, etc.), generic Rys kernels, and necessary
     transpositions for swapped task classes.
+
+    When ``skip_transpose=True``, the post-kernel bra-ket transpose for swapped
+    classes is skipped.  The caller receives tiles in kernel-natural layout
+    ``(nCD_kernel, nAB_kernel)`` and must adjust its own indexing accordingly.
 
     Parameters
     ----------
@@ -1250,9 +1206,9 @@ def run_kernel_batch_spd(
             raw = _run_generic_raw()
             tile = raw.reshape((-1, nAB, nCD))
 
-        if batch.transpose:
+        if batch.transpose and not skip_transpose:
             tile = tile.transpose((0, 2, 1))
-        tile = cp.ascontiguousarray(tile)
+            tile = cp.ascontiguousarray(tile)
 
         if evt0 is not None and evt1 is not None and s0 is not None:
             evt1.record(s0)

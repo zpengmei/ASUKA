@@ -308,7 +308,7 @@ __global__ void KernelContractJKTilesOrderedMulti2(
     // Use a macro to avoid duplicating the J/K accumulation pattern
     #define MULTI2_ACCUM(D_ptr, J_ptr, K_ptr) do {                             \
       /* --- J contributions --- */                                            \
-      {                                                                        \
+      if ((J_ptr) != nullptr) {                                                \
         const double D_cd_val = (D_ptr)[c * N + d];                            \
         const double vJ_ab = f_cd * v * D_cd_val;                              \
         atomicAdd(&(J_ptr)[a * N + b], vJ_ab);                                \

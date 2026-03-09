@@ -18,11 +18,95 @@ from .gpu import (
 from .shell_pairs import ShellPairs, build_shell_pairs_l_order
 from .tasks import TaskList, decode_eri_class_id
 
+_DIAG_MAX_SQRT_TILE_KERNEL = None
+
 
 def _pair_key(sp_A: np.ndarray, sp_B: np.ndarray, *, n_shell: int) -> np.ndarray:
     hi = np.maximum(sp_A.astype(np.int64), sp_B.astype(np.int64))
     lo = np.minimum(sp_A.astype(np.int64), sp_B.astype(np.int64))
     return hi * int(n_shell) + lo
+
+
+def _diag_max_sqrt_from_square_tiles(tile):
+    """Compute sqrt(max(diag(tile_t), 0)) for each task tile on GPU.
+
+    Parameters
+    ----------
+    tile
+        CuPy array with shape (ntasks, n, n).
+
+    Returns
+    -------
+    cupy.ndarray
+        Shape (ntasks,), dtype float64.
+    """
+
+    import cupy as cp
+    import numpy as np
+
+    global _DIAG_MAX_SQRT_TILE_KERNEL
+
+    t = cp.asarray(tile, dtype=cp.float64)
+    if t.ndim != 3:
+        raise ValueError("tile must have shape (ntasks, n, n)")
+    ntasks = int(t.shape[0])
+    nrow = int(t.shape[1])
+    ncol = int(t.shape[2])
+    if nrow != ncol:
+        raise ValueError("tile must be square in its last two dimensions")
+
+    out = cp.empty((ntasks,), dtype=cp.float64)
+    if ntasks == 0:
+        return out
+    if nrow == 0:
+        out.fill(0.0)
+        return out
+
+    if _DIAG_MAX_SQRT_TILE_KERNEL is None:
+        _DIAG_MAX_SQRT_TILE_KERNEL = cp.RawKernel(
+            r"""
+            extern "C" __global__
+            void diag_max_sqrt_tile_f64(const double* tile, int n, int ntasks, double* out) {
+              const int task = blockIdx.x;
+              if (task >= ntasks) return;
+
+              extern __shared__ double smax[];
+              double vmax = 0.0;
+              const long long base = (long long)task * (long long)n * (long long)n;
+
+              for (int i = threadIdx.x; i < n; i += blockDim.x) {
+                const double v = tile[base + (long long)i * (long long)n + (long long)i];
+                if (v > vmax) vmax = v;
+              }
+              smax[threadIdx.x] = vmax;
+              __syncthreads();
+
+              for (int stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+                if (threadIdx.x < stride) {
+                  const double rhs = smax[threadIdx.x + stride];
+                  if (rhs > smax[threadIdx.x]) smax[threadIdx.x] = rhs;
+                }
+                __syncthreads();
+              }
+
+              if (threadIdx.x == 0) {
+                const double m = smax[0] > 0.0 ? smax[0] : 0.0;
+                out[task] = sqrt(m);
+              }
+            }
+            """,
+            "diag_max_sqrt_tile_f64",
+        )
+
+    threads = 256
+    shared = int(threads * np.dtype(np.float64).itemsize)
+    _DIAG_MAX_SQRT_TILE_KERNEL(
+        (ntasks,),
+        (threads,),
+        (t.reshape(-1), np.int32(nrow), np.int32(ntasks), out),
+        shared_mem=shared,
+    )
+    return out
 
 
 def schwarz_sp_device(
@@ -105,8 +189,7 @@ def schwarz_sp_device(
                 work_large_min=work_large_min,
                 blocks_per_task=blocks_per_task,
             ).reshape((-1, 3, 3))
-            diag = cp.diagonal(tile, axis1=1, axis2=2)
-            Q_l[idx_ps] = cp.sqrt(cp.maximum(cp.max(diag, axis=1), 0.0))
+            Q_l[idx_ps] = _diag_max_sqrt_from_square_tiles(tile)
 
         if int(idx_pp.size) > 0:
             tasks = TaskList(task_spAB=idx_pp, task_spCD=idx_pp)
@@ -122,8 +205,7 @@ def schwarz_sp_device(
                 work_large_min=work_large_min,
                 blocks_per_task=blocks_per_task,
             ).reshape((-1, 9, 9))
-            diag = cp.diagonal(tile, axis1=1, axis2=2)
-            Q_l[idx_pp] = cp.sqrt(cp.maximum(cp.max(diag, axis=1), 0.0))
+            Q_l[idx_pp] = _diag_max_sqrt_from_square_tiles(tile)
 
         # Map Q back to the caller shell_pairs order (unordered shell pair key).
         n_shell = int(shell_l.shape[0])
@@ -227,9 +309,9 @@ def schwarz_shellpairs_device(
                     work_large_min=work_large_min,
                     blocks_per_task=blocks_per_task,
                     boys=boys,
+                    skip_transpose=True,
                 )
-                diag = cp.diagonal(tile, axis1=1, axis2=2)
-                Q_l[sub.task_idx] = cp.sqrt(cp.maximum(cp.max(diag, axis=1), 0.0))
+                Q_l[sub.task_idx] = _diag_max_sqrt_from_square_tiles(tile)
 
         # Map Q back to the caller shell_pairs order (unordered shell pair key).
         n_shell = int(shell_l.shape[0])

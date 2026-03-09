@@ -68,6 +68,7 @@ void hb_screen_and_apply_kernel(
     int32_t* __restrict__ hash_keys,
     double*  __restrict__ hash_vals,
     int cap,
+    const uint8_t* __restrict__ selected_mask,  // [ncsf] or NULL
     int* __restrict__ overflow_flag)
 {
     // One block per source CSF
@@ -304,6 +305,7 @@ void hb_screen_and_apply_kernel(
                     int32_t csf_i = prefix_offset + seg_idx2 + suffix_offset;
                     if ((unsigned)csf_i >= (unsigned)ncsf) { overflow = 1; continue; }
                     if (csf_i == j_global) continue;
+                    if (selected_mask && selected_mask[csf_i]) continue;
                     if (w2 == 0.0) continue;
                     guga_frontier_hash_insert_add_f64(
                         hash_keys, hash_vals, cap, root, csf_i,
@@ -361,9 +363,225 @@ void hb_fused_dfs_kernel(
     int32_t* __restrict__ hash_keys,
     double*  __restrict__ hash_vals,
     int cap,
+    const uint8_t* __restrict__ selected_mask,
     int* __restrict__ overflow_flag)
 {
-    // Phase 3 placeholder — to be filled with multi-warp DFS + inline screening.
+    int j_local = blockIdx.x;
+    if (j_local >= nsel) return;
+
+    int j_global = sel_idx[j_local];
+    if ((unsigned)j_global >= (unsigned)ncsf) {
+        if (threadIdx.x == 0) atomicExch(overflow_flag, 1);
+        return;
+    }
+    double cj = c_root[j_local];
+    double abs_cj = fabs(cj);
+    if (abs_cj == 0.0) return;
+    if (norb > MAX_NORB_T) {
+        if (threadIdx.x == 0) atomicExch(overflow_flag, 1);
+        return;
+    }
+    (void)nnodes;
+
+    double cutoff = eps / abs_cj;
+    int tid = threadIdx.x;
+    int nthreads = blockDim.x;
+    int nops = norb * norb;
+
+    __shared__ int8_t steps_s[MAX_NORB_T];
+    __shared__ int32_t nodes_s[MAX_NORB_T + 1];
+    __shared__ int8_t occ_s[MAX_NORB_T];
+    __shared__ int16_t b_s[MAX_NORB_T];
+    __shared__ int32_t idx_prefix_s[MAX_NORB_T + 1];
+    __shared__ int32_t idx_prefix_warp_sums[(MAX_NORB_T + 31) / 32];
+
+    for (int k = tid; k < norb; k += nthreads) {
+        int8_t step = steps_table[(int64_t)j_global * norb + k];
+        steps_s[k] = step;
+        occ_s[k] = hb_step_to_occ[(int)(step & 3)];
+        int32_t node_next = nodes_table[(int64_t)j_global * (norb + 1) + (k + 1)];
+        nodes_s[k + 1] = node_next;
+        b_s[k] = node_twos[node_next];
+    }
+    if (nthreads > 32) { __syncthreads(); } else { __syncwarp(); }
+    if (tid == 0) {
+        nodes_s[0] = nodes_table[(int64_t)j_global * (norb + 1)];
+    }
+    if (nthreads > 32) { __syncthreads(); } else { __syncwarp(); }
+
+    if (norb <= 32) {
+        int lane = tid;
+        if (lane < 32) {
+            int32_t delta = 0;
+            if (lane < norb) {
+                int node_k = nodes_s[lane];
+                int step_k = (int)steps_s[lane];
+                delta = (int32_t)child_prefix[node_k * 5 + step_k];
+            }
+            #pragma unroll
+            for (int off = 1; off < 32; off <<= 1) {
+                int32_t v = __shfl_up_sync(0xffffffffu, delta, off);
+                if (lane >= off) delta += v;
+            }
+            if (lane == 0) idx_prefix_s[0] = 0;
+            if (lane < norb) idx_prefix_s[lane + 1] = delta;
+        }
+        if (nthreads > 32) { __syncthreads(); } else { __syncwarp(); }
+    } else {
+        if (nthreads >= 64) {
+            int lane = tid & 31;
+            int warp = tid >> 5;
+            int warps_needed = (norb + 31) >> 5;
+            int k = warp * 32 + lane;
+            int32_t delta = 0;
+            if (warp < warps_needed && k < norb) {
+                int node_k = nodes_s[k];
+                int step_k = (int)steps_s[k];
+                delta = (int32_t)child_prefix[node_k * 5 + step_k];
+            }
+            #pragma unroll
+            for (int off = 1; off < 32; off <<= 1) {
+                int32_t v = __shfl_up_sync(0xffffffffu, delta, off);
+                if (lane >= off) delta += v;
+            }
+            if (warp < warps_needed && lane == 31) idx_prefix_warp_sums[warp] = delta;
+            __syncthreads();
+            int32_t warp_offset = 0;
+            if (warp < warps_needed && warp > 0) warp_offset = idx_prefix_warp_sums[0];
+            if (tid == 0) idx_prefix_s[0] = 0;
+            if (warp < warps_needed && k < norb) idx_prefix_s[k + 1] = delta + warp_offset;
+            __syncthreads();
+        } else {
+            if (tid == 0) {
+                idx_prefix_s[0] = 0;
+                int32_t acc = 0;
+                for (int k = 0; k < norb; k++) {
+                    int node_k = nodes_s[k];
+                    int step_k = (int)steps_s[k];
+                    acc += (int32_t)child_prefix[node_k * 5 + step_k];
+                    idx_prefix_s[k + 1] = acc;
+                }
+            }
+            __syncthreads();
+        }
+    }
+
+    for (int pq = tid; pq < nops; pq += nthreads) {
+        int p = pq / norb;
+        int q = pq - p * norb;
+        if (p == q) continue;
+
+        int occ_p = (int)occ_s[p];
+        int occ_q = (int)occ_s[q];
+        if (occ_q <= 0 || occ_p >= 2) continue;
+
+        double wgt = 0.0;
+
+        for (int k = 0; k < n_h1; k++) {
+            if (h1_abs[k] < cutoff) break;
+            int hp = h1_pq[k * 2];
+            int hq = h1_pq[k * 2 + 1];
+            if (hp == p && hq == q) {
+                wgt += h1_signed[k];
+                break;
+            }
+        }
+
+        if (pq_max_v[pq] >= cutoff) {
+            int64_t lo = pq_ptr[pq];
+            int64_t hi = pq_ptr[pq + 1];
+            for (int64_t k = lo; k < hi; k++) {
+                if (v_abs[k] < cutoff) break;
+                int rs_flat = rs_idx[k];
+                int r = rs_flat / norb;
+                int s = rs_flat % norb;
+                double v = v_signed[k];
+                if (r == s) {
+                    wgt += 0.5 * (double)occ_s[r] * v;
+                } else {
+                    wgt += 0.5 * v;
+                }
+            }
+        }
+
+        if (wgt == 0.0) continue;
+
+        int start, end, q_start, q_mid, q_end;
+        if (p < q) {
+            start = p; end = q;
+            q_start = Q_uR; q_mid = Q_R; q_end = Q_oR;
+        } else {
+            start = q; end = p;
+            q_start = Q_uL; q_mid = Q_L; q_end = Q_oL;
+        }
+
+        int32_t node_start      = nodes_s[start];
+        int32_t node_end_target = nodes_s[end + 1];
+        int32_t prefix_offset   = idx_prefix_s[start];
+        int32_t prefix_endplus1 = idx_prefix_s[end + 1];
+        int32_t suffix_offset   = (int32_t)j_global - prefix_endplus1;
+
+        int8_t   st_k[MAX_NORB_T];
+        uint64_t st_node_seg[MAX_NORB_T];
+        double   st_w[MAX_NORB_T];
+        int top = 0;
+        int overflow = 0;
+
+        st_k[top] = (int8_t)start;
+        st_node_seg[top] = ((uint64_t)(uint32_t)0) | ((uint64_t)(uint32_t)node_start << 32);
+        st_w[top] = 1.0;
+        top++;
+
+        while (top) {
+            top--;
+            double w = st_w[top];
+            int kpos = (int)st_k[top];
+            uint64_t node_seg = st_node_seg[top];
+            int node_k = (int)(node_seg >> 32);
+            int32_t seg_idx = (int32_t)(uint32_t)node_seg;
+
+            int qk = (kpos == start) ? q_start : ((kpos == end) ? q_end : q_mid);
+            int dk = (int)steps_s[kpos];
+            int bk = (int)b_s[kpos];
+            int k_next = kpos + 1;
+
+            int dp0 = 0, dp1 = 0;
+            int ndp = candidate_dprimes(qk, dk, &dp0, &dp1);
+            if (ndp == 0) continue;
+
+            for (int which = 0; which < ndp; which++) {
+                int dprime = (which == 0) ? dp0 : dp1;
+                int child_k = child_table[node_k * 4 + dprime];
+                if (child_k < 0) continue;
+                int bprime = (int)node_twos[child_k];
+                int db = bk - bprime;
+                double seg = (double)segment_value_int(qk, dprime, dk, db, bk);
+                if (seg == 0.0) continue;
+                double w2 = w * seg;
+                int32_t seg_idx2 = seg_idx + (int32_t)child_prefix[node_k * 5 + dprime];
+
+                if (kpos == end) {
+                    if (child_k != node_end_target) continue;
+                    int32_t csf_i = prefix_offset + seg_idx2 + suffix_offset;
+                    if ((unsigned)csf_i >= (unsigned)ncsf) { overflow = 1; continue; }
+                    if (csf_i == j_global) continue;
+                    if (selected_mask && selected_mask[csf_i]) continue;
+                    if (w2 == 0.0) continue;
+                    guga_frontier_hash_insert_add_f64(
+                        hash_keys, hash_vals, cap, root, csf_i,
+                        cj * wgt * w2, overflow_flag);
+                } else {
+                    if (top >= MAX_NORB_T) { overflow = 1; continue; }
+                    st_k[top] = (int8_t)k_next;
+                    st_node_seg[top] = ((uint64_t)(uint32_t)seg_idx2) |
+                                       ((uint64_t)(uint32_t)child_k << 32);
+                    st_w[top] = w2;
+                    top++;
+                }
+            }
+        }
+        if (overflow) atomicExch(overflow_flag, 1);
+    }
 }
 
 
@@ -443,6 +661,7 @@ extern "C" cudaError_t guga_hb_screen_and_apply_launch_stream(
     int32_t* hash_keys,
     double*  hash_vals,
     int cap,
+    const uint8_t* selected_mask,
     int* overflow_flag,
     cudaStream_t stream,
     int threads)
@@ -452,66 +671,48 @@ extern "C" cudaError_t guga_hb_screen_and_apply_launch_stream(
     if (norb <= 0 || norb > 64) return cudaErrorInvalidValue;
     if (threads <= 0 || threads > 1024) return cudaErrorInvalidValue;
 
-    // Shared memory layout (must match kernel pointer arithmetic):
-    //   g_flat_s:             double[norb^2]
-    //   steps_s:              int8_t[norb],  padded to 8-byte boundary
-    //   nodes_s:              int32_t[norb+1]
-    //   occ_s:                int8_t[norb],  padded to 2-byte boundary
-    //   b_s:                  int16_t[norb], padded to 4-byte boundary
-    //   idx_prefix_s:         int32_t[norb+1]
-    //   idx_prefix_warp_sums: int32_t[ceil(norb/32)]
-    int nops = norb * norb;
-    int smem_bytes = 0;
-    smem_bytes += nops * (int)sizeof(double);                    // g_flat_s
-    smem_bytes += (norb + 7) & ~7;                              // steps_s
-    smem_bytes += (norb + 1) * (int)sizeof(int32_t);            // nodes_s
-    smem_bytes += (norb + 3) & ~3;                              // occ_s, padded to 4-byte boundary
-    smem_bytes += (norb * 2 + 3) & ~3;                          // b_s
-    smem_bytes += (norb + 1) * (int)sizeof(int32_t);            // idx_prefix_s
-    smem_bytes += ((norb + 31) / 32) * (int)sizeof(int32_t);    // idx_prefix_warp_sums
-    smem_bytes = (smem_bytes + 255) & ~255;                     // align to 256 bytes
-
     // 5-way dispatch matching apply_g_flat kernel specializations.
+    // Phase-3 fused DFS path: no materialized g_flat shared buffer.
     if (norb <= 16) {
-        hb_screen_and_apply_kernel<16><<<nsel, threads, smem_bytes, stream>>>(
+        hb_fused_dfs_kernel<16><<<nsel, threads, 0, stream>>>(
             sel_idx, c_root, nsel, root,
             steps_table, nodes_table, norb, ncsf,
             h1_pq, h1_abs, h1_signed, n_h1,
             pq_ptr, rs_idx, v_abs, v_signed, pq_max_v, eps,
             child_table, node_twos, child_prefix, nnodes,
-            hash_keys, hash_vals, cap, overflow_flag);
+            hash_keys, hash_vals, cap, selected_mask, overflow_flag);
     } else if (norb <= 24) {
-        hb_screen_and_apply_kernel<24><<<nsel, threads, smem_bytes, stream>>>(
+        hb_fused_dfs_kernel<24><<<nsel, threads, 0, stream>>>(
             sel_idx, c_root, nsel, root,
             steps_table, nodes_table, norb, ncsf,
             h1_pq, h1_abs, h1_signed, n_h1,
             pq_ptr, rs_idx, v_abs, v_signed, pq_max_v, eps,
             child_table, node_twos, child_prefix, nnodes,
-            hash_keys, hash_vals, cap, overflow_flag);
+            hash_keys, hash_vals, cap, selected_mask, overflow_flag);
     } else if (norb <= 32) {
-        hb_screen_and_apply_kernel<32><<<nsel, threads, smem_bytes, stream>>>(
+        hb_fused_dfs_kernel<32><<<nsel, threads, 0, stream>>>(
             sel_idx, c_root, nsel, root,
             steps_table, nodes_table, norb, ncsf,
             h1_pq, h1_abs, h1_signed, n_h1,
             pq_ptr, rs_idx, v_abs, v_signed, pq_max_v, eps,
             child_table, node_twos, child_prefix, nnodes,
-            hash_keys, hash_vals, cap, overflow_flag);
+            hash_keys, hash_vals, cap, selected_mask, overflow_flag);
     } else if (norb <= 48) {
-        hb_screen_and_apply_kernel<48><<<nsel, threads, smem_bytes, stream>>>(
+        hb_fused_dfs_kernel<48><<<nsel, threads, 0, stream>>>(
             sel_idx, c_root, nsel, root,
             steps_table, nodes_table, norb, ncsf,
             h1_pq, h1_abs, h1_signed, n_h1,
             pq_ptr, rs_idx, v_abs, v_signed, pq_max_v, eps,
             child_table, node_twos, child_prefix, nnodes,
-            hash_keys, hash_vals, cap, overflow_flag);
+            hash_keys, hash_vals, cap, selected_mask, overflow_flag);
     } else {
-        hb_screen_and_apply_kernel<64><<<nsel, threads, smem_bytes, stream>>>(
+        hb_fused_dfs_kernel<64><<<nsel, threads, 0, stream>>>(
             sel_idx, c_root, nsel, root,
             steps_table, nodes_table, norb, ncsf,
             h1_pq, h1_abs, h1_signed, n_h1,
             pq_ptr, rs_idx, v_abs, v_signed, pq_max_v, eps,
             child_table, node_twos, child_prefix, nnodes,
-            hash_keys, hash_vals, cap, overflow_flag);
+            hash_keys, hash_vals, cap, selected_mask, overflow_flag);
     }
     return cudaGetLastError();
 }

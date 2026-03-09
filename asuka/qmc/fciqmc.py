@@ -296,6 +296,7 @@ def _run_fciqmc_cuda(
     ctx.nnz = nnz0
 
     try:
+        pops_dev = cp.empty(int(niter) + 1, dtype=cp.float64)
         for it in range(1, niter + 1):
             cuda_fciqmc_step_hamiltonian_ws(
                 ctx,
@@ -306,13 +307,13 @@ def _run_fciqmc_cuda(
                 sync=True,
             )
 
-            # L1 norm on device — single scalar transfer, negligible bandwidth.
             nnz_now = int(ctx.nnz)
-            pop = float(cp.sum(cp.abs(ctx.x_val[:nnz_now])).get())
-            pops[it] = pop
+            pop_dev = cp.sum(cp.abs(ctx.x_val[:nnz_now]))
+            pops_dev[it] = pop_dev
             shifts[it] = shift
 
             if it >= shift_start and (it % shift_stride == 0):
+                pop = float(pop_dev.get())
                 shift = update_shift(
                     shift,
                     pop,
@@ -335,6 +336,8 @@ def _run_fciqmc_cuda(
                 e_pos += 1
 
         # Final download.
+        if niter >= 1:
+            pops[1:] = cp.asnumpy(pops_dev[1:]).astype(np.float64, copy=False)
         nnz_final = int(ctx.nnz)
         x_idx_out = cp.asnumpy(ctx.x_idx[:nnz_final]).astype(np.int32, copy=False)
         x_val_out = cp.asnumpy(ctx.x_val[:nnz_final]).astype(np.float64, copy=False)

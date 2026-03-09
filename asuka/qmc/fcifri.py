@@ -163,17 +163,19 @@ def run_fcifri_ground(
             for it in range(1, niter + 1):
                 # Initiator threshold uses the current column l1 norm.
                 if float(initiator_na) != 0.0:
-                    l1 = float(cp.sum(cp.abs(ctx.x_val[: ctx.nnz])).get())
-                    initiator_t = float(initiator_na) * l1 / float(m - 1)
+                    # Keep initiator_t on device to avoid a host sync every iteration.
+                    l1_dev = cp.sum(cp.abs(ctx.x_val[: ctx.nnz]))
+                    initiator_t_dev = float(initiator_na) * l1_dev / float(m - 1)
                 else:
-                    initiator_t = 0.0
+                    initiator_t_dev = None
 
                 seed_spawn = int(rng.integers(0, np.iinfo(np.int64).max, dtype=np.int64))
                 seed_phi = int(rng.integers(0, np.iinfo(np.int64).max, dtype=np.int64))
                 cuda_projector_step_hamiltonian_ws(
                     ctx,
                     eps=float(eps),
-                    initiator_t=float(initiator_t),
+                    initiator_t=0.0,
+                    initiator_t_dev=initiator_t_dev,
                     seed_spawn=seed_spawn,
                     seed_phi=seed_phi,
                     scale_identity=1.0,

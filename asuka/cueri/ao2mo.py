@@ -97,36 +97,45 @@ def _ao2mo_general(
     builder: CuERIActiveSpaceDenseCPUBuilder,
     mo_coeffs: Sequence[np.ndarray],
 ) -> np.ndarray:
-    """4-set transform via build-combined-then-slice strategy."""
+    """4-set transform via packed ERI index extraction.
+
+    Avoids the O(n_all^4) full ordered-pair expansion by indexing directly into
+    the packed lower-triangular ERI, which is ~(n_all/2)^2× smaller.
+
+    Because the 4 index sets are non-overlapping in the combined MO basis
+    (idx1 < idx2 and idx3 < idx4 by construction), the packed row/col indices
+    can be computed in closed form without calling expand_eri_packed_to_ordered.
+    """
     C1, C2, C3, C4 = (np.asarray(c, dtype=np.float64, order="C") for c in mo_coeffs)
     for i, c in enumerate((C1, C2, C3, C4)):
         if c.ndim != 2:
             raise ValueError(f"mo_coeffs[{i}] must be a 2-D array")
 
-    nao = C1.shape[0]
     n1, n2, n3, n4 = C1.shape[1], C2.shape[1], C3.shape[1], C4.shape[1]
 
     # Build combined MO coefficient matrix with unique columns.
-    C_all = np.concatenate([C1, C2, C3, C4], axis=1)  # (nao, n1+n2+n3+n4)
-    nmo_all = C_all.shape[1]
+    C_all = np.concatenate([C1, C2, C3, C4], axis=1)  # (nao, n_all)
 
-    # Full ordered-pair ERI in the combined basis: (nmo_all^2, nmo_all^2)
-    eri_full = builder.build_eri_mat(
+    # Packed lower-triangular ERI: (npair_all, npair_all) — avoids full nmo_all^4 square.
+    eri_packed = builder.build_eri_packed(
         C_all, eps_ao=0.0, eps_mo=0.0, blas_nthreads=None, profile=None,
     )
 
-    # Index ranges in the combined basis.
+    # Index ranges in the combined basis (all offsets non-overlapping by construction).
     off = 0
-    idx1 = np.arange(off, off + n1); off += n1
-    idx2 = np.arange(off, off + n2); off += n2
-    idx3 = np.arange(off, off + n3); off += n3
-    idx4 = np.arange(off, off + n4); off += n4
+    idx1 = np.arange(off, off + n1, dtype=np.int64); off += n1
+    idx2 = np.arange(off, off + n2, dtype=np.int64); off += n2
+    idx3 = np.arange(off, off + n3, dtype=np.int64); off += n3
+    idx4 = np.arange(off, off + n4, dtype=np.int64)
 
-    # Ordered-pair indices: row = (p in C1) * nmo_all + (q in C2)
-    row_ids = (idx1[:, None] * nmo_all + idx2[None, :]).ravel()
-    col_ids = (idx3[:, None] * nmo_all + idx4[None, :]).ravel()
+    # Since idx1 < idx2 element-wise (all C1 global indices < all C2 global indices),
+    # packed_pair(p, q) = max(p,q)*(max(p,q)+1)//2 + min(p,q) = q*(q+1)//2 + p
+    row_ids = (idx2[None, :] * (idx2[None, :] + 1) // 2 + idx1[:, None]).ravel()  # (n1*n2,)
 
-    return np.ascontiguousarray(eri_full[np.ix_(row_ids, col_ids)])
+    # Since idx3 < idx4 element-wise, packed_pair(r, s) = s*(s+1)//2 + r
+    col_ids = (idx4[None, :] * (idx4[None, :] + 1) // 2 + idx3[:, None]).ravel()  # (n3*n4,)
+
+    return np.ascontiguousarray(eri_packed[np.ix_(row_ids, col_ids)])
 
 
 # ---------------------------------------------------------------------------

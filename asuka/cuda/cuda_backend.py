@@ -5066,6 +5066,89 @@ def cipsi_score_and_select_topk_inplace_device(
     return out_new_idx, out_new_n, out_pt2
 
 
+def cipsi_score_and_select_topk_from_hash_slots_inplace_device(
+    keys,
+    vals_root_major,
+    *,
+    e_var,
+    hdiag,
+    selected_mask,
+    denom_floor: float,
+    out_new_idx,
+    out_new_n,
+    out_pt2,
+    threads: int = 256,
+    stream=None,
+    sync: bool = True,
+):
+    if _ext is None or not hasattr(_ext, "cipsi_score_and_select_topk_from_hash_slots_inplace_device"):
+        raise RuntimeError(
+            "CUDA extension is missing hash-slot score/select kernel; rebuild with python -m asuka.build.guga_cuda_ext"
+        )
+
+    try:
+        import cupy as cp
+    except Exception as e:  # pragma: no cover
+        raise RuntimeError("CuPy is required for the device-array path") from e
+
+    keys = cp.asarray(keys, dtype=cp.int32).ravel()
+    keys = cp.ascontiguousarray(keys)
+    vals_root_major = cp.asarray(vals_root_major, dtype=cp.float64)
+    vals_root_major = cp.ascontiguousarray(vals_root_major)
+    if vals_root_major.ndim != 2:
+        raise ValueError("vals_root_major must have shape (nroots, cap)")
+    nroots = int(vals_root_major.shape[0])
+    cap = int(keys.size)
+    if int(vals_root_major.shape[1]) != cap:
+        raise ValueError("vals_root_major must have shape (nroots, cap) with cap matching keys")
+
+    e_var = cp.asarray(e_var, dtype=cp.float64).ravel()
+    e_var = cp.ascontiguousarray(e_var)
+    if e_var.shape != (nroots,):
+        raise ValueError("e_var must have shape (nroots,)")
+    hdiag = cp.asarray(hdiag, dtype=cp.float64).ravel()
+    hdiag = cp.ascontiguousarray(hdiag)
+    ncsf = int(hdiag.size)
+
+    if selected_mask is not None:
+        selected_mask = cp.asarray(selected_mask, dtype=cp.uint8).ravel()
+        selected_mask = cp.ascontiguousarray(selected_mask)
+        if selected_mask.shape != (ncsf,):
+            raise ValueError("selected_mask must have shape (ncsf,)")
+
+    out_new_idx = cp.asarray(out_new_idx, dtype=cp.int32).ravel()
+    out_new_idx = cp.ascontiguousarray(out_new_idx)
+    out_new_n = cp.asarray(out_new_n, dtype=cp.int32).ravel()
+    out_new_n = cp.ascontiguousarray(out_new_n)
+    if out_new_n.shape != (1,):
+        raise ValueError("out_new_n must have shape (1,)")
+    out_pt2 = cp.asarray(out_pt2, dtype=cp.float64).ravel()
+    out_pt2 = cp.ascontiguousarray(out_pt2)
+    if out_pt2.shape != (nroots,):
+        raise ValueError("out_pt2 must have shape (nroots,)")
+
+    if stream is None:
+        stream_ptr = int(cp.cuda.get_current_stream().ptr)
+    else:
+        stream_ptr = int(getattr(stream, "ptr", stream))
+
+    _ext.cipsi_score_and_select_topk_from_hash_slots_inplace_device(
+        keys,
+        vals_root_major,
+        e_var,
+        hdiag,
+        selected_mask if selected_mask is not None else None,
+        float(denom_floor),
+        out_new_idx,
+        out_new_n,
+        out_pt2,
+        int(threads),
+        int(stream_ptr),
+        bool(sync),
+    )
+    return out_new_idx, out_new_n, out_pt2
+
+
 def has_hb_screen_and_apply_device() -> bool:
     """Return True if the CUDA extension exposes the HB screen-and-apply kernel."""
     return _ext is not None and hasattr(_ext, "hb_screen_and_apply_inplace_device")
@@ -5093,7 +5176,8 @@ def hb_screen_and_apply_inplace_device(
     eps: float,
     hash_keys,
     hash_vals,
-    overflow,
+    selected_mask=None,
+    overflow=None,
     threads: int = 256,
     stream=None,
     sync: bool = True,
@@ -5114,6 +5198,14 @@ def hb_screen_and_apply_inplace_device(
 
     sel_idx = cp.ascontiguousarray(cp.asarray(sel_idx, dtype=cp.int32).ravel())
     c_root = cp.ascontiguousarray(cp.asarray(c_root, dtype=cp.float64).ravel())
+    if selected_mask is not None:
+        selected_mask = cp.ascontiguousarray(cp.asarray(selected_mask, dtype=cp.uint8).ravel())
+    if overflow is None:
+        overflow = cp.empty((1,), dtype=cp.int32)
+    else:
+        overflow = cp.ascontiguousarray(cp.asarray(overflow, dtype=cp.int32).ravel())
+        if overflow.shape != (1,):
+            raise ValueError("overflow must have shape (1,)")
 
     _ext.hb_screen_and_apply_inplace_device(
         drt_dev,
@@ -5135,6 +5227,7 @@ def hb_screen_and_apply_inplace_device(
         float(eps),
         hash_keys,
         hash_vals,
+        selected_mask if selected_mask is not None else None,
         overflow,
         int(threads),
         int(stream_ptr),
@@ -5153,6 +5246,7 @@ def apply_g_flat_scatter_atomic_frontier_hash_inplace_device(
     hash_keys,
     hash_vals,
     root: int,
+    selected_mask=None,
     overflow=None,
     clear_overflow: bool = True,
     threads: int = 256,
@@ -5195,6 +5289,11 @@ def apply_g_flat_scatter_atomic_frontier_hash_inplace_device(
         raise ValueError("hash_vals must have shape (nroots, cap)")
     if hash_vals.shape[1] != hash_keys.shape[0]:
         raise ValueError("hash_vals must have shape (nroots, cap) with cap matching hash_keys")
+    if selected_mask is not None:
+        selected_mask = cp.asarray(selected_mask, dtype=cp.uint8).ravel()
+        selected_mask = cp.ascontiguousarray(selected_mask)
+        if selected_mask.shape != (int(drt.ncsf),):
+            raise ValueError("selected_mask must have shape (ncsf,)")
 
     if overflow is None:
         overflow = cp.empty((1,), dtype=cp.int32)
@@ -5221,6 +5320,105 @@ def apply_g_flat_scatter_atomic_frontier_hash_inplace_device(
         hash_keys,
         hash_vals,
         int(root),
+        selected_mask if selected_mask is not None else None,
+        overflow,
+        int(threads),
+        int(stream_ptr),
+        bool(sync),
+        bool(check_overflow),
+    )
+    return hash_keys, hash_vals, overflow
+
+
+def apply_g_flat_scatter_atomic_frontier_hash_many_roots_inplace_device(
+    drt: DRT,
+    drt_dev,
+    state_dev,
+    task_csf,
+    task_g,
+    *,
+    task_scale_task_major,
+    hash_keys,
+    hash_vals,
+    selected_mask=None,
+    overflow=None,
+    clear_overflow: bool = True,
+    threads: int = 256,
+    stream=None,
+    sync: bool = True,
+    check_overflow: bool = True,
+):
+    """Apply frontier-hash scatter for all roots with task-major coefficients.
+
+    Parameters
+    ----------
+    task_scale_task_major : array, shape (ntasks, nroots)
+        Task-major coefficient matrix where column `r` is used as `task_scale`
+        for `root=r`. A broadcast row shape `(1, nroots)` is also accepted.
+    """
+    try:
+        import cupy as cp
+    except Exception as e:  # pragma: no cover
+        raise RuntimeError("CuPy is required for the device-array matvec path") from e
+
+    if _ext is None or not hasattr(_ext, "apply_g_flat_scatter_atomic_frontier_hash_many_roots_inplace_device"):
+        raise RuntimeError(
+            "CUDA extension is missing many-roots frontier-hash apply kernel; rebuild with python -m asuka.build.guga_cuda_ext"
+        )
+
+    task_csf = cp.ascontiguousarray(cp.asarray(task_csf, dtype=cp.int32).ravel())
+    task_g = cp.asarray(task_g, dtype=cp.float64)
+    task_g = cp.ascontiguousarray(task_g)
+    if task_g.ndim not in (1, 2):
+        raise ValueError("task_g must be 1D (norb*norb,) or 2D (ntasks,norb*norb)")
+    nops = int(drt.norb) * int(drt.norb)
+    if task_g.ndim == 1 and task_g.shape != (nops,):
+        raise ValueError("task_g (1D) must have shape (norb*norb,)")
+    if task_g.ndim == 2 and task_g.shape != (int(task_csf.size), nops):
+        raise ValueError("task_g (2D) must have shape (ntasks,norb*norb)")
+
+    task_scale_task_major = cp.ascontiguousarray(cp.asarray(task_scale_task_major, dtype=cp.float64))
+    hash_keys = cp.ascontiguousarray(cp.asarray(hash_keys, dtype=cp.int32).ravel())
+    hash_vals = cp.ascontiguousarray(cp.asarray(hash_vals, dtype=cp.float64))
+    if task_scale_task_major.ndim != 2:
+        raise ValueError("task_scale_task_major must have shape (ntasks, nroots)")
+    if int(task_scale_task_major.shape[0]) not in (1, int(task_csf.size)):
+        raise ValueError("task_scale_task_major first dimension must be 1 or match ntasks")
+    if hash_vals.ndim != 2:
+        raise ValueError("hash_vals must have shape (nroots, cap)")
+    if int(hash_vals.shape[1]) != int(hash_keys.shape[0]):
+        raise ValueError("hash_vals must have shape (nroots, cap) with cap matching hash_keys")
+    if int(task_scale_task_major.shape[1]) != int(hash_vals.shape[0]):
+        raise ValueError("task_scale_task_major second dimension must match hash_vals.shape[0]")
+    if selected_mask is not None:
+        selected_mask = cp.asarray(selected_mask, dtype=cp.uint8).ravel()
+        selected_mask = cp.ascontiguousarray(selected_mask)
+        if selected_mask.shape != (int(drt.ncsf),):
+            raise ValueError("selected_mask must have shape (ncsf,)")
+    if overflow is None:
+        overflow = cp.empty((1,), dtype=cp.int32)
+    else:
+        overflow = cp.asarray(overflow, dtype=cp.int32).ravel()
+        overflow = cp.ascontiguousarray(overflow)
+        if overflow.shape != (1,):
+            raise ValueError("overflow must have shape (1,)")
+    if stream is None:
+        stream_ptr = int(cp.cuda.get_current_stream().ptr)
+    else:
+        stream_ptr = int(getattr(stream, "ptr", stream))
+
+    if bool(clear_overflow):
+        cp.cuda.runtime.memsetAsync(int(overflow.data.ptr), 0, 4, int(stream_ptr))
+
+    _ext.apply_g_flat_scatter_atomic_frontier_hash_many_roots_inplace_device(
+        drt_dev,
+        state_dev,
+        task_csf,
+        task_g,
+        task_scale_task_major,
+        hash_keys,
+        hash_vals,
+        selected_mask if selected_mask is not None else None,
         overflow,
         int(threads),
         int(stream_ptr),
