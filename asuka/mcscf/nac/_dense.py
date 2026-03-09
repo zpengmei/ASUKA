@@ -737,7 +737,7 @@ def _grad_elec_active_dense(
     )
 
     # Core-only RHF-like subtraction.
-    D_core_only, _dme_core = _core_energy_weighted_density_dense(
+    D_core_only, dme_core = _core_energy_weighted_density_dense(
         mo_coeff=mo_coeff,
         h_ao=h_ao_use,
         vhf_c_ao=vhf_c_ao,
@@ -767,7 +767,19 @@ def _grad_elec_active_dense(
         threads=int(threads),
     )
 
-    return np.asarray(de_h1 + de_2e - de_h1_core - de_2e_core, dtype=np.float64)
+    # Pulay overlap term for the active contribution:
+    #   -(W_act : dS/dR) with cart bra-only convention => -2 * <dS_ip, W_act>.
+    C = np.asarray(mo_coeff, dtype=np.float64)
+    dme_tot = C @ (0.5 * (np.asarray(gfock, dtype=np.float64) + np.asarray(gfock, dtype=np.float64).T)) @ C.T
+    dme_act = np.asarray(dme_tot, dtype=np.float64) - np.asarray(dme_core, dtype=np.float64)
+    de_pulay = -2.0 * contract_dS_ip_cart(
+        ao_basis,
+        atom_coords_bohr=atom_coords_bohr,
+        M=dme_act,
+        shell_atom=shell_atom,
+    )
+
+    return np.asarray(de_h1 + de_2e - de_h1_core - de_2e_core + de_pulay, dtype=np.float64)
 
 
 def _dense_ppaa_papa_from_eri_ao(
@@ -1020,7 +1032,15 @@ def _Lorb_dot_dgorb_dx_dense(
         threads=int(threads),
     )
 
-    return np.asarray(de_h1 + de_2e, dtype=np.float64)
+    dme0 = 0.5 * (np.asarray(gfock, dtype=np.float64) + np.asarray(gfock, dtype=np.float64).T)
+    de_pulay = -2.0 * contract_dS_ip_cart(
+        ao_basis,
+        atom_coords_bohr=atom_coords_bohr,
+        M=dme0,
+        shell_atom=shell_atom,
+    )
+
+    return np.asarray(de_h1 + de_2e + de_pulay, dtype=np.float64)
 
 @dataclass(frozen=True)
 class DenseNACCPUCache:
@@ -1285,7 +1305,9 @@ def sacasscf_nonadiabatic_couplings_dense(
 
         dm1_t, dm2_t = trans_rdm12(fcisolver_use, ci_list[bra], ci_list[ket], int(ncas), nelecas)
         dm1_t = 0.5 * (np.asarray(dm1_t, dtype=np.float64) + np.asarray(dm1_t, dtype=np.float64).T)
-        dm2_t = np.asarray(dm2_t, dtype=np.float64)
+        dm2_t = 0.5 * (
+            np.asarray(dm2_t, dtype=np.float64) + np.asarray(dm2_t, dtype=np.float64).transpose(1, 0, 3, 2)
+        )
 
         ham = _grad_elec_active_dense(
             ao_basis=ao_basis_ref,

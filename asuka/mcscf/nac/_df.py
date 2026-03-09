@@ -963,8 +963,26 @@ def _grad_elec_active_df(
                 ao_basis, atom_coords_bohr=coords, atom_charges=charges,
                 M=D_core_cpu, shell_atom=shell_atom,
             )
+        dme_tot_ao = C @ (0.5 * (gfock + gfock.T)) @ C.T
+        dme_act_ao = dme_tot_ao - dme_core
+        if _is_sph:
+            from asuka.integrals.int1e_sph import contract_dS_ip_sph  # noqa: PLC0415
+
+            de_pulay = -2.0 * contract_dS_ip_sph(
+                ao_basis,
+                atom_coords_bohr=coords,
+                M_sph=_asnumpy_f64(dme_act_ao),
+                shell_atom=shell_atom,
+            )
+        else:
+            de_pulay = -2.0 * contract_dS_ip_cart(
+                ao_basis,
+                atom_coords_bohr=coords,
+                M=_asnumpy_f64(dme_act_ao),
+                shell_atom=shell_atom,
+            )
         _restore_pool()
-        return np.asarray(de_h1 + _asnumpy_f64(de_df_net) - de_h1_core, dtype=np.float64)
+        return np.asarray(de_h1 + _asnumpy_f64(de_df_net) - de_h1_core + np.asarray(de_pulay, dtype=np.float64), dtype=np.float64)
 
     # ── Debug path (return_terms=True): keep 2 separate contract() calls for breakdown ──
     bar_L_ao_contract = bar_L_ao if str(getattr(bar_L_ao, "dtype", "")) == str(np.float64) else xp.asarray(bar_L_ao, dtype=xp.float64)
@@ -1023,13 +1041,35 @@ def _grad_elec_active_df(
             ao_basis, atom_coords_bohr=coords, atom_charges=charges,
         M=D_core_cpu, shell_atom=shell_atom,
     )
-    total = np.asarray(de_h1 + _asnumpy_f64(de_df) - de_h1_core - _asnumpy_f64(de_df_core), dtype=np.float64)
+    dme_tot_ao = C @ (0.5 * (gfock + gfock.T)) @ C.T
+    dme_act_ao = dme_tot_ao - dme_core
+    if _is_sph:
+        from asuka.integrals.int1e_sph import contract_dS_ip_sph  # noqa: PLC0415
+
+        de_pulay = -2.0 * contract_dS_ip_sph(
+            ao_basis,
+            atom_coords_bohr=coords,
+            M_sph=_asnumpy_f64(dme_act_ao),
+            shell_atom=shell_atom,
+        )
+    else:
+        de_pulay = -2.0 * contract_dS_ip_cart(
+            ao_basis,
+            atom_coords_bohr=coords,
+            M=_asnumpy_f64(dme_act_ao),
+            shell_atom=shell_atom,
+        )
+    total = np.asarray(
+        de_h1 + _asnumpy_f64(de_df) - de_h1_core - _asnumpy_f64(de_df_core) + np.asarray(de_pulay, dtype=np.float64),
+        dtype=np.float64,
+    )
     terms = {
         "dhcore": np.asarray(de_h1, dtype=np.float64),
         "df2e": np.asarray(de_df, dtype=np.float64),
         # Core-only RHF-like subtraction pieces (returned as the *contribution to total*).
         "dhcore_core_sub": np.asarray(-de_h1_core, dtype=np.float64),
         "df2e_core_sub": np.asarray(-de_df_core, dtype=np.float64),
+        "dS_act_pulay": np.asarray(de_pulay, dtype=np.float64),
         # Generalized Fock (MO basis, nmo×nmo) and core energy-weighted density (AO basis)
         # for computing the Pulay (overlap-derivative) term externally.
         "gfock": _asnumpy_f64(gfock),
@@ -1414,14 +1454,32 @@ def _Lorb_dot_dgorb_dx_df(
             ao_basis, atom_coords_bohr=coords, atom_charges=charges,
             M=_asnumpy_f64(D_L), shell_atom=shell_atom,
         )
+    dme0 = 0.5 * (gfock + gfock.T)
+    if _is_sph_l:
+        from asuka.integrals.int1e_sph import contract_dS_ip_sph  # noqa: PLC0415
+
+        de_pulay = -2.0 * contract_dS_ip_sph(
+            ao_basis,
+            atom_coords_bohr=coords,
+            M_sph=_asnumpy_f64(dme0),
+            shell_atom=shell_atom,
+        )
+    else:
+        de_pulay = -2.0 * contract_dS_ip_cart(
+            ao_basis,
+            atom_coords_bohr=coords,
+            M=_asnumpy_f64(dme0),
+            shell_atom=shell_atom,
+        )
     # de_df already on CPU (contract() returns numpy).
-    total = np.asarray(de_h1 + _asnumpy_f64(de_df), dtype=np.float64)
+    total = np.asarray(de_h1 + _asnumpy_f64(de_df) + np.asarray(de_pulay, dtype=np.float64), dtype=np.float64)
     if not bool(return_terms):
         _restore_pool()
         return total
     terms = {
         "dhcore": np.asarray(de_h1, dtype=np.float64),
         "df2e": _asnumpy_f64(de_df),
+        "dS_pulay": np.asarray(de_pulay, dtype=np.float64),
         # Generalized Fock in AO-like basis (nao×nao, with S^{-1} left-multiplied + 2e terms)
         # for computing the Pulay (overlap-derivative) term externally.
         "gfock": _asnumpy_f64(gfock),
