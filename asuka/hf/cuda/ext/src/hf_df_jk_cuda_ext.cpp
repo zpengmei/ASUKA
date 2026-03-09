@@ -13,6 +13,7 @@
 namespace py = pybind11;
 
 extern "C" void hf_df_jk_fill_lower_from_upper_f64(double* a, int n, cudaStream_t stream);
+extern "C" void hf_df_jk_symmetrize_inplace_f64(double* a, int n, cudaStream_t stream);
 extern "C" void hf_df_jk_pack_bmnq_to_bq_f64(
     const double* b_mnq, int nao, int naux, int q0, int q, double* out_bq, cudaStream_t stream);
 extern "C" void hf_df_jk_unpack_qp_to_bq_f64(
@@ -1014,4 +1015,34 @@ PYBIND11_MODULE(_hf_df_jk_cuda_ext, m) {
       py::arg("stream") = 0,
       py::arg("math_mode") = -1,
       py::arg("sync") = false);
+
+  m.def(
+      "symmetrize_inplace_f64",
+      [](const py::object& a, uint64_t stream_ptr, bool sync) {
+        const CudaArrayView a_v = cuda_array_view_from_object(a, "a");
+        require_typestr_f64(a_v, "a");
+        if (a_v.read_only) {
+          throw std::invalid_argument("a must be a writable CUDA array");
+        }
+        if (a_v.shape.size() != 2 || a_v.shape[0] != a_v.shape[1]) {
+          throw std::invalid_argument("a must have shape (n, n)");
+        }
+        constexpr int64_t itemsize = (int64_t)sizeof(double);
+        require_c_contiguous(a_v, "a", itemsize);
+
+        const int64_t n = a_v.shape[0];
+        if (n > (int64_t)std::numeric_limits<int>::max()) {
+          throw std::invalid_argument("n exceeds int32 limits");
+        }
+        auto* a_ptr = reinterpret_cast<double*>(a_v.ptr);
+        validate_cuda_device_pointer(a_ptr, "a");
+
+        cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
+        hf_df_jk_symmetrize_inplace_f64(a_ptr, (int)n, stream);
+        if (sync) throw_on_cuda_error(cudaStreamSynchronize(stream), "cudaStreamSynchronize");
+      },
+      py::arg("a"),
+      py::arg("stream") = 0,
+      py::arg("sync") = false,
+      "Symmetrize a square float64 matrix in-place: A=(A+A^T)/2.");
 }

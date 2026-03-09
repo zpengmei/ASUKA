@@ -27,6 +27,20 @@ __global__ void fill_lower_from_upper_f64_kernel(double* __restrict__ a, int n) 
       a[static_cast<int64_t>(j) * static_cast<int64_t>(n) + static_cast<int64_t>(i)];
 }
 
+__global__ void symmetrize_inplace_f64_kernel(double* __restrict__ a, int n) {
+  const int j = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
+  const int i = static_cast<int>(blockIdx.y * blockDim.y + threadIdx.y);
+  if (i >= n || j >= n) return;
+  if (i <= j) return;
+  const int64_t idx0 = static_cast<int64_t>(i) * static_cast<int64_t>(n) + static_cast<int64_t>(j);
+  const int64_t idx1 = static_cast<int64_t>(j) * static_cast<int64_t>(n) + static_cast<int64_t>(i);
+  const double v0 = a[idx0];
+  const double v1 = a[idx1];
+  const double v = 0.5 * (v0 + v1);
+  a[idx0] = v;
+  a[idx1] = v;
+}
+
 constexpr int kTileDim = 32;
 constexpr int kBlockRows = 8;
 
@@ -209,6 +223,16 @@ extern "C" void hf_df_jk_fill_lower_from_upper_f64(double* a, int n, cudaStream_
                   1);
   fill_lower_from_upper_f64_kernel<<<grid, block, 0, stream>>>(a, n);
   throw_on_cuda_error(cudaGetLastError(), "fill_lower_from_upper_f64_kernel launch");
+}
+
+extern "C" void hf_df_jk_symmetrize_inplace_f64(double* a, int n, cudaStream_t stream) {
+  if (!a || n <= 0) return;
+  const dim3 block(16, 16, 1);
+  const dim3 grid((static_cast<uint32_t>(n) + block.x - 1) / block.x,
+                  (static_cast<uint32_t>(n) + block.y - 1) / block.y,
+                  1);
+  symmetrize_inplace_f64_kernel<<<grid, block, 0, stream>>>(a, n);
+  throw_on_cuda_error(cudaGetLastError(), "symmetrize_inplace_f64_kernel launch");
 }
 
 extern "C" void hf_df_jk_pack_bmnq_to_bq_f64(

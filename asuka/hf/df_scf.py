@@ -373,6 +373,41 @@ def _symmetrize(xp, A):
     return 0.5 * (A + A.T)
 
 
+def _symmetrize_inplace(xp, A):
+    """Best-effort in-place symmetrization.
+
+    - NumPy fallback returns a new array via `_symmetrize`.
+    - On CUDA, if the HF DF-JK CUDA extension is available and `A` is a
+      contiguous float64 CuPy array, symmetrize in-place via a small kernel.
+    """
+
+    if xp is np:
+        return _symmetrize(xp, A)
+
+    try:
+        import cupy as cp  # noqa: PLC0415
+    except Exception:
+        return _symmetrize(xp, A)
+    if not isinstance(A, cp.ndarray):  # type: ignore[attr-defined]
+        return _symmetrize(xp, A)
+
+    try:
+        ext = df_jk._load_hf_df_jk_cuda_ext()  # noqa: SLF001
+    except Exception:
+        ext = None
+    if ext is None or not hasattr(ext, "symmetrize_inplace_f64"):
+        return _symmetrize(xp, A)
+
+    try:
+        if hasattr(A, "flags") and not bool(A.flags.c_contiguous):
+            A = cp.ascontiguousarray(A)
+        stream_ptr = int(cp.cuda.get_current_stream().ptr)
+        ext.symmetrize_inplace_f64(A, stream=int(stream_ptr), sync=False)
+        return A
+    except Exception:
+        return _symmetrize(xp, A)
+
+
 def _orthogonalizer_from_S(S, *, eps: float = 1e-12):
     """Return X such that X.T @ S @ X = I (symmetric orthogonalization)."""
 
@@ -1060,9 +1095,9 @@ def rhf_df(
                     J = df_jk.df_J_from_B2_D(B2, D_prev)
                 else:
                     J = df_jk.df_J_from_BQ_D(BQ, D_prev)
-                J = _symmetrize(xp, J)
+                J = _symmetrize_inplace(xp, J)
 
-                C_occ = xp.ascontiguousarray(C[:, :nocc])
+                C_occ = C[:, :nocc]
                 occ_vals = occ[:nocc]
                 if B_mnQ is not None:
                     K = df_jk.df_K_from_BmnQ_Cocc(
@@ -1080,16 +1115,14 @@ def rhf_df(
                         q_block=int(k_q_block),
                         cublas_math_mode=cublas_math_mode,
                     )
-                K = _symmetrize(xp, K)
                 K_prev = K
             else:
                 if B_mnQ is not None:
                     J, K = _df_JK(B_mnQ, D_prev, want_J=True, want_K=True, B2=B2, BQ=BQ, profile=None)
                 else:
                     J = df_jk.df_J_from_BQ_D(BQ, D_prev)
-                    J = _symmetrize(xp, J)
+                    J = _symmetrize_inplace(xp, J)
                     K = df_jk.df_K_from_BQ_D(BQ, D_prev, profile=None)
-                    K = _symmetrize(xp, K)
                 if use_k_cocc:
                     K_prev = K
 
@@ -1101,7 +1134,7 @@ def rhf_df(
                                          xc_grid_weights, batch_size=int(xc_batch_size),
                                          sph_transform=xc_sph_transform)
                 F = F + _Vxc
-            F = _symmetrize(xp, F)
+            F = _symmetrize_inplace(xp, F)
 
             if level_shift:
                 shift = float(level_shift)
@@ -1157,13 +1190,13 @@ def rhf_df(
                 J = df_jk.df_J_from_B2_D(B2, D)
             else:
                 J = df_jk.df_J_from_BQ_D(BQ, D)
-            J = _symmetrize(xp, J)
+            J = _symmetrize_inplace(xp, J)
             if profile is not None and tJ is not None:
                 jk_prof = profile.setdefault("jk", {})
                 jk_prof["j_ms"] = float(jk_prof.get("j_ms", 0.0)) + _time_ms_end(xp, tJ)
 
             tK = _time_ms_start(xp) if profile is not None else None
-            C_occ = xp.ascontiguousarray(C[:, :nocc])
+            C_occ = C[:, :nocc]
             occ_vals = occ[:nocc]
             if B_mnQ is not None:
                 K_pure = df_jk.df_K_from_BmnQ_Cocc(
@@ -1187,7 +1220,6 @@ def rhf_df(
                 K = (1.0 - lam) * K_pure + lam * K_prev
             else:
                 K = K_pure
-            K = _symmetrize(xp, K)
 
             if profile is not None and tK is not None:
                 jk_prof = profile.setdefault("jk", {})
@@ -1206,19 +1238,22 @@ def rhf_df(
 
                 tJ = _time_ms_start(xp) if profile is not None else None
                 J = df_jk.df_J_from_BQ_D(BQ, D)
-                J = _symmetrize(xp, J)
+                J = _symmetrize_inplace(xp, J)
                 if profile is not None and tJ is not None:
                     jk_prof = profile.setdefault("jk", {})
                     jk_prof["j_ms"] = float(jk_prof.get("j_ms", 0.0)) + _time_ms_end(xp, tJ)
 
                 tK = _time_ms_start(xp) if profile is not None else None
                 K = df_jk.df_K_from_BQ_D(BQ, D, profile=profile)
-                K = _symmetrize(xp, K)
                 if profile is not None and tK is not None:
                     jk_prof = profile.setdefault("jk", {})
                     jk_prof["k_ms"] = float(jk_prof.get("k_ms", 0.0)) + _time_ms_end(xp, tK)
             if use_k_cocc:
-                K_prev = K
+                # Special-case: on GPU we usually use occupied-driven K, but if
+                # the caller provided dm0 we fall back to D-driven K on the
+                # first cycle. Keep K_prev symmetric so optional damping stays
+                # symmetric without extra symmetrization in the hot path.
+                K_prev = _symmetrize(xp, K) if (B_mnQ is not None) else K
         if profile is not None:
             profile["scf"]["jk_ms"] += _time_ms_end(xp, t)
         F = h + J - _cx_main * K
@@ -1228,7 +1263,7 @@ def rhf_df(
                                        xc_grid_weights, batch_size=int(xc_batch_size),
                                        sph_transform=xc_sph_transform)
             F = F + _Vxc
-        F = _symmetrize(xp, F)
+        F = _symmetrize_inplace(xp, F)
 
         if level_shift:
             shift = float(level_shift)
@@ -1242,7 +1277,7 @@ def rhf_df(
             e = _fock_error_rhf(F, D, S)
             diis_obj.push(F, e)
             F = diis_obj.extrapolate()
-            F = _symmetrize(xp, F)
+            F = _symmetrize_inplace(xp, F)
             if profile is not None:
                 profile["scf"]["diis_ms"] += _time_ms_end(xp, t)
 
@@ -1540,14 +1575,14 @@ def uhf_df(
                 J = df_jk.df_J_from_B2_D(B2, Dtot)
             else:
                 J = df_jk.df_J_from_BQ_D(BQ, Dtot)
-            J = _symmetrize(xp, J)
+            J = _symmetrize_inplace(xp, J)
             if profile is not None and tJ is not None:
                 jk_prof = profile.setdefault("jk", {})
                 jk_prof["j_ms"] = float(jk_prof.get("j_ms", 0.0)) + _time_ms_end(xp, tJ)
 
             tK = _time_ms_start(xp) if profile is not None else None
-            Ca_occ = xp.ascontiguousarray(Ca[:, : int(nalpha)])
-            Cb_occ = xp.ascontiguousarray(Cb[:, : int(nbeta)])
+            Ca_occ = Ca[:, : int(nalpha)]
+            Cb_occ = Cb[:, : int(nbeta)]
             occ_a_vals = occ_a[: int(nalpha)]
             occ_b_vals = occ_b[: int(nbeta)]
             if B_mnQ is not None:
@@ -1592,8 +1627,6 @@ def uhf_df(
                 Kb = (1.0 - lam) * Kb_pure + lam * Kb_prev
             else:
                 Kb = Kb_pure
-            Ka = _symmetrize(xp, Ka)
-            Kb = _symmetrize(xp, Kb)
 
             if profile is not None and tK is not None:
                 jk_prof = profile.setdefault("jk", {})
@@ -1615,7 +1648,7 @@ def uhf_df(
 
                 tJ = _time_ms_start(xp) if profile is not None else None
                 J = df_jk.df_J_from_BQ_D(BQ, Dtot)
-                J = _symmetrize(xp, J)
+                J = _symmetrize_inplace(xp, J)
                 if profile is not None and tJ is not None:
                     jk_prof = profile.setdefault("jk", {})
                     jk_prof["j_ms"] = float(jk_prof.get("j_ms", 0.0)) + _time_ms_end(xp, tJ)
@@ -1623,14 +1656,19 @@ def uhf_df(
                 tK = _time_ms_start(xp) if profile is not None else None
                 Ka = df_jk.df_K_from_BQ_D(BQ, Da, profile=profile)
                 Kb = df_jk.df_K_from_BQ_D(BQ, Db, profile=profile)
-                Ka = _symmetrize(xp, Ka)
-                Kb = _symmetrize(xp, Kb)
                 if profile is not None and tK is not None:
                     jk_prof = profile.setdefault("jk", {})
                     jk_prof["k_ms"] = float(jk_prof.get("k_ms", 0.0)) + _time_ms_end(xp, tK)
             if use_k_cocc:
-                Ka_prev = Ka
-                Kb_prev = Kb
+                # See RHF: if dm0 is provided, cycle 1 uses D-driven K even on
+                # GPU. Keep the cached K symmetric so damping doesn't need an
+                # extra symmetrize in the hot path.
+                if B_mnQ is not None:
+                    Ka_prev = _symmetrize(xp, Ka)
+                    Kb_prev = _symmetrize(xp, Kb)
+                else:
+                    Ka_prev = Ka
+                    Kb_prev = Kb
         if profile is not None:
             profile["scf"]["jk_ms"] += _time_ms_end(xp, t)
 
@@ -1643,24 +1681,24 @@ def uhf_df(
                 xc_spec, Da, Db, xc_ao_basis, xc_grid_coords, xc_grid_weights,
                 batch_size=int(xc_batch_size), sph_transform=xc_sph_transform,
             )
-            Fa = _symmetrize(xp, h + J - _cx_u * Ka + _Vxc_a)
-            Fb = _symmetrize(xp, h + J - _cx_u * Kb + _Vxc_b)
+            Fa = _symmetrize_inplace(xp, h + J - _cx_u * Ka + _Vxc_a)
+            Fb = _symmetrize_inplace(xp, h + J - _cx_u * Kb + _Vxc_b)
         else:
-            Fa = _symmetrize(xp, h + J - Ka)
-            Fb = _symmetrize(xp, h + J - Kb)
+            Fa = _symmetrize_inplace(xp, h + J - Ka)
+            Fb = _symmetrize_inplace(xp, h + J - Kb)
 
         if diis_a is not None and cycle >= int(diis_start_cycle):
             t = _time_ms_start(xp)
             ea_mat = _fock_error_rhf(Fa, Da, S)
             diis_a.push(Fa, ea_mat)
-            Fa = _symmetrize(xp, diis_a.extrapolate())
+            Fa = _symmetrize_inplace(xp, diis_a.extrapolate())
             if profile is not None:
                 profile["scf"]["diis_ms"] += _time_ms_end(xp, t)
         if diis_b is not None and cycle >= int(diis_start_cycle):
             t = _time_ms_start(xp)
             eb_mat = _fock_error_rhf(Fb, Db, S)
             diis_b.push(Fb, eb_mat)
-            Fb = _symmetrize(xp, diis_b.extrapolate())
+            Fb = _symmetrize_inplace(xp, diis_b.extrapolate())
             if profile is not None:
                 profile["scf"]["diis_ms"] += _time_ms_end(xp, t)
 
@@ -1953,14 +1991,14 @@ def rohf_df(
                 J = df_jk.df_J_from_B2_D(B2, Dtot)
             else:
                 J = df_jk.df_J_from_BQ_D(BQ, Dtot)
-            J = _symmetrize(xp, J)
+            J = _symmetrize_inplace(xp, J)
             if profile is not None and tJ is not None:
                 jk_prof = profile.setdefault("jk", {})
                 jk_prof["j_ms"] = float(jk_prof.get("j_ms", 0.0)) + _time_ms_end(xp, tJ)
 
             tK = _time_ms_start(xp) if profile is not None else None
-            C_occ_a = xp.ascontiguousarray(C[:, : int(nalpha)])
-            C_occ_b = xp.ascontiguousarray(C[:, : int(nbeta)])
+            C_occ_a = C[:, : int(nalpha)]
+            C_occ_b = C[:, : int(nbeta)]
             occ_a_vals = occ_a[: int(nalpha)]
             occ_b_vals = occ_b[: int(nbeta)]
             if B_mnQ is not None:
@@ -2005,8 +2043,6 @@ def rohf_df(
                 Kb = (1.0 - lam) * Kb_pure + lam * Kb_prev
             else:
                 Kb = Kb_pure
-            Ka = _symmetrize(xp, Ka)
-            Kb = _symmetrize(xp, Kb)
 
             if profile is not None and tK is not None:
                 jk_prof = profile.setdefault("jk", {})
@@ -2028,7 +2064,7 @@ def rohf_df(
 
                 tJ = _time_ms_start(xp) if profile is not None else None
                 J = df_jk.df_J_from_BQ_D(BQ, Dtot)
-                J = _symmetrize(xp, J)
+                J = _symmetrize_inplace(xp, J)
                 if profile is not None and tJ is not None:
                     jk_prof = profile.setdefault("jk", {})
                     jk_prof["j_ms"] = float(jk_prof.get("j_ms", 0.0)) + _time_ms_end(xp, tJ)
@@ -2036,26 +2072,28 @@ def rohf_df(
                 tK = _time_ms_start(xp) if profile is not None else None
                 Ka = df_jk.df_K_from_BQ_D(BQ, Da, profile=profile)
                 Kb = df_jk.df_K_from_BQ_D(BQ, Db, profile=profile)
-                Ka = _symmetrize(xp, Ka)
-                Kb = _symmetrize(xp, Kb)
                 if profile is not None and tK is not None:
                     jk_prof = profile.setdefault("jk", {})
                     jk_prof["k_ms"] = float(jk_prof.get("k_ms", 0.0)) + _time_ms_end(xp, tK)
             if use_k_cocc:
-                Ka_prev = Ka
-                Kb_prev = Kb
+                if B_mnQ is not None:
+                    Ka_prev = _symmetrize(xp, Ka)
+                    Kb_prev = _symmetrize(xp, Kb)
+                else:
+                    Ka_prev = Ka
+                    Kb_prev = Kb
         if profile is not None:
             profile["scf"]["jk_ms"] += _time_ms_end(xp, t)
 
-        Fa = _symmetrize(xp, h + J - Ka)
-        Fb = _symmetrize(xp, h + J - Kb)
+        Fa = _symmetrize_inplace(xp, h + J - Ka)
+        Fb = _symmetrize_inplace(xp, h + J - Kb)
         F = _roothaan_fock_rohf(Fa, Fb, Da, Db, S)
 
         if diis_obj is not None and cycle >= int(diis_start_cycle):
             t = _time_ms_start(xp)
             e = _fock_error_rhf(F, Dtot, S)
             diis_obj.push(F, e)
-            F = _symmetrize(xp, diis_obj.extrapolate())
+            F = _symmetrize_inplace(xp, diis_obj.extrapolate())
             if profile is not None:
                 profile["scf"]["diis_ms"] += _time_ms_end(xp, t)
 

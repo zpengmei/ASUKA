@@ -656,10 +656,35 @@ def _build_aux_basis_cart(
     elements = _unique_elements(mol)
     auxbasis_name = ""
 
+    def _autoaux_basis_name_hint() -> str | None:
+        """Return a basis name usable for BSE autoaux.
+
+        `auxbasis='autoaux'` normally requires `basis_in` to be a string name.
+        For workflows that pass an explicit basis dict (e.g., imported from
+        external codes), callers may stash the original basis name into
+        `mol.results['basis_name']` to keep using AutoAux.
+        """
+
+        if isinstance(basis_in, str):
+            base = str(basis_in).strip()
+            return base or None
+        try:
+            hint = mol.results.get("basis_name")
+        except Exception:
+            hint = None
+        if isinstance(hint, str):
+            hint_s = str(hint).strip()
+            return hint_s or None
+        return None
+
     if isinstance(auxbasis, str) and str(auxbasis).strip().lower() in ("auto", "autoaux"):
-        if not isinstance(basis_in, str):
-            raise ValueError("auxbasis='autoaux' requires basis to be a string name")
-        auxbasis_name, aux_shells = load_autoaux_shells(str(basis_in), elements=elements)
+        base = _autoaux_basis_name_hint()
+        if base is None:
+            raise ValueError(
+                "auxbasis='autoaux' requires basis to be a string name "
+                "(or set mol.results['basis_name'] to the corresponding basis name)"
+            )
+        auxbasis_name, aux_shells = load_autoaux_shells(str(base), elements=elements)
     elif isinstance(auxbasis, str):
         auxbasis_name = str(auxbasis)
         try:
@@ -668,13 +693,13 @@ def _build_aux_basis_cart(
             # Basis Set Exchange does not necessarily expose fitted aux bases as
             # standalone names (e.g. "<basis>-jkfit"). Treat common JKFIT-like
             # names as aliases for the BSE autoaux basis.
-            if isinstance(basis_in, str):
-                base = str(auxbasis_name).strip()
-                for suf in ("-jkfit", "-jfit", "-rifit", "-ri", "-mp2fit"):
-                    if base.lower().endswith(suf):
-                        base = base[: -len(suf)]
-                        break
-                base = base or str(basis_in)
+            base = str(auxbasis_name).strip()
+            for suf in ("-jkfit", "-jfit", "-rifit", "-ri", "-mp2fit"):
+                if base.lower().endswith(suf):
+                    base = base[: -len(suf)]
+                    break
+            base = base or (_autoaux_basis_name_hint() or "")
+            if base:
                 auxbasis_name, aux_shells = load_autoaux_shells(str(base), elements=elements)
             else:
                 raise
