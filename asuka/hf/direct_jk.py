@@ -281,8 +281,9 @@ def make_direct_jk_context(
     perm32_dev = cp.ascontiguousarray(cp.asarray(perm32_cpu, dtype=cp.int32))
     jmax_dev = cp.ascontiguousarray(cp.asarray(jmax_cpu, dtype=cp.int64))
 
-    # Build presorted slabs
+    # Build presorted slabs with cumulative GPU budget tracking
     slabs = []
+    gpu_bytes_used = 0
     slab_i0 = 0
     while slab_i0 < n_valid:
         target = cumtasks_cpu[slab_i0] + max_slab_tasks
@@ -290,12 +291,15 @@ def make_direct_jk_context(
         slab_i1 = max(slab_i0 + 1, slab_i1)
         slab_i1 = min(slab_i1, n_valid)
 
+        remaining_gpu = max(0, int(gpu_task_budget_bytes) - gpu_bytes_used)
         slab = _build_sorted_slab(
             perm32_dev, jmax_dev, sp_class_lo_dev,
             slab_i0, slab_i1,
-            gpu_budget_bytes=int(gpu_task_budget_bytes),
+            gpu_budget_bytes=remaining_gpu,
         )
         if slab is not None:
+            if slab.gpu_resident:
+                gpu_bytes_used += slab.ab_sorted.nbytes + slab.cd_sorted.nbytes
             slabs.append(slab)
 
         slab_i0 = slab_i1
@@ -379,9 +383,9 @@ def direct_JK(
     max_tile_bytes = ctx.max_tile_bytes
 
     D_gpu = cp.asarray(D, dtype=cp.float64)
+    if D_gpu.ndim != 2 or D_gpu.shape != (nao, nao):
+        raise ValueError(f"D must be ({nao}, {nao}), got {tuple(D_gpu.shape)}")
     D_flat = cp.ascontiguousarray(D_gpu.ravel())
-    if D_flat.shape[0] != nao * nao:
-        raise ValueError(f"D must have {nao * nao} elements, got {D_flat.shape[0]}")
 
     J_flat = cp.zeros((nao * nao,), dtype=cp.float64) if want_J else None
     K_flat = cp.zeros((nao * nao,), dtype=cp.float64) if want_K else None

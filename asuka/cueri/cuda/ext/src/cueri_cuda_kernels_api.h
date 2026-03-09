@@ -2246,6 +2246,31 @@ extern "C" cudaError_t cueri_contract_jk_tiles_ordered_launch_stream(
     cudaStream_t stream,
     int threads);
 
+// Multi-density direct J/K contraction: evaluate each ERI tile once and contract
+// against two density matrices (Da, Db) simultaneously.  Produces (Ja, Ka, Jb, Kb).
+// All J/K must be pre-zeroed.  K_a/K_b may be NULL to skip exchange.
+extern "C" cudaError_t cueri_contract_jk_tiles_ordered_multi2_launch_stream(
+    const int32_t* task_spAB,
+    const int32_t* task_spCD,
+    int ntasks,
+    const int32_t* sp_A,
+    const int32_t* sp_B,
+    const int32_t* shell_ao_start,
+    int nao,
+    int nA,
+    int nB,
+    int nC,
+    int nD,
+    const double* tile_vals,  // size ntasks * (nA*nB) * (nC*nD)
+    const double* Da_mat,     // size nao*nao, row-major density a
+    const double* Db_mat,     // size nao*nao, row-major density b
+    double* Ja_mat,           // size nao*nao, row-major Coulomb a
+    double* Ka_mat,           // size nao*nao, row-major exchange a (or NULL)
+    double* Jb_mat,           // size nao*nao, row-major Coulomb b
+    double* Kb_mat,           // size nao*nao, row-major exchange b (or NULL)
+    cudaStream_t stream,
+    int threads);
+
 // Cartesian->spherical transform for ERI tiles.
 extern "C" cudaError_t cueri_cart2sph_eri_right_launch_stream(
     const double* tile_cart,  // size ntasks * (nA_cart*nB_cart) * (nC_cart*nD_cart)

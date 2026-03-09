@@ -111,7 +111,7 @@ def rhf_direct(
         for _ in range(int(init_fock_cycles_i)):
             D_prev = D
             t_init = _time_ms_start(xp) if profile is not None else None
-            J, K = direct_JK(jk_ctx, D_prev, want_J=True, want_K=True)
+            J, K = direct_JK(jk_ctx, D_prev, want_J=True, want_K=True, profile=profile)
             F = _symmetrize(xp, h + J - 0.5 * K)
             if level_shift:
                 shift = float(level_shift)
@@ -129,7 +129,7 @@ def rhf_direct(
     cycle = 0
     for cycle in range(1, int(max_cycle) + 1):
         t = _time_ms_start(xp) if profile is not None else None
-        J, K = direct_JK(jk_ctx, D, want_J=True, want_K=True)
+        J, K = direct_JK(jk_ctx, D, want_J=True, want_K=True, profile=profile)
         if profile is not None and t is not None:
             profile["jk"]["calls"] = int(profile["jk"].get("calls", 0)) + 1
             profile["scf"]["jk_ms"] += _time_ms_end(xp, t)
@@ -277,13 +277,12 @@ def uhf_direct(
 
     cycle = 0
     for cycle in range(1, int(max_cycle) + 1):
-        Dtot = Da + Db
         t = _time_ms_start(xp) if profile is not None else None
-        J, _ = direct_JK(jk_ctx, Dtot, want_J=True, want_K=False)
-        _, Ka = direct_JK(jk_ctx, Da, want_J=False, want_K=True)
-        _, Kb = direct_JK(jk_ctx, Db, want_J=False, want_K=True)
+        Ja, Ka = direct_JK(jk_ctx, Da, want_J=True, want_K=True, profile=profile)
+        Jb, Kb = direct_JK(jk_ctx, Db, want_J=True, want_K=True, profile=profile)
+        J = Ja + Jb
         if profile is not None and t is not None:
-            profile["jk"]["calls"] = int(profile["jk"].get("calls", 0)) + 1
+            profile["jk"]["calls"] = int(profile["jk"].get("calls", 0)) + 2
             profile["scf"]["jk_ms"] += _time_ms_end(xp, t)
 
         Fa = _symmetrize(xp, h + J - Ka)
@@ -445,18 +444,18 @@ def rohf_direct(
 
     cycle = 0
     for cycle in range(1, int(max_cycle) + 1):
-        Dtot = Da + Db
         t = _time_ms_start(xp) if profile is not None else None
-        J, _ = direct_JK(jk_ctx, Dtot, want_J=True, want_K=False)
-        _, Ka = direct_JK(jk_ctx, Da, want_J=False, want_K=True)
-        _, Kb = direct_JK(jk_ctx, Db, want_J=False, want_K=True)
+        Ja, Ka = direct_JK(jk_ctx, Da, want_J=True, want_K=True, profile=profile)
+        Jb, Kb = direct_JK(jk_ctx, Db, want_J=True, want_K=True, profile=profile)
+        J = Ja + Jb
         if profile is not None and t is not None:
-            profile["jk"]["calls"] = int(profile["jk"].get("calls", 0)) + 1
+            profile["jk"]["calls"] = int(profile["jk"].get("calls", 0)) + 2
             profile["scf"]["jk_ms"] += _time_ms_end(xp, t)
 
         Fa = _symmetrize(xp, h + J - Ka)
         Fb = _symmetrize(xp, h + J - Kb)
         F = _roothaan_fock_rohf(Fa, Fb, Da, Db, S)
+        Dtot = Da + Db
 
         if diis_obj is not None and cycle >= int(diis_start_cycle):
             t = _time_ms_start(xp) if profile is not None else None
