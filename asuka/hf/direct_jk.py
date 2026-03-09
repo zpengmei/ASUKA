@@ -360,7 +360,10 @@ def direct_JK(
     want_J, want_K
         Which matrices to compute.
     profile
-        Optional dict for timing statistics.
+        Optional dict for timing statistics.  **Note**: profile mode inserts
+        ``event.synchronize()`` after each contraction kernel call, serializing
+        execution.  Reported timings are not representative of production
+        throughput.
 
     Returns
     -------
@@ -389,7 +392,6 @@ def direct_JK(
 
     J_flat = cp.zeros((nao * nao,), dtype=cp.float64) if want_J else None
     K_flat = cp.zeros((nao * nao,), dtype=cp.float64) if want_K else None
-    J_dummy = cp.zeros((nao * nao,), dtype=cp.float64) if J_flat is None else None
 
     stream_ptr = int(cp.cuda.get_current_stream().ptr)
     n_kernel_calls = 0
@@ -473,7 +475,7 @@ def direct_JK(
                     int(nD),
                     tiles.ravel(),
                     D_flat,
-                    J_flat if J_flat is not None else J_dummy,
+                    J_flat,
                     K_flat,
                     int(threads),
                     int(stream_ptr),
@@ -489,8 +491,6 @@ def direct_JK(
 
         if owned:
             del ab_dev, cd_dev
-
-    cp.cuda.get_current_stream().synchronize()
 
     J = None
     K = None
@@ -509,4 +509,184 @@ def direct_JK(
     return J, K
 
 
-__all__ = ["DirectJKContext", "direct_JK", "make_direct_jk_context"]
+def direct_JK_multi(
+    ctx: DirectJKContext,
+    Da,
+    Db,
+    *,
+    want_J: bool = True,
+    want_K: bool = True,
+    profile: dict | None = None,
+):
+    """Build (Ja, Ka, Jb, Kb) evaluating each ERI tile once.
+
+    For UHF/ROHF this is ~2x faster than calling ``direct_JK`` twice because
+    the ERI evaluation (94% of runtime) is shared.
+
+    Parameters
+    ----------
+    profile
+        Optional dict for timing statistics.  **Note**: profile mode inserts
+        ``event.synchronize()`` after each contraction kernel call, serializing
+        execution.  Reported timings are not representative of production
+        throughput.
+
+    Returns
+    -------
+    (Ja, Ka, Jb, Kb) : tuple
+        Coulomb/exchange matrices for each density, each ``(nao, nao)`` or None.
+    """
+
+    if not want_J and not want_K:
+        return None, None, None, None
+
+    import cupy as cp  # noqa: PLC0415
+
+    from asuka.cueri import _cueri_cuda_ext as _ext  # noqa: PLC0415
+    from asuka.cueri.cart import ncart  # noqa: PLC0415
+    from asuka.cueri.eri_dispatch import KernelBatch, resolve_kernel_class_id, run_kernel_batch_spd  # noqa: PLC0415
+    from asuka.cueri.tasks import TaskList, decode_eri_class_id  # noqa: PLC0415
+
+    nao = ctx.nao
+    threads = ctx.threads
+    max_tile_bytes = ctx.max_tile_bytes
+
+    Da_gpu = cp.asarray(Da, dtype=cp.float64)
+    if Da_gpu.ndim != 2 or Da_gpu.shape != (nao, nao):
+        raise ValueError(f"Da must be ({nao}, {nao}), got {tuple(Da_gpu.shape)}")
+    Db_gpu = cp.asarray(Db, dtype=cp.float64)
+    if Db_gpu.ndim != 2 or Db_gpu.shape != (nao, nao):
+        raise ValueError(f"Db must be ({nao}, {nao}), got {tuple(Db_gpu.shape)}")
+
+    Da_flat = cp.ascontiguousarray(Da_gpu.ravel())
+    Db_flat = cp.ascontiguousarray(Db_gpu.ravel())
+
+    nao2 = nao * nao
+    Ja_flat = cp.zeros((nao2,), dtype=cp.float64) if want_J else None
+    Ka_flat = cp.zeros((nao2,), dtype=cp.float64) if want_K else None
+    Jb_flat = cp.zeros((nao2,), dtype=cp.float64) if want_J else None
+    Kb_flat = cp.zeros((nao2,), dtype=cp.float64) if want_K else None
+
+    # Dummies for want_J=False (kernel needs a non-NULL J pointer)
+    Ja_dummy = cp.zeros((nao2,), dtype=cp.float64) if Ja_flat is None else None
+    Jb_dummy = cp.zeros((nao2,), dtype=cp.float64) if Jb_flat is None else None
+
+    stream_ptr = int(cp.cuda.get_current_stream().ptr)
+    n_kernel_calls = 0
+    t0 = time.perf_counter()
+
+    for slab in ctx.slabs:
+        if slab.gpu_resident:
+            ab_dev = slab.ab_sorted
+            cd_dev = slab.cd_sorted
+            owned = False
+        else:
+            ab_dev = cp.ascontiguousarray(cp.asarray(slab.ab_sorted, dtype=cp.int32))
+            cd_dev = cp.ascontiguousarray(cp.asarray(slab.cd_sorted, dtype=cp.int32))
+            owned = True
+
+        for g in range(int(slab.class_ids.shape[0])):
+            orig_cid = int(slab.class_ids[g])
+            j0, j1 = int(slab.offsets[g]), int(slab.offsets[g + 1])
+            if j1 <= j0:
+                continue
+
+            la, lb, lc, ld = decode_eri_class_id(orig_cid)
+            kernel_cid, transpose = resolve_kernel_class_id(orig_cid)
+
+            nA = int(ncart(la))
+            nB = int(ncart(lb))
+            nC = int(ncart(lc))
+            nD = int(ncart(ld))
+            ncomp = nA * nB * nC * nD
+            chunk_ntasks = max(1, max_tile_bytes // max(ncomp * 8, 1))
+            use_warp_mode = ncomp <= 128
+
+            kernel_spAB_full = cd_dev[j0:j1] if transpose else ab_dev[j0:j1]
+            kernel_spCD_full = ab_dev[j0:j1] if transpose else cd_dev[j0:j1]
+
+            class_ntasks = j1 - j0
+            for c0 in range(0, class_ntasks, chunk_ntasks):
+                c1 = min(class_ntasks, c0 + chunk_ntasks)
+                if c1 <= c0:
+                    continue
+
+                sub_batch = KernelBatch(
+                    task_idx=np.empty(0, dtype=np.int32),
+                    kernel_tasks=TaskList(
+                        task_spAB=kernel_spAB_full[c0:c1],
+                        task_spCD=kernel_spCD_full[c0:c1],
+                    ),
+                    kernel_class_id=np.int32(kernel_cid),
+                    transpose=transpose,
+                )
+
+                tiles = run_kernel_batch_spd(
+                    sub_batch,
+                    dbasis=ctx.dbasis,
+                    dsp=ctx.dsp,
+                    pt=ctx.pair_tables,
+                    stream=None,
+                    threads=threads,
+                    mode="warp" if use_warp_mode else "auto",
+                    profile=profile,
+                )
+                n_kernel_calls += 1
+
+                if profile is not None:
+                    _tc0 = cp.cuda.Event()
+                    _tc1 = cp.cuda.Event()
+                    _tc0.record()
+
+                _ext.contract_jk_tiles_ordered_multi2_inplace_device(
+                    ab_dev[j0 + c0: j0 + c1],
+                    cd_dev[j0 + c0: j0 + c1],
+                    ctx.sp_A_dev,
+                    ctx.sp_B_dev,
+                    ctx.shell_ao_start_dev,
+                    int(nao),
+                    int(nA),
+                    int(nB),
+                    int(nC),
+                    int(nD),
+                    tiles.ravel(),
+                    Da_flat,
+                    Db_flat,
+                    Ja_flat if Ja_flat is not None else Ja_dummy,
+                    Ka_flat,
+                    Jb_flat if Jb_flat is not None else Jb_dummy,
+                    Kb_flat,
+                    int(threads),
+                    int(stream_ptr),
+                    False,
+                )
+
+                if profile is not None:
+                    _tc1.record()
+                    _tc1.synchronize()
+                    profile["contract_ms"] = float(profile.get("contract_ms", 0.0)) + float(
+                        cp.cuda.get_elapsed_time(_tc0, _tc1)
+                    )
+
+        if owned:
+            del ab_dev, cd_dev
+
+    Ja = Jb = Ka = Kb = None
+    if Ja_flat is not None:
+        Ja = 0.5 * (Ja_flat.reshape((nao, nao)) + Ja_flat.reshape((nao, nao)).T)
+    if Ka_flat is not None:
+        Ka = 0.5 * (Ka_flat.reshape((nao, nao)) + Ka_flat.reshape((nao, nao)).T)
+    if Jb_flat is not None:
+        Jb = 0.5 * (Jb_flat.reshape((nao, nao)) + Jb_flat.reshape((nao, nao)).T)
+    if Kb_flat is not None:
+        Kb = 0.5 * (Kb_flat.reshape((nao, nao)) + Kb_flat.reshape((nao, nao)).T)
+
+    if profile is not None:
+        profile["direct_jk_t_s"] = float(time.perf_counter() - t0)
+        profile["direct_jk_kernel_calls"] = int(n_kernel_calls)
+        profile["direct_jk_ntasks"] = int(ctx.ntasks)
+
+    return Ja, Ka, Jb, Kb
+
+
+__all__ = ["DirectJKContext", "direct_JK", "direct_JK_multi", "make_direct_jk_context"]

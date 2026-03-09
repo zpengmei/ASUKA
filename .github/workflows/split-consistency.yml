@@ -1,0 +1,30 @@
+name: Split Consistency
+
+on:
+  push:
+    paths:
+      - ".github/workflows/split-consistency.yml"
+      - "asuka/cueri/cuda/ext/CMakeLists.txt"
+      - "asuka/cueri/cuda/ext/src/**"
+      - "asuka/cueri/cuda/tools/check_split_consistency.py"
+      - "asuka/cueri/cuda/tools/split_large_kernels.py"
+      - "asuka/cueri/cuda/tools/split_wave_files.py"
+  pull_request:
+    paths:
+      - ".github/workflows/split-consistency.yml"
+      - "asuka/cueri/cuda/ext/CMakeLists.txt"
+      - "asuka/cueri/cuda/ext/src/**"
+      - "asuka/cueri/cuda/tools/check_split_consistency.py"
+      - "asuka/cueri/cuda/tools/split_large_kernels.py"
+      - "asuka/cueri/cuda/tools/split_wave_files.py"
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Verify split CUDA sources
+        run: python asuka/cueri/cuda/tools/check_split_consistency.py

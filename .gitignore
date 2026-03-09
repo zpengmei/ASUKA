@@ -1,3 +1,17 @@
+# Ignore everything at repo root by default.
+/*
+
+# Keep this file tracked.
+!/.gitignore
+!/.pre-commit-config.yaml
+!/.github/
+!/.github/workflows/
+!/.github/workflows/split-consistency.yml
+
+# Only keep the package source tree.
+!/asuka/
+!/asuka/**
+
 # Python bytecode and caches
 __pycache__/
 *.py[cod]

@@ -203,12 +203,15 @@ def split_file(src: Path, n_parts: int) -> list[Path]:
     # Extern "C" launcher blocks per kernel
     extern_by_kernel = _extern_blocks(lines, ns_end, kernel_names)
 
-    # Balance kernels across parts: greedy bin-packing by line count
+    # Balance kernels across parts: greedy bin-packing by line count.
+    # Keep exactly `n_parts` non-empty groups when possible so the requested
+    # split count stays reproducible even if the last few kernels are tiny.
     n_kernels = len(kernel_names)
     kernel_sizes = [(bounds[i][1] - bounds[i][0]) for i in range(n_kernels)]
     n_parts = min(n_parts, n_kernels)
 
-    # Simple balanced split: divide by target line count
+    # Simple balanced split: divide by target line count, but force a cut when
+    # each remaining group must receive exactly one remaining kernel.
     total_lines = sum(kernel_sizes)
     target = total_lines / n_parts
 
@@ -218,8 +221,14 @@ def split_file(src: Path, n_parts: int) -> list[Path]:
     for i, sz in enumerate(kernel_sizes):
         current_group.append(i)
         current_sum += sz
-        # Start new group when we hit the target, unless it's the last kernel
-        if current_sum >= target * (len(groups) + 1) and len(groups) < n_parts - 1:
+        remaining_items = n_kernels - (i + 1)
+        remaining_groups = n_parts - len(groups) - 1
+        # Start a new group when we hit the target, unless it's the last
+        # group. Also force a cut when we must leave one kernel per remaining
+        # group to avoid silently collapsing the requested split count.
+        if len(groups) < n_parts - 1 and (
+            current_sum >= target * (len(groups) + 1) or remaining_items == remaining_groups
+        ):
             groups.append(current_group)
             current_group = []
     if current_group:

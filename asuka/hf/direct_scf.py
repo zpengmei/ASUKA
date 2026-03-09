@@ -6,7 +6,7 @@ Uses integral-direct J/K contraction (no materialized ERI tensor) via
 :mod:`asuka.hf.direct_jk`.  Memory usage is O(nao^2) instead of O(nao^4).
 """
 
-from .direct_jk import DirectJKContext, direct_JK, make_direct_jk_context
+from .direct_jk import DirectJKContext, direct_JK, direct_JK_multi, make_direct_jk_context
 from .df_scf import (
     SCFResult,
     _DIIS,
@@ -171,7 +171,7 @@ def rhf_direct(
         if damping:
             D_new = (1.0 - lam) * D_new + lam * D
 
-        e_elec = float(0.5 * xp.trace(D_new @ (h + F)).item())
+        e_elec = float(0.5 * xp.sum(D_new * (h + F)).item())
         e_tot = float(e_elec + float(enuc))
         dm_err = float(xp.linalg.norm(D_new - D).item())
         de = float(abs(e_tot - e_last)) if e_last is not None else float("inf")
@@ -278,11 +278,10 @@ def uhf_direct(
     cycle = 0
     for cycle in range(1, int(max_cycle) + 1):
         t = _time_ms_start(xp) if profile is not None else None
-        Ja, Ka = direct_JK(jk_ctx, Da, want_J=True, want_K=True, profile=profile)
-        Jb, Kb = direct_JK(jk_ctx, Db, want_J=True, want_K=True, profile=profile)
+        Ja, Ka, Jb, Kb = direct_JK_multi(jk_ctx, Da, Db, want_J=True, want_K=True, profile=profile)
         J = Ja + Jb
         if profile is not None and t is not None:
-            profile["jk"]["calls"] = int(profile["jk"].get("calls", 0)) + 2
+            profile["jk"]["calls"] = int(profile["jk"].get("calls", 0)) + 1
             profile["scf"]["jk_ms"] += _time_ms_end(xp, t)
 
         Fa = _symmetrize(xp, h + J - Ka)
@@ -340,9 +339,9 @@ def uhf_direct(
             Db_new = (1.0 - lam) * Db_new + lam * Db
 
         Dtot_new = Da_new + Db_new
-        e_one = float(xp.trace(Dtot_new @ h).item())
-        e_coul = float(0.5 * xp.trace(Dtot_new @ J).item())
-        e_ex = float(0.5 * xp.trace(Da_new @ Ka).item() + 0.5 * xp.trace(Db_new @ Kb).item())
+        e_one = float(xp.sum(Dtot_new * h).item())
+        e_coul = float(0.5 * xp.sum(Dtot_new * J).item())
+        e_ex = float(0.5 * xp.sum(Da_new * Ka).item() + 0.5 * xp.sum(Db_new * Kb).item())
         e_elec = e_one + e_coul - e_ex
         e_tot = float(e_elec + float(enuc))
 
@@ -445,11 +444,10 @@ def rohf_direct(
     cycle = 0
     for cycle in range(1, int(max_cycle) + 1):
         t = _time_ms_start(xp) if profile is not None else None
-        Ja, Ka = direct_JK(jk_ctx, Da, want_J=True, want_K=True, profile=profile)
-        Jb, Kb = direct_JK(jk_ctx, Db, want_J=True, want_K=True, profile=profile)
+        Ja, Ka, Jb, Kb = direct_JK_multi(jk_ctx, Da, Db, want_J=True, want_K=True, profile=profile)
         J = Ja + Jb
         if profile is not None and t is not None:
-            profile["jk"]["calls"] = int(profile["jk"].get("calls", 0)) + 2
+            profile["jk"]["calls"] = int(profile["jk"].get("calls", 0)) + 1
             profile["scf"]["jk_ms"] += _time_ms_end(xp, t)
 
         Fa = _symmetrize(xp, h + J - Ka)
@@ -489,9 +487,9 @@ def rohf_direct(
             Db_new = (1.0 - lam) * Db_new + lam * Db
 
         Dtot_new = Da_new + Db_new
-        e_one = float(xp.trace(Dtot_new @ h).item())
-        e_coul = float(0.5 * xp.trace(Dtot_new @ J).item())
-        e_ex = float(0.5 * xp.trace(Da_new @ Ka).item() + 0.5 * xp.trace(Db_new @ Kb).item())
+        e_one = float(xp.sum(Dtot_new * h).item())
+        e_coul = float(0.5 * xp.sum(Dtot_new * J).item())
+        e_ex = float(0.5 * xp.sum(Da_new * Ka).item() + 0.5 * xp.sum(Db_new * Kb).item())
         e_elec = e_one + e_coul - e_ex
         e_tot = float(e_elec + float(enuc))
 

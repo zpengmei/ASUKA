@@ -1,0 +1,9 @@
+repos:
+  - repo: local
+    hooks:
+      - id: cueri-split-consistency
+        name: cuERI split consistency
+        entry: python asuka/cueri/cuda/tools/check_split_consistency.py
+        language: system
+        pass_filenames: false
+        files: ^(asuka/cueri/cuda/ext/CMakeLists\.txt|asuka/cueri/cuda/ext/src/.*|asuka/cueri/cuda/tools/check_split_consistency\.py|asuka/cueri/cuda/tools/split_large_kernels\.py|asuka/cueri/cuda/tools/split_wave_files\.py)$

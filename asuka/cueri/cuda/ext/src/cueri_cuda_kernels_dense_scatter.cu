@@ -148,18 +148,20 @@ __global__ void KernelContractJKTilesOrdered(
     const bool cd_neq = (C_sh != D_sh);
 
     // --- J contributions ---
-    // D symmetric → D[c,d] = D[d,c], combine AB/CD swap pairs
-    const double f_cd = cd_neq ? 2.0 : 1.0;
-    const double f_ab = ab_neq ? 2.0 : 1.0;
+    if (J_mat != nullptr) {
+      // D symmetric → D[c,d] = D[d,c], combine AB/CD swap pairs
+      const double f_cd = cd_neq ? 2.0 : 1.0;
+      const double f_ab = ab_neq ? 2.0 : 1.0;
 
-    const double vJ_ab = f_cd * v * D_cd;
-    atomicAdd(&J_mat[a * N + b], vJ_ab);
-    if (ab_neq) atomicAdd(&J_mat[b * N + a], vJ_ab);
+      const double vJ_ab = f_cd * v * D_cd;
+      atomicAdd(&J_mat[a * N + b], vJ_ab);
+      if (ab_neq) atomicAdd(&J_mat[b * N + a], vJ_ab);
 
-    if (spab != spcd) {
-      const double vJ_cd = f_ab * v * D_ab;
-      atomicAdd(&J_mat[c * N + d], vJ_cd);
-      if (cd_neq) atomicAdd(&J_mat[d * N + c], vJ_cd);
+      if (spab != spcd) {
+        const double vJ_cd = f_ab * v * D_ab;
+        atomicAdd(&J_mat[c * N + d], vJ_cd);
+        if (cd_neq) atomicAdd(&J_mat[d * N + c], vJ_cd);
+      }
     }
 
     // --- K contributions ---

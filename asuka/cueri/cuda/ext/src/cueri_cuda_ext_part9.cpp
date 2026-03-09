@@ -632,7 +632,6 @@ void cueri_bind_part9(py::module_& m) {
         auto sh0 = cuda_array_view_from_object(shell_ao_start, "shell_ao_start");
         auto tile = cuda_array_view_from_object(tile_vals, "tile_vals");
         auto d_arr = cuda_array_view_from_object(D_mat, "D_mat");
-        auto j_arr = cuda_array_view_from_object(J_mat, "J_mat");
 
         require_typestr(ab, "task_spAB", "<i4");
         require_typestr(cd, "task_spCD", "<i4");
@@ -641,7 +640,6 @@ void cueri_bind_part9(py::module_& m) {
         require_typestr(sh0, "shell_ao_start", "<i4");
         require_typestr(tile, "tile_vals", "<f8");
         require_typestr(d_arr, "D_mat", "<f8");
-        require_typestr(j_arr, "J_mat", "<f8");
 
         const int64_t ntasks = require_1d(ab, "task_spAB");
         if (require_1d(cd, "task_spCD") != ntasks) {
@@ -665,8 +663,16 @@ void cueri_bind_part9(py::module_& m) {
         if (require_1d(d_arr, "D_mat") != nao2) {
           throw std::invalid_argument("D_mat must have shape (nao*nao,)");
         }
-        if (require_1d(j_arr, "J_mat") != nao2) {
-          throw std::invalid_argument("J_mat must have shape (nao*nao,)");
+
+        // J_mat is optional (pass None → nullptr to skip Coulomb)
+        double* j_ptr = nullptr;
+        if (!J_mat.is_none()) {
+          auto j_arr = cuda_array_view_from_object(J_mat, "J_mat");
+          require_typestr(j_arr, "J_mat", "<f8");
+          if (require_1d(j_arr, "J_mat") != nao2) {
+            throw std::invalid_argument("J_mat must have shape (nao*nao,)");
+          }
+          j_ptr = static_cast<double*>(j_arr.ptr);
         }
 
         // K_mat is optional (pass None → nullptr to skip exchange)
@@ -696,7 +702,7 @@ void cueri_bind_part9(py::module_& m) {
                 static_cast<int>(nD),
                 static_cast<const double*>(tile.ptr),
                 static_cast<const double*>(d_arr.ptr),
-                static_cast<double*>(j_arr.ptr),
+                j_ptr,
                 k_ptr,
                 stream,
                 threads),
