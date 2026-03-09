@@ -1461,7 +1461,7 @@ def sacasscf_nonadiabatic_couplings_df(
         SA-CASSCF result providing at least: ``mo_coeff``, ``ci`` (list),
         ``ncore``, ``ncas``, ``nelecas``, and energies (``e_states`` or ``e_roots``).
     pairs
-        Optional list of (ket, bra) root pairs. If None, compute all off-diagonal pairs.
+        Optional list of (bra, ket) root pairs. If None, compute all off-diagonal pairs.
     atmlst
         Atom indices to compute. If None, compute all atoms.
     use_etfs
@@ -1717,18 +1717,18 @@ def sacasscf_nonadiabatic_couplings_df(
     nac = np.zeros((nroots, nroots, len(atmlst_use), 3), dtype=np.float64)
 
     def _unpack_state(state: tuple[int, int]) -> tuple[int, int]:
-        ket, bra = state
-        ket = int(ket)
+        bra, ket = state
         bra = int(bra)
+        ket = int(ket)
         if ket < 0 or bra < 0 or ket >= nroots or bra >= nroots:
             raise ValueError("state indices out of range")
-        return ket, bra
+        return bra, ket
 
     pair_list: list[tuple[int, int]]
     if pairs is None:
-        pair_list = [(ket, bra) for ket in range(nroots) for bra in range(nroots) if ket != bra]
+        pair_list = [(bra, ket) for bra in range(nroots) for ket in range(nroots) if ket != bra]
     else:
-        pair_list = [(int(ket), int(bra)) for (ket, bra) in pairs if int(ket) != int(bra)]
+        pair_list = [(int(bra), int(ket)) for (bra, ket) in pairs if int(ket) != int(bra)]
 
     # Cache AO mappings used by the CSF term.
     shell_atom_ref = shell_to_atom_map(ao_basis_ref, atom_coords_bohr=coords)
@@ -1744,8 +1744,8 @@ def sacasscf_nonadiabatic_couplings_df(
             nelecas=nelecas,
         )
 
-    for ket, bra in pair_list:
-        ket, bra = _unpack_state((ket, bra))
+    for bra, ket in pair_list:
+        bra, ket = _unpack_state((bra, ket))
         if ket == bra:
             continue
 

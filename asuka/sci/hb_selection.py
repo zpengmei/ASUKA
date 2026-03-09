@@ -235,7 +235,7 @@ def _heat_bath_select_python(
         cipsi_score_and_select_topk_inplace_device,
     )
     from asuka.cuguga.state_cache import get_state_cache  # noqa: PLC0415
-    from asuka.sci.hb_integrals import build_g_base  # noqa: PLC0415
+    from asuka.sci.hb_integrals import build_g_base_gpu, upload_hb_index as _hb_upload  # noqa: PLC0415
 
     norb = hb_index.norb
     nops = norb * norb
@@ -248,10 +248,8 @@ def _heat_bath_select_python(
     # --- Step 1: Occupancy batch (nsel, norb) from state_cache steps ---
     state_cache = get_state_cache(drt)
     steps = np.asarray(state_cache.steps, dtype=np.int8)  # (ncsf, norb) step values
-    _STEP_TO_OCC = np.array([0, 1, 1, 2], dtype=np.float64)
 
     sel_idx_i32 = np.asarray(sel_idx, dtype=np.int32)
-    occ_batch = _STEP_TO_OCC[steps[sel_idx_i32].astype(np.int32)]  # (nsel, norb)
 
     # --- Step 2: max|c_j| and global cutoff ---
     max_cj = np.max(np.abs(c_sel), axis=1)  # (nsel,)
@@ -263,16 +261,32 @@ def _heat_bath_select_python(
     # needed by any source CSF; some may get extra small terms, which is correct).
     global_cutoff = float(epsilon) / float(max_cj[pos_mask].max())
 
-    # --- Step 3: Build g_batch (nsel, nops) ---
-    # Pre-allocate to avoid the broadcast-copy allocation in g_base + g_diag.
-    g_batch = np.empty((nsel, nops), dtype=np.float64)
-    np.dot(occ_batch, hb_index.eri_diag_t, out=g_batch)   # (nsel, nops) via BLAS GEMM
-    g_batch *= 0.5
-    g_batch += build_g_base(hb_index, global_cutoff)       # in-place broadcast add
+    # --- Step 3: Build g_batch_d (nsel, nops) entirely on GPU ---
+    # Eliminates CPU GEMM (~120ms), CPU build_g_base (~20ms), and PCIe transfer (~46ms).
+    # hb_dev is cached in frontier_buffers so upload happens only on the first iteration.
+    hb_dev = frontier_buffers.get("hb_dev")
+    if hb_dev is None:
+        hb_dev = _hb_upload(hb_index, cp)
+        frontier_buffers["hb_dev"] = hb_dev
 
-    # Zero out rows for CSFs with max_cj == 0 (no contribution possible)
+    # Upload steps for selected CSFs (nsel × norb int8 ≈ 2 MB for nsel=50K, norb=40).
+    _STEP_TO_OCC_D = cp.array([0.0, 1.0, 1.0, 2.0], dtype=cp.float64)
+    sel_steps_d = cp.asarray(steps[sel_idx_i32], dtype=cp.int8)   # (nsel, norb)
+    occ_batch_d = _STEP_TO_OCC_D[sel_steps_d.astype(cp.int32)]    # (nsel, norb)
+
+    # Pre-allocate g_batch_d once; grow only when nsel × norb^2 increases.
+    if frontier_buffers.get("g_batch_cap", 0) < nsel * nops:
+        frontier_buffers["g_batch_d"] = cp.empty((nsel, nops), dtype=cp.float64)
+        frontier_buffers["g_batch_cap"] = nsel * nops
+    g_batch_d = frontier_buffers["g_batch_d"][:nsel]
+
+    cp.dot(occ_batch_d, hb_dev["eri_diag_t"], out=g_batch_d)          # cuBLAS GEMM
+    g_batch_d *= 0.5
+    g_batch_d += build_g_base_gpu(hb_dev, global_cutoff, norb, cp)    # broadcast add
+
+    # Zero out rows for CSFs with max_cj == 0 (no contribution possible).
     if not pos_mask.all():
-        g_batch[~pos_mask] = 0.0
+        g_batch_d[cp.asarray(~pos_mask)] = 0.0
 
     # --- Step 4: GPU setup and hash table ---
     c_sel_d = cp.ascontiguousarray(cp.asarray(c_sel, dtype=cp.float64))
@@ -293,9 +307,6 @@ def _heat_bath_select_python(
     frontier_hash_max_retries = int(frontier_buffers.get("max_retries", 8))
     selected_mask_d = frontier_buffers.get("selected_mask_d")
     hdiag_d = frontier_buffers.get("hdiag_d")
-
-    # Upload g_batch to GPU once (shared across all roots)
-    g_batch_d = cp.asarray(g_batch, dtype=cp.float64)  # (nsel, nops) — one PCIe transfer
 
     for attempt in range(frontier_hash_max_retries):
         if int(frontier_buffers.get("hash_cap", 0)) != cap or frontier_buffers.get("hash_keys") is None:

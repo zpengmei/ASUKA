@@ -14,7 +14,6 @@ from .df_scf import (
     _density_from_C_occ,
     _fock_error_rhf,
     _gen_eigh_with_X,
-    _get_xp,
     _occ_rhf,
     _occ_uhf,
     _orthogonalizer_from_S,
@@ -54,7 +53,9 @@ def rhf_direct(
 ):
     """RHF SCF with integral-direct J/K evaluation."""
 
-    xp, _is_gpu = _get_xp(S, hcore)
+    import cupy as cp  # noqa: PLC0415
+
+    xp = cp  # Direct J/K always uses CUDA
     S = _as_xp(xp, S, dtype=xp.float64)
     h = _as_xp(xp, hcore, dtype=xp.float64)
     nao = int(S.shape[0])
@@ -221,7 +222,9 @@ def uhf_direct(
 ):
     """UHF SCF with integral-direct J/K evaluation."""
 
-    xp, _is_gpu = _get_xp(S, hcore)
+    import cupy as cp  # noqa: PLC0415
+
+    xp = cp
     S = _as_xp(xp, S, dtype=xp.float64)
     h = _as_xp(xp, hcore, dtype=xp.float64)
     nao = int(S.shape[0])
@@ -393,7 +396,9 @@ def rohf_direct(
 ):
     """ROHF SCF with integral-direct J/K evaluation."""
 
-    xp, _is_gpu = _get_xp(S, hcore)
+    import cupy as cp  # noqa: PLC0415
+
+    xp = cp
     S = _as_xp(xp, S, dtype=xp.float64)
     h = _as_xp(xp, hcore, dtype=xp.float64)
     nao = int(S.shape[0])

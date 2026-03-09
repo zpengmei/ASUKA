@@ -45,10 +45,19 @@ __device__ __forceinline__ void guga_frontier_hash_insert_add_f64(
   uint32_t slot = h & mask;
 
   for (int probe = 0; probe < MAX_PROBES_T; probe++) {
-    int32_t prev = atomicCAS(&keys[slot], (int32_t)-1, idx);
-    if (prev == (int32_t)-1 || prev == idx) {
+    // Fast-path: avoid atomics when the slot is occupied by a different key.
+    // AtomicCAS on every probe is extremely costly at high occupancy.
+    int32_t cur = keys[slot];
+    if (cur == idx) {
       atomicAdd(&vals_root_major[(int64_t)root * (int64_t)cap + (int64_t)slot], v);
       return;
+    }
+    if (cur == (int32_t)-1) {
+      int32_t prev = atomicCAS(&keys[slot], (int32_t)-1, idx);
+      if (prev == (int32_t)-1 || prev == idx) {
+        atomicAdd(&vals_root_major[(int64_t)root * (int64_t)cap + (int64_t)slot], v);
+        return;
+      }
     }
     slot = (slot + 1) & mask;
   }
@@ -56,4 +65,3 @@ __device__ __forceinline__ void guga_frontier_hash_insert_add_f64(
 }
 
 }  // namespace
-

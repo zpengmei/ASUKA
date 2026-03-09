@@ -6,6 +6,10 @@ Builds Coulomb (J) and exchange (K) matrices by evaluating 4-center integrals
 on-the-fly and contracting with the density matrix, without materializing the
 full ERI tensor.  Memory is O(nao^2) instead of O(nao^4).
 
+Uses specialized CUDA kernels (ssss, psss, pppp, dsds, ...) via the
+``eri_dispatch`` infrastructure for optimal throughput, with automatic
+bra/ket swap and fallback to generic Rys for unsupported angular momenta.
+
 Usage::
 
     ctx = make_direct_jk_context(ao_basis, eps_schwarz=1e-12)
@@ -13,10 +17,25 @@ Usage::
 """
 
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 import numpy as np
+
+
+@dataclass(frozen=True)
+class _BatchInfo:
+    """Pre-computed data for one kernel batch (one specialized kernel dispatch)."""
+
+    batch: Any  # KernelBatch from eri_dispatch
+    # Device-resident original (un-swapped) task indices for J/K contraction
+    orig_spAB_dev: Any  # cp.ndarray int32 (batch_ntasks,)
+    orig_spCD_dev: Any  # cp.ndarray int32 (batch_ntasks,)
+    # Original angular momenta (before any bra/ket swap)
+    orig_la: int
+    orig_lb: int
+    orig_lc: int
+    orig_ld: int
 
 
 @dataclass(frozen=True)
@@ -25,11 +44,8 @@ class DirectJKContext:
 
     ao_basis: Any
     nao: int
-    # Pre-grouped tasks (permuted into class order)
-    task_ab_dev: Any  # cp.ndarray int32 (ntasks_total,)
-    task_cd_dev: Any  # cp.ndarray int32 (ntasks_total,)
-    class_ids: np.ndarray  # (nclass,) int32
-    offsets: np.ndarray  # (nclass+1,) int32
+    # Kernel batch dispatch plan (specialized kernels with bra/ket swap)
+    batch_infos: tuple  # tuple[_BatchInfo, ...]
     # Device-resident basis data
     dbasis: Any  # DeviceBasisSS
     dsp: Any  # DeviceShellPairs
@@ -37,6 +53,8 @@ class DirectJKContext:
     sp_A_dev: Any  # cp.ndarray int32 (nsp,)
     sp_B_dev: Any  # cp.ndarray int32 (nsp,)
     shell_ao_start_dev: Any  # cp.ndarray int32 (nshell,)
+    # Backward compat / diagnostics
+    class_ids: np.ndarray  # (nclass,) int32
     # Config
     ntasks: int
     threads: int
@@ -67,6 +85,7 @@ def make_direct_jk_context(
 
     import cupy as cp  # noqa: PLC0415
 
+    from asuka.cueri.eri_dispatch import plan_kernel_batches_spd  # noqa: PLC0415
     from asuka.cueri.gpu import (  # noqa: PLC0415
         CUDA_MAX_L,
         CUDA_MAX_NROOTS,
@@ -79,6 +98,7 @@ def make_direct_jk_context(
     from asuka.cueri.tasks import (  # noqa: PLC0415
         build_tasks_screened,
         build_tasks_screened_sorted_q,
+        decode_eri_class_id,
         group_tasks_by_class,
         with_task_class_id,
     )
@@ -125,12 +145,32 @@ def make_direct_jk_context(
 
     tasks = with_task_class_id(tasks, sp, shell_l)
     assert tasks.task_class_id is not None
-    perm, class_ids, offsets = group_tasks_by_class(tasks.task_class_id)
-    task_ab = tasks.task_spAB[perm]
-    task_cd = tasks.task_spCD[perm]
 
-    task_ab_dev = cp.ascontiguousarray(cp.asarray(task_ab, dtype=cp.int32))
-    task_cd_dev = cp.ascontiguousarray(cp.asarray(task_cd, dtype=cp.int32))
+    # Collect unique class IDs for diagnostics
+    _, class_ids, _ = group_tasks_by_class(tasks.task_class_id)
+
+    # Plan specialized kernel batches (handles bra/ket swap automatically)
+    batches = plan_kernel_batches_spd(tasks, shell_pairs=sp, shell_l=shell_l)
+
+    # Pre-compute device-resident data for each batch
+    batch_infos = []
+    for b in batches:
+        idx = b.task_idx
+        # Recover original (un-swapped) class from the task list
+        orig_cid = int(tasks.task_class_id[int(idx[0])])
+        la, lb, lc, ld = decode_eri_class_id(orig_cid)
+        # Original task indices (before any bra/ket swap for kernel dispatch)
+        orig_spAB = tasks.task_spAB[idx]
+        orig_spCD = tasks.task_spCD[idx]
+        batch_infos.append(_BatchInfo(
+            batch=b,
+            orig_spAB_dev=cp.ascontiguousarray(cp.asarray(orig_spAB, dtype=cp.int32)),
+            orig_spCD_dev=cp.ascontiguousarray(cp.asarray(orig_spCD, dtype=cp.int32)),
+            orig_la=int(la),
+            orig_lb=int(lb),
+            orig_lc=int(lc),
+            orig_ld=int(ld),
+        ))
 
     dbasis = to_device_basis_ss(ao_basis)
     dsp = to_device_shell_pairs(sp)
@@ -144,16 +184,14 @@ def make_direct_jk_context(
     return DirectJKContext(
         ao_basis=ao_basis,
         nao=int(nao),
-        task_ab_dev=task_ab_dev,
-        task_cd_dev=task_cd_dev,
-        class_ids=class_ids,
-        offsets=offsets,
+        batch_infos=tuple(batch_infos),
         dbasis=dbasis,
         dsp=dsp,
         pair_tables=pair_tables,
         sp_A_dev=sp_A_dev,
         sp_B_dev=sp_B_dev,
         shell_ao_start_dev=shell_ao_start_dev,
+        class_ids=class_ids,
         ntasks=int(tasks.ntasks),
         threads=int(threads),
         max_tile_bytes=int(max_tile_bytes),
@@ -169,6 +207,10 @@ def direct_JK(
     profile: dict | None = None,
 ):
     """Build J and K via integral-direct 4-center evaluation.
+
+    Uses specialized CUDA kernels (ssss, psss, pppp, dsds, ...) dispatched
+    via ``eri_dispatch`` for each shell class, with automatic bra/ket swap
+    and fallback to generic Rys for unsupported angular momenta.
 
     Parameters
     ----------
@@ -194,14 +236,15 @@ def direct_JK(
 
     from asuka.cueri import _cueri_cuda_ext as _ext  # noqa: PLC0415
     from asuka.cueri.cart import ncart  # noqa: PLC0415
-    from asuka.cueri.gpu import eri_rys_generic_device  # noqa: PLC0415
-    from asuka.cueri.tasks import TaskList, decode_eri_class_id  # noqa: PLC0415
+    from asuka.cueri.eri_dispatch import KernelBatch, run_kernel_batch_spd  # noqa: PLC0415
+    from asuka.cueri.tasks import TaskList  # noqa: PLC0415
 
     nao = ctx.nao
     threads = ctx.threads
     max_tile_bytes = ctx.max_tile_bytes
 
-    D_flat = cp.ascontiguousarray(D.ravel(), dtype=cp.float64)
+    D_gpu = cp.asarray(D, dtype=cp.float64)
+    D_flat = cp.ascontiguousarray(D_gpu.ravel())
     if D_flat.shape[0] != nao * nao:
         raise ValueError(f"D must have {nao * nao} elements, got {D_flat.shape[0]}")
 
@@ -212,52 +255,58 @@ def direct_JK(
     n_kernel_calls = 0
     t0 = time.perf_counter()
 
-    for g in range(int(ctx.class_ids.shape[0])):
-        cid = int(ctx.class_ids[g])
-        j0 = int(ctx.offsets[g])
-        j1 = int(ctx.offsets[g + 1])
-        if j1 <= j0:
-            continue
-
-        la, lb, lc, ld = decode_eri_class_id(cid)
-        nA = int(ncart(int(la)))
-        nB = int(ncart(int(lb)))
-        nC = int(ncart(int(lc)))
-        nD = int(ncart(int(ld)))
+    for bi in ctx.batch_infos:
+        batch = bi.batch
+        la, lb, lc, ld = bi.orig_la, bi.orig_lb, bi.orig_lc, bi.orig_ld
+        nA = int(ncart(la))
+        nB = int(ncart(lb))
+        nC = int(ncart(lc))
+        nD = int(ncart(ld))
         nAB = nA * nB
         nCD = nC * nD
         bytes_per_task = nAB * nCD * 8
         chunk_ntasks = max(1, max_tile_bytes // max(bytes_per_task, 1))
 
-        for i0 in range(j0, j1, chunk_ntasks):
-            i1 = min(j1, i0 + chunk_ntasks)
-            nt = i1 - i0
+        batch_ntasks = int(batch.task_idx.shape[0])
+
+        for c0 in range(0, batch_ntasks, chunk_ntasks):
+            c1 = min(batch_ntasks, c0 + chunk_ntasks)
+            nt = c1 - c0
             if nt == 0:
                 continue
 
-            task_group = TaskList(
-                task_spAB=np.asarray(cp.asnumpy(ctx.task_ab_dev[i0:i1]), dtype=np.int32),
-                task_spCD=np.asarray(cp.asnumpy(ctx.task_cd_dev[i0:i1]), dtype=np.int32),
+            # Create sub-batch for this chunk
+            sub_batch = KernelBatch(
+                task_idx=batch.task_idx[c0:c1],
+                kernel_tasks=TaskList(
+                    task_spAB=batch.kernel_tasks.task_spAB[c0:c1],
+                    task_spCD=batch.kernel_tasks.task_spCD[c0:c1],
+                ),
+                kernel_class_id=batch.kernel_class_id,
+                transpose=batch.transpose,
             )
 
-            raw = eri_rys_generic_device(
-                task_group,
-                ctx.dbasis,
-                ctx.dsp,
-                ctx.pair_tables,
-                la=int(la),
-                lb=int(lb),
-                lc=int(lc),
-                ld=int(ld),
+            # Evaluate ERI tiles using specialized kernel dispatch
+            tiles = run_kernel_batch_spd(
+                sub_batch,
+                dbasis=ctx.dbasis,
+                dsp=ctx.dsp,
+                pt=ctx.pair_tables,
                 stream=None,
                 threads=threads,
+                profile=profile,
             )
             n_kernel_calls += 1
 
-            # If we only want J, pass None for K (kernel skips K if K_mat is null)
+            # Contract with D and accumulate into J/K
+            # tiles shape: (nt, nAB, nCD) in original bra/ket order
+            if profile is not None:
+                _t_contract0 = cp.cuda.Event()
+                _t_contract1 = cp.cuda.Event()
+                _t_contract0.record()
             _ext.contract_jk_tiles_ordered_inplace_device(
-                ctx.task_ab_dev[i0:i1],
-                ctx.task_cd_dev[i0:i1],
+                bi.orig_spAB_dev[c0:c1],
+                bi.orig_spCD_dev[c0:c1],
                 ctx.sp_A_dev,
                 ctx.sp_B_dev,
                 ctx.shell_ao_start_dev,
@@ -266,7 +315,7 @@ def direct_JK(
                 int(nB),
                 int(nC),
                 int(nD),
-                raw.ravel(),
+                tiles.ravel(),
                 D_flat,
                 J_flat if J_flat is not None else cp.zeros((nao * nao,), dtype=cp.float64),
                 K_flat,  # None → py::none → nullptr in C++
@@ -274,6 +323,12 @@ def direct_JK(
                 int(stream_ptr),
                 False,
             )
+            if profile is not None:
+                _t_contract1.record()
+                _t_contract1.synchronize()
+                profile["contract_ms"] = float(profile.get("contract_ms", 0.0)) + float(
+                    cp.cuda.get_elapsed_time(_t_contract0, _t_contract1)
+                )
 
     cp.cuda.get_current_stream().synchronize()
 

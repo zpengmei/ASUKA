@@ -934,7 +934,7 @@ def make_df_casscf_hvec_df(
         nac_num = sacasscf_nonadiabatic_couplings_df(
             scf_out,
             mc,
-            pairs=[(ket_i, bra_i)],
+            pairs=[(bra_i, ket_i)],
             use_etfs=bool(use_etfs),
             mult_ediff=True,
             fcisolver=fcisolver,

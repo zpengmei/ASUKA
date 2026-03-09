@@ -145,17 +145,17 @@ def sacasscf_nonadiabatic_couplings_df_densez(
     dm1_sa, dm2_sa = make_state_averaged_rdms(fcisolver_use, ci_list, weights, ncas=int(ncas), nelecas=nelecas)
 
     if pairs is None:
-        pair_list = [(ket, bra) for ket in range(nroots) for bra in range(nroots) if ket != bra]
+        pair_list = [(bra, ket) for bra in range(nroots) for ket in range(nroots) if ket != bra]
     else:
-        pair_list = [(int(ket), int(bra)) for (ket, bra) in pairs if int(ket) != int(bra)]
+        pair_list = [(int(bra), int(ket)) for (bra, ket) in pairs if int(ket) != int(bra)]
 
     nac = np.zeros((nroots, nroots, len(atmlst_use), 3), dtype=np.float64)
 
     shell_atom_ref = shell_to_atom_map(ao_basis_ref, atom_coords_bohr=coords)
 
-    for ket, bra in pair_list:
-        ket = int(ket)
+    for bra, ket in pair_list:
         bra = int(bra)
+        ket = int(ket)
         if ket == bra:
             continue
 

@@ -1204,18 +1204,18 @@ def sacasscf_nonadiabatic_couplings_dense(
     nac = np.zeros((nroots, nroots, len(atmlst_use), 3), dtype=np.float64)
 
     def _unpack_state(state: tuple[int, int]) -> tuple[int, int]:
-        ket, bra = state
-        ket = int(ket)
+        bra, ket = state
         bra = int(bra)
+        ket = int(ket)
         if ket < 0 or bra < 0 or ket >= nroots or bra >= nroots:
             raise ValueError("state indices out of range")
-        return ket, bra
+        return bra, ket
 
     pair_list: list[tuple[int, int]]
     if pairs is None:
-        pair_list = [(ket, bra) for ket in range(nroots) for bra in range(nroots) if ket != bra]
+        pair_list = [(bra, ket) for bra in range(nroots) for ket in range(nroots) if ket != bra]
     else:
-        pair_list = [(int(ket), int(bra)) for (ket, bra) in pairs if int(ket) != int(bra)]
+        pair_list = [(int(bra), int(ket)) for (bra, ket) in pairs if int(ket) != int(bra)]
 
     ao_basis_ref = cache_cpu.ao_basis
     shell_atom = np.asarray(cache_cpu.eri4c_cache.shell_atom, dtype=np.int32)
@@ -1270,8 +1270,8 @@ def sacasscf_nonadiabatic_couplings_dense(
             nelecas=nelecas,
         )
 
-    for ket, bra in pair_list:
-        ket, bra = _unpack_state((ket, bra))
+    for bra, ket in pair_list:
+        bra, ket = _unpack_state((bra, ket))
         if ket == bra:
             continue
 

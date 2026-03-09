@@ -229,6 +229,64 @@ def upload_hb_index(hb_index: HeatBathIntegralIndex, cp: Any) -> dict:
     }
 
 
+def build_g_base_gpu(hb_dev: dict, cutoff: float, norb: int, cp: Any) -> Any:
+    """GPU equivalent of build_g_base using CuPy.
+
+    Mirrors the CPU ``build_g_base`` logic but operates entirely on GPU arrays
+    in ``hb_dev`` (as returned by :func:`upload_hb_index`).  Lazily caches
+    derived index arrays (``h1_pq_flat``, ``rs_r_all``, ``rs_s_all``) inside
+    ``hb_dev`` so they are computed at most once per run.
+
+    Parameters
+    ----------
+    hb_dev : dict
+        Dict of CuPy arrays from :func:`upload_hb_index`.
+    cutoff : float
+        Absolute value cutoff (same as passed to :func:`build_g_base`).
+    norb : int
+        Number of active orbitals.
+    cp : module
+        CuPy module.
+
+    Returns
+    -------
+    g_base : cp.ndarray, shape (norb^2,)
+        Fixed part of g_flat (same for all source CSFs at this cutoff level).
+    """
+    nops = norb * norb
+    g_base = cp.zeros(nops, dtype=cp.float64)
+
+    # --- One-body ---
+    h1_abs = hb_dev["h1_abs"]  # float64 [n_h1], sorted descending
+    if h1_abs.size > 0 and float(h1_abs[0]) >= cutoff:
+        k_end = int(cp.searchsorted(-h1_abs, -cutoff))
+        if k_end > 0:
+            if "h1_pq_flat" not in hb_dev:
+                h1_pq = hb_dev["h1_pq"]  # int32 (n_h1, 2)
+                hb_dev["h1_pq_flat"] = (
+                    h1_pq[:, 0].astype(cp.int64) * norb + h1_pq[:, 1].astype(cp.int64)
+                )
+            cp.add.at(g_base, hb_dev["h1_pq_flat"][:k_end], hb_dev["h1_signed"][:k_end])
+
+    # --- Two-body off-diagonal (r != s) ---
+    v_abs = hb_dev["v_abs"]
+    nnz = int(v_abs.size)
+    if nnz > 0 and float(hb_dev["pq_max_v"].max()) >= cutoff:
+        rs_all = hb_dev["rs_idx"]
+        if "rs_r_all" not in hb_dev:
+            hb_dev["rs_r_all"] = rs_all // norb
+            hb_dev["rs_s_all"] = rs_all % norb
+        r_all = hb_dev["rs_r_all"]
+        s_all = hb_dev["rs_s_all"]
+        offdiag_above = (v_abs >= cutoff) & (r_all != s_all)
+        if bool(offdiag_above.any()):
+            v_filtered = cp.where(offdiag_above, 0.5 * hb_dev["v_signed"], 0.0)
+            starts = hb_dev["pq_ptr"][:-1].astype(cp.intp)
+            g_base += cp.add.reduceat(v_filtered, starts)
+
+    return g_base
+
+
 def materialize_eri_4d_from_df_gpu(l_full_d: Any, norb: int, cp: Any) -> Any:
     """Materialize full 4D ERI on GPU from DF 3-index integrals.
 

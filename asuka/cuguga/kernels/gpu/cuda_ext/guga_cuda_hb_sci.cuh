@@ -24,13 +24,13 @@ namespace {
 // Phase 2: Fused screen + g_flat build + apply kernel
 // ---------------------------------------------------------------------------
 // One block per source CSF j. Each block:
-//   1. Loads steps/nodes for CSF j from the state cache
-//   2. Computes max|c_j| across roots (only needs the active root's c)
-//   3. Builds screened g_flat in shared memory from sorted integral index
-//   4. Applies g_flat via the standard DFS walk → scatters to frontier hash
+//   1. Loads steps/nodes/occ/b for CSF j from the state cache
+//   2. Builds screened g_flat in shared memory from sorted integral index
+//   3. Applies g_flat via the standard DFS walk → scatters to frontier hash
 //
 // Template parameter MAX_NORB_T controls shared memory sizing.
-// For norb=40: g_flat = 40*40*8 = 12.8 KB, well under 48 KB smem limit.
+// For norb=40: g_flat = 40*40*8 = 12.8 KB, plus ~0.5 KB overhead = 13.3 KB,
+// well under the 48 KB smem limit.
 
 // Step-to-occupancy mapping (same as CPU-side _STEP_TO_OCC)
 __device__ __constant__ int8_t hb_step_to_occ[4] = {0, 1, 1, 2};
@@ -62,7 +62,7 @@ void hb_screen_and_apply_kernel(
     // DRT tables (for DFS walk)
     const int32_t* __restrict__ child_table,   // [nnodes * 4]
     const int16_t* __restrict__ node_twos,     // [nnodes]
-    const int64_t* __restrict__ child_prefix,  // [nnodes * 4]
+    const int64_t* __restrict__ child_prefix,  // [nnodes * 5]
     int nnodes,
     // Hash output
     int32_t* __restrict__ hash_keys,
@@ -81,31 +81,106 @@ void hb_screen_and_apply_kernel(
 
     double cutoff = eps / abs_cj;
 
-    // --- Shared memory layout ---
-    extern __shared__ char smem_raw[];
-    // g_flat: norb * norb doubles
-    double* g_flat_s = reinterpret_cast<double*>(smem_raw);
-    // steps: norb int8_t
-    int8_t* steps_s = reinterpret_cast<int8_t*>(g_flat_s + norb * norb);
-    // nodes: (norb+1) int32_t
-    int32_t* nodes_s = reinterpret_cast<int32_t*>(steps_s + ((norb + 7) & ~7));  // align to 8
-    // occ: norb int8_t (derived from steps)
-    int8_t* occ_s = reinterpret_cast<int8_t*>(nodes_s + norb + 1);
-
     int tid = threadIdx.x;
     int nthreads = blockDim.x;
     int nops = norb * norb;
 
-    // Load steps and nodes from state cache
-    for (int i = tid; i < norb; i += nthreads) {
-        steps_s[i] = steps_table[(int64_t)j_global * norb + i];
-        occ_s[i] = hb_step_to_occ[(int)(steps_s[i] & 3)];
+    // --- Shared memory layout ---
+    // g_flat_s:              double[norb^2]       (8-byte aligned)
+    // steps_s:               int8_t[norb]         padded to 8-byte boundary
+    // nodes_s:               int32_t[norb+1]      (4-byte aligned after 8-byte pad)
+    // occ_s:                 int8_t[norb]         padded to 2-byte boundary
+    // b_s:                   int16_t[norb]        padded to 4-byte boundary
+    // idx_prefix_s:          int32_t[norb+1]      (4-byte aligned after 4-byte pad)
+    // idx_prefix_warp_sums:  int32_t[ceil(norb/32)]
+    extern __shared__ char smem_raw[];
+    double*  g_flat_s             = reinterpret_cast<double*>(smem_raw);
+    int8_t*  steps_s              = reinterpret_cast<int8_t*>(g_flat_s + nops);
+    int32_t* nodes_s              = reinterpret_cast<int32_t*>(steps_s + ((norb + 7) & ~7));
+    int8_t*  occ_s                = reinterpret_cast<int8_t*>(nodes_s + norb + 1);
+    // Pad occ_s to 4-byte boundary so b_s (int16_t) starts 4-byte-aligned,
+    // which in turn ensures idx_prefix_s (int32_t) is 4-byte-aligned.
+    int16_t* b_s                  = reinterpret_cast<int16_t*>(occ_s + ((norb + 3) & ~3));
+    int32_t* idx_prefix_s         = reinterpret_cast<int32_t*>(
+                                        reinterpret_cast<char*>(b_s) + ((norb * 2 + 3) & ~3));
+    int32_t* idx_prefix_warp_sums = idx_prefix_s + (norb + 1);
+
+    // --- Cooperative load of steps / nodes[k+1] / occ / b ---
+    // (mirrors guga_apply_g_flat_scatter_atomic_frontier_hash_kernel_t pattern)
+    for (int k = tid; k < norb; k += nthreads) {
+        int8_t step = steps_table[(int64_t)j_global * norb + k];
+        steps_s[k] = step;
+        occ_s[k] = hb_step_to_occ[(int)(step & 3)];
+        int32_t node_next = nodes_table[(int64_t)j_global * (norb + 1) + (k + 1)];
+        nodes_s[k + 1] = node_next;
+        b_s[k] = node_twos[node_next];
     }
-    for (int i = tid; i <= norb; i += nthreads) {
-        nodes_s[i] = nodes_table[(int64_t)j_global * (norb + 1) + i];
+    if (nthreads > 32) { __syncthreads(); } else { __syncwarp(); }
+    if (tid == 0) {
+        nodes_s[0] = nodes_table[(int64_t)j_global * (norb + 1)];
+    }
+    if (nthreads > 32) { __syncthreads(); } else { __syncwarp(); }
+
+    // --- Build idx_prefix_s (inclusive prefix sum of child_prefix[node_k*5+step_k]) ---
+    // Used by DFS walk to compute target CSF index from segment walks.
+    if (norb <= 32) {
+        int lane = tid;
+        if (lane < 32) {
+            int32_t delta = 0;
+            if (lane < norb) {
+                int node_k = nodes_s[lane];
+                int step_k = (int)steps_s[lane];
+                delta = (int32_t)child_prefix[node_k * 5 + step_k];
+            }
+            #pragma unroll
+            for (int off = 1; off < 32; off <<= 1) {
+                int32_t v = __shfl_up_sync(0xffffffffu, delta, off);
+                if (lane >= off) delta += v;
+            }
+            if (lane == 0) idx_prefix_s[0] = 0;
+            if (lane < norb) idx_prefix_s[lane + 1] = delta;
+        }
+        if (nthreads > 32) { __syncthreads(); } else { __syncwarp(); }
+    } else {
+        if (nthreads >= 64) {
+            int lane = tid & 31;
+            int warp = tid >> 5;
+            int warps_needed = (norb + 31) >> 5;
+            int k = warp * 32 + lane;
+            int32_t delta = 0;
+            if (warp < warps_needed && k < norb) {
+                int node_k = nodes_s[k];
+                int step_k = (int)steps_s[k];
+                delta = (int32_t)child_prefix[node_k * 5 + step_k];
+            }
+            #pragma unroll
+            for (int off = 1; off < 32; off <<= 1) {
+                int32_t v = __shfl_up_sync(0xffffffffu, delta, off);
+                if (lane >= off) delta += v;
+            }
+            if (warp < warps_needed && lane == 31) idx_prefix_warp_sums[warp] = delta;
+            __syncthreads();
+            int32_t warp_offset = 0;
+            if (warp < warps_needed && warp > 0) warp_offset = idx_prefix_warp_sums[0];
+            if (tid == 0) idx_prefix_s[0] = 0;
+            if (warp < warps_needed && k < norb) idx_prefix_s[k + 1] = delta + warp_offset;
+            __syncthreads();
+        } else {
+            if (tid == 0) {
+                idx_prefix_s[0] = 0;
+                int32_t acc = 0;
+                for (int k = 0; k < norb; k++) {
+                    int node_k = nodes_s[k];
+                    int step_k = (int)steps_s[k];
+                    acc += (int32_t)child_prefix[node_k * 5 + step_k];
+                    idx_prefix_s[k + 1] = acc;
+                }
+            }
+            __syncthreads();
+        }
     }
 
-    // Zero g_flat in shared memory
+    // --- Zero g_flat in shared memory ---
     for (int i = tid; i < nops; i += nthreads) {
         g_flat_s[i] = 0.0;
     }
@@ -118,20 +193,14 @@ void hb_screen_and_apply_kernel(
         if (h1_abs[k] < cutoff) break;
         int p = h1_pq[k * 2];
         int q = h1_pq[k * 2 + 1];
-        // Use atomicAdd since multiple threads may write to same (p,q)
-        // Actually, each (p,q) pair appears only once in h1, so direct write is safe
-        // if we partition h1 entries across threads without overlap.
-        // But with strided access pattern, overlaps are impossible.
+        // Each (p,q) pair appears at most once in h1, so no race condition
+        // with strided access pattern across threads.
         g_flat_s[p * norb + q] = h1_signed[k];
     }
     __syncthreads();
 
     // Two-body: for each (p,q), scan sorted v entries
     for (int pq = tid; pq < nops; pq += nthreads) {
-        int p = pq / norb;
-        int q = pq % norb;
-
-        // Row-level skip
         if (pq_max_v[pq] < cutoff) continue;
 
         int64_t lo = pq_ptr[pq];
@@ -157,67 +226,100 @@ void hb_screen_and_apply_kernel(
     }
     __syncthreads();
 
-    // --- DFS walk: apply g_flat to source CSF j, scatter to hash ---
-    // This mirrors the logic in guga_cuda_kernels_apply_g_flat.cuh
-    // but operates on the shared-memory g_flat.
+    // --- DFS walk: apply screened g_flat to frontier hash ---
+    // Mirrors guga_apply_g_flat_scatter_atomic_frontier_hash_kernel_t exactly,
+    // reading g_flat from shared memory (g_flat_s) instead of global memory.
+    //
+    // Diagonal (p==q): skipped — csf_idx is always in the selected support, and
+    // its self-contribution does not affect external frontier amplitudes.
 
-    // For each (p,q) with non-zero g_flat, check if E_pq can act on CSF j,
-    // and if so, scatter the contribution cj * g_flat[p,q] * coupling to the hash.
+    for (int pq = tid; pq < nops; pq += nthreads) {
+        int p = pq / norb;
+        int q = pq - p * norb;
+        if (p == q) continue;
 
-    // Thread 0 drives the DFS walk for simplicity in this phase.
-    // (Phase 3 will parallelize with multi-warp DFS.)
-    if (tid == 0) {
-        for (int pq = 0; pq < nops; pq++) {
-            double g = g_flat_s[pq];
-            if (g == 0.0) continue;
+        double wgt = g_flat_s[pq];
+        if (wgt == 0.0) continue;
 
-            int p = pq / norb;
-            int q = pq % norb;
+        int occ_p = (int)occ_s[p];
+        int occ_q = (int)occ_s[q];
+        if (occ_q <= 0 || occ_p >= 2) continue;
 
-            // Check occupancy: E_pq requires occ_q > 0 and occ_p < 2
-            int occ_q_val = (int)occ_s[q];
-            int occ_p_val = (int)occ_s[p];
-
-            if (p == q) {
-                // Diagonal: E_pp|j> = n_p|j>, contributes g*n_p*cj to CSF j itself
-                double contrib = g * (double)occ_q_val * cj;
-                if (contrib != 0.0) {
-                    guga_frontier_hash_insert_add_f64(
-                        hash_keys, hash_vals, cap, root, j_global, contrib, overflow_flag);
-                }
-                continue;
-            }
-
-            if (occ_q_val <= 0 || occ_p_val >= 2) continue;
-
-            // Off-diagonal E_pq: DFS walk from level min(p,q) to max(p,q)
-            // This is the expensive part — walk the DRT tree to find connected CSFs.
-            // We use the standard GUGA segment value approach.
-
-            int level_lo = (p < q) ? p : q;
-            int level_hi = (p < q) ? q : p;
-            bool raising = (p < q);  // E_pq with p<q is a raising generator
-
-            // Starting node at level_lo
-            int node_lo = nodes_s[level_lo];
-            int node_hi_target = nodes_s[level_hi + 1];  // target node at level_hi+1
-
-            // The DFS walk computes segment values between levels.
-            // For the simple per-CSF scatter, we compute the coupling coefficient
-            // and the target CSF index via the child_prefix walks.
-
-            // Simplified: use the child_table to find the target CSF.
-            // The full implementation needs the segment value recursion.
-            // For Phase 2, we delegate to the existing apply kernel pattern.
-            // (This kernel stub will be completed when integrating with the
-            //  full DFS walk machinery.)
-
-            // For now, we accumulate g*cj to a placeholder.
-            // The full DFS walk will be integrated in the build step.
-            // PLACEHOLDER: The actual DFS walk logic is complex and
-            // will reuse the patterns from guga_cuda_kernels_apply_g_flat.cuh.
-            // See Phase 3 implementation below.
+        int start, end, q_start, q_mid, q_end;
+        if (p < q) {
+            start = p; end = q;
+            q_start = Q_uR; q_mid = Q_R; q_end = Q_oR;
+        } else {
+            start = q; end = p;
+            q_start = Q_uL; q_mid = Q_L; q_end = Q_oL;
         }
+
+        int32_t node_start      = nodes_s[start];
+        int32_t node_end_target = nodes_s[end + 1];
+        int32_t prefix_offset   = idx_prefix_s[start];
+        int32_t prefix_endplus1 = idx_prefix_s[end + 1];
+        int32_t suffix_offset   = (int32_t)j_global - prefix_endplus1;
+
+        int8_t   st_k[MAX_NORB_T];
+        uint64_t st_node_seg[MAX_NORB_T];
+        double   st_w[MAX_NORB_T];
+        int top = 0;
+        int overflow = 0;
+
+        st_k[top] = (int8_t)start;
+        st_node_seg[top] = ((uint64_t)(uint32_t)0) | ((uint64_t)(uint32_t)node_start << 32);
+        st_w[top] = 1.0;
+        top++;
+
+        while (top) {
+            top--;
+            double w = st_w[top];
+            int kpos = (int)st_k[top];
+            uint64_t node_seg = st_node_seg[top];
+            int node_k = (int)(node_seg >> 32);
+            int32_t seg_idx = (int32_t)(uint32_t)node_seg;
+
+            int qk = (kpos == start) ? q_start : ((kpos == end) ? q_end : q_mid);
+            int dk = (int)steps_s[kpos];
+            int bk = (int)b_s[kpos];
+            int k_next = kpos + 1;
+
+            int dp0 = 0, dp1 = 0;
+            int ndp = candidate_dprimes(qk, dk, &dp0, &dp1);
+            if (ndp == 0) continue;
+
+            for (int which = 0; which < ndp; which++) {
+                int dprime = (which == 0) ? dp0 : dp1;
+                int child_k = child_table[node_k * 4 + dprime];
+                if (child_k < 0) continue;
+                int bprime = (int)node_twos[child_k];
+                int db = bk - bprime;
+                double seg = (double)segment_value_int(qk, dprime, dk, db, bk);
+                if (seg == 0.0) continue;
+                double w2 = w * seg;
+                int32_t seg_idx2 = seg_idx + (int32_t)child_prefix[node_k * 5 + dprime];
+
+                if (kpos == end) {
+                    if (child_k != node_end_target) continue;
+                    int32_t csf_i = prefix_offset + seg_idx2 + suffix_offset;
+                    if ((unsigned)csf_i >= (unsigned)ncsf) { overflow = 1; continue; }
+                    if (csf_i == j_global) continue;
+                    if (w2 == 0.0) continue;
+                    guga_frontier_hash_insert_add_f64(
+                        hash_keys, hash_vals, cap, root, csf_i,
+                        cj * wgt * w2, overflow_flag);
+                } else {
+                    if (top >= MAX_NORB_T) { overflow = 1; continue; }
+                    st_k[top] = (int8_t)k_next;
+                    st_node_seg[top] = ((uint64_t)(uint32_t)seg_idx2) |
+                                       ((uint64_t)(uint32_t)child_k << 32);
+                    st_w[top] = w2;
+                    top++;
+                }
+            }
+        }
+
+        if (overflow) atomicExch(overflow_flag, 1);
     }
 }
 
@@ -262,7 +364,6 @@ void hb_fused_dfs_kernel(
     int* __restrict__ overflow_flag)
 {
     // Phase 3 placeholder — to be filled with multi-warp DFS + inline screening.
-    // For now, falls back to the Phase 2 pattern.
 }
 
 
@@ -305,8 +406,6 @@ void hb_stochastic_pt2_kernel(
     double*  __restrict__ pt2_sumsq)             // [nroots] for variance
 {
     // Phase 4 placeholder — one block per sampled source CSF.
-    // Full sigma vector row (no screening) → accumulate PT2 for non-deterministic
-    // external CSFs → atomicAdd to global accumulators.
     // To be implemented when Phase 3 DFS walk is complete.
 }
 
@@ -353,18 +452,52 @@ extern "C" cudaError_t guga_hb_screen_and_apply_launch_stream(
     if (norb <= 0 || norb > 64) return cudaErrorInvalidValue;
     if (threads <= 0 || threads > 1024) return cudaErrorInvalidValue;
 
-    // Compute shared memory size
+    // Shared memory layout (must match kernel pointer arithmetic):
+    //   g_flat_s:             double[norb^2]
+    //   steps_s:              int8_t[norb],  padded to 8-byte boundary
+    //   nodes_s:              int32_t[norb+1]
+    //   occ_s:                int8_t[norb],  padded to 2-byte boundary
+    //   b_s:                  int16_t[norb], padded to 4-byte boundary
+    //   idx_prefix_s:         int32_t[norb+1]
+    //   idx_prefix_warp_sums: int32_t[ceil(norb/32)]
     int nops = norb * norb;
-    int steps_offset = nops * (int)sizeof(double);
-    int steps_aligned = ((norb + 7) & ~7);
-    int nodes_offset = steps_offset + steps_aligned * (int)sizeof(int8_t);
-    int occ_offset = nodes_offset + (norb + 1) * (int)sizeof(int32_t);
-    int smem_bytes = occ_offset + norb * (int)sizeof(int8_t);
-    smem_bytes = (smem_bytes + 255) & ~255;  // align to 256 bytes
+    int smem_bytes = 0;
+    smem_bytes += nops * (int)sizeof(double);                    // g_flat_s
+    smem_bytes += (norb + 7) & ~7;                              // steps_s
+    smem_bytes += (norb + 1) * (int)sizeof(int32_t);            // nodes_s
+    smem_bytes += (norb + 3) & ~3;                              // occ_s, padded to 4-byte boundary
+    smem_bytes += (norb * 2 + 3) & ~3;                          // b_s
+    smem_bytes += (norb + 1) * (int)sizeof(int32_t);            // idx_prefix_s
+    smem_bytes += ((norb + 31) / 32) * (int)sizeof(int32_t);    // idx_prefix_warp_sums
+    smem_bytes = (smem_bytes + 255) & ~255;                     // align to 256 bytes
 
-    // Dispatch based on norb range for template specialization
-    if (norb <= 32) {
+    // 5-way dispatch matching apply_g_flat kernel specializations.
+    if (norb <= 16) {
+        hb_screen_and_apply_kernel<16><<<nsel, threads, smem_bytes, stream>>>(
+            sel_idx, c_root, nsel, root,
+            steps_table, nodes_table, norb, ncsf,
+            h1_pq, h1_abs, h1_signed, n_h1,
+            pq_ptr, rs_idx, v_abs, v_signed, pq_max_v, eps,
+            child_table, node_twos, child_prefix, nnodes,
+            hash_keys, hash_vals, cap, overflow_flag);
+    } else if (norb <= 24) {
+        hb_screen_and_apply_kernel<24><<<nsel, threads, smem_bytes, stream>>>(
+            sel_idx, c_root, nsel, root,
+            steps_table, nodes_table, norb, ncsf,
+            h1_pq, h1_abs, h1_signed, n_h1,
+            pq_ptr, rs_idx, v_abs, v_signed, pq_max_v, eps,
+            child_table, node_twos, child_prefix, nnodes,
+            hash_keys, hash_vals, cap, overflow_flag);
+    } else if (norb <= 32) {
         hb_screen_and_apply_kernel<32><<<nsel, threads, smem_bytes, stream>>>(
+            sel_idx, c_root, nsel, root,
+            steps_table, nodes_table, norb, ncsf,
+            h1_pq, h1_abs, h1_signed, n_h1,
+            pq_ptr, rs_idx, v_abs, v_signed, pq_max_v, eps,
+            child_table, node_twos, child_prefix, nnodes,
+            hash_keys, hash_vals, cap, overflow_flag);
+    } else if (norb <= 48) {
+        hb_screen_and_apply_kernel<48><<<nsel, threads, smem_bytes, stream>>>(
             sel_idx, c_root, nsel, root,
             steps_table, nodes_table, norb, ncsf,
             h1_pq, h1_abs, h1_signed, n_h1,

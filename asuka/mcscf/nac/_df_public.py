@@ -47,6 +47,7 @@ def sacasscf_nonadiabatic_couplings_df(
     This is the public NAC entry point. It supports only the
     ``split_orbfd`` response backend. ``delta_bohr`` controls the finite-
     difference step only if the DF derivative contraction falls back to FD.
+    The optional ``pairs`` argument is interpreted as ``(bra, ket)`` indices.
     """
 
     if str(response_term).lower() != "split_orbfd":
