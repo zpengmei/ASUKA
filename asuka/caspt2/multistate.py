@@ -211,17 +211,21 @@ def build_heff(
             coupling = 0.0
             for case in range(1, 14):
                 # OpenMolcas `HCOUP` evaluates <I|H|Omega_J> using the ket-state
-                # RHS/solution vectors and a transition-density kernel (TG1/2/3)
-                # between (I,J). See `hefval.F90` -> `hcoup.f`.
-                rhs_j = rhs_raw_by_state[j][case - 1]
-                t_j = t_raw_by_state[j][case - 1]
+                # sigma vector (V_J = contravariant RHS, stored as IVECW after
+                # solving the ket-state CASPT2 equation) and the ket-state
+                # amplitude vector T_J (IVECC), contracted with
+                # transition-density kernel TG1/TG2/TG3 between (I,J).
+                # See `hefval.f` (IVECW=ket RHS, IVECC=ket amplitudes) → `hcoup.f`.
+                # row_dots[μ,ν] = Σ_{ext} V_J[μ,ext] * T_J[ν,ext]
+                rhs_j = rhs_raw_by_state[j][case - 1]  # V_J (ket state sigma)
+                t_j = t_raw_by_state[j][case - 1]       # T_J (ket state amplitudes)
                 if rhs_j.size == 0 or t_j.size == 0:
                     continue
 
                 if rhs_j.shape != t_j.shape:
                     raise ValueError(
                         "MS Heff raw block shape mismatch for "
-                        f"state-pair ({i},{j}) case {case}: rhs {rhs_j.shape} vs t {t_j.shape}"
+                        f"state-pair ({i},{j}) case {case}: rhs_j {rhs_j.shape} vs t_j {t_j.shape}"
                     )
 
                 row_dots = rhs_j @ t_j.T

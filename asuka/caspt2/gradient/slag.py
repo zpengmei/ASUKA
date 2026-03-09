@@ -19,14 +19,21 @@ def build_state_lagrangian(
 ) -> np.ndarray:
     """Build the explicit multistate ``SLag`` contribution for one target root.
 
-    This matches the state-weight construction in OpenMolcas
-    ``caspt2_grad.f`` after ``CLagFinal``:
+    **MS-CASPT2** (``is_xms=False``): diagonal only.
 
-    - MS gradients only add diagonal target-state weights from ``UEFF``.
-    - XMS gradients add the lower-triangular state-rotation weights, with a
-      factor of 2 on off-diagonal entries.
-    - In both cases, the original SA-CASSCF target-root contribution is
-      removed by subtracting 1 on the selected target diagonal.
+    - Diagonal: ``SLag[I,I] = U[I,r]^2``
+    - Target root: ``SLag[r,r] -= 1`` (removes SA-CASSCF contribution)
+
+    Off-diagonal MS coupling is handled by CLagFinal (MCLR response), not here.
+    Matches Molcas ``caspt2_grad.f`` GrdCls (MS branch).
+
+    **XMS-CASPT2** (``is_xms=True``): full lower-triangular.
+
+    - Diagonal: ``SLag[I,I] = U[I,r]^2``
+    - Off-diagonal (I>J): ``SLag[I,J] = 2 * U[I,r] * U[J,r]``
+    - Target root: ``SLag[r,r] -= 1``
+
+    Off-diagonal entries drive Phase 2 (SIGDER-based Heff coupling derivative).
 
     Parameters
     ----------
@@ -37,10 +44,10 @@ def build_state_lagrangian(
     iroot
         Target root index in the final MS/XMS basis.
     is_xms
-        Whether to build the XMS lower-triangular form.
+        True for XMS (full lower-triangular SLag), False for MS (diagonal only).
     u0
         Optional XMS reference-rotation matrix. Accepted for API symmetry and
-        validation hooks; not needed for the explicit ``UEFF``-weight term.
+        validation hooks; not used in the SLag formula itself.
     """
 
     nstates_i = int(nstates)
@@ -66,6 +73,9 @@ def build_state_lagrangian(
 
     slag = np.zeros((nstates_i, nstates_i), dtype=np.float64)
     if bool(is_xms):
+        # XMS: full lower-triangular with factor 2 on off-diagonals.
+        # SLag[I,I] += U[I,r]^2, SLag[I,J] += 2*U[I,r]*U[J,r] for I>J.
+        # Off-diagonal entries drive Phase 2 (SIGDER-based Heff coupling derivative).
         for ist in range(nstates_i):
             for jst in range(ist + 1):
                 val = float(u[ist, iroot_i] * u[jst, iroot_i])
@@ -73,6 +83,11 @@ def build_state_lagrangian(
                     val *= 2.0
                 slag[ist, jst] += val
     else:
+        # MS: diagonal only from this function.
+        # Off-diagonal MS SLag (for Phase 2 d<I|H|Ω_J>/dR contributions) is added
+        # separately in ms_grad.py after this call: slag[I,J] = 2*U[I,r]*U[J,r] for I>J.
+        # Molcas handles the equivalent via CLagFinal (MCLR response); ASUKA uses Phase 2
+        # (SIGDER-based amplitude + OLag response) as an equivalent approach.
         for ist in range(nstates_i):
             slag[ist, ist] += float(u[ist, iroot_i] * u[ist, iroot_i])
 

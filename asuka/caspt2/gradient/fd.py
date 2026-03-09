@@ -574,6 +574,201 @@ def _caspt2_energy_ss_cpu(
     return res
 
 
+def _caspt2_energy_ms_cpu_ic(
+    scf_out: Any,
+    casscf: Any,
+    *,
+    method: str,
+    iroot: int,
+    nstates: int,
+    caspt2_kwargs: dict[str, Any],
+    base_ci_vecs: list[np.ndarray] | None = None,
+) -> Any:
+    """CPU-only IC MS/XMS-CASPT2 energy for deterministic FD gradients.
+
+    Uses the same IC energy + CPU Heff path as `caspt2_ms_gradient_native`
+    with ``ASUKA_SS_ERI_MODE=dense``, ensuring FD and analytic are consistent.
+    Activated via ``ASUKA_MS_CUDA=0``.
+
+    Parameters
+    ----------
+    base_ci_vecs : list of arrays, optional
+        Reference CI vectors for phase-fixing.  When provided, the signs of
+        each CI vector extracted from ``casscf`` are adjusted so that
+        ``<base_ci[i] | ci[i]> >= 0`` before running PT2.  This ensures
+        consistent off-diagonal Heff coupling signs across displaced-geometry
+        evaluations, removing a primary source of FD non-determinism.
+    """
+    from types import SimpleNamespace  # noqa: PLC0415
+
+    from asuka.caspt2.energy import caspt2_energy_ss  # noqa: PLC0415
+    from asuka.caspt2.f3 import CASPT2CIContext  # noqa: PLC0415
+    from asuka.caspt2.fock import build_caspt2_fock  # noqa: PLC0415
+    from asuka.caspt2.fock_df import build_caspt2_fock_ao  # noqa: PLC0415
+    from asuka.caspt2.multistate import build_heff, diagonalize_heff  # noqa: PLC0415
+    from asuka.caspt2.superindex import build_superindex  # noqa: PLC0415
+    from asuka.cuguga.drt import build_drt  # noqa: PLC0415
+    from asuka.mcscf.state_average import ci_as_list  # noqa: PLC0415
+    from asuka.rdm.rdm123 import _make_rdm123_pyscf, _reorder_dm123_molcas  # noqa: PLC0415
+
+    method_u = str(method).upper().strip()
+    imag_shift = float(caspt2_kwargs.get("imag_shift", 0.0))
+    real_shift = float(caspt2_kwargs.get("real_shift", 0.0))
+    tol = float(caspt2_kwargs.get("tol", 1e-8))
+    maxiter = int(caspt2_kwargs.get("maxiter", 200))
+    threshold = float(caspt2_kwargs.get("threshold", 1e-10))
+    threshold_s = float(caspt2_kwargs.get("threshold_s", 1e-8))
+    verbose = int(caspt2_kwargs.get("verbose", 0))
+
+    def _to_np(x: Any) -> np.ndarray:
+        """Convert CuPy or numpy array to numpy float64."""
+        if hasattr(x, "get"):
+            x = x.get()
+        return np.asarray(x, dtype=np.float64)
+
+    ncore = int(getattr(casscf, "ncore"))
+    ncas = int(getattr(casscf, "ncas"))
+    C = _to_np(getattr(casscf, "mo_coeff"))
+    nao, nmo = C.shape
+    nvirt = int(nmo - ncore - ncas)
+    nocc = ncore + ncas
+
+    h_ao = _to_np(getattr(getattr(scf_out, "int1e", None), "hcore"))
+    mol = getattr(scf_out, "mol", None)
+    e_nuc = float(getattr(mol, "energy_nuc")())
+
+    nelecas = getattr(casscf, "nelecas")
+    nelec_total = int(nelecas) if isinstance(nelecas, (int, np.integer)) else int(sum(nelecas))
+    twos = int(getattr(mol, "spin", 0))
+    drt = build_drt(norb=int(ncas), nelec=int(nelec_total), twos_target=int(twos))
+    smap = build_superindex(int(ncore), int(ncas), int(nvirt))
+    ci_vecs = [
+        np.asarray(v, dtype=np.float64).ravel()
+        for v in ci_as_list(getattr(casscf, "ci"), nroots=int(nstates))
+    ]
+
+    # Fix CI phases against reference (base_ci_vecs) to ensure consistent
+    # off-diagonal Heff coupling signs across displaced-geometry evaluations.
+    # Without this, SA-CASSCF CI vectors at displaced geometries can have
+    # arbitrary sign relative to the reference, causing the Heff off-diagonal
+    # to flip sign and making the FD gradient non-deterministic.
+    if base_ci_vecs is not None and len(base_ci_vecs) == len(ci_vecs):
+        for i in range(len(ci_vecs)):
+            if float(np.dot(base_ci_vecs[i], ci_vecs[i])) < 0.0:
+                ci_vecs[i] = -ci_vecs[i]
+
+    # Build MO ERIs (dense 4-index, matching gradient path)
+    eri_mode = str(os.environ.get("ASUKA_SS_ERI_MODE", "df")).strip().lower()
+    if eri_mode in {"dense", "full", "eri_dense"}:
+        from asuka.hf.dense_eri import build_ao_eri_dense  # noqa: PLC0415
+        ao_basis = getattr(scf_out, "ao_basis", None)
+        if ao_basis is None:
+            raise TypeError("scf_out.ao_basis required for dense ERIs")
+        dense_backend = str(os.environ.get("ASUKA_SS_DENSE_ERI_BACKEND", "cuda")).strip().lower()
+        eri_res = build_ao_eri_dense(ao_basis, backend=dense_backend, eps_ao=0.0)
+        eri_mat = _to_np(getattr(eri_res, "eri_mat")).reshape(nao, nao, nao, nao)
+        eri_mo = np.asarray(
+            np.einsum("mp,nq,lr,ks,mnlk->pqrs", C, C, C, C, eri_mat, optimize=True),
+            dtype=np.float64,
+        )
+    else:
+        B_ao = getattr(scf_out, "df_B", None)
+        if B_ao is None:
+            raise ValueError("scf_out.df_B required for DF ERIs in CPU MS energy")
+        B_ao = np.asarray(B_ao.get() if hasattr(B_ao, "get") else B_ao, dtype=np.float64)
+        if B_ao.ndim == 2:
+            from asuka.integrals.df_packed_s2 import unpack_Qp_to_mnQ  # noqa: PLC0415
+            B_ao = np.asarray(unpack_Qp_to_mnQ(B_ao, nao=int(nao)), dtype=np.float64)
+        b_mo = np.einsum("mi,mnP,nj->ijP", C, B_ao, C, optimize=True)
+        naux = b_mo.shape[2]
+        b2 = b_mo.reshape(nmo * nmo, naux)
+        eri_mo = np.asarray((b2 @ b2.T).reshape(nmo, nmo, nmo, nmo), dtype=np.float64)
+
+    # Build per-state RDMs and Fock
+    dm1_list, dm2_list, dm3_list = [], [], []
+    fock_list = []
+    e_ref_list = []
+    if method_u == "XMS":
+        from asuka.caspt2.xms import xms_rotate_states  # noqa: PLC0415
+        _dm1_orig = []
+        for _I in range(nstates):
+            d1, _, _ = _make_rdm123_pyscf(drt, ci_vecs[_I], reorder=False)
+            _dm1_orig.append(d1)
+        dm1_sa = np.mean(np.stack(_dm1_orig), axis=0)
+        h_mo = np.asarray(C.T @ h_ao @ C, dtype=np.float64)
+        fock_sa = build_caspt2_fock(h_mo, eri_mo, dm1_sa, ncore, ncas, nvirt, e_nuc=e_nuc)
+        _casscf_e_roots = np.asarray(getattr(casscf, "e_roots"), dtype=np.float64).ravel()
+        rotated_ci, u0, _ = xms_rotate_states(drt, ci_vecs, _dm1_orig, fock_sa, ncore, ncas, nstates)
+        ci_vecs = [np.asarray(c, dtype=np.float64).ravel() for c in rotated_ci]
+        e_ref_list = [float(_casscf_e_roots[I]) for I in range(nstates)]
+        for I in range(nstates):
+            d1, d2, d3 = _make_rdm123_pyscf(drt, ci_vecs[I], reorder=False)
+            d1, d2, d3 = _reorder_dm123_molcas(d1, d2, d3, inplace=True)
+            dm1_list.append(d1); dm2_list.append(d2); dm3_list.append(d3)
+            fock_list.append(fock_sa)
+    else:
+        for I in range(nstates):
+            d1, d2, d3 = _make_rdm123_pyscf(drt, ci_vecs[I], reorder=False)
+            d1, d2, d3 = _reorder_dm123_molcas(d1, d2, d3, inplace=True)
+            dm1_list.append(d1); dm2_list.append(d2); dm3_list.append(d3)
+            h_mo_I = np.asarray(C.T @ h_ao @ C, dtype=np.float64)
+            fock_I = build_caspt2_fock(h_mo_I, eri_mo, d1, ncore, ncas, nvirt, e_nuc=e_nuc)
+            fock_list.append(fock_I)
+            eri_act = eri_mo[ncore:nocc, ncore:nocc, ncore:nocc, ncore:nocc]
+            e_ref_I = (
+                float(fock_I.e_core)
+                + float(np.einsum("tu,tu->", fock_I.fimo[ncore:nocc, ncore:nocc], d1))
+                + 0.5 * float(np.einsum("tuvx,tuvx->", eri_act, d2.reshape(ncas, ncas, ncas, ncas)))
+            )
+            e_ref_list.append(e_ref_I)
+
+    # SS-CASPT2 energy per state (CPU IC backend, stores amplitudes for Heff)
+    ss_results = []
+    for I in range(nstates):
+        ci_ctx = CASPT2CIContext(drt=drt, ci_csf=ci_vecs[I])
+        res_I = caspt2_energy_ss(
+            smap, fock_list[I], eri_mo, dm1_list[I], dm2_list[I], dm3_list[I], e_ref_list[I],
+            ci_context=ci_ctx,
+            pt2_backend="cpu",
+            imag_shift=float(imag_shift),
+            real_shift=float(real_shift),
+            tol=float(tol),
+            maxiter=int(maxiter),
+            threshold=float(threshold),
+            threshold_s=float(threshold_s),
+            store_sb_decomp=True,
+            verbose=int(verbose),
+        )
+        ss_results.append(res_I)
+
+    # Build MS Heff (CPU, dense ERIs) and diagonalize
+    _heff_fock = fock_list[0] if method_u == "XMS" else fock_list
+    heff = build_heff(
+        nstates, ss_results, ci_vecs, drt, smap,
+        _heff_fock, eri_mo, dm1_list, dm2_list, dm3_list,
+        verbose=int(verbose),
+    )
+    ms_energies, ueff = diagonalize_heff(heff)
+
+    bd: dict[str, Any] = {
+        "ss_energies": [float(r.e_tot) for r in ss_results],
+        "ms_energies": ms_energies.tolist(),
+        "heff_backend": "cpu_ic",
+    }
+    if method_u == "XMS":
+        bd["u0"] = np.asarray(u0, dtype=np.float64)
+
+    return SimpleNamespace(
+        e_ref=e_ref_list,
+        e_pt2=[float(ms_energies[i] - float(e_ref_list[i])) for i in range(nstates)],
+        e_tot=ms_energies.tolist(),
+        heff=np.asarray(heff, dtype=np.float64),
+        ueff=np.asarray(ueff, dtype=np.float64),
+        method=method_u,
+        breakdown=bd,
+    )
+
+
 def fd_nuclear_gradient_from_casscf(
     scf_out: Any,
     casscf: Any,
@@ -750,10 +945,20 @@ def fd_nuclear_gradient_from_casscf(
     else:
         step = abs(float(step_bohr))
 
+    _ms_cpu_ic = (
+        method_u in {"MS", "XMS"}
+        and str(os.environ.get("ASUKA_MS_CUDA", "1")).strip() == "0"
+    )
+
+    # Base CASSCF CI vectors for phase-fixing at displaced geometries.
+    # Extracted lazily after the first build (reference geometry).
+    _base_ci_for_phase_fix: list[np.ndarray] | None = None
+
     def _energy(scf_obj: Any, ref_obj: Any, iroot_sel: int):
+        nonlocal _base_ci_for_phase_fix
         # GPU-first driver fails on some environments (e.g. no CUDA). Fall back
         # to pure-NumPy SS energy drivers when the SCF/CASSCF objects are on CPU.
-        if method_u != "SS":
+        if method_u != "SS" and not _ms_cpu_ic:
             return caspt2_from_casscf(
                 scf_obj,
                 ref_obj,
@@ -761,6 +966,26 @@ def fd_nuclear_gradient_from_casscf(
                 nstates=int(nstates),
                 iroot=int(iroot_sel),
                 **kwargs,
+            )
+        if method_u != "SS" and _ms_cpu_ic:
+            # CPU-only IC MS energy for deterministic FD (matches gradient path).
+            # Lazily build base CI vectors on first call (reference geometry) and
+            # use them to fix CI phases at displaced geometries — this prevents
+            # sign flips in the off-diagonal Heff coupling from run to run.
+            cur_ci = [
+                np.asarray(v, dtype=np.float64).ravel()
+                for v in ci_as_list(getattr(ref_obj, "ci"), nroots=int(nstates))
+            ]
+            if _base_ci_for_phase_fix is None:
+                _base_ci_for_phase_fix = [np.asarray(c, dtype=np.float64).copy() for c in cur_ci]
+            return _caspt2_energy_ms_cpu_ic(
+                scf_obj,
+                ref_obj,
+                method=method_u,
+                iroot=int(iroot_sel),
+                nstates=int(nstates),
+                caspt2_kwargs=dict(kwargs),
+                base_ci_vecs=_base_ci_for_phase_fix,
             )
         if str(hf_backend).strip().lower() == "cpu":
             return _caspt2_energy_ss_cpu(

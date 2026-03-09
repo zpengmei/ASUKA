@@ -104,6 +104,9 @@ def caspt2_ss_gradient_native(
 
     # --- Build AO ingredients ---
     B_ao = _asnumpy_f64(getattr(scf_out, "df_B"))
+    if B_ao.ndim == 2:
+        from asuka.integrals.df_packed_s2 import unpack_Qp_to_mnQ  # noqa: PLC0415
+        B_ao = np.asarray(unpack_Qp_to_mnQ(B_ao, nao=int(nao)), dtype=np.float64)
     h_ao = _asnumpy_f64(getattr(getattr(scf_out, "int1e"), "hcore"))
     S_ao = _asnumpy_f64(getattr(getattr(scf_out, "int1e"), "S"))
     e_nuc = float(mol.energy_nuc())
@@ -115,7 +118,14 @@ def caspt2_ss_gradient_native(
     twos = int(getattr(mol, "spin", 0))
     nelec_total = int(nelecas) if isinstance(nelecas, (int, np.integer)) else int(sum(nelecas))
     drt = build_drt(norb=ncas, nelec=nelec_total, twos_target=twos)
-    ci = _asnumpy_f64(ci_raw).ravel()
+    # For nroots>1 CASSCF, extract the iroot-th CI vector for SS-CASPT2.
+    nroots_casscf = int(getattr(casscf, "nroots", 1))
+    if nroots_casscf > 1:
+        from asuka.mcscf.state_average import ci_as_list  # noqa: PLC0415
+        _ci_list = ci_as_list(ci_raw, nroots=nroots_casscf)
+        ci = np.asarray(_ci_list[int(iroot)], dtype=np.float64).ravel()
+    else:
+        ci = _asnumpy_f64(ci_raw).ravel()
     ncsf = ci.size
     dm1, dm2, dm3 = _make_rdm123_pyscf(drt, ci, reorder=False)
     dm1, dm2, dm3 = _reorder_dm123_molcas(dm1, dm2, dm3, inplace=True)
@@ -473,6 +483,54 @@ def caspt2_ss_gradient_native(
         collect_breakdown=True,
     )
 
+    # --- Multi-root SA-CASSCF corrections for SS gradient ---
+    # When nroots>1, the orbitals are stationary w.r.t. the SA energy, not the
+    # SS energy of root iroot.  We must:
+    #  (a) Expand clag from (ncsf,) to (nroots, ncsf) with only slot iroot populated.
+    #  (b) Add gfock(dm1_iroot) - gfock.T to OLag (orbital non-stationarity).
+    #  (c) Pass dm1/dm2 of the target root to the assembly's direct CASSCF gradient.
+    dm1_casscf_direct_override = None
+    dm2_casscf_direct_override = None
+    if nroots_casscf > 1:
+        from asuka.mcscf.nuc_grad_df import _build_gfock_casscf_df  # noqa: PLC0415
+
+        # (a) Expand clag to (nroots, ncsf)
+        _clag_1d = np.asarray(lagrangians["clag"], dtype=np.float64).ravel()
+        _clag_stacked = np.zeros((nroots_casscf, ncsf), dtype=np.float64)
+        _clag_stacked[int(iroot)] = _clag_1d
+        lagrangians["clag"] = _clag_stacked
+
+        # (b) gfock correction: gfock(dm1_iroot) != gfock(dm1_sa)
+        # Build PySCF-format RDMs directly from CI vector (dm1/dm2 are in Molcas
+        # format from _reorder_dm123_molcas and cannot be reused here).
+        dm1_raw, dm2_raw, _ = _make_rdm123_pyscf(drt, ci, reorder=False)
+        from asuka.rdm.rdm123 import _reorder_rdm_pyscf  # noqa: PLC0415
+        dm1_pyscf_iroot, dm2_pyscf_iroot = _reorder_rdm_pyscf(
+            dm1_raw, dm2_raw.reshape(ncas, ncas, ncas, ncas), inplace=False,
+        )
+        gfock_iroot_mo, _, _, _, _ = _build_gfock_casscf_df(
+            B_ao, h_ao, C,
+            ncore=int(ncore), ncas=int(ncas),
+            dm1_act=dm1_pyscf_iroot, dm2_act=dm2_pyscf_iroot,
+        )
+        gfock_iroot_mo = np.asarray(gfock_iroot_mo, dtype=np.float64)
+        _gfock_factor = float(os.environ.get("ASUKA_SS_GFOCK_FACTOR", "1.0"))
+        _gfock_dm_override = str(os.environ.get("ASUKA_SS_GFOCK_DM_OVERRIDE", "1")).strip().lower() not in {"0", "false", "off", "no"}
+        if verbose >= 1:
+            print(f"[CASPT2 grad] gfock_factor={_gfock_factor}, dm_override={_gfock_dm_override}")
+            print(f"[CASPT2 grad] |gfock_correction| = {np.linalg.norm(gfock_iroot_mo - gfock_iroot_mo.T):.6e}")
+        lagrangians["olag"] = np.asarray(lagrangians["olag"], dtype=np.float64) + _gfock_factor * (gfock_iroot_mo - gfock_iroot_mo.T)
+        if "olag_bare" in lagrangians:
+            lagrangians["olag_bare"] = np.asarray(lagrangians["olag_bare"], dtype=np.float64) + _gfock_factor * (gfock_iroot_mo - gfock_iroot_mo.T)
+
+        # (c) dm1/dm2 for the direct CASSCF gradient (target root, not SA average)
+        if _gfock_dm_override:
+            dm1_casscf_direct_override = dm1_pyscf_iroot
+            dm2_casscf_direct_override = dm2_pyscf_iroot
+
+        # ci_raw_work must be the full SA ci for the Z-vector (all roots)
+        ci_raw_work = ci_raw
+
     # --- Solve Z-vector ---
     z_orb, z_ci, z_meta = _solve_zvector(
         scf_out, casscf, lagrangians,
@@ -484,6 +542,25 @@ def caspt2_ss_gradient_native(
         dump_vectors=_parity_u == "molcas_ss_strict",
         verbose=verbose,
     )
+
+    # --- Flag for W_lorb gfock correction (nroots>1 only) ---
+    # When nroots>1, the Z-vector includes a gfock correction shifting the optimal
+    # W_lorb scale from ~0.5 (nroots=1) to ~0.75 (nroots>1). Assembly adds an
+    # extra 0.25 × W_lorb(z_total) when this flag is non-None (see assembly.py).
+    z_gfock_secondary = True if nroots_casscf > 1 else None
+
+    # --- Build ppaa/papa from DF factors when eri_mo is unavailable ---
+    ppaa_df = None
+    papa_df = None
+    if eri_mo is None and B_ao is not None:
+        nocc_full = ncore + ncas
+        b_mo_full = np.einsum("mi,mnP,nj->ijP", C, B_ao, C, optimize=True)
+        naux = b_mo_full.shape[2]
+        b_pq = b_mo_full.reshape(nmo * nmo, naux)
+        b_tu = b_mo_full[ncore:nocc_full, ncore:nocc_full, :].reshape(ncas * ncas, naux)
+        ppaa_df = np.asarray((b_pq @ b_tu.T).reshape(nmo, nmo, ncas, ncas), dtype=np.float64)
+        b_pt = b_mo_full[:, ncore:nocc_full, :].reshape(nmo * ncas, naux)
+        papa_df = np.asarray((b_pt @ b_pt.T).reshape(nmo, ncas, nmo, ncas), dtype=np.float64)
 
     # --- Assemble gradient ---
     _ci_trans_mode = "molcas" if _parity_u == "molcas_ss_strict" else "solver"
@@ -500,6 +577,11 @@ def caspt2_ss_gradient_native(
         return_components=True,
         collect_breakdown=True,
         verbose=verbose,
+        dm1_casscf_direct_override=dm1_casscf_direct_override,
+        dm2_casscf_direct_override=dm2_casscf_direct_override,
+        ppaa_override=ppaa_df,
+        papa_override=papa_df,
+        z_orb_gfock_secondary=z_gfock_secondary,
     )
     breakdown = dict(grad_comp.get("breakdown", {}) or {})
     # Expose Molcas-reference intermediate names for crosscheck tooling.

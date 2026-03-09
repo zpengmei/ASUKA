@@ -501,7 +501,8 @@ def _caspt2_from_asuka_ref(
                 breakdown=sst_res.breakdown,
             )
 
-        # MS/XMS via SST — use CUDA path when build_heff_cuda is available
+        # MS/XMS via SST — use CUDA path when build_heff_cuda is available.
+        # Set ASUKA_MS_CUDA=0 to force CPU path (useful for deterministic FD gradients).
         from asuka.caspt2.sst.multistate import sst_caspt2_energy_ms  # noqa: PLC0415
 
         _sst_cuda_ok = False
