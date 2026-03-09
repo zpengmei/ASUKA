@@ -600,6 +600,127 @@ void cueri_bind_part9(py::module_& m) {
       py::arg("stream") = 0,
       py::arg("sync") = true);
 
+  // Direct J/K contraction: contract ERI tiles with density D → J, K.
+  m.def(
+      "contract_jk_tiles_ordered_inplace_device",
+      [](py::object task_spAB,
+         py::object task_spCD,
+         py::object sp_A,
+         py::object sp_B,
+         py::object shell_ao_start,
+         int nao,
+         int nA,
+         int nB,
+         int nC,
+         int nD,
+         py::object tile_vals,
+         py::object D_mat,
+         py::object J_mat,
+         py::object K_mat,
+         int threads,
+         uint64_t stream_ptr,
+         bool sync) {
+        require_threads_multiple_of_32(threads, "contract_jk_tiles_ordered_inplace_device");
+        if (nao <= 0 || nA <= 0 || nB <= 0 || nC <= 0 || nD <= 0) {
+          throw std::invalid_argument("nao/nA/nB/nC/nD must be > 0");
+        }
+
+        auto ab = cuda_array_view_from_object(task_spAB, "task_spAB");
+        auto cd = cuda_array_view_from_object(task_spCD, "task_spCD");
+        auto spa = cuda_array_view_from_object(sp_A, "sp_A");
+        auto spb = cuda_array_view_from_object(sp_B, "sp_B");
+        auto sh0 = cuda_array_view_from_object(shell_ao_start, "shell_ao_start");
+        auto tile = cuda_array_view_from_object(tile_vals, "tile_vals");
+        auto d_arr = cuda_array_view_from_object(D_mat, "D_mat");
+        auto j_arr = cuda_array_view_from_object(J_mat, "J_mat");
+
+        require_typestr(ab, "task_spAB", "<i4");
+        require_typestr(cd, "task_spCD", "<i4");
+        require_typestr(spa, "sp_A", "<i4");
+        require_typestr(spb, "sp_B", "<i4");
+        require_typestr(sh0, "shell_ao_start", "<i4");
+        require_typestr(tile, "tile_vals", "<f8");
+        require_typestr(d_arr, "D_mat", "<f8");
+        require_typestr(j_arr, "J_mat", "<f8");
+
+        const int64_t ntasks = require_1d(ab, "task_spAB");
+        if (require_1d(cd, "task_spCD") != ntasks) {
+          throw std::invalid_argument("task_spAB/task_spCD must have identical shape (ntasks,)");
+        }
+
+        const int64_t nsp = require_1d(spa, "sp_A");
+        if (require_1d(spb, "sp_B") != nsp) {
+          throw std::invalid_argument("sp_A/sp_B must have identical shape (nsp,)");
+        }
+        (void)require_1d(sh0, "shell_ao_start");
+
+        const int64_t nAB = static_cast<int64_t>(nA) * static_cast<int64_t>(nB);
+        const int64_t nCD = static_cast<int64_t>(nC) * static_cast<int64_t>(nD);
+        const int64_t need_tile = ntasks * nAB * nCD;
+        if (require_1d(tile, "tile_vals") != need_tile) {
+          throw std::invalid_argument("tile_vals must have shape (ntasks*nAB*nCD,)");
+        }
+
+        const int64_t nao2 = static_cast<int64_t>(nao) * static_cast<int64_t>(nao);
+        if (require_1d(d_arr, "D_mat") != nao2) {
+          throw std::invalid_argument("D_mat must have shape (nao*nao,)");
+        }
+        if (require_1d(j_arr, "J_mat") != nao2) {
+          throw std::invalid_argument("J_mat must have shape (nao*nao,)");
+        }
+
+        // K_mat is optional (pass None → nullptr to skip exchange)
+        double* k_ptr = nullptr;
+        if (!K_mat.is_none()) {
+          auto k_arr = cuda_array_view_from_object(K_mat, "K_mat");
+          require_typestr(k_arr, "K_mat", "<f8");
+          if (require_1d(k_arr, "K_mat") != nao2) {
+            throw std::invalid_argument("K_mat must have shape (nao*nao,)");
+          }
+          k_ptr = static_cast<double*>(k_arr.ptr);
+        }
+
+        cudaStream_t stream = stream_from_uint(stream_ptr);
+        throw_on_cuda_error(
+            cueri_contract_jk_tiles_ordered_launch_stream(
+                static_cast<const int32_t*>(ab.ptr),
+                static_cast<const int32_t*>(cd.ptr),
+                static_cast<int>(ntasks),
+                static_cast<const int32_t*>(spa.ptr),
+                static_cast<const int32_t*>(spb.ptr),
+                static_cast<const int32_t*>(sh0.ptr),
+                static_cast<int>(nao),
+                static_cast<int>(nA),
+                static_cast<int>(nB),
+                static_cast<int>(nC),
+                static_cast<int>(nD),
+                static_cast<const double*>(tile.ptr),
+                static_cast<const double*>(d_arr.ptr),
+                static_cast<double*>(j_arr.ptr),
+                k_ptr,
+                stream,
+                threads),
+            "cueri_contract_jk_tiles_ordered_launch_stream");
+        if (sync) throw_on_cuda_error(cudaStreamSynchronize(stream), "cudaStreamSynchronize");
+      },
+      py::arg("task_spAB"),
+      py::arg("task_spCD"),
+      py::arg("sp_A"),
+      py::arg("sp_B"),
+      py::arg("shell_ao_start"),
+      py::arg("nao"),
+      py::arg("nA"),
+      py::arg("nB"),
+      py::arg("nC"),
+      py::arg("nD"),
+      py::arg("tile_vals"),
+      py::arg("D_mat"),
+      py::arg("J_mat"),
+      py::arg("K_mat"),
+      py::arg("threads") = 256,
+      py::arg("stream") = 0,
+      py::arg("sync") = true);
+
   // ERI tile cart->sph transform.
   m.def(
       "cart2sph_eri_right_device",

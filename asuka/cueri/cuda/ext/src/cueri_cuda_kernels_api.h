@@ -2224,6 +2224,28 @@ extern "C" cudaError_t cueri_scatter_eri_tiles_ordered_launch_stream(
     cudaStream_t stream,
     int threads);
 
+// Direct J/K contraction: contract ERI tiles with density D, accumulate into J and K.
+// J and K must be pre-zeroed.  Caller symmetrizes afterwards: J = 0.5*(J+J^T), etc.
+// K_mat may be NULL to skip exchange computation.
+extern "C" cudaError_t cueri_contract_jk_tiles_ordered_launch_stream(
+    const int32_t* task_spAB,
+    const int32_t* task_spCD,
+    int ntasks,
+    const int32_t* sp_A,
+    const int32_t* sp_B,
+    const int32_t* shell_ao_start,
+    int nao,
+    int nA,
+    int nB,
+    int nC,
+    int nD,
+    const double* tile_vals,  // size ntasks * (nA*nB) * (nC*nD)
+    const double* D_mat,      // size nao*nao, row-major density matrix
+    double* J_mat,            // size nao*nao, row-major Coulomb output
+    double* K_mat,            // size nao*nao, row-major exchange output (or NULL)
+    cudaStream_t stream,
+    int threads);
+
 // Cartesian->spherical transform for ERI tiles.
 extern "C" cudaError_t cueri_cart2sph_eri_right_launch_stream(
     const double* tile_cart,  // size ntasks * (nA_cart*nB_cart) * (nC_cart*nD_cart)

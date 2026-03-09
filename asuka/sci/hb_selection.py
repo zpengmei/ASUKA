@@ -209,18 +209,19 @@ def _heat_bath_select_python(
 ) -> tuple[list[int], np.ndarray]:
     """Python-side heat-bath selection using batched GPU apply/hash kernels.
 
-    Key optimizations vs naive per-CSF loop:
+    Key optimizations vs the naive per-CSF loop:
 
-    1. **GEMM for diagonal g_flat**: occ_batch (nsel, norb) @ eri_diag_t (norb, norb^2)
-       replaces nsel individual Python CSR loops for the diagonal (r==s) two-body part.
+    1. **GEMM for diagonal g_flat**: ``occ_batch (nsel, norb) @ eri_diag_t (norb, norb^2)``
+       replaces nsel individual Python CSR loops for the occupancy-weighted diagonal
+       (r==s) two-body part.  Pre-allocated output avoids the broadcast-copy allocation.
 
-    2. **Log-binning by max_cj**: Group source CSFs into ~20 log-bins so CSFs in the
-       same bin share one ``build_g_base`` call (the cutoff-fixed one-body + off-diagonal
-       two-body part).  One GPU kernel launch per (root, bin) replaces one launch per
-       (root, CSF).  For nsel=50K, nroots=4: ~80 launches instead of 200K.
+    2. **Single-pass g_base**: One ``build_g_base`` call at the tightest global cutoff
+       (= epsilon / max(max_cj)) is conservative (includes all integrals needed by any
+       source CSF) and avoids per-bin g_base overhead.
 
-    3. **Vectorized build_g_base**: The inner CSR loop in build_g_base is replaced by
-       np.repeat + np.bincount (fully NumPy, no Python inner loops).
+    3. **One GPU kernel launch per root**: Entire g_batch (nsel, norb^2) uploaded once
+       per root and processed in a single batched kernel call, reducing Python-level
+       launches from O(nroots × nsel) to O(nroots).
     """
     try:
         import cupy as cp  # type: ignore[import-not-found]
@@ -244,38 +245,40 @@ def _heat_bath_select_python(
 
     stream = cp.cuda.get_current_stream()
 
-    # --- Step 1: Build occupancy batch matrix (nsel, norb) ---
+    # --- Step 1: Occupancy batch (nsel, norb) from state_cache steps ---
     state_cache = get_state_cache(drt)
-    steps = np.asarray(state_cache.steps, dtype=np.int8)  # (ncsf, norb)
+    steps = np.asarray(state_cache.steps, dtype=np.int8)  # (ncsf, norb) step values
     _STEP_TO_OCC = np.array([0, 1, 1, 2], dtype=np.float64)
 
     sel_idx_i32 = np.asarray(sel_idx, dtype=np.int32)
-    sel_steps = steps[sel_idx_i32]                              # (nsel, norb)
-    occ_batch = _STEP_TO_OCC[sel_steps.astype(np.int32)]        # (nsel, norb) float64
+    occ_batch = _STEP_TO_OCC[steps[sel_idx_i32].astype(np.int32)]  # (nsel, norb)
 
-    # --- Step 2: Diagonal g_flat via single GEMM ---
-    # g_diag_batch[j, pq] = 0.5 * sum_r occ_j[r] * eri_diag_t[r, pq]
-    # occ_batch: (nsel, norb),  eri_diag_t: (norb, nops)  →  result: (nsel, nops)
-    g_diag_batch = 0.5 * (occ_batch @ hb_index.eri_diag_t)     # (nsel, nops) — one GEMM
-
-    # --- Step 3: Per-CSF max|c_j| and log-binning ---
+    # --- Step 2: max|c_j| and global cutoff ---
     max_cj = np.max(np.abs(c_sel), axis=1)  # (nsel,)
     pos_mask = max_cj > 0.0
-    pos_where = np.where(pos_mask)[0]
-
-    if pos_where.size == 0:
+    if not pos_mask.any():
         return [], np.zeros((nroots,), dtype=np.float64)
 
-    # Bin by floor(log2(max_cj)); resolution=1 → factor-2 bins.
-    # Two CSFs in the same bin have max_cj ratio ≤ 2.
-    log2_max = np.floor(np.log2(max_cj[pos_where] + 1e-300)).astype(np.int32)
-    unique_bins = np.unique(log2_max)
+    # Use tightest cutoff: epsilon / max(max_cj) → conservative (includes all integrals
+    # needed by any source CSF; some may get extra small terms, which is correct).
+    global_cutoff = float(epsilon) / float(max_cj[pos_mask].max())
 
-    # Precompute c_sel device array for scale lookup
+    # --- Step 3: Build g_batch (nsel, nops) ---
+    # Pre-allocate to avoid the broadcast-copy allocation in g_base + g_diag.
+    g_batch = np.empty((nsel, nops), dtype=np.float64)
+    np.dot(occ_batch, hb_index.eri_diag_t, out=g_batch)   # (nsel, nops) via BLAS GEMM
+    g_batch *= 0.5
+    g_batch += build_g_base(hb_index, global_cutoff)       # in-place broadcast add
+
+    # Zero out rows for CSFs with max_cj == 0 (no contribution possible)
+    if not pos_mask.all():
+        g_batch[~pos_mask] = 0.0
+
+    # --- Step 4: GPU setup and hash table ---
     c_sel_d = cp.ascontiguousarray(cp.asarray(c_sel, dtype=cp.float64))
     e_var_d = cp.ascontiguousarray(cp.asarray(e_var, dtype=cp.float64).ravel())
+    sel_idx_d = cp.asarray(sel_idx_i32, dtype=cp.int32)
 
-    # --- Hash table setup ---
     cap = int(frontier_buffers.get("hash_cap", 0))
     if cap <= 0:
         mult = min(256, max(32, nops // 4))
@@ -290,6 +293,9 @@ def _heat_bath_select_python(
     frontier_hash_max_retries = int(frontier_buffers.get("max_retries", 8))
     selected_mask_d = frontier_buffers.get("selected_mask_d")
     hdiag_d = frontier_buffers.get("hdiag_d")
+
+    # Upload g_batch to GPU once (shared across all roots)
+    g_batch_d = cp.asarray(g_batch, dtype=cp.float64)  # (nsel, nops) — one PCIe transfer
 
     for attempt in range(frontier_hash_max_retries):
         if int(frontier_buffers.get("hash_cap", 0)) != cap or frontier_buffers.get("hash_keys") is None:
@@ -311,47 +317,26 @@ def _heat_bath_select_python(
         cipsi_frontier_hash_clear_inplace_device(hash_keys, hash_vals, threads=256, stream=stream, sync=False)
         cp.cuda.runtime.memsetAsync(int(hash_overflow.data.ptr), 0, 4, int(stream.ptr))
 
-        # --- Step 4: For each log-bin: one g_base + one batch GPU call per root ---
-        for bin_id in unique_bins:
-            # Local indices within pos_where
-            local_mask = log2_max == bin_id
-            local_where = pos_where[local_mask]      # indices into [0, nsel)
-
-            # Conservative cutoff for this bin: use the largest max_cj in bin
-            # (lowest cutoff → includes all integrals needed by any CSF in bin)
-            bin_max_cj = float(max_cj[local_where].max())
-            bin_cutoff = epsilon / bin_max_cj if bin_max_cj > 0.0 else 0.0
-
-            # Build cutoff-fixed part (one-body + off-diagonal 2e) — once per bin
-            g_base = build_g_base(hb_index, bin_cutoff)  # (nops,) on CPU
-
-            # Combine: g_total[j] = g_base + g_diag_batch[j]  for j in bin
-            g_batch_cpu = g_base[None, :] + g_diag_batch[local_where]  # (bin_size, nops)
-
-            # Upload batch to GPU (one transfer per bin)
-            g_batch_d = cp.asarray(g_batch_cpu, dtype=cp.float64)      # (bin_size, nops)
-            bin_csf_d = cp.asarray(sel_idx_i32[local_where], dtype=cp.int32)  # (bin_size,)
-
-            # One kernel launch per (bin, root) instead of one per (CSF, root)
-            for r in range(nroots):
-                task_scale_d = cp.ascontiguousarray(c_sel_d[local_where, r])  # (bin_size,)
-                apply_g_flat_scatter_atomic_frontier_hash_inplace_device(
-                    drt,
-                    ws.drt_dev,
-                    ws.state_dev,
-                    bin_csf_d,
-                    g_batch_d,
-                    task_scale=task_scale_d,
-                    hash_keys=hash_keys,
-                    hash_vals=hash_vals,
-                    root=r,
-                    overflow=hash_overflow,
-                    clear_overflow=False,
-                    threads=256,
-                    stream=stream,
-                    sync=False,
-                    check_overflow=False,
-                )
+        # --- Step 5: One GPU kernel launch per root (not per CSF) ---
+        for r in range(nroots):
+            task_scale_d = cp.ascontiguousarray(c_sel_d[:, r])  # (nsel,)
+            apply_g_flat_scatter_atomic_frontier_hash_inplace_device(
+                drt,
+                ws.drt_dev,
+                ws.state_dev,
+                sel_idx_d,
+                g_batch_d,
+                task_scale=task_scale_d,
+                hash_keys=hash_keys,
+                hash_vals=hash_vals,
+                root=r,
+                overflow=hash_overflow,
+                clear_overflow=False,
+                threads=256,
+                stream=stream,
+                sync=False,
+                check_overflow=False,
+            )
 
         # Overflow check
         stream.synchronize()

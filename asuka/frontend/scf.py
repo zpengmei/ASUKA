@@ -858,6 +858,235 @@ def run_rhf_dense(
     )
 
 
+def run_rhf_direct(
+    mol: Molecule,
+    *,
+    basis: Any | None = None,
+    expand_contractions: bool = True,
+    eps_schwarz: float = 1e-12,
+    direct_threads: int = 256,
+    direct_max_tile_bytes: int = 256 << 20,
+    max_cycle: int = 50,
+    conv_tol: float = 1e-10,
+    conv_tol_dm: float = 1e-8,
+    diis: bool = True,
+    diis_start_cycle: int | None = None,
+    diis_space: int = 8,
+    damping: float = 0.0,
+    level_shift: float = 0.0,
+    dm0: Any | None = None,
+    mo_coeff0: Any | None = None,
+    init_fock_cycles: int | None = None,
+    profile: dict | None = None,
+) -> RHFDFRunResult:
+    """Run RHF with integral-direct 4-center J/K (no DF, no materialized ERI)."""
+
+    if int(mol.spin) != 0:
+        raise NotImplementedError("run_rhf_direct currently supports only closed-shell molecules (spin=0)")
+
+    nelec = int(mol.nelectron)
+    if nelec <= 0 or nelec % 2 != 0:
+        raise ValueError("RHF requires an even, positive electron count")
+
+    basis_in = mol.basis if basis is None else basis
+    ao_basis, basis_name = build_ao_basis_cart(mol, basis=basis_in, expand_contractions=bool(expand_contractions))
+    coords, charges = _atom_coords_charges_bohr(mol)
+    int1e = build_int1e_cart(ao_basis, atom_coords_bohr=coords, atom_charges=charges)
+
+    if not bool(mol.cart):
+        raise NotImplementedError("Integral-direct SCF does not yet support spherical AOs (cart=False)")
+
+    from asuka.hf.direct_jk import make_direct_jk_context  # noqa: PLC0415
+    from asuka.hf.direct_scf import rhf_direct  # noqa: PLC0415
+
+    jk_ctx = make_direct_jk_context(
+        ao_basis,
+        eps_schwarz=float(eps_schwarz),
+        threads=int(direct_threads),
+        max_tile_bytes=int(direct_max_tile_bytes),
+    )
+
+    init_fock_cycles_i = int(_HF_INIT_FOCK_CYCLES) if init_fock_cycles is None else max(0, int(init_fock_cycles))
+    diis_start_cycle_i = (
+        int(diis_start_cycle) if diis_start_cycle is not None else (1 if int(init_fock_cycles_i) > 0 else 2)
+    )
+    scf = rhf_direct(
+        int1e.S,
+        int1e.hcore,
+        jk_ctx,
+        nelec=int(nelec),
+        enuc=float(mol.energy_nuc()),
+        max_cycle=int(max_cycle),
+        conv_tol=float(conv_tol),
+        conv_tol_dm=float(conv_tol_dm),
+        diis=bool(diis),
+        diis_start_cycle=int(diis_start_cycle_i),
+        diis_space=int(diis_space),
+        damping=float(damping),
+        level_shift=float(level_shift),
+        dm0=dm0,
+        mo_coeff0=mo_coeff0,
+        init_fock_cycles=int(init_fock_cycles_i),
+        profile=profile,
+    )
+
+    return RHFDFRunResult(
+        mol=mol,
+        basis_name=str(basis_name),
+        auxbasis_name="<direct>",
+        ao_basis=ao_basis,
+        aux_basis=None,
+        int1e=int1e,
+        df_B=None,
+        scf=scf,
+        profile=profile,
+    )
+
+
+def run_uhf_direct(
+    mol: Molecule,
+    *,
+    basis: Any | None = None,
+    expand_contractions: bool = True,
+    eps_schwarz: float = 1e-12,
+    direct_threads: int = 256,
+    direct_max_tile_bytes: int = 256 << 20,
+    max_cycle: int = 50,
+    conv_tol: float = 1e-10,
+    conv_tol_dm: float = 1e-8,
+    diis: bool = True,
+    diis_start_cycle: int = 2,
+    diis_space: int = 8,
+    damping: float = 0.0,
+    dm0: Any | None = None,
+    mo_coeff0: Any | None = None,
+    profile: dict | None = None,
+) -> UHFDFRunResult:
+    """Run UHF with integral-direct 4-center J/K."""
+
+    nalpha, nbeta = _nalpha_nbeta_from_mol(mol)
+    basis_in = mol.basis if basis is None else basis
+    ao_basis, basis_name = build_ao_basis_cart(mol, basis=basis_in, expand_contractions=bool(expand_contractions))
+    coords, charges = _atom_coords_charges_bohr(mol)
+    int1e = build_int1e_cart(ao_basis, atom_coords_bohr=coords, atom_charges=charges)
+
+    if not bool(mol.cart):
+        raise NotImplementedError("Integral-direct SCF does not yet support spherical AOs (cart=False)")
+
+    from asuka.hf.direct_jk import make_direct_jk_context  # noqa: PLC0415
+    from asuka.hf.direct_scf import uhf_direct  # noqa: PLC0415
+
+    jk_ctx = make_direct_jk_context(
+        ao_basis,
+        eps_schwarz=float(eps_schwarz),
+        threads=int(direct_threads),
+        max_tile_bytes=int(direct_max_tile_bytes),
+    )
+
+    scf = uhf_direct(
+        int1e.S,
+        int1e.hcore,
+        jk_ctx,
+        nalpha=int(nalpha),
+        nbeta=int(nbeta),
+        enuc=float(mol.energy_nuc()),
+        max_cycle=int(max_cycle),
+        conv_tol=float(conv_tol),
+        conv_tol_dm=float(conv_tol_dm),
+        diis=bool(diis),
+        diis_start_cycle=int(diis_start_cycle),
+        diis_space=int(diis_space),
+        damping=float(damping),
+        dm0=dm0,
+        mo_coeff0=mo_coeff0,
+        profile=profile,
+    )
+
+    return UHFDFRunResult(
+        mol=mol,
+        basis_name=str(basis_name),
+        auxbasis_name="<direct>",
+        ao_basis=ao_basis,
+        aux_basis=None,
+        int1e=int1e,
+        df_B=None,
+        scf=scf,
+        profile=profile,
+    )
+
+
+def run_rohf_direct(
+    mol: Molecule,
+    *,
+    basis: Any | None = None,
+    expand_contractions: bool = True,
+    eps_schwarz: float = 1e-12,
+    direct_threads: int = 256,
+    direct_max_tile_bytes: int = 256 << 20,
+    max_cycle: int = 50,
+    conv_tol: float = 1e-10,
+    conv_tol_dm: float = 1e-8,
+    diis: bool = True,
+    diis_start_cycle: int = 2,
+    diis_space: int = 8,
+    damping: float = 0.0,
+    dm0: Any | None = None,
+    mo_coeff0: Any | None = None,
+    profile: dict | None = None,
+) -> ROHFDFRunResult:
+    """Run ROHF with integral-direct 4-center J/K."""
+
+    nalpha, nbeta = _nalpha_nbeta_from_mol(mol)
+    basis_in = mol.basis if basis is None else basis
+    ao_basis, basis_name = build_ao_basis_cart(mol, basis=basis_in, expand_contractions=bool(expand_contractions))
+    coords, charges = _atom_coords_charges_bohr(mol)
+    int1e = build_int1e_cart(ao_basis, atom_coords_bohr=coords, atom_charges=charges)
+
+    if not bool(mol.cart):
+        raise NotImplementedError("Integral-direct SCF does not yet support spherical AOs (cart=False)")
+
+    from asuka.hf.direct_jk import make_direct_jk_context  # noqa: PLC0415
+    from asuka.hf.direct_scf import rohf_direct  # noqa: PLC0415
+
+    jk_ctx = make_direct_jk_context(
+        ao_basis,
+        eps_schwarz=float(eps_schwarz),
+        threads=int(direct_threads),
+        max_tile_bytes=int(direct_max_tile_bytes),
+    )
+
+    scf = rohf_direct(
+        int1e.S,
+        int1e.hcore,
+        jk_ctx,
+        nalpha=int(nalpha),
+        nbeta=int(nbeta),
+        enuc=float(mol.energy_nuc()),
+        max_cycle=int(max_cycle),
+        conv_tol=float(conv_tol),
+        conv_tol_dm=float(conv_tol_dm),
+        diis=bool(diis),
+        diis_start_cycle=int(diis_start_cycle),
+        diis_space=int(diis_space),
+        damping=float(damping),
+        dm0=dm0,
+        mo_coeff0=mo_coeff0,
+        profile=profile,
+    )
+
+    return ROHFDFRunResult(
+        mol=mol,
+        basis_name=str(basis_name),
+        auxbasis_name="<direct>",
+        ao_basis=ao_basis,
+        aux_basis=None,
+        int1e=int1e,
+        df_B=None,
+        scf=scf,
+        profile=profile,
+    )
+
+
 def run_uhf_dense(
     mol: Molecule,
     *,
@@ -2523,8 +2752,8 @@ def run_hf_df(
         two_e = "df" if bool(df) else "dense"
     else:
         two_e = str(two_e_backend).strip().lower()
-        if two_e not in {"df", "dense", "thc"}:
-            raise ValueError("two_e_backend must be one of: 'df', 'dense', 'thc'")
+        if two_e not in {"df", "dense", "thc", "direct"}:
+            raise ValueError("two_e_backend must be one of: 'df', 'dense', 'thc', 'direct'")
 
     if method_s in {"rks", "uks"}:
         if backend_s != "cuda":
@@ -2569,6 +2798,38 @@ def run_hf_df(
         if method_s == "uhf":
             return run_uhf_dense(mol, backend=backend_s, dm0=dm0, mo_coeff0=mo_coeff0, **dense_kwargs)
         return run_rohf_dense(mol, backend=backend_s, dm0=dm0, mo_coeff0=mo_coeff0, **dense_kwargs)
+
+    if two_e == "direct":
+        if backend_s != "cuda":
+            raise NotImplementedError("Direct integral backend currently requires backend='cuda'")
+        direct_kwargs = dict(kwargs)
+        # Ignore DF/dense-only knobs.
+        for key in (
+            "auxbasis",
+            "df_config",
+            "df_threads",
+            "jk_mode",
+            "k_engine",
+            "k_q_block",
+            "cublas_math_mode",
+            "ao_basis",
+            "aux_basis",
+            "df_backend",
+            "df_mode",
+            "df_aux_block_naux",
+            "L_metric",
+            "dense_threads",
+            "dense_max_tile_bytes",
+            "dense_eps_ao",
+            "dense_max_l",
+            "dense_mem_budget_gib",
+        ):
+            direct_kwargs.pop(key, None)
+        if method_s == "rhf":
+            return run_rhf_direct(mol, dm0=dm0, mo_coeff0=mo_coeff0, **direct_kwargs)
+        if method_s == "uhf":
+            return run_uhf_direct(mol, dm0=dm0, mo_coeff0=mo_coeff0, **direct_kwargs)
+        return run_rohf_direct(mol, dm0=dm0, mo_coeff0=mo_coeff0, **direct_kwargs)
 
     if two_e == "thc":
         if backend_s != "cuda":
