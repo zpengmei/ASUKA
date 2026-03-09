@@ -85,7 +85,7 @@ def make_direct_jk_context(
 
     import cupy as cp  # noqa: PLC0415
 
-    from asuka.cueri.eri_dispatch import plan_kernel_batches_spd  # noqa: PLC0415
+    from asuka.cueri.eri_dispatch import KernelBatch, resolve_kernel_class_id  # noqa: PLC0415
     from asuka.cueri.gpu import (  # noqa: PLC0415
         CUDA_MAX_L,
         CUDA_MAX_NROOTS,
@@ -96,6 +96,7 @@ def make_direct_jk_context(
     )
     from asuka.cueri.shell_pairs import build_shell_pairs_l_order  # noqa: PLC0415
     from asuka.cueri.tasks import (  # noqa: PLC0415
+        TaskList,
         build_tasks_screened,
         build_tasks_screened_sorted_q,
         decode_eri_class_id,
@@ -146,26 +147,46 @@ def make_direct_jk_context(
     tasks = with_task_class_id(tasks, sp, shell_l)
     assert tasks.task_class_id is not None
 
-    # Collect unique class IDs for diagnostics
-    _, class_ids, _ = group_tasks_by_class(tasks.task_class_id)
+    # Group tasks by class: O(N log N) sort — fast even for 46M tasks
+    perm, class_ids, offsets = group_tasks_by_class(tasks.task_class_id)
+    task_ab = tasks.task_spAB[perm]
+    task_cd = tasks.task_spCD[perm]
 
-    # Plan specialized kernel batches (handles bra/ket swap automatically)
-    batches = plan_kernel_batches_spd(tasks, shell_pairs=sp, shell_l=shell_l)
+    # Upload all task arrays in ONE transfer instead of one per batch
+    task_ab_dev = cp.ascontiguousarray(cp.asarray(task_ab, dtype=cp.int32))
+    task_cd_dev = cp.ascontiguousarray(cp.asarray(task_cd, dtype=cp.int32))
 
-    # Pre-compute device-resident data for each batch
+    # Build dispatch plan: O(1) per class (not O(57×ntasks) like plan_kernel_batches_spd).
+    # resolve_kernel_class_id() checks if a native kernel exists, possibly with bra/ket swap.
     batch_infos = []
-    for b in batches:
-        idx = b.task_idx
-        # Recover original (un-swapped) class from the task list
-        orig_cid = int(tasks.task_class_id[int(idx[0])])
+    for g in range(int(class_ids.shape[0])):
+        orig_cid = int(class_ids[g])
+        j0, j1 = int(offsets[g]), int(offsets[g + 1])
+        if j1 <= j0:
+            continue
+
         la, lb, lc, ld = decode_eri_class_id(orig_cid)
-        # Original task indices (before any bra/ket swap for kernel dispatch)
-        orig_spAB = tasks.task_spAB[idx]
-        orig_spCD = tasks.task_spCD[idx]
+        kernel_cid, transpose = resolve_kernel_class_id(orig_cid)
+
+        # Kernel tasks are CPU numpy arrays (slices, no copy)
+        if transpose:
+            kernel_spAB = task_cd[j0:j1]
+            kernel_spCD = task_ab[j0:j1]
+        else:
+            kernel_spAB = task_ab[j0:j1]
+            kernel_spCD = task_cd[j0:j1]
+
+        batch = KernelBatch(
+            task_idx=perm[j0:j1],
+            kernel_tasks=TaskList(task_spAB=kernel_spAB, task_spCD=kernel_spCD),
+            kernel_class_id=np.int32(kernel_cid),
+            transpose=transpose,  # run_kernel_batch_spd transposes tiles back to (AB|CD) order
+        )
+
         batch_infos.append(_BatchInfo(
-            batch=b,
-            orig_spAB_dev=cp.ascontiguousarray(cp.asarray(orig_spAB, dtype=cp.int32)),
-            orig_spCD_dev=cp.ascontiguousarray(cp.asarray(orig_spCD, dtype=cp.int32)),
+            batch=batch,
+            orig_spAB_dev=task_ab_dev[j0:j1],  # view — no extra copy
+            orig_spCD_dev=task_cd_dev[j0:j1],  # view — no extra copy
             orig_la=int(la),
             orig_lb=int(lb),
             orig_lc=int(lc),

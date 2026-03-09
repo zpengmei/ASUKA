@@ -42,6 +42,12 @@ from asuka.solver import GUGAFCISolver
 
 
 def _asnumpy_f64(a) -> np.ndarray:
+    try:
+        import cupy as cp  # type: ignore[import-not-found]
+    except Exception:
+        cp = None  # type: ignore
+    if cp is not None and isinstance(a, cp.ndarray):  # type: ignore[attr-defined]
+        a = cp.asnumpy(a)
     return np.asarray(a, dtype=np.float64)
 
 

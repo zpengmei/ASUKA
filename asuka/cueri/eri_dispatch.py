@@ -93,6 +93,81 @@ _GENERIC_WARP_CAP_LARGE = max(1, _env_int("ASUKA_CUERI_GENERIC_WARP_CAP_LARGE", 
 _GENERIC_WARP_CAP_THRESHOLD = max(1, _env_int("ASUKA_CUERI_GENERIC_WARP_CAP_THRESHOLD", 1024))
 
 
+# Set of class IDs that have native CUDA kernels (excluding ff* which are opt-in).
+# Used by make_direct_jk_context to resolve kernel dispatch in O(1) per class
+# instead of the O(57*ntasks) vectorized loop in plan_kernel_batches_spd.
+_NATIVE_CLASS_IDS: frozenset[int] = frozenset([
+    int(eri_class_id(0, 0, 0, 0)),
+    int(eri_class_id(1, 0, 0, 0)),
+    int(eri_class_id(1, 1, 0, 0)),
+    int(eri_class_id(1, 0, 1, 0)),
+    int(eri_class_id(1, 1, 1, 0)),
+    int(eri_class_id(1, 1, 1, 1)),
+    int(eri_class_id(2, 0, 0, 0)),
+    int(eri_class_id(2, 2, 0, 0)),
+    int(eri_class_id(0, 0, 2, 1)),
+    int(eri_class_id(1, 0, 2, 0)),
+    int(eri_class_id(1, 0, 2, 1)),
+    int(eri_class_id(1, 0, 2, 2)),
+    int(eri_class_id(1, 1, 2, 0)),
+    int(eri_class_id(1, 1, 2, 1)),
+    int(eri_class_id(1, 1, 2, 2)),
+    int(eri_class_id(2, 0, 2, 0)),
+    int(eri_class_id(2, 0, 2, 1)),
+    int(eri_class_id(2, 0, 2, 2)),
+    int(eri_class_id(3, 1, 0, 0)),
+    int(eri_class_id(3, 2, 0, 0)),
+    int(eri_class_id(3, 1, 1, 0)),
+    int(eri_class_id(3, 2, 1, 0)),
+    int(eri_class_id(3, 1, 2, 0)),
+    int(eri_class_id(3, 2, 2, 0)),
+    int(eri_class_id(0, 0, 3, 0)),
+    int(eri_class_id(1, 0, 3, 0)),
+    int(eri_class_id(1, 1, 3, 0)),
+    int(eri_class_id(2, 0, 3, 0)),
+    int(eri_class_id(3, 0, 3, 0)),
+    int(eri_class_id(2, 1, 3, 0)),
+    int(eri_class_id(3, 1, 3, 0)),
+    int(eri_class_id(2, 2, 3, 0)),
+    int(eri_class_id(3, 2, 3, 0)),
+    int(eri_class_id(0, 0, 4, 0)),
+    int(eri_class_id(1, 0, 4, 0)),
+    int(eri_class_id(1, 1, 4, 0)),
+    int(eri_class_id(2, 0, 4, 0)),
+    int(eri_class_id(3, 0, 4, 0)),
+    int(eri_class_id(2, 1, 4, 0)),
+    int(eri_class_id(3, 1, 4, 0)),
+    int(eri_class_id(2, 2, 4, 0)),
+    int(eri_class_id(3, 2, 4, 0)),
+    int(eri_class_id(2, 1, 2, 1)),
+    int(eri_class_id(2, 1, 2, 2)),
+    int(eri_class_id(2, 2, 2, 2)),
+])
+
+
+def resolve_kernel_class_id(cid: int) -> tuple[int, bool]:
+    """For a given ERI class ID, return ``(kernel_class_id, transpose)``.
+
+    Returns the native specialized kernel class (possibly with bra/ket swap
+    when ``transpose=True``) if one is available, otherwise returns
+    ``(cid, False)`` signalling a fallback to the generic Rys kernel.
+
+    This is O(1) per class and intended for per-class dispatch planning in
+    :func:`make_direct_jk_context`, which already has tasks grouped by class
+    via :func:`group_tasks_by_class`.  Use this instead of calling the full
+    :func:`plan_kernel_batches_spd` (which does an O(57 × ntasks) loop) when
+    you only need the dispatch decision per class.
+    """
+    cid = int(cid)
+    if cid in _NATIVE_CLASS_IDS:
+        return cid, False
+    la, lb, lc, ld = decode_eri_class_id(cid)
+    swap_cid = int(eri_class_id(lc, ld, la, lb))
+    if swap_cid in _NATIVE_CLASS_IDS:
+        return swap_cid, True
+    return cid, False
+
+
 @dataclass(frozen=True)
 class KernelBatch:
     task_idx: np.ndarray  # int32, indices into original task list
@@ -1197,4 +1272,4 @@ def run_kernel_batch_spd(
         return tile
 
 
-__all__ = ["KernelBatch", "plan_kernel_batches_spd", "run_kernel_batch_spd"]
+__all__ = ["KernelBatch", "_NATIVE_CLASS_IDS", "plan_kernel_batches_spd", "resolve_kernel_class_id", "run_kernel_batch_spd"]
