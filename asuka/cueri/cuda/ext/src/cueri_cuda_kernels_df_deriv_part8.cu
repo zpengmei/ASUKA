@@ -1,4 +1,4 @@
-// Auto-split from cueri_cuda_kernels_df_deriv.cu (part 3/17: KernelDFInt3c2eDerivContractedCartAllSPAtomGrad..KernelDFInt3c2eDerivContractedCartAllSPAtomGrad)
+// Auto-split from cueri_cuda_kernels_df_deriv.cu (part 8/17: KernelDFInt3c2eDerivContractedCartAllSPAtomGradSphBarQpMultiBar..KernelDFInt3c2eDerivContractedCartAllSPAtomGradSphBarQpMultiBar)
 // Do not edit — regenerate with split_large_kernels.py
 
 #include <cuda_runtime.h>
@@ -363,11 +363,10 @@ __device__ __forceinline__ void warp_reduce_sum_arr(double* v) {
 
 // Bridge: gap code from previous part (types needed here).
 
-// Batched variant: processes ALL AO shell pairs in one (la,lb) class × all spCD in one lq class
-// in a single 2D kernel launch.  Results are accumulated directly into grad_dev via atomicAdd.
-// Grid: dim3(ntasks_cd, n_spAB).  Block: same thread layout as KernelDFInt3c2eDerivContractedCartBatch.
-template <int NROOTS>
-__global__ void KernelDFInt3c2eDerivContractedCartAllSPAtomGrad(
+// Packed-Qp multi-bar variant: consumes multiple independent packed-Qp bar_X tensors directly
+// (no Qmn chunk staging) and accumulates NBAR gradients in one kernel pass.
+template <int NROOTS, typename TBar, int NBAR>
+__global__ void KernelDFInt3c2eDerivContractedCartAllSPAtomGradSphBarQpMultiBar(
     const int32_t* spAB_arr,   // [n_spAB] AO shell-pair indices in this (la,lb) class
     int n_spAB,
     const int32_t* spCD,       // [ntasks] aux shell-pair indices
@@ -390,12 +389,19 @@ __global__ void KernelDFInt3c2eDerivContractedCartAllSPAtomGrad(
     const double* pair_cK,
     int nao,
     int naux,
+    int nao_sph,
     int la,
     int lb,
     int lc,
-    const double* bar_X_flat,
-    const int32_t* shell_atom,  // combined AO+aux shell->atom map (length: nAOshells+nAuxShells)
-    double* grad_dev) {         // [natm*3] gradient accumulator (atomicAdd target)
+    const TBar* bar_X_sph_Qp0,          // [naux*ntri]
+    const TBar* bar_X_sph_Qp1,          // [naux*ntri]
+    const TBar* bar_X_sph_Qp2,          // [naux*ntri] (ignored when NBAR<3)
+    const int32_t* shell_ao_start_sph, // spherical AO start offset per AO shell
+    const int32_t* shell_atom,         // combined AO+aux shell->atom map (length: nAOshells+nAuxShells)
+    int q_offset,                      // absolute aux AO start index for streamed bar_X window
+    int q_count,                       // number of aux AO rows in streamed bar_X window
+    double* grad_dev_multi,            // [NBAR*grad_stride]
+    int64_t grad_stride) {             // stride (elements) between gradients (typically natm*3)
   const int t   = static_cast<int>(blockIdx.x);  // CD task index
   const int iAB = static_cast<int>(blockIdx.y);  // AB class index
   if (t >= ntasks || iAB >= n_spAB) return;
@@ -403,7 +409,7 @@ __global__ void KernelDFInt3c2eDerivContractedCartAllSPAtomGrad(
   const int spAB   = static_cast<int>(spAB_arr[iAB]);
   const int spCD_i = static_cast<int>(spCD[t]);
 
-  // --- Shared memory (identical layout to KernelDFInt3c2eDerivContractedCartBatch) ---
+  // --- Shared memory (identical layout to KernelDFInt3c2eDerivContractedCartAllSPAtomGradSphBarQmnMultiBar) ---
   __shared__ int8_t shA_lx[kNcartMax], shA_ly[kNcartMax], shA_lz[kNcartMax];
   __shared__ int8_t shB_lx[kNcartMax], shB_ly[kNcartMax], shB_lz[kNcartMax];
   __shared__ int8_t shC_lx[kNcartMax], shC_ly[kNcartMax], shC_lz[kNcartMax];
@@ -413,8 +419,8 @@ __global__ void KernelDFInt3c2eDerivContractedCartAllSPAtomGrad(
   __shared__ double sh_Gy[kMaxWarpsPerBlock][kGSizeD];
   __shared__ double sh_Gz[kMaxWarpsPerBlock][kGSizeD];
 
-  __shared__ double sh_warp_sum[kMaxWarpsPerBlock][9];
-  __shared__ double sh_bar[kBarCacheMax];
+  __shared__ double sh_warp_sum[kMaxWarpsPerBlock][9 * NBAR];
+  __shared__ double sh_bar[NBAR * kBarCacheMax];
 
   const int shellA = static_cast<int>(sp_A[spAB]);
   const int shellB = static_cast<int>(sp_B[spAB]);
@@ -425,9 +431,10 @@ __global__ void KernelDFInt3c2eDerivContractedCartAllSPAtomGrad(
   const int nC = ncart(lc);
   const int nElem = nA * nB * nC;
 
-  const int a0 = static_cast<int>(shell_ao_start[shellA]);
-  const int b0 = static_cast<int>(shell_ao_start[shellB]);
   const int c0 = static_cast<int>(shell_ao_start[shellC]) - nao;
+
+  const int a0_sph = static_cast<int>(shell_ao_start_sph[shellA]);
+  const int b0_sph = static_cast<int>(shell_ao_start_sph[shellB]);
 
   const int baseAB = static_cast<int>(sp_pair_start[spAB]);
   const int baseCD = static_cast<int>(sp_pair_start[spCD_i]);
@@ -468,27 +475,35 @@ __global__ void KernelDFInt3c2eDerivContractedCartAllSPAtomGrad(
   }
 
   const bool cache_bar = (nElem > 0 && nElem <= kBarCacheMax);
+  const TBar* bar_ptrs[3] = {bar_X_sph_Qp0, bar_X_sph_Qp1, bar_X_sph_Qp2};
+
   if (cache_bar) {
     for (int idx = static_cast<int>(threadIdx.x); idx < nElem; idx += static_cast<int>(blockDim.x)) {
       const int ia = idx / (nB * nC);
       const int rem = idx - ia * (nB * nC);
       const int ib = rem / nC;
       const int ic = rem - ib * nC;
-      const int row_idx = (a0 + ia) * nao + (b0 + ib);
-      const int col_idx = c0 + ic;
-      sh_bar[idx] = bar_X_flat[static_cast<int64_t>(row_idx) * static_cast<int64_t>(naux) + static_cast<int64_t>(col_idx)];
+      const int q = c0 + ic;
+#pragma unroll
+      for (int r = 0; r < NBAR; ++r) {
+        sh_bar[r * kBarCacheMax + idx] = df_bar_cart_from_sph_qp_stream(
+            bar_ptrs[r], q, q_offset, q_count, ia, ib, la, lb, a0_sph, b0_sph, nao_sph);
+      }
     }
   }
 
   __syncthreads();
 
-  // Block-level bar_X early-exit: skip block if max|sh_bar| < threshold.
+  // Block-level bar_X early-exit: skip block if max|sh_bar| < threshold across both bars.
   if (cache_bar) {
     double tmax = 0.0;
     for (int idx = static_cast<int>(threadIdx.x); idx < nElem; idx += static_cast<int>(blockDim.x)) {
-      double v = static_cast<double>(sh_bar[idx]);
-      if (v < 0.0) v = -v;
-      if (v > tmax) tmax = v;
+#pragma unroll
+      for (int r = 0; r < NBAR; ++r) {
+        double v = static_cast<double>(sh_bar[r * kBarCacheMax + idx]);
+        if (v < 0.0) v = -v;
+        if (v > tmax) tmax = v;
+      }
     }
     for (int offset = 16; offset > 0; offset >>= 1) {
       double other = __shfl_down_sync(0xffffffff, tmax, offset);
@@ -516,9 +531,9 @@ __global__ void KernelDFInt3c2eDerivContractedCartAllSPAtomGrad(
   const int warp_id = static_cast<int>(threadIdx.x) >> 5;
   const int warps = static_cast<int>(blockDim.x) >> 5;
 
-  double acc[9];
+  double acc[9 * NBAR];
 #pragma unroll
-  for (int i = 0; i < 9; ++i) acc[i] = 0.0;
+  for (int i = 0; i < 9 * NBAR; ++i) acc[i] = 0.0;
 
   const int nmax = la + lb + 1;
   const int mmax = lc + 1;
@@ -564,9 +579,9 @@ __global__ void KernelDFInt3c2eDerivContractedCartAllSPAtomGrad(
       cueri_rys::rys_roots_weights<NROOTS>(T, roots, weights);
     }
 
-    for (int r = 0; r < NROOTS; ++r) {
-      double x = (lane == 0) ? roots[r] : 0.0;
-      double w = (lane == 0) ? weights[r] : 0.0;
+    for (int rrt = 0; rrt < NROOTS; ++rrt) {
+      double x = (lane == 0) ? roots[rrt] : 0.0;
+      double w = (lane == 0) ? weights[rrt] : 0.0;
       x = __shfl_sync(0xffffffff, x, 0);
       w = __shfl_sync(0xffffffff, w, 0);
 
@@ -590,24 +605,11 @@ __global__ void KernelDFInt3c2eDerivContractedCartAllSPAtomGrad(
       __syncwarp();
 
       for (int idx = lane; idx < nElem; idx += 32) {
-        double bar = 0.0;
-        if (cache_bar) {
-          bar = sh_bar[idx];
-        } else {
-          const int ia = idx / (nB * nC);
-          const int rem = idx - ia * (nB * nC);
-          const int ib = rem / nC;
-          const int ic = rem - ib * nC;
-          const int row_idx = (a0 + ia) * nao + (b0 + ib);
-          const int col_idx = c0 + ic;
-          bar = bar_X_flat[static_cast<int64_t>(row_idx) * static_cast<int64_t>(naux) + static_cast<int64_t>(col_idx)];
-        }
-        if (bar == 0.0) continue;
-
         const int ia = idx / (nB * nC);
         const int rem = idx - ia * (nB * nC);
         const int ib = rem / nC;
         const int ic = rem - ib * nC;
+        const int q_idx = c0 + ic;
 
         const int iax = static_cast<int>(shA_lx[ia]);
         const int iay = static_cast<int>(shA_ly[ia]);
@@ -623,55 +625,67 @@ __global__ void KernelDFInt3c2eDerivContractedCartAllSPAtomGrad(
         const double Iy = shift_from_G_ld0_d(sh_Gy[warp_id], iay, iby, icy, sh_yij_pow);
         const double Iz = shift_from_G_ld0_d(sh_Gz[warp_id], iaz, ibz, icz, sh_zij_pow);
 
-        const double bar_scale = bar * scale;
+#pragma unroll
+        for (int br = 0; br < NBAR; ++br) {
+          double bar = 0.0;
+          if (cache_bar) {
+            bar = sh_bar[br * kBarCacheMax + idx];
+          } else {
+            const TBar* bar_r = (br == 0) ? bar_X_sph_Qp0 : bar_X_sph_Qp1;
+            bar = df_bar_cart_from_sph_qp_stream(
+                bar_r, q_idx, q_offset, q_count, ia, ib, la, lb, a0_sph, b0_sph, nao_sph);
+          }
+          if (bar == 0.0) continue;
+          const double bar_scale = bar * scale;
 
-        // Center A derivatives.
-        const double Ix_m_A = (iax > 0) ? shift_from_G_ld0_d(sh_Gx[warp_id], iax - 1, ibx, icx, sh_xij_pow) : 0.0;
-        const double Ix_p_A = shift_from_G_ld0_d(sh_Gx[warp_id], iax + 1, ibx, icx, sh_xij_pow);
-        const double dIx_A = (-static_cast<double>(iax)) * Ix_m_A + (2.0 * aexp) * Ix_p_A;
-        acc[0] += bar_scale * (dIx_A * Iy * Iz);
+          // Center A derivatives.
+          const double Ix_m_A = (iax > 0) ? shift_from_G_ld0_d(sh_Gx[warp_id], iax - 1, ibx, icx, sh_xij_pow) : 0.0;
+          const double Ix_p_A = shift_from_G_ld0_d(sh_Gx[warp_id], iax + 1, ibx, icx, sh_xij_pow);
+          const double dIx_A = (-static_cast<double>(iax)) * Ix_m_A + (2.0 * aexp) * Ix_p_A;
+          acc[br * 9 + 0] += bar_scale * (dIx_A * Iy * Iz);
 
-        const double Iy_m_A = (iay > 0) ? shift_from_G_ld0_d(sh_Gy[warp_id], iay - 1, iby, icy, sh_yij_pow) : 0.0;
-        const double Iy_p_A = shift_from_G_ld0_d(sh_Gy[warp_id], iay + 1, iby, icy, sh_yij_pow);
-        const double dIy_A = (-static_cast<double>(iay)) * Iy_m_A + (2.0 * aexp) * Iy_p_A;
-        acc[1] += bar_scale * (Ix * dIy_A * Iz);
+          const double Iy_m_A = (iay > 0) ? shift_from_G_ld0_d(sh_Gy[warp_id], iay - 1, iby, icy, sh_yij_pow) : 0.0;
+          const double Iy_p_A = shift_from_G_ld0_d(sh_Gy[warp_id], iay + 1, iby, icy, sh_yij_pow);
+          const double dIy_A = (-static_cast<double>(iay)) * Iy_m_A + (2.0 * aexp) * Iy_p_A;
+          acc[br * 9 + 1] += bar_scale * (Ix * dIy_A * Iz);
 
-        const double Iz_m_A = (iaz > 0) ? shift_from_G_ld0_d(sh_Gz[warp_id], iaz - 1, ibz, icz, sh_zij_pow) : 0.0;
-        const double Iz_p_A = shift_from_G_ld0_d(sh_Gz[warp_id], iaz + 1, ibz, icz, sh_zij_pow);
-        const double dIz_A = (-static_cast<double>(iaz)) * Iz_m_A + (2.0 * aexp) * Iz_p_A;
-        acc[2] += bar_scale * (Ix * Iy * dIz_A);
+          const double Iz_m_A = (iaz > 0) ? shift_from_G_ld0_d(sh_Gz[warp_id], iaz - 1, ibz, icz, sh_zij_pow) : 0.0;
+          const double Iz_p_A = shift_from_G_ld0_d(sh_Gz[warp_id], iaz + 1, ibz, icz, sh_zij_pow);
+          const double dIz_A = (-static_cast<double>(iaz)) * Iz_m_A + (2.0 * aexp) * Iz_p_A;
+          acc[br * 9 + 2] += bar_scale * (Ix * Iy * dIz_A);
 
-        // Center B derivatives.
-        const double Ix_m_B = (ibx > 0) ? shift_from_G_ld0_d(sh_Gx[warp_id], iax, ibx - 1, icx, sh_xij_pow) : 0.0;
-        const double Ix_p_B = shift_from_G_ld0_d(sh_Gx[warp_id], iax, ibx + 1, icx, sh_xij_pow);
-        const double dIx_B = (-static_cast<double>(ibx)) * Ix_m_B + (2.0 * bexp) * Ix_p_B;
-        acc[3] += bar_scale * (dIx_B * Iy * Iz);
+          // Center B derivatives.
+          const double Ix_m_B = (ibx > 0) ? shift_from_G_ld0_d(sh_Gx[warp_id], iax, ibx - 1, icx, sh_xij_pow) : 0.0;
+          const double Ix_p_B = shift_from_G_ld0_d(sh_Gx[warp_id], iax, ibx + 1, icx, sh_xij_pow);
+          const double dIx_B = (-static_cast<double>(ibx)) * Ix_m_B + (2.0 * bexp) * Ix_p_B;
+          acc[br * 9 + 3] += bar_scale * (dIx_B * Iy * Iz);
 
-        const double Iy_m_B = (iby > 0) ? shift_from_G_ld0_d(sh_Gy[warp_id], iay, iby - 1, icy, sh_yij_pow) : 0.0;
-        const double Iy_p_B = shift_from_G_ld0_d(sh_Gy[warp_id], iay, iby + 1, icy, sh_yij_pow);
-        const double dIy_B = (-static_cast<double>(iby)) * Iy_m_B + (2.0 * bexp) * Iy_p_B;
-        acc[4] += bar_scale * (Ix * dIy_B * Iz);
+          const double Iy_m_B = (iby > 0) ? shift_from_G_ld0_d(sh_Gy[warp_id], iay, iby - 1, icy, sh_yij_pow) : 0.0;
+          const double Iy_p_B = shift_from_G_ld0_d(sh_Gy[warp_id], iay, iby + 1, icy, sh_yij_pow);
+          const double dIy_B = (-static_cast<double>(iby)) * Iy_m_B + (2.0 * bexp) * Iy_p_B;
+          acc[br * 9 + 4] += bar_scale * (Ix * dIy_B * Iz);
 
-        const double Iz_m_B = (ibz > 0) ? shift_from_G_ld0_d(sh_Gz[warp_id], iaz, ibz - 1, icz, sh_zij_pow) : 0.0;
-        const double Iz_p_B = shift_from_G_ld0_d(sh_Gz[warp_id], iaz, ibz + 1, icz, sh_zij_pow);
-        const double dIz_B = (-static_cast<double>(ibz)) * Iz_m_B + (2.0 * bexp) * Iz_p_B;
-        acc[5] += bar_scale * (Ix * Iy * dIz_B);
+          const double Iz_m_B = (ibz > 0) ? shift_from_G_ld0_d(sh_Gz[warp_id], iaz, ibz - 1, icz, sh_zij_pow) : 0.0;
+          const double Iz_p_B = shift_from_G_ld0_d(sh_Gz[warp_id], iaz, ibz + 1, icz, sh_zij_pow);
+          const double dIz_B = (-static_cast<double>(ibz)) * Iz_m_B + (2.0 * bexp) * Iz_p_B;
+          acc[br * 9 + 5] += bar_scale * (Ix * Iy * dIz_B);
 
-        // Center C derivatives (aux).
-        const double Ix_m_C = (icx > 0) ? shift_from_G_ld0_d(sh_Gx[warp_id], iax, ibx, icx - 1, sh_xij_pow) : 0.0;
-        const double Ix_p_C = shift_from_G_ld0_d(sh_Gx[warp_id], iax, ibx, icx + 1, sh_xij_pow);
-        const double dIx_C = (-static_cast<double>(icx)) * Ix_m_C + (2.0 * cexp) * Ix_p_C;
-        acc[6] += bar_scale * (dIx_C * Iy * Iz);
+          // Center C derivatives (aux).
+          const double Ix_m_C = (icx > 0) ? shift_from_G_ld0_d(sh_Gx[warp_id], iax, ibx, icx - 1, sh_xij_pow) : 0.0;
+          const double Ix_p_C = shift_from_G_ld0_d(sh_Gx[warp_id], iax, ibx, icx + 1, sh_xij_pow);
+          const double dIx_C = (-static_cast<double>(icx)) * Ix_m_C + (2.0 * cexp) * Ix_p_C;
+          acc[br * 9 + 6] += bar_scale * (dIx_C * Iy * Iz);
 
-        const double Iy_m_C = (icy > 0) ? shift_from_G_ld0_d(sh_Gy[warp_id], iay, iby, icy - 1, sh_yij_pow) : 0.0;
-        const double Iy_p_C = shift_from_G_ld0_d(sh_Gy[warp_id], iay, iby, icy + 1, sh_yij_pow);
-        const double dIy_C = (-static_cast<double>(icy)) * Iy_m_C + (2.0 * cexp) * Iy_p_C;
-        acc[7] += bar_scale * (Ix * dIy_C * Iz);
+          const double Iy_m_C = (icy > 0) ? shift_from_G_ld0_d(sh_Gy[warp_id], iay, iby, icy - 1, sh_yij_pow) : 0.0;
+          const double Iy_p_C = shift_from_G_ld0_d(sh_Gy[warp_id], iay, iby, icy + 1, sh_yij_pow);
+          const double dIy_C = (-static_cast<double>(icy)) * Iy_m_C + (2.0 * cexp) * Iy_p_C;
+          acc[br * 9 + 7] += bar_scale * (Ix * dIy_C * Iz);
 
-        const double Iz_m_C = (icz > 0) ? shift_from_G_ld0_d(sh_Gz[warp_id], iaz, ibz, icz - 1, sh_zij_pow) : 0.0;
-        const double Iz_p_C = shift_from_G_ld0_d(sh_Gz[warp_id], iaz, ibz, icz + 1, sh_zij_pow);
-        const double dIz_C = (-static_cast<double>(icz)) * Iz_m_C + (2.0 * cexp) * Iz_p_C;
-        acc[8] += bar_scale * (Ix * Iy * dIz_C);
+          const double Iz_m_C = (icz > 0) ? shift_from_G_ld0_d(sh_Gz[warp_id], iaz, ibz, icz - 1, sh_zij_pow) : 0.0;
+          const double Iz_p_C = shift_from_G_ld0_d(sh_Gz[warp_id], iaz, ibz, icz + 1, sh_zij_pow);
+          const double dIz_C = (-static_cast<double>(icz)) * Iz_m_C + (2.0 * cexp) * Iz_p_C;
+          acc[br * 9 + 8] += bar_scale * (Ix * Iy * dIz_C);
+        }
       }
 
       __syncwarp();
@@ -682,42 +696,43 @@ __global__ void KernelDFInt3c2eDerivContractedCartAllSPAtomGrad(
   warp_reduce_sum_arr(acc);
   if (lane == 0) {
 #pragma unroll
-    for (int i = 0; i < 9; ++i) sh_warp_sum[warp_id][i] = acc[i];
+    for (int i = 0; i < 9 * NBAR; ++i) sh_warp_sum[warp_id][i] = acc[i];
   }
   __syncthreads();
 
   if (threadIdx.x == 0) {
-    double sum[9];
+    double sum[9 * NBAR];
 #pragma unroll
-    for (int i = 0; i < 9; ++i) sum[i] = 0.0;
+    for (int i = 0; i < 9 * NBAR; ++i) sum[i] = 0.0;
     for (int w = 0; w < warps; ++w) {
 #pragma unroll
-      for (int i = 0; i < 9; ++i) sum[i] += sh_warp_sum[w][i];
+      for (int i = 0; i < 9 * NBAR; ++i) sum[i] += sh_warp_sum[w][i];
     }
     const double fac = (shellA != shellB) ? 2.0 : 1.0;
     const int atomA = static_cast<int>(shell_atom[shellA]);
     const int atomB = static_cast<int>(shell_atom[shellB]);
     const int atomC = static_cast<int>(shell_atom[shellC]);
-    atomicAdd(&grad_dev[atomA * 3 + 0], fac * sum[0]);
-    atomicAdd(&grad_dev[atomA * 3 + 1], fac * sum[1]);
-    atomicAdd(&grad_dev[atomA * 3 + 2], fac * sum[2]);
-    atomicAdd(&grad_dev[atomB * 3 + 0], fac * sum[3]);
-    atomicAdd(&grad_dev[atomB * 3 + 1], fac * sum[4]);
-    atomicAdd(&grad_dev[atomB * 3 + 2], fac * sum[5]);
-    atomicAdd(&grad_dev[atomC * 3 + 0], fac * sum[6]);
-    atomicAdd(&grad_dev[atomC * 3 + 1], fac * sum[7]);
-    atomicAdd(&grad_dev[atomC * 3 + 2], fac * sum[8]);
+
+    for (int br = 0; br < NBAR; ++br) {
+      double* g = grad_dev_multi + static_cast<int64_t>(br) * grad_stride;
+      atomicAdd(&g[atomA * 3 + 0], fac * sum[br * 9 + 0]);
+      atomicAdd(&g[atomA * 3 + 1], fac * sum[br * 9 + 1]);
+      atomicAdd(&g[atomA * 3 + 2], fac * sum[br * 9 + 2]);
+      atomicAdd(&g[atomB * 3 + 0], fac * sum[br * 9 + 3]);
+      atomicAdd(&g[atomB * 3 + 1], fac * sum[br * 9 + 4]);
+      atomicAdd(&g[atomB * 3 + 2], fac * sum[br * 9 + 5]);
+      atomicAdd(&g[atomC * 3 + 0], fac * sum[br * 9 + 6]);
+      atomicAdd(&g[atomC * 3 + 1], fac * sum[br * 9 + 7]);
+      atomicAdd(&g[atomC * 3 + 2], fac * sum[br * 9 + 8]);
+    }
   }
 }
 
-// Spherical bar_X variant: consumes bar_X in spherical AO basis in Qmn layout and applies the
-// cart<-sph transforms inside the contraction kernel to avoid materializing the full
-// Cartesian bar_X tensor (nao_cart^2 * naux).
 static inline int df_nroots_from_L(int L_total) {
   return ((L_total + 1) / 2) + 1;
 }
 
-static inline cudaError_t launch_df_int3c2e_deriv_cart_allsp_atomgrad(
+static inline cudaError_t launch_df_int3c2e_deriv_cart_allsp_atomgrad_sphbar_qp_multibar2(
     const int32_t* spAB_arr,
     int n_spAB,
     const int32_t* spCD,
@@ -740,94 +755,255 @@ static inline cudaError_t launch_df_int3c2e_deriv_cart_allsp_atomgrad(
     const double* pair_cK,
     int nao,
     int naux,
+    int nao_sph,
     int la,
     int lb,
     int lc,
-    const double* bar_X_flat,
+    const double* bar_X_sph_Qp0,
+    const double* bar_X_sph_Qp1,
+    const int32_t* shell_ao_start_sph,
     const int32_t* shell_atom,
-    double* grad_dev,
+    int q_offset,
+    int q_count,
+    double* grad_dev_multi,
+    int64_t grad_stride,
     cudaStream_t stream,
     int threads) {
+  if (q_count <= 0) return cudaSuccess;
+  if (grad_stride <= 0) return cudaErrorInvalidValue;
   const int nroots = df_nroots_from_L(la + lb + lc);
   const dim3 grid(static_cast<unsigned int>(ntasks), static_cast<unsigned int>(n_spAB));
   switch (nroots) {
-    case 1:
-      KernelDFInt3c2eDerivContractedCartAllSPAtomGrad<1><<<grid, threads, 0, stream>>>(
-          spAB_arr, n_spAB, spCD, ntasks, sp_A, sp_B, sp_pair_start, sp_npair,
-          shell_cx, shell_cy, shell_cz, shell_prim_start, shell_nprim, shell_ao_start,
-          prim_exp, pair_eta, pair_Px, pair_Py, pair_Pz, pair_cK,
-          nao, naux, la, lb, lc, bar_X_flat, shell_atom, grad_dev);
+#define LAUNCH_3C_SPH_QP_MULTI2(NR) \
+    case NR: \
+      KernelDFInt3c2eDerivContractedCartAllSPAtomGradSphBarQpMultiBar<NR, double, 2><<<grid, threads, 0, stream>>>( \
+          spAB_arr, n_spAB, spCD, ntasks, sp_A, sp_B, sp_pair_start, sp_npair, \
+          shell_cx, shell_cy, shell_cz, shell_prim_start, shell_nprim, shell_ao_start, \
+          prim_exp, pair_eta, pair_Px, pair_Py, pair_Pz, pair_cK, \
+          nao, naux, nao_sph, la, lb, lc, bar_X_sph_Qp0, bar_X_sph_Qp1, bar_X_sph_Qp1, shell_ao_start_sph, shell_atom, \
+          q_offset, q_count, grad_dev_multi, grad_stride); \
       break;
-    case 2:
-      KernelDFInt3c2eDerivContractedCartAllSPAtomGrad<2><<<grid, threads, 0, stream>>>(
-          spAB_arr, n_spAB, spCD, ntasks, sp_A, sp_B, sp_pair_start, sp_npair,
-          shell_cx, shell_cy, shell_cz, shell_prim_start, shell_nprim, shell_ao_start,
-          prim_exp, pair_eta, pair_Px, pair_Py, pair_Pz, pair_cK,
-          nao, naux, la, lb, lc, bar_X_flat, shell_atom, grad_dev);
+    LAUNCH_3C_SPH_QP_MULTI2(1)
+    LAUNCH_3C_SPH_QP_MULTI2(2)
+    LAUNCH_3C_SPH_QP_MULTI2(3)
+    LAUNCH_3C_SPH_QP_MULTI2(4)
+    LAUNCH_3C_SPH_QP_MULTI2(5)
+    LAUNCH_3C_SPH_QP_MULTI2(6)
+    LAUNCH_3C_SPH_QP_MULTI2(7)
+    LAUNCH_3C_SPH_QP_MULTI2(8)
+    LAUNCH_3C_SPH_QP_MULTI2(9)
+    LAUNCH_3C_SPH_QP_MULTI2(10)
+    LAUNCH_3C_SPH_QP_MULTI2(11)
+#undef LAUNCH_3C_SPH_QP_MULTI2
+    default:
+      return cudaErrorInvalidValue;
+  }
+  return cudaGetLastError();
+}
+
+static inline cudaError_t launch_df_int3c2e_deriv_cart_allsp_atomgrad_sphbar_qp_multibar2_f32bar(
+    const int32_t* spAB_arr,
+    int n_spAB,
+    const int32_t* spCD,
+    int ntasks,
+    const int32_t* sp_A,
+    const int32_t* sp_B,
+    const int32_t* sp_pair_start,
+    const int32_t* sp_npair,
+    const double* shell_cx,
+    const double* shell_cy,
+    const double* shell_cz,
+    const int32_t* shell_prim_start,
+    const int32_t* shell_nprim,
+    const int32_t* shell_ao_start,
+    const double* prim_exp,
+    const double* pair_eta,
+    const double* pair_Px,
+    const double* pair_Py,
+    const double* pair_Pz,
+    const double* pair_cK,
+    int nao,
+    int naux,
+    int nao_sph,
+    int la,
+    int lb,
+    int lc,
+    const float* bar_X_sph_Qp0,
+    const float* bar_X_sph_Qp1,
+    const int32_t* shell_ao_start_sph,
+    const int32_t* shell_atom,
+    int q_offset,
+    int q_count,
+    double* grad_dev_multi,
+    int64_t grad_stride,
+    cudaStream_t stream,
+    int threads) {
+  if (q_count <= 0) return cudaSuccess;
+  if (grad_stride <= 0) return cudaErrorInvalidValue;
+  const int nroots = df_nroots_from_L(la + lb + lc);
+  const dim3 grid(static_cast<unsigned int>(ntasks), static_cast<unsigned int>(n_spAB));
+  switch (nroots) {
+#define LAUNCH_3C_SPH_QP_MULTI2_F32(NR) \
+    case NR: \
+      KernelDFInt3c2eDerivContractedCartAllSPAtomGradSphBarQpMultiBar<NR, float, 2><<<grid, threads, 0, stream>>>( \
+          spAB_arr, n_spAB, spCD, ntasks, sp_A, sp_B, sp_pair_start, sp_npair, \
+          shell_cx, shell_cy, shell_cz, shell_prim_start, shell_nprim, shell_ao_start, \
+          prim_exp, pair_eta, pair_Px, pair_Py, pair_Pz, pair_cK, \
+          nao, naux, nao_sph, la, lb, lc, bar_X_sph_Qp0, bar_X_sph_Qp1, bar_X_sph_Qp1, shell_ao_start_sph, shell_atom, \
+          q_offset, q_count, grad_dev_multi, grad_stride); \
       break;
-    case 3:
-      KernelDFInt3c2eDerivContractedCartAllSPAtomGrad<3><<<grid, threads, 0, stream>>>(
-          spAB_arr, n_spAB, spCD, ntasks, sp_A, sp_B, sp_pair_start, sp_npair,
-          shell_cx, shell_cy, shell_cz, shell_prim_start, shell_nprim, shell_ao_start,
-          prim_exp, pair_eta, pair_Px, pair_Py, pair_Pz, pair_cK,
-          nao, naux, la, lb, lc, bar_X_flat, shell_atom, grad_dev);
+    LAUNCH_3C_SPH_QP_MULTI2_F32(1)
+    LAUNCH_3C_SPH_QP_MULTI2_F32(2)
+    LAUNCH_3C_SPH_QP_MULTI2_F32(3)
+    LAUNCH_3C_SPH_QP_MULTI2_F32(4)
+    LAUNCH_3C_SPH_QP_MULTI2_F32(5)
+    LAUNCH_3C_SPH_QP_MULTI2_F32(6)
+    LAUNCH_3C_SPH_QP_MULTI2_F32(7)
+    LAUNCH_3C_SPH_QP_MULTI2_F32(8)
+    LAUNCH_3C_SPH_QP_MULTI2_F32(9)
+    LAUNCH_3C_SPH_QP_MULTI2_F32(10)
+    LAUNCH_3C_SPH_QP_MULTI2_F32(11)
+#undef LAUNCH_3C_SPH_QP_MULTI2_F32
+    default:
+      return cudaErrorInvalidValue;
+  }
+  return cudaGetLastError();
+}
+
+static inline cudaError_t launch_df_int3c2e_deriv_cart_allsp_atomgrad_sphbar_qp_multibar3(
+    const int32_t* spAB_arr,
+    int n_spAB,
+    const int32_t* spCD,
+    int ntasks,
+    const int32_t* sp_A,
+    const int32_t* sp_B,
+    const int32_t* sp_pair_start,
+    const int32_t* sp_npair,
+    const double* shell_cx,
+    const double* shell_cy,
+    const double* shell_cz,
+    const int32_t* shell_prim_start,
+    const int32_t* shell_nprim,
+    const int32_t* shell_ao_start,
+    const double* prim_exp,
+    const double* pair_eta,
+    const double* pair_Px,
+    const double* pair_Py,
+    const double* pair_Pz,
+    const double* pair_cK,
+    int nao,
+    int naux,
+    int nao_sph,
+    int la,
+    int lb,
+    int lc,
+    const double* bar_X_sph_Qp0,
+    const double* bar_X_sph_Qp1,
+    const double* bar_X_sph_Qp2,
+    const int32_t* shell_ao_start_sph,
+    const int32_t* shell_atom,
+    int q_offset,
+    int q_count,
+    double* grad_dev_multi,
+    int64_t grad_stride,
+    cudaStream_t stream,
+    int threads) {
+  if (q_count <= 0) return cudaSuccess;
+  if (grad_stride <= 0) return cudaErrorInvalidValue;
+  const int nroots = df_nroots_from_L(la + lb + lc);
+  const dim3 grid(static_cast<unsigned int>(ntasks), static_cast<unsigned int>(n_spAB));
+  switch (nroots) {
+#define LAUNCH_3C_SPH_QP_MULTI3(NR) \
+    case NR: \
+      KernelDFInt3c2eDerivContractedCartAllSPAtomGradSphBarQpMultiBar<NR, double, 3><<<grid, threads, 0, stream>>>( \
+          spAB_arr, n_spAB, spCD, ntasks, sp_A, sp_B, sp_pair_start, sp_npair, \
+          shell_cx, shell_cy, shell_cz, shell_prim_start, shell_nprim, shell_ao_start, \
+          prim_exp, pair_eta, pair_Px, pair_Py, pair_Pz, pair_cK, \
+          nao, naux, nao_sph, la, lb, lc, bar_X_sph_Qp0, bar_X_sph_Qp1, bar_X_sph_Qp2, shell_ao_start_sph, shell_atom, \
+          q_offset, q_count, grad_dev_multi, grad_stride); \
       break;
-    case 4:
-      KernelDFInt3c2eDerivContractedCartAllSPAtomGrad<4><<<grid, threads, 0, stream>>>(
-          spAB_arr, n_spAB, spCD, ntasks, sp_A, sp_B, sp_pair_start, sp_npair,
-          shell_cx, shell_cy, shell_cz, shell_prim_start, shell_nprim, shell_ao_start,
-          prim_exp, pair_eta, pair_Px, pair_Py, pair_Pz, pair_cK,
-          nao, naux, la, lb, lc, bar_X_flat, shell_atom, grad_dev);
+    LAUNCH_3C_SPH_QP_MULTI3(1)
+    LAUNCH_3C_SPH_QP_MULTI3(2)
+    LAUNCH_3C_SPH_QP_MULTI3(3)
+    LAUNCH_3C_SPH_QP_MULTI3(4)
+    LAUNCH_3C_SPH_QP_MULTI3(5)
+    LAUNCH_3C_SPH_QP_MULTI3(6)
+    LAUNCH_3C_SPH_QP_MULTI3(7)
+    LAUNCH_3C_SPH_QP_MULTI3(8)
+    LAUNCH_3C_SPH_QP_MULTI3(9)
+    LAUNCH_3C_SPH_QP_MULTI3(10)
+    LAUNCH_3C_SPH_QP_MULTI3(11)
+#undef LAUNCH_3C_SPH_QP_MULTI3
+    default:
+      return cudaErrorInvalidValue;
+  }
+  return cudaGetLastError();
+}
+
+static inline cudaError_t launch_df_int3c2e_deriv_cart_allsp_atomgrad_sphbar_qp_multibar3_f32bar(
+    const int32_t* spAB_arr,
+    int n_spAB,
+    const int32_t* spCD,
+    int ntasks,
+    const int32_t* sp_A,
+    const int32_t* sp_B,
+    const int32_t* sp_pair_start,
+    const int32_t* sp_npair,
+    const double* shell_cx,
+    const double* shell_cy,
+    const double* shell_cz,
+    const int32_t* shell_prim_start,
+    const int32_t* shell_nprim,
+    const int32_t* shell_ao_start,
+    const double* prim_exp,
+    const double* pair_eta,
+    const double* pair_Px,
+    const double* pair_Py,
+    const double* pair_Pz,
+    const double* pair_cK,
+    int nao,
+    int naux,
+    int nao_sph,
+    int la,
+    int lb,
+    int lc,
+    const float* bar_X_sph_Qp0,
+    const float* bar_X_sph_Qp1,
+    const float* bar_X_sph_Qp2,
+    const int32_t* shell_ao_start_sph,
+    const int32_t* shell_atom,
+    int q_offset,
+    int q_count,
+    double* grad_dev_multi,
+    int64_t grad_stride,
+    cudaStream_t stream,
+    int threads) {
+  if (q_count <= 0) return cudaSuccess;
+  if (grad_stride <= 0) return cudaErrorInvalidValue;
+  const int nroots = df_nroots_from_L(la + lb + lc);
+  const dim3 grid(static_cast<unsigned int>(ntasks), static_cast<unsigned int>(n_spAB));
+  switch (nroots) {
+#define LAUNCH_3C_SPH_QP_MULTI3_F32(NR) \
+    case NR: \
+      KernelDFInt3c2eDerivContractedCartAllSPAtomGradSphBarQpMultiBar<NR, float, 3><<<grid, threads, 0, stream>>>( \
+          spAB_arr, n_spAB, spCD, ntasks, sp_A, sp_B, sp_pair_start, sp_npair, \
+          shell_cx, shell_cy, shell_cz, shell_prim_start, shell_nprim, shell_ao_start, \
+          prim_exp, pair_eta, pair_Px, pair_Py, pair_Pz, pair_cK, \
+          nao, naux, nao_sph, la, lb, lc, bar_X_sph_Qp0, bar_X_sph_Qp1, bar_X_sph_Qp2, shell_ao_start_sph, shell_atom, \
+          q_offset, q_count, grad_dev_multi, grad_stride); \
       break;
-    case 5:
-      KernelDFInt3c2eDerivContractedCartAllSPAtomGrad<5><<<grid, threads, 0, stream>>>(
-          spAB_arr, n_spAB, spCD, ntasks, sp_A, sp_B, sp_pair_start, sp_npair,
-          shell_cx, shell_cy, shell_cz, shell_prim_start, shell_nprim, shell_ao_start,
-          prim_exp, pair_eta, pair_Px, pair_Py, pair_Pz, pair_cK,
-          nao, naux, la, lb, lc, bar_X_flat, shell_atom, grad_dev);
-      break;
-    case 6:
-      KernelDFInt3c2eDerivContractedCartAllSPAtomGrad<6><<<grid, threads, 0, stream>>>(
-          spAB_arr, n_spAB, spCD, ntasks, sp_A, sp_B, sp_pair_start, sp_npair,
-          shell_cx, shell_cy, shell_cz, shell_prim_start, shell_nprim, shell_ao_start,
-          prim_exp, pair_eta, pair_Px, pair_Py, pair_Pz, pair_cK,
-          nao, naux, la, lb, lc, bar_X_flat, shell_atom, grad_dev);
-      break;
-    case 7:
-      KernelDFInt3c2eDerivContractedCartAllSPAtomGrad<7><<<grid, threads, 0, stream>>>(
-          spAB_arr, n_spAB, spCD, ntasks, sp_A, sp_B, sp_pair_start, sp_npair,
-          shell_cx, shell_cy, shell_cz, shell_prim_start, shell_nprim, shell_ao_start,
-          prim_exp, pair_eta, pair_Px, pair_Py, pair_Pz, pair_cK,
-          nao, naux, la, lb, lc, bar_X_flat, shell_atom, grad_dev);
-      break;
-    case 8:
-      KernelDFInt3c2eDerivContractedCartAllSPAtomGrad<8><<<grid, threads, 0, stream>>>(
-          spAB_arr, n_spAB, spCD, ntasks, sp_A, sp_B, sp_pair_start, sp_npair,
-          shell_cx, shell_cy, shell_cz, shell_prim_start, shell_nprim, shell_ao_start,
-          prim_exp, pair_eta, pair_Px, pair_Py, pair_Pz, pair_cK,
-          nao, naux, la, lb, lc, bar_X_flat, shell_atom, grad_dev);
-      break;
-    case 9:
-      KernelDFInt3c2eDerivContractedCartAllSPAtomGrad<9><<<grid, threads, 0, stream>>>(
-          spAB_arr, n_spAB, spCD, ntasks, sp_A, sp_B, sp_pair_start, sp_npair,
-          shell_cx, shell_cy, shell_cz, shell_prim_start, shell_nprim, shell_ao_start,
-          prim_exp, pair_eta, pair_Px, pair_Py, pair_Pz, pair_cK,
-          nao, naux, la, lb, lc, bar_X_flat, shell_atom, grad_dev);
-      break;
-    case 10:
-      KernelDFInt3c2eDerivContractedCartAllSPAtomGrad<10><<<grid, threads, 0, stream>>>(
-          spAB_arr, n_spAB, spCD, ntasks, sp_A, sp_B, sp_pair_start, sp_npair,
-          shell_cx, shell_cy, shell_cz, shell_prim_start, shell_nprim, shell_ao_start,
-          prim_exp, pair_eta, pair_Px, pair_Py, pair_Pz, pair_cK,
-          nao, naux, la, lb, lc, bar_X_flat, shell_atom, grad_dev);
-      break;
-    case 11:
-      KernelDFInt3c2eDerivContractedCartAllSPAtomGrad<11><<<grid, threads, 0, stream>>>(
-          spAB_arr, n_spAB, spCD, ntasks, sp_A, sp_B, sp_pair_start, sp_npair,
-          shell_cx, shell_cy, shell_cz, shell_prim_start, shell_nprim, shell_ao_start,
-          prim_exp, pair_eta, pair_Px, pair_Py, pair_Pz, pair_cK,
-          nao, naux, la, lb, lc, bar_X_flat, shell_atom, grad_dev);
-      break;
+    LAUNCH_3C_SPH_QP_MULTI3_F32(1)
+    LAUNCH_3C_SPH_QP_MULTI3_F32(2)
+    LAUNCH_3C_SPH_QP_MULTI3_F32(3)
+    LAUNCH_3C_SPH_QP_MULTI3_F32(4)
+    LAUNCH_3C_SPH_QP_MULTI3_F32(5)
+    LAUNCH_3C_SPH_QP_MULTI3_F32(6)
+    LAUNCH_3C_SPH_QP_MULTI3_F32(7)
+    LAUNCH_3C_SPH_QP_MULTI3_F32(8)
+    LAUNCH_3C_SPH_QP_MULTI3_F32(9)
+    LAUNCH_3C_SPH_QP_MULTI3_F32(10)
+    LAUNCH_3C_SPH_QP_MULTI3_F32(11)
+#undef LAUNCH_3C_SPH_QP_MULTI3_F32
     default:
       return cudaErrorInvalidValue;
   }
@@ -836,7 +1012,7 @@ static inline cudaError_t launch_df_int3c2e_deriv_cart_allsp_atomgrad(
 
 }  // namespace
 
-extern "C" cudaError_t cueri_df_int3c2e_deriv_contracted_cart_allsp_atomgrad_launch_stream(
+extern "C" cudaError_t cueri_df_int3c2e_deriv_contracted_cart_allsp_atomgrad_sphbar_qp_multibar2_launch_stream(
     const int32_t* spAB_arr,
     int n_spAB,
     const int32_t* spCD,
@@ -859,21 +1035,170 @@ extern "C" cudaError_t cueri_df_int3c2e_deriv_contracted_cart_allsp_atomgrad_lau
     const double* pair_cK,
     int nao,
     int naux,
+    int nao_sph,
     int la,
     int lb,
     int lc,
-    const double* bar_X_flat,
+    const double* bar_X_sph_Qp0,
+    const double* bar_X_sph_Qp1,
+    const int32_t* shell_ao_start_sph,
     const int32_t* shell_atom,
-    double* grad_dev,
+    double* grad_dev_multi,
+    int64_t grad_stride,
     cudaStream_t stream,
     int threads) {
-  return launch_df_int3c2e_deriv_cart_allsp_atomgrad(
+  return launch_df_int3c2e_deriv_cart_allsp_atomgrad_sphbar_qp_multibar2(
       spAB_arr, n_spAB, spCD, ntasks,
       sp_A, sp_B, sp_pair_start, sp_npair,
       shell_cx, shell_cy, shell_cz,
       shell_prim_start, shell_nprim, shell_ao_start,
       prim_exp, pair_eta, pair_Px, pair_Py, pair_Pz, pair_cK,
-      nao, naux, la, lb, lc, bar_X_flat, shell_atom, grad_dev,
+      nao, naux, nao_sph, la, lb, lc,
+      bar_X_sph_Qp0, bar_X_sph_Qp1, shell_ao_start_sph, shell_atom,
+      0, naux, grad_dev_multi, grad_stride,
+      stream, threads);
+}
+
+extern "C" cudaError_t cueri_df_int3c2e_deriv_contracted_cart_allsp_atomgrad_sphbar_qp_multibar2_f32bar_launch_stream(
+    const int32_t* spAB_arr,
+    int n_spAB,
+    const int32_t* spCD,
+    int ntasks,
+    const int32_t* sp_A,
+    const int32_t* sp_B,
+    const int32_t* sp_pair_start,
+    const int32_t* sp_npair,
+    const double* shell_cx,
+    const double* shell_cy,
+    const double* shell_cz,
+    const int32_t* shell_prim_start,
+    const int32_t* shell_nprim,
+    const int32_t* shell_ao_start,
+    const double* prim_exp,
+    const double* pair_eta,
+    const double* pair_Px,
+    const double* pair_Py,
+    const double* pair_Pz,
+    const double* pair_cK,
+    int nao,
+    int naux,
+    int nao_sph,
+    int la,
+    int lb,
+    int lc,
+    const float* bar_X_sph_Qp0,
+    const float* bar_X_sph_Qp1,
+    const int32_t* shell_ao_start_sph,
+    const int32_t* shell_atom,
+    double* grad_dev_multi,
+    int64_t grad_stride,
+    cudaStream_t stream,
+    int threads) {
+  return launch_df_int3c2e_deriv_cart_allsp_atomgrad_sphbar_qp_multibar2_f32bar(
+      spAB_arr, n_spAB, spCD, ntasks,
+      sp_A, sp_B, sp_pair_start, sp_npair,
+      shell_cx, shell_cy, shell_cz,
+      shell_prim_start, shell_nprim, shell_ao_start,
+      prim_exp, pair_eta, pair_Px, pair_Py, pair_Pz, pair_cK,
+      nao, naux, nao_sph, la, lb, lc,
+      bar_X_sph_Qp0, bar_X_sph_Qp1, shell_ao_start_sph, shell_atom,
+      0, naux, grad_dev_multi, grad_stride,
+      stream, threads);
+}
+
+extern "C" cudaError_t cueri_df_int3c2e_deriv_contracted_cart_allsp_atomgrad_sphbar_qp_multibar3_launch_stream(
+    const int32_t* spAB_arr,
+    int n_spAB,
+    const int32_t* spCD,
+    int ntasks,
+    const int32_t* sp_A,
+    const int32_t* sp_B,
+    const int32_t* sp_pair_start,
+    const int32_t* sp_npair,
+    const double* shell_cx,
+    const double* shell_cy,
+    const double* shell_cz,
+    const int32_t* shell_prim_start,
+    const int32_t* shell_nprim,
+    const int32_t* shell_ao_start,
+    const double* prim_exp,
+    const double* pair_eta,
+    const double* pair_Px,
+    const double* pair_Py,
+    const double* pair_Pz,
+    const double* pair_cK,
+    int nao,
+    int naux,
+    int nao_sph,
+    int la,
+    int lb,
+    int lc,
+    const double* bar_X_sph_Qp0,
+    const double* bar_X_sph_Qp1,
+    const double* bar_X_sph_Qp2,
+    const int32_t* shell_ao_start_sph,
+    const int32_t* shell_atom,
+    double* grad_dev_multi,
+    int64_t grad_stride,
+    cudaStream_t stream,
+    int threads) {
+  return launch_df_int3c2e_deriv_cart_allsp_atomgrad_sphbar_qp_multibar3(
+      spAB_arr, n_spAB, spCD, ntasks,
+      sp_A, sp_B, sp_pair_start, sp_npair,
+      shell_cx, shell_cy, shell_cz,
+      shell_prim_start, shell_nprim, shell_ao_start,
+      prim_exp, pair_eta, pair_Px, pair_Py, pair_Pz, pair_cK,
+      nao, naux, nao_sph, la, lb, lc,
+      bar_X_sph_Qp0, bar_X_sph_Qp1, bar_X_sph_Qp2, shell_ao_start_sph, shell_atom,
+      0, naux, grad_dev_multi, grad_stride,
+      stream, threads);
+}
+
+extern "C" cudaError_t cueri_df_int3c2e_deriv_contracted_cart_allsp_atomgrad_sphbar_qp_multibar3_f32bar_launch_stream(
+    const int32_t* spAB_arr,
+    int n_spAB,
+    const int32_t* spCD,
+    int ntasks,
+    const int32_t* sp_A,
+    const int32_t* sp_B,
+    const int32_t* sp_pair_start,
+    const int32_t* sp_npair,
+    const double* shell_cx,
+    const double* shell_cy,
+    const double* shell_cz,
+    const int32_t* shell_prim_start,
+    const int32_t* shell_nprim,
+    const int32_t* shell_ao_start,
+    const double* prim_exp,
+    const double* pair_eta,
+    const double* pair_Px,
+    const double* pair_Py,
+    const double* pair_Pz,
+    const double* pair_cK,
+    int nao,
+    int naux,
+    int nao_sph,
+    int la,
+    int lb,
+    int lc,
+    const float* bar_X_sph_Qp0,
+    const float* bar_X_sph_Qp1,
+    const float* bar_X_sph_Qp2,
+    const int32_t* shell_ao_start_sph,
+    const int32_t* shell_atom,
+    double* grad_dev_multi,
+    int64_t grad_stride,
+    cudaStream_t stream,
+    int threads) {
+  return launch_df_int3c2e_deriv_cart_allsp_atomgrad_sphbar_qp_multibar3_f32bar(
+      spAB_arr, n_spAB, spCD, ntasks,
+      sp_A, sp_B, sp_pair_start, sp_npair,
+      shell_cx, shell_cy, shell_cz,
+      shell_prim_start, shell_nprim, shell_ao_start,
+      prim_exp, pair_eta, pair_Px, pair_Py, pair_Pz, pair_cK,
+      nao, naux, nao_sph, la, lb, lc,
+      bar_X_sph_Qp0, bar_X_sph_Qp1, bar_X_sph_Qp2, shell_ao_start_sph, shell_atom,
+      0, naux, grad_dev_multi, grad_stride,
       stream, threads);
 }
 

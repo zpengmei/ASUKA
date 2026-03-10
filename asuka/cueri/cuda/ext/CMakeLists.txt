@@ -46,12 +46,26 @@ pybind11_add_module(
     src/generated/cueri_cuda_kernels_wave2_generated_part5.cu
     src/cueri_cuda_kernels_rys_generic_part1.cu
     src/cueri_cuda_kernels_rys_generic_part2.cu
-    src/cueri_cuda_kernels_rys_generic_deriv.cu
+    src/cueri_cuda_kernels_rys_generic_deriv_part1.cu
+    src/cueri_cuda_kernels_rys_generic_deriv_part2.cu
     src/cueri_cuda_kernels_dense_scatter.cu
     src/cueri_cuda_kernels_df_deriv_part1.cu
     src/cueri_cuda_kernels_df_deriv_part2.cu
     src/cueri_cuda_kernels_df_deriv_part3.cu
     src/cueri_cuda_kernels_df_deriv_part4.cu
+    src/cueri_cuda_kernels_df_deriv_part5.cu
+    src/cueri_cuda_kernels_df_deriv_part6.cu
+    src/cueri_cuda_kernels_df_deriv_part7.cu
+    src/cueri_cuda_kernels_df_deriv_part8.cu
+    src/cueri_cuda_kernels_df_deriv_part9.cu
+    src/cueri_cuda_kernels_df_deriv_part10.cu
+    src/cueri_cuda_kernels_df_deriv_part11.cu
+    src/cueri_cuda_kernels_df_deriv_part12.cu
+    src/cueri_cuda_kernels_df_deriv_part13.cu
+    src/cueri_cuda_kernels_df_deriv_part14.cu
+    src/cueri_cuda_kernels_df_deriv_part15.cu
+    src/cueri_cuda_kernels_df_deriv_part16.cu
+    src/cueri_cuda_kernels_df_deriv_part17.cu
     src/cueri_cuda_kernels_cart2sph_eri.cu
     src/cueri_cuda_kernels_sph.cu
     src/cueri_cuda_kernels_int1e_sph.cu

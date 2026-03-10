@@ -122,7 +122,7 @@ def _parse_structure(lines: list[str]):
     rx_inline = re.compile(r"^(?:static\s+inline|__device__\s+inline|__device__)\s+\S+\s+(\w+)\s*\(")
 
     ns_start = _find_line(lines, r"^namespace \{")
-    ns_end = _find_line(lines, r"^\}  // namespace", start=ns_start)
+    ns_end = _find_line(lines, r"^\}\s*// namespace", start=ns_start)
 
     header_lines = lines[:ns_start]
 
@@ -411,7 +411,11 @@ def _balance_groups(sizes: list[int], n_parts: int) -> list[list[int]]:
     for i, sz in enumerate(sizes):
         current.append(i)
         current_sum += sz
-        if current_sum >= target * (len(groups) + 1) and len(groups) < n_parts - 1:
+        remaining_items = n - (i + 1)
+        remaining_groups = n_parts - len(groups) - 1
+        if len(groups) < n_parts - 1 and (
+            current_sum >= target * (len(groups) + 1) or remaining_items == remaining_groups
+        ):
             groups.append(current)
             current = []
     if current:
@@ -421,13 +425,123 @@ def _balance_groups(sizes: list[int], n_parts: int) -> list[list[int]]:
     return groups
 
 
+def _split_post_namespace_kernels(src: Path, lines: list[str], n_parts: int, no_cmake: bool) -> list[Path]:
+    """Split files whose helpers live in a namespace but whose kernels are outside it.
+
+    This covers sources like `cueri_cuda_kernels_rys_generic_deriv.cu`, where:
+      - shared helpers/constants are wrapped in `namespace { ... }`
+      - `__global__` kernels are defined after the namespace closes
+      - each `extern "C"` launcher appears after the kernel it launches
+    """
+    rx_global = re.compile(r"^__global__\s+\S+\s+(\w+)\s*\(")
+    rx_extern = re.compile(r'^extern\s+"C"\s+\S+\s+(\w+)\s*\(')
+
+    ns_start = _find_line(lines, r"^namespace \{")
+    ns_end = _find_line(lines, r"^\}\s*// namespace", start=ns_start)
+
+    header_lines = lines[:ns_start]
+    preamble_lines = lines[ns_start:ns_end + 1]
+
+    kernels: list[tuple[str, list[str]]] = []
+    externs: list[tuple[str, list[str], set[str]]] = []
+
+    i = ns_end + 1
+    while i < len(lines):
+        m_global = rx_global.match(lines[i])
+        m_extern = rx_extern.match(lines[i])
+        if m_global:
+            end_i = _find_func_end(lines, i)
+            kernels.append((m_global.group(1), list(lines[i:end_i])))
+            i = end_i
+            continue
+        if m_extern:
+            end_i = _find_func_end(lines, i)
+            block = list(lines[i:end_i])
+            body = "\n".join(block)
+            refs = {kname for kname, _ in kernels if _name_in_body(kname, body)}
+            externs.append((m_extern.group(1), block, refs))
+            i = end_i
+            continue
+        i += 1
+
+    if not kernels:
+        raise ValueError("No __global__ kernels found after namespace")
+
+    n_parts = min(n_parts, len(kernels))
+    kernel_sizes = [len(block) for _, block in kernels]
+    groups = _balance_groups(kernel_sizes, n_parts)
+
+    out_paths: list[Path] = []
+    stem = src.stem
+    for part_idx, group in enumerate(groups):
+        part_num = part_idx + 1
+        out_path = src.parent / f"{stem}_part{part_num}.cu"
+        group_kernel_names = {kernels[kidx][0] for kidx in group}
+
+        out_lines: list[str] = []
+        first_name = kernels[group[0]][0]
+        last_name = kernels[group[-1]][0]
+        out_lines.append(
+            f"// Auto-split from {src.name} (part {part_num}/{len(groups)}:"
+            f" {first_name}..{last_name})"
+        )
+        out_lines.append("// Do not edit — regenerate with split_large_kernels.py")
+        out_lines.append("")
+        out_lines.extend(header_lines)
+        out_lines.extend(preamble_lines)
+        out_lines.append("")
+
+        for kidx in group:
+            out_lines.extend(kernels[kidx][1])
+            out_lines.append("")
+
+        for _fname, fblock, refs in externs:
+            if refs & group_kernel_names:
+                out_lines.extend(fblock)
+                out_lines.append("")
+
+        out_path.write_text("\n".join(out_lines) + "\n", encoding="utf-8")
+        approx_lines = sum(kernel_sizes[k] for k in group) + len(preamble_lines)
+        print(
+            f"  Wrote {out_path.name} ({len(group)} kernel(s), ~{approx_lines} lines)",
+            file=sys.stderr,
+        )
+        out_paths.append(out_path)
+
+    all_extern_names = {fname for fname, _, _ in externs}
+    assigned = set()
+    for group in groups:
+        group_kernel_names = {kernels[kidx][0] for kidx in group}
+        for fname, _fblock, refs in externs:
+            if refs & group_kernel_names:
+                assigned.add(fname)
+    unassigned = all_extern_names - assigned
+    if unassigned:
+        print(
+            f"  WARNING: {len(unassigned)} extern(s) not assigned: {sorted(unassigned)}",
+            file=sys.stderr,
+        )
+    else:
+        print(f"  All {len(all_extern_names)} extern(s) assigned. OK.", file=sys.stderr)
+
+    if not no_cmake:
+        _update_cmake(src, out_paths)
+
+    return out_paths
+
+
 def split_file(src: Path, n_parts: int, no_cmake: bool = False) -> list[Path]:
     text = src.read_text(encoding="utf-8")
     lines = text.splitlines(keepends=False)
 
-    header_lines, preamble_lines, kernel_groups, dispatch_helpers, post_ns_statics, extern_blocks = (
-        _parse_structure(lines)
-    )
+    try:
+        header_lines, preamble_lines, kernel_groups, dispatch_helpers, post_ns_statics, extern_blocks = (
+            _parse_structure(lines)
+        )
+    except ValueError as exc:
+        if "No __global__ kernels found in namespace" not in str(exc):
+            raise
+        return _split_post_namespace_kernels(src, lines, n_parts, no_cmake)
 
     n_kernels = len(kernel_groups)
     if n_kernels == 0:
@@ -658,6 +772,7 @@ def main(argv: list[str] | None = None) -> None:
         sources = [
             src_dir / "cueri_cuda_kernels_df_deriv.cu",
             src_dir / "cueri_cuda_kernels_rys_generic.cu",
+            src_dir / "cueri_cuda_kernels_rys_generic_deriv.cu",
         ]
 
     for src in sources:

@@ -11,6 +11,7 @@
 
 #include "cueri_cuda_kernels_api.h"
 #include "cueri_cuda_contract_fock_warp.cuh"
+#include "cueri_cuda_contract_jk_warp.cuh"
 #include "cueri_cuda_rys_device.cuh"
 
 namespace {

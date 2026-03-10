@@ -7,6 +7,7 @@ import numpy as np
 import pytest
 
 from asuka._solver.dump_flags_runtime import dump_flags
+from asuka._solver.init_runtime import configure_solver_runtime_defaults
 from asuka._solver.matvec_cache_runtime import (
     configure_matvec_cuda_ws_cache,
     matvec_cuda_ws_cache_drop,
@@ -23,9 +24,16 @@ from asuka._solver.cuda_policy import (
     normalize_cuda_user_policy_mode,
     normalize_matvec_cuda_path_mode,
     normalize_ws_cache_fraction,
+    resolve_cuda_memory_controls,
+    resolve_kernel_cuda_policy,
     resolve_epq_overbudget_action,
 )
-from asuka._solver.config import auto_num_threads
+from asuka._solver.config import (
+    auto_num_threads,
+    resolve_kernel_frontend_controls,
+    resolve_kernel_runtime_controls,
+    resolve_kernel_solver_controls,
+)
 from asuka._solver.drt_cache import (
     DRTKey,
     ne_constraints_key_to_dict,
@@ -38,6 +46,7 @@ from asuka._solver.matvec_runtime import (
     estimate_matvec_cuda_workspace_bytes,
     release_matvec_cuda_workspace,
     resolve_approx_cuda_frontend,
+    resolve_approx_kernel_iteration_caps,
     resolve_matvec_cuda_ws_cache_budget_bytes,
     resolve_kernel_cuda_execution_mode,
     ws_needs_rebuild,
@@ -191,6 +200,29 @@ def test_matvec_runtime_resolve_approx_cuda_frontend():
             defaults=object(),
             matvec_backend="cuda",
         )
+
+
+def test_matvec_runtime_resolve_approx_kernel_iteration_caps():
+    kwargs = {"max_cycle": 9, "max_space": 11}
+    defaults = SimpleNamespace(approx_kernel_max_cycle=3, approx_kernel_max_space=8)
+    out = resolve_approx_kernel_iteration_caps(
+        kwargs=kwargs,
+        defaults=defaults,
+        nroots=2,
+        matvec_backend="cuda",
+    )
+    assert out["nroots"] == 2
+    assert out["max_cycle"] == 3
+    assert out["max_space"] == 8
+
+    out2 = resolve_approx_kernel_iteration_caps(
+        kwargs={},
+        defaults=SimpleNamespace(approx_kernel_max_cycle=None, approx_kernel_max_space=None),
+        nroots=1,
+        matvec_backend="contract",
+    )
+    assert out2["max_cycle"] == 2
+    assert out2["max_space"] == 4
 
 
 def test_matvec_runtime_ws_needs_rebuild_and_budget_helpers():
@@ -444,6 +476,60 @@ def test_dump_flags_runtime_silent_and_verbose_output():
     assert "matvec_cuda_policy = auto" in text
 
 
+def test_init_runtime_defaults_env_override_and_normalization():
+    seen: dict[str, object] = {}
+
+    def _norm(v):
+        seen["norm_in"] = v
+        return 0.37
+
+    def _auto_cap():
+        seen["auto_cap_called"] = True
+        return 6.5
+
+    solver = SimpleNamespace(
+        matvec_cuda_ws_cache_fraction=0.19,
+        matvec_cuda_mem_hard_cap_gib=3.0,
+        unconverged_fallback_ncsf_max=0,
+    )
+    configure_solver_runtime_defaults(
+        solver,
+        normalize_ws_cache_fraction_fn=_norm,
+        auto_gpu_mem_hard_cap_fn=_auto_cap,
+        env_get_fn=lambda key: "0.91" if key == "ASUKA_GPU_WS_CACHE_FRAC" else None,
+    )
+
+    assert seen["norm_in"] == "0.91"
+    assert "auto_cap_called" in seen
+    assert solver.matvec_cuda_ws_cache_fraction == 0.37
+    # Existing explicit value is preserved via getattr default path.
+    assert solver.matvec_cuda_mem_hard_cap_gib == 3.0
+    assert solver.unconverged_fallback_ncsf_max == 1
+    assert solver.matvec_backend == "contract"
+    assert solver.contract_nthreads == 0
+
+
+def test_init_runtime_defaults_fallback_to_attr_when_env_missing():
+    seen: dict[str, object] = {}
+
+    def _norm(v):
+        seen["norm_in"] = v
+        return float(v)
+
+    solver = SimpleNamespace(matvec_cuda_ws_cache_fraction=0.23)
+    configure_solver_runtime_defaults(
+        solver,
+        normalize_ws_cache_fraction_fn=_norm,
+        auto_gpu_mem_hard_cap_fn=lambda: 7.0,
+        env_get_fn=lambda _key: None,
+    )
+    assert seen["norm_in"] == 0.23
+    assert solver.matvec_cuda_ws_cache_fraction == 0.23
+    assert solver.matvec_cuda_mem_hard_cap_gib == 7.0
+    assert solver.kernel_profile is False
+    assert solver._last_warm_start_info is None
+
+
 def test_warm_state_metadata_validation():
     with pytest.raises(TypeError):
         normalize_warm_cas_metadata("bad", default_ncas=4, default_nelecas=(2, 2))
@@ -502,6 +588,73 @@ def test_apply_cuda_user_policy_defaults_only_for_cuda_backends():
     assert non_cuda == {}
 
 
+def test_resolve_kernel_cuda_policy_helper_behavior():
+    kwargs = {"matvec_cuda_policy": "on", "matvec_cuda_aggregate_offdiag": True}
+    defaults = SimpleNamespace(
+        matvec_cuda_policy="auto",
+        matvec_cuda_accuracy_mode="balanced",
+        matvec_cuda_memory_cap_gib=None,
+        matvec_cuda_dtype="float64",
+        matvec_cuda_aggregate_offdiag=None,
+    )
+    out = resolve_kernel_cuda_policy(
+        kwargs=kwargs,
+        defaults=defaults,
+        matvec_backend="cuda",
+        strict_gpu=False,
+    )
+    assert out["matvec_cuda_aggregate_offdiag_preview"] is True
+    assert out["profile"]["matvec_cuda_policy"] == "on"
+    assert out["profile"]["matvec_cuda_policy_applied"] is True
+    assert kwargs["matvec_cuda_use_epq_table"] is True
+
+    with pytest.raises(ValueError, match="must be > 0"):
+        resolve_kernel_cuda_policy(
+            kwargs={"matvec_cuda_memory_cap_gib": 0.0},
+            defaults=defaults,
+            matvec_backend="cuda",
+            strict_gpu=False,
+        )
+    with pytest.raises(ValueError, match="forbidden by hard guard"):
+        resolve_kernel_cuda_policy(
+            kwargs={"matvec_cuda_aggregate_offdiag": False},
+            defaults=defaults,
+            matvec_backend="cuda",
+            strict_gpu=False,
+        )
+
+    out2 = resolve_kernel_cuda_policy(
+        kwargs={},
+        defaults=defaults,
+        matvec_backend="contract",
+        strict_gpu=True,
+    )
+    assert out2["matvec_cuda_aggregate_offdiag_preview"] is None
+    assert out2["profile"]["strict_gpu"] is True
+
+
+def test_resolve_cuda_memory_controls_consume_and_readonly():
+    defaults = SimpleNamespace(
+        matvec_cuda_mem_hard_cap_gib=9.5,
+        matvec_cuda_ws_cache_fraction=0.2,
+    )
+    kwargs = {"matvec_cuda_mem_hard_cap_gib": "6.0", "matvec_cuda_ws_cache_fraction": "0.4"}
+    out = resolve_cuda_memory_controls(kwargs=kwargs, defaults=defaults, consume=False)
+    assert out["matvec_cuda_mem_hard_cap_gib"] == pytest.approx(6.0)
+    assert out["matvec_cuda_ws_cache_fraction"] == pytest.approx(0.4)
+    assert "matvec_cuda_mem_hard_cap_gib" in kwargs
+    assert "matvec_cuda_ws_cache_fraction" in kwargs
+
+    out2 = resolve_cuda_memory_controls(kwargs=kwargs, defaults=defaults, consume=True)
+    assert out2["matvec_cuda_mem_hard_cap_gib"] == pytest.approx(6.0)
+    assert out2["matvec_cuda_ws_cache_fraction"] == pytest.approx(0.4)
+    assert kwargs == {}
+
+    out3 = resolve_cuda_memory_controls(kwargs={}, defaults=defaults, consume=False)
+    assert out3["matvec_cuda_mem_hard_cap_gib"] == pytest.approx(9.5)
+    assert out3["matvec_cuda_ws_cache_fraction"] == pytest.approx(0.2)
+
+
 def test_ws_fraction_and_epq_overbudget_resolution():
     assert normalize_ws_cache_fraction(-1) == 0.0
     assert normalize_ws_cache_fraction(2.5) == 0.8
@@ -521,6 +674,131 @@ def test_ws_fraction_and_epq_overbudget_resolution():
 
 def test_auto_num_threads_is_positive():
     assert int(auto_num_threads()) >= 1
+
+
+def test_resolve_kernel_frontend_controls_defaults_and_clamps():
+    defaults = SimpleNamespace(
+        kernel_profile=True,
+        kernel_profile_cuda_sync=False,
+        kernel_profile_print=False,
+        matvec_cuda_hop_profile=True,
+        matvec_cuda_davidson_subspace_eigh_cpu=True,
+        matvec_cuda_davidson_subspace_eigh_cpu_ncsf_cutoff=10,
+        matvec_cuda_davidson_subspace_eigh_cpu_max_m=8,
+        orbsym=(1, 2),
+        wfnsym=0,
+        matvec_backend="Contract",
+        strict_gpu=False,
+    )
+    kwargs = {
+        "matvec_cuda_davidson_subspace_eigh_cpu_ncsf_cutoff": -1,
+        "matvec_cuda_davidson_subspace_eigh_cpu_max_m": -5,
+        "matvec_backend": "CUDA",
+        "strict_gpu": 1,
+        "dry_run": 1,
+        "warm_state_enable": 0,
+        "warm_state_update": 1,
+        "warm_state_context": {"ncas": 2},
+        "mo_coeff": "C",
+        "mo_occ": "occ",
+        "orbsym": (3, 3),
+        "wfnsym": 2,
+    }
+    out = resolve_kernel_frontend_controls(kwargs=kwargs, defaults=defaults)
+    assert out["kernel_profile"] is True
+    assert out["matvec_cuda_hop_profile"] is True
+    assert out["matvec_cuda_davidson_subspace_eigh_cpu_in"] is True
+    assert out["matvec_cuda_davidson_subspace_eigh_cpu_ncsf_cutoff"] == 0
+    assert out["matvec_cuda_davidson_subspace_eigh_cpu_max_m"] == 0
+    assert out["matvec_backend"] == "cuda"
+    assert out["strict_gpu"] is True
+    assert out["dry_run"] is True
+    assert out["warm_state_enable"] is False
+    assert out["warm_state_update"] is True
+    assert out["warm_state_context_in"] == {"ncas": 2}
+    assert out["warm_state_mo_coeff"] == "C"
+    assert out["warm_state_mo_occ"] == "occ"
+    assert out["orbsym"] == (3, 3)
+    assert out["wfnsym"] == 2
+    assert kwargs == {}
+
+
+def test_resolve_kernel_solver_controls_defaults_and_alias():
+    kwargs = {"pspace": 9}
+    defaults = SimpleNamespace(conv_tol=1e-8, lindep=2e-13, max_cycle=44, max_space=13, max_memory=1234.0, pspace_size=7)
+    out = resolve_kernel_solver_controls(kwargs=kwargs, defaults=defaults)
+    assert out == {
+        "tol": 1e-8,
+        "lindep": 2e-13,
+        "max_cycle": 44,
+        "max_space": 13,
+        "max_memory": 1234.0,
+        "pspace_size": 9,
+    }
+    assert kwargs == {}
+
+
+def test_resolve_kernel_solver_controls_explicit_pspace_size_takes_precedence():
+    kwargs = {
+        "tol": "1e-9",
+        "lindep": "1e-12",
+        "max_cycle": "20",
+        "max_space": "11",
+        "max_memory": "2048.0",
+        "pspace_size": 5,
+        "pspace": 99,
+    }
+    out = resolve_kernel_solver_controls(kwargs=kwargs, defaults=object())
+    assert out["tol"] == pytest.approx(1e-9)
+    assert out["lindep"] == pytest.approx(1e-12)
+    assert out["max_cycle"] == 20
+    assert out["max_space"] == 11
+    assert out["max_memory"] == pytest.approx(2048.0)
+    assert out["pspace_size"] == 5
+    # Keep existing nested-pop semantics from solver.py (pspace is consumed too).
+    assert kwargs == {}
+
+
+def test_resolve_kernel_runtime_controls_contract_and_noncontract():
+    defaults = SimpleNamespace(
+        ne_constraints={"x": (0, 1)},
+        unconverged_fallback_full_diag=True,
+        unconverged_fallback_ncsf_max=512,
+        raise_on_unconverged=False,
+        warn_on_unconverged=True,
+        contract_nthreads=0,
+        contract_blas_nthreads=None,
+        kernel_blas_nthreads=None,
+    )
+    kwargs = {
+        "precompute_epq": True,
+        "contract_nthreads": 0,
+        "contract_blas_nthreads": 0,
+        "kernel_blas_nthreads": -1,
+        "unconverged_fallback_ncsf_max": 0,
+    }
+    out = resolve_kernel_runtime_controls(
+        kwargs=kwargs,
+        defaults=defaults,
+        matvec_backend="contract",
+        auto_num_threads_fn=lambda: 13,
+    )
+    assert out["precompute_epq"] is True
+    assert out["contract_nthreads"] == 13
+    assert out["contract_blas_nthreads"] == 13
+    assert out["kernel_blas_nthreads"] is None
+    assert out["unconverged_fallback_ncsf_max"] == 1
+    assert kwargs == {}
+
+    out2 = resolve_kernel_runtime_controls(
+        kwargs={"precompute_epq": True, "contract_nthreads": 2},
+        defaults=defaults,
+        matvec_backend="cuda",
+        auto_num_threads_fn=lambda: 9,
+    )
+    assert out2["precompute_epq"] is False
+    assert out2["contract_nthreads"] == 2
+    assert out2["contract_blas_nthreads"] is None
 
 
 def test_warm_state_runtime_roundtrip(tmp_path):

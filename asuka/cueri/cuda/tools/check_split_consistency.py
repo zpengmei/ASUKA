@@ -45,8 +45,9 @@ GEN_DIR = SRC_DIR / "generated"
 
 DEFAULT_CHECKS: tuple[CheckSpec, ...] = (
     CheckSpec("bindings", "bindings", SRC_DIR / "cueri_cuda_ext.cpp", 9),
-    CheckSpec("df_deriv", "large", SRC_DIR / "cueri_cuda_kernels_df_deriv.cu", 4),
+    CheckSpec("df_deriv", "large", SRC_DIR / "cueri_cuda_kernels_df_deriv.cu", 17),
     CheckSpec("rys_generic", "large", SRC_DIR / "cueri_cuda_kernels_rys_generic.cu", 2),
+    CheckSpec("rys_generic_deriv", "large", SRC_DIR / "cueri_cuda_kernels_rys_generic_deriv.cu", 2),
     CheckSpec("wave1", "wave", GEN_DIR / "cueri_cuda_kernels_wave1_generated.cu", 6),
     CheckSpec("wave2", "wave", GEN_DIR / "cueri_cuda_kernels_wave2_generated.cu", 5),
 )
@@ -181,7 +182,7 @@ def main(argv: list[str] | None = None) -> int:
         "--only",
         action="append",
         default=[],
-        help="Limit checks to named groups: bindings, df_deriv, rys_generic, wave1, wave2",
+        help="Limit checks to named groups: bindings, df_deriv, rys_generic, rys_generic_deriv, wave1, wave2",
     )
     parser.add_argument("--show-diff", action="store_true", help="Show unified diffs for mismatches")
     parser.add_argument(

@@ -13,11 +13,18 @@ from .cuda_policy import (
     normalize_cuda_user_policy_mode,
     normalize_matvec_cuda_path_mode,
     normalize_prefilter_trivial_tasks_mode,
+    resolve_cuda_memory_controls,
     normalize_ws_cache_fraction,
+    resolve_kernel_cuda_policy,
     resolve_epq_overbudget_action,
     resolve_mixed_low_workspace_oom_fallback,
 )
-from .config import auto_num_threads
+from .config import (
+    auto_num_threads,
+    resolve_kernel_frontend_controls,
+    resolve_kernel_runtime_controls,
+    resolve_kernel_solver_controls,
+)
 from .drt_cache import (
     DRTKey,
     ne_constraints_key_to_dict,
@@ -30,6 +37,7 @@ from .matvec_runtime import (
     estimate_matvec_cuda_workspace_bytes,
     release_matvec_cuda_workspace,
     resolve_approx_cuda_frontend,
+    resolve_approx_kernel_iteration_caps,
     resolve_matvec_cuda_ws_cache_budget_bytes,
     resolve_kernel_cuda_execution_mode,
     ws_needs_rebuild,
@@ -45,6 +53,7 @@ from .matvec_cache_runtime import (
     release_matvec_cuda_ws_cache,
 )
 from .dump_flags_runtime import dump_flags
+from .init_runtime import configure_solver_runtime_defaults
 from .warm_state import (
     WARM_CUDA_MATVEC_BACKENDS,
     WARM_STATE_FORMAT_VERSION,
@@ -68,6 +77,9 @@ __all__ = [
     "apply_cuda_pool_hard_cap",
     "apply_cuda_user_policy",
     "auto_num_threads",
+    "resolve_kernel_frontend_controls",
+    "resolve_kernel_runtime_controls",
+    "resolve_kernel_solver_controls",
     "auto_gpu_mem_hard_cap",
     "cuda_budget_free_bytes",
     "allowed_ci_devices_for_backend",
@@ -85,11 +97,14 @@ __all__ = [
     "normalize_cuda_user_policy_mode",
     "normalize_matvec_cuda_path_mode",
     "normalize_prefilter_trivial_tasks_mode",
+    "resolve_cuda_memory_controls",
+    "resolve_kernel_cuda_policy",
     "orbsym_to_tuple",
     "normalize_warm_cas_metadata",
     "normalize_ws_cache_fraction",
     "load_warm_state",
     "resolve_approx_cuda_frontend",
+    "resolve_approx_kernel_iteration_caps",
     "resolve_matvec_cuda_ws_cache_budget_bytes",
     "resolve_kernel_cuda_execution_mode",
     "release_matvec_cuda_workspace",
@@ -102,6 +117,7 @@ __all__ = [
     "matvec_cuda_ws_cache_touch",
     "release_matvec_cuda_ws_cache",
     "dump_flags",
+    "configure_solver_runtime_defaults",
     "resolve_epq_overbudget_action",
     "resolve_mixed_low_workspace_oom_fallback",
     "save_warm_state",

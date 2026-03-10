@@ -189,6 +189,128 @@ def apply_cuda_user_policy(
     return True, ("policy_on" if mode == "on" else "policy_auto"), resolved
 
 
+def resolve_kernel_cuda_policy(
+    *,
+    kwargs: dict[str, Any],
+    defaults: Any,
+    matvec_backend: str,
+    strict_gpu: bool,
+) -> dict[str, Any]:
+    """Resolve/apply kernel CUDA policy inputs and return profiling metadata."""
+
+    cuda_policy_key_present = "matvec_cuda_policy" in kwargs
+    cuda_acc_mode_key_present = "matvec_cuda_accuracy_mode" in kwargs
+    cuda_mem_cap_alias_key_present = "matvec_cuda_memory_cap_gib" in kwargs
+
+    matvec_cuda_policy_mode = normalize_cuda_user_policy_mode(
+        kwargs.pop("matvec_cuda_policy", getattr(defaults, "matvec_cuda_policy", "auto"))
+    )
+    matvec_cuda_accuracy_mode = normalize_cuda_accuracy_mode(
+        kwargs.pop("matvec_cuda_accuracy_mode", getattr(defaults, "matvec_cuda_accuracy_mode", "balanced"))
+    )
+    matvec_cuda_mem_cap_alias_in = kwargs.pop(
+        "matvec_cuda_memory_cap_gib",
+        getattr(defaults, "matvec_cuda_memory_cap_gib", None),
+    )
+    matvec_cuda_mem_cap_alias = None
+    if matvec_cuda_mem_cap_alias_in is not None:
+        matvec_cuda_mem_cap_alias = float(matvec_cuda_mem_cap_alias_in)
+        if float(matvec_cuda_mem_cap_alias) <= 0.0:
+            raise ValueError("matvec_cuda_memory_cap_gib must be > 0 when provided")
+
+    cuda_policy_explicit = bool(
+        cuda_policy_key_present or cuda_acc_mode_key_present or cuda_mem_cap_alias_key_present
+    )
+    cuda_policy_configured = bool(
+        str(matvec_cuda_accuracy_mode) != "balanced" or matvec_cuda_mem_cap_alias is not None
+    )
+    matvec_cuda_dtype_hint = str(
+        kwargs.get("matvec_cuda_dtype", getattr(defaults, "matvec_cuda_dtype", "float64"))
+    ).strip().lower()
+    cuda_policy_applied, cuda_policy_reason, cuda_policy_resolved = apply_cuda_user_policy(
+        matvec_backend=matvec_backend,
+        policy_mode=matvec_cuda_policy_mode,
+        accuracy_mode=matvec_cuda_accuracy_mode,
+        dtype_hint=matvec_cuda_dtype_hint,
+        memory_cap_gib=matvec_cuda_mem_cap_alias,
+        kwargs=kwargs,
+        policy_explicit=cuda_policy_explicit,
+        policy_configured=cuda_policy_configured,
+    )
+
+    matvec_cuda_aggregate_offdiag_preview = None
+    if str(matvec_backend) in ("cuda_eri_mat", "cuda"):
+        aggregate_preview_in = kwargs.get(
+            "matvec_cuda_aggregate_offdiag",
+            getattr(defaults, "matvec_cuda_aggregate_offdiag", None),
+        )
+        if aggregate_preview_in is None:
+            matvec_cuda_aggregate_offdiag_preview = True
+        else:
+            matvec_cuda_aggregate_offdiag_preview = bool(aggregate_preview_in)
+        enforce_cuda_aggregate_offdiag_guard(
+            bool(matvec_cuda_aggregate_offdiag_preview),
+            context="kernel(cuda)",
+        )
+
+    profile: dict[str, Any] = {
+        "strict_gpu": bool(strict_gpu),
+        "matvec_cuda_policy": str(matvec_cuda_policy_mode),
+        "matvec_cuda_accuracy_mode": str(matvec_cuda_accuracy_mode),
+        "matvec_cuda_policy_applied": bool(cuda_policy_applied),
+        "matvec_cuda_policy_reason": str(cuda_policy_reason),
+    }
+    if matvec_cuda_mem_cap_alias is not None:
+        profile["matvec_cuda_memory_cap_gib_alias"] = float(matvec_cuda_mem_cap_alias)
+    if cuda_policy_resolved:
+        profile["matvec_cuda_policy_resolved"] = {
+            str(kk): vv for kk, vv in dict(cuda_policy_resolved).items()
+        }
+
+    return {
+        "matvec_cuda_policy_mode": str(matvec_cuda_policy_mode),
+        "matvec_cuda_accuracy_mode": str(matvec_cuda_accuracy_mode),
+        "matvec_cuda_mem_cap_alias": matvec_cuda_mem_cap_alias,
+        "cuda_policy_applied": bool(cuda_policy_applied),
+        "cuda_policy_reason": str(cuda_policy_reason),
+        "cuda_policy_resolved": dict(cuda_policy_resolved),
+        "matvec_cuda_aggregate_offdiag_preview": matvec_cuda_aggregate_offdiag_preview,
+        "profile": profile,
+    }
+
+
+def resolve_cuda_memory_controls(
+    *,
+    kwargs: dict[str, Any],
+    defaults: Any,
+    consume: bool = False,
+) -> dict[str, float]:
+    """Resolve CUDA memory hard-cap and workspace-cache fraction controls."""
+
+    if consume:
+        mem_cap_in = kwargs.pop(
+            "matvec_cuda_mem_hard_cap_gib",
+            getattr(defaults, "matvec_cuda_mem_hard_cap_gib", 11.5),
+        )
+        ws_cache_frac_in = kwargs.pop(
+            "matvec_cuda_ws_cache_fraction",
+            getattr(defaults, "matvec_cuda_ws_cache_fraction", 0.2),
+        )
+    else:
+        mem_cap_in = kwargs.get(
+            "matvec_cuda_mem_hard_cap_gib",
+            getattr(defaults, "matvec_cuda_mem_hard_cap_gib", 11.5),
+        )
+        ws_cache_frac_in = kwargs.get(
+            "matvec_cuda_ws_cache_fraction",
+            getattr(defaults, "matvec_cuda_ws_cache_fraction", 0.2),
+        )
+    return {
+        "matvec_cuda_mem_hard_cap_gib": float(mem_cap_in),
+        "matvec_cuda_ws_cache_fraction": float(normalize_ws_cache_fraction(ws_cache_frac_in)),
+    }
+
+
 def enforce_cuda_fp32_large_cas_epq_policy(
     *,
     context: str,

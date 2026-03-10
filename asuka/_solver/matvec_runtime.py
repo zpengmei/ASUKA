@@ -346,3 +346,37 @@ def resolve_approx_cuda_frontend(
         "approx_cuda_dtype": approx_cuda_dtype,
         "matvec_cuda_aggregate_offdiag_preview": aggregate_preview,
     }
+
+
+def resolve_approx_kernel_iteration_caps(
+    *,
+    kwargs: dict[str, Any],
+    defaults: Any,
+    nroots: int,
+    matvec_backend: str,
+) -> dict[str, int]:
+    nroots_i = int(nroots)
+    if str(matvec_backend) in ("cuda_eri_mat", "cuda"):
+        default_cap_cycle = 2
+        default_cap_space = max(4, 2 * nroots_i)
+    else:
+        default_cap_cycle = 2
+        default_cap_space = max(4, 2 * nroots_i)
+
+    cap_cycle_attr = getattr(defaults, "approx_kernel_max_cycle", None)
+    cap_space_attr = getattr(defaults, "approx_kernel_max_space", None)
+    cap_cycle = int(default_cap_cycle if cap_cycle_attr is None else cap_cycle_attr)
+    cap_space = int(default_cap_space if cap_space_attr is None else cap_space_attr)
+
+    max_cycle = int(kwargs.pop("max_cycle", cap_cycle))
+    max_space = int(kwargs.pop("max_space", cap_space))
+    if cap_cycle > 0:
+        max_cycle = min(max_cycle, cap_cycle)
+    if cap_space > 0:
+        max_space = min(max_space, cap_space)
+
+    return {
+        "nroots": int(nroots_i),
+        "max_cycle": int(max_cycle),
+        "max_space": int(max_space),
+    }

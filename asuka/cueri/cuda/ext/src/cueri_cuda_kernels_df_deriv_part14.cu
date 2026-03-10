@@ -1,4 +1,4 @@
-// Auto-split from cueri_cuda_kernels_df_deriv.cu (part 3/17: KernelDFInt3c2eDerivContractedCartAllSPAtomGrad..KernelDFInt3c2eDerivContractedCartAllSPAtomGrad)
+// Auto-split from cueri_cuda_kernels_df_deriv.cu (part 14/17: KernelDFInt3c2eDerivContractedCartAllSPAtomGradSphBarQmnF32Bar..KernelDFInt3c2eDerivContractedCartAllSPAtomGradSphBarQmnF32Bar)
 // Do not edit — regenerate with split_large_kernels.py
 
 #include <cuda_runtime.h>
@@ -363,11 +363,10 @@ __device__ __forceinline__ void warp_reduce_sum_arr(double* v) {
 
 // Bridge: gap code from previous part (types needed here).
 
-// Batched variant: processes ALL AO shell pairs in one (la,lb) class × all spCD in one lq class
-// in a single 2D kernel launch.  Results are accumulated directly into grad_dev via atomicAdd.
-// Grid: dim3(ntasks_cd, n_spAB).  Block: same thread layout as KernelDFInt3c2eDerivContractedCartBatch.
+// Spherical bar_X + float32 variant: reads bar_X in spherical AO basis in Qmn layout as float32
+// (reduced global memory bandwidth), while keeping accumulation in FP64.
 template <int NROOTS>
-__global__ void KernelDFInt3c2eDerivContractedCartAllSPAtomGrad(
+__global__ void KernelDFInt3c2eDerivContractedCartAllSPAtomGradSphBarQmnF32Bar(
     const int32_t* spAB_arr,   // [n_spAB] AO shell-pair indices in this (la,lb) class
     int n_spAB,
     const int32_t* spCD,       // [ntasks] aux shell-pair indices
@@ -390,12 +389,14 @@ __global__ void KernelDFInt3c2eDerivContractedCartAllSPAtomGrad(
     const double* pair_cK,
     int nao,
     int naux,
+    int nao_sph,
     int la,
     int lb,
     int lc,
-    const double* bar_X_flat,
-    const int32_t* shell_atom,  // combined AO+aux shell->atom map (length: nAOshells+nAuxShells)
-    double* grad_dev) {         // [natm*3] gradient accumulator (atomicAdd target)
+    const float* bar_X_sph_Qmn,        // [naux*nao_sph*nao_sph] (Q,m,n) C-order
+    const int32_t* shell_ao_start_sph, // spherical AO start offset per AO shell
+    const int32_t* shell_atom,         // combined AO+aux shell->atom map (length: nAOshells+nAuxShells)
+    double* grad_dev) {                // [natm*3] gradient accumulator (atomicAdd target)
   const int t   = static_cast<int>(blockIdx.x);  // CD task index
   const int iAB = static_cast<int>(blockIdx.y);  // AB class index
   if (t >= ntasks || iAB >= n_spAB) return;
@@ -414,7 +415,7 @@ __global__ void KernelDFInt3c2eDerivContractedCartAllSPAtomGrad(
   __shared__ double sh_Gz[kMaxWarpsPerBlock][kGSizeD];
 
   __shared__ double sh_warp_sum[kMaxWarpsPerBlock][9];
-  __shared__ double sh_bar[kBarCacheMax];
+  __shared__ float sh_bar[kBarCacheMax];
 
   const int shellA = static_cast<int>(sp_A[spAB]);
   const int shellB = static_cast<int>(sp_B[spAB]);
@@ -425,9 +426,10 @@ __global__ void KernelDFInt3c2eDerivContractedCartAllSPAtomGrad(
   const int nC = ncart(lc);
   const int nElem = nA * nB * nC;
 
-  const int a0 = static_cast<int>(shell_ao_start[shellA]);
-  const int b0 = static_cast<int>(shell_ao_start[shellB]);
   const int c0 = static_cast<int>(shell_ao_start[shellC]) - nao;
+
+  const int a0_sph = static_cast<int>(shell_ao_start_sph[shellA]);
+  const int b0_sph = static_cast<int>(shell_ao_start_sph[shellB]);
 
   const int baseAB = static_cast<int>(sp_pair_start[spAB]);
   const int baseCD = static_cast<int>(sp_pair_start[spCD_i]);
@@ -474,9 +476,8 @@ __global__ void KernelDFInt3c2eDerivContractedCartAllSPAtomGrad(
       const int rem = idx - ia * (nB * nC);
       const int ib = rem / nC;
       const int ic = rem - ib * nC;
-      const int row_idx = (a0 + ia) * nao + (b0 + ib);
-      const int col_idx = c0 + ic;
-      sh_bar[idx] = bar_X_flat[static_cast<int64_t>(row_idx) * static_cast<int64_t>(naux) + static_cast<int64_t>(col_idx)];
+      const int q = c0 + ic;
+      sh_bar[idx] = static_cast<float>(df_bar_cart_from_sph_qmn_f32(bar_X_sph_Qmn, q, ia, ib, la, lb, a0_sph, b0_sph, nao_sph));
     }
   }
 
@@ -590,24 +591,19 @@ __global__ void KernelDFInt3c2eDerivContractedCartAllSPAtomGrad(
       __syncwarp();
 
       for (int idx = lane; idx < nElem; idx += 32) {
-        double bar = 0.0;
-        if (cache_bar) {
-          bar = sh_bar[idx];
-        } else {
-          const int ia = idx / (nB * nC);
-          const int rem = idx - ia * (nB * nC);
-          const int ib = rem / nC;
-          const int ic = rem - ib * nC;
-          const int row_idx = (a0 + ia) * nao + (b0 + ib);
-          const int col_idx = c0 + ic;
-          bar = bar_X_flat[static_cast<int64_t>(row_idx) * static_cast<int64_t>(naux) + static_cast<int64_t>(col_idx)];
-        }
-        if (bar == 0.0) continue;
-
         const int ia = idx / (nB * nC);
         const int rem = idx - ia * (nB * nC);
         const int ib = rem / nC;
         const int ic = rem - ib * nC;
+
+        float bar_f = 0.0f;
+        if (cache_bar) {
+          bar_f = sh_bar[idx];
+        } else {
+          const int q_idx = c0 + ic;
+          bar_f = static_cast<float>(df_bar_cart_from_sph_qmn_f32(bar_X_sph_Qmn, q_idx, ia, ib, la, lb, a0_sph, b0_sph, nao_sph));
+        }
+        if (bar_f == 0.0f) continue;
 
         const int iax = static_cast<int>(shA_lx[ia]);
         const int iay = static_cast<int>(shA_ly[ia]);
@@ -623,7 +619,7 @@ __global__ void KernelDFInt3c2eDerivContractedCartAllSPAtomGrad(
         const double Iy = shift_from_G_ld0_d(sh_Gy[warp_id], iay, iby, icy, sh_yij_pow);
         const double Iz = shift_from_G_ld0_d(sh_Gz[warp_id], iaz, ibz, icz, sh_zij_pow);
 
-        const double bar_scale = bar * scale;
+        const double bar_scale = static_cast<double>(bar_f) * scale;
 
         // Center A derivatives.
         const double Ix_m_A = (iax > 0) ? shift_from_G_ld0_d(sh_Gx[warp_id], iax - 1, ibx, icx, sh_xij_pow) : 0.0;
@@ -710,14 +706,11 @@ __global__ void KernelDFInt3c2eDerivContractedCartAllSPAtomGrad(
   }
 }
 
-// Spherical bar_X variant: consumes bar_X in spherical AO basis in Qmn layout and applies the
-// cart<-sph transforms inside the contraction kernel to avoid materializing the full
-// Cartesian bar_X tensor (nao_cart^2 * naux).
 static inline int df_nroots_from_L(int L_total) {
   return ((L_total + 1) / 2) + 1;
 }
 
-static inline cudaError_t launch_df_int3c2e_deriv_cart_allsp_atomgrad(
+static inline cudaError_t launch_df_int3c2e_deriv_cart_allsp_atomgrad_sphbar_qmn_f32bar(
     const int32_t* spAB_arr,
     int n_spAB,
     const int32_t* spCD,
@@ -740,10 +733,12 @@ static inline cudaError_t launch_df_int3c2e_deriv_cart_allsp_atomgrad(
     const double* pair_cK,
     int nao,
     int naux,
+    int nao_sph,
     int la,
     int lb,
     int lc,
-    const double* bar_X_flat,
+    const float* bar_X_sph_Qmn,
+    const int32_t* shell_ao_start_sph,
     const int32_t* shell_atom,
     double* grad_dev,
     cudaStream_t stream,
@@ -751,83 +746,26 @@ static inline cudaError_t launch_df_int3c2e_deriv_cart_allsp_atomgrad(
   const int nroots = df_nroots_from_L(la + lb + lc);
   const dim3 grid(static_cast<unsigned int>(ntasks), static_cast<unsigned int>(n_spAB));
   switch (nroots) {
-    case 1:
-      KernelDFInt3c2eDerivContractedCartAllSPAtomGrad<1><<<grid, threads, 0, stream>>>(
-          spAB_arr, n_spAB, spCD, ntasks, sp_A, sp_B, sp_pair_start, sp_npair,
-          shell_cx, shell_cy, shell_cz, shell_prim_start, shell_nprim, shell_ao_start,
-          prim_exp, pair_eta, pair_Px, pair_Py, pair_Pz, pair_cK,
-          nao, naux, la, lb, lc, bar_X_flat, shell_atom, grad_dev);
+#define LAUNCH_3C_SPH_F32(NR) \
+    case NR: \
+      KernelDFInt3c2eDerivContractedCartAllSPAtomGradSphBarQmnF32Bar<NR><<<grid, threads, 0, stream>>>( \
+          spAB_arr, n_spAB, spCD, ntasks, sp_A, sp_B, sp_pair_start, sp_npair, \
+          shell_cx, shell_cy, shell_cz, shell_prim_start, shell_nprim, shell_ao_start, \
+          prim_exp, pair_eta, pair_Px, pair_Py, pair_Pz, pair_cK, \
+          nao, naux, nao_sph, la, lb, lc, bar_X_sph_Qmn, shell_ao_start_sph, shell_atom, grad_dev); \
       break;
-    case 2:
-      KernelDFInt3c2eDerivContractedCartAllSPAtomGrad<2><<<grid, threads, 0, stream>>>(
-          spAB_arr, n_spAB, spCD, ntasks, sp_A, sp_B, sp_pair_start, sp_npair,
-          shell_cx, shell_cy, shell_cz, shell_prim_start, shell_nprim, shell_ao_start,
-          prim_exp, pair_eta, pair_Px, pair_Py, pair_Pz, pair_cK,
-          nao, naux, la, lb, lc, bar_X_flat, shell_atom, grad_dev);
-      break;
-    case 3:
-      KernelDFInt3c2eDerivContractedCartAllSPAtomGrad<3><<<grid, threads, 0, stream>>>(
-          spAB_arr, n_spAB, spCD, ntasks, sp_A, sp_B, sp_pair_start, sp_npair,
-          shell_cx, shell_cy, shell_cz, shell_prim_start, shell_nprim, shell_ao_start,
-          prim_exp, pair_eta, pair_Px, pair_Py, pair_Pz, pair_cK,
-          nao, naux, la, lb, lc, bar_X_flat, shell_atom, grad_dev);
-      break;
-    case 4:
-      KernelDFInt3c2eDerivContractedCartAllSPAtomGrad<4><<<grid, threads, 0, stream>>>(
-          spAB_arr, n_spAB, spCD, ntasks, sp_A, sp_B, sp_pair_start, sp_npair,
-          shell_cx, shell_cy, shell_cz, shell_prim_start, shell_nprim, shell_ao_start,
-          prim_exp, pair_eta, pair_Px, pair_Py, pair_Pz, pair_cK,
-          nao, naux, la, lb, lc, bar_X_flat, shell_atom, grad_dev);
-      break;
-    case 5:
-      KernelDFInt3c2eDerivContractedCartAllSPAtomGrad<5><<<grid, threads, 0, stream>>>(
-          spAB_arr, n_spAB, spCD, ntasks, sp_A, sp_B, sp_pair_start, sp_npair,
-          shell_cx, shell_cy, shell_cz, shell_prim_start, shell_nprim, shell_ao_start,
-          prim_exp, pair_eta, pair_Px, pair_Py, pair_Pz, pair_cK,
-          nao, naux, la, lb, lc, bar_X_flat, shell_atom, grad_dev);
-      break;
-    case 6:
-      KernelDFInt3c2eDerivContractedCartAllSPAtomGrad<6><<<grid, threads, 0, stream>>>(
-          spAB_arr, n_spAB, spCD, ntasks, sp_A, sp_B, sp_pair_start, sp_npair,
-          shell_cx, shell_cy, shell_cz, shell_prim_start, shell_nprim, shell_ao_start,
-          prim_exp, pair_eta, pair_Px, pair_Py, pair_Pz, pair_cK,
-          nao, naux, la, lb, lc, bar_X_flat, shell_atom, grad_dev);
-      break;
-    case 7:
-      KernelDFInt3c2eDerivContractedCartAllSPAtomGrad<7><<<grid, threads, 0, stream>>>(
-          spAB_arr, n_spAB, spCD, ntasks, sp_A, sp_B, sp_pair_start, sp_npair,
-          shell_cx, shell_cy, shell_cz, shell_prim_start, shell_nprim, shell_ao_start,
-          prim_exp, pair_eta, pair_Px, pair_Py, pair_Pz, pair_cK,
-          nao, naux, la, lb, lc, bar_X_flat, shell_atom, grad_dev);
-      break;
-    case 8:
-      KernelDFInt3c2eDerivContractedCartAllSPAtomGrad<8><<<grid, threads, 0, stream>>>(
-          spAB_arr, n_spAB, spCD, ntasks, sp_A, sp_B, sp_pair_start, sp_npair,
-          shell_cx, shell_cy, shell_cz, shell_prim_start, shell_nprim, shell_ao_start,
-          prim_exp, pair_eta, pair_Px, pair_Py, pair_Pz, pair_cK,
-          nao, naux, la, lb, lc, bar_X_flat, shell_atom, grad_dev);
-      break;
-    case 9:
-      KernelDFInt3c2eDerivContractedCartAllSPAtomGrad<9><<<grid, threads, 0, stream>>>(
-          spAB_arr, n_spAB, spCD, ntasks, sp_A, sp_B, sp_pair_start, sp_npair,
-          shell_cx, shell_cy, shell_cz, shell_prim_start, shell_nprim, shell_ao_start,
-          prim_exp, pair_eta, pair_Px, pair_Py, pair_Pz, pair_cK,
-          nao, naux, la, lb, lc, bar_X_flat, shell_atom, grad_dev);
-      break;
-    case 10:
-      KernelDFInt3c2eDerivContractedCartAllSPAtomGrad<10><<<grid, threads, 0, stream>>>(
-          spAB_arr, n_spAB, spCD, ntasks, sp_A, sp_B, sp_pair_start, sp_npair,
-          shell_cx, shell_cy, shell_cz, shell_prim_start, shell_nprim, shell_ao_start,
-          prim_exp, pair_eta, pair_Px, pair_Py, pair_Pz, pair_cK,
-          nao, naux, la, lb, lc, bar_X_flat, shell_atom, grad_dev);
-      break;
-    case 11:
-      KernelDFInt3c2eDerivContractedCartAllSPAtomGrad<11><<<grid, threads, 0, stream>>>(
-          spAB_arr, n_spAB, spCD, ntasks, sp_A, sp_B, sp_pair_start, sp_npair,
-          shell_cx, shell_cy, shell_cz, shell_prim_start, shell_nprim, shell_ao_start,
-          prim_exp, pair_eta, pair_Px, pair_Py, pair_Pz, pair_cK,
-          nao, naux, la, lb, lc, bar_X_flat, shell_atom, grad_dev);
-      break;
+    LAUNCH_3C_SPH_F32(1)
+    LAUNCH_3C_SPH_F32(2)
+    LAUNCH_3C_SPH_F32(3)
+    LAUNCH_3C_SPH_F32(4)
+    LAUNCH_3C_SPH_F32(5)
+    LAUNCH_3C_SPH_F32(6)
+    LAUNCH_3C_SPH_F32(7)
+    LAUNCH_3C_SPH_F32(8)
+    LAUNCH_3C_SPH_F32(9)
+    LAUNCH_3C_SPH_F32(10)
+    LAUNCH_3C_SPH_F32(11)
+#undef LAUNCH_3C_SPH_F32
     default:
       return cudaErrorInvalidValue;
   }
@@ -836,7 +774,7 @@ static inline cudaError_t launch_df_int3c2e_deriv_cart_allsp_atomgrad(
 
 }  // namespace
 
-extern "C" cudaError_t cueri_df_int3c2e_deriv_contracted_cart_allsp_atomgrad_launch_stream(
+extern "C" cudaError_t cueri_df_int3c2e_deriv_contracted_cart_allsp_atomgrad_sphbar_qmn_f32bar_launch_stream(
     const int32_t* spAB_arr,
     int n_spAB,
     const int32_t* spCD,
@@ -859,21 +797,24 @@ extern "C" cudaError_t cueri_df_int3c2e_deriv_contracted_cart_allsp_atomgrad_lau
     const double* pair_cK,
     int nao,
     int naux,
+    int nao_sph,
     int la,
     int lb,
     int lc,
-    const double* bar_X_flat,
+    const float* bar_X_sph_Qmn,
+    const int32_t* shell_ao_start_sph,
     const int32_t* shell_atom,
     double* grad_dev,
     cudaStream_t stream,
     int threads) {
-  return launch_df_int3c2e_deriv_cart_allsp_atomgrad(
+  return launch_df_int3c2e_deriv_cart_allsp_atomgrad_sphbar_qmn_f32bar(
       spAB_arr, n_spAB, spCD, ntasks,
       sp_A, sp_B, sp_pair_start, sp_npair,
       shell_cx, shell_cy, shell_cz,
       shell_prim_start, shell_nprim, shell_ao_start,
       prim_exp, pair_eta, pair_Px, pair_Py, pair_Pz, pair_cK,
-      nao, naux, la, lb, lc, bar_X_flat, shell_atom, grad_dev,
+      nao, naux, nao_sph, la, lb, lc,
+      bar_X_sph_Qmn, shell_ao_start_sph, shell_atom, grad_dev,
       stream, threads);
 }
 

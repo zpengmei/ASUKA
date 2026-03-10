@@ -34,17 +34,16 @@ from asuka._solver.warm_state import (
 )
 from asuka._solver.cuda_policy import (
     apply_cuda_pool_hard_cap as _apply_cuda_pool_hard_cap,
-    apply_cuda_user_policy as _apply_cuda_user_policy,
     auto_gpu_mem_hard_cap as _auto_gpu_mem_hard_cap,
     cuda_budget_free_bytes as _cuda_budget_free_bytes,
     enforce_cuda_aggregate_offdiag_guard as _enforce_cuda_aggregate_offdiag_guard,
     enforce_cuda_fp32_large_cas_epq_policy as _enforce_cuda_fp32_large_cas_epq_policy,
     estimate_epq_peak_bytes as _estimate_epq_peak_bytes,
     normalize_csr_host_cache_mode as _normalize_csr_host_cache_mode,
-    normalize_cuda_accuracy_mode as _normalize_cuda_accuracy_mode,
-    normalize_cuda_user_policy_mode as _normalize_cuda_user_policy_mode,
     normalize_matvec_cuda_path_mode as _normalize_matvec_cuda_path_mode,
     normalize_prefilter_trivial_tasks_mode as _normalize_prefilter_trivial_tasks_mode,
+    resolve_cuda_memory_controls as _resolve_cuda_memory_controls_runtime,
+    resolve_kernel_cuda_policy as _resolve_kernel_cuda_policy_runtime,
     normalize_ws_cache_fraction as _normalize_ws_cache_fraction,
     resolve_epq_overbudget_action as _resolve_epq_overbudget_action,
     resolve_mixed_low_workspace_oom_fallback as _resolve_mixed_low_workspace_oom_fallback,
@@ -55,7 +54,12 @@ from asuka._solver.drt_cache import (
     ne_constraints_to_key as _ne_constraints_to_key,
     orbsym_to_tuple as _orbsym_to_tuple,
 )
-from asuka._solver.config import auto_num_threads as _auto_num_threads
+from asuka._solver.config import (
+    auto_num_threads as _auto_num_threads,
+    resolve_kernel_frontend_controls as _resolve_kernel_frontend_controls_runtime,
+    resolve_kernel_runtime_controls as _resolve_kernel_runtime_controls_runtime,
+    resolve_kernel_solver_controls as _resolve_kernel_solver_controls_runtime,
+)
 from asuka._solver.warm_state_runtime import (
     allowed_ci_devices_for_backend as _allowed_ci_devices_for_backend_runtime,
     load_warm_state as _load_warm_state_runtime,
@@ -74,6 +78,7 @@ from asuka._solver.matvec_runtime import (
     resolve_matvec_cuda_ws_cache_budget_bytes as _resolve_matvec_cuda_ws_cache_budget_bytes_runtime,
     resolve_kernel_cuda_execution_mode as _resolve_kernel_cuda_execution_mode_runtime,
     resolve_approx_cuda_frontend as _resolve_approx_cuda_frontend_runtime,
+    resolve_approx_kernel_iteration_caps as _resolve_approx_kernel_iteration_caps_runtime,
     ws_needs_rebuild as _ws_needs_rebuild_runtime,
 )
 from asuka._solver.matvec_cache_runtime import (
@@ -87,6 +92,9 @@ from asuka._solver.matvec_cache_runtime import (
     release_matvec_cuda_ws_cache as _release_matvec_cuda_ws_cache_runtime,
 )
 from asuka._solver.dump_flags_runtime import dump_flags as _dump_flags_runtime
+from asuka._solver.init_runtime import (
+    configure_solver_runtime_defaults as _configure_solver_runtime_defaults_runtime,
+)
 
 if TYPE_CHECKING:  # pragma: no cover
     from asuka.contract import ContractWorkspace
@@ -339,180 +347,11 @@ class GUGAFCISolver(_StreamObject):
         # CASSCF calls `make_rdm12(ci, ...)` without passing `wfnsym/orbsym`, so we need a
         # fallback to avoid rebuilding an incompatible (full-symmetry) DRT.
         self._last_drt_key: _DRTKey | None = None
-        # `0` means "auto": use PySCF's process-wide thread count (`lib.num_threads()`).
-        self.contract_nthreads = 0
-        # BLAS thread limit for the dense pair-space GEMMs inside the contract backend.
-        # None means "auto" (see kernel()).
-        self.contract_blas_nthreads: int | None = None
-        # Limit BLAS/OpenMP threads during Davidson iterations. This prevents
-        # oversubscription (when the contract backend uses Python threads) and
-        # avoids slow multi-threaded BLAS-1/2 kernels on small/moderate CI spaces.
-        #
-        # None means "auto" (see kernel()).
-        self.kernel_blas_nthreads: int | None = getattr(self, "kernel_blas_nthreads", None)
-        # Safety net for pathological Davidson failures: for small CSF spaces we can
-        # deterministically recover roots by explicit full-space diagonalization.
-        self.dense_eigh_ncsf_threshold = int(getattr(self, "dense_eigh_ncsf_threshold", 0))
-        self.unconverged_fallback_full_diag = getattr(self, "unconverged_fallback_full_diag", True)
-        self.unconverged_fallback_ncsf_max = int(getattr(self, "unconverged_fallback_ncsf_max", 512))
-        if self.unconverged_fallback_ncsf_max < 1:
-            self.unconverged_fallback_ncsf_max = 1
-        self.raise_on_unconverged = getattr(self, "raise_on_unconverged", False)
-        self.rdm_backend = getattr(self, "rdm_backend", "auto")
-        # `0` means "auto": use process-wide `lib.num_threads()`.
-        self.rdm_nthreads = getattr(self, "rdm_nthreads", 0)
-        self.rdm_blas_nthreads: int | None = getattr(self, "rdm_blas_nthreads", None)
-        self.rdm_block_nops = getattr(self, "rdm_block_nops", 8)
-        self.rdm_tmpdir = getattr(self, "rdm_tmpdir", None)
-        self.rdm_cuda_build_threads = getattr(self, "rdm_cuda_build_threads", 256)
-        self.rdm_cuda_enable_fp64_emulation = getattr(self, "rdm_cuda_enable_fp64_emulation", False)
-        self.rdm_cuda_gemm_backend = getattr(self, "rdm_cuda_gemm_backend", "gemmex_fp64")
-        self.rdm_cuda_math_mode = getattr(self, "rdm_cuda_math_mode", "default")
-        self.rdm_cuda_cublas_workspace_mb = getattr(self, "rdm_cuda_cublas_workspace_mb", 0)
-        self.rdm_cuda_emulation_strategy = getattr(self, "rdm_cuda_emulation_strategy", None)
-        self.rdm_cuda_fixed_point_mantissa_control = getattr(self, "rdm_cuda_fixed_point_mantissa_control", None)
-        self.rdm_cuda_fixed_point_max_mantissa_bits = getattr(self, "rdm_cuda_fixed_point_max_mantissa_bits", None)
-        self.rdm_cuda_fixed_point_mantissa_bit_offset = getattr(self, "rdm_cuda_fixed_point_mantissa_bit_offset", None)
-        self.rdm_cuda_symmetrize_gram = getattr(self, "rdm_cuda_symmetrize_gram", True)
-        # CUDA RDM streaming policy: force tiled T-matrix builds when ncsf is large.
-        # <=0 disables this size-based force and leaves the memory heuristic as-is.
-        self.rdm_cuda_streaming_ncsf_cutoff = getattr(self, "rdm_cuda_streaming_ncsf_cutoff", 2_000_000)
-        self.matvec_backend = getattr(self, "matvec_backend", "contract")
-        # Strict GPU mode: disallow CPU fallbacks in CUDA workflows.
-        self.strict_gpu = getattr(self, "strict_gpu", False)
-        # High-level CUDA policy:
-        # - matvec_cuda_policy: auto/on/off
-        # - matvec_cuda_accuracy_mode: fast/balanced/strict
-        # - matvec_cuda_memory_cap_gib: alias for matvec_cuda_mem_hard_cap_gib
-        self.matvec_cuda_policy = getattr(self, "matvec_cuda_policy", "auto")
-        self.matvec_cuda_accuracy_mode = getattr(self, "matvec_cuda_accuracy_mode", "balanced")
-        self.matvec_cuda_memory_cap_gib = getattr(self, "matvec_cuda_memory_cap_gib", None)
-        # Fraction of the active GPU budget reserved for cached CUDA matvec workspaces.
-        # Can be overridden by `ASUKA_GPU_WS_CACHE_FRAC` or per-call kwargs.
-        _ws_cache_frac_env = os.environ.get("ASUKA_GPU_WS_CACHE_FRAC")
-        if _ws_cache_frac_env is None:
-            _ws_cache_frac_env = getattr(self, "matvec_cuda_ws_cache_fraction", 0.2)
-        self.matvec_cuda_ws_cache_fraction = _normalize_ws_cache_fraction(_ws_cache_frac_env)
-        # PySCF determinant-style FCI uses absorb_h1e(..., fac=0.5) to fold the 1e part into a 2e tensor.
-        # For cuGUGA we can optionally bypass that allocation-heavy path and pass (h1e,eri,fac) through as a
-        # lightweight wrapper, enabling CUDA matvec without reconstructing (or inverting) the absorbed tensor.
-        self.absorb_h1e_mode = getattr(self, "absorb_h1e_mode", "tensor")  # "tensor" (default) | "direct"
-        # Optional override for `contract_2e` dispatch; when None, falls back to `matvec_backend`.
-        self.contract_2e_backend = getattr(self, "contract_2e_backend", None)
-        # Debug/profiling knob: collect a per-hop breakdown (one-body, CSR build, kernel4, ...)
-        # from the CUDA matvec workspace into the kernel profile dict.
-        self.matvec_cuda_hop_profile = getattr(self, "matvec_cuda_hop_profile", False)
-        # CUDA Davidson subspace eigensolve policy:
-        # - None: auto (enable CPU path; `subspace_eigh_cpu_max_m` decides CPU vs GPU by subspace size m).
-        # - bool: force CPU/GPU subspace eigh in `cuda_davidson`.
-        self.matvec_cuda_davidson_subspace_eigh_cpu = getattr(self, "matvec_cuda_davidson_subspace_eigh_cpu", None)
-        self.matvec_cuda_davidson_subspace_eigh_cpu_ncsf_cutoff = getattr(
-            self, "matvec_cuda_davidson_subspace_eigh_cpu_ncsf_cutoff", 100_000_000
+        _configure_solver_runtime_defaults_runtime(
+            self,
+            normalize_ws_cache_fraction_fn=_normalize_ws_cache_fraction,
+            auto_gpu_mem_hard_cap_fn=_auto_gpu_mem_hard_cap,
         )
-        # For CUDA Davidson CPU-subspace mode, only use host eigh when subspace size m is small.
-        self.matvec_cuda_davidson_subspace_eigh_cpu_max_m = getattr(
-            self, "matvec_cuda_davidson_subspace_eigh_cpu_max_m", 64
-        )
-        # CUDA make_hdiag policy:
-        # - None: auto (CPU for small ncsf, GPU for large ncsf).
-        # - bool: force CPU/GPU determinant-diagonal guess build.
-        self.matvec_cuda_make_hdiag_cpu = getattr(self, "matvec_cuda_make_hdiag_cpu", None)
-        self.matvec_cuda_make_hdiag_cpu_ncsf_cutoff = getattr(
-            self, "matvec_cuda_make_hdiag_cpu_ncsf_cutoff", 10_000
-        )
-        # Approximate CI solver (used by PySCF CASSCF orbital updates via solve_approx_ci)
-        # Caps for the approximate CI solve used during CASSCF orbital micro-iterations.
-        # When left as None, approx_kernel selects backend-dependent defaults.
-        self.approx_kernel_max_cycle = getattr(self, "approx_kernel_max_cycle", None)
-        self.approx_kernel_max_space = getattr(self, "approx_kernel_max_space", None)
-        # CUDA matvec precision controls:
-        # - approx_cuda_dtype: precision for approx_kernel CUDA hops ("float32" or "float64")
-        # - matvec_cuda_dtype: precision mode for full kernel CUDA Davidson
-        #   ("float64" | "float32" | "mixed")
-        # - matvec_cuda_mixed_threshold: residual threshold for switching mixed mode
-        #   from low-precision hop to full-precision hop.
-        self.approx_cuda_dtype = getattr(self, "approx_cuda_dtype", "float32")
-        self.matvec_cuda_dtype = getattr(self, "matvec_cuda_dtype", "float64")
-        self.matvec_cuda_mixed_threshold = getattr(self, "matvec_cuda_mixed_threshold", 1e-5)
-        self.matvec_cuda_mixed_force_final_full_hop = getattr(self, "matvec_cuda_mixed_force_final_full_hop", True)
-        self.matvec_cuda_mixed_final_full_subspace_refresh = getattr(
-            self, "matvec_cuda_mixed_final_full_subspace_refresh", False
-        )
-        self.matvec_cuda_mixed_low_precision_max_iter = getattr(self, "matvec_cuda_mixed_low_precision_max_iter", 2)
-        # Set <=0 to auto-tune j_tile based on norb/ncsf.
-        self.matvec_cuda_j_tile = getattr(self, "matvec_cuda_j_tile", 0)
-        self.matvec_cuda_target_ntasks = getattr(self, "matvec_cuda_target_ntasks", 1_500_000)
-        self.matvec_cuda_j_tile_align = getattr(self, "matvec_cuda_j_tile_align", 256)
-        self.matvec_cuda_csr_capacity_mult = getattr(self, "matvec_cuda_csr_capacity_mult", 2.0)
-        self.matvec_cuda_csr_host_cache = getattr(self, "matvec_cuda_csr_host_cache", "auto")
-        self.matvec_cuda_csr_host_cache_budget_gib = getattr(self, "matvec_cuda_csr_host_cache_budget_gib", 4.0)
-        self.matvec_cuda_csr_host_cache_min_ncsf = getattr(self, "matvec_cuda_csr_host_cache_min_ncsf", 1_000_000)
-        self.matvec_cuda_csr_pipeline_streams = getattr(self, "matvec_cuda_csr_pipeline_streams", "auto")
-        self.matvec_cuda_csr_pipeline_min_ncsf = getattr(self, "matvec_cuda_csr_pipeline_min_ncsf", 1_000_000)
-        self.matvec_cuda_prefilter_trivial_tasks = getattr(self, "matvec_cuda_prefilter_trivial_tasks", "auto")
-        self.matvec_cuda_prefilter_trivial_tasks_min_ncsf = getattr(
-            self, "matvec_cuda_prefilter_trivial_tasks_min_ncsf", 1_000_000
-        )
-        self.matvec_cuda_threads_enum = getattr(self, "matvec_cuda_threads_enum", 128)
-        self.matvec_cuda_threads_g = getattr(self, "matvec_cuda_threads_g", 256)
-        # Kernel4-side helper kernel for the k-aggregated off-diagonal path (Kernel4W).
-        # <=0 means "auto" (currently defaults to threads_g).
-        self.matvec_cuda_threads_w = getattr(self, "matvec_cuda_threads_w", 0)
-        # <=0 means "auto" (chosen in kernel() based on epq_table usage and problem size).
-        self.matvec_cuda_threads_apply = getattr(self, "matvec_cuda_threads_apply", 0)
-        self.matvec_cuda_max_g_mib = getattr(self, "matvec_cuda_max_g_mib", 256.0)
-        # Hard cap for CUDA private-memory budgeting (<=0 disables cap).
-        # Auto policies (EPQ enable, max_g sizing) use this budget to avoid OOM on
-        # constrained private-GPU environments.
-        self.matvec_cuda_mem_hard_cap_gib = getattr(self, "matvec_cuda_mem_hard_cap_gib", _auto_gpu_mem_hard_cap())
-        self.matvec_cuda_coalesce = getattr(self, "matvec_cuda_coalesce", True)
-        self.matvec_cuda_include_diagonal_rs = getattr(self, "matvec_cuda_include_diagonal_rs", True)
-        self.matvec_cuda_fuse_count_write = getattr(self, "matvec_cuda_fuse_count_write", True)
-        # CUDA matvec path selector.
-        # auto: choose among fused_coo / fused_epq_hybrid / epq_blocked
-        self.matvec_cuda_path_mode = getattr(self, "matvec_cuda_path_mode", "auto")
-        # Controls whether the fused-hop kernel path is allowed when eligible.
-        # Set False to force legacy EPQ/CSR paths for benchmarking or debugging.
-        self.matvec_cuda_use_fused_hop = getattr(self, "matvec_cuda_use_fused_hop", True)
-        self.matvec_cuda_fp32_coeff_data = getattr(self, "matvec_cuda_fp32_coeff_data", False)
-        # CUDA: k-aggregated off-diagonal matvec (can be much faster, but allocates O(ncsf*nops) device memory).
-        # None means "auto" (chosen in kernel() based on norb/ncsf and epq_table availability).
-        self.matvec_cuda_aggregate_offdiag = getattr(self, "matvec_cuda_aggregate_offdiag", None)
-        # cuBLAS FP64 fixed-point emulation for the off-diagonal ERI_mat GEMM (CUDA 13.x; aggregate-offdiag path).
-        self.matvec_cuda_enable_fp64_emulation = getattr(self, "matvec_cuda_enable_fp64_emulation", False)
-        # cuBLAS backend for the off-diagonal ERI_mat/DF GEMM path (CUDA 13.x: optional cuBLASLt).
-        self.matvec_cuda_gemm_backend = getattr(self, "matvec_cuda_gemm_backend", "gemmex_fp64")
-        self.matvec_cuda_emulation_strategy = getattr(self, "matvec_cuda_emulation_strategy", "performant")
-        self.matvec_cuda_cublas_workspace_cap_mb = getattr(self, "matvec_cuda_cublas_workspace_cap_mb", 2048)
-        # EPQ apply mode for CUDA matvec one-body / table-based apply:
-        # "auto" (heuristic), "scatter" (legacy default), or "gather" (forced).
-        self.matvec_cuda_apply_mode = getattr(self, "matvec_cuda_apply_mode", "auto")
-        # CPU threading for building the combined E_pq action table used by the CUDA matvec fast path.
-        # <=0 means "auto" (currently caps at 8).
-        self.matvec_cuda_epq_build_nthreads = getattr(self, "matvec_cuda_epq_build_nthreads", 0)
-        # Build the combined E_pq action table on GPU (avoids large CPU setup cost).
-        # None means "auto".
-        self.matvec_cuda_epq_build_device = getattr(self, "matvec_cuda_epq_build_device", None)
-        # Tile size for GPU epq_table build; <=0 means "auto" (currently defaults to matvec j_tile).
-        self.matvec_cuda_epq_build_j_tile = getattr(self, "matvec_cuda_epq_build_j_tile", 0)
-        # Stream E_pq tiles on-demand instead of materializing a full table.
-        # None/"auto" enables policy-based activation (e.g., large FP32 + mem-cap pressure).
-        self.matvec_cuda_epq_streaming = getattr(self, "matvec_cuda_epq_streaming", "auto")
-        self.matvec_cuda_epq_stream_j_tile = getattr(self, "matvec_cuda_epq_stream_j_tile", 0)
-        self.matvec_cuda_epq_stream_use_recompute = getattr(self, "matvec_cuda_epq_stream_use_recompute", "auto")
-        # Fixed sparse matvec backend (build full H once, then apply with fixed-pattern SpMV/SpMM).
-        self.matvec_cuda_fixed_ell_max_ncsf = getattr(self, "matvec_cuda_fixed_ell_max_ncsf", 50_000)
-        self.matvec_cuda_fixed_ell_max_width = getattr(self, "matvec_cuda_fixed_ell_max_width", 256)
-        self.matvec_cuda_fixed_ell_row_oracle = getattr(self, "matvec_cuda_fixed_ell_row_oracle", "sparse")
-        self.matvec_cuda_fixed_ell_threads_spmv = getattr(self, "matvec_cuda_fixed_ell_threads_spmv", 128)
-        self._warned_row_oracle_df = False
-        self.kernel_profile = getattr(self, "kernel_profile", False)
-        self.kernel_profile_cuda_sync = getattr(self, "kernel_profile_cuda_sync", False)
-        self.kernel_profile_print = getattr(self, "kernel_profile_print", False)
-        self._last_kernel_profile: dict[str, Any] | None = None
-        # Solver-attached warm state (CI-first reuse, plus optional MO/CAS metadata).
-        self._warm_state: dict[str, Any] | None = None
-        self._last_warm_start_info: dict[str, Any] | None = None
 
     def dump_flags(self, verbose: int | None = None):
         return _dump_flags_runtime(self, verbose=verbose)
@@ -819,158 +658,62 @@ class GUGAFCISolver(_StreamObject):
         nroots: int | None = None,
         **kwargs,
     ):
-        kernel_profile = bool(kwargs.pop("kernel_profile", getattr(self, "kernel_profile", False)))
-        kernel_profile_cuda_sync = bool(
-            kwargs.pop("kernel_profile_cuda_sync", getattr(self, "kernel_profile_cuda_sync", False))
-        )
-        kernel_profile_print = bool(kwargs.pop("kernel_profile_print", getattr(self, "kernel_profile_print", False)))
-        matvec_cuda_hop_profile = bool(
-            kwargs.pop("matvec_cuda_hop_profile", getattr(self, "matvec_cuda_hop_profile", False))
-        )
-        matvec_cuda_davidson_subspace_eigh_cpu_in = kwargs.pop(
-            "matvec_cuda_davidson_subspace_eigh_cpu",
-            getattr(self, "matvec_cuda_davidson_subspace_eigh_cpu", None),
-        )
+        _frontend_controls = _resolve_kernel_frontend_controls_runtime(kwargs=kwargs, defaults=self)
+        kernel_profile = bool(_frontend_controls["kernel_profile"])
+        kernel_profile_cuda_sync = bool(_frontend_controls["kernel_profile_cuda_sync"])
+        kernel_profile_print = bool(_frontend_controls["kernel_profile_print"])
+        matvec_cuda_hop_profile = bool(_frontend_controls["matvec_cuda_hop_profile"])
+        matvec_cuda_davidson_subspace_eigh_cpu_in = _frontend_controls[
+            "matvec_cuda_davidson_subspace_eigh_cpu_in"
+        ]
         matvec_cuda_davidson_subspace_eigh_cpu_ncsf_cutoff = int(
-            kwargs.pop(
-                "matvec_cuda_davidson_subspace_eigh_cpu_ncsf_cutoff",
-                getattr(self, "matvec_cuda_davidson_subspace_eigh_cpu_ncsf_cutoff", 100_000_000),
-            )
+            _frontend_controls["matvec_cuda_davidson_subspace_eigh_cpu_ncsf_cutoff"]
         )
-        if matvec_cuda_davidson_subspace_eigh_cpu_ncsf_cutoff < 0:
-            matvec_cuda_davidson_subspace_eigh_cpu_ncsf_cutoff = 0
         matvec_cuda_davidson_subspace_eigh_cpu_max_m = int(
-            kwargs.pop(
-                "matvec_cuda_davidson_subspace_eigh_cpu_max_m",
-                getattr(self, "matvec_cuda_davidson_subspace_eigh_cpu_max_m", 64),
-            )
+            _frontend_controls["matvec_cuda_davidson_subspace_eigh_cpu_max_m"]
         )
-        if matvec_cuda_davidson_subspace_eigh_cpu_max_m < 0:
-            matvec_cuda_davidson_subspace_eigh_cpu_max_m = 0
         kprof: dict[str, Any] | None = {} if kernel_profile else None
         t_kernel0 = time.perf_counter()
-        dry_run = bool(kwargs.pop("dry_run", False))
-        warm_state_enable = bool(kwargs.pop("warm_state_enable", True))
-        warm_state_update = bool(kwargs.pop("warm_state_update", True))
-        warm_state_context_in = kwargs.pop("warm_state_context", None)
-        warm_state_mo_coeff = kwargs.pop("mo_coeff", None)
-        warm_state_mo_occ = kwargs.pop("mo_occ", None)
+        dry_run = bool(_frontend_controls["dry_run"])
+        warm_state_enable = bool(_frontend_controls["warm_state_enable"])
+        warm_state_update = bool(_frontend_controls["warm_state_update"])
+        warm_state_context_in = _frontend_controls["warm_state_context_in"]
+        warm_state_mo_coeff = _frontend_controls["warm_state_mo_coeff"]
+        warm_state_mo_occ = _frontend_controls["warm_state_mo_occ"]
 
-        orbsym = kwargs.pop("orbsym", self.orbsym)
-        wfnsym = kwargs.pop("wfnsym", self.wfnsym)
-        matvec_backend = str(kwargs.pop("matvec_backend", getattr(self, "matvec_backend", "contract"))).strip().lower()
-        strict_gpu = bool(kwargs.pop("strict_gpu", getattr(self, "strict_gpu", False)))
-
-        cuda_policy_key_present = "matvec_cuda_policy" in kwargs
-        cuda_acc_mode_key_present = "matvec_cuda_accuracy_mode" in kwargs
-        cuda_mem_cap_alias_key_present = "matvec_cuda_memory_cap_gib" in kwargs
-        matvec_cuda_policy_mode = _normalize_cuda_user_policy_mode(
-            kwargs.pop("matvec_cuda_policy", getattr(self, "matvec_cuda_policy", "auto"))
-        )
-        matvec_cuda_accuracy_mode = _normalize_cuda_accuracy_mode(
-            kwargs.pop("matvec_cuda_accuracy_mode", getattr(self, "matvec_cuda_accuracy_mode", "balanced"))
-        )
-        matvec_cuda_mem_cap_alias_in = kwargs.pop(
-            "matvec_cuda_memory_cap_gib",
-            getattr(self, "matvec_cuda_memory_cap_gib", None),
-        )
-        matvec_cuda_mem_cap_alias = None
-        if matvec_cuda_mem_cap_alias_in is not None:
-            matvec_cuda_mem_cap_alias = float(matvec_cuda_mem_cap_alias_in)
-            if float(matvec_cuda_mem_cap_alias) <= 0.0:
-                raise ValueError("matvec_cuda_memory_cap_gib must be > 0 when provided")
-        cuda_policy_explicit = bool(
-            cuda_policy_key_present or cuda_acc_mode_key_present or cuda_mem_cap_alias_key_present
-        )
-        cuda_policy_configured = bool(
-            str(matvec_cuda_accuracy_mode) != "balanced" or matvec_cuda_mem_cap_alias is not None
-        )
-        matvec_cuda_dtype_hint = str(
-            kwargs.get("matvec_cuda_dtype", getattr(self, "matvec_cuda_dtype", "float64"))
-        ).strip().lower()
-        cuda_policy_applied, cuda_policy_reason, cuda_policy_resolved = _apply_cuda_user_policy(
-            matvec_backend=matvec_backend,
-            policy_mode=matvec_cuda_policy_mode,
-            accuracy_mode=matvec_cuda_accuracy_mode,
-            dtype_hint=matvec_cuda_dtype_hint,
-            memory_cap_gib=matvec_cuda_mem_cap_alias,
+        orbsym = _frontend_controls["orbsym"]
+        wfnsym = _frontend_controls["wfnsym"]
+        matvec_backend = str(_frontend_controls["matvec_backend"])
+        strict_gpu = bool(_frontend_controls["strict_gpu"])
+        _cuda_policy = _resolve_kernel_cuda_policy_runtime(
             kwargs=kwargs,
-            policy_explicit=cuda_policy_explicit,
-            policy_configured=cuda_policy_configured,
+            defaults=self,
+            matvec_backend=matvec_backend,
+            strict_gpu=bool(strict_gpu),
         )
+        matvec_cuda_aggregate_offdiag_preview = _cuda_policy["matvec_cuda_aggregate_offdiag_preview"]
         if kprof is not None:
-            kprof["strict_gpu"] = bool(strict_gpu)
-            kprof["matvec_cuda_policy"] = str(matvec_cuda_policy_mode)
-            kprof["matvec_cuda_accuracy_mode"] = str(matvec_cuda_accuracy_mode)
-            kprof["matvec_cuda_policy_applied"] = bool(cuda_policy_applied)
-            kprof["matvec_cuda_policy_reason"] = str(cuda_policy_reason)
-            if matvec_cuda_mem_cap_alias is not None:
-                kprof["matvec_cuda_memory_cap_gib_alias"] = float(matvec_cuda_mem_cap_alias)
-            if cuda_policy_resolved:
-                kprof["matvec_cuda_policy_resolved"] = {
-                    str(kk): vv for kk, vv in dict(cuda_policy_resolved).items()
-                }
-
-        if matvec_backend in ("cuda_eri_mat", "cuda"):
-            matvec_cuda_aggregate_offdiag_preview_in = kwargs.get(
-                "matvec_cuda_aggregate_offdiag",
-                getattr(self, "matvec_cuda_aggregate_offdiag", None),
-            )
-            if matvec_cuda_aggregate_offdiag_preview_in is None:
-                matvec_cuda_aggregate_offdiag_preview = True
-            else:
-                matvec_cuda_aggregate_offdiag_preview = bool(matvec_cuda_aggregate_offdiag_preview_in)
-            _enforce_cuda_aggregate_offdiag_guard(
-                bool(matvec_cuda_aggregate_offdiag_preview),
-                context="kernel(cuda)",
-            )
+            kprof.update(dict(_cuda_policy["profile"]))
         row_screening = kwargs.pop("row_screening", None)
         if row_screening is not None and not isinstance(row_screening, RowScreening):
             raise TypeError("row_screening must be a RowScreening or None")
-        ne_constraints = kwargs.pop("ne_constraints", getattr(self, "ne_constraints", None))
-        row_oracle_use_state_cache = bool(kwargs.pop("row_oracle_use_state_cache", False))
-        # Precomputing all E_pq actions can add significant one-time overhead;
-        # the contract backend builds and caches operators lazily.
-        precompute_epq = bool(kwargs.pop("precompute_epq", False))
-        max_out = int(kwargs.pop("max_out", 200_000))
-        unconverged_fallback_full_diag = bool(
-            kwargs.pop(
-                "unconverged_fallback_full_diag",
-                getattr(self, "unconverged_fallback_full_diag", True),
-            )
+        _runtime_controls = _resolve_kernel_runtime_controls_runtime(
+            kwargs=kwargs,
+            defaults=self,
+            matvec_backend=matvec_backend,
+            auto_num_threads_fn=_auto_num_threads,
         )
-        unconverged_fallback_ncsf_max = int(
-            kwargs.pop(
-                "unconverged_fallback_ncsf_max",
-                getattr(self, "unconverged_fallback_ncsf_max", 512),
-            )
-        )
-        if unconverged_fallback_ncsf_max < 1:
-            unconverged_fallback_ncsf_max = 1
-        raise_on_unconverged = bool(
-            kwargs.pop("raise_on_unconverged", getattr(self, "raise_on_unconverged", False))
-        )
-        warn_on_unconverged = bool(
-            kwargs.pop("warn_on_unconverged", getattr(self, "warn_on_unconverged", True))
-        )
-        contract_nthreads = int(kwargs.pop("contract_nthreads", int(getattr(self, "contract_nthreads", 0))))
-        if contract_nthreads <= 0:
-            contract_nthreads = _auto_num_threads()
-        contract_blas_nthreads = kwargs.pop("contract_blas_nthreads", getattr(self, "contract_blas_nthreads", None))
-        if contract_blas_nthreads is not None:
-            contract_blas_nthreads = int(contract_blas_nthreads)
-            if contract_blas_nthreads <= 0:
-                contract_blas_nthreads = None
-        if contract_blas_nthreads is None and matvec_backend == "contract":
-            # Auto: keep BLAS single-threaded during the threaded sparse generator
-            # applications, but allow the dense pair-space GEMMs to use the same
-            # thread count as the contract backend for better throughput.
-            contract_blas_nthreads = int(contract_nthreads)
-        kernel_blas_nthreads = kwargs.pop("kernel_blas_nthreads", getattr(self, "kernel_blas_nthreads", None))
-        if kernel_blas_nthreads is not None:
-            kernel_blas_nthreads = int(kernel_blas_nthreads)
-            if kernel_blas_nthreads <= 0:
-                kernel_blas_nthreads = None
+        ne_constraints = _runtime_controls["ne_constraints"]
+        row_oracle_use_state_cache = bool(_runtime_controls["row_oracle_use_state_cache"])
+        precompute_epq = bool(_runtime_controls["precompute_epq"])
+        max_out = int(_runtime_controls["max_out"])
+        unconverged_fallback_full_diag = bool(_runtime_controls["unconverged_fallback_full_diag"])
+        unconverged_fallback_ncsf_max = int(_runtime_controls["unconverged_fallback_ncsf_max"])
+        raise_on_unconverged = bool(_runtime_controls["raise_on_unconverged"])
+        warn_on_unconverged = bool(_runtime_controls["warn_on_unconverged"])
+        contract_nthreads = int(_runtime_controls["contract_nthreads"])
+        contract_blas_nthreads = _runtime_controls["contract_blas_nthreads"]
+        kernel_blas_nthreads = _runtime_controls["kernel_blas_nthreads"]
         # For the dense CPU contract backend, PySCF commonly supplies CAS ERIs in sym=4 pair-matrix
         # form (npair,npair). Restoring to a 4-index tensor inside each matvec hop would be extremely
         # costly; restore once up-front when needed.
@@ -1181,15 +924,13 @@ class GUGAFCISolver(_StreamObject):
             return e, ci
 
         # Solver controls (match common PySCF naming where possible)
-        tol = float(kwargs.pop("tol", getattr(self, "conv_tol", 1e-10)))
-        lindep = float(kwargs.pop("lindep", getattr(self, "lindep", 1e-14)))
-        max_cycle = int(kwargs.pop("max_cycle", getattr(self, "max_cycle", 100)))
-        max_space = int(kwargs.pop("max_space", getattr(self, "max_space", 12)))
-        max_memory = float(kwargs.pop("max_memory", getattr(self, "max_memory", 4000.0)))
-        pspace_size = int(kwargs.pop("pspace_size", kwargs.pop("pspace", getattr(self, "pspace_size", 0))))
-
-        if matvec_backend != "contract":
-            precompute_epq = False
+        _solver_controls = _resolve_kernel_solver_controls_runtime(kwargs=kwargs, defaults=self)
+        tol = float(_solver_controls["tol"])
+        lindep = float(_solver_controls["lindep"])
+        max_cycle = int(_solver_controls["max_cycle"])
+        max_space = int(_solver_controls["max_space"])
+        max_memory = float(_solver_controls["max_memory"])
+        pspace_size = int(_solver_controls["pspace_size"])
 
         if precompute_epq:
             precompute_epq_actions(drt)
@@ -1220,18 +961,13 @@ class GUGAFCISolver(_StreamObject):
                 make_device_state_cache,
             )
 
-            matvec_cuda_mem_hard_cap_gib = float(
-                kwargs.pop(
-                    "matvec_cuda_mem_hard_cap_gib",
-                    getattr(self, "matvec_cuda_mem_hard_cap_gib", 11.5),
-                )
+            _cuda_mem_ctl = _resolve_cuda_memory_controls_runtime(
+                kwargs=kwargs,
+                defaults=self,
+                consume=True,
             )
-            matvec_cuda_ws_cache_fraction = _normalize_ws_cache_fraction(
-                kwargs.pop(
-                    "matvec_cuda_ws_cache_fraction",
-                    getattr(self, "matvec_cuda_ws_cache_fraction", 0.2),
-                )
-            )
+            matvec_cuda_mem_hard_cap_gib = float(_cuda_mem_ctl["matvec_cuda_mem_hard_cap_gib"])
+            matvec_cuda_ws_cache_fraction = float(_cuda_mem_ctl["matvec_cuda_ws_cache_fraction"])
             _cuda_pool_limit_b = _apply_cuda_pool_hard_cap(cp, float(matvec_cuda_mem_hard_cap_gib))
             _cuda_ws_cache_budget_b = self._configure_matvec_cuda_ws_cache(
                 cp_mod=cp,
@@ -3369,25 +3105,15 @@ class GUGAFCISolver(_StreamObject):
         )
         approx_cuda_dtype = _approx_cuda_frontend["approx_cuda_dtype"]
         matvec_cuda_aggregate_offdiag_preview = _approx_cuda_frontend["matvec_cuda_aggregate_offdiag_preview"]
-        nroots_i = int(nroots)
-        if matvec_backend in ("cuda_eri_mat", "cuda"):
-            default_cap_cycle = 2
-            default_cap_space = max(4, 2 * nroots_i)
-        else:
-            default_cap_cycle = 2
-            default_cap_space = max(4, 2 * nroots_i)
-
-        cap_cycle_attr = getattr(self, "approx_kernel_max_cycle", None)
-        cap_space_attr = getattr(self, "approx_kernel_max_space", None)
-        cap_cycle = int(default_cap_cycle if cap_cycle_attr is None else cap_cycle_attr)
-        cap_space = int(default_cap_space if cap_space_attr is None else cap_space_attr)
-
-        max_cycle = int(kwargs.pop("max_cycle", cap_cycle))
-        max_space = int(kwargs.pop("max_space", cap_space))
-        if cap_cycle > 0:
-            max_cycle = min(max_cycle, cap_cycle)
-        if cap_space > 0:
-            max_space = min(max_space, cap_space)
+        _approx_caps = _resolve_approx_kernel_iteration_caps_runtime(
+            kwargs=kwargs,
+            defaults=self,
+            nroots=nroots,
+            matvec_backend=matvec_backend,
+        )
+        nroots_i = int(_approx_caps["nroots"])
+        max_cycle = int(_approx_caps["max_cycle"])
+        max_space = int(_approx_caps["max_space"])
 
         # Fast path for the GPU backend (single-root): a small Arnoldi/Rayleigh-Ritz
         # solve with a bounded subspace, to avoid running a full Davidson solve
@@ -3399,18 +3125,13 @@ class GUGAFCISolver(_StreamObject):
                 cp = None
 
             if cp is not None:
-                approx_mem_hard_cap_gib = float(
-                    kwargs.get(
-                        "matvec_cuda_mem_hard_cap_gib",
-                        getattr(self, "matvec_cuda_mem_hard_cap_gib", 11.5),
-                    )
+                _approx_cuda_mem_ctl = _resolve_cuda_memory_controls_runtime(
+                    kwargs=kwargs,
+                    defaults=self,
+                    consume=False,
                 )
-                approx_ws_cache_fraction = _normalize_ws_cache_fraction(
-                    kwargs.get(
-                        "matvec_cuda_ws_cache_fraction",
-                        getattr(self, "matvec_cuda_ws_cache_fraction", 0.2),
-                    )
-                )
+                approx_mem_hard_cap_gib = float(_approx_cuda_mem_ctl["matvec_cuda_mem_hard_cap_gib"])
+                approx_ws_cache_fraction = float(_approx_cuda_mem_ctl["matvec_cuda_ws_cache_fraction"])
                 _apply_cuda_pool_hard_cap(cp, float(approx_mem_hard_cap_gib))
                 self._configure_matvec_cuda_ws_cache(
                     cp_mod=cp,
@@ -3593,12 +3314,12 @@ class GUGAFCISolver(_StreamObject):
                             )
                         ),
                     )
-                    matvec_cuda_mem_hard_cap_gib = float(
-                        kwargs.get(
-                            "matvec_cuda_mem_hard_cap_gib",
-                            getattr(self, "matvec_cuda_mem_hard_cap_gib", 11.5),
-                        )
+                    _approx_cuda_mem_ctl2 = _resolve_cuda_memory_controls_runtime(
+                        kwargs=kwargs,
+                        defaults=self,
+                        consume=False,
                     )
+                    matvec_cuda_mem_hard_cap_gib = float(_approx_cuda_mem_ctl2["matvec_cuda_mem_hard_cap_gib"])
                     threads_enum_forced = "matvec_cuda_threads_enum" in kwargs
                     threads_g_forced = "matvec_cuda_threads_g" in kwargs
                     matvec_cuda_threads_enum = int(
@@ -4259,18 +3980,13 @@ class GUGAFCISolver(_StreamObject):
             except Exception as e:  # pragma: no cover
                 raise RuntimeError("contract_2e backend 'cuda_eri_mat' requires CuPy") from e
 
-            contract_mem_hard_cap_gib = float(
-                kwargs.get(
-                    "matvec_cuda_mem_hard_cap_gib",
-                    getattr(self, "matvec_cuda_mem_hard_cap_gib", 11.5),
-                )
+            _contract_cuda_mem_ctl = _resolve_cuda_memory_controls_runtime(
+                kwargs=kwargs,
+                defaults=self,
+                consume=False,
             )
-            contract_ws_cache_fraction = _normalize_ws_cache_fraction(
-                kwargs.get(
-                    "matvec_cuda_ws_cache_fraction",
-                    getattr(self, "matvec_cuda_ws_cache_fraction", 0.2),
-                )
-            )
+            contract_mem_hard_cap_gib = float(_contract_cuda_mem_ctl["matvec_cuda_mem_hard_cap_gib"])
+            contract_ws_cache_fraction = float(_contract_cuda_mem_ctl["matvec_cuda_ws_cache_fraction"])
             _apply_cuda_pool_hard_cap(cp, float(contract_mem_hard_cap_gib))
             self._configure_matvec_cuda_ws_cache(
                 cp_mod=cp,
