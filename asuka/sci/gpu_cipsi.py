@@ -5,42 +5,27 @@ import os
 from dataclasses import dataclass
 from itertools import permutations
 from pathlib import Path
-from types import SimpleNamespace
 from typing import Any
 
 import numpy as np
 
 from asuka.cuguga.drt import DRT, build_drt
-from asuka.cuguga.oracle import _restore_eri_4d
 from asuka.cuguga.state_cache import get_state_cache
-from asuka.cuda.cuda_backend import (
-    GugaMatvecEriMatWorkspace,
-    gather_project_batched_inplace_device,
-    has_cipsi_frontier_hash_device,
-    make_device_drt,
-    make_device_state_cache,
-    scatter_embed_batched_inplace_device,
-)
-from asuka.cuda.cuda_davidson import davidson_sym_gpu
-from asuka.integrals.df_integrals import DFMOIntegrals, DeviceDFMOIntegrals
 from asuka.mcscf.casci import CASCIResult, _build_casci_df_integrals
+from asuka.qmc.labels import normalize_state_rep
 from asuka.qmc.sparse import SparseVector
-from asuka.sci.frontier_hash import FrontierHashSelector
+from asuka.sci.frontier_hash import SparseFrontierSelector
+from asuka.sci.hb_selection import heat_bath_select_and_pt2_sparse
 from asuka.sci.selected_ci import (
-    _build_variational_hamiltonian,
-    _initial_selection,
-    _make_hdiag_guess,
-    _normalize_ci0,
+    DiagonalGuessLookup,
+    _build_variational_hamiltonian_sparse,
+    _initial_selection_sparse,
+    _normalize_ci0_sparse,
     _solve_subspace,
 )
 
 
-def _require_cupy():
-    try:
-        import cupy as cp  # type: ignore[import-not-found]
-    except Exception as e:  # pragma: no cover
-        raise RuntimeError("GPU CIPSI requires cupy and the CUDA backend") from e
-    return cp
+_INT32_MAX = int(np.iinfo(np.int32).max)
 
 
 def _jsonify(value: Any) -> Any:
@@ -67,6 +52,8 @@ class CIPSITrialSpaceResult:
     profile: dict[str, Any]
     epq_mode: str
     ncsf: int
+    sel_key_u64: np.ndarray | None = None
+    label_kind: str = "csf_idx"
 
     def to_qmc_x0(self, root: int | None = None):
         if root is None:
@@ -89,12 +76,17 @@ class CIPSITrialSpaceResult:
             "e_var": np.asarray(self.e_var, dtype=np.float64),
             "e_pt2": np.asarray(self.e_pt2, dtype=np.float64),
             "e_tot": np.asarray(self.e_tot, dtype=np.float64),
-            "sel_idx": np.asarray(self.sel_idx, dtype=np.int32),
+            "sel_idx": np.asarray(self.sel_idx, dtype=np.int64),
+            "sel_key_u64": np.asarray(
+                np.zeros((0,), dtype=np.uint64) if self.sel_key_u64 is None else self.sel_key_u64,
+                dtype=np.uint64,
+            ),
             "ci_sel": np.asarray(self.ci_sel, dtype=np.float64),
             "meta_json": np.asarray(
                 json.dumps(
                     {
                         "epq_mode": str(self.epq_mode),
+                        "label_kind": str(self.label_kind),
                         "ncsf": int(self.ncsf),
                         "history": _jsonify(self.history),
                         "profile": _jsonify(self.profile),
@@ -113,7 +105,12 @@ class CIPSITrialSpaceResult:
     def load(cls, path: str | Path) -> "CIPSITrialSpaceResult":
         with np.load(str(path), allow_pickle=False) as data:
             meta = json.loads(str(np.asarray(data["meta_json"]).item()))
-            sel_idx = np.asarray(data["sel_idx"], dtype=np.int32)
+            sel_idx = np.asarray(data["sel_idx"], dtype=np.int64)
+            sel_key_u64 = None
+            if "sel_key_u64" in data:
+                sel_key_arr = np.asarray(data["sel_key_u64"], dtype=np.uint64).ravel()
+                if sel_key_arr.size > 0:
+                    sel_key_u64 = np.asarray(sel_key_arr, dtype=np.uint64)
             ci_sel = np.asarray(data["ci_sel"], dtype=np.float64)
             roots = _sparse_roots_from_selected(sel_idx, ci_sel)
             return cls(
@@ -121,6 +118,8 @@ class CIPSITrialSpaceResult:
                 e_pt2=np.asarray(data["e_pt2"], dtype=np.float64),
                 e_tot=np.asarray(data["e_tot"], dtype=np.float64),
                 sel_idx=sel_idx,
+                sel_key_u64=sel_key_u64,
+                label_kind=str(meta.get("label_kind", "csf_idx")),
                 ci_sel=ci_sel,
                 roots=roots,
                 history=list(meta.get("history", [])),
@@ -128,73 +127,6 @@ class CIPSITrialSpaceResult:
                 epq_mode=str(meta.get("epq_mode", "unknown")),
                 ncsf=int(meta.get("ncsf", int(sel_idx.max()) + 1 if sel_idx.size else 0)),
             )
-
-
-class _ProjectedCudaSubspaceHop:
-    def __init__(self, workspace: GugaMatvecEriMatWorkspace, sel_idx: np.ndarray):
-        cp = _require_cupy()
-        self.cp = cp
-        self.workspace = workspace
-        self.sel_idx = np.asarray(sel_idx, dtype=np.int64)
-        self.sel_idx_d = cp.asarray(self.sel_idx, dtype=cp.int64)
-        self.ncsf = int(workspace.ncsf)
-        self.nsel = int(self.sel_idx.size)
-        self._x_full = None
-        self._y_full = None
-        self._y_sub = None
-
-    def _ensure_buffers(self, nvec: int):
-        cp = self.cp
-        nvec = int(nvec)
-        if nvec <= 0:
-            raise ValueError("nvec must be > 0")
-        if self._x_full is not None and int(self._x_full.shape[1]) >= nvec:
-            return
-        self._x_full = cp.empty((self.ncsf, nvec), dtype=cp.float64, order="C")
-        self._y_full = cp.empty((self.ncsf, nvec), dtype=cp.float64, order="C")
-        self._y_sub = cp.empty((self.nsel, nvec), dtype=cp.float64, order="C")
-
-    def _apply_block(self, x_sub):
-        cp = self.cp
-        x_sub = cp.asarray(x_sub, dtype=cp.float64)
-        if x_sub.ndim != 2 or int(x_sub.shape[0]) != self.nsel:
-            raise ValueError("x_sub must have shape (nsel, nvec)")
-        nvec = int(x_sub.shape[1])
-        self._ensure_buffers(nvec)
-        x_full = self._x_full[:, :nvec]
-        y_full = self._y_full[:, :nvec]
-        y_sub = self._y_sub[:, :nvec]
-        cp.cuda.runtime.memsetAsync(int(x_full.data.ptr), 0, int(x_full.nbytes), int(cp.cuda.get_current_stream().ptr))
-        scatter_embed_batched_inplace_device(x_sub, self.sel_idx_d, x_full, sync=False)
-        for i in range(nvec):
-            self.workspace.hop(x_full[:, i], y=y_full[:, i], sync=False, check_overflow=False)
-        gather_project_batched_inplace_device(y_full, self.sel_idx_d, y_sub, sync=False)
-        return y_sub
-
-    def apply_full_block(self, x_sub):
-        cp = self.cp
-        x_sub = cp.asarray(x_sub, dtype=cp.float64)
-        if x_sub.ndim != 2 or int(x_sub.shape[0]) != self.nsel:
-            raise ValueError("x_sub must have shape (nsel, nvec)")
-        nvec = int(x_sub.shape[1])
-        self._ensure_buffers(nvec)
-        x_full = self._x_full[:, :nvec]
-        y_full = self._y_full[:, :nvec]
-        cp.cuda.runtime.memsetAsync(int(x_full.data.ptr), 0, int(x_full.nbytes), int(cp.cuda.get_current_stream().ptr))
-        scatter_embed_batched_inplace_device(x_sub, self.sel_idx_d, x_full, sync=False)
-        for i in range(nvec):
-            self.workspace.hop(x_full[:, i], y=y_full[:, i], sync=False, check_overflow=False)
-        return y_full
-
-    def __call__(self, x_sub):
-        cp = self.cp
-        x_sub = cp.asarray(x_sub, dtype=cp.float64)
-        if x_sub.ndim == 1:
-            y_sub = self._apply_block(x_sub.reshape(self.nsel, 1))
-            return y_sub[:, 0]
-        if x_sub.ndim == 2:
-            return self._apply_block(x_sub)
-        raise ValueError("x_sub must be 1D or 2D")
 
 
 def _normalize_epq_mode(epq_mode: str) -> str:
@@ -215,114 +147,12 @@ def _normalize_epq_mode(epq_mode: str) -> str:
     return mode
 
 
-def _dense_eri_mat_from_input(eri: Any, *, norb: int) -> np.ndarray:
-    if isinstance(eri, np.ndarray) and eri.ndim == 2:
-        return np.asarray(eri, dtype=np.float64, order="C")
-    eri4 = _restore_eri_4d(eri, int(norb)).astype(np.float64, copy=False)
-    return np.asarray(eri4.reshape(int(norb) * int(norb), int(norb) * int(norb)), dtype=np.float64, order="C")
-
-
-def _build_cuda_workspace(
-    drt: DRT,
-    h1e: np.ndarray,
-    eri: Any,
-    *,
-    epq_mode: str,
-    workspace_kwargs: dict[str, Any] | None = None,
-) -> tuple[GugaMatvecEriMatWorkspace, dict[str, Any]]:
-    cp = _require_cupy()
-    nops = int(drt.norb) * int(drt.norb)
-    drt_dev = make_device_drt(drt)
-    state_dev = make_device_state_cache(drt, drt_dev)
-    h1e = np.asarray(h1e, dtype=np.float64, order="C")
-
-    eri_mat_d = None
-    l_full_d = None
-    j_ps = None
-    if isinstance(eri, DeviceDFMOIntegrals):
-        j_ps = cp.asarray(eri.j_ps, dtype=cp.float64)
-        if eri.eri_mat is not None:
-            eri_mat_d = cp.ascontiguousarray(cp.asarray(eri.eri_mat, dtype=cp.float64))
-        if eri.l_full is not None:
-            l_full_d = cp.ascontiguousarray(cp.asarray(eri.l_full, dtype=cp.float64))
-    elif isinstance(eri, DFMOIntegrals):
-        j_ps = np.asarray(eri.j_ps, dtype=np.float64, order="C")
-        l_full_d = cp.ascontiguousarray(cp.asarray(eri.l_full, dtype=cp.float64))
-    else:
-        eri_mat_h = _dense_eri_mat_from_input(eri, norb=int(drt.norb))
-        eri_mat_d = cp.ascontiguousarray(cp.asarray(eri_mat_h, dtype=cp.float64))
-        eri4 = np.asarray(eri_mat_h, dtype=np.float64).reshape(int(drt.norb), int(drt.norb), int(drt.norb), int(drt.norb))
-        j_ps = np.einsum("pqqs->ps", eri4, optimize=True).astype(np.float64, copy=False)
-
-    if j_ps is None:
-        raise RuntimeError("failed to resolve J_ps for CUDA workspace")
-    h_eff = cp.asarray(h1e, dtype=cp.float64) - 0.5 * cp.asarray(j_ps, dtype=cp.float64)
-
-    mode = _normalize_epq_mode(epq_mode)
-    ws_opts: dict[str, Any] = {
-        "path_mode": "epq_blocked",
-        "use_fused_hop": False,
-        "use_cuda_graph": False,
-        "skip_zero_x_tiles": True,
-        "epq_build_device": True,
-        "threads_enum": 128,
-        "threads_g": 256,
-        "threads_w": 256,
-        "threads_apply": 64,
-        "dtype": cp.float64,
-    }
-    if mode == "materialized_epq":
-        ws_opts.update(
-            {
-                "use_epq_table": True,
-                "epq_streaming": False,
-                "aggregate_offdiag_k": True,
-            }
-        )
-    elif mode == "streamed_epq":
-        ws_opts.update(
-            {
-                "use_epq_table": True,
-                "epq_streaming": True,
-                "aggregate_offdiag_k": True,
-            }
-        )
-    else:
-        ws_opts.update(
-            {
-                "use_epq_table": False,
-                "epq_streaming": False,
-                "aggregate_offdiag_k": False,
-                "prefilter_trivial_tasks": True,
-            }
-        )
-    if workspace_kwargs:
-        ws_opts.update(dict(workspace_kwargs))
-
-    try:
-        ws = GugaMatvecEriMatWorkspace(
-            drt,
-            drt_dev=drt_dev,
-            state_dev=state_dev,
-            eri_mat=eri_mat_d,
-            l_full=l_full_d,
-            h_eff=h_eff,
-            **ws_opts,
-        )
-    except Exception as e:
-        raise RuntimeError(f"failed to initialize GPU CIPSI workspace in mode={mode!r}: {e}") from e
-
-    meta = {
-        "epq_mode": mode,
-        "norb": int(drt.norb),
-        "ncsf": int(drt.ncsf),
-        "nops": int(nops),
-        "use_epq_table": bool(getattr(ws, "use_epq_table", False)),
-        "epq_streaming": bool(getattr(ws, "epq_streaming", False)),
-        "aggregate_offdiag_k": bool(getattr(ws, "aggregate_offdiag_k", False)),
-        "path_mode": str(getattr(ws, "path_mode", "unknown")),
-    }
-    return ws, meta
+def _normalize_cipsi_backend(backend: str) -> str:
+    mode = str(backend).strip().lower()
+    allowed = {"auto", "cpu_sparse", "cuda_key64"}
+    if mode not in allowed:
+        raise ValueError("backend must be 'auto', 'cpu_sparse', or 'cuda_key64'")
+    return mode
 
 
 def _match_roots_by_overlap(prev_c_sel: np.ndarray | None, cur_c_sel: np.ndarray, e_var: np.ndarray) -> np.ndarray:
@@ -360,56 +190,8 @@ def _match_roots_by_overlap(prev_c_sel: np.ndarray | None, cur_c_sel: np.ndarray
     return np.asarray(picked, dtype=np.int32)
 
 
-def _choose_new_indices(
-    score: np.ndarray,
-    *,
-    max_add: int,
-    select_threshold: float | None,
-) -> list[int]:
-    ncsf, nroots = score.shape
-    if max_add <= 0 or ncsf <= 0:
-        return []
-    global_score = np.max(score, axis=1)
-    owner = np.argmax(score, axis=1)
-    picked: list[int] = []
-    picked_set: set[int] = set()
-
-    for r in range(nroots):
-        order = np.argsort(score[:, r])[::-1]
-        for ii in order.tolist():
-            val = float(score[ii, r])
-            if not np.isfinite(val) or val <= 0.0:
-                break
-            if ii in picked_set:
-                continue
-            picked.append(int(ii))
-            picked_set.add(int(ii))
-            break
-        if len(picked) >= int(max_add):
-            return picked[:max_add]
-
-    if select_threshold is not None:
-        mask = np.asarray(global_score >= float(select_threshold), dtype=np.bool_)
-        cand = np.nonzero(mask)[0]
-    else:
-        cand = np.nonzero(np.isfinite(global_score) & (global_score > 0.0))[0]
-    if cand.size == 0:
-        return picked[:max_add]
-
-    order = sorted(
-        (int(ii) for ii in cand.tolist() if int(ii) not in picked_set),
-        key=lambda ii: (-float(global_score[ii]), int(owner[ii]), int(ii)),
-    )
-    for ii in order:
-        picked.append(ii)
-        picked_set.add(ii)
-        if len(picked) >= int(max_add):
-            break
-    return picked[:max_add]
-
-
 def _sparse_roots_from_selected(sel_idx: np.ndarray, ci_sel: np.ndarray) -> list[SparseVector]:
-    sel_idx = np.asarray(sel_idx, dtype=np.int32).ravel()
+    sel_idx = np.asarray(sel_idx, dtype=np.int64).ravel()
     ci_sel = np.asarray(ci_sel, dtype=np.float64)
     if ci_sel.ndim != 2:
         raise ValueError("ci_sel must be 2D")
@@ -417,21 +199,22 @@ def _sparse_roots_from_selected(sel_idx: np.ndarray, ci_sel: np.ndarray) -> list
     for r in range(int(ci_sel.shape[1])):
         col = np.asarray(ci_sel[:, r], dtype=np.float64)
         mask = np.abs(col) > 0.0
-        idx = np.asarray(sel_idx[mask], dtype=np.int32)
+        idx = np.asarray(sel_idx[mask], dtype=np.int64)
         val = np.asarray(col[mask], dtype=np.float64)
         if idx.size > 1:
             order = np.argsort(idx, kind="stable")
-            idx = np.asarray(idx[order], dtype=np.int32)
+            idx = np.asarray(idx[order], dtype=np.int64)
             val = np.asarray(val[order], dtype=np.float64)
         roots.append(SparseVector(idx, val))
     return roots
 
 
-def _build_ci0_subspace(
+def _build_ci0_subspace_sparse(
     *,
     sel_idx: np.ndarray,
+    loc_map: dict[int, int],
     nroots: int,
-    ci0_list: list[np.ndarray] | None,
+    ci0_sparse: list[SparseVector] | None,
     prev_c_sel: np.ndarray | None,
 ) -> list[np.ndarray]:
     nsel = int(sel_idx.size)
@@ -443,162 +226,26 @@ def _build_ci0_subspace(
             v[:old_nsel] = np.asarray(prev_c_sel[:, r], dtype=np.float64)
             out.append(v)
         return out
-    if ci0_list is not None:
-        return [np.asarray(ci0_list[r][sel_idx], dtype=np.float64) for r in range(int(nroots))]
+    if ci0_sparse is not None:
+        out: list[np.ndarray] = []
+        for r in range(int(nroots)):
+            v = np.zeros((nsel,), dtype=np.float64)
+            rv = ci0_sparse[r]
+            for ii, vv in zip(np.asarray(rv.idx, dtype=np.int64).tolist(), np.asarray(rv.val, dtype=np.float64).tolist()):
+                pos = loc_map.get(int(ii))
+                if pos is not None:
+                    v[int(pos)] = float(vv)
+            if not np.any(v) and nsel > 0:
+                v[min(r, nsel - 1)] = 1.0
+            out.append(v)
+        return out
     out = []
     for r in range(int(nroots)):
         v = np.zeros((nsel,), dtype=np.float64)
-        v[min(r, nsel - 1)] = 1.0
+        if nsel > 0:
+            v[min(r, nsel - 1)] = 1.0
         out.append(v)
     return out
-
-
-def _solve_davidson_with_retries(
-    *,
-    hop: Any,
-    x0: list[np.ndarray],
-    hdiag_sub: np.ndarray,
-    nroots: int,
-    max_cycle: int,
-    max_space: int,
-    tol: float,
-    tag: str,
-):
-    """Run GPU Davidson with bounded retry expansion until all roots converge."""
-
-    nroots_i = int(nroots)
-    hdiag_sub = np.asarray(hdiag_sub, dtype=np.float64).ravel()
-    nsel_i = int(hdiag_sub.size)
-    max_cycle_i = int(max_cycle)
-    max_space_i = min(int(max_space), int(nsel_i))
-    if max_space_i < nroots_i:
-        max_space_i = int(nroots_i)
-
-    retries = 2
-    cycle_cap = max(int(max_cycle_i), max(200, int(max_cycle_i) * 4))
-    space_cap = min(int(nsel_i), max(int(max_space_i), max(64, int(max_space_i) * 4)))
-
-    attempts: list[dict[str, Any]] = []
-    last_res = None
-    for attempt in range(retries + 1):
-        dres = davidson_sym_gpu(
-            hop,
-            x0=x0,
-            hdiag=hdiag_sub,
-            nroots=nroots_i,
-            max_cycle=int(max_cycle_i),
-            max_space=int(max_space_i),
-            tol=float(tol),
-            subspace_eigh_cpu=True,
-            subspace_eigh_cpu_max_m=64,
-        )
-        conv = np.asarray(getattr(dres, "converged", np.zeros((nroots_i,), dtype=np.bool_)), dtype=np.bool_).ravel()
-        conv_count = int(np.count_nonzero(conv))
-        attempts.append(
-            {
-                "attempt": int(attempt),
-                "max_cycle": int(max_cycle_i),
-                "max_space": int(max_space_i),
-                "niter": int(getattr(dres, "niter", -1)),
-                "converged_roots": int(conv_count),
-                "nroots": int(nroots_i),
-            }
-        )
-        if conv.shape == (nroots_i,) and bool(np.all(conv)):
-            return dres, {"attempts": attempts, "retry_count": int(attempt)}
-
-        last_res = dres
-        if attempt >= retries:
-            break
-        max_cycle_i = min(int(cycle_cap), max(int(max_cycle_i) + max(8, nroots_i * 4), int(max_cycle_i * 3 // 2)))
-        max_space_i = min(int(space_cap), max(int(max_space_i) + max(4, nroots_i), int(max_space_i * 3 // 2)))
-
-    dense_fallback_max_nsel = max(64, nroots_i * 8)
-    if nsel_i <= int(dense_fallback_max_nsel):
-        cp = _require_cupy()
-        eye = cp.eye(nsel_i, dtype=cp.float64)
-        h_cols = []
-        for ii in range(nsel_i):
-            col = cp.asarray(hop(eye[:, ii]), dtype=cp.float64).ravel()
-            h_cols.append(col)
-        h_sub = cp.asnumpy(cp.stack(h_cols, axis=1))
-        h_sub = 0.5 * (h_sub + h_sub.T)
-        evals, evecs = np.linalg.eigh(np.asarray(h_sub, dtype=np.float64))
-        e_out = np.asarray(evals[:nroots_i], dtype=np.float64)
-        x_out = [np.asarray(evecs[:, i], dtype=np.float64).copy() for i in range(nroots_i)]
-        attempts.append(
-            {
-                "attempt": int(len(attempts)),
-                "max_cycle": int(max_cycle_i),
-                "max_space": int(max_space_i),
-                "niter": -1,
-                "converged_roots": int(nroots_i),
-                "nroots": int(nroots_i),
-                "dense_fallback": True,
-            }
-        )
-        dres = SimpleNamespace(
-            converged=np.ones((nroots_i,), dtype=np.bool_),
-            e=e_out,
-            x=x_out,
-            niter=-1,
-            stats={"dense_fallback": 1.0},
-        )
-        return dres, {"attempts": attempts, "retry_count": int(retries), "used_dense_fallback": True}
-
-    raise RuntimeError(
-        f"GPU Davidson did not converge for {tag}; attempts={attempts}, "
-        f"last_niter={int(getattr(last_res, 'niter', -1)) if last_res is not None else -1}"
-    )
-
-
-def _maybe_refine_subspace_cpu(
-    *,
-    drt: DRT,
-    h1e: np.ndarray,
-    eri: Any,
-    sel_idx: np.ndarray,
-    loc: np.ndarray,
-    nroots: int,
-    davidson_tol: float,
-):
-    """Optionally refine small selected spaces with deterministic CPU subspace diagonalization."""
-
-    max_nsel = int(str(os.environ.get("ASUKA_GPU_CIPSI_CPU_SUBSPACE_REFINE_MAX_NSEL", "256")).strip() or "256")
-    if max_nsel <= 0:
-        return None
-    sel_idx_i64 = np.asarray(sel_idx, dtype=np.int64).ravel()
-    nsel = int(sel_idx_i64.size)
-    if nsel <= 0 or nsel > int(max_nsel):
-        return None
-
-    try:
-        state_cache = get_state_cache(drt)
-        h_sub = _build_variational_hamiltonian(
-            drt,
-            np.asarray(h1e, dtype=np.float64),
-            eri,
-            sel=sel_idx_i64.tolist(),
-            loc=np.asarray(loc, dtype=np.int32),
-            max_out=200_000,
-            screening=None,
-            state_cache=state_cache,
-        )
-        e_sub, c_sub = _solve_subspace(
-            h_sub,
-            nroots=int(nroots),
-            dense_limit=max(64, int(nsel)),
-            eigsh_tol=max(float(davidson_tol), 1e-12),
-            v0=None,
-        )
-    except Exception:
-        return None
-
-    return {
-        "e_var": np.asarray(e_sub, dtype=np.float64),
-        "c_sel": np.asarray(c_sub, dtype=np.float64, order="C"),
-        "cpu_subspace_refined": True,
-    }
 
 
 def run_cipsi_trials(
@@ -616,12 +263,12 @@ def run_cipsi_trials(
     max_iter: int = 20,
     select_threshold: float | None = None,
     denom_floor: float = 1e-12,
-    epq_mode: str = "materialized_epq",
+    epq_mode: str = "no_epq_support_aware",
     workspace_kwargs: dict[str, Any] | None = None,
     davidson_max_cycle: int = 40,
     davidson_max_space: int = 12,
     davidson_tol: float = 1e-8,
-    selection_mode: str = "dense",
+    selection_mode: str = "frontier_hash",
     frontier_hash_cap: int | None = None,
     frontier_hash_tile: int = 1024,
     frontier_hash_rs_block: int = 0,
@@ -633,59 +280,52 @@ def run_cipsi_trials(
     hb_eps_schedule: str = "fixed",
     hb_eps_init: float = 1e-3,
     hb_eps_final: float = 1e-6,
+    backend: str = "auto",
+    state_rep: str = "auto",
     verbose: int = 0,
 ) -> CIPSITrialSpaceResult:
-    cp = _require_cupy()
-
     nroots = int(nroots)
     if nroots < 1:
         raise ValueError("nroots must be >= 1")
     ncsf = int(drt.ncsf)
+    if ncsf < 1:
+        raise ValueError("drt.ncsf must be >= 1")
     if nroots > ncsf:
         raise ValueError("nroots must be <= drt.ncsf")
     max_ncsf = min(int(max_ncsf), ncsf)
     if max_ncsf < nroots:
         raise ValueError("max_ncsf must be >= nroots")
+    backend_requested = _normalize_cipsi_backend(backend)
+    state_rep_s = normalize_state_rep(state_rep)
+    if state_rep_s == "key64" and int(drt.norb) > 32:
+        raise ValueError("state_rep='key64' requires drt.norb <= 32")
 
-    if hdiag is None:
-        state_cache = get_state_cache(drt)
-        hdiag = _make_hdiag_guess(drt, h1e, eri, state_cache=state_cache)
+    if backend_requested == "cuda_key64" and int(drt.norb) > 32:
+        raise ValueError("backend='cuda_key64' requires drt.norb <= 32")
+    if backend_requested == "cuda_key64" and state_rep_s == "i32":
+        raise ValueError("backend='cuda_key64' is incompatible with state_rep='i32'")
+
+    if backend_requested == "auto":
+        use_key64 = state_rep_s == "key64" or (state_rep_s == "auto" and int(drt.ncsf) > _INT32_MAX and int(drt.norb) <= 32)
+        backend_effective = "cuda_key64" if use_key64 else "cpu_sparse"
     else:
-        hdiag = np.asarray(hdiag, dtype=np.float64).ravel()
-    if int(hdiag.size) != ncsf:
-        raise ValueError("hdiag has wrong length")
-
-    ci0_list = _normalize_ci0(ci0, nroots=nroots, ncsf=ncsf)
-    sel_seed = _initial_selection(
-        ncsf=ncsf,
-        nroots=nroots,
-        init_ncsf=int(init_ncsf),
-        hdiag=hdiag,
-        ci0_list=ci0_list,
-    )
-    sel: list[int] = []
-    loc = -np.ones((ncsf,), dtype=np.int32)
-    for ii in sel_seed:
-        jj = int(ii)
-        if jj < 0 or jj >= ncsf or int(loc[jj]) >= 0:
-            continue
-        loc[jj] = int(len(sel))
-        sel.append(jj)
-        if len(sel) >= int(max_ncsf):
-            break
+        backend_effective = backend_requested
+        use_key64 = backend_effective == "cuda_key64"
+    if use_key64:
+        state_rep_s = "key64"
 
     selection_mode_s = str(selection_mode).strip().lower()
-    if selection_mode_s in ("dense", "full", "hc_full"):
-        selection_mode_s = "dense"
-    elif selection_mode_s in ("frontier_hash", "hash", "frontier-hash"):
+    if selection_mode_s in ("frontier_hash", "hash", "frontier-hash"):
         selection_mode_s = "frontier_hash"
     elif selection_mode_s in ("heat_bath", "hb", "heatbath", "hb_sci", "heat-bath"):
         selection_mode_s = "heat_bath"
+    elif selection_mode_s in ("dense", "full", "hc_full"):
+        raise ValueError(
+            "selection_mode='dense' has been removed from the scalable CIPSI path; "
+            "use selection_mode='frontier_hash' or selection_mode='heat_bath'"
+        )
     else:
-        raise ValueError("selection_mode must be 'dense', 'frontier_hash', or 'heat_bath'")
-
-    # Resolve EPQ mode before building the CUDA workspace so we can enforce constraints
-    # (frontier-hash and heat-bath selection require the no-EPQ path).
+        raise ValueError("selection_mode must be 'frontier_hash' or 'heat_bath'")
     requested_epq_mode = _normalize_epq_mode(epq_mode)
     epq_mode_s = str(requested_epq_mode)
     if epq_mode_s == "streamed_epq":
@@ -697,136 +337,96 @@ def run_cipsi_trials(
                     "[GPU-CIPSI] streamed_epq requested but currently disabled for stability; "
                     "falling back to materialized_epq (set ASUKA_ALLOW_STREAMED_EPQ_EXPERIMENTAL=1 to force)"
                 )
-    ws_kwargs = dict(workspace_kwargs or {})
-    if selection_mode_s in ("frontier_hash", "heat_bath"):
-        if select_threshold is not None:
-            raise NotImplementedError(f"selection_mode='{selection_mode_s}' does not currently support select_threshold")
-        if not bool(has_cipsi_frontier_hash_device()):
-            raise RuntimeError(f"selection_mode='{selection_mode_s}' requires CUDA extension with frontier-hash kernels")
-        if epq_mode_s != "no_epq_support_aware":
-            raise RuntimeError(f"selection_mode='{selection_mode_s}' requires epq_mode='no_epq_support_aware' (no EPQ table)")
-        ws_kwargs.setdefault("csr_capacity_mult", float(frontier_hash_csr_capacity_mult))
-        # Force no-EPQ even if the caller passed overrides.
-        ws_kwargs["use_epq_table"] = False
-        ws_kwargs["aggregate_offdiag_k"] = False
-        ws_kwargs["epq_streaming"] = False
+    if epq_mode_s != "no_epq_support_aware":
+        raise RuntimeError(f"selection_mode='{selection_mode_s}' requires epq_mode='no_epq_support_aware' (no EPQ table)")
 
-    ws, profile = _build_cuda_workspace(drt, h1e, eri, epq_mode=epq_mode_s, workspace_kwargs=ws_kwargs)
-    profile["selection_mode"] = str(selection_mode_s)
+    need_sparse_state = int(ncsf) > _INT32_MAX or state_rep_s == "key64"
+    state_cache = None if need_sparse_state else get_state_cache(drt)
+    hdiag_lookup = DiagonalGuessLookup(drt, h1e, eri, hdiag=None if hdiag is None else np.asarray(hdiag, dtype=np.float64))
+    ci0_sparse = _normalize_ci0_sparse(ci0, nroots=nroots, ncsf=ncsf)
+    sel_seed = _initial_selection_sparse(
+        ncsf=ncsf,
+        nroots=nroots,
+        init_ncsf=int(init_ncsf),
+        hdiag_lookup=hdiag_lookup,
+        ci0_sparse=ci0_sparse,
+    )
+    sel: list[int] = []
+    loc_map: dict[int, int] = {}
+    for ii in sel_seed:
+        jj = int(ii)
+        if jj < 0 or jj >= ncsf or jj in loc_map:
+            continue
+        loc_map[jj] = int(len(sel))
+        sel.append(jj)
+        if len(sel) >= int(max_ncsf):
+            break
+
+    profile: dict[str, Any] = {
+        "selection_mode": str(selection_mode_s),
+        "state_rep": str(state_rep_s),
+        "backend_requested": str(backend_requested),
+        "backend_effective": str(backend_effective),
+        "epq_mode": str(epq_mode_s),
+        "driver": "sparse_row_oracle",
+        "workspace_kwargs_ignored": bool(workspace_kwargs),
+        "frontier_hash_cap_ignored": frontier_hash_cap is not None,
+        "frontier_hash_tile_ignored": int(frontier_hash_tile),
+        "frontier_hash_rs_block_ignored": int(frontier_hash_rs_block),
+        "frontier_hash_g_rows_ignored": int(frontier_hash_g_rows),
+        "frontier_hash_offdiag_kernel_mode_ignored": frontier_hash_offdiag_kernel_mode,
+        "frontier_hash_csr_capacity_mult_ignored": float(frontier_hash_csr_capacity_mult),
+        "frontier_hash_max_retries_ignored": int(frontier_hash_max_retries),
+    }
     if str(requested_epq_mode) != str(epq_mode_s):
         profile["epq_mode_requested"] = str(requested_epq_mode)
         profile["epq_mode_effective"] = str(epq_mode_s)
         profile["epq_mode_fallback_reason"] = "streamed_epq_temporarily_disabled"
+    else:
+        profile["epq_mode_effective"] = str(epq_mode_s)
     history: list[dict[str, Any]] = []
     prev_c_sel: np.ndarray | None = None
-
-    frontier_selector: FrontierHashSelector | None = None
-    hb_index_obj = None
-    hb_frontier = None
-    if selection_mode_s == "heat_bath":
-        from asuka.sci.hb_integrals import build_hb_index, build_hb_index_from_df  # noqa: PLC0415
-        from asuka.sci.hb_selection import adaptive_epsilon as _adaptive_eps  # noqa: PLC0415
-
-        norb = int(drt.norb)
-        nops = norb * norb
-
-        # Build the sorted integral index (one-time cost)
-        l_full_ws = getattr(ws, "l_full", None)
-        eri_mat_ws = getattr(ws, "eri_mat", None)
-        h_eff_flat = getattr(ws, "h_eff_flat", None)
-        if h_eff_flat is None:
-            raise RuntimeError("internal error: workspace h_eff_flat is missing")
-        h_eff_np = cp.asnumpy(h_eff_flat).reshape(norb, norb)
-
-        if l_full_ws is not None:
-            l_full_np = cp.asnumpy(l_full_ws)
-            hb_index_obj = build_hb_index_from_df(h_eff_np, l_full_np, norb)
-        elif eri_mat_ws is not None:
-            eri_mat_np = cp.asnumpy(eri_mat_ws).reshape(norb, norb, norb, norb)
-            hb_index_obj = build_hb_index(h_eff_np, eri_mat_np, norb)
-        else:
-            raise RuntimeError("internal error: workspace missing both eri_mat and l_full for HB-SCI")
-
-        # Set up frontier hash buffers for heat-bath mode
-        selected_mask_d = cp.zeros((ncsf,), dtype=cp.uint8)
-        selected_mask_d[cp.asarray(np.asarray(sel, dtype=np.int32), dtype=cp.int32)] = np.uint8(1)
-        hdiag_d = cp.ascontiguousarray(cp.asarray(np.asarray(hdiag, dtype=np.float64), dtype=cp.float64))
-
-        hb_frontier = {
-            "selected_mask_d": selected_mask_d,
-            "hdiag_d": hdiag_d,
-            "hash_cap": 0,
-            "hash_keys": None,
-            "hash_vals": None,
-            "hash_overflow": None,
-            "out_idx": None,
-            "out_vals": None,
-            "out_nnz": None,
-            "max_retries": int(frontier_hash_max_retries),
-            "offdiag_rs_block": int(frontier_hash_rs_block),
-            "offdiag_g_rows": int(frontier_hash_g_rows),
-            "offdiag_kernel_mode": frontier_hash_offdiag_kernel_mode,
-            "hb_dev": None,
-        }
-
-    if selection_mode_s == "frontier_hash":
-        frontier_selector = FrontierHashSelector(
-            drt,
-            ws,
-            nroots=int(nroots),
-            hdiag=hdiag,
-            denom_floor=float(denom_floor),
-            tile=int(frontier_hash_tile),
-            rs_block=int(frontier_hash_rs_block),
-            g_rows=int(frontier_hash_g_rows),
-            hash_cap=frontier_hash_cap,
-            max_retries=int(frontier_hash_max_retries),
-            offdiag_kernel_mode=frontier_hash_offdiag_kernel_mode,
-            nvtx=None,
-            profile=False,
-        )
-        frontier_selector.reset_selected_mask(np.asarray(sel, dtype=np.int64))
+    frontier_selector = SparseFrontierSelector(
+        drt,
+        h1e,
+        eri,
+        hdiag_lookup=hdiag_lookup,
+        denom_floor=float(denom_floor),
+        max_out=200_000,
+        screening=None,
+        state_cache=state_cache,
+        select_screen_contrib=0.0,
+    )
+    frontier_selector.reset_selected_mask(np.asarray(sel, dtype=np.int64))
 
     for it in range(1, int(max_iter) + 1):
         sel_idx = np.asarray(sel, dtype=np.int64)
-        hop = _ProjectedCudaSubspaceHop(ws, sel_idx)
-        ci0_sub = _build_ci0_subspace(
-            sel_idx=np.asarray(sel_idx, dtype=np.int64),
-            nroots=nroots,
-            ci0_list=ci0_list,
+        h_sub = _build_variational_hamiltonian_sparse(
+            drt,
+            h1e,
+            eri,
+            sel=sel,
+            loc_map=loc_map,
+            max_out=200_000,
+            screening=None,
+            state_cache=state_cache,
+        )
+        ci0_sub = _build_ci0_subspace_sparse(
+            sel_idx=sel_idx,
+            loc_map=loc_map,
+            nroots=int(nroots),
+            ci0_sparse=ci0_sparse,
             prev_c_sel=prev_c_sel,
         )
-        dres, dmeta = _solve_davidson_with_retries(
-            hop=hop,
-            x0=ci0_sub,
-            hdiag_sub=np.asarray(hdiag[sel_idx], dtype=np.float64),
+        v0 = None if not ci0_sub else np.asarray(ci0_sub[0], dtype=np.float64)
+        e_var, c_sel = _solve_subspace(
+            h_sub,
             nroots=int(nroots),
-            max_cycle=int(davidson_max_cycle),
-            max_space=int(davidson_max_space),
-            tol=float(davidson_tol),
-            tag=f"iter={int(it)} nsel={int(sel_idx.size)}",
+            dense_limit=max(64, int(davidson_max_space) * 8),
+            eigsh_tol=float(davidson_tol),
+            v0=v0,
         )
-        profile["davidson_max_retry_count"] = max(
-            int(profile.get("davidson_max_retry_count", 0)),
-            int(dmeta.get("retry_count", 0)),
-        )
-        e_var = np.asarray(dres.e, dtype=np.float64)
-        c_sel = np.ascontiguousarray(np.column_stack(dres.x), dtype=np.float64)
-        refine_meta = _maybe_refine_subspace_cpu(
-            drt=drt,
-            h1e=h1e,
-            eri=eri,
-            sel_idx=np.asarray(sel_idx, dtype=np.int64),
-            loc=loc,
-            nroots=int(nroots),
-            davidson_tol=float(davidson_tol),
-        )
-        if refine_meta is not None:
-            e_var = np.asarray(refine_meta["e_var"], dtype=np.float64)
-            c_sel = np.asarray(refine_meta["c_sel"], dtype=np.float64, order="C")
-            dmeta["used_cpu_subspace_refine"] = True
-        else:
-            dmeta["used_cpu_subspace_refine"] = False
+        c_sel = np.asarray(c_sel, dtype=np.float64, order="C")
         perm = _match_roots_by_overlap(prev_c_sel, c_sel, e_var)
         if np.any(perm != np.arange(int(nroots), dtype=np.int32)):
             e_var = np.asarray(e_var[perm], dtype=np.float64)
@@ -834,63 +434,51 @@ def run_cipsi_trials(
 
         max_add = min(int(grow_by), int(max_ncsf) - int(sel_idx.size))
         if selection_mode_s == "frontier_hash":
-            if frontier_selector is None:  # pragma: no cover
-                raise RuntimeError("internal error: frontier selector is missing for selection_mode='frontier_hash'")
             new_idx, e_pt2, _stats = frontier_selector.build_and_score(
                 sel_idx=sel_idx,
                 c_sel=c_sel,
                 e_var=e_var,
                 max_add=int(max_add),
-            )
-        elif selection_mode_s == "heat_bath":
-            from asuka.sci.hb_selection import heat_bath_select_and_pt2 as _hb_select  # noqa: PLC0415
-            if hb_index_obj is None or hb_frontier is None:  # pragma: no cover
-                raise RuntimeError("internal error: HB-SCI index/buffers missing")
-            # Compute epsilon for this iteration
-            if str(hb_eps_schedule).lower() == "adaptive":
-                _eps = _adaptive_eps(it, int(sel_idx.size), int(max_ncsf), eps_init=float(hb_eps_init), eps_final=float(hb_eps_final))
-            else:
-                _eps = float(hb_epsilon)
-            new_idx, e_pt2 = _hb_select(
-                hb_index_obj, sel_idx, c_sel, e_var, int(max_add), _eps,
-                ws, drt, hb_frontier, nroots, ncsf, float(denom_floor),
-                verbose=verbose,
+                select_threshold=select_threshold,
             )
         else:
-            c_sel_d = cp.asarray(c_sel, dtype=cp.float64)
-            hc_full_d = hop.apply_full_block(c_sel_d)
-            hc_full_d[hop.sel_idx_d, :] = 0.0
-            denom_d = cp.asarray(np.asarray(e_var, dtype=np.float64).reshape(1, nroots), dtype=cp.float64)
-            hdiag_d = cp.asarray(np.asarray(hdiag, dtype=np.float64).reshape(ncsf, 1), dtype=cp.float64)
-            denom_d = denom_d - hdiag_d
-            if float(denom_floor) > 0.0:
-                small = cp.abs(denom_d) < float(denom_floor)
-                denom_d = cp.where(small, cp.where(denom_d >= 0.0, float(denom_floor), -float(denom_floor)), denom_d)
-            score_d = cp.abs(hc_full_d / denom_d)
-            e_pt2 = cp.asnumpy(cp.sum((hc_full_d * hc_full_d) / denom_d, axis=0))
-            score = cp.asnumpy(score_d)
-            new_idx = _choose_new_indices(score, max_add=int(max_add), select_threshold=select_threshold)
+            if str(hb_eps_schedule).lower() == "adaptive":
+                frac = 0.0 if int(max_ncsf) <= int(init_ncsf) else (int(sel_idx.size) - int(init_ncsf)) / max(
+                    1, int(max_ncsf) - int(init_ncsf)
+                )
+                frac = float(np.clip(frac, 0.0, 1.0))
+                _eps = float(hb_eps_init) * (float(hb_eps_final) / float(hb_eps_init)) ** frac
+            else:
+                _eps = float(hb_epsilon)
+            new_idx, e_pt2 = heat_bath_select_and_pt2_sparse(
+                drt,
+                h1e,
+                eri,
+                sel_idx=sel_idx,
+                c_sel=c_sel,
+                e_var=e_var,
+                max_add=int(max_add),
+                epsilon=float(_eps),
+                denom_floor=float(denom_floor),
+                hdiag_lookup=hdiag_lookup,
+                max_out=200_000,
+                screening=None,
+                state_cache=state_cache,
+            )
         for ii in new_idx:
-            if int(loc[int(ii)]) >= 0:
+            jj = int(ii)
+            if jj in loc_map:
                 continue
-            loc[int(ii)] = int(len(sel))
-            sel.append(int(ii))
+            loc_map[jj] = int(len(sel))
+            sel.append(jj)
             if len(sel) >= int(max_ncsf):
                 break
-        if selection_mode_s == "frontier_hash" and frontier_selector is not None and len(new_idx) > 0:
+        if len(new_idx) > 0:
             frontier_selector.mark_selected(new_idx)
-        if selection_mode_s == "heat_bath" and hb_frontier is not None and len(new_idx) > 0:
-            selected_mask_d = hb_frontier.get("selected_mask_d")
-            if selected_mask_d is not None:
-                new_i32 = np.asarray(new_idx, dtype=np.int32)
-                selected_mask_d[cp.asarray(new_i32, dtype=cp.int32)] = np.uint8(1)
 
         active_mask = np.any(np.abs(c_sel) > 0.0, axis=1)
         active_sources = np.asarray(sel_idx[active_mask], dtype=np.int64)
-        j_tile = int(getattr(ws, "j_tile", int(ncsf)))
-        active_tiles = 0
-        if active_sources.size:
-            active_tiles = int(np.unique(active_sources // max(1, j_tile)).size)
+        active_tiles = int(active_sources.size)
 
         rec = {
             "iter": int(it),
@@ -902,10 +490,10 @@ def run_cipsi_trials(
             "active_sources": int(active_sources.size),
             "active_tiles": int(active_tiles),
             "epq_mode": str(profile.get("epq_mode", epq_mode)),
-            "davidson_niter": int(getattr(dres, "niter", -1)),
-            "davidson_retry_count": int(dmeta.get("retry_count", 0)),
-            "davidson_attempts": list(dmeta.get("attempts", [])),
-            "cpu_subspace_refined": bool(dmeta.get("used_cpu_subspace_refine", False)),
+            "davidson_niter": -1,
+            "davidson_retry_count": 0,
+            "davidson_attempts": [],
+            "cpu_subspace_refined": False,
         }
         history.append(rec)
         prev_c_sel = np.asarray(c_sel, dtype=np.float64)
@@ -914,90 +502,87 @@ def run_cipsi_trials(
         if len(new_idx) == 0 or len(sel) >= int(max_ncsf):
             break
 
-    sel_idx = np.asarray(sel, dtype=np.int32)
-    hop = _ProjectedCudaSubspaceHop(ws, sel_idx)
-    ci0_sub = _build_ci0_subspace(
-        sel_idx=np.asarray(sel_idx, dtype=np.int64),
-        nroots=nroots,
-        ci0_list=ci0_list,
+    sel_idx = np.asarray(sel, dtype=np.int64)
+    h_sub = _build_variational_hamiltonian_sparse(
+        drt,
+        h1e,
+        eri,
+        sel=sel,
+        loc_map=loc_map,
+        max_out=200_000,
+        screening=None,
+        state_cache=state_cache,
+    )
+    ci0_sub = _build_ci0_subspace_sparse(
+        sel_idx=sel_idx,
+        loc_map=loc_map,
+        nroots=int(nroots),
+        ci0_sparse=ci0_sparse,
         prev_c_sel=prev_c_sel,
     )
-    dres, dmeta_final = _solve_davidson_with_retries(
-        hop=hop,
-        x0=ci0_sub,
-        hdiag_sub=np.asarray(hdiag[sel_idx], dtype=np.float64),
+    v0 = None if not ci0_sub else np.asarray(ci0_sub[0], dtype=np.float64)
+    e_var, c_sel = _solve_subspace(
+        h_sub,
         nroots=int(nroots),
-        max_cycle=int(davidson_max_cycle),
-        max_space=int(davidson_max_space),
-        tol=float(davidson_tol),
-        tag=f"final nsel={int(sel_idx.size)}",
+        dense_limit=max(64, int(davidson_max_space) * 8),
+        eigsh_tol=float(davidson_tol),
+        v0=v0,
     )
-    profile["davidson_final_retry_count"] = int(dmeta_final.get("retry_count", 0))
-    profile["davidson_final_attempts"] = list(dmeta_final.get("attempts", []))
-    profile["davidson_final_niter"] = int(getattr(dres, "niter", -1))
-    e_var = np.asarray(dres.e, dtype=np.float64)
-    c_sel = np.ascontiguousarray(np.column_stack(dres.x), dtype=np.float64)
-    refine_meta = _maybe_refine_subspace_cpu(
-        drt=drt,
-        h1e=h1e,
-        eri=eri,
-        sel_idx=np.asarray(sel_idx, dtype=np.int64),
-        loc=loc,
-        nroots=int(nroots),
-        davidson_tol=float(davidson_tol),
-    )
-    if refine_meta is not None:
-        e_var = np.asarray(refine_meta["e_var"], dtype=np.float64)
-        c_sel = np.asarray(refine_meta["c_sel"], dtype=np.float64, order="C")
-        profile["cpu_subspace_refined_final"] = 1.0
-    else:
-        profile["cpu_subspace_refined_final"] = 0.0
+    profile["davidson_final_retry_count"] = 0
+    profile["davidson_final_attempts"] = []
+    profile["davidson_final_niter"] = -1
+    profile["cpu_subspace_refined_final"] = 0.0
+    c_sel = np.asarray(c_sel, dtype=np.float64, order="C")
     perm = _match_roots_by_overlap(prev_c_sel, c_sel, e_var)
     if np.any(perm != np.arange(int(nroots), dtype=np.int32)):
         e_var = np.asarray(e_var[perm], dtype=np.float64)
         c_sel = np.asarray(c_sel[:, perm], dtype=np.float64)
     if selection_mode_s == "frontier_hash":
-        if frontier_selector is None:  # pragma: no cover
-            raise RuntimeError("internal error: frontier selector is missing for selection_mode='frontier_hash'")
         _new_idx, e_pt2, _stats = frontier_selector.build_and_score(
             sel_idx=np.asarray(sel_idx, dtype=np.int64),
             c_sel=c_sel,
             e_var=e_var,
             max_add=0,
+            select_threshold=select_threshold,
         )
         assert len(_new_idx) == 0
-    elif selection_mode_s == "heat_bath":
-        from asuka.sci.hb_selection import heat_bath_select_and_pt2 as _hb_select  # noqa: PLC0415
-        if hb_index_obj is None or hb_frontier is None:  # pragma: no cover
-            raise RuntimeError("internal error: HB-SCI index/buffers missing")
-        _eps_final = float(hb_eps_final) if str(hb_eps_schedule).lower() == "adaptive" else float(hb_epsilon)
-        _new_idx, e_pt2 = _hb_select(
-            hb_index_obj, np.asarray(sel_idx, dtype=np.int64), c_sel, e_var, 0, _eps_final,
-            ws, drt, hb_frontier, nroots, ncsf, float(denom_floor),
-            verbose=verbose,
-        )
     else:
-        c_sel_d = cp.asarray(c_sel, dtype=cp.float64)
-        hc_full_d = hop.apply_full_block(c_sel_d)
-        hc_full_d[hop.sel_idx_d, :] = 0.0
-        denom_d = cp.asarray(np.asarray(e_var, dtype=np.float64).reshape(1, nroots), dtype=cp.float64) - cp.asarray(
-            np.asarray(hdiag, dtype=np.float64).reshape(ncsf, 1), dtype=cp.float64
+        _eps_final = float(hb_eps_final) if str(hb_eps_schedule).lower() == "adaptive" else float(hb_epsilon)
+        _new_idx, e_pt2 = heat_bath_select_and_pt2_sparse(
+            drt,
+            h1e,
+            eri,
+            sel_idx=np.asarray(sel_idx, dtype=np.int64),
+            c_sel=c_sel,
+            e_var=e_var,
+            max_add=0,
+            epsilon=float(_eps_final),
+            denom_floor=float(denom_floor),
+            hdiag_lookup=hdiag_lookup,
+            max_out=200_000,
+            screening=None,
+            state_cache=state_cache,
         )
-        if float(denom_floor) > 0.0:
-            small = cp.abs(denom_d) < float(denom_floor)
-            denom_d = cp.where(small, cp.where(denom_d >= 0.0, float(denom_floor), -float(denom_floor)), denom_d)
-        e_pt2 = cp.asnumpy(cp.sum((hc_full_d * hc_full_d) / denom_d, axis=0))
     roots = _sparse_roots_from_selected(sel_idx, c_sel)
+    sel_key_u64 = None
+    label_kind = "csf_idx"
+    if state_rep_s == "key64":
+        from asuka.qmc.cuda_backend import csf_idx_to_key64_host  # noqa: PLC0415
+
+        sel_key_u64 = np.asarray(csf_idx_to_key64_host(drt, sel_idx, state_cache=None), dtype=np.uint64, order="C")
+        label_kind = "key64"
     return CIPSITrialSpaceResult(
         e_var=np.asarray(e_var + float(ecore), dtype=np.float64),
         e_pt2=np.asarray(e_pt2, dtype=np.float64),
         e_tot=np.asarray(e_var + e_pt2 + float(ecore), dtype=np.float64),
         sel_idx=sel_idx,
+        sel_key_u64=sel_key_u64,
+        label_kind=label_kind,
         ci_sel=np.asarray(c_sel, dtype=np.float64),
         roots=roots,
         history=history,
         profile=dict(profile),
-        epq_mode=str(profile.get("epq_mode", _normalize_epq_mode(epq_mode))),
+        epq_mode=str(profile.get("epq_mode", epq_mode_s)),
         ncsf=int(ncsf),
     )
 
@@ -1010,15 +595,13 @@ def build_cipsi_trials_from_scf(
     nelecas: int | tuple[int, int] | None = None,
     nroots: int = 1,
     df: bool = True,
-    backend: str = "cuda",
-    epq_mode: str = "materialized_epq",
+    backend: str = "auto",
+    epq_mode: str = "no_epq_support_aware",
     ci0: Any = None,
     twos: int | None = None,
     **kwargs,
 ) -> CIPSITrialSpaceResult:
-    backend_s = str(backend).lower()
-    if backend_s != "cuda":
-        raise ValueError("build_cipsi_trials_from_scf currently requires backend='cuda'")
+    backend_s = _normalize_cipsi_backend(backend)
 
     if isinstance(scf_or_casci, CASCIResult):
         cas = scf_or_casci
@@ -1038,6 +621,7 @@ def build_cipsi_trials_from_scf(
             nroots=int(nroots),
             ci0=ci0,
             epq_mode=epq_mode,
+            backend=backend_s,
             **kwargs,
         )
 
@@ -1077,6 +661,7 @@ def build_cipsi_trials_from_scf(
         nroots=int(nroots),
         ci0=ci0,
         epq_mode=epq_mode,
+        backend=backend_s,
         **kwargs,
     )
 

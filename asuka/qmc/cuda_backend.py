@@ -299,8 +299,8 @@ def csf_idx_to_key64_host(drt: Any, idx: np.ndarray, *, state_cache: Any | None 
     return pack_steps_to_key64_host(steps)
 
 
-def key64_to_csf_idx_host(drt: Any, key: np.ndarray, *, strict: bool = True) -> np.ndarray:
-    """Convert Key64 (uint64) to CSF indices (int32) via DRT traversal.
+def key64_to_csf_idx64_host(drt: Any, key: np.ndarray, *, strict: bool = True) -> np.ndarray:
+    """Convert Key64 (uint64) to CSF indices (int64) via DRT traversal.
 
     This is vectorized across keys and runs in O(len(key) * norb).
     """
@@ -310,7 +310,7 @@ def key64_to_csf_idx_host(drt: Any, key: np.ndarray, *, strict: bool = True) -> 
     if norb > 32:
         raise ValueError("Key64 representation requires drt.norb <= 32")
     if key_u64.size == 0:
-        return np.zeros((0,), dtype=np.int32)
+        return np.zeros((0,), dtype=np.int64)
 
     from asuka.cuguga.oracle import _child_prefix_walks  # noqa: PLC0415
 
@@ -332,9 +332,15 @@ def key64_to_csf_idx_host(drt: Any, key: np.ndarray, *, strict: bool = True) -> 
         if leaf >= 0 and np.any(node != leaf):
             raise ValueError("invalid Key64 path (does not terminate at leaf)")
 
-    if np.any(idx < 0) or np.any(idx > np.iinfo(np.int32).max):
-        raise ValueError("CSF index out of int32 range")
-    return np.asarray(idx, dtype=np.int32)
+    if np.any(idx < 0):
+        raise ValueError("CSF index must be non-negative")
+    return np.asarray(idx, dtype=np.int64)
+
+
+def key64_to_csf_idx_host(drt: Any, key: np.ndarray, *, strict: bool = True) -> np.ndarray:
+    """Backward-compatible alias for Key64 -> int64 CSF index conversion."""
+
+    return key64_to_csf_idx64_host(drt, key, strict=bool(strict))
 
 
 def _compact_spawn_events_i32(evt_idx: Any, evt_val: Any) -> tuple[Any, Any, int]:
@@ -924,7 +930,7 @@ def _build_det_subspace_cols_dense(
 
     from asuka.cuguga.oracle.sparse import connected_row_sparse  # noqa: PLC0415
 
-    det_idx = np.asarray(det_idx, dtype=np.int32).ravel()
+    det_idx = np.asarray(det_idx, dtype=np.int64).ravel()
     ndet = int(det_idx.size)
     if ndet <= 0:
         return []
@@ -944,7 +950,7 @@ def _build_det_subspace_cols_dense(
         if i_idx.size == 0:
             cols.append((np.zeros(0, dtype=np.int32), np.zeros(0, dtype=np.float64)))
             continue
-        i_idx = np.asarray(i_idx, dtype=np.int32, order="C").ravel()
+        i_idx = np.asarray(i_idx, dtype=np.int64, order="C").ravel()
         hij = np.asarray(hij, dtype=np.float64, order="C").ravel()
 
         # Filter to i in D and map to positions.
@@ -3641,23 +3647,23 @@ def make_cuda_fciqmc_context_key64(
     ctx.nnz_u = cp.empty(1, dtype=cp.int32)
 
     if det_idx is not None:
-        det_idx_i32 = np.asarray(det_idx, dtype=np.int32).ravel()
-        if det_idx_i32.size:
-            det_idx_i32 = np.unique(det_idx_i32)
-            det_idx_i32.sort()
-            cache = get_state_cache(drt)
-            ctx.det_idx_host = det_idx_i32
+        det_idx_i64 = np.asarray(det_idx, dtype=np.int64).ravel()
+        if det_idx_i64.size:
+            det_idx_i64 = np.unique(det_idx_i64)
+            det_idx_i64.sort()
+            cache = None if int(drt.ncsf) > np.iinfo(np.int32).max else get_state_cache(drt)
+            ctx.det_idx_host = det_idx_i64
             ctx.det_key_dev = cp.asarray(
-                np.asarray(csf_idx_to_key64_host(drt, det_idx_i32, state_cache=cache), dtype=np.uint64, order="C"),
+                np.asarray(csf_idx_to_key64_host(drt, det_idx_i64, state_cache=cache), dtype=np.uint64, order="C"),
                 dtype=cp.uint64,
             )
-            ctx.det_key_buf = cp.empty(int(det_idx_i32.size), dtype=cp.uint64)
-            ctx.det_val_buf = cp.empty(int(det_idx_i32.size), dtype=cp.float64)
+            ctx.det_key_buf = cp.empty(int(det_idx_i64.size), dtype=cp.uint64)
+            ctx.det_val_buf = cp.empty(int(det_idx_i64.size), dtype=cp.float64)
             ctx.det_cols = _build_det_subspace_cols_dense(
                 drt=drt,
                 h1e=np.asarray(h1e, dtype=np.float64),
                 eri=eri4,
-                det_idx=det_idx_i32,
+                det_idx=det_idx_i64,
                 max_out=int(det_max_out),
                 state_cache=cache,
             )
@@ -3666,7 +3672,7 @@ def make_cuda_fciqmc_context_key64(
             except Exception as e:  # pragma: no cover
                 raise RuntimeError("deterministic-subspace CUDA correction requires cupyx.scipy.sparse") from e
             row_h, col_h, dat_h = _det_subspace_coo_from_cols(ctx.det_cols)
-            ndet = int(det_idx_i32.size)
+            ndet = int(det_idx_i64.size)
             if int(dat_h.size) == 0:
                 ctx.det_hdd_csr_dev = cpx_sparse.csr_matrix((ndet, ndet), dtype=cp.float64)
             else:

@@ -32,6 +32,7 @@ from collections.abc import Callable
 
 import numpy as np
 
+from .compress import _coerce_i32_sparse_labels
 from .sparse import coalesce_coo_i32_f64
 
 
@@ -102,7 +103,10 @@ def compress_phi_pivot_resample_guided(
     if q_floor <= 0.0 or not np.isfinite(q_floor):
         raise ValueError("q_floor must be a finite positive number")
 
-    idx_u, val_u = coalesce_coo_i32_f64(idx, val)
+    idx_u, val_u = coalesce_coo_i32_f64(
+        _coerce_i32_sparse_labels(idx, caller="compress_phi_pivot_resample_guided"),
+        val,
+    )
     L = int(idx_u.size)
 
     if m == 0 or L == 0:

@@ -33,9 +33,14 @@ from asuka.cuguga.drt import DRT
 from asuka.cuguga.screening import RowScreening
 from asuka.cuguga.state_cache import DRTStateCache, get_state_cache
 from asuka.integrals.df_integrals import DFMOIntegrals, DeviceDFMOIntegrals
-from asuka.cuguga.oracle import _STEP_TO_OCC, _restore_eri_4d
+from asuka.integrals.df_diag import diagonal_element_det_guess_df
+from asuka.cuguga.oracle import _STEP_TO_OCC, _restore_eri_4d, diagonal_element_det_guess
 from asuka.cuguga.oracle.sparse import connected_row_sparse, connected_row_sparse_df
+from asuka.qmc.sparse import SparseVector
 from asuka.solver import GUGAFCISolver
+
+
+_INT32_MAX = int(np.iinfo(np.int32).max)
 
 
 def _as_numpy_f64(a: Any) -> np.ndarray:
@@ -61,6 +66,386 @@ class SCIResult:
     ci_sel: np.ndarray  # (nsel, nroots)
     ci_full: list[np.ndarray]  # length nroots; each is (ncsf,)
     history: list[dict[str, Any]]
+
+
+class DiagonalGuessLookup:
+    """Lazy diagonal-element provider for scalable selected-CI/CIPSI paths."""
+
+    def __init__(self, drt: DRT, h1e: np.ndarray, eri: Any, *, hdiag: np.ndarray | None = None) -> None:
+        self.drt = drt
+        self.h1e = np.asarray(h1e, dtype=np.float64)
+        self.ncsf = int(drt.ncsf)
+        self._dense = None if hdiag is None else np.asarray(hdiag, dtype=np.float64).ravel()
+        if self._dense is not None and int(self._dense.size) != self.ncsf:
+            raise ValueError("hdiag has wrong length")
+        self._cache: dict[int, float] = {}
+        self._eri_dense = None
+        self._eri_ppqq = None
+        self._eri_pqqp = None
+        self._df_eri = None
+
+        if isinstance(eri, DeviceDFMOIntegrals):
+            l_full = _as_numpy_f64(eri.l_full) if eri.l_full is not None else None
+            pair_norm = _as_numpy_f64(eri.pair_norm) if eri.pair_norm is not None else None
+            eri_mat = _as_numpy_f64(eri.eri_mat) if eri.eri_mat is not None else None
+            if l_full is None and eri_mat is None:
+                raise ValueError("DeviceDFMOIntegrals must provide l_full or eri_mat for diagonal lookup")
+            if l_full is not None:
+                if pair_norm is None:
+                    pair_norm = np.linalg.norm(l_full, axis=1)
+                self._df_eri = DFMOIntegrals(
+                    norb=int(eri.norb),
+                    l_full=np.asarray(l_full, dtype=np.float64, order="C"),
+                    j_ps=np.asarray(_as_numpy_f64(eri.j_ps), dtype=np.float64, order="C"),
+                    pair_norm=np.asarray(pair_norm, dtype=np.float64, order="C"),
+                    eri_mat=None if eri_mat is None else np.asarray(eri_mat, dtype=np.float64, order="C"),
+                )
+            else:
+                self._eri_dense = np.asarray(
+                    eri_mat.reshape(int(drt.norb), int(drt.norb), int(drt.norb), int(drt.norb)),
+                    dtype=np.float64,
+                    order="C",
+                )
+        elif isinstance(eri, DFMOIntegrals):
+            self._df_eri = eri
+        else:
+            self._eri_dense = _restore_eri_4d(eri, int(drt.norb)).astype(np.float64, copy=False)
+            self._eri_ppqq = np.einsum("iijj->ij", self._eri_dense)
+            self._eri_pqqp = np.einsum("ijji->ij", self._eri_dense)
+
+    @property
+    def has_dense(self) -> bool:
+        return self._dense is not None
+
+    def get(self, idx: int) -> float:
+        ii = int(idx)
+        if ii < 0 or ii >= self.ncsf:
+            raise IndexError(f"CSF index out of range: {ii}")
+        if self._dense is not None:
+            return float(self._dense[ii])
+        cached = self._cache.get(ii)
+        if cached is not None:
+            return float(cached)
+        if self._df_eri is not None:
+            val = diagonal_element_det_guess_df(self.drt, self.h1e, self._df_eri, ii)
+        else:
+            val = diagonal_element_det_guess(
+                self.drt,
+                self.h1e,
+                self._eri_dense,
+                ii,
+                eri_ppqq=self._eri_ppqq,
+                eri_pqqp=self._eri_pqqp,
+            )
+        self._cache[ii] = float(val)
+        return float(val)
+
+    def get_many(self, idx: Sequence[int] | np.ndarray) -> np.ndarray:
+        idx_i64 = np.asarray(idx, dtype=np.int64).ravel()
+        if idx_i64.size == 0:
+            return np.zeros((0,), dtype=np.float64)
+        if self._dense is not None:
+            return np.asarray(self._dense[idx_i64], dtype=np.float64, order="C")
+        return np.asarray([self.get(int(ii)) for ii in idx_i64.tolist()], dtype=np.float64, order="C")
+
+
+def _normalize_ci0_sparse(ci0: Any, *, nroots: int, ncsf: int) -> list[SparseVector] | None:
+    if ci0 is None:
+        return None
+
+    if hasattr(ci0, "to_qmc_x0"):
+        ci0 = ci0.to_qmc_x0()
+
+    def _from_sparse_pair(idx_like: Any, val_like: Any) -> SparseVector:
+        idx = np.asarray(idx_like)
+        if idx.dtype.kind not in ("i", "u"):
+            raise ValueError("sparse ci0 indices must be integers")
+        idx = np.asarray(idx, dtype=np.int64).ravel()
+        val = np.asarray(val_like, dtype=np.float64).ravel()
+        if idx.size != val.size:
+            raise ValueError("sparse ci0 index/value size mismatch")
+        if idx.size and (int(np.min(idx)) < 0 or int(np.max(idx)) >= int(ncsf)):
+            raise ValueError("sparse ci0 contains out-of-range indices")
+        if idx.size > 1:
+            order = np.argsort(idx, kind="stable")
+            idx = np.asarray(idx[order], dtype=np.int64, order="C")
+            val = np.asarray(val[order], dtype=np.float64, order="C")
+            change = np.ones(idx.shape, dtype=np.bool_)
+            change[1:] = idx[1:] != idx[:-1]
+            if not np.all(change):
+                starts = np.flatnonzero(change)
+                idx = np.asarray(idx[starts], dtype=np.int64, order="C")
+                val = np.asarray(np.add.reduceat(val, starts), dtype=np.float64, order="C")
+        return SparseVector(idx, val)
+
+    def _from_dense(x: Any) -> SparseVector:
+        v = np.asarray(x, dtype=np.float64).ravel()
+        if int(v.size) != int(ncsf):
+            raise ValueError("ci0 has wrong length")
+        mask = np.abs(v) > 0.0
+        return SparseVector(np.asarray(np.nonzero(mask)[0], dtype=np.int64), np.asarray(v[mask], dtype=np.float64))
+
+    if isinstance(ci0, SparseVector):
+        out = [SparseVector(np.asarray(ci0.idx, dtype=np.int64), np.asarray(ci0.val, dtype=np.float64))]
+    elif isinstance(ci0, tuple) and len(ci0) == 2 and not np.isscalar(ci0[0]):
+        out = [_from_sparse_pair(ci0[0], ci0[1])]
+    elif isinstance(ci0, list):
+        out = []
+        for x in ci0[:nroots]:
+            if isinstance(x, SparseVector):
+                out.append(SparseVector(np.asarray(x.idx, dtype=np.int64), np.asarray(x.val, dtype=np.float64)))
+            elif isinstance(x, tuple) and len(x) == 2:
+                out.append(_from_sparse_pair(x[0], x[1]))
+            else:
+                out.append(_from_dense(x))
+    else:
+        v = np.asarray(ci0, dtype=np.float64)
+        if v.ndim == 2:
+            out = [_from_dense(v[i]) for i in range(min(int(v.shape[0]), int(nroots)))]
+        else:
+            out = [_from_dense(v)]
+
+    if not out:
+        return None
+    while len(out) < int(nroots):
+        out.append(SparseVector(np.zeros((0,), dtype=np.int64), np.zeros((0,), dtype=np.float64)))
+    return out
+
+
+def _initial_selection_sparse(
+    *,
+    ncsf: int,
+    nroots: int,
+    init_ncsf: int,
+    hdiag_lookup: DiagonalGuessLookup,
+    ci0_sparse: list[SparseVector] | None,
+) -> list[int]:
+    init_ncsf = int(init_ncsf)
+    if init_ncsf <= 0:
+        init_ncsf = max(1, int(nroots))
+    init_ncsf = min(init_ncsf, int(ncsf))
+
+    sel: list[int] = []
+    seen: set[int] = set()
+
+    if ci0_sparse is not None:
+        per_root = max(1, init_ncsf // max(1, nroots))
+        per_root = max(per_root, min(64, init_ncsf))
+        for rv in ci0_sparse[: int(nroots)]:
+            idx = np.asarray(rv.idx, dtype=np.int64).ravel()
+            val = np.asarray(rv.val, dtype=np.float64).ravel()
+            if idx.size == 0:
+                continue
+            if idx.size <= per_root:
+                order = np.argsort(np.abs(val))[::-1]
+            else:
+                keep = np.argpartition(np.abs(val), -per_root)[-per_root:]
+                order = keep[np.argsort(np.abs(val[keep]))[::-1]]
+            for ii in idx[order].tolist():
+                jj = int(ii)
+                if jj in seen:
+                    continue
+                sel.append(jj)
+                seen.add(jj)
+                if len(sel) >= init_ncsf:
+                    return sel
+
+    if len(sel) < init_ncsf:
+        need = int(init_ncsf) - len(sel)
+        if hdiag_lookup.has_dense:
+            hdiag_dense = hdiag_lookup.get_many(np.arange(int(ncsf), dtype=np.int64))
+            if need >= int(ncsf):
+                idx = np.argsort(hdiag_dense)
+            else:
+                idx = np.argpartition(hdiag_dense, need)[:need]
+                idx = idx[np.argsort(hdiag_dense[idx])]
+            for ii in np.asarray(idx, dtype=np.int64).tolist():
+                jj = int(ii)
+                if jj in seen:
+                    continue
+                sel.append(jj)
+                seen.add(jj)
+                if len(sel) >= init_ncsf:
+                    break
+        else:
+            probe = min(int(ncsf), max(64, 8 * int(init_ncsf)))
+            cand = np.arange(probe, dtype=np.int64)
+            h_probe = hdiag_lookup.get_many(cand)
+            order = np.argsort(h_probe)
+            for ii in cand[order].tolist():
+                jj = int(ii)
+                if jj in seen:
+                    continue
+                sel.append(jj)
+                seen.add(jj)
+                if len(sel) >= init_ncsf:
+                    break
+
+    if len(sel) < nroots:
+        for ii in range(int(nroots)):
+            if ii >= int(ncsf):
+                break
+            if ii in seen:
+                continue
+            sel.append(ii)
+            seen.add(ii)
+            if len(sel) >= int(nroots):
+                break
+    return sel
+
+
+def _build_variational_hamiltonian_sparse(
+    drt: DRT,
+    h1e: np.ndarray,
+    eri: Any,
+    *,
+    sel: Sequence[int],
+    loc_map: dict[int, int],
+    max_out: int,
+    screening: RowScreening | None,
+    state_cache: DRTStateCache | None,
+) -> "sp.csr_matrix":
+    if sp is None:  # pragma: no cover
+        raise RuntimeError("scipy is required for selected_ci")
+
+    nsel = int(len(sel))
+    rows: list[int] = []
+    cols: list[int] = []
+    data: list[float] = []
+
+    for col, j in enumerate(sel):
+        i_idx, hij = _connected_row(
+            drt,
+            h1e,
+            eri,
+            int(j),
+            max_out=max_out,
+            screening=screening,
+            state_cache=state_cache,
+        )
+        for i, v in zip(i_idx.tolist(), hij.tolist()):
+            row = loc_map.get(int(i))
+            if row is None:
+                continue
+            rows.append(int(row))
+            cols.append(int(col))
+            data.append(float(v))
+
+    h = sp.coo_matrix((np.asarray(data, dtype=np.float64), (rows, cols)), shape=(nsel, nsel)).tocsr()
+    h = (h + h.T) * 0.5
+    h.eliminate_zeros()
+    return h
+
+
+def _select_external_sparse(
+    drt: DRT,
+    h1e: np.ndarray,
+    eri: Any,
+    *,
+    sel: Sequence[int],
+    selected_set: set[int],
+    c_sel: np.ndarray,
+    e_var: np.ndarray,
+    hdiag_lookup: DiagonalGuessLookup,
+    max_add: int,
+    select_threshold: float | None,
+    denom_floor: float,
+    max_out: int,
+    screening: RowScreening | None,
+    state_cache: DRTStateCache | None,
+    select_screen_contrib: float,
+) -> tuple[list[int], np.ndarray]:
+    nroots = int(e_var.size)
+    denom_floor = float(denom_floor)
+    if denom_floor < 0.0:
+        raise ValueError("denom_floor must be >= 0")
+
+    ext: dict[int, np.ndarray] = {}
+    for col, j in enumerate(sel):
+        cj = np.asarray(c_sel[col, :], dtype=np.float64)
+        max_cj = float(np.max(np.abs(cj)))
+        if max_cj == 0.0:
+            continue
+
+        i_idx, hij = _connected_row(
+            drt,
+            h1e,
+            eri,
+            int(j),
+            max_out=max_out,
+            screening=screening,
+            state_cache=state_cache,
+        )
+
+        for i, v in zip(i_idx.tolist(), hij.tolist()):
+            ii = int(i)
+            if ii in selected_set:
+                continue
+            vv = float(v)
+            if select_screen_contrib > 0.0 and abs(vv) * max_cj < float(select_screen_contrib):
+                continue
+            acc = ext.get(ii)
+            if acc is None:
+                ext[ii] = vv * cj
+            else:
+                acc += vv * cj
+
+    if not ext:
+        return [], np.zeros((nroots,), dtype=np.float64)
+
+    cand_i: list[int] = []
+    cand_w: list[float] = []
+    e_pt2 = np.zeros((nroots,), dtype=np.float64)
+    for ii, p in ext.items():
+        denom = np.asarray(e_var - float(hdiag_lookup.get(ii)), dtype=np.float64)
+        if denom_floor > 0.0:
+            small = np.abs(denom) < denom_floor
+            if np.any(small):
+                denom = denom.copy()
+                denom[small] = np.where(denom[small] >= 0.0, denom_floor, -denom_floor)
+        c1 = p / denom
+        w = float(np.max(np.abs(c1)))
+        if w == 0.0 or not np.isfinite(w):
+            continue
+        cand_i.append(int(ii))
+        cand_w.append(w)
+        e_pt2 += (p * p) / denom
+
+    if not cand_i:
+        return [], e_pt2
+
+    w_arr = np.asarray(cand_w, dtype=np.float64)
+    i_arr = np.asarray(cand_i, dtype=np.int64)
+    max_add = int(max_add)
+    if max_add <= 0:
+        return [], e_pt2
+    max_add = min(max_add, int(i_arr.size))
+
+    if select_threshold is not None:
+        thr = float(select_threshold)
+        if thr < 0.0:
+            raise ValueError("select_threshold must be >= 0")
+        keep = np.nonzero(w_arr >= thr)[0]
+        if int(keep.size) == 0:
+            return [], e_pt2
+        if int(keep.size) > max_add:
+            keep = keep[np.argpartition(w_arr[keep], -max_add)[-max_add:]]
+    else:
+        keep = np.argpartition(w_arr, -max_add)[-max_add:]
+
+    keep = keep[np.argsort(w_arr[keep])[::-1]]
+    return [int(x) for x in i_arr[keep].tolist()], e_pt2
+
+
+def _require_supported_selected_ci_space(drt: DRT) -> None:
+    ncsf = int(drt.ncsf)
+    if ncsf <= _INT32_MAX:
+        return
+    raise NotImplementedError(
+        f"selected_ci does not yet support ncsf={ncsf} (> 2^31-1); the current implementation still "
+        "allocates dense loc/ci_full arrays and depends on the global state cache. Use the CUDA key64 "
+        "QMC path directly for large-space runs until sparse selected-CI support lands."
+    )
 
 
 def _connected_row(
@@ -580,6 +965,7 @@ def selected_ci(
         raise ValueError("nroots must be >= 1")
 
     ncsf = int(drt.ncsf)
+    _require_supported_selected_ci_space(drt)
     if ncsf < 1:
         raise ValueError("drt.ncsf must be >= 1")
     if nroots > ncsf:
@@ -765,7 +1151,7 @@ def selected_ci(
     e_tot = np.asarray(e_var + e_pt2, dtype=np.float64)
 
     # Expand CI vectors to full size (dense) for compatibility with downstream code.
-    sel_idx = np.asarray(sel, dtype=np.int32)
+    sel_idx = np.asarray(sel, dtype=np.int64)
     ci_full: list[np.ndarray] = []
     for r in range(nroots):
         v = np.zeros(ncsf, dtype=np.float64)

@@ -33,6 +33,10 @@ except Exception:  # pragma: no cover
     _epq_apply_g_cy = None
 
 
+def _csf_index_dtype(drt: DRT) -> np.dtype:
+    return np.dtype(np.int32 if int(drt.ncsf) <= np.iinfo(np.int32).max else np.int64)
+
+
 def path_nodes(drt: DRT, steps: np.ndarray) -> np.ndarray:
     """Return the sequence of DRT node indices visited by a CSF walk.
 
@@ -95,18 +99,19 @@ def epq_contribs_one(
     Returns
     -------
     idx : np.ndarray
-        int32 array of destination CSF indices.
+        int32/int64 array of destination CSF indices.
     coeff : np.ndarray
         float64 array of coupling coefficients.
     """
 
+    idx_dtype = _csf_index_dtype(drt)
     csf_idx = int(csf_idx)
     if steps is None:
         steps = drt.index_to_path(csf_idx)
     if nodes is None:
         nodes = path_nodes(drt, steps)
 
-    if _epq_contribs_one_cy is not None:
+    if idx_dtype == np.dtype(np.int32) and _epq_contribs_one_cy is not None:
         idx, coeff = _epq_contribs_one_cy(drt, csf_idx, int(p), int(q), steps, nodes)
     else:
         idx, coeff = _e_pq_contribs_from_csf_index_arrays(
@@ -117,7 +122,7 @@ def epq_contribs_one(
             steps=steps,
             nodes=nodes,
         )
-    return idx, coeff
+    return np.asarray(idx, dtype=idx_dtype, order="C"), np.asarray(coeff, dtype=np.float64, order="C")
 
 
 def epq_apply_weighted_many(
@@ -145,6 +150,7 @@ def epq_apply_weighted_many(
     """
 
     csf_idx = int(csf_idx)
+    idx_dtype = _csf_index_dtype(drt)
     p_idx = np.asarray(p_idx, dtype=np.int32).ravel()
     q_idx = np.asarray(q_idx, dtype=np.int32).ravel()
     weights = np.asarray(weights, dtype=np.float64).ravel()
@@ -152,12 +158,12 @@ def epq_apply_weighted_many(
         raise ValueError("p_idx, q_idx, and weights must have the same length")
 
     if p_idx.size == 0:
-        return np.zeros(0, dtype=np.int32), np.zeros(0, dtype=np.float64)
+        return np.zeros(0, dtype=idx_dtype), np.zeros(0, dtype=np.float64)
 
     steps = np.asarray(steps, dtype=np.int8).ravel()
     nodes = np.asarray(nodes, dtype=np.int32).ravel()
 
-    if _epq_apply_weighted_many_cy is not None:
+    if idx_dtype == np.dtype(np.int32) and _epq_apply_weighted_many_cy is not None:
         return _epq_apply_weighted_many_cy(
             drt,
             csf_idx,
@@ -185,14 +191,14 @@ def epq_apply_weighted_many(
             keep = np.abs(val) > thresh
             if not np.any(keep):
                 continue
-            out_i.append(np.asarray(i_idx[keep], dtype=np.int32, order="C"))
+            out_i.append(np.asarray(i_idx[keep], dtype=idx_dtype, order="C"))
             out_v.append(np.asarray(val[keep], dtype=np.float64, order="C"))
         else:
-            out_i.append(np.asarray(i_idx, dtype=np.int32, order="C"))
+            out_i.append(np.asarray(i_idx, dtype=idx_dtype, order="C"))
             out_v.append(np.asarray(val, dtype=np.float64, order="C"))
 
     if not out_i:
-        return np.zeros(0, dtype=np.int32), np.zeros(0, dtype=np.float64)
+        return np.zeros(0, dtype=idx_dtype), np.zeros(0, dtype=np.float64)
     return np.concatenate(out_i), np.concatenate(out_v)
 
 
@@ -224,11 +230,12 @@ def epq_apply_g(
     """
 
     csf_idx = int(csf_idx)
+    idx_dtype = _csf_index_dtype(drt)
     g_flat = np.asarray(g_flat, dtype=np.float64).ravel(order="C")
     steps = np.asarray(steps, dtype=np.int8).ravel()
     nodes = np.asarray(nodes, dtype=np.int32).ravel()
 
-    if _epq_apply_g_cy is not None:
+    if idx_dtype == np.dtype(np.int32) and _epq_apply_g_cy is not None:
         i_idx, val, n_pairs = _epq_apply_g_cy(
             drt,
             csf_idx,
@@ -284,8 +291,8 @@ def epq_apply_g(
 
     if not p_list:
         if diag == 0.0 or (tc > 0.0 and abs(diag) <= tc):
-            return np.zeros(0, dtype=np.int32), np.zeros(0, dtype=np.float64), 0
-        return np.asarray([csf_idx], dtype=np.int32), np.asarray([diag], dtype=np.float64), 0
+            return np.zeros(0, dtype=idx_dtype), np.zeros(0, dtype=np.float64), 0
+        return np.asarray([csf_idx], dtype=idx_dtype), np.asarray([diag], dtype=np.float64), 0
 
     p_idx = np.asarray(p_list, dtype=np.int32)
     q_idx = np.asarray(q_list, dtype=np.int32)
@@ -302,7 +309,7 @@ def epq_apply_g(
         trusted=True,
     )
     if diag != 0.0 and not (tc > 0.0 and abs(diag) <= tc):
-        i_idx = np.concatenate((np.asarray([csf_idx], dtype=np.int32), i_idx))
+        i_idx = np.concatenate((np.asarray([csf_idx], dtype=idx_dtype), np.asarray(i_idx, dtype=idx_dtype)))
         val = np.concatenate((np.asarray([diag], dtype=np.float64), val))
     return i_idx, val, int(p_idx.size)
 

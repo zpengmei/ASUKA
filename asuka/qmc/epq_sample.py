@@ -13,6 +13,26 @@ except Exception:  # pragma: no cover
     _epq_sample_from_csf_index_cy = None
 
 
+_INT32_MAX = int(np.iinfo(np.int32).max)
+_INT32_MIN = int(np.iinfo(np.int32).min)
+
+
+def _coerce_i32_epq_labels(idx: np.ndarray, *, caller: str) -> np.ndarray:
+    idx_arr = np.asarray(idx).ravel()
+    if idx_arr.dtype.kind not in ("i", "u"):
+        raise ValueError(f"{caller} idx must have an integer dtype")
+    if idx_arr.size:
+        if idx_arr.dtype.kind == "u":
+            if int(np.max(idx_arr)) > _INT32_MAX:
+                raise NotImplementedError(f"{caller} only supports int32-addressable labels")
+        else:
+            lo = int(np.min(idx_arr))
+            hi = int(np.max(idx_arr))
+            if lo < _INT32_MIN or hi > _INT32_MAX:
+                raise NotImplementedError(f"{caller} only supports int32-addressable labels")
+    return np.asarray(idx_arr, dtype=np.int32).ravel()
+
+
 def _step_to_occ(step: int) -> int:
     if step == 0:
         return 0
@@ -38,7 +58,7 @@ def sample_epq_from_arrays(idx: np.ndarray, coeff: np.ndarray, rng: np.random.Ge
         contribution = coeff * inv_p  (placed on the sampled `child` index).
     """
 
-    idx_i32 = np.asarray(idx, dtype=np.int32).ravel()
+    idx_i32 = _coerce_i32_epq_labels(idx, caller="sample_epq_from_arrays")
     coeff_f64 = np.asarray(coeff, dtype=np.float64).ravel()
     if idx_i32.size != coeff_f64.size:
         raise ValueError("idx and coeff must have the same size")
@@ -77,6 +97,8 @@ def sample_epq_one(
     """Sample one child for `E_pq|csf_idx>` (CPU reference implementation)."""
 
     csf_idx = int(csf_idx)
+    if int(drt.ncsf) > _INT32_MAX or csf_idx < _INT32_MIN or csf_idx > _INT32_MAX:
+        raise NotImplementedError("sample_epq_one is an int32 CPU reference helper and does not support large-space / key64 labels")
     p = int(p)
     q = int(q)
 

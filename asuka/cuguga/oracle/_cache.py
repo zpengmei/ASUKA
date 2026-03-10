@@ -90,6 +90,10 @@ _EPQ_ACTION_CACHE: weakref.WeakKeyDictionary[DRT, _EPQActionCache] = weakref.Wea
 # ---------------------------------------------------------------------------
 
 
+def _csf_index_dtype(drt: DRT) -> np.dtype:
+    return np.dtype(np.int32 if int(drt.ncsf) <= np.iinfo(np.int32).max else np.int64)
+
+
 def _child_prefix_walks(drt: DRT) -> np.ndarray:
     r"""Return cached prefix sums :math:`\sum_{prior < s} nwalks[child(node, prior)]`.
 
@@ -412,11 +416,12 @@ def _e_pq_contribs_from_csf_index_arrays(
     Returns
     -------
     idx : np.ndarray
-        int32 array of bra CSF indices with nonzero matrix elements.
+        int32/int64 array of bra CSF indices with nonzero matrix elements.
     coeff : np.ndarray
         float64 array of corresponding ``<i|E_pq|j>`` values.
     """
 
+    idx_dtype = _csf_index_dtype(drt)
     csf_idx = int(csf_idx)
     p = int(p)
     q = int(q)
@@ -424,7 +429,7 @@ def _e_pq_contribs_from_csf_index_arrays(
     if not (0 <= p < norb and 0 <= q < norb):
         raise ValueError("orbital indices out of range")
     if p == q:
-        return np.zeros(0, dtype=np.int32), np.zeros(0, dtype=np.float64)
+        return np.zeros(0, dtype=idx_dtype), np.zeros(0, dtype=np.float64)
 
     if steps is None:
         steps = drt.index_to_path(csf_idx).astype(np.int8, copy=False)
@@ -435,7 +440,7 @@ def _e_pq_contribs_from_csf_index_arrays(
     occ_p = int(_STEP_TO_OCC[int(steps[p])])
     occ_q = int(_STEP_TO_OCC[int(steps[q])])
     if occ_q <= 0 or occ_p >= 2:
-        return np.zeros(0, dtype=np.int32), np.zeros(0, dtype=np.float64)
+        return np.zeros(0, dtype=idx_dtype), np.zeros(0, dtype=np.float64)
 
     child = drt.child
     node_twos = drt.node_twos
@@ -515,7 +520,7 @@ def _e_pq_contribs_from_csf_index_arrays(
             else:
                 stack_append((k_next, child_k, w2, seg_idx2))
 
-    return np.asarray(idx_buf, dtype=np.int32), np.asarray(coeff_buf, dtype=np.float64)
+    return np.asarray(idx_buf, dtype=idx_dtype), np.asarray(coeff_buf, dtype=np.float64)
 
 
 # ---------------------------------------------------------------------------

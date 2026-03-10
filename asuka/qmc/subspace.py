@@ -8,6 +8,24 @@ from .compress import compress_phi_pivot_resample
 from .sparse import coalesce_coo_i32_f64
 
 
+_INT32_MAX = int(np.iinfo(np.int32).max)
+_INT32_MIN = int(np.iinfo(np.int32).min)
+
+
+def _coerce_i32_sparse_labels(idx: np.ndarray, *, caller: str) -> np.ndarray:
+    idx_arr = np.asarray(idx).ravel()
+    if idx_arr.dtype.kind not in ("i", "u"):
+        raise ValueError(f"{caller} indices must have an integer dtype")
+    if idx_arr.size > 0:
+        if idx_arr.dtype.kind == "u":
+            if int(np.max(idx_arr)) > _INT32_MAX:
+                raise NotImplementedError(f"{caller} only supports int32-addressable labels")
+        else:
+            if int(np.min(idx_arr)) < _INT32_MIN or int(np.max(idx_arr)) > _INT32_MAX:
+                raise NotImplementedError(f"{caller} only supports int32-addressable labels")
+    return np.asarray(idx_arr, dtype=np.int32).ravel()
+
+
 def dot_sparse(
     a_idx: np.ndarray,
     a_val: np.ndarray,
@@ -16,9 +34,9 @@ def dot_sparse(
 ) -> float:
     """Dot product of two sorted sparse vectors."""
 
-    a_idx = np.asarray(a_idx, dtype=np.int32).ravel()
+    a_idx = _coerce_i32_sparse_labels(a_idx, caller="dot_sparse")
     a_val = np.asarray(a_val, dtype=np.float64).ravel()
-    b_idx = np.asarray(b_idx, dtype=np.int32).ravel()
+    b_idx = _coerce_i32_sparse_labels(b_idx, caller="dot_sparse")
     b_val = np.asarray(b_val, dtype=np.float64).ravel()
     if a_idx.size != a_val.size or b_idx.size != b_val.size:
         raise ValueError("idx and val must have matching sizes")
@@ -52,9 +70,9 @@ def axpy_sparse(
 ) -> tuple[np.ndarray, np.ndarray]:
     """Return y + alpha * x as a coalesced sparse vector."""
 
-    x_idx = np.asarray(x_idx, dtype=np.int32).ravel()
+    x_idx = _coerce_i32_sparse_labels(x_idx, caller="axpy_sparse")
     x_val = np.asarray(x_val, dtype=np.float64).ravel()
-    y_idx = np.asarray(y_idx, dtype=np.int32).ravel()
+    y_idx = _coerce_i32_sparse_labels(y_idx, caller="axpy_sparse")
     y_val = np.asarray(y_val, dtype=np.float64).ravel()
     if x_idx.size != x_val.size or y_idx.size != y_val.size:
         raise ValueError("idx and val must have matching sizes")
@@ -77,7 +95,7 @@ def normalize_sparse(
 ) -> tuple[np.ndarray, np.ndarray, float]:
     """Normalize a sparse vector to unit 2-norm."""
 
-    idx = np.asarray(idx, dtype=np.int32).ravel()
+    idx = _coerce_i32_sparse_labels(idx, caller="normalize_sparse")
     val = np.asarray(val, dtype=np.float64).ravel()
     if idx.size != val.size:
         raise ValueError("idx and val must have the same size")
@@ -173,7 +191,7 @@ def apply_right_matrix(
             idx_j, val_j = cols[j]
             if idx_j.size == 0:
                 continue
-            idx_chunks.append(np.asarray(idx_j, dtype=np.int32, order="C"))
+            idx_chunks.append(_coerce_i32_sparse_labels(idx_j, caller="apply_right_matrix"))
             val_chunks.append(w * np.asarray(val_j, dtype=np.float64, order="C"))
 
         if not idx_chunks:
@@ -195,4 +213,3 @@ def apply_right_matrix(
         out.append(normalize_sparse(idx, val)[0:2])
 
     return out
-

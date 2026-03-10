@@ -28,6 +28,10 @@ _DENSE_ACC_NCSF_MAX = 10_000_000
 _DENSE_MASK_ACC_CACHE: dict[int, "_DenseRowMaskAccumulator"] = {}
 
 
+def _csf_index_dtype(drt: DRT) -> np.dtype:
+    return np.dtype(np.int32 if int(drt.ncsf) <= np.iinfo(np.int32).max else np.int64)
+
+
 class _DenseRowMaskAccumulator:
     __slots__ = ("row", "mask", "_dirty")
 
@@ -153,16 +157,16 @@ def _select_offdiag_pq(
     )
 
 
-def _coalesce_coo_i32_f64(idx: np.ndarray, val: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-    idx_i32 = np.asarray(idx, dtype=np.int32).ravel()
+def _coalesce_coo_idx_f64(idx: np.ndarray, val: np.ndarray, *, idx_dtype: np.dtype) -> tuple[np.ndarray, np.ndarray]:
+    idx_arr = np.asarray(idx, dtype=idx_dtype).ravel()
     val_f64 = np.asarray(val, dtype=np.float64).ravel()
-    if idx_i32.size != val_f64.size:
+    if idx_arr.size != val_f64.size:
         raise ValueError("idx and val must have the same size")
-    if idx_i32.size <= 1:
-        return np.ascontiguousarray(idx_i32), np.ascontiguousarray(val_f64)
+    if idx_arr.size <= 1:
+        return np.ascontiguousarray(idx_arr), np.ascontiguousarray(val_f64)
 
-    order = np.argsort(idx_i32, kind="stable")
-    idx_s = idx_i32[order]
+    order = np.argsort(idx_arr, kind="stable")
+    idx_s = idx_arr[order]
     val_s = val_f64[order]
     change = idx_s[1:] != idx_s[:-1]
     ngrp = int(np.count_nonzero(change)) + 1
@@ -171,35 +175,36 @@ def _coalesce_coo_i32_f64(idx: np.ndarray, val: np.ndarray) -> tuple[np.ndarray,
     if ngrp > 1:
         starts[1:] = np.flatnonzero(change) + 1
 
-    idx_u = np.asarray(idx_s[starts], dtype=np.int32, order="C")
+    idx_u = np.asarray(idx_s[starts], dtype=idx_dtype, order="C")
     val_u = np.asarray(np.add.reduceat(val_s, starts), dtype=np.float64, order="C")
     return idx_u, val_u
 
 
 def _finalize_coalesced_row(
-    j: int, idx_u: np.ndarray, val_u: np.ndarray, *, max_out: int
+    j: int, idx_u: np.ndarray, val_u: np.ndarray, *, max_out: int, idx_dtype: np.dtype
 ) -> tuple[np.ndarray, np.ndarray]:
     j = int(j)
-    idx_u = np.asarray(idx_u, dtype=np.int32).ravel()
+    idx_u = np.asarray(idx_u, dtype=idx_dtype).ravel()
     val_u = np.asarray(val_u, dtype=np.float64).ravel()
     if idx_u.size != val_u.size:
         raise ValueError("idx_u and val_u must have the same size")
 
     if idx_u.size == 0:
-        i_idx_arr = np.asarray([j], dtype=np.int32)
+        i_idx_arr = np.asarray([j], dtype=idx_dtype)
         hij_arr = np.asarray([0.0], dtype=np.float64)
     else:
-        pos = int(np.searchsorted(idx_u, j))
-        has_j = pos < int(idx_u.size) and int(idx_u[pos]) == j
+        j_arr = np.asarray([j], dtype=idx_dtype)
+        pos = int(np.searchsorted(idx_u, j_arr[0]))
+        has_j = pos < int(idx_u.size) and idx_u[pos] == j_arr[0]
         if has_j:
             hij_j = float(val_u[pos])
             if idx_u.size == 1:
-                i_idx_arr = np.asarray([j], dtype=np.int32)
+                i_idx_arr = np.asarray([j], dtype=idx_dtype)
                 hij_arr = np.asarray([hij_j], dtype=np.float64)
             else:
-                i_idx_arr = np.empty(int(idx_u.size), dtype=np.int32)
+                i_idx_arr = np.empty(int(idx_u.size), dtype=idx_dtype)
                 hij_arr = np.empty(int(val_u.size), dtype=np.float64)
-                i_idx_arr[0] = np.int32(j)
+                i_idx_arr[0] = j_arr[0]
                 hij_arr[0] = np.float64(hij_j)
                 if pos:
                     i_idx_arr[1 : pos + 1] = idx_u[:pos]
@@ -208,9 +213,9 @@ def _finalize_coalesced_row(
                     i_idx_arr[pos + 1 :] = idx_u[pos + 1 :]
                     hij_arr[pos + 1 :] = val_u[pos + 1 :]
         else:
-            i_idx_arr = np.empty(int(idx_u.size) + 1, dtype=np.int32)
+            i_idx_arr = np.empty(int(idx_u.size) + 1, dtype=idx_dtype)
             hij_arr = np.empty(int(val_u.size) + 1, dtype=np.float64)
-            i_idx_arr[0] = np.int32(j)
+            i_idx_arr[0] = j_arr[0]
             hij_arr[0] = np.float64(0.0)
             i_idx_arr[1:] = idx_u
             hij_arr[1:] = val_u
@@ -256,6 +261,7 @@ def connected_row_sparse(
         )
 
     j = int(j)
+    idx_dtype = _csf_index_dtype(drt)
     max_out = int(max_out)
     if max_out < 1:
         raise ValueError("max_out must be >= 1")
@@ -296,7 +302,7 @@ def connected_row_sparse(
         coo_v: list[np.ndarray] = []
     else:
         # Accumulate as COO and coalesce at the end.
-        coo_i = [np.asarray([j], dtype=np.int32)]
+        coo_i = [np.asarray([j], dtype=idx_dtype)]
         coo_v = [np.asarray([diag_j], dtype=np.float64)]
 
     # One-body off-diagonal: restrict to feasible moves E_pq on |j>.
@@ -477,12 +483,12 @@ def connected_row_sparse(
             dense_acc.add_many(idx_all, val_all)
             idx_u, val_u = dense_acc.extract_coalesced()
         else:
-            idx_u, val_u = _coalesce_coo_i32_f64(idx_all, val_all)
+            idx_u, val_u = _coalesce_coo_idx_f64(idx_all, val_all, idx_dtype=idx_dtype)
     if stats is not None:
         stats.add_time("apply_accum", time.perf_counter() - t0)
 
     t0 = time.perf_counter() if stats is not None else 0.0
-    i_idx_arr, hij_arr = _finalize_coalesced_row(j, idx_u, val_u, max_out=max_out)
+    i_idx_arr, hij_arr = _finalize_coalesced_row(j, idx_u, val_u, max_out=max_out, idx_dtype=idx_dtype)
     if stats is not None:
         stats.add_time("finalize", time.perf_counter() - t0)
     return i_idx_arr, hij_arr
@@ -502,6 +508,7 @@ def connected_row_sparse_df(
     """DF-backed sparse row oracle (no global E_pq caches)."""
 
     j = int(j)
+    idx_dtype = _csf_index_dtype(drt)
     max_out = int(max_out)
     if max_out < 1:
         raise ValueError("max_out must be >= 1")
@@ -544,7 +551,7 @@ def connected_row_sparse_df(
         coo_v: list[np.ndarray] = []
     else:
         # Accumulate as COO and coalesce at the end.
-        coo_i = [np.asarray([j], dtype=np.int32)]
+        coo_i = [np.asarray([j], dtype=idx_dtype)]
         coo_v = [np.asarray([diag_j], dtype=np.float64)]
 
     t0 = time.perf_counter() if stats is not None else 0.0
@@ -790,13 +797,12 @@ def connected_row_sparse_df(
             dense_acc.add_many(idx_all, val_all)
             idx_u, val_u = dense_acc.extract_coalesced()
         else:
-            idx_u, val_u = _coalesce_coo_i32_f64(idx_all, val_all)
+            idx_u, val_u = _coalesce_coo_idx_f64(idx_all, val_all, idx_dtype=idx_dtype)
     if stats is not None:
         stats.add_time("apply_accum", time.perf_counter() - t0)
 
     t0 = time.perf_counter() if stats is not None else 0.0
-    i_idx_arr, hij_arr = _finalize_coalesced_row(j, idx_u, val_u, max_out=max_out)
+    i_idx_arr, hij_arr = _finalize_coalesced_row(j, idx_u, val_u, max_out=max_out, idx_dtype=idx_dtype)
     if stats is not None:
         stats.add_time("finalize", time.perf_counter() - t0)
     return i_idx_arr, hij_arr
-

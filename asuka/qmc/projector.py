@@ -8,7 +8,7 @@ from asuka.cuguga.drt import DRT
 from asuka.cuguga.state_cache import DRTStateCache
 from asuka.cuguga.oracle.sparse import connected_row_sparse
 from .compress import compress_phi_pivot_resample
-from .spawn import spawn_hamiltonian_events
+from .spawn import _coerce_i32_state_labels, spawn_hamiltonian_events
 from .sparse import coalesce_coo_i32_f64
 
 
@@ -50,7 +50,7 @@ def projector_step(
     If `m` is not None, returns `Φ(y)` compressed to exactly `m` nonzeros (unless y has fewer).
     """
 
-    x_idx_i32 = np.asarray(x_idx, dtype=np.int32).ravel()
+    x_idx_i32 = _coerce_i32_state_labels(drt, x_idx, caller="projector_step")
     x_val_f64 = np.asarray(x_val, dtype=np.float64).ravel()
     if x_idx_i32.size != x_val_f64.size:
         raise ValueError("x_idx and x_val must have the same size")

@@ -18,6 +18,27 @@ except Exception:  # pragma: no cover
     _qmc_spawn_hamiltonian_events_cy = None
 
 _STEP_TO_OCC = np.asarray([0, 1, 1, 2], dtype=np.int8)
+_INT32_MAX = int(np.iinfo(np.int32).max)
+_INT32_MIN = int(np.iinfo(np.int32).min)
+
+
+def _coerce_i32_state_labels(drt: DRT, idx: np.ndarray, *, caller: str) -> np.ndarray:
+    idx_arr = np.asarray(idx).ravel()
+    if idx_arr.dtype.kind not in ("i", "u"):
+        raise ValueError(f"{caller} indices must have an integer dtype")
+    if int(drt.ncsf) > _INT32_MAX:
+        raise NotImplementedError(
+            f"{caller} is an int32 CPU reference helper and does not support large-space / key64 labels; "
+            "use the scalable CUDA key64 drivers instead"
+        )
+    if idx_arr.size > 0:
+        if idx_arr.dtype.kind == "u":
+            if int(np.max(idx_arr)) > _INT32_MAX:
+                raise NotImplementedError(f"{caller} does not support labels above int32 range")
+        else:
+            if int(np.min(idx_arr)) < _INT32_MIN or int(np.max(idx_arr)) > _INT32_MAX:
+                raise NotImplementedError(f"{caller} does not support labels outside int32 range")
+    return np.asarray(idx_arr, dtype=np.int32).ravel()
 
 
 def spawn_one_body_events(
@@ -54,7 +75,7 @@ def spawn_one_body_events(
     if nspawn <= 0:
         raise ValueError("nspawn must be > 0")
 
-    x_idx_i32 = np.asarray(x_idx, dtype=np.int32).ravel()
+    x_idx_i32 = _coerce_i32_state_labels(drt, x_idx, caller="spawn_one_body_events")
     x_val_f64 = np.asarray(x_val, dtype=np.float64).ravel()
     if x_idx_i32.size != x_val_f64.size:
         raise ValueError("x_idx and x_val must have the same size")
@@ -189,7 +210,7 @@ def spawn_two_body_events(
     if nspawn <= 0:
         raise ValueError("nspawn must be > 0")
 
-    x_idx_i32 = np.asarray(x_idx, dtype=np.int32).ravel()
+    x_idx_i32 = _coerce_i32_state_labels(drt, x_idx, caller="spawn_two_body_events")
     x_val_f64 = np.asarray(x_val, dtype=np.float64).ravel()
     if x_idx_i32.size != x_val_f64.size:
         raise ValueError("x_idx and x_val must have the same size")
@@ -354,7 +375,7 @@ def spawn_hamiltonian_events(
     if nspawn_one == 0 and nspawn_two == 0:
         raise ValueError("at least one of nspawn_one or nspawn_two must be > 0")
 
-    x_idx_i32 = np.asarray(x_idx, dtype=np.int32).ravel()
+    x_idx_i32 = _coerce_i32_state_labels(drt, x_idx, caller="spawn_hamiltonian_events")
     x_val_f64 = np.asarray(x_val, dtype=np.float64).ravel()
     if x_idx_i32.size != x_val_f64.size:
         raise ValueError("x_idx and x_val must have the same size")
@@ -619,7 +640,7 @@ def spawn_hamiltonian_events_semi_stochastic(
     eps = float(eps)
     nspawn_one = int(nspawn_one)
     nspawn_two = int(nspawn_two)
-    x_idx_i32 = np.asarray(x_idx, dtype=np.int32).ravel()
+    x_idx_i32 = _coerce_i32_state_labels(drt, x_idx, caller="spawn_hamiltonian_events_semi_stochastic")
     x_val_f64 = np.asarray(x_val, dtype=np.float64).ravel()
     if x_idx_i32.size != x_val_f64.size:
         raise ValueError("x_idx and x_val must have the same size")
@@ -633,7 +654,11 @@ def spawn_hamiltonian_events_semi_stochastic(
         raise ValueError("det_abs_x_threshold must be finite when provided")
     det_parent_idx_i32 = np.zeros(0, dtype=np.int32)
     if det_parent_idx is not None:
-        det_parent_idx_i32 = np.asarray(det_parent_idx, dtype=np.int32).ravel()
+        det_parent_idx_i32 = _coerce_i32_state_labels(
+            drt,
+            np.asarray(det_parent_idx),
+            caller="spawn_hamiltonian_events_semi_stochastic(det_parent_idx)",
+        )
 
     m = int(x_idx_i32.size)
     abs_x = np.abs(x_val_f64)

@@ -30,7 +30,7 @@ import numpy as np
 from asuka.cuguga.drt import DRT
 from asuka.cuguga.state_cache import DRTStateCache
 from asuka.cuguga.oracle.sparse import connected_row_sparse
-from .spawn import spawn_hamiltonian_events
+from .spawn import _coerce_i32_state_labels, spawn_hamiltonian_events
 from .sparse import coalesce_coo_i32_f64
 
 
@@ -114,7 +114,10 @@ def spawn_hamiltonian_events_guided_row(
         raise ValueError("at least one of nspawn_one or nspawn_two must be > 0")
 
     # Coalesce input (safety): we assume sorted unique downstream for initiator gating.
-    x_idx_u, x_val_u = coalesce_coo_i32_f64(x_idx, x_val)
+    x_idx_u, x_val_u = coalesce_coo_i32_f64(
+        _coerce_i32_state_labels(drt, x_idx, caller="spawn_hamiltonian_events_guided_row"),
+        x_val,
+    )
     m = int(x_idx_u.size)
     if m == 0:
         return np.zeros(0, dtype=np.int32), np.zeros(0, dtype=np.float64)

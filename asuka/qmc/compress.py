@@ -5,6 +5,24 @@ import numpy as np
 from .sparse import coalesce_coo_i32_f64
 
 
+_INT32_MAX = int(np.iinfo(np.int32).max)
+_INT32_MIN = int(np.iinfo(np.int32).min)
+
+
+def _coerce_i32_sparse_labels(idx: np.ndarray, *, caller: str) -> np.ndarray:
+    idx_arr = np.asarray(idx).ravel()
+    if idx_arr.dtype.kind not in ("i", "u"):
+        raise ValueError(f"{caller} indices must have an integer dtype")
+    if idx_arr.size > 0:
+        if idx_arr.dtype.kind == "u":
+            if int(np.max(idx_arr)) > _INT32_MAX:
+                raise NotImplementedError(f"{caller} only supports int32-addressable labels")
+        else:
+            if int(np.min(idx_arr)) < _INT32_MIN or int(np.max(idx_arr)) > _INT32_MAX:
+                raise NotImplementedError(f"{caller} only supports int32-addressable labels")
+    return np.asarray(idx_arr, dtype=np.int32).ravel()
+
+
 def _choose_pivotal_d(abs_u: np.ndarray, *, m: int) -> int:
     """Choose deterministic keep count `d` for pivotal compression.
 
@@ -208,7 +226,7 @@ def compress_phi_pivotal(
     if m < 0:
         raise ValueError("m must be >= 0")
 
-    idx_u, val_u = coalesce_coo_i32_f64(idx, val)
+    idx_u, val_u = coalesce_coo_i32_f64(_coerce_i32_sparse_labels(idx, caller="compress_phi_pivotal"), val)
     L = int(idx_u.size)
     if m == 0 or L == 0:
         return np.zeros(0, dtype=np.int32), np.zeros(0, dtype=np.float64)
@@ -285,7 +303,7 @@ def compress_phi_pivot_resample(
     if pivot < 0:
         raise ValueError("pivot must be >= 0")
 
-    idx_u, val_u = coalesce_coo_i32_f64(idx, val)
+    idx_u, val_u = coalesce_coo_i32_f64(_coerce_i32_sparse_labels(idx, caller="compress_phi_pivot_resample"), val)
     L = int(idx_u.size)
     if m == 0 or L == 0:
         return np.zeros(0, dtype=np.int32), np.zeros(0, dtype=np.float64)
@@ -327,4 +345,3 @@ def compress_phi_pivot_resample(
     idx_out = np.concatenate((idx_p, samp_idx))
     val_out = np.concatenate((val_p, samp_val))
     return coalesce_coo_i32_f64(idx_out, val_out)
-

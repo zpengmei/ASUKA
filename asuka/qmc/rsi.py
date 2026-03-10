@@ -686,7 +686,11 @@ def run_fcifri_rsi(
     debug: bool = False,
     debug_dense_checks: bool = False,
 ) -> FCIFRIRSIResult:
-    """Multi-root FCI-FRI excited states via RSI subspace iteration."""
+    """Removed non-scalable RSI excited-state driver."""
+
+    raise NotImplementedError(
+        "run_fcifri_rsi has been removed from the scalable production path; use run_fcifri_block(...) / run_fcifri_ground(...)"
+    )
 
     m = int(m)
     niter = int(niter)
@@ -747,6 +751,10 @@ def run_fcifri_rsi(
     backend = str(backend).lower()
     if backend not in ("stochastic", "exact", "cuda"):
         raise ValueError("backend must be 'stochastic', 'exact', or 'cuda'")
+    if int(drt.ncsf) > np.iinfo(np.int32).max:
+        raise NotImplementedError(
+            "run_fcifri_rsi is a small-space excited-state driver and does not support large-space / key64 labels"
+        )
 
     if backend == "cuda" and (projector_spawner is not None or projector_spawner_kwargs is not None):
         warnings.warn(
@@ -772,6 +780,17 @@ def run_fcifri_rsi(
 
     U_cols: List[SparseCol] = []
     for k, (idx_k, val_k) in enumerate(U0):
+        idx_arr = np.asarray(idx_k).ravel()
+        if idx_arr.dtype.kind not in ("i", "u"):
+            raise ValueError(f"trial vector {k} indices must have an integer dtype")
+        if idx_arr.size > 0 and (
+            (idx_arr.dtype.kind == "u" and int(np.max(idx_arr)) > np.iinfo(np.int32).max)
+            or (
+                idx_arr.dtype.kind == "i"
+                and (int(np.min(idx_arr)) < np.iinfo(np.int32).min or int(np.max(idx_arr)) > np.iinfo(np.int32).max)
+            )
+        ):
+            raise NotImplementedError("run_fcifri_rsi only supports int32-addressable trial-vector labels")
         idx_k, val_k = coalesce_coo_i32_f64(idx_k, val_k)
         if idx_k.size == 0:
             raise ValueError(f"trial vector {k} is empty")
