@@ -7,6 +7,7 @@
 #include <cstdint>
 
 #include "cueri_cuda_kernels_api.h"
+#include "cueri_cuda_contract_fock_warp.cuh"
 #include "cueri_cuda_rys_device.cuh"
 
 namespace {
@@ -288,6 +289,174 @@ __global__ void KernelERI_ssdp_fixed(
     if (active) {
       eri_out[static_cast<int64_t>(t) * static_cast<int64_t>(kNComp) + static_cast<int64_t>(e)] = val;
     }
+  }
+}
+
+template <int NROOTS>
+__global__ void KernelFusedFock_ssdp_fixed(
+    const int32_t* task_spAB,
+    const int32_t* task_spCD,
+    int ntasks,
+    const int32_t* sp_A,
+    const int32_t* sp_B,
+    const int32_t* sp_pair_start,
+    const int32_t* sp_npair,
+    const double* shell_cx,
+    const double* shell_cy,
+    const double* shell_cz,
+    const double* pair_eta,
+    const double* pair_Px,
+    const double* pair_Py,
+    const double* pair_Pz,
+    const double* pair_cK,
+    const int32_t* shell_ao_start,
+    int nao,
+    const double* D_mat,
+    double* F_mat) {
+  const int lane = static_cast<int>(threadIdx.x) & 31;
+  const int warp_id = static_cast<int>(threadIdx.x) >> 5;
+  const int warps_per_block = static_cast<int>(blockDim.x) >> 5;
+  const int t = static_cast<int>(blockIdx.x) * warps_per_block + warp_id;
+  if (t >= ntasks) return;
+
+  constexpr int kStride = 5;
+  constexpr int kNComp = 18;
+  constexpr int kNMax = 0;
+  constexpr int kMMax = 3;
+  constexpr int kGSize = kStride * kStride;
+  constexpr int kWarpDoubles = 3 * kGSize + 2 * NROOTS + 11 + kNComp;
+
+  extern __shared__ char sh_raw[];
+  double* sh_warp = reinterpret_cast<double*>(sh_raw) + static_cast<int64_t>(warp_id) * kWarpDoubles;
+  double* Gx = sh_warp;
+  double* Gy = sh_warp + kGSize;
+  double* Gz = sh_warp + 2 * kGSize;
+  double* sh_roots = sh_warp + 3 * kGSize;
+  double* sh_weights = sh_roots + NROOTS;
+  double* sh_sc = sh_weights + NROOTS;
+  double* tile = sh_sc + 11;
+
+  const int spAB = static_cast<int>(task_spAB[t]);
+  const int spCD = static_cast<int>(task_spCD[t]);
+  const int A = static_cast<int>(sp_A[spAB]);
+  const int B = static_cast<int>(sp_B[spAB]);
+  const int C = static_cast<int>(sp_A[spCD]);
+  const int D = static_cast<int>(sp_B[spCD]);
+
+  const double Ax = shell_cx[A];
+  const double Ay = shell_cy[A];
+  const double Az = shell_cz[A];
+  const double Bx = shell_cx[B];
+  const double By = shell_cy[B];
+  const double Bz = shell_cz[B];
+  const double Cx = shell_cx[C];
+  const double Cy = shell_cy[C];
+  const double Cz = shell_cz[C];
+  const double Dx = shell_cx[D];
+  const double Dy = shell_cy[D];
+  const double Dz = shell_cz[D];
+
+  const double xij = Ax - Bx;
+  const double yij = Ay - By;
+  const double zij = Az - Bz;
+  const double xkl = Cx - Dx;
+  const double ykl = Cy - Dy;
+  const double zkl = Cz - Dz;
+  const double xij2 = xij * xij;
+  const double yij2 = yij * yij;
+  const double zij2 = zij * zij;
+  const double xkl2 = xkl * xkl;
+  const double ykl2 = ykl * ykl;
+  const double zkl2 = zkl * zkl;
+
+  const int baseAB = static_cast<int>(sp_pair_start[spAB]);
+  const int baseCD = static_cast<int>(sp_pair_start[spCD]);
+  const int nPairAB = static_cast<int>(sp_npair[spAB]);
+  const int nPairCD = static_cast<int>(sp_npair[spCD]);
+
+  for (int ebase = 0; ebase < kNComp; ebase += 32) {
+    const int e = ebase + lane;
+    const bool active = (e < kNComp);
+    double val = 0.0;
+    for (int ip = 0; ip < nPairAB; ++ip) {
+      const int ki = baseAB + ip;
+      for (int jp = 0; jp < nPairCD; ++jp) {
+        const int kj = baseCD + jp;
+        if (lane == 0) {
+          sh_sc[1] = pair_eta[ki];
+          sh_sc[2] = pair_eta[kj];
+          sh_sc[3] = pair_Px[ki];
+          sh_sc[4] = pair_Py[ki];
+          sh_sc[5] = pair_Pz[ki];
+          sh_sc[6] = pair_Px[kj];
+          sh_sc[7] = pair_Py[kj];
+          sh_sc[8] = pair_Pz[kj];
+          const double dx = sh_sc[3] - sh_sc[6];
+          const double dy = sh_sc[4] - sh_sc[7];
+          const double dz = sh_sc[5] - sh_sc[8];
+          const double PQ2 = dx * dx + dy * dy + dz * dz;
+          sh_sc[9] = sh_sc[1] + sh_sc[2];
+          const double omega = sh_sc[1] * sh_sc[2] / sh_sc[9];
+          const double T = omega * PQ2;
+          sh_sc[10] = kTwoPiToFiveHalves / (sh_sc[1] * sh_sc[2] * ::sqrt(sh_sc[9])) * pair_cK[ki] * pair_cK[kj];
+          cueri_rys::rys_roots_weights<NROOTS>(T, sh_roots, sh_weights);
+        }
+        __syncwarp();
+        for (int u = 0; u < NROOTS; ++u) {
+          if (lane == 0) {
+            const double x = sh_roots[u];
+            const double w = sh_weights[u];
+            const double inv_denom = 1.0 / sh_sc[9];
+            const double B0 = x * 0.5 * inv_denom;
+            const double B1 = (1.0 - x) * 0.5 / sh_sc[1] + B0;
+            const double B1p = (1.0 - x) * 0.5 / sh_sc[2] + B0;
+
+            const double Cx_ = (sh_sc[3] - Ax) + (sh_sc[2] * inv_denom) * x * (sh_sc[6] - sh_sc[3]);
+            const double Cy_ = (sh_sc[4] - Ay) + (sh_sc[2] * inv_denom) * x * (sh_sc[7] - sh_sc[4]);
+            const double Cz_ = (sh_sc[5] - Az) + (sh_sc[2] * inv_denom) * x * (sh_sc[8] - sh_sc[5]);
+            const double Cpx_ = (sh_sc[6] - Cx) + (sh_sc[1] * inv_denom) * x * (sh_sc[3] - sh_sc[6]);
+            const double Cpy_ = (sh_sc[7] - Cy) + (sh_sc[1] * inv_denom) * x * (sh_sc[4] - sh_sc[7]);
+            const double Cpz_ = (sh_sc[8] - Cz) + (sh_sc[1] * inv_denom) * x * (sh_sc[5] - sh_sc[8]);
+
+            compute_G_stride_fixed<kStride, kNMax, kMMax>(Gx, Cx_, Cpx_, B0, B1, B1p);
+            compute_G_stride_fixed<kStride, kNMax, kMMax>(Gy, Cy_, Cpy_, B0, B1, B1p);
+            compute_G_stride_fixed<kStride, kNMax, kMMax>(Gz, Cz_, Cpz_, B0, B1, B1p);
+            sh_sc[0] = sh_sc[10] * w;
+          }
+          __syncwarp();
+          if (active) {
+            const double Ix = eval_ssdp_x(e, Gx, xij, xij2, xkl, xkl2);
+            const double Iy = eval_ssdp_y(e, Gy, yij, yij2, ykl, ykl2);
+            const double Iz = eval_ssdp_z(e, Gz, zij, zij2, zkl, zkl2);
+            val += sh_sc[0] * (Ix * Iy * Iz);
+          }
+          __syncwarp();
+        }
+      }
+    }
+    if (active) tile[e] = val;
+  }
+
+  __syncwarp();
+  {
+    constexpr int nA = 1, nB = 1, nC = 6, nD = 3;
+    constexpr int nAB = 1;
+    constexpr int nCD = 18;
+    const int a0 = static_cast<int>(shell_ao_start[A]);
+    const int b0 = static_cast<int>(shell_ao_start[B]);
+    const int c0 = static_cast<int>(shell_ao_start[C]);
+    const int d0 = static_cast<int>(shell_ao_start[D]);
+    const bool ab_neq = (A != B);
+    const bool cd_neq = (C != D);
+    const bool bk_swap = (spAB != spCD);
+    const double f_ab = ab_neq ? 2.0 : 1.0;
+    const double f_cd = cd_neq ? 2.0 : 1.0;
+    const int64_t N = static_cast<int64_t>(nao);
+    cueri_contract_fock_warp_single(
+        tile, D_mat, F_mat, lane,
+        nAB, nCD, nA, nB, nC, nD,
+        a0, b0, c0, d0,
+        ab_neq, cd_neq, bk_swap, f_ab, f_cd, N);
   }
 }
 
@@ -633,6 +802,174 @@ __global__ void KernelERI_psdp_fixed(
     if (active) {
       eri_out[static_cast<int64_t>(t) * static_cast<int64_t>(kNComp) + static_cast<int64_t>(e)] = val;
     }
+  }
+}
+
+template <int NROOTS>
+__global__ void KernelFusedFock_psdp_fixed(
+    const int32_t* task_spAB,
+    const int32_t* task_spCD,
+    int ntasks,
+    const int32_t* sp_A,
+    const int32_t* sp_B,
+    const int32_t* sp_pair_start,
+    const int32_t* sp_npair,
+    const double* shell_cx,
+    const double* shell_cy,
+    const double* shell_cz,
+    const double* pair_eta,
+    const double* pair_Px,
+    const double* pair_Py,
+    const double* pair_Pz,
+    const double* pair_cK,
+    const int32_t* shell_ao_start,
+    int nao,
+    const double* D_mat,
+    double* F_mat) {
+  const int lane = static_cast<int>(threadIdx.x) & 31;
+  const int warp_id = static_cast<int>(threadIdx.x) >> 5;
+  const int warps_per_block = static_cast<int>(blockDim.x) >> 5;
+  const int t = static_cast<int>(blockIdx.x) * warps_per_block + warp_id;
+  if (t >= ntasks) return;
+
+  constexpr int kStride = 5;
+  constexpr int kNComp = 54;
+  constexpr int kNMax = 1;
+  constexpr int kMMax = 3;
+  constexpr int kGSize = kStride * kStride;
+  constexpr int kWarpDoubles = 3 * kGSize + 2 * NROOTS + 11 + kNComp;
+
+  extern __shared__ char sh_raw[];
+  double* sh_warp = reinterpret_cast<double*>(sh_raw) + static_cast<int64_t>(warp_id) * kWarpDoubles;
+  double* Gx = sh_warp;
+  double* Gy = sh_warp + kGSize;
+  double* Gz = sh_warp + 2 * kGSize;
+  double* sh_roots = sh_warp + 3 * kGSize;
+  double* sh_weights = sh_roots + NROOTS;
+  double* sh_sc = sh_weights + NROOTS;
+  double* tile = sh_sc + 11;
+
+  const int spAB = static_cast<int>(task_spAB[t]);
+  const int spCD = static_cast<int>(task_spCD[t]);
+  const int A = static_cast<int>(sp_A[spAB]);
+  const int B = static_cast<int>(sp_B[spAB]);
+  const int C = static_cast<int>(sp_A[spCD]);
+  const int D = static_cast<int>(sp_B[spCD]);
+
+  const double Ax = shell_cx[A];
+  const double Ay = shell_cy[A];
+  const double Az = shell_cz[A];
+  const double Bx = shell_cx[B];
+  const double By = shell_cy[B];
+  const double Bz = shell_cz[B];
+  const double Cx = shell_cx[C];
+  const double Cy = shell_cy[C];
+  const double Cz = shell_cz[C];
+  const double Dx = shell_cx[D];
+  const double Dy = shell_cy[D];
+  const double Dz = shell_cz[D];
+
+  const double xij = Ax - Bx;
+  const double yij = Ay - By;
+  const double zij = Az - Bz;
+  const double xkl = Cx - Dx;
+  const double ykl = Cy - Dy;
+  const double zkl = Cz - Dz;
+  const double xij2 = xij * xij;
+  const double yij2 = yij * yij;
+  const double zij2 = zij * zij;
+  const double xkl2 = xkl * xkl;
+  const double ykl2 = ykl * ykl;
+  const double zkl2 = zkl * zkl;
+
+  const int baseAB = static_cast<int>(sp_pair_start[spAB]);
+  const int baseCD = static_cast<int>(sp_pair_start[spCD]);
+  const int nPairAB = static_cast<int>(sp_npair[spAB]);
+  const int nPairCD = static_cast<int>(sp_npair[spCD]);
+
+  for (int ebase = 0; ebase < kNComp; ebase += 32) {
+    const int e = ebase + lane;
+    const bool active = (e < kNComp);
+    double val = 0.0;
+    for (int ip = 0; ip < nPairAB; ++ip) {
+      const int ki = baseAB + ip;
+      for (int jp = 0; jp < nPairCD; ++jp) {
+        const int kj = baseCD + jp;
+        if (lane == 0) {
+          sh_sc[1] = pair_eta[ki];
+          sh_sc[2] = pair_eta[kj];
+          sh_sc[3] = pair_Px[ki];
+          sh_sc[4] = pair_Py[ki];
+          sh_sc[5] = pair_Pz[ki];
+          sh_sc[6] = pair_Px[kj];
+          sh_sc[7] = pair_Py[kj];
+          sh_sc[8] = pair_Pz[kj];
+          const double dx = sh_sc[3] - sh_sc[6];
+          const double dy = sh_sc[4] - sh_sc[7];
+          const double dz = sh_sc[5] - sh_sc[8];
+          const double PQ2 = dx * dx + dy * dy + dz * dz;
+          sh_sc[9] = sh_sc[1] + sh_sc[2];
+          const double omega = sh_sc[1] * sh_sc[2] / sh_sc[9];
+          const double T = omega * PQ2;
+          sh_sc[10] = kTwoPiToFiveHalves / (sh_sc[1] * sh_sc[2] * ::sqrt(sh_sc[9])) * pair_cK[ki] * pair_cK[kj];
+          cueri_rys::rys_roots_weights<NROOTS>(T, sh_roots, sh_weights);
+        }
+        __syncwarp();
+        for (int u = 0; u < NROOTS; ++u) {
+          if (lane == 0) {
+            const double x = sh_roots[u];
+            const double w = sh_weights[u];
+            const double inv_denom = 1.0 / sh_sc[9];
+            const double B0 = x * 0.5 * inv_denom;
+            const double B1 = (1.0 - x) * 0.5 / sh_sc[1] + B0;
+            const double B1p = (1.0 - x) * 0.5 / sh_sc[2] + B0;
+
+            const double Cx_ = (sh_sc[3] - Ax) + (sh_sc[2] * inv_denom) * x * (sh_sc[6] - sh_sc[3]);
+            const double Cy_ = (sh_sc[4] - Ay) + (sh_sc[2] * inv_denom) * x * (sh_sc[7] - sh_sc[4]);
+            const double Cz_ = (sh_sc[5] - Az) + (sh_sc[2] * inv_denom) * x * (sh_sc[8] - sh_sc[5]);
+            const double Cpx_ = (sh_sc[6] - Cx) + (sh_sc[1] * inv_denom) * x * (sh_sc[3] - sh_sc[6]);
+            const double Cpy_ = (sh_sc[7] - Cy) + (sh_sc[1] * inv_denom) * x * (sh_sc[4] - sh_sc[7]);
+            const double Cpz_ = (sh_sc[8] - Cz) + (sh_sc[1] * inv_denom) * x * (sh_sc[5] - sh_sc[8]);
+
+            compute_G_stride_fixed<kStride, kNMax, kMMax>(Gx, Cx_, Cpx_, B0, B1, B1p);
+            compute_G_stride_fixed<kStride, kNMax, kMMax>(Gy, Cy_, Cpy_, B0, B1, B1p);
+            compute_G_stride_fixed<kStride, kNMax, kMMax>(Gz, Cz_, Cpz_, B0, B1, B1p);
+            sh_sc[0] = sh_sc[10] * w;
+          }
+          __syncwarp();
+          if (active) {
+            const double Ix = eval_psdp_x(e, Gx, xij, xij2, xkl, xkl2);
+            const double Iy = eval_psdp_y(e, Gy, yij, yij2, ykl, ykl2);
+            const double Iz = eval_psdp_z(e, Gz, zij, zij2, zkl, zkl2);
+            val += sh_sc[0] * (Ix * Iy * Iz);
+          }
+          __syncwarp();
+        }
+      }
+    }
+    if (active) tile[e] = val;
+  }
+
+  __syncwarp();
+  {
+    constexpr int nA = 3, nB = 1, nC = 6, nD = 3;
+    constexpr int nAB = 3;
+    constexpr int nCD = 18;
+    const int a0 = static_cast<int>(shell_ao_start[A]);
+    const int b0 = static_cast<int>(shell_ao_start[B]);
+    const int c0 = static_cast<int>(shell_ao_start[C]);
+    const int d0 = static_cast<int>(shell_ao_start[D]);
+    const bool ab_neq = (A != B);
+    const bool cd_neq = (C != D);
+    const bool bk_swap = (spAB != spCD);
+    const double f_ab = ab_neq ? 2.0 : 1.0;
+    const double f_cd = cd_neq ? 2.0 : 1.0;
+    const int64_t N = static_cast<int64_t>(nao);
+    cueri_contract_fock_warp_single(
+        tile, D_mat, F_mat, lane,
+        nAB, nCD, nA, nB, nC, nD,
+        a0, b0, c0, d0,
+        ab_neq, cd_neq, bk_swap, f_ab, f_cd, N);
   }
 }
 
@@ -1140,6 +1477,174 @@ __global__ void KernelERI_psdd_fixed(
     if (active) {
       eri_out[static_cast<int64_t>(t) * static_cast<int64_t>(kNComp) + static_cast<int64_t>(e)] = val;
     }
+  }
+}
+
+template <int NROOTS>
+__global__ void KernelFusedFock_psdd_fixed(
+    const int32_t* task_spAB,
+    const int32_t* task_spCD,
+    int ntasks,
+    const int32_t* sp_A,
+    const int32_t* sp_B,
+    const int32_t* sp_pair_start,
+    const int32_t* sp_npair,
+    const double* shell_cx,
+    const double* shell_cy,
+    const double* shell_cz,
+    const double* pair_eta,
+    const double* pair_Px,
+    const double* pair_Py,
+    const double* pair_Pz,
+    const double* pair_cK,
+    const int32_t* shell_ao_start,
+    int nao,
+    const double* D_mat,
+    double* F_mat) {
+  const int lane = static_cast<int>(threadIdx.x) & 31;
+  const int warp_id = static_cast<int>(threadIdx.x) >> 5;
+  const int warps_per_block = static_cast<int>(blockDim.x) >> 5;
+  const int t = static_cast<int>(blockIdx.x) * warps_per_block + warp_id;
+  if (t >= ntasks) return;
+
+  constexpr int kStride = 5;
+  constexpr int kNComp = 108;
+  constexpr int kNMax = 1;
+  constexpr int kMMax = 4;
+  constexpr int kGSize = kStride * kStride;
+  constexpr int kWarpDoubles = 3 * kGSize + 2 * NROOTS + 11 + kNComp;
+
+  extern __shared__ char sh_raw[];
+  double* sh_warp = reinterpret_cast<double*>(sh_raw) + static_cast<int64_t>(warp_id) * kWarpDoubles;
+  double* Gx = sh_warp;
+  double* Gy = sh_warp + kGSize;
+  double* Gz = sh_warp + 2 * kGSize;
+  double* sh_roots = sh_warp + 3 * kGSize;
+  double* sh_weights = sh_roots + NROOTS;
+  double* sh_sc = sh_weights + NROOTS;
+  double* tile = sh_sc + 11;
+
+  const int spAB = static_cast<int>(task_spAB[t]);
+  const int spCD = static_cast<int>(task_spCD[t]);
+  const int A = static_cast<int>(sp_A[spAB]);
+  const int B = static_cast<int>(sp_B[spAB]);
+  const int C = static_cast<int>(sp_A[spCD]);
+  const int D = static_cast<int>(sp_B[spCD]);
+
+  const double Ax = shell_cx[A];
+  const double Ay = shell_cy[A];
+  const double Az = shell_cz[A];
+  const double Bx = shell_cx[B];
+  const double By = shell_cy[B];
+  const double Bz = shell_cz[B];
+  const double Cx = shell_cx[C];
+  const double Cy = shell_cy[C];
+  const double Cz = shell_cz[C];
+  const double Dx = shell_cx[D];
+  const double Dy = shell_cy[D];
+  const double Dz = shell_cz[D];
+
+  const double xij = Ax - Bx;
+  const double yij = Ay - By;
+  const double zij = Az - Bz;
+  const double xkl = Cx - Dx;
+  const double ykl = Cy - Dy;
+  const double zkl = Cz - Dz;
+  const double xij2 = xij * xij;
+  const double yij2 = yij * yij;
+  const double zij2 = zij * zij;
+  const double xkl2 = xkl * xkl;
+  const double ykl2 = ykl * ykl;
+  const double zkl2 = zkl * zkl;
+
+  const int baseAB = static_cast<int>(sp_pair_start[spAB]);
+  const int baseCD = static_cast<int>(sp_pair_start[spCD]);
+  const int nPairAB = static_cast<int>(sp_npair[spAB]);
+  const int nPairCD = static_cast<int>(sp_npair[spCD]);
+
+  for (int ebase = 0; ebase < kNComp; ebase += 32) {
+    const int e = ebase + lane;
+    const bool active = (e < kNComp);
+    double val = 0.0;
+    for (int ip = 0; ip < nPairAB; ++ip) {
+      const int ki = baseAB + ip;
+      for (int jp = 0; jp < nPairCD; ++jp) {
+        const int kj = baseCD + jp;
+        if (lane == 0) {
+          sh_sc[1] = pair_eta[ki];
+          sh_sc[2] = pair_eta[kj];
+          sh_sc[3] = pair_Px[ki];
+          sh_sc[4] = pair_Py[ki];
+          sh_sc[5] = pair_Pz[ki];
+          sh_sc[6] = pair_Px[kj];
+          sh_sc[7] = pair_Py[kj];
+          sh_sc[8] = pair_Pz[kj];
+          const double dx = sh_sc[3] - sh_sc[6];
+          const double dy = sh_sc[4] - sh_sc[7];
+          const double dz = sh_sc[5] - sh_sc[8];
+          const double PQ2 = dx * dx + dy * dy + dz * dz;
+          sh_sc[9] = sh_sc[1] + sh_sc[2];
+          const double omega = sh_sc[1] * sh_sc[2] / sh_sc[9];
+          const double T = omega * PQ2;
+          sh_sc[10] = kTwoPiToFiveHalves / (sh_sc[1] * sh_sc[2] * ::sqrt(sh_sc[9])) * pair_cK[ki] * pair_cK[kj];
+          cueri_rys::rys_roots_weights<NROOTS>(T, sh_roots, sh_weights);
+        }
+        __syncwarp();
+        for (int u = 0; u < NROOTS; ++u) {
+          if (lane == 0) {
+            const double x = sh_roots[u];
+            const double w = sh_weights[u];
+            const double inv_denom = 1.0 / sh_sc[9];
+            const double B0 = x * 0.5 * inv_denom;
+            const double B1 = (1.0 - x) * 0.5 / sh_sc[1] + B0;
+            const double B1p = (1.0 - x) * 0.5 / sh_sc[2] + B0;
+
+            const double Cx_ = (sh_sc[3] - Ax) + (sh_sc[2] * inv_denom) * x * (sh_sc[6] - sh_sc[3]);
+            const double Cy_ = (sh_sc[4] - Ay) + (sh_sc[2] * inv_denom) * x * (sh_sc[7] - sh_sc[4]);
+            const double Cz_ = (sh_sc[5] - Az) + (sh_sc[2] * inv_denom) * x * (sh_sc[8] - sh_sc[5]);
+            const double Cpx_ = (sh_sc[6] - Cx) + (sh_sc[1] * inv_denom) * x * (sh_sc[3] - sh_sc[6]);
+            const double Cpy_ = (sh_sc[7] - Cy) + (sh_sc[1] * inv_denom) * x * (sh_sc[4] - sh_sc[7]);
+            const double Cpz_ = (sh_sc[8] - Cz) + (sh_sc[1] * inv_denom) * x * (sh_sc[5] - sh_sc[8]);
+
+            compute_G_stride_fixed<kStride, kNMax, kMMax>(Gx, Cx_, Cpx_, B0, B1, B1p);
+            compute_G_stride_fixed<kStride, kNMax, kMMax>(Gy, Cy_, Cpy_, B0, B1, B1p);
+            compute_G_stride_fixed<kStride, kNMax, kMMax>(Gz, Cz_, Cpz_, B0, B1, B1p);
+            sh_sc[0] = sh_sc[10] * w;
+          }
+          __syncwarp();
+          if (active) {
+            const double Ix = eval_psdd_x(e, Gx, xij, xij2, xkl, xkl2);
+            const double Iy = eval_psdd_y(e, Gy, yij, yij2, ykl, ykl2);
+            const double Iz = eval_psdd_z(e, Gz, zij, zij2, zkl, zkl2);
+            val += sh_sc[0] * (Ix * Iy * Iz);
+          }
+          __syncwarp();
+        }
+      }
+    }
+    if (active) tile[e] = val;
+  }
+
+  __syncwarp();
+  {
+    constexpr int nA = 3, nB = 1, nC = 6, nD = 6;
+    constexpr int nAB = 3;
+    constexpr int nCD = 36;
+    const int a0 = static_cast<int>(shell_ao_start[A]);
+    const int b0 = static_cast<int>(shell_ao_start[B]);
+    const int c0 = static_cast<int>(shell_ao_start[C]);
+    const int d0 = static_cast<int>(shell_ao_start[D]);
+    const bool ab_neq = (A != B);
+    const bool cd_neq = (C != D);
+    const bool bk_swap = (spAB != spCD);
+    const double f_ab = ab_neq ? 2.0 : 1.0;
+    const double f_cd = cd_neq ? 2.0 : 1.0;
+    const int64_t N = static_cast<int64_t>(nao);
+    cueri_contract_fock_warp_single(
+        tile, D_mat, F_mat, lane,
+        nAB, nCD, nA, nB, nC, nD,
+        a0, b0, c0, d0,
+        ab_neq, cd_neq, bk_swap, f_ab, f_cd, N);
   }
 }
 
@@ -3255,6 +3760,174 @@ __global__ void KernelERI_ddss_fixed(
     if (active) {
       eri_out[static_cast<int64_t>(t) * static_cast<int64_t>(kNComp) + static_cast<int64_t>(e)] = val;
     }
+  }
+}
+
+template <int NROOTS>
+__global__ void KernelFusedFock_ddss_fixed(
+    const int32_t* task_spAB,
+    const int32_t* task_spCD,
+    int ntasks,
+    const int32_t* sp_A,
+    const int32_t* sp_B,
+    const int32_t* sp_pair_start,
+    const int32_t* sp_npair,
+    const double* shell_cx,
+    const double* shell_cy,
+    const double* shell_cz,
+    const double* pair_eta,
+    const double* pair_Px,
+    const double* pair_Py,
+    const double* pair_Pz,
+    const double* pair_cK,
+    const int32_t* shell_ao_start,
+    int nao,
+    const double* D_mat,
+    double* F_mat) {
+  const int lane = static_cast<int>(threadIdx.x) & 31;
+  const int warp_id = static_cast<int>(threadIdx.x) >> 5;
+  const int warps_per_block = static_cast<int>(blockDim.x) >> 5;
+  const int t = static_cast<int>(blockIdx.x) * warps_per_block + warp_id;
+  if (t >= ntasks) return;
+
+  constexpr int kStride = 5;
+  constexpr int kNComp = 36;
+  constexpr int kNMax = 4;
+  constexpr int kMMax = 0;
+  constexpr int kGSize = kStride * kStride;
+  constexpr int kWarpDoubles = 3 * kGSize + 2 * NROOTS + 11 + kNComp;
+
+  extern __shared__ char sh_raw[];
+  double* sh_warp = reinterpret_cast<double*>(sh_raw) + static_cast<int64_t>(warp_id) * kWarpDoubles;
+  double* Gx = sh_warp;
+  double* Gy = sh_warp + kGSize;
+  double* Gz = sh_warp + 2 * kGSize;
+  double* sh_roots = sh_warp + 3 * kGSize;
+  double* sh_weights = sh_roots + NROOTS;
+  double* sh_sc = sh_weights + NROOTS;
+  double* tile = sh_sc + 11;
+
+  const int spAB = static_cast<int>(task_spAB[t]);
+  const int spCD = static_cast<int>(task_spCD[t]);
+  const int A = static_cast<int>(sp_A[spAB]);
+  const int B = static_cast<int>(sp_B[spAB]);
+  const int C = static_cast<int>(sp_A[spCD]);
+  const int D = static_cast<int>(sp_B[spCD]);
+
+  const double Ax = shell_cx[A];
+  const double Ay = shell_cy[A];
+  const double Az = shell_cz[A];
+  const double Bx = shell_cx[B];
+  const double By = shell_cy[B];
+  const double Bz = shell_cz[B];
+  const double Cx = shell_cx[C];
+  const double Cy = shell_cy[C];
+  const double Cz = shell_cz[C];
+  const double Dx = shell_cx[D];
+  const double Dy = shell_cy[D];
+  const double Dz = shell_cz[D];
+
+  const double xij = Ax - Bx;
+  const double yij = Ay - By;
+  const double zij = Az - Bz;
+  const double xkl = Cx - Dx;
+  const double ykl = Cy - Dy;
+  const double zkl = Cz - Dz;
+  const double xij2 = xij * xij;
+  const double yij2 = yij * yij;
+  const double zij2 = zij * zij;
+  const double xkl2 = xkl * xkl;
+  const double ykl2 = ykl * ykl;
+  const double zkl2 = zkl * zkl;
+
+  const int baseAB = static_cast<int>(sp_pair_start[spAB]);
+  const int baseCD = static_cast<int>(sp_pair_start[spCD]);
+  const int nPairAB = static_cast<int>(sp_npair[spAB]);
+  const int nPairCD = static_cast<int>(sp_npair[spCD]);
+
+  for (int ebase = 0; ebase < kNComp; ebase += 32) {
+    const int e = ebase + lane;
+    const bool active = (e < kNComp);
+    double val = 0.0;
+    for (int ip = 0; ip < nPairAB; ++ip) {
+      const int ki = baseAB + ip;
+      for (int jp = 0; jp < nPairCD; ++jp) {
+        const int kj = baseCD + jp;
+        if (lane == 0) {
+          sh_sc[1] = pair_eta[ki];
+          sh_sc[2] = pair_eta[kj];
+          sh_sc[3] = pair_Px[ki];
+          sh_sc[4] = pair_Py[ki];
+          sh_sc[5] = pair_Pz[ki];
+          sh_sc[6] = pair_Px[kj];
+          sh_sc[7] = pair_Py[kj];
+          sh_sc[8] = pair_Pz[kj];
+          const double dx = sh_sc[3] - sh_sc[6];
+          const double dy = sh_sc[4] - sh_sc[7];
+          const double dz = sh_sc[5] - sh_sc[8];
+          const double PQ2 = dx * dx + dy * dy + dz * dz;
+          sh_sc[9] = sh_sc[1] + sh_sc[2];
+          const double omega = sh_sc[1] * sh_sc[2] / sh_sc[9];
+          const double T = omega * PQ2;
+          sh_sc[10] = kTwoPiToFiveHalves / (sh_sc[1] * sh_sc[2] * ::sqrt(sh_sc[9])) * pair_cK[ki] * pair_cK[kj];
+          cueri_rys::rys_roots_weights<NROOTS>(T, sh_roots, sh_weights);
+        }
+        __syncwarp();
+        for (int u = 0; u < NROOTS; ++u) {
+          if (lane == 0) {
+            const double x = sh_roots[u];
+            const double w = sh_weights[u];
+            const double inv_denom = 1.0 / sh_sc[9];
+            const double B0 = x * 0.5 * inv_denom;
+            const double B1 = (1.0 - x) * 0.5 / sh_sc[1] + B0;
+            const double B1p = (1.0 - x) * 0.5 / sh_sc[2] + B0;
+
+            const double Cx_ = (sh_sc[3] - Ax) + (sh_sc[2] * inv_denom) * x * (sh_sc[6] - sh_sc[3]);
+            const double Cy_ = (sh_sc[4] - Ay) + (sh_sc[2] * inv_denom) * x * (sh_sc[7] - sh_sc[4]);
+            const double Cz_ = (sh_sc[5] - Az) + (sh_sc[2] * inv_denom) * x * (sh_sc[8] - sh_sc[5]);
+            const double Cpx_ = (sh_sc[6] - Cx) + (sh_sc[1] * inv_denom) * x * (sh_sc[3] - sh_sc[6]);
+            const double Cpy_ = (sh_sc[7] - Cy) + (sh_sc[1] * inv_denom) * x * (sh_sc[4] - sh_sc[7]);
+            const double Cpz_ = (sh_sc[8] - Cz) + (sh_sc[1] * inv_denom) * x * (sh_sc[5] - sh_sc[8]);
+
+            compute_G_stride_fixed<kStride, kNMax, kMMax>(Gx, Cx_, Cpx_, B0, B1, B1p);
+            compute_G_stride_fixed<kStride, kNMax, kMMax>(Gy, Cy_, Cpy_, B0, B1, B1p);
+            compute_G_stride_fixed<kStride, kNMax, kMMax>(Gz, Cz_, Cpz_, B0, B1, B1p);
+            sh_sc[0] = sh_sc[10] * w;
+          }
+          __syncwarp();
+          if (active) {
+            const double Ix = eval_ddss_x(e, Gx, xij, xij2, xkl, xkl2);
+            const double Iy = eval_ddss_y(e, Gy, yij, yij2, ykl, ykl2);
+            const double Iz = eval_ddss_z(e, Gz, zij, zij2, zkl, zkl2);
+            val += sh_sc[0] * (Ix * Iy * Iz);
+          }
+          __syncwarp();
+        }
+      }
+    }
+    if (active) tile[e] = val;
+  }
+
+  __syncwarp();
+  {
+    constexpr int nA = 6, nB = 6, nC = 1, nD = 1;
+    constexpr int nAB = 36;
+    constexpr int nCD = 1;
+    const int a0 = static_cast<int>(shell_ao_start[A]);
+    const int b0 = static_cast<int>(shell_ao_start[B]);
+    const int c0 = static_cast<int>(shell_ao_start[C]);
+    const int d0 = static_cast<int>(shell_ao_start[D]);
+    const bool ab_neq = (A != B);
+    const bool cd_neq = (C != D);
+    const bool bk_swap = (spAB != spCD);
+    const double f_ab = ab_neq ? 2.0 : 1.0;
+    const double f_cd = cd_neq ? 2.0 : 1.0;
+    const int64_t N = static_cast<int64_t>(nao);
+    cueri_contract_fock_warp_single(
+        tile, D_mat, F_mat, lane,
+        nAB, nCD, nA, nB, nC, nD,
+        a0, b0, c0, d0,
+        ab_neq, cd_neq, bk_swap, f_ab, f_cd, N);
   }
 }
 
@@ -10698,6 +11371,50 @@ extern "C" cudaError_t cueri_eri_ssdp_multiblock_launch_stream(
       pair_eta, pair_Px, pair_Py, pair_Pz, pair_cK, eri_out, stream, threads);
 }
 
+extern "C" cudaError_t cueri_fused_fock_ssdp_launch_stream(
+    const int32_t* task_spAB,
+    const int32_t* task_spCD,
+    int ntasks,
+    const int32_t* sp_A,
+    const int32_t* sp_B,
+    const int32_t* sp_pair_start,
+    const int32_t* sp_npair,
+    const double* shell_cx,
+    const double* shell_cy,
+    const double* shell_cz,
+    const double* pair_eta,
+    const double* pair_Px,
+    const double* pair_Py,
+    const double* pair_Pz,
+    const double* pair_cK,
+    const int32_t* shell_ao_start,
+    int nao,
+    const double* D_mat,
+    double* F_mat,
+    cudaStream_t stream,
+    int threads) {
+  if (ntasks < 0 || nao <= 0) return cudaErrorInvalidValue;
+  if (ntasks == 0) return cudaSuccess;
+  constexpr int kDefaultThreads = 64;
+  int launch_threads = (threads > 0) ? threads : kDefaultThreads;
+  if (launch_threads > 1024) launch_threads = 1024;
+  if (launch_threads < 32) launch_threads = 32;
+  launch_threads = (launch_threads / 32) * 32;
+  if (launch_threads < 32) launch_threads = 32;
+  const int warps_per_block = launch_threads >> 5;
+  if (warps_per_block <= 0) return cudaErrorInvalidValue;
+  const int blocks = (ntasks + warps_per_block - 1) / warps_per_block;
+  constexpr int kGSize_ssdp = 5 * 5;
+  constexpr int kWarpDoubles_ssdp = 3 * kGSize_ssdp + 2 * 2 + 11 + 18;
+  const size_t shmem_ssdp = static_cast<size_t>(warps_per_block) * kWarpDoubles_ssdp * sizeof(double);
+  KernelFusedFock_ssdp_fixed<2><<<blocks, launch_threads, shmem_ssdp, stream>>>(
+      task_spAB, task_spCD, ntasks, sp_A, sp_B, sp_pair_start, sp_npair,
+      shell_cx, shell_cy, shell_cz,
+      pair_eta, pair_Px, pair_Py, pair_Pz, pair_cK,
+      shell_ao_start, nao, D_mat, F_mat);
+  return cudaGetLastError();
+}
+
 extern "C" cudaError_t cueri_eri_psdp_launch_stream(
     const int32_t* task_spAB,
     const int32_t* task_spCD,
@@ -10783,6 +11500,50 @@ extern "C" cudaError_t cueri_eri_psdp_multiblock_launch_stream(
       pair_eta, pair_Px, pair_Py, pair_Pz, pair_cK, eri_out, stream, threads);
 }
 
+extern "C" cudaError_t cueri_fused_fock_psdp_launch_stream(
+    const int32_t* task_spAB,
+    const int32_t* task_spCD,
+    int ntasks,
+    const int32_t* sp_A,
+    const int32_t* sp_B,
+    const int32_t* sp_pair_start,
+    const int32_t* sp_npair,
+    const double* shell_cx,
+    const double* shell_cy,
+    const double* shell_cz,
+    const double* pair_eta,
+    const double* pair_Px,
+    const double* pair_Py,
+    const double* pair_Pz,
+    const double* pair_cK,
+    const int32_t* shell_ao_start,
+    int nao,
+    const double* D_mat,
+    double* F_mat,
+    cudaStream_t stream,
+    int threads) {
+  if (ntasks < 0 || nao <= 0) return cudaErrorInvalidValue;
+  if (ntasks == 0) return cudaSuccess;
+  constexpr int kDefaultThreads = 64;
+  int launch_threads = (threads > 0) ? threads : kDefaultThreads;
+  if (launch_threads > 1024) launch_threads = 1024;
+  if (launch_threads < 32) launch_threads = 32;
+  launch_threads = (launch_threads / 32) * 32;
+  if (launch_threads < 32) launch_threads = 32;
+  const int warps_per_block = launch_threads >> 5;
+  if (warps_per_block <= 0) return cudaErrorInvalidValue;
+  const int blocks = (ntasks + warps_per_block - 1) / warps_per_block;
+  constexpr int kGSize_psdp = 5 * 5;
+  constexpr int kWarpDoubles_psdp = 3 * kGSize_psdp + 2 * 3 + 11 + 54;
+  const size_t shmem_psdp = static_cast<size_t>(warps_per_block) * kWarpDoubles_psdp * sizeof(double);
+  KernelFusedFock_psdp_fixed<3><<<blocks, launch_threads, shmem_psdp, stream>>>(
+      task_spAB, task_spCD, ntasks, sp_A, sp_B, sp_pair_start, sp_npair,
+      shell_cx, shell_cy, shell_cz,
+      pair_eta, pair_Px, pair_Py, pair_Pz, pair_cK,
+      shell_ao_start, nao, D_mat, F_mat);
+  return cudaGetLastError();
+}
+
 extern "C" cudaError_t cueri_eri_psdd_launch_stream(
     const int32_t* task_spAB,
     const int32_t* task_spCD,
@@ -10866,6 +11627,50 @@ extern "C" cudaError_t cueri_eri_psdd_multiblock_launch_stream(
   return cueri_eri_psdd_launch_stream(
       task_spAB, task_spCD, ntasks, sp_A, sp_B, sp_pair_start, sp_npair, shell_cx, shell_cy, shell_cz,
       pair_eta, pair_Px, pair_Py, pair_Pz, pair_cK, eri_out, stream, threads);
+}
+
+extern "C" cudaError_t cueri_fused_fock_psdd_launch_stream(
+    const int32_t* task_spAB,
+    const int32_t* task_spCD,
+    int ntasks,
+    const int32_t* sp_A,
+    const int32_t* sp_B,
+    const int32_t* sp_pair_start,
+    const int32_t* sp_npair,
+    const double* shell_cx,
+    const double* shell_cy,
+    const double* shell_cz,
+    const double* pair_eta,
+    const double* pair_Px,
+    const double* pair_Py,
+    const double* pair_Pz,
+    const double* pair_cK,
+    const int32_t* shell_ao_start,
+    int nao,
+    const double* D_mat,
+    double* F_mat,
+    cudaStream_t stream,
+    int threads) {
+  if (ntasks < 0 || nao <= 0) return cudaErrorInvalidValue;
+  if (ntasks == 0) return cudaSuccess;
+  constexpr int kDefaultThreads = 64;
+  int launch_threads = (threads > 0) ? threads : kDefaultThreads;
+  if (launch_threads > 1024) launch_threads = 1024;
+  if (launch_threads < 32) launch_threads = 32;
+  launch_threads = (launch_threads / 32) * 32;
+  if (launch_threads < 32) launch_threads = 32;
+  const int warps_per_block = launch_threads >> 5;
+  if (warps_per_block <= 0) return cudaErrorInvalidValue;
+  const int blocks = (ntasks + warps_per_block - 1) / warps_per_block;
+  constexpr int kGSize_psdd = 5 * 5;
+  constexpr int kWarpDoubles_psdd = 3 * kGSize_psdd + 2 * 3 + 11 + 108;
+  const size_t shmem_psdd = static_cast<size_t>(warps_per_block) * kWarpDoubles_psdd * sizeof(double);
+  KernelFusedFock_psdd_fixed<3><<<blocks, launch_threads, shmem_psdd, stream>>>(
+      task_spAB, task_spCD, ntasks, sp_A, sp_B, sp_pair_start, sp_npair,
+      shell_cx, shell_cy, shell_cz,
+      pair_eta, pair_Px, pair_Py, pair_Pz, pair_cK,
+      shell_ao_start, nao, D_mat, F_mat);
+  return cudaGetLastError();
 }
 
 extern "C" cudaError_t cueri_eri_ppdp_launch_stream(
@@ -11121,6 +11926,50 @@ extern "C" cudaError_t cueri_eri_ddss_multiblock_launch_stream(
   return cueri_eri_ddss_launch_stream(
       task_spAB, task_spCD, ntasks, sp_A, sp_B, sp_pair_start, sp_npair, shell_cx, shell_cy, shell_cz,
       pair_eta, pair_Px, pair_Py, pair_Pz, pair_cK, eri_out, stream, threads);
+}
+
+extern "C" cudaError_t cueri_fused_fock_ddss_launch_stream(
+    const int32_t* task_spAB,
+    const int32_t* task_spCD,
+    int ntasks,
+    const int32_t* sp_A,
+    const int32_t* sp_B,
+    const int32_t* sp_pair_start,
+    const int32_t* sp_npair,
+    const double* shell_cx,
+    const double* shell_cy,
+    const double* shell_cz,
+    const double* pair_eta,
+    const double* pair_Px,
+    const double* pair_Py,
+    const double* pair_Pz,
+    const double* pair_cK,
+    const int32_t* shell_ao_start,
+    int nao,
+    const double* D_mat,
+    double* F_mat,
+    cudaStream_t stream,
+    int threads) {
+  if (ntasks < 0 || nao <= 0) return cudaErrorInvalidValue;
+  if (ntasks == 0) return cudaSuccess;
+  constexpr int kDefaultThreads = 64;
+  int launch_threads = (threads > 0) ? threads : kDefaultThreads;
+  if (launch_threads > 1024) launch_threads = 1024;
+  if (launch_threads < 32) launch_threads = 32;
+  launch_threads = (launch_threads / 32) * 32;
+  if (launch_threads < 32) launch_threads = 32;
+  const int warps_per_block = launch_threads >> 5;
+  if (warps_per_block <= 0) return cudaErrorInvalidValue;
+  const int blocks = (ntasks + warps_per_block - 1) / warps_per_block;
+  constexpr int kGSize_ddss = 5 * 5;
+  constexpr int kWarpDoubles_ddss = 3 * kGSize_ddss + 2 * 3 + 11 + 36;
+  const size_t shmem_ddss = static_cast<size_t>(warps_per_block) * kWarpDoubles_ddss * sizeof(double);
+  KernelFusedFock_ddss_fixed<3><<<blocks, launch_threads, shmem_ddss, stream>>>(
+      task_spAB, task_spCD, ntasks, sp_A, sp_B, sp_pair_start, sp_npair,
+      shell_cx, shell_cy, shell_cz,
+      pair_eta, pair_Px, pair_Py, pair_Pz, pair_cK,
+      shell_ao_start, nao, D_mat, F_mat);
+  return cudaGetLastError();
 }
 
 extern "C" cudaError_t cueri_eri_dpdp_launch_stream(

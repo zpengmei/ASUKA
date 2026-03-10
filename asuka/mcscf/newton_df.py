@@ -758,6 +758,104 @@ def build_provider_newton_eris(
     return DFNewtonERIs(ppaa=ppaa, papa=papa, vhf_c=vhf_c, j_pc=j_pc, k_pc=k_pc)
 
 
+class THCERIProvider:
+    """ERI provider for Newton-CASSCF using THC factors.
+
+    Implements the ``eri_provider`` interface expected by
+    :func:`build_provider_newton_eris` and :class:`DFNewtonCASSCFAdapter`.
+
+    Methods
+    -------
+    build_pq_uv(mo, C_act) -> (nmo*nmo, ncas*ncas)
+    build_pu_qv(mo, C_act) -> (nmo*ncas, nmo*ncas)
+    jk(D, want_J, want_K) -> (J, K)
+    jk_multi2(D1, D2, want_J, want_K) -> (J1, K1, J2, K2)
+    probe_array() -> any device array
+    """
+
+    def __init__(self, thc_factors: Any, *, q_block: int = 256):
+        self._thc = thc_factors
+        self._q_block = int(q_block)
+
+    def probe_array(self) -> Any:
+        return self._thc.X
+
+    def _get_xp(self):
+        xp, _ = _df_scf._get_xp(self._thc.X, self._thc.X)
+        return xp
+
+    def jk(self, D: Any, want_J: bool = True, want_K: bool = True) -> tuple[Any, Any]:
+        from asuka.hf.thc_jk import thc_JK  # noqa: PLC0415
+
+        xp = self._get_xp()
+        D_dev = xp.asarray(D, dtype=xp.float64)
+        J, K = thc_JK(D_dev, self._thc.X, self._thc.Z, Y=self._thc.Y)
+        if not want_J:
+            J = None
+        if not want_K:
+            K = None
+        return J, K
+
+    def jk_multi2(
+        self, D1: Any, D2: Any, want_J: bool = True, want_K: bool = True,
+    ) -> tuple[Any, Any, Any, Any]:
+        J1, K1 = self.jk(D1, want_J=want_J, want_K=want_K)
+        J2, K2 = self.jk(D2, want_J=want_J, want_K=want_K)
+        return J1, K1, J2, K2
+
+    def _mo_collocation(self, C: Any) -> Any:
+        """X_MO[P,p] = sum_mu X[P,mu] * C[mu,p]."""
+        xp = self._get_xp()
+        X = xp.asarray(self._thc.X, dtype=xp.float64)
+        C_dev = xp.asarray(C, dtype=xp.float64)
+        return X @ C_dev  # (npt, ncol)
+
+    def _z_action(self, M: Any) -> Any:
+        """Compute Z @ M where Z = Y @ Y.T (lazy)."""
+        xp = self._get_xp()
+        thc = self._thc
+        if thc.Z is not None:
+            Z = xp.asarray(thc.Z, dtype=xp.float64)
+            return Z @ xp.asarray(M, dtype=xp.float64)
+        Y = xp.asarray(thc.Y, dtype=xp.float64)
+        M_dev = xp.asarray(M, dtype=xp.float64)
+        return Y @ (Y.T @ M_dev)
+
+    def build_pq_uv(self, mo: Any, C_act: Any) -> Any:
+        """(pq|uv) via THC: sum_PQ X_MO_Pp X_MO_Pq Z_PQ X_MO_Qu X_MO_Qv."""
+        xp = self._get_xp()
+        X_all = self._mo_collocation(mo)          # (npt, nmo)
+        X_act = self._mo_collocation(C_act)        # (npt, ncas)
+        nmo = int(X_all.shape[1])
+        ncas = int(X_act.shape[1])
+
+        # B_all[P, pq] = X_all[P,p] * X_all[P,q], shape (npt, nmo*nmo)
+        # B_act[Q, uv] = X_act[Q,u] * X_act[Q,v], shape (npt, ncas*ncas)
+        B_all = (X_all[:, :, None] * X_all[:, None, :]).reshape(-1, nmo * nmo)
+        B_act = (X_act[:, :, None] * X_act[:, None, :]).reshape(-1, ncas * ncas)
+
+        # ppaa = B_all.T @ Z @ B_act, shape (nmo*nmo, ncas*ncas)
+        ZB_act = self._z_action(B_act)  # (npt, ncas*ncas)
+        ppaa = B_all.T @ ZB_act
+        return ppaa
+
+    def build_pu_qv(self, mo: Any, C_act: Any) -> Any:
+        """(pu|qv) via THC: sum_PQ X_MO_Pp X_MO_Pu Z_PQ X_MO_Qq X_MO_Qv."""
+        xp = self._get_xp()
+        X_all = self._mo_collocation(mo)      # (npt, nmo)
+        X_act = self._mo_collocation(C_act)    # (npt, ncas)
+        nmo = int(X_all.shape[1])
+        ncas = int(X_act.shape[1])
+
+        # B_pu[P, p*u] = X_all[P,p] * X_act[P,u], shape (npt, nmo*ncas)
+        B_pu = (X_all[:, :, None] * X_act[:, None, :]).reshape(-1, nmo * ncas)
+
+        # papa = B_pu.T @ Z @ B_pu, shape (nmo*ncas, nmo*ncas)
+        ZB = self._z_action(B_pu)  # (npt, nmo*ncas)
+        papa = B_pu.T @ ZB
+        return papa
+
+
 @dataclass
 class DFNewtonCASSCFAdapter:
     """Minimal CASSCF-like adapter for `newton_casscf.gen_g_hop_internal`.

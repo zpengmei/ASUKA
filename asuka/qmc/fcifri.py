@@ -92,7 +92,7 @@ def run_fcifri_ground(
     key64_pair_norm: np.ndarray | None = None,
     key64_pair_sampling_mode: int = 0,
 ) -> FCIFRIRun:
-    """Single-root FCI-FRI projector iteration (scalable Key64 CUDA path only)."""
+    """Single-root FCI-FRI projector iteration (scalable CUDA uint64-label path)."""
 
     m = int(m)
     niter = int(niter)
@@ -112,16 +112,41 @@ def run_fcifri_ground(
 
     backend = str(backend).lower().strip()
     state_rep_s = normalize_state_rep(state_rep)
-    if backend not in ("auto", "cuda_key64"):
-        raise ValueError("backend must be 'auto' or 'cuda_key64'")
+    if backend not in ("auto", "cuda_key64", "cuda_idx64"):
+        raise ValueError("backend must be 'auto', 'cuda_key64', or 'cuda_idx64'")
     if state_rep_s == "i32":
-        raise ValueError("state_rep='i32' has been removed from the scalable FCI-FRI path; use state_rep='auto' or 'key64'")
-    if int(drt.norb) > 32:
-        raise ValueError("scalable Key64 FCI-FRI requires drt.norb <= 32")
+        raise ValueError(
+            "state_rep='i32' has been removed from the scalable FCI-FRI path; use state_rep='auto', 'i64'/'idx64', or 'key64'"
+        )
+    if int(drt.norb) > 64:
+        raise ValueError("scalable CUDA FCI-FRI requires drt.norb <= 64")
     if omp_threads is not None:
-        raise ValueError("omp_threads is unsupported for scalable Key64 FCI-FRI (CUDA path only)")
+        raise ValueError("omp_threads is unsupported for scalable CUDA FCI-FRI (CUDA path only)")
     if compressor is not None or spawner is not None or spawner_kwargs is not None:
-        raise ValueError("custom compressor/spawner hooks are removed from scalable FCI-FRI; use default CUDA Key64 kernels")
+        raise ValueError("custom compressor/spawner hooks are removed from scalable FCI-FRI; use default CUDA kernels")
+
+    if backend == "auto":
+        if state_rep_s == "key64":
+            backend_effective = "cuda_key64"
+        elif state_rep_s == "i64":
+            backend_effective = "cuda_idx64"
+        else:
+            backend_effective = "cuda_key64" if int(drt.norb) <= 32 else "cuda_idx64"
+    else:
+        backend_effective = backend
+
+    if backend_effective == "cuda_key64":
+        if int(drt.norb) > 32:
+            raise ValueError("backend='cuda_key64' requires drt.norb <= 32")
+        if state_rep_s == "i64":
+            raise ValueError("backend='cuda_key64' is incompatible with state_rep='i64'/'idx64'")
+        label_mode = "key64"
+    else:
+        if state_rep_s == "key64":
+            raise ValueError("backend='cuda_idx64' is incompatible with state_rep='key64'")
+        if int(drt.ncsf) > np.iinfo(np.int64).max:
+            raise ValueError("backend='cuda_idx64' requires drt.ncsf <= int64 max")
+        label_mode = "idx64"
 
     x_idx_u, x_val_u = coalesce_sparse_state(drt, idx=x_idx, key=x_key, val=x_val, name="initial state")
     if x_idx_u is None or x_val_u is None:
@@ -164,22 +189,35 @@ def run_fcifri_ground(
         csf_idx_to_key64_host,
         cuda_projector_step_hamiltonian_u64_ws,
         key64_to_csf_idx_host,
+        make_cuda_projector_context_idx64,
         make_cuda_projector_context_key64,
     )
 
-    key0 = csf_idx_to_key64_host(drt, x_idx_u, state_cache=state_cache)
+    if backend_effective == "cuda_key64":
+        key0 = csf_idx_to_key64_host(drt, x_idx_u, state_cache=state_cache)
+    else:
+        idx_i64 = np.asarray(x_idx_u, dtype=np.int64).ravel()
+        if idx_i64.size:
+            if int(np.min(idx_i64)) < 0:
+                raise ValueError("initial state indices must be non-negative for idx64 backend")
+            if int(np.max(idx_i64)) >= int(drt.ncsf):
+                raise ValueError("initial state indices must be < drt.ncsf for idx64 backend")
+        key0 = np.asarray(idx_i64, dtype=np.uint64, order="C")
     order0 = np.argsort(key0)
     key0 = np.asarray(key0[order0], dtype=np.uint64, order="C")
     val0 = np.asarray(x_val_u[order0], dtype=np.float64, order="C")
 
     if niter == 0:
-        x_idx_out = key64_to_csf_idx_host(drt, key0, strict=True)
+        if label_mode == "key64":
+            x_idx_out = key64_to_csf_idx_host(drt, key0, strict=True)
+        else:
+            x_idx_out = np.asarray(key0, dtype=np.int64, order="C")
         order_idx = np.argsort(x_idx_out)
         return FCIFRIRun(
             idx=np.asarray(x_idx_out[order_idx], dtype=idx_dtype_out, order="C"),
             val=np.asarray(val0[order_idx], dtype=np.float64, order="C"),
             key_u64=np.asarray(key0[order_idx], dtype=np.uint64, order="C"),
-            label_kind="key64",
+            label_kind="key64" if label_mode == "key64" else "idx64",
             energies=np.asarray(energies, dtype=np.float64, order="C"),
             ref_idx=np.asarray(ref_hist, dtype=np.int64, order="C"),
             energy_estimator=energy_estimator,
@@ -188,7 +226,7 @@ def run_fcifri_ground(
     try:  # optional
         import cupy as cp  # type: ignore
     except Exception as e:  # pragma: no cover
-        raise RuntimeError(f"backend='cuda_key64' requires cupy: {e}") from e
+        raise RuntimeError(f"scalable CUDA FCI-FRI backend requires cupy: {e}") from e
 
     pair_sampling_mode = int(key64_pair_sampling_mode)
     pair_norm = None
@@ -206,20 +244,37 @@ def run_fcifri_ground(
         pair_alias_idx = alias.alias
         pair_norm_sum = float(alias.weight_sum)
 
-    ctx = make_cuda_projector_context_key64(
-        drt,
-        h1e,
-        eri,
-        m=int(m),
-        pivot=int(pivot),
-        nspawn_one=int(nspawn_one),
-        nspawn_two=int(nspawn_two),
-        pair_alias_prob=pair_alias_prob,
-        pair_alias_idx=pair_alias_idx,
-        pair_norm=pair_norm,
-        pair_norm_sum=float(pair_norm_sum),
-        pair_sampling_mode=int(pair_sampling_mode),
-    )
+    if backend_effective == "cuda_key64":
+        ctx = make_cuda_projector_context_key64(
+            drt,
+            h1e,
+            eri,
+            m=int(m),
+            pivot=int(pivot),
+            nspawn_one=int(nspawn_one),
+            nspawn_two=int(nspawn_two),
+            pair_alias_prob=pair_alias_prob,
+            pair_alias_idx=pair_alias_idx,
+            pair_norm=pair_norm,
+            pair_norm_sum=float(pair_norm_sum),
+            pair_sampling_mode=int(pair_sampling_mode),
+        )
+    else:
+        ctx = make_cuda_projector_context_idx64(
+            drt,
+            h1e,
+            eri,
+            m=int(m),
+            pivot=int(pivot),
+            nspawn_one=int(nspawn_one),
+            nspawn_two=int(nspawn_two),
+            pair_alias_prob=pair_alias_prob,
+            pair_alias_idx=pair_alias_idx,
+            pair_norm=pair_norm,
+            pair_norm_sum=float(pair_norm_sum),
+            pair_sampling_mode=int(pair_sampling_mode),
+            ncsf_u64=int(drt.ncsf),
+        )
     rng = np.random.default_rng(int(seed))
     try:
         nnz0 = int(key0.size)
@@ -254,7 +309,10 @@ def run_fcifri_ground(
                 nnz_now = int(ctx.nnz)
                 x_key_h = cp.asnumpy(ctx.x_key[:nnz_now]).astype(np.uint64, copy=False)
                 x_val_h = cp.asnumpy(ctx.x_val[:nnz_now]).astype(np.float64, copy=False)
-                x_idx_h = key64_to_csf_idx_host(drt, x_key_h, strict=True)
+                if label_mode == "key64":
+                    x_idx_h = key64_to_csf_idx_host(drt, x_key_h, strict=True)
+                else:
+                    x_idx_h = np.asarray(x_key_h, dtype=np.int64, order="C")
                 order = np.argsort(x_idx_h)
                 x_idx_h = np.asarray(x_idx_h[order], dtype=idx_dtype_out, order="C")
                 x_val_h = np.asarray(x_val_h[order], dtype=np.float64, order="C")
@@ -274,13 +332,16 @@ def run_fcifri_ground(
     finally:
         ctx.release()
 
-    x_idx_u = key64_to_csf_idx_host(drt, x_key_u, strict=True)
+    if label_mode == "key64":
+        x_idx_u = key64_to_csf_idx_host(drt, x_key_u, strict=True)
+    else:
+        x_idx_u = np.asarray(x_key_u, dtype=np.int64, order="C")
     order = np.argsort(x_idx_u)
     return FCIFRIRun(
         idx=np.asarray(x_idx_u[order], dtype=idx_dtype_out, order="C"),
         val=np.asarray(x_val_u[order], dtype=np.float64, order="C"),
         key_u64=np.asarray(x_key_u[order], dtype=np.uint64, order="C"),
-        label_kind="key64",
+        label_kind="key64" if label_mode == "key64" else "idx64",
         energies=np.asarray(energies, dtype=np.float64, order="C"),
         ref_idx=np.asarray(ref_hist, dtype=np.int64, order="C"),
         energy_estimator=energy_estimator,
@@ -331,8 +392,8 @@ def run_fcifri_block(
         )
 
     backend_s = str(backend).lower().strip()
-    if backend_s not in ("auto", "cuda_key64"):
-        raise ValueError("backend must be 'auto' or 'cuda_key64'")
+    if backend_s not in ("auto", "cuda_key64", "cuda_idx64"):
+        raise ValueError("backend must be 'auto', 'cuda_key64', or 'cuda_idx64'")
     if omp_threads is not None:
         raise ValueError("omp_threads is unsupported for scalable run_fcifri_block (CUDA path only)")
     if compressor is not None or spawner is not None or spawner_kwargs is not None:
@@ -388,7 +449,7 @@ def run_fcifri_block(
         val=[np.asarray(ground.val, dtype=np.float64, order="C")],
         energies=energies,
         iters=iters,
-        backend="cuda_key64",
+        backend="cuda_key64" if str(ground.label_kind) == "key64" else "cuda_idx64",
     )
 
 

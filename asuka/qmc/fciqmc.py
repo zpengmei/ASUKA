@@ -315,6 +315,7 @@ def _build_run(
     idx: np.ndarray,
     val: np.ndarray,
     key_u64: np.ndarray | None,
+    label_kind: str,
     shifts: np.ndarray,
     populations: np.ndarray,
     trace: _FCIQMCTrace,
@@ -335,7 +336,7 @@ def _build_run(
         idx=np.asarray(idx_arr, dtype=idx_arr.dtype, order="C"),
         val=np.asarray(val, dtype=np.float64, order="C"),
         key_u64=None if key_u64 is None else np.asarray(key_u64, dtype=np.uint64, order="C"),
-        label_kind="key64" if key_u64 is not None else "csf_idx",
+        label_kind=str(label_kind),
         energies=energies,
         shifts=np.asarray(shifts, dtype=np.float64, order="C"),
         populations=np.asarray(populations, dtype=np.float64, order="C"),
@@ -425,7 +426,7 @@ def run_fciqmc(
     key64_pair_norm: np.ndarray | None = None,
     key64_pair_sampling_mode: int = 0,
 ) -> FCIQMCRun:
-    """Single-root CSF-native FCIQMC loop (scalable Key64 CUDA path only)."""
+    """Single-root CSF-native FCIQMC loop (scalable CUDA uint64-label path)."""
 
     dt = float(dt)
     niter = int(niter)
@@ -457,14 +458,37 @@ def run_fciqmc(
 
     backend_s = str(backend).lower().strip()
     state_rep_s = normalize_state_rep(state_rep)
-    if backend_s not in ("auto", "cuda_key64"):
-        raise ValueError("backend must be 'auto' or 'cuda_key64'")
+    if backend_s not in ("auto", "cuda_key64", "cuda_idx64"):
+        raise ValueError("backend must be 'auto', 'cuda_key64', or 'cuda_idx64'")
     if state_rep_s == "i32":
-        raise ValueError("state_rep='i32' has been removed from the scalable FCIQMC path; use state_rep='auto' or 'key64'")
-    if int(drt.norb) > 32:
-        raise ValueError("scalable Key64 FCIQMC requires drt.norb <= 32")
+        raise ValueError(
+            "state_rep='i32' has been removed from the scalable FCIQMC path; use state_rep='auto', 'i64'/'idx64', or 'key64'"
+        )
+    if int(drt.norb) > 64:
+        raise ValueError("scalable CUDA FCIQMC requires drt.norb <= 64")
     if omp_threads is not None:
-        raise ValueError("omp_threads is unsupported for scalable Key64 FCIQMC (CUDA path only)")
+        raise ValueError("omp_threads is unsupported for scalable CUDA FCIQMC (CUDA path only)")
+
+    if backend_s == "auto":
+        if state_rep_s == "key64":
+            backend_effective = "cuda_key64"
+        elif state_rep_s == "i64":
+            backend_effective = "cuda_idx64"
+        else:
+            backend_effective = "cuda_key64" if int(drt.norb) <= 32 else "cuda_idx64"
+    else:
+        backend_effective = backend_s
+
+    if backend_effective == "cuda_key64":
+        if int(drt.norb) > 32:
+            raise ValueError("backend='cuda_key64' requires drt.norb <= 32")
+        if state_rep_s == "i64":
+            raise ValueError("backend='cuda_key64' is incompatible with state_rep='i64'/'idx64'")
+    else:
+        if state_rep_s == "key64":
+            raise ValueError("backend='cuda_idx64' is incompatible with state_rep='key64'")
+        if int(drt.ncsf) > np.iinfo(np.int64).max:
+            raise ValueError("backend='cuda_idx64' requires drt.ncsf <= int64 max")
 
     x_idx_u, x_val_u = coalesce_sparse_state(drt, idx=x_idx, key=x_key, val=x_val, name="initial state")
     if x_idx_u is None or x_val_u is None:
@@ -541,13 +565,23 @@ def run_fciqmc(
     shifts[0] = shift
 
     if niter == 0:
-        from .cuda_backend import csf_idx_to_key64_host  # noqa: PLC0415
+        if backend_effective == "cuda_key64":
+            from .cuda_backend import csf_idx_to_key64_host  # noqa: PLC0415
 
-        key_u64 = csf_idx_to_key64_host(drt, x_idx_u, state_cache=state_cache)
+            key_u64 = csf_idx_to_key64_host(drt, x_idx_u, state_cache=state_cache)
+        else:
+            idx_i64 = np.asarray(x_idx_u, dtype=np.int64).ravel()
+            if idx_i64.size:
+                if int(np.min(idx_i64)) < 0:
+                    raise ValueError("initial state indices must be non-negative for idx64 backend")
+                if int(np.max(idx_i64)) >= int(drt.ncsf):
+                    raise ValueError("initial state indices must be < drt.ncsf for idx64 backend")
+            key_u64 = np.asarray(idx_i64, dtype=np.uint64, order="C")
         return _build_run(
             idx=x_idx_u,
             val=x_val_u,
             key_u64=np.asarray(key_u64, dtype=np.uint64, order="C"),
+            label_kind="key64" if backend_effective == "cuda_key64" else "idx64",
             shifts=shifts,
             populations=pops,
             trace=trace,
@@ -556,7 +590,7 @@ def run_fciqmc(
             fixed_ref_idx=fixed_ref_idx,
         )
 
-    return _run_fciqmc_cuda_key64(
+    common_kwargs = dict(
         drt=drt,
         h1e=h1e,
         eri=eri,
@@ -593,6 +627,9 @@ def run_fciqmc(
         key64_pair_norm=key64_pair_norm,
         key64_pair_sampling_mode=int(key64_pair_sampling_mode),
     )
+    if backend_effective == "cuda_key64":
+        return _run_fciqmc_cuda_key64(**common_kwargs)
+    return _run_fciqmc_cuda_idx64(**common_kwargs)
 
 
 def _run_fciqmc_cuda_key64(
@@ -766,6 +803,195 @@ def _run_fciqmc_cuda_key64(
         idx=x_idx_out,
         val=x_val_out,
         key_u64=np.asarray(x_key_out[order], dtype=np.uint64, order="C"),
+        label_kind="key64",
+        shifts=shifts,
+        populations=pops,
+        trace=trace,
+        energy_estimator=energy_estimator,
+        reference_policy=reference_policy,
+        fixed_ref_idx=fixed_ref_idx,
+    )
+
+
+def _run_fciqmc_cuda_idx64(
+    *,
+    drt,
+    h1e,
+    eri,
+    x_idx_u: np.ndarray,
+    x_val_u: np.ndarray,
+    dt: float,
+    niter: int,
+    nspawn_one: int,
+    nspawn_two: int,
+    seed: int,
+    max_walker: int | None,
+    shift: float,
+    tgt_pop: float,
+    shift_damping: float,
+    shift_stride: int,
+    shift_start: int,
+    shift_warmup_iters: int,
+    shift_log_clip: float | None,
+    energy_stride: int,
+    preferred_ref_idx: int | None,
+    fixed_ref_idx: int,
+    initiator_t: float,
+    pops: np.ndarray,
+    shifts: np.ndarray,
+    trace: _FCIQMCTrace,
+    trial_idx_u: np.ndarray,
+    trial_val_u: np.ndarray,
+    trial_l2: float,
+    det_idx_u: np.ndarray,
+    rayleigh_stride: int,
+    state_cache,
+    energy_estimator: str,
+    reference_policy: str,
+    key64_pair_norm: np.ndarray | None,
+    key64_pair_sampling_mode: int,
+) -> FCIQMCRun:
+    from .cuda_backend import (  # noqa: PLC0415
+        cuda_fciqmc_step_hamiltonian_u64_ws,
+        make_cuda_fciqmc_context_idx64,
+    )
+
+    norb = int(drt.norb)
+    if norb > 64:
+        raise ValueError("backend='cuda_idx64' requires drt.norb <= 64")
+    if int(drt.ncsf) > np.iinfo(np.int64).max:
+        raise ValueError("backend='cuda_idx64' requires drt.ncsf <= int64 max")
+
+    if max_walker is None:
+        max_walker = max(1024, 4 * int(x_idx_u.size))
+    max_walker = int(max_walker)
+
+    pair_sampling_mode = int(key64_pair_sampling_mode)
+    pair_norm = None
+    pair_alias_prob = None
+    pair_alias_idx = None
+    pair_norm_sum = 0.0
+    if pair_sampling_mode != 0:
+        from .alias import build_alias_table_from_weights  # noqa: PLC0415
+
+        if key64_pair_norm is None:
+            raise ValueError("key64_pair_norm must be provided when key64_pair_sampling_mode!=0")
+        alias = build_alias_table_from_weights(np.asarray(key64_pair_norm, dtype=np.float64).ravel())
+        pair_norm = np.asarray(key64_pair_norm, dtype=np.float64).ravel()
+        pair_alias_prob = alias.prob
+        pair_alias_idx = alias.alias
+        pair_norm_sum = float(alias.weight_sum)
+
+    ctx = make_cuda_fciqmc_context_idx64(
+        drt,
+        h1e,
+        eri,
+        max_walker=max_walker,
+        nspawn_one=int(nspawn_one),
+        nspawn_two=int(nspawn_two),
+        det_idx=det_idx_u if int(det_idx_u.size) > 0 else None,
+        pair_alias_prob=pair_alias_prob,
+        pair_alias_idx=pair_alias_idx,
+        pair_norm=pair_norm,
+        pair_norm_sum=float(pair_norm_sum),
+        pair_sampling_mode=int(pair_sampling_mode),
+        ncsf_u64=int(drt.ncsf),
+    )
+
+    nnz0 = int(x_idx_u.size)
+    import cupy as cp  # noqa: PLC0415
+
+    idx_dtype_out = np.asarray(x_idx_u).dtype
+    idx0_i64 = np.asarray(x_idx_u, dtype=np.int64).ravel()
+    if idx0_i64.size:
+        if int(np.min(idx0_i64)) < 0:
+            raise ValueError("initial state indices must be non-negative for idx64 backend")
+        if int(np.max(idx0_i64)) >= int(drt.ncsf):
+            raise ValueError("initial state indices must be < drt.ncsf for idx64 backend")
+    key0 = np.asarray(idx0_i64, dtype=np.uint64, order="C")
+    order0 = np.argsort(key0)
+    key0 = np.asarray(key0[order0], dtype=np.uint64, order="C")
+    val0 = np.asarray(x_val_u[order0], dtype=np.float64, order="C")
+    ctx.x_key[:nnz0] = cp.asarray(key0, dtype=cp.uint64)
+    ctx.x_val[:nnz0] = cp.asarray(val0, dtype=cp.float64)
+    ctx.nnz = nnz0
+
+    sample_pos = 1
+    try:
+        pops_dev = cp.empty(int(niter) + 1, dtype=cp.float64)
+        pops_dev[0] = float(pops[0])
+        for it in range(1, niter + 1):
+            cuda_fciqmc_step_hamiltonian_u64_ws(
+                ctx,
+                dt=dt,
+                shift=shift,
+                initiator_t=float(initiator_t),
+                seed_spawn=int(seed) + it,
+                sync=True,
+            )
+
+            nnz_now = int(ctx.nnz)
+            pop_dev = cp.sum(cp.abs(ctx.x_val[:nnz_now]))
+            pops_dev[it] = pop_dev
+            shifts[it] = shift
+
+            if float(shift_damping) > 0.0 and it >= max(int(shift_start), int(shift_warmup_iters)) and (it % int(shift_stride) == 0):
+                pop = float(pop_dev.get())
+                shift = _maybe_update_shift(
+                    shift=shift,
+                    pop=pop,
+                    it=it,
+                    dt=dt,
+                    tgt_pop=tgt_pop,
+                    shift_damping=shift_damping,
+                    shift_stride=shift_stride,
+                    shift_start=shift_start,
+                    shift_warmup_iters=shift_warmup_iters,
+                    shift_log_clip=shift_log_clip,
+                )
+
+            if it % int(energy_stride) == 0:
+                x_key_h = cp.asnumpy(ctx.x_key[:nnz_now]).astype(np.uint64, copy=False)
+                x_val_h = cp.asnumpy(ctx.x_val[:nnz_now]).astype(np.float64, copy=False)
+                x_idx_h = np.asarray(x_key_h, dtype=np.int64, order="C")
+                order = np.argsort(x_idx_h)
+                x_idx_h = np.asarray(x_idx_h[order], dtype=idx_dtype_out, order="C")
+                x_val_h = np.asarray(x_val_h[order], dtype=np.float64, order="C")
+                metrics = _evaluate_checkpoint(
+                    drt=drt,
+                    h1e=h1e,
+                    eri=eri,
+                    x_idx_u=x_idx_h,
+                    x_val_u=x_val_h,
+                    fixed_ref_idx=int(fixed_ref_idx),
+                    preferred_ref_idx=preferred_ref_idx,
+                    trial_idx_u=trial_idx_u,
+                    trial_val_u=trial_val_u,
+                    trial_l2=float(trial_l2),
+                    det_idx_u=det_idx_u,
+                    compute_rayleigh=_need_rayleigh(it, rayleigh_stride=rayleigh_stride),
+                    state_cache=state_cache,
+                )
+                _write_checkpoint(trace, sample_pos, it, metrics)
+                sample_pos += 1
+
+        pops[1:] = cp.asnumpy(pops_dev[1:]).astype(np.float64, copy=False)
+
+        nnz_final = int(ctx.nnz)
+        x_key_out = cp.asnumpy(ctx.x_key[:nnz_final]).astype(np.uint64, copy=False)
+        x_val_out = cp.asnumpy(ctx.x_val[:nnz_final]).astype(np.float64, copy=False)
+        x_idx_out = np.asarray(x_key_out, dtype=np.int64, order="C")
+        order = np.argsort(x_idx_out)
+        x_idx_out = np.asarray(x_idx_out[order], dtype=idx_dtype_out, order="C")
+        x_val_out = np.asarray(x_val_out[order], dtype=np.float64, order="C")
+    finally:
+        ctx.release()
+
+    return _build_run(
+        idx=x_idx_out,
+        val=x_val_out,
+        key_u64=np.asarray(x_key_out[order], dtype=np.uint64, order="C"),
+        label_kind="idx64",
         shifts=shifts,
         populations=pops,
         trace=trace,

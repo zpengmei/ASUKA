@@ -727,6 +727,113 @@ void cueri_bind_part9(py::module_& m) {
       py::arg("stream") = 0,
       py::arg("sync") = true);
 
+  // RHF Fock contraction: contract ERI tiles with density D → F += J - 0.5*K.
+  m.def(
+      "contract_fock_tiles_ordered_inplace_device",
+      [](py::object task_spAB,
+         py::object task_spCD,
+         py::object sp_A,
+         py::object sp_B,
+         py::object shell_ao_start,
+         int nao,
+         int nA,
+         int nB,
+         int nC,
+         int nD,
+         py::object tile_vals,
+         py::object D_mat,
+         py::object F_mat,
+         int threads,
+         uint64_t stream_ptr,
+         bool sync) {
+        require_threads_multiple_of_32(threads, "contract_fock_tiles_ordered_inplace_device");
+        if (nao <= 0 || nA <= 0 || nB <= 0 || nC <= 0 || nD <= 0) {
+          throw std::invalid_argument("nao/nA/nB/nC/nD must be > 0");
+        }
+
+        auto ab = cuda_array_view_from_object(task_spAB, "task_spAB");
+        auto cd = cuda_array_view_from_object(task_spCD, "task_spCD");
+        auto spa = cuda_array_view_from_object(sp_A, "sp_A");
+        auto spb = cuda_array_view_from_object(sp_B, "sp_B");
+        auto sh0 = cuda_array_view_from_object(shell_ao_start, "shell_ao_start");
+        auto tile = cuda_array_view_from_object(tile_vals, "tile_vals");
+        auto d_arr = cuda_array_view_from_object(D_mat, "D_mat");
+        auto f_arr = cuda_array_view_from_object(F_mat, "F_mat");
+
+        require_typestr(ab, "task_spAB", "<i4");
+        require_typestr(cd, "task_spCD", "<i4");
+        require_typestr(spa, "sp_A", "<i4");
+        require_typestr(spb, "sp_B", "<i4");
+        require_typestr(sh0, "shell_ao_start", "<i4");
+        require_typestr(tile, "tile_vals", "<f8");
+        require_typestr(d_arr, "D_mat", "<f8");
+        require_typestr(f_arr, "F_mat", "<f8");
+
+        const int64_t ntasks = require_1d(ab, "task_spAB");
+        if (require_1d(cd, "task_spCD") != ntasks) {
+          throw std::invalid_argument("task_spAB/task_spCD must have identical shape (ntasks,)");
+        }
+
+        const int64_t nsp = require_1d(spa, "sp_A");
+        if (require_1d(spb, "sp_B") != nsp) {
+          throw std::invalid_argument("sp_A/sp_B must have identical shape (nsp,)");
+        }
+        (void)require_1d(sh0, "shell_ao_start");
+
+        const int64_t nAB = static_cast<int64_t>(nA) * static_cast<int64_t>(nB);
+        const int64_t nCD = static_cast<int64_t>(nC) * static_cast<int64_t>(nD);
+        const int64_t need_tile = ntasks * nAB * nCD;
+        if (require_1d(tile, "tile_vals") != need_tile) {
+          throw std::invalid_argument("tile_vals must have shape (ntasks*nAB*nCD,)");
+        }
+
+        const int64_t nao2 = static_cast<int64_t>(nao) * static_cast<int64_t>(nao);
+        if (require_1d(d_arr, "D_mat") != nao2) {
+          throw std::invalid_argument("D_mat must have shape (nao*nao,)");
+        }
+        if (require_1d(f_arr, "F_mat") != nao2) {
+          throw std::invalid_argument("F_mat must have shape (nao*nao,)");
+        }
+
+        cudaStream_t stream = stream_from_uint(stream_ptr);
+        throw_on_cuda_error(
+            cueri_contract_fock_tiles_ordered_launch_stream(
+                static_cast<const int32_t*>(ab.ptr),
+                static_cast<const int32_t*>(cd.ptr),
+                static_cast<int>(ntasks),
+                static_cast<const int32_t*>(spa.ptr),
+                static_cast<const int32_t*>(spb.ptr),
+                static_cast<const int32_t*>(sh0.ptr),
+                static_cast<int>(nao),
+                static_cast<int>(nA),
+                static_cast<int>(nB),
+                static_cast<int>(nC),
+                static_cast<int>(nD),
+                static_cast<const double*>(tile.ptr),
+                static_cast<const double*>(d_arr.ptr),
+                static_cast<double*>(f_arr.ptr),
+                stream,
+                threads),
+            "cueri_contract_fock_tiles_ordered_launch_stream");
+        if (sync) throw_on_cuda_error(cudaStreamSynchronize(stream), "cudaStreamSynchronize");
+      },
+      py::arg("task_spAB"),
+      py::arg("task_spCD"),
+      py::arg("sp_A"),
+      py::arg("sp_B"),
+      py::arg("shell_ao_start"),
+      py::arg("nao"),
+      py::arg("nA"),
+      py::arg("nB"),
+      py::arg("nC"),
+      py::arg("nD"),
+      py::arg("tile_vals"),
+      py::arg("D_mat"),
+      py::arg("F_mat"),
+      py::arg("threads") = 256,
+      py::arg("stream") = 0,
+      py::arg("sync") = true);
+
   // Multi-density direct J/K contraction: contracts tiles with (Da, Db) → (Ja, Ka, Jb, Kb).
   m.def(
       "contract_jk_tiles_ordered_multi2_inplace_device",
@@ -979,6 +1086,285 @@ void cueri_bind_part9(py::module_& m) {
       py::arg("threads") = 32,
       py::arg("stream") = 0,
       py::arg("sync") = true);
+
+  // Warp-reduce RHF Fock contraction: 1 warp per task, fixed block=32 threads.
+  m.def(
+      "contract_fock_tiles_ordered_warp_inplace_device",
+      [](py::object task_spAB,
+         py::object task_spCD,
+         py::object sp_A,
+         py::object sp_B,
+         py::object shell_ao_start,
+         int nao,
+         int nA,
+         int nB,
+         int nC,
+         int nD,
+         py::object tile_vals,
+         py::object D_mat,
+         py::object F_mat,
+         int /*threads*/,
+         uint64_t stream_ptr,
+         bool sync) {
+        if (nao <= 0 || nA <= 0 || nB <= 0 || nC <= 0 || nD <= 0) {
+          throw std::invalid_argument("nao/nA/nB/nC/nD must be > 0");
+        }
+
+        auto ab = cuda_array_view_from_object(task_spAB, "task_spAB");
+        auto cd = cuda_array_view_from_object(task_spCD, "task_spCD");
+        auto spa = cuda_array_view_from_object(sp_A, "sp_A");
+        auto spb = cuda_array_view_from_object(sp_B, "sp_B");
+        auto sh0 = cuda_array_view_from_object(shell_ao_start, "shell_ao_start");
+        auto tile = cuda_array_view_from_object(tile_vals, "tile_vals");
+        auto d_arr = cuda_array_view_from_object(D_mat, "D_mat");
+        auto f_arr = cuda_array_view_from_object(F_mat, "F_mat");
+
+        require_typestr(ab, "task_spAB", "<i4");
+        require_typestr(cd, "task_spCD", "<i4");
+        require_typestr(spa, "sp_A", "<i4");
+        require_typestr(spb, "sp_B", "<i4");
+        require_typestr(sh0, "shell_ao_start", "<i4");
+        require_typestr(tile, "tile_vals", "<f8");
+        require_typestr(d_arr, "D_mat", "<f8");
+        require_typestr(f_arr, "F_mat", "<f8");
+
+        const int64_t ntasks = require_1d(ab, "task_spAB");
+        if (require_1d(cd, "task_spCD") != ntasks)
+          throw std::invalid_argument("task_spAB/task_spCD shape mismatch");
+        const int64_t nsp = require_1d(spa, "sp_A");
+        if (require_1d(spb, "sp_B") != nsp)
+          throw std::invalid_argument("sp_A/sp_B shape mismatch");
+        (void)require_1d(sh0, "shell_ao_start");
+
+        const int64_t nAB = static_cast<int64_t>(nA) * nB;
+        const int64_t nCD = static_cast<int64_t>(nC) * nD;
+        if (require_1d(tile, "tile_vals") != ntasks * nAB * nCD)
+          throw std::invalid_argument("tile_vals shape mismatch");
+        const int64_t nao2 = static_cast<int64_t>(nao) * nao;
+        if (require_1d(d_arr, "D_mat") != nao2)
+          throw std::invalid_argument("D_mat must have shape (nao*nao,)");
+        if (require_1d(f_arr, "F_mat") != nao2)
+          throw std::invalid_argument("F_mat must have shape (nao*nao,)");
+
+        cudaStream_t stream = stream_from_uint(stream_ptr);
+        throw_on_cuda_error(
+            cueri_contract_fock_warp_launch_stream(
+                static_cast<const int32_t*>(ab.ptr),
+                static_cast<const int32_t*>(cd.ptr),
+                static_cast<int>(ntasks),
+                static_cast<const int32_t*>(spa.ptr),
+                static_cast<const int32_t*>(spb.ptr),
+                static_cast<const int32_t*>(sh0.ptr),
+                nao, nA, nB, nC, nD,
+                static_cast<const double*>(tile.ptr),
+                static_cast<const double*>(d_arr.ptr),
+                static_cast<double*>(f_arr.ptr),
+                stream),
+            "cueri_contract_fock_warp_launch_stream");
+        if (sync) throw_on_cuda_error(cudaStreamSynchronize(stream), "cudaStreamSynchronize");
+      },
+      py::arg("task_spAB"),
+      py::arg("task_spCD"),
+      py::arg("sp_A"),
+      py::arg("sp_B"),
+      py::arg("shell_ao_start"),
+      py::arg("nao"),
+      py::arg("nA"),
+      py::arg("nB"),
+      py::arg("nC"),
+      py::arg("nD"),
+      py::arg("tile_vals"),
+      py::arg("D_mat"),
+      py::arg("F_mat"),
+      py::arg("threads") = 32,
+      py::arg("stream") = 0,
+      py::arg("sync") = true);
+
+  // -----------------------------------------------------------------------
+  // Fused ERI->Fock kernels for dominant SPD classes.
+  // -----------------------------------------------------------------------
+  using FusedFockLaunchFn = cudaError_t (*)(
+      const int32_t* task_spAB,
+      const int32_t* task_spCD,
+      int ntasks,
+      const int32_t* sp_A,
+      const int32_t* sp_B,
+      const int32_t* sp_pair_start,
+      const int32_t* sp_npair,
+      const double* shell_cx,
+      const double* shell_cy,
+      const double* shell_cz,
+      const double* pair_eta,
+      const double* pair_Px,
+      const double* pair_Py,
+      const double* pair_Pz,
+      const double* pair_cK,
+      const int32_t* shell_ao_start,
+      int nao,
+      const double* D_mat,
+      double* F_mat,
+      cudaStream_t stream,
+      int threads);
+
+  auto bind_fused_fock_spd = [&](const char* cls, FusedFockLaunchFn fn, const char* cuda_name) {
+    std::string pyname = std::string("fused_fock_") + cls + "_inplace_device";
+    m.def(
+        pyname.c_str(),
+        [fn, cuda_name, pyname](py::object task_spAB,
+                                py::object task_spCD,
+                                py::object sp_A,
+                                py::object sp_B,
+                                py::object sp_pair_start,
+                                py::object sp_npair,
+                                py::object shell_cx,
+                                py::object shell_cy,
+                                py::object shell_cz,
+                                py::object pair_eta,
+                                py::object pair_Px,
+                                py::object pair_Py,
+                                py::object pair_Pz,
+                                py::object pair_cK,
+                                py::object shell_ao_start,
+                                int nao,
+                                py::object D_mat,
+                                py::object F_mat,
+                                int threads,
+                                uint64_t stream_ptr,
+                                bool sync) {
+          require_threads_multiple_of_32(threads, pyname.c_str());
+          if (nao <= 0) throw std::invalid_argument("nao must be > 0");
+
+          auto ab = cuda_array_view_from_object(task_spAB, "task_spAB");
+          auto cd = cuda_array_view_from_object(task_spCD, "task_spCD");
+          auto spa = cuda_array_view_from_object(sp_A, "sp_A");
+          auto spb = cuda_array_view_from_object(sp_B, "sp_B");
+          auto sp0 = cuda_array_view_from_object(sp_pair_start, "sp_pair_start");
+          auto snp = cuda_array_view_from_object(sp_npair, "sp_npair");
+          auto cx = cuda_array_view_from_object(shell_cx, "shell_cx");
+          auto cy = cuda_array_view_from_object(shell_cy, "shell_cy");
+          auto cz = cuda_array_view_from_object(shell_cz, "shell_cz");
+          auto eta = cuda_array_view_from_object(pair_eta, "pair_eta");
+          auto px = cuda_array_view_from_object(pair_Px, "pair_Px");
+          auto pyv = cuda_array_view_from_object(pair_Py, "pair_Py");
+          auto pz = cuda_array_view_from_object(pair_Pz, "pair_Pz");
+          auto ck = cuda_array_view_from_object(pair_cK, "pair_cK");
+          auto a0 = cuda_array_view_from_object(shell_ao_start, "shell_ao_start");
+          auto d_arr = cuda_array_view_from_object(D_mat, "D_mat");
+          auto f_arr = cuda_array_view_from_object(F_mat, "F_mat");
+
+          require_typestr(ab, "task_spAB", "<i4");
+          require_typestr(cd, "task_spCD", "<i4");
+          require_typestr(spa, "sp_A", "<i4");
+          require_typestr(spb, "sp_B", "<i4");
+          require_typestr(sp0, "sp_pair_start", "<i4");
+          require_typestr(snp, "sp_npair", "<i4");
+          require_typestr(cx, "shell_cx", "<f8");
+          require_typestr(cy, "shell_cy", "<f8");
+          require_typestr(cz, "shell_cz", "<f8");
+          require_typestr(eta, "pair_eta", "<f8");
+          require_typestr(px, "pair_Px", "<f8");
+          require_typestr(pyv, "pair_Py", "<f8");
+          require_typestr(pz, "pair_Pz", "<f8");
+          require_typestr(ck, "pair_cK", "<f8");
+          require_typestr(a0, "shell_ao_start", "<i4");
+          require_typestr(d_arr, "D_mat", "<f8");
+          require_typestr(f_arr, "F_mat", "<f8");
+
+          const int64_t ntasks = require_1d(ab, "task_spAB");
+          if (require_1d(cd, "task_spCD") != ntasks)
+            throw std::invalid_argument("task_spAB/task_spCD must have identical shape (ntasks,)");
+
+          const int64_t nsp = require_1d(spa, "sp_A");
+          if (require_1d(spb, "sp_B") != nsp)
+            throw std::invalid_argument("sp_A/sp_B must have identical shape (nsp,)");
+          const int64_t nsp2 = require_1d(sp0, "sp_pair_start");
+          if (require_1d(snp, "sp_npair") != nsp2)
+            throw std::invalid_argument("sp_pair_start/sp_npair must have identical shape (nsp,)");
+          if (nsp2 != nsp) {
+            throw std::invalid_argument("sp_A/sp_B and sp_pair_start/sp_npair must have consistent length (nsp,)");
+          }
+
+          const int64_t nshell = require_1d(cx, "shell_cx");
+          if (require_1d(cy, "shell_cy") != nshell || require_1d(cz, "shell_cz") != nshell) {
+            throw std::invalid_argument("shell_cx/shell_cy/shell_cz must have identical shape (nshell,)");
+          }
+          (void)require_1d(a0, "shell_ao_start");
+
+          const int64_t npair = require_1d(eta, "pair_eta");
+          if (require_1d(px, "pair_Px") != npair || require_1d(pyv, "pair_Py") != npair ||
+              require_1d(pz, "pair_Pz") != npair || require_1d(ck, "pair_cK") != npair) {
+            throw std::invalid_argument("pair_* arrays must have identical shape (npair,)");
+          }
+
+          const int64_t nao2 = static_cast<int64_t>(nao) * static_cast<int64_t>(nao);
+          if (require_1d(d_arr, "D_mat") != nao2)
+            throw std::invalid_argument("D_mat must have shape (nao*nao,)");
+          if (require_1d(f_arr, "F_mat") != nao2)
+            throw std::invalid_argument("F_mat must have shape (nao*nao,)");
+
+          cudaStream_t stream = stream_from_uint(stream_ptr);
+          throw_on_cuda_error(
+              fn(static_cast<const int32_t*>(ab.ptr),
+                 static_cast<const int32_t*>(cd.ptr),
+                 static_cast<int>(ntasks),
+                 static_cast<const int32_t*>(spa.ptr),
+                 static_cast<const int32_t*>(spb.ptr),
+                 static_cast<const int32_t*>(sp0.ptr),
+                 static_cast<const int32_t*>(snp.ptr),
+                 static_cast<const double*>(cx.ptr),
+                 static_cast<const double*>(cy.ptr),
+                 static_cast<const double*>(cz.ptr),
+                 static_cast<const double*>(eta.ptr),
+                 static_cast<const double*>(px.ptr),
+                 static_cast<const double*>(pyv.ptr),
+                 static_cast<const double*>(pz.ptr),
+                 static_cast<const double*>(ck.ptr),
+                 static_cast<const int32_t*>(a0.ptr),
+                 static_cast<int>(nao),
+                 static_cast<const double*>(d_arr.ptr),
+                 static_cast<double*>(f_arr.ptr),
+                 stream,
+                 threads),
+              cuda_name);
+          if (sync) throw_on_cuda_error(cudaStreamSynchronize(stream), "cudaStreamSynchronize");
+        },
+        py::arg("task_spAB"),
+        py::arg("task_spCD"),
+        py::arg("sp_A"),
+        py::arg("sp_B"),
+        py::arg("sp_pair_start"),
+        py::arg("sp_npair"),
+        py::arg("shell_cx"),
+        py::arg("shell_cy"),
+        py::arg("shell_cz"),
+        py::arg("pair_eta"),
+        py::arg("pair_Px"),
+        py::arg("pair_Py"),
+        py::arg("pair_Pz"),
+        py::arg("pair_cK"),
+        py::arg("shell_ao_start"),
+        py::arg("nao"),
+        py::arg("D_mat"),
+        py::arg("F_mat"),
+        py::arg("threads") = 256,
+        py::arg("stream") = 0,
+        py::arg("sync") = true);
+  };
+
+  bind_fused_fock_spd("ssss", cueri_fused_fock_ssss_launch_stream, "cueri_fused_fock_ssss_launch_stream");
+  bind_fused_fock_spd("psss", cueri_fused_fock_psss_launch_stream, "cueri_fused_fock_psss_launch_stream");
+  bind_fused_fock_spd("dsss", cueri_fused_fock_dsss_launch_stream, "cueri_fused_fock_dsss_launch_stream");
+  bind_fused_fock_spd("ppss", cueri_fused_fock_ppss_launch_stream, "cueri_fused_fock_ppss_launch_stream");
+  bind_fused_fock_spd("psps", cueri_fused_fock_psps_launch_stream, "cueri_fused_fock_psps_launch_stream");
+  bind_fused_fock_spd("ppps", cueri_fused_fock_ppps_launch_stream, "cueri_fused_fock_ppps_launch_stream");
+  bind_fused_fock_spd("ddss", cueri_fused_fock_ddss_launch_stream, "cueri_fused_fock_ddss_launch_stream");
+  bind_fused_fock_spd("ssdp", cueri_fused_fock_ssdp_launch_stream, "cueri_fused_fock_ssdp_launch_stream");
+  bind_fused_fock_spd("psds", cueri_fused_fock_psds_launch_stream, "cueri_fused_fock_psds_launch_stream");
+  bind_fused_fock_spd("psdp", cueri_fused_fock_psdp_launch_stream, "cueri_fused_fock_psdp_launch_stream");
+  bind_fused_fock_spd("psdd", cueri_fused_fock_psdd_launch_stream, "cueri_fused_fock_psdd_launch_stream");
+  bind_fused_fock_spd("ppds", cueri_fused_fock_ppds_launch_stream, "cueri_fused_fock_ppds_launch_stream");
+  bind_fused_fock_spd("dsds", cueri_fused_fock_dsds_launch_stream, "cueri_fused_fock_dsds_launch_stream");
+  bind_fused_fock_spd("dsdp", cueri_fused_fock_dsdp_launch_stream, "cueri_fused_fock_dsdp_launch_stream");
 
   // Multi-density warp-reduce J/K contraction (D9 multi2).
   m.def(

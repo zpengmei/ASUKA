@@ -6,7 +6,7 @@ Uses integral-direct J/K contraction (no materialized ERI tensor) via
 :mod:`asuka.hf.direct_jk`.  Memory usage is O(nao^2) instead of O(nao^4).
 """
 
-from .direct_jk import DirectJKContext, direct_JK, direct_JK_multi, make_direct_jk_context
+from .direct_jk import DirectJKContext, direct_JK, direct_JK_multi, direct_fock_rhf, make_direct_jk_context
 from .df_scf import (
     SCFResult,
     _DIIS,
@@ -113,8 +113,11 @@ def rhf_direct(
         for _ in range(int(init_fock_cycles_i)):
             D_prev = D
             t_init = _time_ms_start(xp) if profile is not None else None
-            J, K = direct_JK(jk_ctx, D_prev, want_J=True, want_K=True, profile=profile)
-            F = _symmetrize_inplace(xp, h + J - 0.5 * K)
+            if int(getattr(jk_ctx, "max_l", 99)) <= 2:
+                F = direct_fock_rhf(jk_ctx, D_prev, h, profile=profile)
+            else:
+                J, K = direct_JK(jk_ctx, D_prev, want_J=True, want_K=True, profile=profile)
+                F = _symmetrize_inplace(xp, h + J - 0.5 * K)
             if level_shift:
                 shift = float(level_shift)
                 if shift != 0.0:
@@ -131,12 +134,14 @@ def rhf_direct(
     cycle = 0
     for cycle in range(1, int(max_cycle) + 1):
         t = _time_ms_start(xp) if profile is not None else None
-        J, K = direct_JK(jk_ctx, D, want_J=True, want_K=True, profile=profile)
+        if int(getattr(jk_ctx, "max_l", 99)) <= 2:
+            F = direct_fock_rhf(jk_ctx, D, h, profile=profile)
+        else:
+            J, K = direct_JK(jk_ctx, D, want_J=True, want_K=True, profile=profile)
+            F = _symmetrize_inplace(xp, h + J - 0.5 * K)
         if profile is not None and t is not None:
             profile["jk"]["calls"] = int(profile["jk"].get("calls", 0)) + 1
             profile["scf"]["jk_ms"] += _time_ms_end(xp, t)
-
-        F = _symmetrize_inplace(xp, h + J - 0.5 * K)
         if level_shift:
             shift = float(level_shift)
             if shift != 0.0:

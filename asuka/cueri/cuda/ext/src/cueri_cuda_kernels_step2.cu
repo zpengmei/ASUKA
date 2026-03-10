@@ -4,6 +4,7 @@
 #include <cstdint>
 
 #include "cueri_cuda_kernels_api.h"
+#include "cueri_cuda_contract_fock_warp.cuh"
 
 namespace {
 
@@ -3066,6 +3067,846 @@ __global__ void KernelERI_pppp_multiblock_reduce(const double* partial_sums, int
   }
 }
 
+// ---------------------------------------------------------------------------
+// Fused ERI->Fock kernels for dominant SPD classes.
+//
+// These kernels evaluate contracted ERIs in-register (or via warp reductions),
+// write the compact tile into shared memory, then immediately contract into
+// RHF Fock (F += J - 0.5*K) using the warp-reduced contraction routine.
+// Eliminates the global-memory tile round-trip and the extra contraction launch.
+// ---------------------------------------------------------------------------
+
+__global__ void KernelFusedFock_psss_warp(
+    const int32_t* task_spAB,
+    const int32_t* task_spCD,
+    int ntasks,
+    const int32_t* sp_A,
+    const int32_t* sp_B,
+    const int32_t* sp_pair_start,
+    const int32_t* sp_npair,
+    const double* shell_cx,
+    const double* shell_cy,
+    const double* shell_cz,
+    const double* pair_eta,
+    const double* pair_Px,
+    const double* pair_Py,
+    const double* pair_Pz,
+    const double* pair_cK,
+    const int32_t* shell_ao_start,
+    int nao,
+    const double* D_mat,
+    double* F_mat) {
+  constexpr int nA = 3, nB = 1, nC = 1, nD = 1;
+  constexpr int nAB = nA * nB;
+  constexpr int nCD = nC * nD;
+  constexpr int kNComp = nAB * nCD;  // 3
+
+  extern __shared__ double sh_tile[];
+  const int lane = static_cast<int>(threadIdx.x) & 31;
+  const int warp_id = static_cast<int>(threadIdx.x) >> 5;
+  const int warps_per_block = static_cast<int>(blockDim.x) >> 5;
+  const int t = static_cast<int>(blockIdx.x) * warps_per_block + warp_id;
+  if (t >= ntasks) return;
+
+  double* tile = sh_tile + static_cast<int64_t>(warp_id) * static_cast<int64_t>(kNComp);
+
+  const int spAB = static_cast<int>(task_spAB[t]);
+  const int spCD = static_cast<int>(task_spCD[t]);
+  const int A = static_cast<int>(sp_A[spAB]);
+
+  const double Ax = shell_cx[A];
+  const double Ay = shell_cy[A];
+  const double Az = shell_cz[A];
+
+  const int baseAB = static_cast<int>(sp_pair_start[spAB]);
+  const int baseCD = static_cast<int>(sp_pair_start[spCD]);
+  const int nPairAB = static_cast<int>(sp_npair[spAB]);
+  const int nPairCD = static_cast<int>(sp_npair[spCD]);
+  const int64_t nTot = static_cast<int64_t>(nPairAB) * static_cast<int64_t>(nPairCD);
+
+  double sx = 0.0, sy = 0.0, sz = 0.0;
+  for (int64_t u = static_cast<int64_t>(lane); u < nTot; u += 32) {
+    const int i = static_cast<int>(u / nPairCD);
+    const int j = static_cast<int>(u - static_cast<int64_t>(i) * nPairCD);
+    const int ki = baseAB + i;
+    const int kj = baseCD + j;
+
+    const double p = pair_eta[ki];
+    const double q = pair_eta[kj];
+    const double Px = pair_Px[ki];
+    const double Py = pair_Py[ki];
+    const double Pz = pair_Pz[ki];
+    const double Qx = pair_Px[kj];
+    const double Qy = pair_Py[kj];
+    const double Qz = pair_Pz[kj];
+
+    const double dx = Px - Qx;
+    const double dy = Py - Qy;
+    const double dz = Pz - Qz;
+    const double PQ2 = dx * dx + dy * dy + dz * dz;
+
+    const double denom = p + q;
+    const double omega = p * q / denom;
+    const double T = omega * PQ2;
+
+    const double pref = kTwoPiToFiveHalves / (p * q * ::sqrt(denom));
+    const double base = pref * pair_cK[ki] * pair_cK[kj];
+
+    double F0, F1, F2;
+    boys_f0_f1_f2(T, F0, F1, F2);
+    (void)F2;
+
+    const double q_over = q / denom;  // omega/p
+    sx += base * (-(Ax - Px) * F0 - q_over * dx * F1);
+    sy += base * (-(Ay - Py) * F0 - q_over * dy * F1);
+    sz += base * (-(Az - Pz) * F0 - q_over * dz * F1);
+  }
+
+  sx = warp_reduce_sum(sx);
+  sy = warp_reduce_sum(sy);
+  sz = warp_reduce_sum(sz);
+
+  if (lane == 0) {
+    tile[0] = sx;
+    tile[1] = sy;
+    tile[2] = sz;
+  }
+  __syncwarp();
+
+  const int A_sh = static_cast<int>(sp_A[spAB]);
+  const int B_sh = static_cast<int>(sp_B[spAB]);
+  const int C_sh = static_cast<int>(sp_A[spCD]);
+  const int D_sh = static_cast<int>(sp_B[spCD]);
+  const int a0 = static_cast<int>(shell_ao_start[A_sh]);
+  const int b0 = static_cast<int>(shell_ao_start[B_sh]);
+  const int c0 = static_cast<int>(shell_ao_start[C_sh]);
+  const int d0 = static_cast<int>(shell_ao_start[D_sh]);
+  const bool ab_neq = (A_sh != B_sh);
+  const bool cd_neq = (C_sh != D_sh);
+  const bool bk_swap = (spAB != spCD);
+  const double f_ab = ab_neq ? 2.0 : 1.0;
+  const double f_cd = cd_neq ? 2.0 : 1.0;
+  const int64_t N = static_cast<int64_t>(nao);
+
+  cueri_contract_fock_warp_single(
+      tile, D_mat, F_mat, lane,
+      nAB, nCD, nA, nB, nC, nD,
+      a0, b0, c0, d0,
+      ab_neq, cd_neq, bk_swap, f_ab, f_cd, N);
+}
+
+__global__ void KernelFusedFock_dsss_warp(
+    const int32_t* task_spAB,
+    const int32_t* task_spCD,
+    int ntasks,
+    const int32_t* sp_A,
+    const int32_t* sp_B,
+    const int32_t* sp_pair_start,
+    const int32_t* sp_npair,
+    const double* shell_cx,
+    const double* shell_cy,
+    const double* shell_cz,
+    const double* pair_eta,
+    const double* pair_Px,
+    const double* pair_Py,
+    const double* pair_Pz,
+    const double* pair_cK,
+    const int32_t* shell_ao_start,
+    int nao,
+    const double* D_mat,
+    double* F_mat) {
+  constexpr int nA = 6, nB = 1, nC = 1, nD = 1;
+  constexpr int nAB = nA * nB;
+  constexpr int nCD = nC * nD;
+  constexpr int kNComp = nAB * nCD;  // 6
+
+  extern __shared__ double sh_tile[];
+  const int lane = static_cast<int>(threadIdx.x) & 31;
+  const int warp_id = static_cast<int>(threadIdx.x) >> 5;
+  const int warps_per_block = static_cast<int>(blockDim.x) >> 5;
+  const int t = static_cast<int>(blockIdx.x) * warps_per_block + warp_id;
+  if (t >= ntasks) return;
+
+  double* tile = sh_tile + static_cast<int64_t>(warp_id) * static_cast<int64_t>(kNComp);
+
+  const int spAB = static_cast<int>(task_spAB[t]);
+  const int spCD = static_cast<int>(task_spCD[t]);
+  const int A = static_cast<int>(sp_A[spAB]);
+
+  const double Ax = shell_cx[A];
+  const double Ay = shell_cy[A];
+  const double Az = shell_cz[A];
+
+  const int baseAB = static_cast<int>(sp_pair_start[spAB]);
+  const int baseCD = static_cast<int>(sp_pair_start[spCD]);
+  const int nPairAB = static_cast<int>(sp_npair[spAB]);
+  const int nPairCD = static_cast<int>(sp_npair[spCD]);
+  const int64_t nTot = static_cast<int64_t>(nPairAB) * static_cast<int64_t>(nPairCD);
+
+  // Match KernelERI_dsss_warp exactly: outputs are (xx,xy,xz,yy,yz,zz).
+  double s_xx = 0.0;
+  double s_xy = 0.0;
+  double s_xz = 0.0;
+  double s_yy = 0.0;
+  double s_yz = 0.0;
+  double s_zz = 0.0;
+  for (int64_t u = static_cast<int64_t>(lane); u < nTot; u += 32) {
+    const int i = static_cast<int>(u / nPairCD);
+    const int j = static_cast<int>(u - static_cast<int64_t>(i) * nPairCD);
+    const int ki = baseAB + i;
+    const int kj = baseCD + j;
+
+    const double p = pair_eta[ki];
+    const double q = pair_eta[kj];
+    const double Px = pair_Px[ki];
+    const double Py = pair_Py[ki];
+    const double Pz = pair_Pz[ki];
+    const double Qx = pair_Px[kj];
+    const double Qy = pair_Py[kj];
+    const double Qz = pair_Pz[kj];
+
+    const double dx = Px - Qx;
+    const double dy = Py - Qy;
+    const double dz = Pz - Qz;
+    const double PQ2 = dx * dx + dy * dy + dz * dz;
+
+    const double denom = p + q;
+    const double omega = p * q / denom;
+    const double T = omega * PQ2;
+
+    const double pref = kTwoPiToFiveHalves / (p * q * ::sqrt(denom));
+    const double base = pref * pair_cK[ki] * pair_cK[kj];
+
+    double F0, F1, F2;
+    boys_f0_f1_f2(T, F0, F1, F2);
+
+    const double I = base * F0;
+    const double omega_over_p = omega / p;
+    const double Jx = -omega_over_p * base * F1 * dx;
+    const double Jy = -omega_over_p * base * F1 * dy;
+    const double Jz = -omega_over_p * base * F1 * dz;
+
+    const double inv4p2 = 1.0 / (4.0 * p * p);
+    const double w2 = omega * omega;
+    const double t4 = 4.0 * w2 * F2;
+    const double t2 = 2.0 * omega * F1;
+    const double Kxx = (base * (t4 * dx * dx - t2) + 2.0 * p * I) * inv4p2;
+    const double Kyy = (base * (t4 * dy * dy - t2) + 2.0 * p * I) * inv4p2;
+    const double Kzz = (base * (t4 * dz * dz - t2) + 2.0 * p * I) * inv4p2;
+    const double Kxy = (base * (t4 * dx * dy)) * inv4p2;
+    const double Kxz = (base * (t4 * dx * dz)) * inv4p2;
+    const double Kyz = (base * (t4 * dy * dz)) * inv4p2;
+
+    const double PAx = Px - Ax;
+    const double PAy = Py - Ay;
+    const double PAz = Pz - Az;
+
+    s_xx += Kxx + 2.0 * PAx * Jx + (PAx * PAx) * I;
+    s_xy += Kxy + PAx * Jy + PAy * Jx + (PAx * PAy) * I;
+    s_xz += Kxz + PAx * Jz + PAz * Jx + (PAx * PAz) * I;
+    s_yy += Kyy + 2.0 * PAy * Jy + (PAy * PAy) * I;
+    s_yz += Kyz + PAy * Jz + PAz * Jy + (PAy * PAz) * I;
+    s_zz += Kzz + 2.0 * PAz * Jz + (PAz * PAz) * I;
+  }
+
+  s_xx = warp_reduce_sum(s_xx);
+  s_xy = warp_reduce_sum(s_xy);
+  s_xz = warp_reduce_sum(s_xz);
+  s_yy = warp_reduce_sum(s_yy);
+  s_yz = warp_reduce_sum(s_yz);
+  s_zz = warp_reduce_sum(s_zz);
+
+  if (lane == 0) {
+    tile[0] = s_xx;
+    tile[1] = s_xy;
+    tile[2] = s_xz;
+    tile[3] = s_yy;
+    tile[4] = s_yz;
+    tile[5] = s_zz;
+  }
+  __syncwarp();
+
+  const int A_sh = static_cast<int>(sp_A[spAB]);
+  const int B_sh = static_cast<int>(sp_B[spAB]);
+  const int C_sh = static_cast<int>(sp_A[spCD]);
+  const int D_sh = static_cast<int>(sp_B[spCD]);
+  const int a0 = static_cast<int>(shell_ao_start[A_sh]);
+  const int b0 = static_cast<int>(shell_ao_start[B_sh]);
+  const int c0 = static_cast<int>(shell_ao_start[C_sh]);
+  const int d0 = static_cast<int>(shell_ao_start[D_sh]);
+  const bool ab_neq = (A_sh != B_sh);
+  const bool cd_neq = (C_sh != D_sh);
+  const bool bk_swap = (spAB != spCD);
+  const double f_ab = ab_neq ? 2.0 : 1.0;
+  const double f_cd = cd_neq ? 2.0 : 1.0;
+  const int64_t N = static_cast<int64_t>(nao);
+
+  cueri_contract_fock_warp_single(
+      tile, D_mat, F_mat, lane,
+      nAB, nCD, nA, nB, nC, nD,
+      a0, b0, c0, d0,
+      ab_neq, cd_neq, bk_swap, f_ab, f_cd, N);
+  (void)sp_B;
+}
+
+__global__ void KernelFusedFock_ppss_warp(
+    const int32_t* task_spAB,
+    const int32_t* task_spCD,
+    int ntasks,
+    const int32_t* sp_A,
+    const int32_t* sp_B,
+    const int32_t* sp_pair_start,
+    const int32_t* sp_npair,
+    const double* shell_cx,
+    const double* shell_cy,
+    const double* shell_cz,
+    const double* pair_eta,
+    const double* pair_Px,
+    const double* pair_Py,
+    const double* pair_Pz,
+    const double* pair_cK,
+    const int32_t* shell_ao_start,
+    int nao,
+    const double* D_mat,
+    double* F_mat) {
+  constexpr int nA = 3, nB = 3, nC = 1, nD = 1;
+  constexpr int nAB = nA * nB;
+  constexpr int nCD = nC * nD;
+  constexpr int kNComp = nAB * nCD;  // 9
+
+  extern __shared__ double sh_tile[];
+  const int lane = static_cast<int>(threadIdx.x) & 31;
+  const int warp_id = static_cast<int>(threadIdx.x) >> 5;
+  const int warps_per_block = static_cast<int>(blockDim.x) >> 5;
+  const int t = static_cast<int>(blockIdx.x) * warps_per_block + warp_id;
+  if (t >= ntasks) return;
+
+  double* tile = sh_tile + static_cast<int64_t>(warp_id) * static_cast<int64_t>(kNComp);
+
+  const int spAB = static_cast<int>(task_spAB[t]);
+  const int spCD = static_cast<int>(task_spCD[t]);
+  const int A = static_cast<int>(sp_A[spAB]);
+  const int B = static_cast<int>(sp_B[spAB]);
+
+  const double Ax = shell_cx[A];
+  const double Ay = shell_cy[A];
+  const double Az = shell_cz[A];
+  const double Bx = shell_cx[B];
+  const double By = shell_cy[B];
+  const double Bz = shell_cz[B];
+
+  const int baseAB = static_cast<int>(sp_pair_start[spAB]);
+  const int baseCD = static_cast<int>(sp_pair_start[spCD]);
+  const int nPairAB = static_cast<int>(sp_npair[spAB]);
+  const int nPairCD = static_cast<int>(sp_npair[spCD]);
+  const int64_t nTot = static_cast<int64_t>(nPairAB) * static_cast<int64_t>(nPairCD);
+
+  double s00 = 0.0, s01 = 0.0, s02 = 0.0;
+  double s10 = 0.0, s11 = 0.0, s12 = 0.0;
+  double s20 = 0.0, s21 = 0.0, s22 = 0.0;
+
+  for (int64_t u = static_cast<int64_t>(lane); u < nTot; u += 32) {
+    const int i = static_cast<int>(u / nPairCD);
+    const int j = static_cast<int>(u - static_cast<int64_t>(i) * nPairCD);
+    const int ki = baseAB + i;
+    const int kj = baseCD + j;
+
+    const double p = pair_eta[ki];
+    const double q = pair_eta[kj];
+    const double Px = pair_Px[ki];
+    const double Py = pair_Py[ki];
+    const double Pz = pair_Pz[ki];
+    const double Qx = pair_Px[kj];
+    const double Qy = pair_Py[kj];
+    const double Qz = pair_Pz[kj];
+
+    const double dx = Px - Qx;
+    const double dy = Py - Qy;
+    const double dz = Pz - Qz;
+    const double PQ2 = dx * dx + dy * dy + dz * dz;
+
+    const double denom = p + q;
+    const double omega = p * q / denom;
+    const double T = omega * PQ2;
+
+    const double pref = kTwoPiToFiveHalves / (p * q * ::sqrt(denom));
+    const double base = pref * pair_cK[ki] * pair_cK[kj];
+
+    double F0, F1, F2;
+    boys_f0_f1_f2(T, F0, F1, F2);
+
+    const double I = base * F0;
+
+    const double omega_over_p = omega / p;
+    const double omega_over_q = omega / q;
+    const double Jpx = -omega_over_p * base * F1 * dx;
+    const double Jpy = -omega_over_p * base * F1 * dy;
+    const double Jpz = -omega_over_p * base * F1 * dz;
+    const double Jqx = omega_over_q * base * F1 * dx;
+    const double Jqy = omega_over_q * base * F1 * dy;
+    const double Jqz = omega_over_q * base * F1 * dz;
+
+    const double w2 = omega * omega;
+    const double t4 = 4.0 * w2 * F2;
+    const double t2 = 2.0 * omega * F1;
+    const double inv4pq = 1.0 / (4.0 * p * q);
+
+    const double Hxx = base * (t4 * dx * dx - t2);
+    const double Hyy = base * (t4 * dy * dy - t2);
+    const double Hzz = base * (t4 * dz * dz - t2);
+    const double Hxy = base * (t4 * dx * dy);
+    const double Hxz = base * (t4 * dx * dz);
+    const double Hyz = base * (t4 * dy * dz);
+
+    const double Lxx = -(Hxx) * inv4pq;
+    const double Lyy = -(Hyy) * inv4pq;
+    const double Lzz = -(Hzz) * inv4pq;
+    const double Lxy = -(Hxy) * inv4pq;
+    const double Lxz = -(Hxz) * inv4pq;
+    const double Lyz = -(Hyz) * inv4pq;
+
+    const double PAx = Px - Ax;
+    const double PAy = Py - Ay;
+    const double PAz = Pz - Az;
+    const double QBx = Qx - Bx;
+    const double QBy = Qy - By;
+    const double QBz = Qz - Bz;
+
+    s00 += Lxx + QBx * Jpx + PAx * Jqx + PAx * QBx * I;
+    s01 += Lxy + QBy * Jpx + PAx * Jqy + PAx * QBy * I;
+    s02 += Lxz + QBz * Jpx + PAx * Jqz + PAx * QBz * I;
+
+    s10 += Lxy + QBx * Jpy + PAy * Jqx + PAy * QBx * I;
+    s11 += Lyy + QBy * Jpy + PAy * Jqy + PAy * QBy * I;
+    s12 += Lyz + QBz * Jpy + PAy * Jqz + PAy * QBz * I;
+
+    s20 += Lxz + QBx * Jpz + PAz * Jqx + PAz * QBx * I;
+    s21 += Lyz + QBy * Jpz + PAz * Jqy + PAz * QBy * I;
+    s22 += Lzz + QBz * Jpz + PAz * Jqz + PAz * QBz * I;
+  }
+
+  s00 = warp_reduce_sum(s00);
+  s01 = warp_reduce_sum(s01);
+  s02 = warp_reduce_sum(s02);
+  s10 = warp_reduce_sum(s10);
+  s11 = warp_reduce_sum(s11);
+  s12 = warp_reduce_sum(s12);
+  s20 = warp_reduce_sum(s20);
+  s21 = warp_reduce_sum(s21);
+  s22 = warp_reduce_sum(s22);
+
+  if (lane == 0) {
+    tile[0] = s00;
+    tile[1] = s01;
+    tile[2] = s02;
+    tile[3] = s10;
+    tile[4] = s11;
+    tile[5] = s12;
+    tile[6] = s20;
+    tile[7] = s21;
+    tile[8] = s22;
+  }
+  __syncwarp();
+
+  const int A_sh = static_cast<int>(sp_A[spAB]);
+  const int B_sh = static_cast<int>(sp_B[spAB]);
+  const int C_sh = static_cast<int>(sp_A[spCD]);
+  const int D_sh = static_cast<int>(sp_B[spCD]);
+  const int a0 = static_cast<int>(shell_ao_start[A_sh]);
+  const int b0 = static_cast<int>(shell_ao_start[B_sh]);
+  const int c0 = static_cast<int>(shell_ao_start[C_sh]);
+  const int d0 = static_cast<int>(shell_ao_start[D_sh]);
+  const bool ab_neq = (A_sh != B_sh);
+  const bool cd_neq = (C_sh != D_sh);
+  const bool bk_swap = (spAB != spCD);
+  const double f_ab = ab_neq ? 2.0 : 1.0;
+  const double f_cd = cd_neq ? 2.0 : 1.0;
+  const int64_t N = static_cast<int64_t>(nao);
+
+  cueri_contract_fock_warp_single(
+      tile, D_mat, F_mat, lane,
+      nAB, nCD, nA, nB, nC, nD,
+      a0, b0, c0, d0,
+      ab_neq, cd_neq, bk_swap, f_ab, f_cd, N);
+}
+
+__global__ void KernelFusedFock_psps_warp(
+    const int32_t* task_spAB,
+    const int32_t* task_spCD,
+    int ntasks,
+    const int32_t* sp_A,
+    const int32_t* sp_B,
+    const int32_t* sp_pair_start,
+    const int32_t* sp_npair,
+    const double* shell_cx,
+    const double* shell_cy,
+    const double* shell_cz,
+    const double* pair_eta,
+    const double* pair_Px,
+    const double* pair_Py,
+    const double* pair_Pz,
+    const double* pair_cK,
+    const int32_t* shell_ao_start,
+    int nao,
+    const double* D_mat,
+    double* F_mat) {
+  constexpr int nA = 3, nB = 1, nC = 3, nD = 1;
+  constexpr int nAB = nA * nB;
+  constexpr int nCD = nC * nD;
+  constexpr int kNComp = nAB * nCD;  // 9
+
+  extern __shared__ double sh_tile[];
+  const int lane = static_cast<int>(threadIdx.x) & 31;
+  const int warp_id = static_cast<int>(threadIdx.x) >> 5;
+  const int warps_per_block = static_cast<int>(blockDim.x) >> 5;
+  const int t = static_cast<int>(blockIdx.x) * warps_per_block + warp_id;
+  if (t >= ntasks) return;
+
+  double* tile = sh_tile + static_cast<int64_t>(warp_id) * static_cast<int64_t>(kNComp);
+
+  const int spAB = static_cast<int>(task_spAB[t]);
+  const int spCD = static_cast<int>(task_spCD[t]);
+  const int A = static_cast<int>(sp_A[spAB]);
+  const int C = static_cast<int>(sp_A[spCD]);
+
+  const double Ax = shell_cx[A];
+  const double Ay = shell_cy[A];
+  const double Az = shell_cz[A];
+  const double Cx = shell_cx[C];
+  const double Cy = shell_cy[C];
+  const double Cz = shell_cz[C];
+
+  const int baseAB = static_cast<int>(sp_pair_start[spAB]);
+  const int baseCD = static_cast<int>(sp_pair_start[spCD]);
+  const int nPairAB = static_cast<int>(sp_npair[spAB]);
+  const int nPairCD = static_cast<int>(sp_npair[spCD]);
+  const int64_t nTot = static_cast<int64_t>(nPairAB) * static_cast<int64_t>(nPairCD);
+
+  double s00 = 0.0, s01 = 0.0, s02 = 0.0;
+  double s10 = 0.0, s11 = 0.0, s12 = 0.0;
+  double s20 = 0.0, s21 = 0.0, s22 = 0.0;
+
+  for (int64_t u = static_cast<int64_t>(lane); u < nTot; u += 32) {
+    const int i = static_cast<int>(u / nPairCD);
+    const int j = static_cast<int>(u - static_cast<int64_t>(i) * nPairCD);
+    const int ki = baseAB + i;
+    const int kj = baseCD + j;
+
+    const double p = pair_eta[ki];
+    const double q = pair_eta[kj];
+    const double Px = pair_Px[ki];
+    const double Py = pair_Py[ki];
+    const double Pz = pair_Pz[ki];
+    const double Qx = pair_Px[kj];
+    const double Qy = pair_Py[kj];
+    const double Qz = pair_Pz[kj];
+
+    const double dx = Px - Qx;
+    const double dy = Py - Qy;
+    const double dz = Pz - Qz;
+    const double PQ2 = dx * dx + dy * dy + dz * dz;
+
+    const double denom = p + q;
+    const double omega = p * q / denom;
+    const double T = omega * PQ2;
+
+    const double pref = kTwoPiToFiveHalves / (p * q * ::sqrt(denom));
+    const double base = pref * pair_cK[ki] * pair_cK[kj];
+
+    double F0, F1, F2;
+    boys_f0_f1_f2(T, F0, F1, F2);
+
+    const double I = base * F0;
+
+    const double omega_over_p = omega / p;
+    const double omega_over_q = omega / q;
+    const double Jpx = -omega_over_p * base * F1 * dx;
+    const double Jpy = -omega_over_p * base * F1 * dy;
+    const double Jpz = -omega_over_p * base * F1 * dz;
+    const double Jqx = omega_over_q * base * F1 * dx;
+    const double Jqy = omega_over_q * base * F1 * dy;
+    const double Jqz = omega_over_q * base * F1 * dz;
+
+    const double w2 = omega * omega;
+    const double t4 = 4.0 * w2 * F2;
+    const double t2 = 2.0 * omega * F1;
+    const double inv4pq = 1.0 / (4.0 * p * q);
+
+    const double Hxx = base * (t4 * dx * dx - t2);
+    const double Hyy = base * (t4 * dy * dy - t2);
+    const double Hzz = base * (t4 * dz * dz - t2);
+    const double Hxy = base * (t4 * dx * dy);
+    const double Hxz = base * (t4 * dx * dz);
+    const double Hyz = base * (t4 * dy * dz);
+
+    const double Lxx = -(Hxx) * inv4pq;
+    const double Lyy = -(Hyy) * inv4pq;
+    const double Lzz = -(Hzz) * inv4pq;
+    const double Lxy = -(Hxy) * inv4pq;
+    const double Lxz = -(Hxz) * inv4pq;
+    const double Lyz = -(Hyz) * inv4pq;
+
+    const double PAx = Px - Ax;
+    const double PAy = Py - Ay;
+    const double PAz = Pz - Az;
+    const double QCx = Qx - Cx;
+    const double QCy = Qy - Cy;
+    const double QCz = Qz - Cz;
+
+    s00 += Lxx + QCx * Jpx + PAx * Jqx + PAx * QCx * I;
+    s01 += Lxy + QCy * Jpx + PAx * Jqy + PAx * QCy * I;
+    s02 += Lxz + QCz * Jpx + PAx * Jqz + PAx * QCz * I;
+
+    s10 += Lxy + QCx * Jpy + PAy * Jqx + PAy * QCx * I;
+    s11 += Lyy + QCy * Jpy + PAy * Jqy + PAy * QCy * I;
+    s12 += Lyz + QCz * Jpy + PAy * Jqz + PAy * QCz * I;
+
+    s20 += Lxz + QCx * Jpz + PAz * Jqx + PAz * QCx * I;
+    s21 += Lyz + QCy * Jpz + PAz * Jqy + PAz * QCy * I;
+    s22 += Lzz + QCz * Jpz + PAz * Jqz + PAz * QCz * I;
+  }
+
+  s00 = warp_reduce_sum(s00);
+  s01 = warp_reduce_sum(s01);
+  s02 = warp_reduce_sum(s02);
+  s10 = warp_reduce_sum(s10);
+  s11 = warp_reduce_sum(s11);
+  s12 = warp_reduce_sum(s12);
+  s20 = warp_reduce_sum(s20);
+  s21 = warp_reduce_sum(s21);
+  s22 = warp_reduce_sum(s22);
+
+  if (lane == 0) {
+    tile[0] = s00;
+    tile[1] = s01;
+    tile[2] = s02;
+    tile[3] = s10;
+    tile[4] = s11;
+    tile[5] = s12;
+    tile[6] = s20;
+    tile[7] = s21;
+    tile[8] = s22;
+  }
+  __syncwarp();
+
+  const int A_sh = static_cast<int>(sp_A[spAB]);
+  const int B_sh = static_cast<int>(sp_B[spAB]);
+  const int C_sh = static_cast<int>(sp_A[spCD]);
+  const int D_sh = static_cast<int>(sp_B[spCD]);
+  const int a0 = static_cast<int>(shell_ao_start[A_sh]);
+  const int b0 = static_cast<int>(shell_ao_start[B_sh]);
+  const int c0 = static_cast<int>(shell_ao_start[C_sh]);
+  const int d0 = static_cast<int>(shell_ao_start[D_sh]);
+  const bool ab_neq = (A_sh != B_sh);
+  const bool cd_neq = (C_sh != D_sh);
+  const bool bk_swap = (spAB != spCD);
+  const double f_ab = ab_neq ? 2.0 : 1.0;
+  const double f_cd = cd_neq ? 2.0 : 1.0;
+  const int64_t N = static_cast<int64_t>(nao);
+
+  cueri_contract_fock_warp_single(
+      tile, D_mat, F_mat, lane,
+      nAB, nCD, nA, nB, nC, nD,
+      a0, b0, c0, d0,
+      ab_neq, cd_neq, bk_swap, f_ab, f_cd, N);
+}
+
+__global__ void KernelFusedFock_ppps_warp(
+    const int32_t* task_spAB,
+    const int32_t* task_spCD,
+    int ntasks,
+    const int32_t* sp_A,
+    const int32_t* sp_B,
+    const int32_t* sp_pair_start,
+    const int32_t* sp_npair,
+    const double* shell_cx,
+    const double* shell_cy,
+    const double* shell_cz,
+    const double* pair_eta,
+    const double* pair_Px,
+    const double* pair_Py,
+    const double* pair_Pz,
+    const double* pair_cK,
+    const int32_t* shell_ao_start,
+    int nao,
+    const double* D_mat,
+    double* F_mat) {
+  constexpr int nA = 3, nB = 3, nC = 3, nD = 1;
+  constexpr int nAB = nA * nB;
+  constexpr int nCD = nC * nD;
+  constexpr int kNComp = nAB * nCD;  // 27
+
+  extern __shared__ double sh_tile[];
+  const int lane = static_cast<int>(threadIdx.x) & 31;
+  const int warp_id = static_cast<int>(threadIdx.x) >> 5;
+  const int warps_per_block = static_cast<int>(blockDim.x) >> 5;
+  const int t = static_cast<int>(blockIdx.x) * warps_per_block + warp_id;
+  if (t >= ntasks) return;
+
+  double* tile = sh_tile + static_cast<int64_t>(warp_id) * static_cast<int64_t>(kNComp);
+
+  const int spAB = static_cast<int>(task_spAB[t]);
+  const int spCD = static_cast<int>(task_spCD[t]);
+  const int A = static_cast<int>(sp_A[spAB]);
+  const int B = static_cast<int>(sp_B[spAB]);
+  const int C = static_cast<int>(sp_A[spCD]);
+
+  const double Ax = shell_cx[A];
+  const double Ay = shell_cy[A];
+  const double Az = shell_cz[A];
+  const double Bx = shell_cx[B];
+  const double By = shell_cy[B];
+  const double Bz = shell_cz[B];
+  const double Cx = shell_cx[C];
+  const double Cy = shell_cy[C];
+  const double Cz = shell_cz[C];
+
+  const int baseAB = static_cast<int>(sp_pair_start[spAB]);
+  const int baseCD = static_cast<int>(sp_pair_start[spCD]);
+  const int nPairAB = static_cast<int>(sp_npair[spAB]);
+  const int nPairCD = static_cast<int>(sp_npair[spCD]);
+  const int64_t nTot = static_cast<int64_t>(nPairAB) * static_cast<int64_t>(nPairCD);
+
+  // Match KernelERI_ppps_warp exactly.
+  double s[27];
+#pragma unroll
+  for (int i = 0; i < 27; ++i) s[i] = 0.0;
+
+  for (int64_t u = static_cast<int64_t>(lane); u < nTot; u += 32) {
+    const int iab = static_cast<int>(u / nPairCD);
+    const int icd = static_cast<int>(u - static_cast<int64_t>(iab) * nPairCD);
+    const int ki = baseAB + iab;
+    const int kj = baseCD + icd;
+
+    const double p = pair_eta[ki];
+    const double q = pair_eta[kj];
+    const double Px = pair_Px[ki];
+    const double Py = pair_Py[ki];
+    const double Pz = pair_Pz[ki];
+    const double Qx = pair_Px[kj];
+    const double Qy = pair_Py[kj];
+    const double Qz = pair_Pz[kj];
+
+    const double dx = Px - Qx;
+    const double dy = Py - Qy;
+    const double dz = Pz - Qz;
+    const double dvec[3] = {dx, dy, dz};
+    const double PQ2 = dx * dx + dy * dy + dz * dz;
+
+    const double denom = p + q;
+    const double omega = p * q / denom;
+    const double T = omega * PQ2;
+
+    const double pref = kTwoPiToFiveHalves / (p * q * ::sqrt(denom));
+    const double base = pref * pair_cK[ki] * pair_cK[kj];
+
+    double F0, F1, F2, F3, F4;
+    boys_f0_f1_f2_f3_f4(T, F0, F1, F2, F3, F4);
+    (void)F4;
+
+    const double I = base * F0;
+
+    const double omega_over_p = omega / p;
+    const double omega_over_q = omega / q;
+    const double Jp[3] = {
+        -omega_over_p * base * F1 * dx,
+        -omega_over_p * base * F1 * dy,
+        -omega_over_p * base * F1 * dz,
+    };
+    const double Jq[3] = {
+        omega_over_q * base * F1 * dx,
+        omega_over_q * base * F1 * dy,
+        omega_over_q * base * F1 * dz,
+    };
+
+    const double w2 = omega * omega;
+    const double w3 = w2 * omega;
+    const double inv4p2 = 1.0 / (4.0 * p * p);
+    const double inv4pq = 1.0 / (4.0 * p * q);
+
+    const double t4 = 4.0 * w2 * F2;
+    const double t2 = 2.0 * omega * F1;
+    const double H[3][3] = {
+        {base * (t4 * dx * dx - t2), base * (t4 * dx * dy), base * (t4 * dx * dz)},
+        {base * (t4 * dy * dx), base * (t4 * dy * dy - t2), base * (t4 * dy * dz)},
+        {base * (t4 * dz * dx), base * (t4 * dz * dy), base * (t4 * dz * dz - t2)},
+    };
+
+    double Kp[3][3];
+    double L[3][3];
+#pragma unroll
+    for (int a = 0; a < 3; ++a) {
+#pragma unroll
+      for (int b = 0; b < 3; ++b) {
+        const double dij = (a == b) ? 1.0 : 0.0;
+        Kp[a][b] = (H[a][b] + 2.0 * p * I * dij) * inv4p2;
+        L[a][b] = -(H[a][b]) * inv4pq;
+      }
+    }
+
+    const double PA[3] = {Px - Ax, Py - Ay, Pz - Az};
+    const double PB[3] = {Px - Bx, Py - By, Pz - Bz};
+    const double QC[3] = {Qx - Cx, Qy - Cy, Qz - Cz};
+
+    const double term_t3_f2 = 4.0 * w2 * base * F2;
+    const double term_t3_f3 = -8.0 * w3 * base * F3;
+
+#pragma unroll
+    for (int ia = 0; ia < 3; ++ia) {
+#pragma unroll
+      for (int ib = 0; ib < 3; ++ib) {
+        const int ab = ia * 3 + ib;
+        const double a = PA[ia];
+        const double b = PB[ib];
+        const double dij = (ia == ib) ? 1.0 : 0.0;
+        const double Kp_ij = Kp[ia][ib];
+
+#pragma unroll
+        for (int ic = 0; ic < 3; ++ic) {
+          const double c = QC[ic];
+          const double T3_ijk = t3_component(ia, ib, ic, dvec, term_t3_f2, term_t3_f3);
+          const double M_ijk = (-T3_ijk + 4.0 * p * q * dij * Jq[ic]) / (8.0 * p * p * q);
+
+          const double val =
+              M_ijk + c * Kp_ij + b * L[ia][ic] + b * c * Jp[ia] + a * L[ib][ic] + a * c * Jp[ib] +
+              a * b * Jq[ic] + a * b * c * I;
+          s[ab * 3 + ic] += val;
+        }
+      }
+    }
+  }
+
+#pragma unroll
+  for (int i = 0; i < 27; ++i) s[i] = warp_reduce_sum(s[i]);
+  if (lane == 0) {
+#pragma unroll
+    for (int i = 0; i < 27; ++i) tile[i] = s[i];
+  }
+  __syncwarp();
+
+  const int A_sh = static_cast<int>(sp_A[spAB]);
+  const int B_sh = static_cast<int>(sp_B[spAB]);
+  const int C_sh = static_cast<int>(sp_A[spCD]);
+  const int D_sh = static_cast<int>(sp_B[spCD]);
+  const int a0 = static_cast<int>(shell_ao_start[A_sh]);
+  const int b0 = static_cast<int>(shell_ao_start[B_sh]);
+  const int c0 = static_cast<int>(shell_ao_start[C_sh]);
+  const int d0 = static_cast<int>(shell_ao_start[D_sh]);
+  const bool ab_neq = (A_sh != B_sh);
+  const bool cd_neq = (C_sh != D_sh);
+  const bool bk_swap = (spAB != spCD);
+  const double f_ab = ab_neq ? 2.0 : 1.0;
+  const double f_cd = cd_neq ? 2.0 : 1.0;
+  const int64_t N = static_cast<int64_t>(nao);
+
+  cueri_contract_fock_warp_single(
+      tile, D_mat, F_mat, lane,
+      nAB, nCD, nA, nB, nC, nD,
+      a0, b0, c0, d0,
+      ab_neq, cd_neq, bk_swap, f_ab, f_cd, N);
+  (void)sp_B;
+}
+
 }  // namespace
 
 extern "C" cudaError_t cueri_eri_psss_launch_stream(
@@ -3676,5 +4517,199 @@ extern "C" cudaError_t cueri_eri_pppp_multiblock_launch_stream(
                                                                                                   blocks_per_task,
                                                                                                   eri_out);
   }
+  return cudaGetLastError();
+}
+
+// ---------------------------------------------------------------------------
+// Fused ERI->Fock launchers (SPD dominant classes).
+// ---------------------------------------------------------------------------
+
+extern "C" cudaError_t cueri_fused_fock_psss_launch_stream(
+    const int32_t* task_spAB,
+    const int32_t* task_spCD,
+    int ntasks,
+    const int32_t* sp_A,
+    const int32_t* sp_B,
+    const int32_t* sp_pair_start,
+    const int32_t* sp_npair,
+    const double* shell_cx,
+    const double* shell_cy,
+    const double* shell_cz,
+    const double* pair_eta,
+    const double* pair_Px,
+    const double* pair_Py,
+    const double* pair_Pz,
+    const double* pair_cK,
+    const int32_t* shell_ao_start,
+    int nao,
+    const double* D_mat,
+    double* F_mat,
+    cudaStream_t stream,
+    int threads) {
+  if (ntasks < 0 || nao <= 0) return cudaErrorInvalidValue;
+  if (ntasks == 0) return cudaSuccess;
+  if (threads < 32 || (threads & 31) != 0) return cudaErrorInvalidValue;
+  const int warps_per_block = threads >> 5;
+  if (warps_per_block <= 0) return cudaErrorInvalidValue;
+  const int blocks = (ntasks + warps_per_block - 1) / warps_per_block;
+  const size_t shmem = static_cast<size_t>(warps_per_block) * 3u * sizeof(double);
+  KernelFusedFock_psss_warp<<<static_cast<unsigned int>(blocks), threads, shmem, stream>>>(
+      task_spAB, task_spCD, ntasks,
+      sp_A, sp_B, sp_pair_start, sp_npair,
+      shell_cx, shell_cy, shell_cz,
+      pair_eta, pair_Px, pair_Py, pair_Pz, pair_cK,
+      shell_ao_start, nao, D_mat, F_mat);
+  return cudaGetLastError();
+}
+
+extern "C" cudaError_t cueri_fused_fock_dsss_launch_stream(
+    const int32_t* task_spAB,
+    const int32_t* task_spCD,
+    int ntasks,
+    const int32_t* sp_A,
+    const int32_t* sp_B,
+    const int32_t* sp_pair_start,
+    const int32_t* sp_npair,
+    const double* shell_cx,
+    const double* shell_cy,
+    const double* shell_cz,
+    const double* pair_eta,
+    const double* pair_Px,
+    const double* pair_Py,
+    const double* pair_Pz,
+    const double* pair_cK,
+    const int32_t* shell_ao_start,
+    int nao,
+    const double* D_mat,
+    double* F_mat,
+    cudaStream_t stream,
+    int threads) {
+  if (ntasks < 0 || nao <= 0) return cudaErrorInvalidValue;
+  if (ntasks == 0) return cudaSuccess;
+  if (threads < 32 || (threads & 31) != 0) return cudaErrorInvalidValue;
+  const int warps_per_block = threads >> 5;
+  if (warps_per_block <= 0) return cudaErrorInvalidValue;
+  const int blocks = (ntasks + warps_per_block - 1) / warps_per_block;
+  const size_t shmem = static_cast<size_t>(warps_per_block) * 6u * sizeof(double);
+  KernelFusedFock_dsss_warp<<<static_cast<unsigned int>(blocks), threads, shmem, stream>>>(
+      task_spAB, task_spCD, ntasks,
+      sp_A, sp_B, sp_pair_start, sp_npair,
+      shell_cx, shell_cy, shell_cz,
+      pair_eta, pair_Px, pair_Py, pair_Pz, pair_cK,
+      shell_ao_start, nao, D_mat, F_mat);
+  return cudaGetLastError();
+}
+
+extern "C" cudaError_t cueri_fused_fock_ppss_launch_stream(
+    const int32_t* task_spAB,
+    const int32_t* task_spCD,
+    int ntasks,
+    const int32_t* sp_A,
+    const int32_t* sp_B,
+    const int32_t* sp_pair_start,
+    const int32_t* sp_npair,
+    const double* shell_cx,
+    const double* shell_cy,
+    const double* shell_cz,
+    const double* pair_eta,
+    const double* pair_Px,
+    const double* pair_Py,
+    const double* pair_Pz,
+    const double* pair_cK,
+    const int32_t* shell_ao_start,
+    int nao,
+    const double* D_mat,
+    double* F_mat,
+    cudaStream_t stream,
+    int threads) {
+  if (ntasks < 0 || nao <= 0) return cudaErrorInvalidValue;
+  if (ntasks == 0) return cudaSuccess;
+  if (threads < 32 || (threads & 31) != 0) return cudaErrorInvalidValue;
+  const int warps_per_block = threads >> 5;
+  if (warps_per_block <= 0) return cudaErrorInvalidValue;
+  const int blocks = (ntasks + warps_per_block - 1) / warps_per_block;
+  const size_t shmem = static_cast<size_t>(warps_per_block) * 9u * sizeof(double);
+  KernelFusedFock_ppss_warp<<<static_cast<unsigned int>(blocks), threads, shmem, stream>>>(
+      task_spAB, task_spCD, ntasks,
+      sp_A, sp_B, sp_pair_start, sp_npair,
+      shell_cx, shell_cy, shell_cz,
+      pair_eta, pair_Px, pair_Py, pair_Pz, pair_cK,
+      shell_ao_start, nao, D_mat, F_mat);
+  return cudaGetLastError();
+}
+
+extern "C" cudaError_t cueri_fused_fock_psps_launch_stream(
+    const int32_t* task_spAB,
+    const int32_t* task_spCD,
+    int ntasks,
+    const int32_t* sp_A,
+    const int32_t* sp_B,
+    const int32_t* sp_pair_start,
+    const int32_t* sp_npair,
+    const double* shell_cx,
+    const double* shell_cy,
+    const double* shell_cz,
+    const double* pair_eta,
+    const double* pair_Px,
+    const double* pair_Py,
+    const double* pair_Pz,
+    const double* pair_cK,
+    const int32_t* shell_ao_start,
+    int nao,
+    const double* D_mat,
+    double* F_mat,
+    cudaStream_t stream,
+    int threads) {
+  if (ntasks < 0 || nao <= 0) return cudaErrorInvalidValue;
+  if (ntasks == 0) return cudaSuccess;
+  if (threads < 32 || (threads & 31) != 0) return cudaErrorInvalidValue;
+  const int warps_per_block = threads >> 5;
+  if (warps_per_block <= 0) return cudaErrorInvalidValue;
+  const int blocks = (ntasks + warps_per_block - 1) / warps_per_block;
+  const size_t shmem = static_cast<size_t>(warps_per_block) * 9u * sizeof(double);
+  KernelFusedFock_psps_warp<<<static_cast<unsigned int>(blocks), threads, shmem, stream>>>(
+      task_spAB, task_spCD, ntasks,
+      sp_A, sp_B, sp_pair_start, sp_npair,
+      shell_cx, shell_cy, shell_cz,
+      pair_eta, pair_Px, pair_Py, pair_Pz, pair_cK,
+      shell_ao_start, nao, D_mat, F_mat);
+  return cudaGetLastError();
+}
+
+extern "C" cudaError_t cueri_fused_fock_ppps_launch_stream(
+    const int32_t* task_spAB,
+    const int32_t* task_spCD,
+    int ntasks,
+    const int32_t* sp_A,
+    const int32_t* sp_B,
+    const int32_t* sp_pair_start,
+    const int32_t* sp_npair,
+    const double* shell_cx,
+    const double* shell_cy,
+    const double* shell_cz,
+    const double* pair_eta,
+    const double* pair_Px,
+    const double* pair_Py,
+    const double* pair_Pz,
+    const double* pair_cK,
+    const int32_t* shell_ao_start,
+    int nao,
+    const double* D_mat,
+    double* F_mat,
+    cudaStream_t stream,
+    int threads) {
+  if (ntasks < 0 || nao <= 0) return cudaErrorInvalidValue;
+  if (ntasks == 0) return cudaSuccess;
+  if (threads < 32 || (threads & 31) != 0) return cudaErrorInvalidValue;
+  const int warps_per_block = threads >> 5;
+  if (warps_per_block <= 0) return cudaErrorInvalidValue;
+  const int blocks = (ntasks + warps_per_block - 1) / warps_per_block;
+  const size_t shmem = static_cast<size_t>(warps_per_block) * 27u * sizeof(double);
+  KernelFusedFock_ppps_warp<<<static_cast<unsigned int>(blocks), threads, shmem, stream>>>(
+      task_spAB, task_spCD, ntasks,
+      sp_A, sp_B, sp_pair_start, sp_npair,
+      shell_cx, shell_cy, shell_cz,
+      pair_eta, pair_Px, pair_Py, pair_Pz, pair_cK,
+      shell_ao_start, nao, D_mat, F_mat);
   return cudaGetLastError();
 }

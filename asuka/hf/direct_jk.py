@@ -41,10 +41,30 @@ class _SortedSlab:
     # Task arrays — either CuPy (gpu_resident) or numpy (cpu)
     ab_sorted: Any   # (ntasks_slab,) int32
     cd_sorted: Any   # (ntasks_slab,) int32
+    ntasks: int
     # Class group metadata (always CPU numpy — tiny)
     class_ids: np.ndarray  # (nclass,) int32
     offsets: np.ndarray    # (nclass+1,) int32
     gpu_resident: bool
+
+
+@dataclass(frozen=True)
+class _DirectJKGroupPlan:
+    """Immutable per-class execution plan for a slab."""
+
+    orig_cid: int
+    kernel_cid: int
+    transpose: bool
+    j0: int
+    j1: int
+    nA: int
+    nB: int
+    nC: int
+    nD: int
+    ncomp: int
+    chunk_ntasks: int
+    use_warp_eri: bool
+    use_warp_contract: bool
 
 
 @dataclass(frozen=True)
@@ -53,6 +73,7 @@ class DirectJKContext:
 
     ao_basis: Any
     nao: int
+    max_l: int
     # GPU-resident basis data
     dbasis: Any
     dsp: Any
@@ -64,11 +85,15 @@ class DirectJKContext:
     sp_class_lo_cpu: np.ndarray  # (nsp,) int32
     # Presorted task slabs
     slabs: tuple            # tuple[_SortedSlab, ...]
+    plans: tuple            # tuple[tuple[_DirectJKGroupPlan, ...], ...] aligned with slabs
     nsp: int
     ntasks: int
     eps_schwarz: float
     threads: int
     max_tile_bytes: int
+    gpu_task_budget_bytes_used: int
+    max_slab_tasks_used: int
+    max_cpu_slab_ntasks: int
 
 
 def _build_sorted_slab(
@@ -157,6 +182,7 @@ def _build_sorted_slab(
         return _SortedSlab(
             ab_sorted=ab_sorted_dev,
             cd_sorted=cd_sorted_dev,
+            ntasks=int(total),
             class_ids=class_ids_cpu,
             offsets=offsets_cpu,
             gpu_resident=True,
@@ -181,10 +207,104 @@ def _build_sorted_slab(
         return _SortedSlab(
             ab_sorted=ab_cpu,
             cd_sorted=cd_cpu,
+            ntasks=int(total),
             class_ids=class_ids_cpu,
             offsets=offsets_cpu,
             gpu_resident=False,
         )
+
+
+@dataclass
+class DirectJKWorkspace:
+    """Per-device persistent workspace for direct J/K builds."""
+
+    copy_stream: Any
+    upload_ab: list[Any]
+    upload_cd: list[Any]
+    upload_done: list[Any]
+    compute_done: list[Any]
+    max_ntasks: int
+
+
+_DIRECT_JK_WS_BY_DEVICE: dict[int, DirectJKWorkspace | None] = {}
+
+
+def release_direct_jk_workspace_cache() -> None:
+    """Release cached direct-JK workspaces."""
+
+    try:
+        _DIRECT_JK_WS_BY_DEVICE.clear()
+    except Exception:
+        pass
+
+
+def _get_direct_jk_workspace(cp, ctx: DirectJKContext) -> DirectJKWorkspace | None:
+    need = int(getattr(ctx, "max_cpu_slab_ntasks", 0) or 0)
+    if need <= 0:
+        return None
+    dev = int(cp.cuda.runtime.getDevice())
+    ws = _DIRECT_JK_WS_BY_DEVICE.get(dev)
+    if ws is not None and int(ws.max_ntasks) >= need:
+        return ws
+
+    # (Re)allocate upload buffers sized to the largest CPU slab in this context.
+    copy_stream = cp.cuda.Stream(non_blocking=True)
+    upload_ab = [cp.empty((need,), dtype=cp.int32), cp.empty((need,), dtype=cp.int32)]
+    upload_cd = [cp.empty((need,), dtype=cp.int32), cp.empty((need,), dtype=cp.int32)]
+    upload_done = [cp.cuda.Event(), cp.cuda.Event()]
+    compute_done = [cp.cuda.Event(), cp.cuda.Event()]
+    # Mark buffers as initially reusable.
+    cur = cp.cuda.get_current_stream()
+    compute_done[0].record(cur)
+    compute_done[1].record(cur)
+
+    ws = DirectJKWorkspace(
+        copy_stream=copy_stream,
+        upload_ab=upload_ab,
+        upload_cd=upload_cd,
+        upload_done=upload_done,
+        compute_done=compute_done,
+        max_ntasks=int(need),
+    )
+    _DIRECT_JK_WS_BY_DEVICE[dev] = ws
+    return ws
+
+
+def _auto_direct_jk_budgets(cp, *, max_slab_tasks: int | None, gpu_task_budget_bytes: int | None) -> tuple[int, int]:
+    """Return (max_slab_tasks, gpu_task_budget_bytes), filling autos for None."""
+
+    # Historical constants remain the defaults; passing None opts into auto.
+    max_slab_tasks_v = int(200_000_000) if max_slab_tasks is None else max(1, int(max_slab_tasks))
+    gpu_task_budget_bytes_v = int(2 << 30) if gpu_task_budget_bytes is None else max(0, int(gpu_task_budget_bytes))
+
+    if max_slab_tasks is not None and gpu_task_budget_bytes is not None:
+        return max_slab_tasks_v, gpu_task_budget_bytes_v
+
+    try:
+        free_bytes, total_bytes = cp.cuda.runtime.memGetInfo()
+        free_bytes = int(free_bytes)
+        total_bytes = int(total_bytes)
+    except Exception:
+        return max_slab_tasks_v, gpu_task_budget_bytes_v
+
+    # Headroom for matrices, pair tables, CuPy pool, and other phases.
+    headroom = max(2 << 30, int(0.10 * float(total_bytes)))
+    usable = max(0, free_bytes - int(headroom))
+
+    if gpu_task_budget_bytes is None:
+        gpu_task_budget_bytes_v = max(0, min(int(usable), int(0.45 * float(usable))))
+
+    if max_slab_tasks is None:
+        # Slab build is argsort-heavy and allocates several int64 temporaries.
+        # Keep a conservative scratch budget per slab.
+        scratch_budget = min(int(0.25 * float(usable)), 6 << 30)
+        upload_budget = min(int(0.10 * float(usable)), 3 << 30)
+        # Conservative per-task scratch model (~64 B/task) + double-buffer upload (16 B/task).
+        from_scratch = int(max(1, scratch_budget // 64))
+        from_upload = int(max(1, upload_budget // 16))
+        max_slab_tasks_v = int(min(200_000_000, max(5_000_000, min(from_scratch, from_upload))))
+
+    return int(max_slab_tasks_v), int(gpu_task_budget_bytes_v)
 
 
 def make_direct_jk_context(
@@ -193,8 +313,8 @@ def make_direct_jk_context(
     eps_schwarz: float = 1e-12,
     threads: int = 256,
     max_tile_bytes: int = 256 << 20,
-    max_slab_tasks: int = 200_000_000,
-    gpu_task_budget_bytes: int = 2 << 30,
+    max_slab_tasks: int | None = 200_000_000,
+    gpu_task_budget_bytes: int | None = 2 << 30,
 ) -> DirectJKContext:
     """One-time setup: build shell pairs, Schwarz bounds, and presorted task slabs.
 
@@ -210,10 +330,11 @@ def make_direct_jk_context(
         Maximum bytes for the integral tile buffer per chunk.
     max_slab_tasks
         Maximum tasks per slab (bounds peak GPU memory during context build).
-        Default 200 M ≈ 3.2 GB peak GPU for task arrays + sort workspace.
+        Pass None for an auto-selected value based on available VRAM.
     gpu_task_budget_bytes
         If a slab's task arrays fit within this budget (default 2 GB), they
         are kept GPU-resident for zero per-iteration H→D overhead.
+        Pass None for an auto-selected value based on available VRAM.
     """
 
     import cupy as cp  # noqa: PLC0415
@@ -239,10 +360,17 @@ def make_direct_jk_context(
     shell_l = np.asarray(ao_basis.shell_l, dtype=np.int32).ravel()
     if shell_l.size == 0:
         raise ValueError("AO basis has zero shells")
-    if int(shell_l.max()) > CUDA_MAX_L:
+    max_l = int(shell_l.max())
+    if max_l > CUDA_MAX_L:
         raise NotImplementedError(
             f"CUDA direct J/K supports only l<={CUDA_MAX_L} (nroots<={CUDA_MAX_NROOTS})"
         )
+
+    max_slab_tasks_i, gpu_task_budget_bytes_i = _auto_direct_jk_budgets(
+        cp,
+        max_slab_tasks=max_slab_tasks,
+        gpu_task_budget_bytes=gpu_task_budget_bytes,
+    )
 
     sp = build_shell_pairs_l_order(ao_basis)
     nsp = int(sp.sp_A.shape[0])
@@ -296,14 +424,15 @@ def make_direct_jk_context(
     # Build presorted slabs with cumulative GPU budget tracking
     slabs = []
     gpu_bytes_used = 0
+    max_cpu_slab_ntasks = 0
     slab_i0 = 0
     while slab_i0 < n_valid:
-        target = cumtasks_cpu[slab_i0] + max_slab_tasks
+        target = cumtasks_cpu[slab_i0] + int(max_slab_tasks_i)
         slab_i1 = int(np.searchsorted(cumtasks_cpu, target, side="right")) - 1
         slab_i1 = max(slab_i0 + 1, slab_i1)
         slab_i1 = min(slab_i1, n_valid)
 
-        remaining_gpu = max(0, int(gpu_task_budget_bytes) - gpu_bytes_used)
+        remaining_gpu = max(0, int(gpu_task_budget_bytes_i) - int(gpu_bytes_used))
         slab = _build_sorted_slab(
             perm32_dev, jmax_dev, sp_class_lo_dev,
             slab_i0, slab_i1,
@@ -312,6 +441,8 @@ def make_direct_jk_context(
         if slab is not None:
             if slab.gpu_resident:
                 gpu_bytes_used += slab.ab_sorted.nbytes + slab.cd_sorted.nbytes
+            else:
+                max_cpu_slab_ntasks = max(int(max_cpu_slab_ntasks), int(slab.ntasks))
             slabs.append(slab)
 
         slab_i0 = slab_i1
@@ -330,9 +461,50 @@ def make_direct_jk_context(
     shell_ao_start_np = np.asarray(ao_basis.shell_ao_start, dtype=np.int32).ravel()
     shell_ao_start_dev = cp.ascontiguousarray(cp.asarray(shell_ao_start_np, dtype=cp.int32))
 
+    # Precompute a per-slab execution plan so the hot loop is a simple executor.
+    from asuka.cueri.cart import ncart  # noqa: PLC0415
+    from asuka.cueri.eri_dispatch import resolve_kernel_class_id  # noqa: PLC0415
+    from asuka.cueri.tasks import decode_eri_class_id  # noqa: PLC0415
+
+    plans: list[tuple[_DirectJKGroupPlan, ...]] = []
+    for slab in slabs:
+        slab_plans: list[_DirectJKGroupPlan] = []
+        for g in range(int(slab.class_ids.shape[0])):
+            orig_cid = int(slab.class_ids[g])
+            j0 = int(slab.offsets[g])
+            j1 = int(slab.offsets[g + 1])
+            la, lb, lc, ld = decode_eri_class_id(orig_cid)
+            kernel_cid, transpose = resolve_kernel_class_id(orig_cid)
+            nA = int(ncart(int(la)))
+            nB = int(ncart(int(lb)))
+            nC = int(ncart(int(lc)))
+            nD = int(ncart(int(ld)))
+            ncomp = int(nA * nB * nC * nD)
+            chunk_ntasks = int(max(1, int(max_tile_bytes) // max(int(ncomp) * 8, 1)))
+            use_warp = bool(ncomp <= 128)
+            slab_plans.append(
+                _DirectJKGroupPlan(
+                    orig_cid=int(orig_cid),
+                    kernel_cid=int(kernel_cid),
+                    transpose=bool(transpose),
+                    j0=int(j0),
+                    j1=int(j1),
+                    nA=int(nA),
+                    nB=int(nB),
+                    nC=int(nC),
+                    nD=int(nD),
+                    ncomp=int(ncomp),
+                    chunk_ntasks=int(chunk_ntasks),
+                    use_warp_eri=bool(use_warp),
+                    use_warp_contract=bool(use_warp),
+                )
+            )
+        plans.append(tuple(slab_plans))
+
     return DirectJKContext(
         ao_basis=ao_basis,
         nao=int(nao),
+        max_l=int(max_l),
         dbasis=dbasis,
         dsp=dsp,
         pair_tables=pair_tables,
@@ -342,11 +514,15 @@ def make_direct_jk_context(
         sp_class_lo_dev=sp_class_lo_dev,
         sp_class_lo_cpu=sp_class_lo_cpu,
         slabs=tuple(slabs),
+        plans=tuple(plans),
         nsp=int(nsp),
         ntasks=int(ntasks),
         eps_schwarz=float(eps_f),
         threads=int(threads),
         max_tile_bytes=int(max_tile_bytes),
+        gpu_task_budget_bytes_used=int(gpu_task_budget_bytes_i),
+        max_slab_tasks_used=int(max_slab_tasks_i),
+        max_cpu_slab_ntasks=int(max_cpu_slab_ntasks),
     )
 
 
@@ -357,6 +533,7 @@ def direct_JK(
     want_J: bool = True,
     want_K: bool = True,
     profile: dict | None = None,
+    stats: dict | None = None,
 ):
     """Build J and K via streaming integral-direct 4-center evaluation.
 
@@ -389,13 +566,11 @@ def direct_JK(
     import cupy as cp  # noqa: PLC0415
 
     from asuka.cueri import _cueri_cuda_ext as _ext  # noqa: PLC0415
-    from asuka.cueri.cart import ncart  # noqa: PLC0415
-    from asuka.cueri.eri_dispatch import KernelBatch, resolve_kernel_class_id, run_kernel_batch_spd  # noqa: PLC0415
-    from asuka.cueri.tasks import TaskList, decode_eri_class_id  # noqa: PLC0415
+    from asuka.cueri.eri_dispatch import KernelBatch, run_kernel_batch_spd  # noqa: PLC0415
+    from asuka.cueri.tasks import TaskList  # noqa: PLC0415
 
     nao = ctx.nao
     threads = ctx.threads
-    max_tile_bytes = ctx.max_tile_bytes
 
     D_gpu = cp.asarray(D, dtype=cp.float64)
     if D_gpu.ndim != 2 or D_gpu.shape != (nao, nao):
@@ -405,43 +580,162 @@ def direct_JK(
     J_flat = cp.zeros((nao * nao,), dtype=cp.float64) if want_J else None
     K_flat = cp.zeros((nao * nao,), dtype=cp.float64) if want_K else None
 
-    stream_ptr = int(cp.cuda.get_current_stream().ptr)
+    compute_stream = cp.cuda.get_current_stream()
+    stream_ptr = int(compute_stream.ptr)
+    ws = _get_direct_jk_workspace(cp, ctx)
     n_kernel_calls = 0
     t0 = time.perf_counter()
 
-    for slab in ctx.slabs:
+    if stats is not None:
+        stats["direct_jk_ntasks"] = int(ctx.ntasks)
+        stats.setdefault("resident_ntasks", 0)
+        stats.setdefault("streamed_ntasks", 0)
+        stats.setdefault("bytes_uploaded", 0)
+        stats.setdefault("n_eval_calls", 0)
+        stats.setdefault("n_contract_calls", 0)
+        stats.setdefault("n_fused_calls", 0)
+        stats.setdefault("classes", {})
+
+    buf_slab: list[int | None] = [None, None]
+    cur_buf = 0
+
+    def _find_next_cpu(i: int) -> int | None:
+        for j in range(int(i) + 1, int(len(ctx.slabs))):
+            if not bool(ctx.slabs[j].gpu_resident):
+                return int(j)
+        return None
+
+    def _am_label(l: int) -> str:
+        am = "spdfghijklm"
+        li = int(l)
+        if 0 <= li < len(am):
+            return am[li]
+        return f"l{li}"
+
+    def _class_label(cid: int) -> str:
+        x = int(cid) & 0xFFFFFFFF
+        la = x & 0xFF
+        lb = (x >> 8) & 0xFF
+        lc = (x >> 16) & 0xFF
+        ld = (x >> 24) & 0xFF
+        return f"{_am_label(la)}{_am_label(lb)}{_am_label(lc)}{_am_label(ld)}"
+
+    def _enqueue_upload(slab_idx: int, buf_idx: int) -> None:
+        assert ws is not None
+        # Ensure we don't overwrite a buffer that compute is still reading.
+        ws.copy_stream.wait_event(ws.compute_done[int(buf_idx)])
+
+        slab_u = ctx.slabs[int(slab_idx)]
+        nt = int(slab_u.ntasks)
+        if nt <= 0:
+            buf_slab[int(buf_idx)] = int(slab_idx)
+            ws.upload_done[int(buf_idx)].record(ws.copy_stream)
+            return
+        if nt > int(ws.max_ntasks):
+            raise RuntimeError(
+                f"DirectJKWorkspace upload buffer too small: need ntasks={nt}, have {int(ws.max_ntasks)}"
+            )
+        ab_host = np.asarray(slab_u.ab_sorted, dtype=np.int32, order="C")
+        cd_host = np.asarray(slab_u.cd_sorted, dtype=np.int32, order="C")
+        dst_ab = ws.upload_ab[int(buf_idx)]
+        dst_cd = ws.upload_cd[int(buf_idx)]
+        stream_h2d = int(ws.copy_stream.ptr)
+        cp.cuda.runtime.memcpyAsync(
+            int(dst_ab.data.ptr),
+            int(ab_host.ctypes.data),
+            int(nt * 4),
+            cp.cuda.runtime.memcpyHostToDevice,
+            stream_h2d,
+        )
+        cp.cuda.runtime.memcpyAsync(
+            int(dst_cd.data.ptr),
+            int(cd_host.ctypes.data),
+            int(nt * 4),
+            cp.cuda.runtime.memcpyHostToDevice,
+            stream_h2d,
+        )
+        ws.upload_done[int(buf_idx)].record(ws.copy_stream)
+        buf_slab[int(buf_idx)] = int(slab_idx)
+        if stats is not None:
+            stats["bytes_uploaded"] = int(stats.get("bytes_uploaded", 0)) + int(nt * 8)
+
+    for slab_i, slab in enumerate(ctx.slabs):
+        slab_i = int(slab_i)
+
+        # Prefetch the next CPU slab during GPU-resident slab compute when possible.
+        if ws is not None and bool(slab.gpu_resident):
+            nxt = _find_next_cpu(slab_i)
+            if nxt is not None and nxt not in buf_slab:
+                free_buf = 0 if buf_slab[0] is None else (1 if buf_slab[1] is None else None)
+                if free_buf is not None:
+                    _enqueue_upload(int(nxt), int(free_buf))
+
+        used_buf: int | None = None
         if slab.gpu_resident:
-            # Task arrays already on GPU — zero H→D cost
             ab_dev = slab.ab_sorted
             cd_dev = slab.cd_sorted
-            owned = False
+            if stats is not None:
+                stats["resident_ntasks"] = int(stats.get("resident_ntasks", 0)) + int(slab.ntasks)
         else:
-            # H→D: upload presorted task indices from CPU
-            ab_dev = cp.ascontiguousarray(cp.asarray(slab.ab_sorted, dtype=cp.int32))
-            cd_dev = cp.ascontiguousarray(cp.asarray(slab.cd_sorted, dtype=cp.int32))
-            owned = True
+            if stats is not None:
+                stats["streamed_ntasks"] = int(stats.get("streamed_ntasks", 0)) + int(slab.ntasks)
+            if ws is None:
+                # Fallback: synchronous upload.
+                ab_dev = cp.ascontiguousarray(cp.asarray(slab.ab_sorted, dtype=cp.int32))
+                cd_dev = cp.ascontiguousarray(cp.asarray(slab.cd_sorted, dtype=cp.int32))
+                if stats is not None:
+                    stats["bytes_uploaded"] = int(stats.get("bytes_uploaded", 0)) + int(slab.ntasks * 8)
+            else:
+                # Ensure current slab is uploaded into one of the two buffers.
+                if slab_i in buf_slab:
+                    cur_buf = int(buf_slab.index(slab_i))
+                else:
+                    if buf_slab[int(cur_buf)] is not None:
+                        cur_buf = 1 - int(cur_buf)
+                    _enqueue_upload(int(slab_i), int(cur_buf))
 
-        for g in range(int(slab.class_ids.shape[0])):
-            orig_cid = int(slab.class_ids[g])
-            j0, j1 = int(slab.offsets[g]), int(slab.offsets[g + 1])
+                # Prefetch the next CPU slab into the other buffer (copy stream).
+                nxt = _find_next_cpu(slab_i)
+                other = 1 - int(cur_buf)
+                if nxt is not None and nxt not in buf_slab and buf_slab[int(other)] is None:
+                    _enqueue_upload(int(nxt), int(other))
+
+                # Wait for H2D completion on the compute stream.
+                compute_stream.wait_event(ws.upload_done[int(cur_buf)])
+                nt = int(slab.ntasks)
+                ab_dev = ws.upload_ab[int(cur_buf)][:nt]
+                cd_dev = ws.upload_cd[int(cur_buf)][:nt]
+                used_buf = int(cur_buf)
+
+        slab_plan = ctx.plans[slab_i]
+        for gp in slab_plan:
+            orig_cid = int(gp.orig_cid)
+            j0, j1 = int(gp.j0), int(gp.j1)
             if j1 <= j0:
                 continue
 
-            la, lb, lc, ld = decode_eri_class_id(orig_cid)
-            kernel_cid, transpose = resolve_kernel_class_id(orig_cid)
-
-            nA = int(ncart(la))
-            nB = int(ncart(lb))
-            nC = int(ncart(lc))
-            nD = int(ncart(ld))
-            ncomp = nA * nB * nC * nD
-            chunk_ntasks = max(1, max_tile_bytes // max(ncomp * 8, 1))
-            use_warp_mode = ncomp <= 128
+            kernel_cid = int(gp.kernel_cid)
+            transpose = bool(gp.transpose)
+            nA = int(gp.nA)
+            nB = int(gp.nB)
+            nC = int(gp.nC)
+            nD = int(gp.nD)
+            chunk_ntasks = int(gp.chunk_ntasks)
+            use_warp_mode = bool(gp.use_warp_eri)
+            use_warp_contract = bool(gp.use_warp_contract)
 
             kernel_spAB_full = cd_dev[j0:j1] if transpose else ab_dev[j0:j1]
             kernel_spCD_full = ab_dev[j0:j1] if transpose else cd_dev[j0:j1]
 
             class_ntasks = j1 - j0
+            if stats is not None:
+                cls = _class_label(orig_cid)
+                row = stats.setdefault("classes", {}).setdefault(cls, {"ntasks": 0, "chunks": 0, "path": ""})
+                row["ntasks"] = int(row.get("ntasks", 0)) + int(class_ntasks)
+                row["chunks"] = int(row.get("chunks", 0)) + int((class_ntasks + chunk_ntasks - 1) // chunk_ntasks)
+                path = "fused_ssss" if int(orig_cid) == 0 else "staged"
+                prev = str(row.get("path", "") or "")
+                row["path"] = path if (not prev or prev == path) else "mixed"
 
             # --- Fused ssss+JK path (D3 partial): skip tile alloc entirely ---
             if orig_cid == 0:
@@ -476,6 +770,8 @@ def direct_JK(
                         False,
                         False,  # fast_boys
                     )
+                    if stats is not None:
+                        stats["n_fused_calls"] = int(stats.get("n_fused_calls", 0)) + 1
                     if profile is not None:
                         _tc1.record()
                         _tc1.synchronize()
@@ -511,18 +807,26 @@ def direct_JK(
                     skip_transpose=True,
                 )
                 n_kernel_calls += 1
+                if stats is not None:
+                    stats["n_eval_calls"] = int(stats.get("n_eval_calls", 0)) + 1
 
                 if profile is not None:
                     _tc0 = cp.cuda.Event()
                     _tc1 = cp.cuda.Event()
                     _tc0.record()
 
+                contract_fn = (
+                    _ext.contract_jk_tiles_ordered_warp_inplace_device
+                    if use_warp_contract
+                    else _ext.contract_jk_tiles_ordered_inplace_device
+                )
+
                 # When transpose=True, the kernel produced tiles in
                 # (nCD_orig, nAB_orig) layout.  Instead of transposing +
                 # copying tiles, swap nA/nB/nC/nD and shell-pair arrays
                 # passed to the contraction kernel.
                 if transpose:
-                    _ext.contract_jk_tiles_ordered_warp_inplace_device(
+                    contract_fn(
                         cd_dev[j0 + c0: j0 + c1],
                         ab_dev[j0 + c0: j0 + c1],
                         ctx.sp_A_dev,
@@ -542,7 +846,7 @@ def direct_JK(
                         False,
                     )
                 else:
-                    _ext.contract_jk_tiles_ordered_warp_inplace_device(
+                    contract_fn(
                         ab_dev[j0 + c0: j0 + c1],
                         cd_dev[j0 + c0: j0 + c1],
                         ctx.sp_A_dev,
@@ -561,6 +865,8 @@ def direct_JK(
                         int(stream_ptr),
                         False,
                     )
+                if stats is not None:
+                    stats["n_contract_calls"] = int(stats.get("n_contract_calls", 0)) + 1
 
                 if profile is not None:
                     _tc1.record()
@@ -569,8 +875,12 @@ def direct_JK(
                         cp.cuda.get_elapsed_time(_tc0, _tc1)
                     )
 
-        if owned:
-            del ab_dev, cd_dev
+        if used_buf is not None and ws is not None:
+            # Prevent buffer reuse until all compute that reads it is complete.
+            ws.compute_done[int(used_buf)].record(compute_stream)
+            if slab_i in buf_slab:
+                bi = int(buf_slab.index(slab_i))
+                buf_slab[bi] = None
 
     J = None
     K = None
@@ -589,6 +899,375 @@ def direct_JK(
     return J, K
 
 
+def direct_fock_rhf(
+    ctx: DirectJKContext,
+    D,
+    hcore,
+    *,
+    profile: dict | None = None,
+    stats: dict | None = None,
+):
+    """Build the RHF Fock matrix directly: F = h + J(D) - 0.5 * K(D).
+
+    This is an SCF-specific convenience that avoids allocating materialized
+    J and K outputs.
+    """
+
+    import cupy as cp  # noqa: PLC0415
+
+    from asuka.cueri import _cueri_cuda_ext as _ext  # noqa: PLC0415
+    from asuka.cueri.eri_dispatch import KernelBatch, run_kernel_batch_spd  # noqa: PLC0415
+    from asuka.cueri.tasks import TaskList  # noqa: PLC0415
+    import os  # noqa: PLC0415
+
+    nao = ctx.nao
+    threads = ctx.threads
+
+    D_gpu = cp.asarray(D, dtype=cp.float64)
+    if D_gpu.ndim != 2 or D_gpu.shape != (nao, nao):
+        raise ValueError(f"D must be ({nao}, {nao}), got {tuple(D_gpu.shape)}")
+    D_flat = cp.ascontiguousarray(D_gpu.ravel())
+
+    h_gpu = cp.asarray(hcore, dtype=cp.float64)
+    if h_gpu.ndim != 2 or h_gpu.shape != (nao, nao):
+        raise ValueError(f"hcore must be ({nao}, {nao}), got {tuple(h_gpu.shape)}")
+    F_flat = cp.ascontiguousarray(h_gpu.ravel()).copy()
+
+    compute_stream = cp.cuda.get_current_stream()
+    stream_ptr = int(compute_stream.ptr)
+    ws = _get_direct_jk_workspace(cp, ctx)
+    n_kernel_calls = 0
+    t0 = time.perf_counter()
+
+    if stats is not None:
+        stats["direct_jk_ntasks"] = int(ctx.ntasks)
+        stats.setdefault("resident_ntasks", 0)
+        stats.setdefault("streamed_ntasks", 0)
+        stats.setdefault("bytes_uploaded", 0)
+        stats.setdefault("n_eval_calls", 0)
+        stats.setdefault("n_contract_calls", 0)
+        stats.setdefault("n_fused_calls", 0)
+        stats.setdefault("fused_ntasks", 0)
+        stats.setdefault("classes", {})
+
+    buf_slab: list[int | None] = [None, None]
+    cur_buf = 0
+
+    def _find_next_cpu(i: int) -> int | None:
+        for j in range(int(i) + 1, int(len(ctx.slabs))):
+            if not bool(ctx.slabs[j].gpu_resident):
+                return int(j)
+        return None
+
+    def _am_label(l: int) -> str:
+        am = "spdfghijklm"
+        li = int(l)
+        if 0 <= li < len(am):
+            return am[li]
+        return f"l{li}"
+
+    def _class_label(cid: int) -> str:
+        x = int(cid) & 0xFFFFFFFF
+        la = x & 0xFF
+        lb = (x >> 8) & 0xFF
+        lc = (x >> 16) & 0xFF
+        ld = (x >> 24) & 0xFF
+        return f"{_am_label(la)}{_am_label(lb)}{_am_label(lc)}{_am_label(ld)}"
+
+    sp_pair_start_fused = ctx.dsp.sp_pair_start
+    if int(sp_pair_start_fused.shape[0]) == int(ctx.dsp.sp_npair.shape[0]) + 1:
+        # Some contexts store a sentinel end entry (nsp+1); fused CUDA APIs expect nsp.
+        sp_pair_start_fused = sp_pair_start_fused[:-1]
+
+    # All fused kernels use warp-per-task pattern.
+    # ssss: scalar ERI + direct Fock (cueri_cuda_kernels.cu)
+    # psss/dsss/ppss/psps/ppps: explicit Boys derivatives (step2.cu)
+    # ddss/ssdp/psds/psdp/psdd/ppds/dsds/dsdp: Rys quadrature, converted
+    #   from block-per-task to warp-per-task (wave1/wave2 generated files)
+    fused_default = {
+        "ssss", "psss", "dsss", "ppss", "psps", "ppps",
+        "ddss", "ssdp", "psds", "psdp", "ppds", "dsds", "dsdp", "psdd",
+    }
+    fused_enabled = set(fused_default)
+    fused_flag = str(os.environ.get("ASUKA_DIRECT_FOCK_FUSED", "") or "").strip().lower()
+    if fused_flag in ("0", "false", "off", "no"):
+        fused_enabled.clear()
+    fused_only = str(os.environ.get("ASUKA_DIRECT_FOCK_FUSED_ONLY", "") or "").strip()
+    if fused_only:
+        fused_enabled = {x.strip().lower() for x in fused_only.replace(" ", ",").split(",") if x.strip()}
+    fused_disable = str(os.environ.get("ASUKA_DIRECT_FOCK_FUSED_DISABLE", "") or "").strip()
+    if fused_disable:
+        fused_enabled -= {x.strip().lower() for x in fused_disable.replace(" ", ",").split(",") if x.strip()}
+    fused_enable = str(os.environ.get("ASUKA_DIRECT_FOCK_FUSED_ENABLE", "") or "").strip()
+    if fused_enable:
+        fused_enabled |= {x.strip().lower() for x in fused_enable.replace(" ", ",").split(",") if x.strip()}
+
+    def _enqueue_upload(slab_idx: int, buf_idx: int) -> None:
+        assert ws is not None
+        # Ensure we don't overwrite a buffer that compute is still reading.
+        ws.copy_stream.wait_event(ws.compute_done[int(buf_idx)])
+
+        slab_u = ctx.slabs[int(slab_idx)]
+        nt = int(slab_u.ntasks)
+        if nt <= 0:
+            buf_slab[int(buf_idx)] = int(slab_idx)
+            ws.upload_done[int(buf_idx)].record(ws.copy_stream)
+            return
+        if nt > int(ws.max_ntasks):
+            raise RuntimeError(
+                f"DirectJKWorkspace upload buffer too small: need ntasks={nt}, have {int(ws.max_ntasks)}"
+            )
+        ab_host = np.asarray(slab_u.ab_sorted, dtype=np.int32, order="C")
+        cd_host = np.asarray(slab_u.cd_sorted, dtype=np.int32, order="C")
+        dst_ab = ws.upload_ab[int(buf_idx)]
+        dst_cd = ws.upload_cd[int(buf_idx)]
+        stream_h2d = int(ws.copy_stream.ptr)
+        cp.cuda.runtime.memcpyAsync(
+            int(dst_ab.data.ptr),
+            int(ab_host.ctypes.data),
+            int(nt * 4),
+            cp.cuda.runtime.memcpyHostToDevice,
+            stream_h2d,
+        )
+        cp.cuda.runtime.memcpyAsync(
+            int(dst_cd.data.ptr),
+            int(cd_host.ctypes.data),
+            int(nt * 4),
+            cp.cuda.runtime.memcpyHostToDevice,
+            stream_h2d,
+        )
+        ws.upload_done[int(buf_idx)].record(ws.copy_stream)
+        buf_slab[int(buf_idx)] = int(slab_idx)
+        if stats is not None:
+            stats["bytes_uploaded"] = int(stats.get("bytes_uploaded", 0)) + int(nt * 8)
+
+    for slab_i, slab in enumerate(ctx.slabs):
+        slab_i = int(slab_i)
+
+        # Prefetch the next CPU slab during GPU-resident slab compute when possible.
+        if ws is not None and bool(slab.gpu_resident):
+            nxt = _find_next_cpu(slab_i)
+            if nxt is not None and nxt not in buf_slab:
+                free_buf = 0 if buf_slab[0] is None else (1 if buf_slab[1] is None else None)
+                if free_buf is not None:
+                    _enqueue_upload(int(nxt), int(free_buf))
+
+        used_buf: int | None = None
+        if slab.gpu_resident:
+            ab_dev = slab.ab_sorted
+            cd_dev = slab.cd_sorted
+            if stats is not None:
+                stats["resident_ntasks"] = int(stats.get("resident_ntasks", 0)) + int(slab.ntasks)
+        else:
+            if stats is not None:
+                stats["streamed_ntasks"] = int(stats.get("streamed_ntasks", 0)) + int(slab.ntasks)
+            if ws is None:
+                # Fallback: synchronous upload.
+                ab_dev = cp.ascontiguousarray(cp.asarray(slab.ab_sorted, dtype=cp.int32))
+                cd_dev = cp.ascontiguousarray(cp.asarray(slab.cd_sorted, dtype=cp.int32))
+                if stats is not None:
+                    stats["bytes_uploaded"] = int(stats.get("bytes_uploaded", 0)) + int(slab.ntasks * 8)
+            else:
+                # Ensure current slab is uploaded into one of the two buffers.
+                if slab_i in buf_slab:
+                    cur_buf = int(buf_slab.index(slab_i))
+                else:
+                    if buf_slab[int(cur_buf)] is not None:
+                        cur_buf = 1 - int(cur_buf)
+                    _enqueue_upload(int(slab_i), int(cur_buf))
+
+                # Prefetch the next CPU slab into the other buffer (copy stream).
+                nxt = _find_next_cpu(slab_i)
+                other = 1 - int(cur_buf)
+                if nxt is not None and nxt not in buf_slab and buf_slab[int(other)] is None:
+                    _enqueue_upload(int(nxt), int(other))
+
+                # Wait for H2D completion on the compute stream.
+                compute_stream.wait_event(ws.upload_done[int(cur_buf)])
+                nt = int(slab.ntasks)
+                ab_dev = ws.upload_ab[int(cur_buf)][:nt]
+                cd_dev = ws.upload_cd[int(cur_buf)][:nt]
+                used_buf = int(cur_buf)
+
+        slab_plan = ctx.plans[slab_i]
+        for gp in slab_plan:
+            orig_cid = int(gp.orig_cid)
+            j0, j1 = int(gp.j0), int(gp.j1)
+            if j1 <= j0:
+                continue
+
+            kernel_cid = int(gp.kernel_cid)
+            transpose = bool(gp.transpose)
+            nA = int(gp.nA)
+            nB = int(gp.nB)
+            nC = int(gp.nC)
+            nD = int(gp.nD)
+            chunk_ntasks = int(gp.chunk_ntasks)
+            use_warp_mode = bool(gp.use_warp_eri)
+            use_warp_contract = bool(gp.use_warp_contract)
+
+            kernel_spAB_full = cd_dev[j0:j1] if transpose else ab_dev[j0:j1]
+            kernel_spCD_full = ab_dev[j0:j1] if transpose else cd_dev[j0:j1]
+
+            class_ntasks = j1 - j0
+            klabel = _class_label(kernel_cid).lower()
+            fused_fn = None
+            use_fused = False
+            if klabel in fused_enabled:
+                fused_fn = getattr(_ext, f"fused_fock_{klabel}_inplace_device", None)
+                use_fused = fused_fn is not None
+
+            if stats is not None:
+                cls = _class_label(orig_cid)
+                row = stats.setdefault("classes", {}).setdefault(cls, {"ntasks": 0, "chunks": 0, "path": ""})
+                row["ntasks"] = int(row.get("ntasks", 0)) + int(class_ntasks)
+                if use_fused:
+                    row["chunks"] = int(row.get("chunks", 0)) + 1
+                else:
+                    row["chunks"] = int(row.get("chunks", 0)) + int((class_ntasks + chunk_ntasks - 1) // chunk_ntasks)
+                path = "fock_fused" if use_fused else "fock_staged"
+                prev = str(row.get("path", "") or "")
+                row["path"] = path if (not prev or prev == path) else "mixed"
+
+            if use_fused and fused_fn is not None:
+                # One fused kernel per class group (no tile allocation / contraction launch).
+                fused_fn(
+                    kernel_spAB_full,
+                    kernel_spCD_full,
+                    ctx.dsp.sp_A,
+                    ctx.dsp.sp_B,
+                    sp_pair_start_fused,
+                    ctx.dsp.sp_npair,
+                    ctx.dbasis.shell_cx,
+                    ctx.dbasis.shell_cy,
+                    ctx.dbasis.shell_cz,
+                    ctx.pair_tables.pair_eta,
+                    ctx.pair_tables.pair_Px,
+                    ctx.pair_tables.pair_Py,
+                    ctx.pair_tables.pair_Pz,
+                    ctx.pair_tables.pair_cK,
+                    ctx.shell_ao_start_dev,
+                    int(nao),
+                    D_flat,
+                    F_flat,
+                    int(threads),
+                    int(stream_ptr),
+                    False,
+                )
+                n_kernel_calls += 1
+                if stats is not None:
+                    stats["n_fused_calls"] = int(stats.get("n_fused_calls", 0)) + 1
+                    stats["n_eval_calls"] = int(stats.get("n_eval_calls", 0)) + 1
+                    stats["fused_ntasks"] = int(stats.get("fused_ntasks", 0)) + int(class_ntasks)
+                continue
+
+            for c0 in range(0, class_ntasks, chunk_ntasks):
+                c1 = min(class_ntasks, c0 + chunk_ntasks)
+                if c1 <= c0:
+                    continue
+
+                sub_batch = KernelBatch(
+                    task_idx=np.empty(0, dtype=np.int32),  # unused by run_kernel_batch_spd
+                    kernel_tasks=TaskList(
+                        task_spAB=kernel_spAB_full[c0:c1],
+                        task_spCD=kernel_spCD_full[c0:c1],
+                    ),
+                    kernel_class_id=np.int32(kernel_cid),
+                    transpose=transpose,
+                )
+
+                tiles = run_kernel_batch_spd(
+                    sub_batch,
+                    dbasis=ctx.dbasis,
+                    dsp=ctx.dsp,
+                    pt=ctx.pair_tables,
+                    stream=None,
+                    threads=threads,
+                    mode="warp" if use_warp_mode else "auto",
+                    profile=profile,
+                    skip_transpose=True,
+                )
+                n_kernel_calls += 1
+                if stats is not None:
+                    stats["n_eval_calls"] = int(stats.get("n_eval_calls", 0)) + 1
+
+                if profile is not None:
+                    _tc0 = cp.cuda.Event()
+                    _tc1 = cp.cuda.Event()
+                    _tc0.record()
+
+                contract_fn = (
+                    _ext.contract_fock_tiles_ordered_warp_inplace_device
+                    if use_warp_contract
+                    else _ext.contract_fock_tiles_ordered_inplace_device
+                )
+
+                if transpose:
+                    contract_fn(
+                        cd_dev[j0 + c0: j0 + c1],
+                        ab_dev[j0 + c0: j0 + c1],
+                        ctx.sp_A_dev,
+                        ctx.sp_B_dev,
+                        ctx.shell_ao_start_dev,
+                        int(nao),
+                        int(nC),
+                        int(nD),
+                        int(nA),
+                        int(nB),
+                        tiles.ravel(),
+                        D_flat,
+                        F_flat,
+                        int(threads),
+                        int(stream_ptr),
+                        False,
+                    )
+                else:
+                    contract_fn(
+                        ab_dev[j0 + c0: j0 + c1],
+                        cd_dev[j0 + c0: j0 + c1],
+                        ctx.sp_A_dev,
+                        ctx.sp_B_dev,
+                        ctx.shell_ao_start_dev,
+                        int(nao),
+                        int(nA),
+                        int(nB),
+                        int(nC),
+                        int(nD),
+                        tiles.ravel(),
+                        D_flat,
+                        F_flat,
+                        int(threads),
+                        int(stream_ptr),
+                        False,
+                    )
+                if stats is not None:
+                    stats["n_contract_calls"] = int(stats.get("n_contract_calls", 0)) + 1
+
+                if profile is not None:
+                    _tc1.record()
+                    _tc1.synchronize()
+                    profile["contract_ms"] = float(profile.get("contract_ms", 0.0)) + float(
+                        cp.cuda.get_elapsed_time(_tc0, _tc1)
+                    )
+
+        if used_buf is not None and ws is not None:
+            # Prevent buffer reuse until all compute that reads it is complete.
+            ws.compute_done[int(used_buf)].record(compute_stream)
+            if slab_i in buf_slab:
+                bi = int(buf_slab.index(slab_i))
+                buf_slab[bi] = None
+
+    F = F_flat.reshape((nao, nao))
+    F = 0.5 * (F + F.T)
+
+    if profile is not None:
+        profile["direct_fock_t_s"] = float(time.perf_counter() - t0)
+        profile["direct_fock_kernel_calls"] = int(n_kernel_calls)
+        profile["direct_fock_ntasks"] = int(ctx.ntasks)
+
+    return F
+
+
 def direct_JK_multi(
     ctx: DirectJKContext,
     Da,
@@ -597,6 +1276,7 @@ def direct_JK_multi(
     want_J: bool = True,
     want_K: bool = True,
     profile: dict | None = None,
+    stats: dict | None = None,
 ):
     """Build (Ja, Ka, Jb, Kb) evaluating each ERI tile once.
 
@@ -623,13 +1303,11 @@ def direct_JK_multi(
     import cupy as cp  # noqa: PLC0415
 
     from asuka.cueri import _cueri_cuda_ext as _ext  # noqa: PLC0415
-    from asuka.cueri.cart import ncart  # noqa: PLC0415
-    from asuka.cueri.eri_dispatch import KernelBatch, resolve_kernel_class_id, run_kernel_batch_spd  # noqa: PLC0415
-    from asuka.cueri.tasks import TaskList, decode_eri_class_id  # noqa: PLC0415
+    from asuka.cueri.eri_dispatch import KernelBatch, run_kernel_batch_spd  # noqa: PLC0415
+    from asuka.cueri.tasks import TaskList  # noqa: PLC0415
 
     nao = ctx.nao
     threads = ctx.threads
-    max_tile_bytes = ctx.max_tile_bytes
 
     Da_gpu = cp.asarray(Da, dtype=cp.float64)
     if Da_gpu.ndim != 2 or Da_gpu.shape != (nao, nao):
@@ -647,48 +1325,170 @@ def direct_JK_multi(
     Jb_flat = cp.zeros((nao2,), dtype=cp.float64) if want_J else None
     Kb_flat = cp.zeros((nao2,), dtype=cp.float64) if want_K else None
 
-    stream_ptr = int(cp.cuda.get_current_stream().ptr)
+    compute_stream = cp.cuda.get_current_stream()
+    stream_ptr = int(compute_stream.ptr)
+    ws = _get_direct_jk_workspace(cp, ctx)
     n_kernel_calls = 0
     t0 = time.perf_counter()
 
-    for slab in ctx.slabs:
+    if stats is not None:
+        stats["direct_jk_ntasks"] = int(ctx.ntasks)
+        stats.setdefault("resident_ntasks", 0)
+        stats.setdefault("streamed_ntasks", 0)
+        stats.setdefault("bytes_uploaded", 0)
+        stats.setdefault("n_eval_calls", 0)
+        stats.setdefault("n_contract_calls", 0)
+        stats.setdefault("n_fused_calls", 0)
+        stats.setdefault("classes", {})
+
+    buf_slab: list[int | None] = [None, None]
+    cur_buf = 0
+
+    def _find_next_cpu(i: int) -> int | None:
+        for j in range(int(i) + 1, int(len(ctx.slabs))):
+            if not bool(ctx.slabs[j].gpu_resident):
+                return int(j)
+        return None
+
+    def _am_label(l: int) -> str:
+        am = "spdfghijklm"
+        li = int(l)
+        if 0 <= li < len(am):
+            return am[li]
+        return f"l{li}"
+
+    def _class_label(cid: int) -> str:
+        x = int(cid) & 0xFFFFFFFF
+        la = x & 0xFF
+        lb = (x >> 8) & 0xFF
+        lc = (x >> 16) & 0xFF
+        ld = (x >> 24) & 0xFF
+        return f"{_am_label(la)}{_am_label(lb)}{_am_label(lc)}{_am_label(ld)}"
+
+    def _enqueue_upload(slab_idx: int, buf_idx: int) -> None:
+        assert ws is not None
+        # Ensure we don't overwrite a buffer that compute is still reading.
+        ws.copy_stream.wait_event(ws.compute_done[int(buf_idx)])
+
+        slab_u = ctx.slabs[int(slab_idx)]
+        nt = int(slab_u.ntasks)
+        if nt <= 0:
+            buf_slab[int(buf_idx)] = int(slab_idx)
+            ws.upload_done[int(buf_idx)].record(ws.copy_stream)
+            return
+        if nt > int(ws.max_ntasks):
+            raise RuntimeError(
+                f"DirectJKWorkspace upload buffer too small: need ntasks={nt}, have {int(ws.max_ntasks)}"
+            )
+        ab_host = np.asarray(slab_u.ab_sorted, dtype=np.int32, order="C")
+        cd_host = np.asarray(slab_u.cd_sorted, dtype=np.int32, order="C")
+        dst_ab = ws.upload_ab[int(buf_idx)]
+        dst_cd = ws.upload_cd[int(buf_idx)]
+        stream_h2d = int(ws.copy_stream.ptr)
+        cp.cuda.runtime.memcpyAsync(
+            int(dst_ab.data.ptr),
+            int(ab_host.ctypes.data),
+            int(nt * 4),
+            cp.cuda.runtime.memcpyHostToDevice,
+            stream_h2d,
+        )
+        cp.cuda.runtime.memcpyAsync(
+            int(dst_cd.data.ptr),
+            int(cd_host.ctypes.data),
+            int(nt * 4),
+            cp.cuda.runtime.memcpyHostToDevice,
+            stream_h2d,
+        )
+        ws.upload_done[int(buf_idx)].record(ws.copy_stream)
+        buf_slab[int(buf_idx)] = int(slab_idx)
+        if stats is not None:
+            stats["bytes_uploaded"] = int(stats.get("bytes_uploaded", 0)) + int(nt * 8)
+
+    for slab_i, slab in enumerate(ctx.slabs):
+        slab_i = int(slab_i)
+
+        # Prefetch the next CPU slab during GPU-resident slab compute when possible.
+        if ws is not None and bool(slab.gpu_resident):
+            nxt = _find_next_cpu(slab_i)
+            if nxt is not None and nxt not in buf_slab:
+                free_buf = 0 if buf_slab[0] is None else (1 if buf_slab[1] is None else None)
+                if free_buf is not None:
+                    _enqueue_upload(int(nxt), int(free_buf))
+
+        used_buf: int | None = None
         if slab.gpu_resident:
             ab_dev = slab.ab_sorted
             cd_dev = slab.cd_sorted
-            owned = False
+            if stats is not None:
+                stats["resident_ntasks"] = int(stats.get("resident_ntasks", 0)) + int(slab.ntasks)
         else:
-            ab_dev = cp.ascontiguousarray(cp.asarray(slab.ab_sorted, dtype=cp.int32))
-            cd_dev = cp.ascontiguousarray(cp.asarray(slab.cd_sorted, dtype=cp.int32))
-            owned = True
+            if stats is not None:
+                stats["streamed_ntasks"] = int(stats.get("streamed_ntasks", 0)) + int(slab.ntasks)
+            if ws is None:
+                # Fallback: synchronous upload.
+                ab_dev = cp.ascontiguousarray(cp.asarray(slab.ab_sorted, dtype=cp.int32))
+                cd_dev = cp.ascontiguousarray(cp.asarray(slab.cd_sorted, dtype=cp.int32))
+                if stats is not None:
+                    stats["bytes_uploaded"] = int(stats.get("bytes_uploaded", 0)) + int(slab.ntasks * 8)
+            else:
+                # Ensure current slab is uploaded into one of the two buffers.
+                if slab_i in buf_slab:
+                    cur_buf = int(buf_slab.index(slab_i))
+                else:
+                    if buf_slab[int(cur_buf)] is not None:
+                        cur_buf = 1 - int(cur_buf)
+                    _enqueue_upload(int(slab_i), int(cur_buf))
 
-        for g in range(int(slab.class_ids.shape[0])):
-            orig_cid = int(slab.class_ids[g])
-            j0, j1 = int(slab.offsets[g]), int(slab.offsets[g + 1])
+                # Prefetch the next CPU slab into the other buffer (copy stream).
+                nxt = _find_next_cpu(slab_i)
+                other = 1 - int(cur_buf)
+                if nxt is not None and nxt not in buf_slab and buf_slab[int(other)] is None:
+                    _enqueue_upload(int(nxt), int(other))
+
+                # Wait for H2D completion on the compute stream.
+                compute_stream.wait_event(ws.upload_done[int(cur_buf)])
+                nt = int(slab.ntasks)
+                ab_dev = ws.upload_ab[int(cur_buf)][:nt]
+                cd_dev = ws.upload_cd[int(cur_buf)][:nt]
+                used_buf = int(cur_buf)
+
+        slab_plan = ctx.plans[slab_i]
+        for gp in slab_plan:
+            orig_cid = int(gp.orig_cid)
+            j0, j1 = int(gp.j0), int(gp.j1)
             if j1 <= j0:
                 continue
 
-            la, lb, lc, ld = decode_eri_class_id(orig_cid)
-            kernel_cid, transpose = resolve_kernel_class_id(orig_cid)
-
-            nA = int(ncart(la))
-            nB = int(ncart(lb))
-            nC = int(ncart(lc))
-            nD = int(ncart(ld))
-            ncomp = nA * nB * nC * nD
-            chunk_ntasks = max(1, max_tile_bytes // max(ncomp * 8, 1))
-            use_warp_mode = ncomp <= 128
+            kernel_cid = int(gp.kernel_cid)
+            transpose = bool(gp.transpose)
+            nA = int(gp.nA)
+            nB = int(gp.nB)
+            nC = int(gp.nC)
+            nD = int(gp.nD)
+            chunk_ntasks = int(gp.chunk_ntasks)
+            use_warp_mode = bool(gp.use_warp_eri)
+            use_warp_contract = bool(gp.use_warp_contract)
 
             kernel_spAB_full = cd_dev[j0:j1] if transpose else ab_dev[j0:j1]
             kernel_spCD_full = ab_dev[j0:j1] if transpose else cd_dev[j0:j1]
 
             class_ntasks = j1 - j0
+            if stats is not None:
+                cls = _class_label(orig_cid)
+                row = stats.setdefault("classes", {}).setdefault(cls, {"ntasks": 0, "chunks": 0, "path": ""})
+                row["ntasks"] = int(row.get("ntasks", 0)) + int(class_ntasks)
+                row["chunks"] = int(row.get("chunks", 0)) + int((class_ntasks + chunk_ntasks - 1) // chunk_ntasks)
+                path = "staged"
+                prev = str(row.get("path", "") or "")
+                row["path"] = path if (not prev or prev == path) else "mixed"
+
             for c0 in range(0, class_ntasks, chunk_ntasks):
                 c1 = min(class_ntasks, c0 + chunk_ntasks)
                 if c1 <= c0:
                     continue
 
                 sub_batch = KernelBatch(
-                    task_idx=np.empty(0, dtype=np.int32),
+                    task_idx=np.empty(0, dtype=np.int32),  # unused by run_kernel_batch_spd
                     kernel_tasks=TaskList(
                         task_spAB=kernel_spAB_full[c0:c1],
                         task_spCD=kernel_spCD_full[c0:c1],
@@ -709,14 +1509,22 @@ def direct_JK_multi(
                     skip_transpose=True,
                 )
                 n_kernel_calls += 1
+                if stats is not None:
+                    stats["n_eval_calls"] = int(stats.get("n_eval_calls", 0)) + 1
 
                 if profile is not None:
                     _tc0 = cp.cuda.Event()
                     _tc1 = cp.cuda.Event()
                     _tc0.record()
 
+                contract_fn = (
+                    _ext.contract_jk_tiles_ordered_warp_multi2_inplace_device
+                    if use_warp_contract
+                    else _ext.contract_jk_tiles_ordered_multi2_inplace_device
+                )
+
                 if transpose:
-                    _ext.contract_jk_tiles_ordered_warp_multi2_inplace_device(
+                    contract_fn(
                         cd_dev[j0 + c0: j0 + c1],
                         ab_dev[j0 + c0: j0 + c1],
                         ctx.sp_A_dev,
@@ -739,7 +1547,7 @@ def direct_JK_multi(
                         False,
                     )
                 else:
-                    _ext.contract_jk_tiles_ordered_warp_multi2_inplace_device(
+                    contract_fn(
                         ab_dev[j0 + c0: j0 + c1],
                         cd_dev[j0 + c0: j0 + c1],
                         ctx.sp_A_dev,
@@ -761,6 +1569,8 @@ def direct_JK_multi(
                         int(stream_ptr),
                         False,
                     )
+                if stats is not None:
+                    stats["n_contract_calls"] = int(stats.get("n_contract_calls", 0)) + 1
 
                 if profile is not None:
                     _tc1.record()
@@ -769,8 +1579,12 @@ def direct_JK_multi(
                         cp.cuda.get_elapsed_time(_tc0, _tc1)
                     )
 
-        if owned:
-            del ab_dev, cd_dev
+        if used_buf is not None and ws is not None:
+            # Prevent buffer reuse until all compute that reads it is complete.
+            ws.compute_done[int(used_buf)].record(compute_stream)
+            if slab_i in buf_slab:
+                bi = int(buf_slab.index(slab_i))
+                buf_slab[bi] = None
 
     Ja = Jb = Ka = Kb = None
     if Ja_flat is not None:
@@ -790,4 +1604,12 @@ def direct_JK_multi(
     return Ja, Ka, Jb, Kb
 
 
-__all__ = ["DirectJKContext", "direct_JK", "direct_JK_multi", "make_direct_jk_context"]
+__all__ = [
+    "DirectJKContext",
+    "DirectJKWorkspace",
+    "release_direct_jk_workspace_cache",
+    "direct_JK",
+    "direct_JK_multi",
+    "direct_fock_rhf",
+    "make_direct_jk_context",
+]

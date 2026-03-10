@@ -325,6 +325,85 @@ def _df_int3c2e_class_id_step2_eligible(cid: int) -> bool:
     return swap_cid in _STEP2_BASE_CLASS_IDS
 
 
+_DF_INT3C2E_PLAN_AUTO_FAST_MIN_TASKS = 250_000
+
+
+def _normalize_df_int3c2e_plan_policy(plan_policy: str) -> str:
+    s = str(plan_policy).strip().lower().replace("-", "_")
+    if s in {"auto", "fast", "legacy"}:
+        return s
+    raise ValueError("plan_policy must be one of: 'auto', 'fast', 'legacy'")
+
+
+def _pick_df_int3c2e_plan_policy(*, requested: str, nsp_ao: int, n_shell_aux: int) -> str:
+    req = _normalize_df_int3c2e_plan_policy(requested)
+    if req != "auto":
+        return str(req)
+    ntasks = int(nsp_ao) * int(n_shell_aux)
+    if int(ntasks) >= int(_DF_INT3C2E_PLAN_AUTO_FAST_MIN_TASKS):
+        return "fast"
+    return "legacy"
+
+
+def _plan_df_int3c2e_batches_fast(*, sp_all, ao_l: np.ndarray, aux_l: np.ndarray, nsp_ao: int) -> list[object]:
+    from .eri_dispatch import KernelBatch, resolve_kernel_class_id
+
+    spab_all = np.arange(int(nsp_ao), dtype=np.int32)
+    if int(spab_all.size) == 0:
+        return []
+
+    spA = np.asarray(sp_all.sp_A[: int(nsp_ao)], dtype=np.int32).ravel()
+    spB = np.asarray(sp_all.sp_B[: int(nsp_ao)], dtype=np.int32).ravel()
+    la_all = np.asarray(ao_l[spA], dtype=np.int32).ravel()
+    lb_all = np.asarray(ao_l[spB], dtype=np.int32).ravel()
+    pair_tag = ((la_all.astype(np.int64) << 8) | lb_all.astype(np.int64)).astype(np.int64, copy=False)
+
+    aux_l_arr = np.asarray(aux_l, dtype=np.int32).ravel()
+    aux_tags = np.unique(aux_l_arr)
+    aux_groups: dict[int, np.ndarray] = {}
+    for tag in aux_tags:
+        idx = np.nonzero(aux_l_arr == int(tag))[0]
+        if idx.size:
+            aux_groups[int(tag)] = np.asarray(idx, dtype=np.int32)
+
+    batches: list[object] = []
+    empty_idx = np.empty((0,), dtype=np.int32)
+    for tag in np.unique(pair_tag):
+        idx_ab = np.nonzero(pair_tag == int(tag))[0]
+        if idx_ab.size == 0:
+            continue
+        spab_group = np.asarray(idx_ab, dtype=np.int32)
+        la = int((int(tag) >> 8) & 0xFF)
+        lb = int(int(tag) & 0xFF)
+        n_ab = int(spab_group.size)
+        for lp, p_shell in aux_groups.items():
+            n_p = int(p_shell.size)
+            if n_p == 0:
+                continue
+            cid = int(eri_class_id(int(la), int(lb), int(lp), 0))
+            kcid, transpose = resolve_kernel_class_id(int(cid))
+
+            task_spAB = np.repeat(spab_group, int(n_p)).astype(np.int32, copy=False)
+            task_spCD = (np.tile(p_shell, int(n_ab)) + np.int32(int(nsp_ao))).astype(np.int32, copy=False)
+
+            if not bool(transpose):
+                kt_ab = np.ascontiguousarray(task_spAB, dtype=np.int32)
+                kt_cd = np.ascontiguousarray(task_spCD, dtype=np.int32)
+            else:
+                kt_ab = np.ascontiguousarray(task_spCD, dtype=np.int32)
+                kt_cd = np.ascontiguousarray(task_spAB, dtype=np.int32)
+
+            batches.append(
+                KernelBatch(
+                    task_idx=empty_idx,
+                    kernel_tasks=TaskList(task_spAB=kt_ab, task_spCD=kt_cd),
+                    kernel_class_id=np.int32(kcid),
+                    transpose=bool(transpose),
+                )
+            )
+    return batches
+
+
 def _basis_with_dummy_constant_shell(basis: BasisSoA) -> tuple[BasisSoA, int]:
     """Append a single 'constant' shell with one primitive exp=0, coef=1.
 
@@ -1532,10 +1611,12 @@ def _get_df_int3c2e_rys_plan(
     work_small_max: int,
     work_large_min: int,
     blocks_per_task: int,
+    plan_policy: str = "auto",
 ) -> _DFInt3c2eRysPlan:
     import cupy as cp
 
     _require_cuda_ext()
+    plan_policy_s = _normalize_df_int3c2e_plan_policy(plan_policy)
 
     dev = int(cp.cuda.runtime.getDevice())
     key = (
@@ -1547,6 +1628,7 @@ def _get_df_int3c2e_rys_plan(
         int(work_small_max),
         int(work_large_min),
         int(blocks_per_task),
+        str(plan_policy_s),
     )
     hit = _df_int3c2e_rys_plan_cache.get(key)
     if hit is not None:
@@ -1635,15 +1717,23 @@ def _get_df_int3c2e_rys_plan(
     dsp = to_device_shell_pairs(sp_all)
     pt = build_pair_tables_ss_device(dbasis, dsp, threads=threads)
 
-    # Tasks: all (AO shell pair, aux shell) combinations for full aux coverage.
-    task_ab = np.tile(np.arange(nsp_ao, dtype=np.int32), int(n_shell_aux))
-    task_cd = np.repeat((np.int32(nsp_ao) + np.arange(n_shell_aux, dtype=np.int32)), int(nsp_ao))
-    tasks = TaskList(task_spAB=task_ab, task_spCD=task_cd)
-    tasks = with_task_class_id(tasks, sp_all, shell_l)
+    plan_policy_use = _pick_df_int3c2e_plan_policy(
+        requested=str(plan_policy_s),
+        nsp_ao=int(nsp_ao),
+        n_shell_aux=int(n_shell_aux),
+    )
+    if str(plan_policy_use) == "fast":
+        batches = _plan_df_int3c2e_batches_fast(sp_all=sp_all, ao_l=ao_l, aux_l=aux_l, nsp_ao=int(nsp_ao))
+    else:
+        # Tasks: all (AO shell pair, aux shell) combinations for full aux coverage.
+        task_ab = np.tile(np.arange(nsp_ao, dtype=np.int32), int(n_shell_aux))
+        task_cd = np.repeat((np.int32(nsp_ao) + np.arange(n_shell_aux, dtype=np.int32)), int(nsp_ao))
+        tasks = TaskList(task_spAB=task_ab, task_spCD=task_cd)
+        tasks = with_task_class_id(tasks, sp_all, shell_l)
 
-    from .eri_dispatch import plan_kernel_batches_spd
+        from .eri_dispatch import plan_kernel_batches_spd
 
-    batches = plan_kernel_batches_spd(tasks, shell_pairs=sp_all, shell_l=shell_l)
+        batches = plan_kernel_batches_spd(tasks, shell_pairs=sp_all, shell_l=shell_l)
 
     ao_start = np.asarray(ao_basis.shell_ao_start, dtype=np.int32)
     ao_nfunc = np.asarray([ncart(int(l)) for l in ao_l], dtype=np.int32)
@@ -1672,8 +1762,13 @@ def _get_df_int3c2e_rys_plan(
     batch_lb: list[int] = []
 
     for batch in batches:
-        idx = np.asarray(batch.task_idx, dtype=np.int32).ravel()
-        if idx.size == 0:
+        if bool(batch.transpose):
+            spab = np.asarray(batch.kernel_tasks.task_spCD, dtype=np.int32).ravel()
+            spcd = np.asarray(batch.kernel_tasks.task_spAB, dtype=np.int32).ravel()
+        else:
+            spab = np.asarray(batch.kernel_tasks.task_spAB, dtype=np.int32).ravel()
+            spcd = np.asarray(batch.kernel_tasks.task_spCD, dtype=np.int32).ravel()
+        if spab.size == 0:
             batch_a0_dev.append(cp.empty((0,), dtype=cp.int32))
             batch_b0_dev.append(cp.empty((0,), dtype=cp.int32))
             batch_a0_sph_dev.append(cp.empty((0,), dtype=cp.int32))
@@ -1683,9 +1778,6 @@ def _get_df_int3c2e_rys_plan(
             batch_la.append(0)
             batch_lb.append(0)
             continue
-
-        spab = np.asarray(tasks.task_spAB[idx], dtype=np.int32).ravel()
-        spcd = np.asarray(tasks.task_spCD[idx], dtype=np.int32).ravel()
 
         A = np.asarray(sp_all.sp_A[spab], dtype=np.int32).ravel()
         B = np.asarray(sp_all.sp_B[spab], dtype=np.int32).ravel()
@@ -2000,6 +2092,7 @@ def df_int3c2e_sp_device(
     work_small_max: int = 512,
     work_large_min: int = 200_000,
     blocks_per_task: int = 4,
+    plan_policy: str = "auto",
     ao_contract_mode: str = "auto",
     ao_rep: str = "cart",
     profile: dict | None = None,
@@ -2031,6 +2124,7 @@ def df_int3c2e_sp_device(
         work_small_max=work_small_max,
         work_large_min=work_large_min,
         blocks_per_task=blocks_per_task,
+        plan_policy=plan_policy,
         ao_contract_mode=ao_contract_mode,
         ao_rep=ao_rep,
         profile=profile,
@@ -2047,6 +2141,7 @@ def df_int3c2e_rys_device(
     work_small_max: int = 512,
     work_large_min: int = 200_000,
     blocks_per_task: int = 4,
+    plan_policy: str = "auto",
     ao_contract_mode: str = "auto",
     ao_rep: str = "cart",
     profile: dict | None = None,
@@ -2069,6 +2164,7 @@ def df_int3c2e_rys_device(
         work_small_max=work_small_max,
         work_large_min=work_large_min,
         blocks_per_task=blocks_per_task,
+        plan_policy=plan_policy,
         ao_contract_mode=ao_contract_mode,
         ao_rep=ao_rep,
         profile=profile,
@@ -2514,6 +2610,7 @@ def df_int3c2e_rys_device_block(
     work_small_max: int = 512,
     work_large_min: int = 200_000,
     blocks_per_task: int = 4,
+    plan_policy: str = "auto",
     ao_contract_mode: str = "auto",
     ao_rep: str = "cart",
     profile: dict | None = None,
@@ -2671,6 +2768,12 @@ def df_int3c2e_rys_device_block(
         mode = mode.lower().strip()
         if mode not in ("block", "warp", "multiblock", "auto"):
             raise ValueError("mode must be one of: 'block', 'warp', 'multiblock', 'auto'")
+        plan_policy_s = _normalize_df_int3c2e_plan_policy(plan_policy)
+        if profile is not None:
+            prof = profile.setdefault("df_int3c2e", {})
+            prof.setdefault("plan_policy_requested", str(plan_policy_s))
+            prof.setdefault("plan_policy_used", str(plan_policy_s))
+            prof.setdefault("plan_policy_fallback_reason", None)
 
         # Fast path: cache the full-aux plan to avoid Python planning + repeated H2D index transfers
         # for microbenchmarks and materialized 3c2e builds.
@@ -2680,20 +2783,41 @@ def df_int3c2e_rys_device_block(
                 t0 = cp.cuda.Event()
                 t1 = cp.cuda.Event()
                 t0.record(s0)
-            plan = _get_df_int3c2e_rys_plan(
-                ao_basis,
-                aux_basis,
-                threads=int(threads),
-                mode=str(mode),
-                work_small_max=int(work_small_max),
-                work_large_min=int(work_large_min),
-                blocks_per_task=int(blocks_per_task),
-            )
+            plan_policy_used = str(plan_policy_s)
+            plan_policy_fallback_reason = None
+            try:
+                plan = _get_df_int3c2e_rys_plan(
+                    ao_basis,
+                    aux_basis,
+                    threads=int(threads),
+                    mode=str(mode),
+                    work_small_max=int(work_small_max),
+                    work_large_min=int(work_large_min),
+                    blocks_per_task=int(blocks_per_task),
+                    plan_policy=str(plan_policy_s),
+                )
+            except Exception as e:
+                if str(plan_policy_s) == "legacy":
+                    raise
+                plan = _get_df_int3c2e_rys_plan(
+                    ao_basis,
+                    aux_basis,
+                    threads=int(threads),
+                    mode=str(mode),
+                    work_small_max=int(work_small_max),
+                    work_large_min=int(work_large_min),
+                    blocks_per_task=int(blocks_per_task),
+                    plan_policy="legacy",
+                )
+                plan_policy_used = "legacy"
+                plan_policy_fallback_reason = str(e)
             if profile is not None:
                 t1.record(s0)
                 t1.synchronize()
                 prof = profile.setdefault("df_int3c2e", {})
                 prof["plan_ms"] = float(cp.cuda.get_elapsed_time(t0, t1))
+                prof["plan_policy_used"] = str(plan_policy_used)
+                prof["plan_policy_fallback_reason"] = plan_policy_fallback_reason
 
             nao_out = int(plan.nao_sph) if ao_rep_s == "sph" else int(plan.nao)
             X = cp.zeros((nao_out, nao_out, int(plan.naux)), dtype=cp.float64)

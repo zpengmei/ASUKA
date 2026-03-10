@@ -681,6 +681,8 @@ class CudaProjectorContextKey64:
     pair_norm_dev: Any | None = None
     pair_norm_sum: float = 0.0
     pair_sampling_mode: int = 0
+    label_mode: str = "key64"
+    ncsf_u64: int = 0
 
     # Ping-pong sparse-vector buffers (capacity m; only prefix [:nnz] is valid).
     x_key_a: Any | None = None
@@ -1290,13 +1292,17 @@ def make_cuda_projector_context_key64(
     pair_norm: Any | None = None,
     pair_norm_sum: float = 0.0,
     pair_sampling_mode: int = 0,
+    label_mode: str = "key64",
+    ncsf_u64: int | None = None,
 ) -> CudaProjectorContextKey64:
     """Build a reusable CUDA projector context in Key64 walker space.
 
     Notes
     -----
-    This requires ``drt.norb <= 32`` so each CSF path can be packed into a 64-bit key
-    (2 bits per orbital step).
+    ``label_mode='key64'`` requires ``drt.norb <= 32`` so each CSF path can be
+    packed into a 64-bit key (2 bits per orbital step).
+    ``label_mode='idx64'`` accepts ``drt.norb <= 64`` and stores global CSF
+    indices in the same uint64 buffers/workspace.
     """
 
     if cp is None or _guga_cuda_ext is None:  # pragma: no cover
@@ -1306,9 +1312,20 @@ def make_cuda_projector_context_key64(
 
     from asuka.cuguga.oracle import _child_prefix_walks  # noqa: PLC0415
 
+    label_mode_s = str(label_mode).strip().lower()
+    if label_mode_s not in ("key64", "idx64"):
+        raise ValueError("label_mode must be 'key64' or 'idx64'")
+
     norb = int(drt.norb)
-    if norb > 32:
-        raise ValueError("Key64 projector context requires drt.norb <= 32")
+    if label_mode_s == "key64":
+        if norb > 32:
+            raise ValueError("Key64 projector context requires drt.norb <= 32")
+    else:
+        if norb > 64:
+            raise ValueError("idx64 projector context requires drt.norb <= 64")
+    ncsf_u64_eff = int(int(drt.ncsf) if ncsf_u64 is None else int(ncsf_u64))
+    if ncsf_u64_eff <= 0:
+        raise ValueError("ncsf_u64 must be > 0")
     nops = norb * norb
 
     h1e = np.asarray(h1e, dtype=np.float64).reshape(norb, norb)
@@ -1397,6 +1414,8 @@ def make_cuda_projector_context_key64(
         pair_norm_dev=pair_norm_dev,
         pair_norm_sum=float(pair_norm_sum),
         pair_sampling_mode=int(pair_sampling_mode),
+        label_mode=str(label_mode_s),
+        ncsf_u64=int(ncsf_u64_eff),
     )
 
     # Preallocate buffers.
@@ -1411,6 +1430,48 @@ def make_cuda_projector_context_key64(
     ctx.nnz_u = cp.empty(1, dtype=cp.int32)
     ctx.nnz_out = cp.empty(1, dtype=cp.int32)
     return ctx
+
+
+def make_cuda_projector_context_idx64(
+    drt: Any,
+    h1e: Any,
+    eri: Any,
+    *,
+    m: int,
+    pivot: int,
+    nspawn_one: int,
+    nspawn_two: int,
+    threads_spawn: int = 128,
+    threads_qmc: int = 256,
+    stream: int | None = None,
+    pair_alias_prob: Any | None = None,
+    pair_alias_idx: Any | None = None,
+    pair_norm: Any | None = None,
+    pair_norm_sum: float = 0.0,
+    pair_sampling_mode: int = 0,
+    ncsf_u64: int | None = None,
+) -> CudaProjectorContextKey64:
+    """Build a reusable CUDA projector context in idx64 walker space (uint64 CSF indices)."""
+
+    return make_cuda_projector_context_key64(
+        drt,
+        h1e,
+        eri,
+        m=int(m),
+        pivot=int(pivot),
+        nspawn_one=int(nspawn_one),
+        nspawn_two=int(nspawn_two),
+        threads_spawn=int(threads_spawn),
+        threads_qmc=int(threads_qmc),
+        stream=stream,
+        pair_alias_prob=pair_alias_prob,
+        pair_alias_idx=pair_alias_idx,
+        pair_norm=pair_norm,
+        pair_norm_sum=float(pair_norm_sum),
+        pair_sampling_mode=int(pair_sampling_mode),
+        label_mode="idx64",
+        ncsf_u64=int(int(drt.ncsf) if ncsf_u64 is None else int(ncsf_u64)),
+    )
 
 
 def make_cuda_block_projector_context(
@@ -1862,57 +1923,111 @@ def cuda_projector_step_hamiltonian_u64_ws(
     evt_key = key_all[nnz:all_len]
     evt_val = val_all[nnz:all_len]
 
+    label_mode = str(getattr(ctx, "label_mode", "key64")).strip().lower()
+    if label_mode not in ("key64", "idx64"):
+        raise ValueError("ctx.label_mode must be 'key64' or 'idx64'")
+
     if initiator_t_dev is not None:
         if float(initiator_t) != 0.0:
             raise ValueError("provide either initiator_t or initiator_t_dev (not both)")
         initiator_t_dev = cp.asarray(initiator_t_dev, dtype=cp.float64)
         if int(initiator_t_dev.size) != 1:
             raise ValueError("initiator_t_dev must be a device scalar (shape () or (1,))")
-        _guga_cuda_ext.qmc_spawn_hamiltonian_u64_inplace_device_initiator_dev(
-            ctx.drt_dev,
-            x_key,
-            x_val,
-            ctx.h_base_flat_dev,
-            ctx.eri_mat_dev,
-            evt_key,
-            evt_val,
-            float(eps),
-            int(ctx.nspawn_one),
-            int(ctx.nspawn_two),
-            int(seed_spawn),
-            initiator_t_dev,
-            int(ctx.threads_spawn),
-            int(ctx.stream),
-            False,
-            ctx.pair_alias_prob_dev,
-            ctx.pair_alias_idx_dev,
-            ctx.pair_norm_dev,
-            float(ctx.pair_norm_sum),
-            int(ctx.pair_sampling_mode),
-        )
+        if label_mode == "idx64":
+            _guga_cuda_ext.qmc_spawn_hamiltonian_idx64_u64_inplace_device_initiator_dev(
+                ctx.drt_dev,
+                int(ctx.ncsf_u64),
+                x_key,
+                x_val,
+                ctx.h_base_flat_dev,
+                ctx.eri_mat_dev,
+                evt_key,
+                evt_val,
+                float(eps),
+                int(ctx.nspawn_one),
+                int(ctx.nspawn_two),
+                int(seed_spawn),
+                initiator_t_dev,
+                int(ctx.threads_spawn),
+                int(ctx.stream),
+                False,
+                ctx.pair_alias_prob_dev,
+                ctx.pair_alias_idx_dev,
+                ctx.pair_norm_dev,
+                float(ctx.pair_norm_sum),
+                int(ctx.pair_sampling_mode),
+            )
+        else:
+            _guga_cuda_ext.qmc_spawn_hamiltonian_u64_inplace_device_initiator_dev(
+                ctx.drt_dev,
+                x_key,
+                x_val,
+                ctx.h_base_flat_dev,
+                ctx.eri_mat_dev,
+                evt_key,
+                evt_val,
+                float(eps),
+                int(ctx.nspawn_one),
+                int(ctx.nspawn_two),
+                int(seed_spawn),
+                initiator_t_dev,
+                int(ctx.threads_spawn),
+                int(ctx.stream),
+                False,
+                ctx.pair_alias_prob_dev,
+                ctx.pair_alias_idx_dev,
+                ctx.pair_norm_dev,
+                float(ctx.pair_norm_sum),
+                int(ctx.pair_sampling_mode),
+            )
     else:
-        _guga_cuda_ext.qmc_spawn_hamiltonian_u64_inplace_device(
-            ctx.drt_dev,
-            x_key,
-            x_val,
-            ctx.h_base_flat_dev,
-            ctx.eri_mat_dev,
-            evt_key,
-            evt_val,
-            float(eps),
-            int(ctx.nspawn_one),
-            int(ctx.nspawn_two),
-            int(seed_spawn),
-            float(initiator_t),
-            int(ctx.threads_spawn),
-            int(ctx.stream),
-            False,
-            ctx.pair_alias_prob_dev,
-            ctx.pair_alias_idx_dev,
-            ctx.pair_norm_dev,
-            float(ctx.pair_norm_sum),
-            int(ctx.pair_sampling_mode),
-        )
+        if label_mode == "idx64":
+            _guga_cuda_ext.qmc_spawn_hamiltonian_idx64_u64_inplace_device(
+                ctx.drt_dev,
+                int(ctx.ncsf_u64),
+                x_key,
+                x_val,
+                ctx.h_base_flat_dev,
+                ctx.eri_mat_dev,
+                evt_key,
+                evt_val,
+                float(eps),
+                int(ctx.nspawn_one),
+                int(ctx.nspawn_two),
+                int(seed_spawn),
+                float(initiator_t),
+                int(ctx.threads_spawn),
+                int(ctx.stream),
+                False,
+                ctx.pair_alias_prob_dev,
+                ctx.pair_alias_idx_dev,
+                ctx.pair_norm_dev,
+                float(ctx.pair_norm_sum),
+                int(ctx.pair_sampling_mode),
+            )
+        else:
+            _guga_cuda_ext.qmc_spawn_hamiltonian_u64_inplace_device(
+                ctx.drt_dev,
+                x_key,
+                x_val,
+                ctx.h_base_flat_dev,
+                ctx.eri_mat_dev,
+                evt_key,
+                evt_val,
+                float(eps),
+                int(ctx.nspawn_one),
+                int(ctx.nspawn_two),
+                int(seed_spawn),
+                float(initiator_t),
+                int(ctx.threads_spawn),
+                int(ctx.stream),
+                False,
+                ctx.pair_alias_prob_dev,
+                ctx.pair_alias_idx_dev,
+                ctx.pair_norm_dev,
+                float(ctx.pair_norm_sum),
+                int(ctx.pair_sampling_mode),
+            )
 
     # Compact spawn events before coalesce to reduce sort/reduce volume.
     evt_key_c, evt_val_c, n_evt = _compact_spawn_events_u64(evt_key, evt_val)
@@ -1963,6 +2078,33 @@ def cuda_projector_step_hamiltonian_u64_ws(
     ctx.nnz = nnz_out
     ctx.use_a = not ctx.use_a
     return nnz_out
+
+
+def cuda_projector_step_hamiltonian_idx64_ws(
+    ctx: CudaProjectorContextKey64,
+    *,
+    eps: float,
+    initiator_t: float = 0.0,
+    initiator_t_dev: Any | None = None,
+    seed_spawn: int,
+    seed_phi: int,
+    scale_identity: float = 1.0,
+    sync: bool = True,
+) -> int:
+    """One idx64 projector step on GPU (uint64 global CSF indices)."""
+
+    if str(getattr(ctx, "label_mode", "key64")).strip().lower() != "idx64":
+        raise ValueError("cuda_projector_step_hamiltonian_idx64_ws requires ctx.label_mode='idx64'")
+    return cuda_projector_step_hamiltonian_u64_ws(
+        ctx,
+        eps=float(eps),
+        initiator_t=float(initiator_t),
+        initiator_t_dev=initiator_t_dev,
+        seed_spawn=int(seed_spawn),
+        seed_phi=int(seed_phi),
+        scale_identity=float(scale_identity),
+        sync=bool(sync),
+    )
 
 
 def cuda_block_projector_step_hamiltonian_ws(
@@ -3332,6 +3474,8 @@ class CudaFCIQMCContextKey64:
     pair_norm_dev: Any | None = None
     pair_norm_sum: float = 0.0
     pair_sampling_mode: int = 0
+    label_mode: str = "key64"
+    ncsf_u64: int = 0
 
     # Ping-pong merged buffers (capacity max_n):
     # - prefix [:nnz] holds the current sparse vector x (sorted unique by key),
@@ -3539,8 +3683,18 @@ def make_cuda_fciqmc_context_key64(
     pair_norm: Any | None = None,
     pair_norm_sum: float = 0.0,
     pair_sampling_mode: int = 0,
+    label_mode: str = "key64",
+    ncsf_u64: int | None = None,
 ) -> CudaFCIQMCContextKey64:
-    """Build a reusable CUDA FCIQMC context in Key64 walker space (dense-ERI Hamiltonians)."""
+    """Build a reusable CUDA FCIQMC context in uint64 walker space.
+
+    Notes
+    -----
+    ``label_mode='key64'`` requires ``drt.norb <= 32`` so each CSF path can be
+    packed into a 64-bit key (2 bits per orbital step).
+    ``label_mode='idx64'`` accepts ``drt.norb <= 64`` and stores global CSF
+    indices in uint64 buffers/workspace.
+    """
 
     if cp is None or _guga_cuda_ext is None:  # pragma: no cover
         raise RuntimeError("CUDA QMC backend unavailable (requires cupy and asuka._guga_cuda_ext)")
@@ -3550,9 +3704,20 @@ def make_cuda_fciqmc_context_key64(
     from asuka.cuguga.oracle import _child_prefix_walks  # noqa: PLC0415
     from asuka.cuguga.state_cache import get_state_cache  # noqa: PLC0415
 
+    label_mode_s = str(label_mode).strip().lower()
+    if label_mode_s not in ("key64", "idx64"):
+        raise ValueError("label_mode must be 'key64' or 'idx64'")
+
     norb = int(drt.norb)
-    if norb > 32:
-        raise ValueError("Key64 FCIQMC context requires drt.norb <= 32")
+    if label_mode_s == "key64":
+        if norb > 32:
+            raise ValueError("Key64 FCIQMC context requires drt.norb <= 32")
+    else:
+        if norb > 64:
+            raise ValueError("idx64 FCIQMC context requires drt.norb <= 64")
+    ncsf_u64_eff = int(int(drt.ncsf) if ncsf_u64 is None else int(ncsf_u64))
+    if ncsf_u64_eff <= 0:
+        raise ValueError("ncsf_u64 must be > 0")
     nops = norb * norb
 
     h1e = np.asarray(h1e, dtype=np.float64).reshape(norb, norb)
@@ -3638,6 +3803,8 @@ def make_cuda_fciqmc_context_key64(
         pair_norm_dev=pair_norm_dev,
         pair_norm_sum=float(pair_norm_sum),
         pair_sampling_mode=int(pair_sampling_mode),
+        label_mode=str(label_mode_s),
+        ncsf_u64=int(ncsf_u64_eff),
     )
 
     ctx.x_key_a = cp.empty(max_n, dtype=cp.uint64)
@@ -3651,12 +3818,17 @@ def make_cuda_fciqmc_context_key64(
         if det_idx_i64.size:
             det_idx_i64 = np.unique(det_idx_i64)
             det_idx_i64.sort()
+            if det_idx_i64[0] < 0:
+                raise ValueError("det_idx entries must be non-negative")
+            if det_idx_i64[-1] >= int(ncsf_u64_eff):
+                raise ValueError("det_idx entries must be < ncsf_u64")
             cache = None if int(drt.ncsf) > np.iinfo(np.int32).max else get_state_cache(drt)
             ctx.det_idx_host = det_idx_i64
-            ctx.det_key_dev = cp.asarray(
-                np.asarray(csf_idx_to_key64_host(drt, det_idx_i64, state_cache=cache), dtype=np.uint64, order="C"),
-                dtype=cp.uint64,
-            )
+            if label_mode_s == "key64":
+                det_label_u64 = np.asarray(csf_idx_to_key64_host(drt, det_idx_i64, state_cache=cache), dtype=np.uint64, order="C")
+            else:
+                det_label_u64 = np.asarray(det_idx_i64, dtype=np.uint64, order="C")
+            ctx.det_key_dev = cp.asarray(det_label_u64, dtype=cp.uint64)
             ctx.det_key_buf = cp.empty(int(det_idx_i64.size), dtype=cp.uint64)
             ctx.det_val_buf = cp.empty(int(det_idx_i64.size), dtype=cp.float64)
             ctx.det_cols = _build_det_subspace_cols_dense(
@@ -3691,6 +3863,50 @@ def make_cuda_fciqmc_context_key64(
             ctx.det_y_buf = cp.zeros(ndet, dtype=cp.float64)
             ctx.det_spawn_slot_offsets = cp.arange(int(nspawn_total), dtype=cp.int64)
     return ctx
+
+
+def make_cuda_fciqmc_context_idx64(
+    drt: Any,
+    h1e: Any,
+    eri: Any,
+    *,
+    max_walker: int,
+    nspawn_one: int,
+    nspawn_two: int,
+    det_idx: np.ndarray | None = None,
+    det_max_out: int = 200_000,
+    threads_spawn: int = 128,
+    threads_qmc: int = 256,
+    stream: int | None = None,
+    pair_alias_prob: Any | None = None,
+    pair_alias_idx: Any | None = None,
+    pair_norm: Any | None = None,
+    pair_norm_sum: float = 0.0,
+    pair_sampling_mode: int = 0,
+    ncsf_u64: int | None = None,
+) -> CudaFCIQMCContextKey64:
+    """Build a reusable CUDA FCIQMC context in idx64 walker space (uint64 CSF indices)."""
+
+    return make_cuda_fciqmc_context_key64(
+        drt,
+        h1e,
+        eri,
+        max_walker=int(max_walker),
+        nspawn_one=int(nspawn_one),
+        nspawn_two=int(nspawn_two),
+        det_idx=det_idx,
+        det_max_out=int(det_max_out),
+        threads_spawn=int(threads_spawn),
+        threads_qmc=int(threads_qmc),
+        stream=stream,
+        pair_alias_prob=pair_alias_prob,
+        pair_alias_idx=pair_alias_idx,
+        pair_norm=pair_norm,
+        pair_norm_sum=float(pair_norm_sum),
+        pair_sampling_mode=int(pair_sampling_mode),
+        label_mode="idx64",
+        ncsf_u64=int(int(drt.ncsf) if ncsf_u64 is None else int(ncsf_u64)),
+    )
 
 
 def cuda_fciqmc_step_hamiltonian_ws(
@@ -3909,29 +4125,58 @@ def cuda_fciqmc_step_hamiltonian_u64_ws(
     evt_key = x_key[nnz:all_len]
     evt_val = x_val[nnz:all_len]
 
+    label_mode = str(getattr(ctx, "label_mode", "key64")).strip().lower()
+    if label_mode not in ("key64", "idx64"):
+        raise ValueError("ctx.label_mode must be 'key64' or 'idx64'")
+
     # Spawn: fills evt_key/evt_val with -dt*H*x events (UINT64_MAX sentinel for invalid slots).
-    _guga_cuda_ext.qmc_spawn_hamiltonian_u64_inplace_device(
-        ctx.drt_dev,
-        x_key_cur,
-        x_val_cur,
-        ctx.h_base_flat_dev,
-        ctx.eri_mat_dev,
-        evt_key,
-        evt_val,
-        float(dt),
-        int(ctx.nspawn_one),
-        int(ctx.nspawn_two),
-        int(seed_spawn),
-        float(initiator_t),
-        int(ctx.threads_spawn),
-        int(ctx.stream),
-        False,
-        ctx.pair_alias_prob_dev,
-        ctx.pair_alias_idx_dev,
-        ctx.pair_norm_dev,
-        float(ctx.pair_norm_sum),
-        int(ctx.pair_sampling_mode),
-    )
+    if label_mode == "idx64":
+        _guga_cuda_ext.qmc_spawn_hamiltonian_idx64_u64_inplace_device(
+            ctx.drt_dev,
+            int(ctx.ncsf_u64),
+            x_key_cur,
+            x_val_cur,
+            ctx.h_base_flat_dev,
+            ctx.eri_mat_dev,
+            evt_key,
+            evt_val,
+            float(dt),
+            int(ctx.nspawn_one),
+            int(ctx.nspawn_two),
+            int(seed_spawn),
+            float(initiator_t),
+            int(ctx.threads_spawn),
+            int(ctx.stream),
+            False,
+            ctx.pair_alias_prob_dev,
+            ctx.pair_alias_idx_dev,
+            ctx.pair_norm_dev,
+            float(ctx.pair_norm_sum),
+            int(ctx.pair_sampling_mode),
+        )
+    else:
+        _guga_cuda_ext.qmc_spawn_hamiltonian_u64_inplace_device(
+            ctx.drt_dev,
+            x_key_cur,
+            x_val_cur,
+            ctx.h_base_flat_dev,
+            ctx.eri_mat_dev,
+            evt_key,
+            evt_val,
+            float(dt),
+            int(ctx.nspawn_one),
+            int(ctx.nspawn_two),
+            int(seed_spawn),
+            float(initiator_t),
+            int(ctx.threads_spawn),
+            int(ctx.stream),
+            False,
+            ctx.pair_alias_prob_dev,
+            ctx.pair_alias_idx_dev,
+            ctx.pair_norm_dev,
+            float(ctx.pair_norm_sum),
+            int(ctx.pair_sampling_mode),
+        )
 
     nnz_det = 0
     if use_det:
@@ -3977,3 +4222,26 @@ def cuda_fciqmc_step_hamiltonian_u64_ws(
     ctx.nnz = n_out
     ctx.use_a = not ctx.use_a
     return n_out
+
+
+def cuda_fciqmc_step_hamiltonian_idx64_ws(
+    ctx: CudaFCIQMCContextKey64,
+    *,
+    dt: float,
+    shift: float,
+    initiator_t: float = 0.0,
+    seed_spawn: int,
+    sync: bool = True,
+) -> int:
+    """One idx64 FCIQMC step on GPU (uint64 global CSF indices)."""
+
+    if str(getattr(ctx, "label_mode", "key64")).strip().lower() != "idx64":
+        raise ValueError("cuda_fciqmc_step_hamiltonian_idx64_ws requires ctx.label_mode='idx64'")
+    return cuda_fciqmc_step_hamiltonian_u64_ws(
+        ctx,
+        dt=float(dt),
+        shift=float(shift),
+        initiator_t=float(initiator_t),
+        seed_spawn=int(seed_spawn),
+        sync=bool(sync),
+    )

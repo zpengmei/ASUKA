@@ -886,6 +886,7 @@ def rhf_df(
     jk_mode: str = "materialized",
     k_engine: str = "auto",
     k_q_block: int = 128,
+    k_cache_max_mb: int | None = None,
     cublas_math_mode: str | None = None,
     ao_basis=None,
     aux_basis=None,
@@ -1052,6 +1053,8 @@ def rhf_df(
         jk_prof = profile.setdefault("jk", {})
         jk_prof["B_layout"] = str(b_layout)
         jk_prof["BQ_copied"] = bool(bq_copied)
+        if k_cache_max_mb is not None:
+            jk_prof["k_cache_max_mb"] = int(k_cache_max_mb)
         if bool(is_gpu):
             try:
                 pool = xp.get_default_memory_pool()
@@ -1144,6 +1147,7 @@ def rhf_df(
                         C_occ,
                         occ_vals,
                         q_block=int(k_q_block),
+                        k_cache_max_mb=None if k_cache_max_mb is None else int(k_cache_max_mb),
                         cublas_math_mode=cublas_math_mode,
                     )
                 else:
@@ -1250,7 +1254,14 @@ def rhf_df(
             if BQ is not None and B_mnQ is None:
                 _bq_for_fused = BQ  # direct Qmn input, already C-contiguous
             elif B_mnQ is not None and bool(is_gpu):
-                _bq_for_fused = df_jk._cached_bq_from_mnq(xp, B_mnQ, nao=int(nao), naux=int(naux))
+                _cache_bytes = None if k_cache_max_mb is None else max(64, int(k_cache_max_mb)) * 1024 * 1024
+                _bq_for_fused = df_jk._cached_bq_from_mnq(
+                    xp,
+                    B_mnQ,
+                    nao=int(nao),
+                    naux=int(naux),
+                    cache_max_bytes=_cache_bytes,
+                )
 
             if _bq_for_fused is not None:
                 tJK = _time_ms_start(xp) if profile is not None else None
@@ -1285,6 +1296,7 @@ def rhf_df(
                         C_occ,
                         occ_vals,
                         q_block=int(k_q_block),
+                        k_cache_max_mb=None if k_cache_max_mb is None else int(k_cache_max_mb),
                         cublas_math_mode=_eff_math_mode,
                         profile=profile,
                     )
@@ -1435,6 +1447,7 @@ def uhf_df(
     jk_mode: str = "materialized",
     k_engine: str = "auto",
     k_q_block: int = 128,
+    k_cache_max_mb: int | None = None,
     cublas_math_mode: str | None = None,
     ao_basis=None,
     aux_basis=None,
@@ -1683,6 +1696,7 @@ def uhf_df(
                     Ca_occ,
                     occ_a_vals,
                     q_block=int(k_q_block),
+                    k_cache_max_mb=None if k_cache_max_mb is None else int(k_cache_max_mb),
                     cublas_math_mode=cublas_math_mode,
                     profile=profile,
                 )
@@ -1691,6 +1705,7 @@ def uhf_df(
                     Cb_occ,
                     occ_b_vals,
                     q_block=int(k_q_block),
+                    k_cache_max_mb=None if k_cache_max_mb is None else int(k_cache_max_mb),
                     cublas_math_mode=cublas_math_mode,
                     profile=profile,
                 )
@@ -1870,6 +1885,7 @@ def rohf_df(
     jk_mode: str = "materialized",
     k_engine: str = "auto",
     k_q_block: int = 128,
+    k_cache_max_mb: int | None = None,
     cublas_math_mode: str | None = None,
     ao_basis=None,
     aux_basis=None,
@@ -2108,6 +2124,7 @@ def rohf_df(
                     C_occ_a,
                     occ_a_vals,
                     q_block=int(k_q_block),
+                    k_cache_max_mb=None if k_cache_max_mb is None else int(k_cache_max_mb),
                     cublas_math_mode=cublas_math_mode,
                     profile=profile,
                 )
@@ -2116,6 +2133,7 @@ def rohf_df(
                     C_occ_b,
                     occ_b_vals,
                     q_block=int(k_q_block),
+                    k_cache_max_mb=None if k_cache_max_mb is None else int(k_cache_max_mb),
                     cublas_math_mode=cublas_math_mode,
                     profile=profile,
                 )

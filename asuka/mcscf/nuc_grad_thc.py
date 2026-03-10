@@ -891,6 +891,115 @@ def _build_bar_xy_target_thc(
     return bar_X_list, bar_Y_list
 
 
+def _build_bar_xy_response_thc(
+    scf_out: Any,
+    *,
+    C: Any,
+    dm1_delta: Any,
+    dm2_delta: Any,
+    ncore: int,
+    ncas: int,
+    q_block: int = 256,
+    pair_p_block: int = 8,
+) -> tuple[Any, Any, Any]:
+    """Return (bar_X, bar_Y, D_act_delta) for the *response* adjoint.
+
+    Unlike ``_build_bar_xy_net_active_thc`` (which doubles the core-active J/K
+    interaction because it symmetrises bra ↔ ket), this function computes the
+    one-sided core mean-field response:
+
+        bar = bilinear(D_core, D_act_delta) + 0.5·active_2rdm(dm2_delta)
+
+    This is the correct adjoint for CI-response (lci) contributions where the
+    energy derivative is Tr[(J_core-0.5K_core)·D_act_delta] + 0.5·Σ dm2_delta·(ij|kl).
+    """
+
+    cp = _require_cupy()
+    from asuka.hf.local_thc_factors import LocalTHCFactors  # noqa: PLC0415
+    from asuka.hf.thc_factors import THCFactors  # noqa: PLC0415
+
+    thc = getattr(scf_out, "thc_factors", None)
+    if not isinstance(thc, (THCFactors, LocalTHCFactors)):
+        raise TypeError("scf_out.thc_factors must be THCFactors or LocalTHCFactors")
+
+    C = cp.asarray(C, dtype=cp.float64)
+    ncore = int(ncore)
+    ncas = int(ncas)
+    nocc = int(ncore + ncas)
+    C_core = C[:, :ncore]
+    C_act = C[:, ncore:nocc]
+    dm1 = cp.asarray(dm1_delta, dtype=cp.float64)
+    dm1 = 0.5 * (dm1 + dm1.T)
+
+    if ncore:
+        D_core = 2.0 * (C_core @ C_core.T)
+    else:
+        D_core = cp.zeros((int(C.shape[0]), int(C.shape[0])), dtype=cp.float64)
+    D_act = C_act @ dm1 @ C_act.T
+    dm2_flat = _dm2_sym_flat(cp, dm2_delta, ncas=int(ncas))
+
+    if isinstance(thc, THCFactors):
+        # One-sided core-active J/K: bilinear(D_core, D_act_delta)
+        bar_X_jk, bar_Y_jk = _thc_energy_adjoint_jk_bilinear(
+            D_core,
+            D_act,
+            thc.X,
+            thc.Z,
+            thc.Y,
+            cJ=1.0,
+            cK=-0.5,
+            q_block=int(q_block),
+        )
+        # Active 2-RDM: 0.5 * dm2_delta * (ij|kl)
+        bar_X_aa, bar_Y_aa = _thc_energy_adjoint_active_global(
+            thc.X,
+            thc.Y,
+            C_act,
+            dm2_flat,
+            pair_p_block=int(pair_p_block),
+        )
+        return (
+            cp.ascontiguousarray(bar_X_jk + bar_X_aa),
+            cp.ascontiguousarray(bar_Y_jk + bar_Y_aa),
+            cp.ascontiguousarray(D_act, dtype=cp.float64),
+        )
+
+    # Local-THC path
+    bar_X_list = []
+    bar_Y_list = []
+    for blk in thc.blocks:
+        idx_np = np.asarray(getattr(blk, "ao_idx_global"), dtype=np.int32).ravel()
+        idx = cp.asarray(idx_np, dtype=cp.int32)
+        D_core_sub = D_core[idx[:, None], idx[None, :]]
+        D_act_sub = D_act[idx[:, None], idx[None, :]]
+
+        bar_X_jk, bar_Y_jk = _thc_energy_adjoint_jk_bilinear(
+            D_core_sub,
+            _mask_local_left_density(D_act_sub, blk),
+            blk.X,
+            blk.Z,
+            blk.Y,
+            cJ=1.0,
+            cK=-0.5,
+            q_block=int(q_block),
+        )
+        bar_X_aa, bar_Y_aa = _thc_energy_adjoint_active_local_block(
+            blk.X,
+            blk.Z,
+            blk.Y,
+            ao_idx_global=idx_np,
+            n_early=int(getattr(blk, "n_early", 0)),
+            n_primary=int(getattr(blk, "n_primary", 0)),
+            C_act=C_act,
+            dm2_flat_sym=dm2_flat,
+            pair_p_block=int(pair_p_block),
+            q_block=int(q_block),
+        )
+        bar_X_list.append(cp.ascontiguousarray(bar_X_jk + bar_X_aa))
+        bar_Y_list.append(cp.ascontiguousarray(bar_Y_jk + bar_Y_aa))
+    return bar_X_list, bar_Y_list, cp.ascontiguousarray(D_act, dtype=cp.float64)
+
+
 def _build_bar_xy_net_active_thc(
     scf_out: Any,
     *,
@@ -1103,16 +1212,13 @@ def _build_bar_xy_lorb_thc(
             q_block=int(q_block),
         )
 
-        bar_X_act = cp.zeros_like(cp.asarray(thc.X, dtype=cp.float64))
-        bar_Y_act = cp.zeros_like(cp.asarray(thc.Y, dtype=cp.float64))
-        if abs(float(scale)) > 0.0:
-            bar_X_act, bar_Y_act = _thc_energy_adjoint_active_global_lorb(
-                thc.X,
-                thc.Y,
-                C_act,
-                C_L_act,
-                dm2_flat,
-            )
+        bar_X_act, bar_Y_act = _thc_energy_adjoint_active_global_lorb(
+            thc.X,
+            thc.Y,
+            C_act,
+            C_L_act,
+            dm2_flat,
+        )
 
         return (
             cp.ascontiguousarray(bar_X_1 + bar_X_2 + bar_X_act),
@@ -1153,21 +1259,18 @@ def _build_bar_xy_lorb_thc(
             q_block=int(q_block),
         )
 
-        bar_X_act = cp.zeros_like(cp.asarray(blk.X, dtype=cp.float64))
-        bar_Y_act = cp.zeros_like(cp.asarray(blk.Y, dtype=cp.float64))
-        if abs(float(scale)) > 0.0:
-            bar_X_act, bar_Y_act = _thc_energy_adjoint_active_local_block_lorb(
-                blk.X,
-                blk.Z,
-                blk.Y,
-                ao_idx_global=idx_np,
-                n_early=int(getattr(blk, "n_early", 0)),
-                n_primary=int(getattr(blk, "n_primary", 0)),
-                C_act=C_act,
-                C_L_act=C_L_act,
-                dm2_flat_sym=dm2_flat,
-                q_block=int(q_block),
-            )
+        bar_X_act, bar_Y_act = _thc_energy_adjoint_active_local_block_lorb(
+            blk.X,
+            blk.Z,
+            blk.Y,
+            ao_idx_global=idx_np,
+            n_early=int(getattr(blk, "n_early", 0)),
+            n_primary=int(getattr(blk, "n_primary", 0)),
+            C_act=C_act,
+            C_L_act=C_L_act,
+            dm2_flat_sym=dm2_flat,
+            q_block=int(q_block),
+        )
 
         bar_X_list.append(cp.ascontiguousarray(bar_X_1 + bar_X_2 + bar_X_act))
         bar_Y_list.append(cp.ascontiguousarray(bar_Y_1 + bar_Y_2 + bar_Y_act))
@@ -1197,13 +1300,17 @@ def _contract_thc_bar_adjoint(
     solve_method = str(meta.get("solve_method", "fit_metric_qr")).strip().lower()
     inv_metric_methods = {"inv_metric", "inv", "metric_inv", "vinv", "v_inv"}
     fit_metric_gram_methods = {"fit_metric_gram", "gram"}
+    fit_metric_qr_methods = {"fit_metric_qr", "fit_metric", "qr", "lq", "lstsq"}
     if solve_method in inv_metric_methods:
         solve_kind = "inv_metric"
     elif solve_method in fit_metric_gram_methods:
         solve_kind = "fit_metric_gram"
+    elif solve_method in fit_metric_qr_methods:
+        solve_kind = "fit_metric_qr"
     else:
         raise NotImplementedError(
-            "Analytic THC gradients currently support solve_method in {'inv_metric','fit_metric_gram'} "
+            "Analytic THC gradients currently support solve_method in "
+            "{'inv_metric','fit_metric_gram','fit_metric_qr'} "
             f"(got {solve_method!r})"
         )
     is_spherical = not bool(getattr(mol, "cart", True))
@@ -1222,42 +1329,34 @@ def _contract_thc_bar_adjoint(
             raise NotImplementedError("Analytic THC gradients currently support only grid_kind in {'becke','rdvr'}")
         becke_n = int(meta.get("becke_n", 3))
 
+        _vjp_kwargs = dict(
+            mol=mol,
+            ao_basis_cart=ao_basis_cart,
+            aux_basis_cart=aux_basis_cart,
+            sph_map=sph_map,
+            is_spherical=bool(is_spherical),
+            pts=thc.points,
+            w=thc.weights,
+            point_atom=point_atom,
+            becke_n=int(becke_n),
+            X=thc.X,
+            Y=thc.Y,
+            L_metric=thc.L_metric,
+            bar_X=bar_X,
+            bar_Y=bar_Y,
+            df_threads=int(df_threads),
+        )
         if solve_kind == "inv_metric":
-            g_thc, g_metric = _thc_factor_vjp_atomgrad_inv_metric(
-                mol=mol,
-                ao_basis_cart=ao_basis_cart,
-                aux_basis_cart=aux_basis_cart,
-                sph_map=sph_map,
-                is_spherical=bool(is_spherical),
-                pts=thc.points,
-                w=thc.weights,
-                point_atom=point_atom,
-                becke_n=int(becke_n),
-                X=thc.X,
-                Y=thc.Y,
-                L_metric=thc.L_metric,
-                bar_X=bar_X,
-                bar_Y=bar_Y,
-                df_threads=int(df_threads),
+            g_thc, g_metric = _thc_factor_vjp_atomgrad_inv_metric(**_vjp_kwargs)
+        elif solve_kind == "fit_metric_qr":
+            g_thc, g_metric = _thc_factor_vjp_atomgrad_fit_metric_qr(
+                **_vjp_kwargs,
+                solve_rcond=float(meta.get("solve_rcond", 1e-12)),
             )
         else:
             g_thc, g_metric = _thc_factor_vjp_atomgrad_fit_metric_gram(
-                mol=mol,
-                ao_basis_cart=ao_basis_cart,
-                aux_basis_cart=aux_basis_cart,
-                sph_map=sph_map,
-                is_spherical=bool(is_spherical),
-                pts=thc.points,
-                w=thc.weights,
-                point_atom=point_atom,
-                becke_n=int(becke_n),
-                X=thc.X,
-                Y=thc.Y,
-                L_metric=thc.L_metric,
-                bar_X=bar_X,
-                bar_Y=bar_Y,
+                **_vjp_kwargs,
                 solve_rcond=float(meta.get("solve_rcond", 1e-12)),
-                df_threads=int(df_threads),
             )
         cp.cuda.get_current_stream().synchronize()
         return np.asarray(cp.asnumpy(g_thc + g_metric), dtype=np.float64)
@@ -1315,42 +1414,34 @@ def _contract_thc_bar_adjoint(
 
             blk_sph_map = _TmpSphMap()
 
+        _vjp_blk_kwargs = dict(
+            mol=mol,
+            ao_basis_cart=ao_basis_blk,
+            aux_basis_cart=aux_basis_blk,
+            sph_map=blk_sph_map,
+            is_spherical=bool(is_spherical),
+            pts=getattr(blk, "points"),
+            w=getattr(blk, "weights"),
+            point_atom=point_atom,
+            becke_n=int(becke_n),
+            X=getattr(blk, "X"),
+            Y=getattr(blk, "Y"),
+            L_metric=getattr(blk, "L_metric"),
+            bar_X=bar_X_blk,
+            bar_Y=bar_Y_blk,
+            df_threads=int(df_threads),
+        )
         if solve_kind == "inv_metric":
-            g_thc_blk, g_metric_blk = _thc_factor_vjp_atomgrad_inv_metric(
-                mol=mol,
-                ao_basis_cart=ao_basis_blk,
-                aux_basis_cart=aux_basis_blk,
-                sph_map=blk_sph_map,
-                is_spherical=bool(is_spherical),
-                pts=getattr(blk, "points"),
-                w=getattr(blk, "weights"),
-                point_atom=point_atom,
-                becke_n=int(becke_n),
-                X=getattr(blk, "X"),
-                Y=getattr(blk, "Y"),
-                L_metric=getattr(blk, "L_metric"),
-                bar_X=bar_X_blk,
-                bar_Y=bar_Y_blk,
-                df_threads=int(df_threads),
+            g_thc_blk, g_metric_blk = _thc_factor_vjp_atomgrad_inv_metric(**_vjp_blk_kwargs)
+        elif solve_kind == "fit_metric_qr":
+            g_thc_blk, g_metric_blk = _thc_factor_vjp_atomgrad_fit_metric_qr(
+                **_vjp_blk_kwargs,
+                solve_rcond=float(bmeta.get("solve_rcond", 1e-12)),
             )
         else:
             g_thc_blk, g_metric_blk = _thc_factor_vjp_atomgrad_fit_metric_gram(
-                mol=mol,
-                ao_basis_cart=ao_basis_blk,
-                aux_basis_cart=aux_basis_blk,
-                sph_map=blk_sph_map,
-                is_spherical=bool(is_spherical),
-                pts=getattr(blk, "points"),
-                w=getattr(blk, "weights"),
-                point_atom=point_atom,
-                becke_n=int(becke_n),
-                X=getattr(blk, "X"),
-                Y=getattr(blk, "Y"),
-                L_metric=getattr(blk, "L_metric"),
-                bar_X=bar_X_blk,
-                bar_Y=bar_Y_blk,
-                solve_rcond=1e-12,
-                df_threads=int(df_threads),
+                **_vjp_blk_kwargs,
+                solve_rcond=float(bmeta.get("solve_rcond", 1e-12)),
             )
         grad_thc_dev += g_thc_blk
         grad_metric_dev += g_metric_blk
@@ -1672,6 +1763,191 @@ def _thc_factor_vjp_atomgrad_fit_metric_gram(
     return grad_thc, grad_metric
 
 
+def _thc_factor_vjp_atomgrad_fit_metric_qr(
+    *,
+    mol: Any,
+    ao_basis_cart: Any,
+    aux_basis_cart: Any,
+    sph_map: Any | None,
+    is_spherical: bool,
+    pts: Any,
+    w: Any,
+    point_atom: Any,
+    becke_n: int,
+    X: Any,
+    Y: Any,
+    L_metric: Any,
+    bar_X: Any,
+    bar_Y: Any,
+    solve_rcond: float = 1e-12,
+    df_threads: int = 0,
+    threads: int = 256,
+) -> tuple[Any, Any]:
+    """Return (grad_thc_dev, grad_metric_dev) for fit_metric_qr THC factors.
+
+    Forward factor build:
+      X_aux_p = w^(1/2) * chi_aux(r)
+      Q, R = qr(X_aux_p)
+      G = R^{-T} L   (SVD-regularized pseudoinverse)
+      Y = Q @ G
+
+    Mathematically equivalent to fit_metric_gram (Y = X_aux_p @ Gm^{-1} L
+    with Gm = X_aux_p^T X_aux_p = R^T R), but uses QR + SVD for numerical
+    stability.  The adjoint exploits the same equivalence, solving Gm
+    systems via the QR factors.
+    """
+
+    cp = _require_cupy()
+
+    from asuka.integrals.df_adjoint import chol_lower_adjoint  # noqa: PLC0415
+    from asuka.orbitals.eval_basis_device import (  # noqa: PLC0415
+        becke_weight_vjp_atomgrad_device,
+        contract_aos_cart_value_grad_vjp_atomgrad_device,
+        eval_aos_cart_value_on_points_device,
+    )
+    from asuka.integrals.int1e_cart import shell_to_atom_map  # noqa: PLC0415
+    from asuka.hf.nuc_grad_thc import _metric_2c2e_deriv_aux_atomgrad_cuda  # noqa: PLC0415
+
+    coords = np.asarray(getattr(mol, "coords_bohr"), dtype=np.float64).reshape((-1, 3))
+    natm = int(coords.shape[0])
+    if natm <= 0:
+        z = cp.zeros((0, 3), dtype=cp.float64)
+        return z, z
+
+    pts = cp.asarray(pts, dtype=cp.float64)
+    w = cp.asarray(w, dtype=cp.float64).ravel()
+    p_atom = cp.asarray(point_atom, dtype=cp.int32).ravel()
+
+    X = cp.asarray(X, dtype=cp.float64)
+    Y = cp.asarray(Y, dtype=cp.float64)
+    L = cp.asarray(L_metric, dtype=cp.float64)
+    bar_X = cp.asarray(bar_X, dtype=cp.float64)
+    bar_Y = cp.asarray(bar_Y, dtype=cp.float64)
+
+    if p_atom.shape != (int(w.shape[0]),):
+        raise ValueError("point_atom shape mismatch with grid size")
+
+    w_quart = cp.sqrt(cp.sqrt(w))
+    w_sqrt = cp.sqrt(w)
+
+    # Aux collocation (cart) — recompute for gradient.
+    aux_cart = eval_aos_cart_value_on_points_device(aux_basis_cart, pts, threads=int(threads), sync=True)
+    X_aux_p = cp.ascontiguousarray(aux_cart * w_sqrt[:, None])  # (npt, naux)
+    del aux_cart
+
+    # ---- Recompute QR + SVD-regularized solve (matching forward pass) ----
+    Q, R = cp.linalg.qr(X_aux_p, mode="reduced")  # Q:(npt,naux), R:(naux,naux)
+    rcond = float(solve_rcond)
+    try:
+        U_svd, s, Vh = cp.linalg.svd(R, full_matrices=False)
+        smax = float(cp.max(s).item()) if int(s.size) else 0.0
+        if smax == 0.0:
+            inv_s = cp.zeros_like(s)
+        else:
+            cutoff = float(rcond) * float(smax)
+            inv_s = cp.where(s > cutoff, 1.0 / s, 0.0)
+    except Exception:
+        U_svd, s, Vh = cp.linalg.svd(R, full_matrices=False)
+        inv_s = cp.where(s > 0, 1.0 / s, 0.0)
+
+    # R^{-T} (regularized) and R^{-1} (regularized)
+    RinvT = U_svd @ (inv_s[:, None] * Vh)                 # (naux, naux)
+    Rinv = Vh.T @ (inv_s[:, None] * U_svd.T)              # (naux, naux)
+
+    # G_hat = R^{-T} L;  G_gram = R^{-1} G_hat = Gm^{-1} L
+    G_hat = RinvT @ L       # (naux, naux)
+    G_gram = Rinv @ G_hat   # (naux, naux) = Gm^{-1} L
+
+    # ---- Adjoint: Y = X_aux_p @ G_gram, Gm @ G_gram = L ----
+    bar_X_aux_p = bar_Y @ G_gram.T                        # (npt, naux)
+    bar_G_gram = X_aux_p.T @ bar_Y                        # (naux, naux)
+
+    # Gm^{-T} @ bar_G_gram = Gm^{-1} @ bar_G_gram (symmetric Gm)
+    # Use QR: Gm^{-1} = R^{-1} R^{-T}, so Gm^{-1} x = Rinv @ RinvT @ x
+    U_adj = Rinv @ (RinvT @ bar_G_gram)                   # (naux, naux)
+
+    bar_L = cp.tril(U_adj)
+    bar_V = chol_lower_adjoint(L, bar_L)
+
+    bar_Gm = -(U_adj @ G_gram.T)
+    bar_X_aux_p = bar_X_aux_p + X_aux_p @ (bar_Gm + bar_Gm.T)
+
+    del Q, R, U_svd, s, Vh, inv_s, RinvT, Rinv, G_hat, G_gram
+    del bar_G_gram, U_adj, bar_L, bar_Gm
+
+    # ---- Accumulate atom gradients from collocation + Becke weights ----
+    bar_w = (0.25 / w) * cp.sum(bar_X * X, axis=1)
+    bar_w += (0.5 / w) * cp.sum(bar_X_aux_p * X_aux_p, axis=1)
+    del X_aux_p
+
+    grad_thc = cp.zeros((natm, 3), dtype=cp.float64)
+
+    # AO collocation VJP needs cart basis.
+    if bool(is_spherical):
+        if sph_map is None:
+            raise RuntimeError("expected sph_map for mol.cart=False")
+        T_c2s = getattr(sph_map, "T_c2s", None)
+        if T_c2s is None:
+            T_c2s = sph_map[0]
+        T_dev = cp.asarray(np.asarray(T_c2s, dtype=np.float64), dtype=cp.float64)
+        bar_X_cart = bar_X @ T_dev.T
+    else:
+        bar_X_cart = bar_X
+
+    shell_atom_cart = shell_to_atom_map(ao_basis_cart, atom_coords_bohr=coords)
+    grad_thc = contract_aos_cart_value_grad_vjp_atomgrad_device(
+        ao_basis_cart,
+        pts,
+        point_atom=p_atom,
+        w_pow=w_quart,
+        bar_ao=bar_X_cart,
+        shell_atom=cp.asarray(shell_atom_cart, dtype=cp.int32),
+        natm=natm,
+        out=grad_thc,
+        threads=int(threads),
+        sync=False,
+    )
+
+    # Aux collocation contributions.
+    shell_atom_aux = shell_to_atom_map(aux_basis_cart, atom_coords_bohr=coords)
+    grad_thc = contract_aos_cart_value_grad_vjp_atomgrad_device(
+        aux_basis_cart,
+        pts,
+        point_atom=p_atom,
+        w_pow=w_sqrt,
+        bar_ao=bar_X_aux_p,
+        shell_atom=cp.asarray(shell_atom_aux, dtype=cp.int32),
+        natm=natm,
+        out=grad_thc,
+        threads=int(threads),
+        sync=False,
+    )
+
+    # Becke partition weight derivative contributions.
+    atom_coords_dev = cp.ascontiguousarray(cp.asarray(coords, dtype=cp.float64))
+    grad_thc = becke_weight_vjp_atomgrad_device(
+        pts,
+        w,
+        bar_w=bar_w,
+        point_atom=p_atom,
+        atom_coords=atom_coords_dev,
+        becke_n=int(becke_n),
+        out=grad_thc,
+        threads=int(threads),
+        sync=False,
+    )
+
+    # Metric derivative contraction (cuERI CUDA).
+    grad_metric = _metric_2c2e_deriv_aux_atomgrad_cuda(
+        aux_basis_cart,
+        atom_coords_bohr=coords,
+        bar_V=bar_V,
+        df_threads=int(df_threads),
+    )
+
+    return grad_thc, grad_metric
+
+
 def casscf_nuc_grad_thc(
     scf_out: Any,
     casscf: Any,
@@ -1780,14 +2056,17 @@ def casscf_nuc_grad_thc(
         solve_method = str(meta.get("solve_method", "fit_metric_qr")).strip().lower()
         inv_metric_methods = {"inv_metric", "inv", "metric_inv", "vinv", "v_inv"}
         fit_metric_gram_methods = {"fit_metric_gram", "gram"}
+        fit_metric_qr_methods = {"fit_metric_qr", "fit_metric", "qr", "lq", "lstsq"}
         if solve_method in inv_metric_methods:
             solve_kind = "inv_metric"
         elif solve_method in fit_metric_gram_methods:
             solve_kind = "fit_metric_gram"
+        elif solve_method in fit_metric_qr_methods:
+            solve_kind = "fit_metric_qr"
         else:
             raise NotImplementedError(
-                "THC-CASSCF analytic gradients currently support solve_method in {'inv_metric','fit_metric_gram'} "
-                f"(got {solve_method!r})"
+                "THC-CASSCF analytic gradients currently support solve_method in "
+                f"{{'inv_metric','fit_metric_gram','fit_metric_qr'}} (got {solve_method!r})"
             )
         if bool(meta.get("downselected", False)):
             raise NotImplementedError("THC-CASSCF analytic gradients require THC factors built without point downselect")
@@ -1820,42 +2099,34 @@ def casscf_nuc_grad_thc(
         bar_X = bar_X_mean + bar_X_aa
         bar_Y = bar_Y_mean + bar_Y_aa
 
+        _vjp_kwargs = dict(
+            mol=mol,
+            ao_basis_cart=ao_basis_cart,
+            aux_basis_cart=aux_basis_cart,
+            sph_map=sph_map,
+            is_spherical=bool(is_spherical),
+            pts=thc.points,
+            w=thc.weights,
+            point_atom=point_atom,
+            becke_n=int(becke_n),
+            X=thc.X,
+            Y=thc.Y,
+            L_metric=thc.L_metric,
+            bar_X=bar_X,
+            bar_Y=bar_Y,
+            df_threads=int(df_threads),
+        )
         if solve_kind == "inv_metric":
-            g_thc_blk, g_metric_blk = _thc_factor_vjp_atomgrad_inv_metric(
-                mol=mol,
-                ao_basis_cart=ao_basis_cart,
-                aux_basis_cart=aux_basis_cart,
-                sph_map=sph_map,
-                is_spherical=bool(is_spherical),
-                pts=thc.points,
-                w=thc.weights,
-                point_atom=point_atom,
-                becke_n=int(becke_n),
-                X=thc.X,
-                Y=thc.Y,
-                L_metric=thc.L_metric,
-                bar_X=bar_X,
-                bar_Y=bar_Y,
-                df_threads=int(df_threads),
+            g_thc_blk, g_metric_blk = _thc_factor_vjp_atomgrad_inv_metric(**_vjp_kwargs)
+        elif solve_kind == "fit_metric_qr":
+            g_thc_blk, g_metric_blk = _thc_factor_vjp_atomgrad_fit_metric_qr(
+                **_vjp_kwargs,
+                solve_rcond=float(meta.get("solve_rcond", 1e-12)),
             )
         else:
             g_thc_blk, g_metric_blk = _thc_factor_vjp_atomgrad_fit_metric_gram(
-                mol=mol,
-                ao_basis_cart=ao_basis_cart,
-                aux_basis_cart=aux_basis_cart,
-                sph_map=sph_map,
-                is_spherical=bool(is_spherical),
-                pts=thc.points,
-                w=thc.weights,
-                point_atom=point_atom,
-                becke_n=int(becke_n),
-                X=thc.X,
-                Y=thc.Y,
-                L_metric=thc.L_metric,
-                bar_X=bar_X,
-                bar_Y=bar_Y,
+                **_vjp_kwargs,
                 solve_rcond=float(meta.get("solve_rcond", 1e-12)),
-                df_threads=int(df_threads),
             )
 
         grad_thc_dev += g_thc_blk
@@ -1868,14 +2139,17 @@ def casscf_nuc_grad_thc(
         solve_method = str(lmeta.get("solve_method", "fit_metric_qr")).strip().lower()
         inv_metric_methods = {"inv_metric", "inv", "metric_inv", "vinv", "v_inv"}
         fit_metric_gram_methods = {"fit_metric_gram", "gram"}
+        fit_metric_qr_methods = {"fit_metric_qr", "fit_metric", "qr", "lq", "lstsq"}
         if solve_method in inv_metric_methods:
             solve_kind = "inv_metric"
         elif solve_method in fit_metric_gram_methods:
             solve_kind = "fit_metric_gram"
+        elif solve_method in fit_metric_qr_methods:
+            solve_kind = "fit_metric_qr"
         else:
             raise NotImplementedError(
-                "LocalTHC analytic gradients currently support solve_method in {'inv_metric','fit_metric_gram'} "
-                f"(got {solve_method!r})"
+                "LocalTHC analytic gradients currently support solve_method in "
+                f"{{'inv_metric','fit_metric_gram','fit_metric_qr'}} (got {solve_method!r})"
             )
         if bool(lmeta.get("downselected", False)):
             raise NotImplementedError("LocalTHC analytic gradients require factors built without point downselect")
@@ -1982,42 +2256,34 @@ def casscf_nuc_grad_thc(
 
                 blk_sph_map = _TmpSphMap()
 
+            _vjp_blk_kwargs = dict(
+                mol=mol,
+                ao_basis_cart=ao_basis_blk,
+                aux_basis_cart=aux_basis_blk,
+                sph_map=blk_sph_map,
+                is_spherical=bool(is_spherical),
+                pts=getattr(blk, "points"),
+                w=getattr(blk, "weights"),
+                point_atom=point_atom,
+                becke_n=int(becke_n),
+                X=getattr(blk, "X"),
+                Y=getattr(blk, "Y"),
+                L_metric=getattr(blk, "L_metric"),
+                bar_X=bar_X_blk,
+                bar_Y=bar_Y_blk,
+                df_threads=int(df_threads),
+            )
             if solve_kind == "inv_metric":
-                g_thc_blk, g_metric_blk = _thc_factor_vjp_atomgrad_inv_metric(
-                    mol=mol,
-                    ao_basis_cart=ao_basis_blk,
-                    aux_basis_cart=aux_basis_blk,
-                    sph_map=blk_sph_map,
-                    is_spherical=bool(is_spherical),
-                    pts=getattr(blk, "points"),
-                    w=getattr(blk, "weights"),
-                    point_atom=point_atom,
-                    becke_n=int(becke_n),
-                    X=getattr(blk, "X"),
-                    Y=getattr(blk, "Y"),
-                    L_metric=getattr(blk, "L_metric"),
-                    bar_X=bar_X_blk,
-                    bar_Y=bar_Y_blk,
-                    df_threads=int(df_threads),
+                g_thc_blk, g_metric_blk = _thc_factor_vjp_atomgrad_inv_metric(**_vjp_blk_kwargs)
+            elif solve_kind == "fit_metric_qr":
+                g_thc_blk, g_metric_blk = _thc_factor_vjp_atomgrad_fit_metric_qr(
+                    **_vjp_blk_kwargs,
+                    solve_rcond=float(bmeta.get("solve_rcond", 1e-12)),
                 )
             else:
                 g_thc_blk, g_metric_blk = _thc_factor_vjp_atomgrad_fit_metric_gram(
-                    mol=mol,
-                    ao_basis_cart=ao_basis_blk,
-                    aux_basis_cart=aux_basis_blk,
-                    sph_map=blk_sph_map,
-                    is_spherical=bool(is_spherical),
-                    pts=getattr(blk, "points"),
-                    w=getattr(blk, "weights"),
-                    point_atom=point_atom,
-                    becke_n=int(becke_n),
-                    X=getattr(blk, "X"),
-                    Y=getattr(blk, "Y"),
-                    L_metric=getattr(blk, "L_metric"),
-                    bar_X=bar_X_blk,
-                    bar_Y=bar_Y_blk,
-                    solve_rcond=1e-12,
-                    df_threads=int(df_threads),
+                    **_vjp_blk_kwargs,
+                    solve_rcond=float(bmeta.get("solve_rcond", 1e-12)),
                 )
 
             grad_thc_dev += g_thc_blk
@@ -2076,6 +2342,8 @@ def casscf_nuc_grad_thc(
             shell_atom=shell_atom,
             contract_backend=str(int1e_contract_backend),
         )
+    # THC AO-factor VJP already contains the AO-basis response contribution,
+    # so adding an explicit -Tr(W dS) Pulay term here would double-count.
     de_pulay = np.zeros_like(np.asarray(de_h1, dtype=np.float64))
 
     de_nuc = np.asarray(mol.energy_nuc_grad(), dtype=np.float64)
@@ -2255,6 +2523,7 @@ def _casscf_nuc_grad_thc_per_root_impl(
             contract_backend=str(int1e_contract_backend),
         )
     de_nuc = np.asarray(mol.energy_nuc_grad(), dtype=np.float64)
+
     grad_sa_base = np.asarray(np.asarray(de_h1_sa, dtype=np.float64) + np.asarray(de_thc_sa, dtype=np.float64) + de_nuc, dtype=np.float64)
 
     mc_sa = THCNewtonCASSCFAdapter(
@@ -2339,6 +2608,26 @@ def _casscf_nuc_grad_thc_per_root_impl(
             rhs_ci = [np.zeros_like(np.asarray(ci_list[r], dtype=np.float64).ravel()) for r in range(int(nroots))]
             rhs_ci[K] = rhs_ci_K[: int(np.asarray(ci_list[K]).size)]
 
+            def _z_bad(z_res: Any) -> bool:
+                z_vec = np.asarray(getattr(z_res, "z_packed", np.array([], dtype=np.float64)), dtype=np.float64).ravel()
+                if z_vec.size == 0:
+                    return True
+                if not np.all(np.isfinite(z_vec)):
+                    return True
+                if float(np.max(np.abs(z_vec))) > 1e8:
+                    return True
+                if not bool(getattr(z_res, "converged", True)):
+                    return True
+                info = getattr(z_res, "info", None)
+                if hasattr(info, "get"):
+                    try:
+                        rel = float(info.get("residual_rel", np.nan))
+                        if np.isfinite(rel) and rel > max(10.0 * float(z_tol), 1e-8):
+                            return True
+                    except Exception:
+                        pass
+                return False
+
             z_K = solve_mcscf_zvector(
                 mc_sa,
                 rhs_orb=np.asarray(rhs_orb, dtype=np.float64),
@@ -2346,7 +2635,33 @@ def _casscf_nuc_grad_thc_per_root_impl(
                 hessian_op=hess_op,
                 tol=float(z_tol),
                 maxiter=int(z_maxiter),
+                method="gmres",
             )
+            if _z_bad(z_K):
+                z_K = solve_mcscf_zvector(
+                    mc_sa,
+                    rhs_orb=np.asarray(rhs_orb, dtype=np.float64),
+                    rhs_ci=rhs_ci,
+                    hessian_op=hess_op,
+                    tol=float(z_tol),
+                    maxiter=max(int(z_maxiter), 400),
+                    method="gmres",
+                    x0=None,
+                )
+            if _z_bad(z_K):
+                z_K = solve_mcscf_zvector(
+                    mc_sa,
+                    rhs_orb=np.asarray(rhs_orb, dtype=np.float64),
+                    rhs_ci=rhs_ci,
+                    hessian_op=hess_op,
+                    tol=float(z_tol),
+                    maxiter=max(int(z_maxiter), 400),
+                    method="gcrotmk",
+                    x0=None,
+                )
+            if _z_bad(z_K):
+                raise RuntimeError("unstable THC per-root Z-vector solution")
+
             Lvec = np.asarray(z_K.z_packed, dtype=np.float64).ravel()
             Lorb_mat = mc_sa.unpack_uniq_var(Lvec[:n_orb])
             Lci_list = hess_op.ci_unflatten(Lvec[n_orb:])

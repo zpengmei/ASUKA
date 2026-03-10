@@ -20,6 +20,10 @@ class CuERIDFConfig:
     mode: str = "warp"
     threads: int = 256
     stream: Any | None = None
+    int3c_work_small_max: int = 512
+    int3c_work_large_min: int = 200_000
+    int3c_blocks_per_task: int = 4
+    int3c_plan_policy: str = "auto"
 
 
 def build_df_B_from_cueri_packed_bases(
@@ -81,6 +85,10 @@ def build_df_B_from_cueri_packed_bases(
         backend=str(cfg.backend),
         mode=str(cfg.mode),
         threads=int(cfg.threads),
+        work_small_max=int(cfg.int3c_work_small_max),
+        work_large_min=int(cfg.int3c_work_large_min),
+        blocks_per_task=int(cfg.int3c_blocks_per_task),
+        plan_policy=str(cfg.int3c_plan_policy),
         ao_rep=str(ao_rep),
         profile=profile,
     )

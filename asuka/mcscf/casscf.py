@@ -719,11 +719,7 @@ def run_casscf_df(
     orbital_optimizer = str(orbital_optimizer).strip().lower()
     if orbital_optimizer not in {"jacobi", "lbfgs", "ah", "1step"}:
         raise ValueError("orbital_optimizer must be one of: 'jacobi', 'lbfgs', 'ah', '1step'")
-    if casci_backend_s == "thc" and orbital_optimizer in {"ah", "1step"}:
-        raise NotImplementedError(
-            "casci_backend='thc' currently supports orbital_optimizer in {'jacobi','lbfgs'} "
-            "(THC AH/1step wiring is not implemented yet)."
-        )
+    # THC with AH/1step is supported via THCERIProvider (newton_df.py).
     newton_aux_block_naux = int(newton_aux_block_naux)
     if newton_aux_block_naux < 0:
         raise ValueError("newton_aux_block_naux must be >= 0")
@@ -1501,6 +1497,16 @@ def run_casscf_df(
             if ah_df_B is None and casci_backend_s in ("dense_gpu", "dense_cpu"):
                 _ah_ao_eri = getattr(scf_out, "ao_eri", None)
 
+            # THC ERI provider for AH when using THC backend.
+            _ah_eri_provider = two_e_provider if direct_mode else None
+            _ah_jk_provider = two_e_provider if direct_mode else None
+            if _ah_eri_provider is None and casci_backend_s == "thc":
+                _thc_fac = getattr(scf_out, "thc_factors", None)
+                if _thc_fac is not None:
+                    from asuka.mcscf.newton_df import THCERIProvider as _THCProv  # noqa: PLC0415
+                    _ah_eri_provider = _THCProv(_thc_fac)
+                    _ah_jk_provider = _ah_eri_provider
+
             mc_ah = DFNewtonCASSCFAdapter(
                 df_B=ah_df_B,
                 ao_eri=_ah_ao_eri,
@@ -1517,8 +1523,8 @@ def run_casscf_df(
                 extrasym=None,
                 mixed_precision=bool(newton_mixed_precision),
                 aux_block_naux=int(newton_aux_block_naux),
-                jk_provider=two_e_provider if direct_mode else None,
-                eri_provider=two_e_provider if direct_mode else None,
+                jk_provider=_ah_jk_provider,
+                eri_provider=_ah_eri_provider,
             )
             mc_ah.max_stepsize = float(max_stepsize_cur)
             mc_ah.ah_level_shift = float(ah_level_shift)
@@ -1795,6 +1801,16 @@ def run_casscf_df(
                 ah_fcisolver_1s._matvec_cuda_state_cache = {}
                 ah_fcisolver_1s._rdm_cuda_ws_cache = {}
 
+            # THC ERI provider for 1step when using THC backend.
+            _1s_eri_provider = two_e_provider if direct_mode else None
+            _1s_jk_provider = two_e_provider if direct_mode else None
+            if _1s_eri_provider is None and casci_backend_s == "thc":
+                _thc_fac_1s = getattr(scf_out, "thc_factors", None)
+                if _thc_fac_1s is not None:
+                    from asuka.mcscf.newton_df import THCERIProvider as _THCProv1s  # noqa: PLC0415
+                    _1s_eri_provider = _THCProv1s(_thc_fac_1s)
+                    _1s_jk_provider = _1s_eri_provider
+
             mc_1s = DFNewtonCASSCFAdapter(
                 df_B=ah_df_B,
                 ao_eri=None,
@@ -1811,8 +1827,8 @@ def run_casscf_df(
                 extrasym=None,
                 mixed_precision=bool(newton_mixed_precision),
                 aux_block_naux=int(newton_aux_block_naux),
-                jk_provider=two_e_provider if direct_mode else None,
-                eri_provider=two_e_provider if direct_mode else None,
+                jk_provider=_1s_jk_provider,
+                eri_provider=_1s_eri_provider,
             )
             # PySCF mc1step defaults.
             mc_1s.max_stepsize = min(float(max_stepsize), 0.02)

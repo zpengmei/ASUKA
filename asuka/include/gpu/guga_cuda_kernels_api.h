@@ -396,6 +396,58 @@ extern "C" cudaError_t guga_qmc_spawn_hamiltonian_u64_f64_initiator_dev_launch_s
     cudaStream_t stream,
     int threads);
 
+extern "C" cudaError_t guga_qmc_spawn_hamiltonian_idx64_u64_f64_launch_stream(
+    const int32_t* child,
+    const int16_t* node_twos,
+    const int64_t* child_prefix,
+    uint64_t ncsf,
+    int norb,
+    const uint64_t* x_idx_u64,
+    const double* x_val,
+    int m,
+    const double* h_base_flat,
+    const double* eri_mat,
+    const float* pair_alias_prob,
+    const int32_t* pair_alias_idx,
+    const double* pair_norm,
+    double pair_norm_sum,
+    int pair_sampling_mode,
+    double eps,
+    int nspawn_one,
+    int nspawn_two,
+    uint64_t seed,
+    double initiator_t,
+    uint64_t* out_idx_u64,
+    double* out_val,
+    cudaStream_t stream,
+    int threads);
+
+extern "C" cudaError_t guga_qmc_spawn_hamiltonian_idx64_u64_f64_initiator_dev_launch_stream(
+    const int32_t* child,
+    const int16_t* node_twos,
+    const int64_t* child_prefix,
+    uint64_t ncsf,
+    int norb,
+    const uint64_t* x_idx_u64,
+    const double* x_val,
+    int m,
+    const double* h_base_flat,
+    const double* eri_mat,
+    const float* pair_alias_prob,
+    const int32_t* pair_alias_idx,
+    const double* pair_norm,
+    double pair_norm_sum,
+    int pair_sampling_mode,
+    double eps,
+    int nspawn_one,
+    int nspawn_two,
+    uint64_t seed,
+    const double* initiator_t_dev,
+    uint64_t* out_idx_u64,
+    double* out_val,
+    cudaStream_t stream,
+    int threads);
+
 extern "C" cudaError_t guga_qmc_coalesce_coo_i32_f64_launch_stream(
     const int32_t* idx_in,
     const double* val_in,
@@ -2400,6 +2452,38 @@ extern "C" cudaError_t guga_hb_screen_and_apply_many_roots_launch_stream(
     int cap,
     const uint8_t* selected_mask,
     int* overflow_flag,
+    cudaStream_t stream,
+    int threads);
+
+extern "C" cudaError_t cas36_diag_guess_candidates_u64_dense_launch_stream(
+    const int32_t* child,
+    const int64_t* child_prefix,
+    uint64_t ncsf,
+    int norb,
+    const uint64_t* cand_idx_u64,
+    int ncand,
+    const double* h1_diag,
+    const double* eri_ppqq,
+    const double* eri_pqqp,
+    int neleca,
+    int nelecb,
+    double* hdiag_out,
+    cudaStream_t stream,
+    int threads);
+
+extern "C" cudaError_t cas36_cipsi_score_pt2_compact_u64_launch_stream(
+    const uint64_t* idx_u64,
+    const double* vals_root_major,
+    int64_t vals_stride,
+    int ncand,
+    int nroots,
+    const double* e_var,
+    const double* cand_hdiag,
+    const uint64_t* selected_idx_sorted_u64,
+    int nselected,
+    double denom_floor,
+    uint64_t* score_bits_out,
+    double* pt2_out,
     cudaStream_t stream,
     int threads);
 

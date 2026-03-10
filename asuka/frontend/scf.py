@@ -559,10 +559,99 @@ def _init_guess_dm_atom_hcore_cart(
 def _df_config_key(config: CuERIDFConfig | None) -> tuple[Any, ...]:
     cfg = CuERIDFConfig() if config is None else config
     return (
-        str(cfg.backend).strip().lower(),
-        str(cfg.mode).strip().lower(),
-        int(cfg.threads),
+        str(_cfg_get(cfg, "backend", "gpu_rys")).strip().lower(),
+        str(_cfg_get(cfg, "mode", "warp")).strip().lower(),
+        int(_cfg_get(cfg, "threads", 256)),
+        int(_cfg_get(cfg, "int3c_work_small_max", 512)),
+        int(_cfg_get(cfg, "int3c_work_large_min", 200_000)),
+        int(_cfg_get(cfg, "int3c_blocks_per_task", 4)),
+        str(_cfg_get(cfg, "int3c_plan_policy", "auto")).strip().lower(),
         int(_cuda_device_id_or_neg1()),
+    )
+
+
+def _cfg_get(cfg: Any, name: str, default: Any) -> Any:
+    if cfg is None:
+        return default
+    if isinstance(cfg, dict):
+        return cfg.get(name, default)
+    return getattr(cfg, name, default)
+
+
+def _env_int_default(name: str, default: int) -> int:
+    try:
+        return int(str(os.environ.get(str(name), str(default))).strip())
+    except Exception:
+        return int(default)
+
+
+def _env_str_default(name: str, default: str) -> str:
+    return str(os.environ.get(str(name), str(default))).strip()
+
+
+def _resolve_cueri_df_config(
+    df_config: CuERIDFConfig | None,
+    *,
+    df_int3c_plan_policy: str | None = None,
+    df_int3c_work_small_max: int | None = None,
+    df_int3c_work_large_min: int | None = None,
+    df_int3c_blocks_per_task: int | None = None,
+) -> CuERIDFConfig:
+    defaults = CuERIDFConfig()
+    cfg_in = defaults if df_config is None else df_config
+
+    if df_config is None:
+        plan_policy = (
+            str(df_int3c_plan_policy).strip().lower()
+            if df_int3c_plan_policy is not None
+            else _env_str_default("ASUKA_DF_INT3C_PLAN_POLICY", str(getattr(defaults, "int3c_plan_policy", "auto")))
+        )
+        work_small_max = (
+            int(df_int3c_work_small_max)
+            if df_int3c_work_small_max is not None
+            else _env_int_default("ASUKA_DF_INT3C_WORK_SMALL_MAX", int(getattr(defaults, "int3c_work_small_max", 512)))
+        )
+        work_large_min = (
+            int(df_int3c_work_large_min)
+            if df_int3c_work_large_min is not None
+            else _env_int_default("ASUKA_DF_INT3C_WORK_LARGE_MIN", int(getattr(defaults, "int3c_work_large_min", 200_000)))
+        )
+        blocks_per_task = (
+            int(df_int3c_blocks_per_task)
+            if df_int3c_blocks_per_task is not None
+            else _env_int_default("ASUKA_DF_INT3C_BLOCKS_PER_TASK", int(getattr(defaults, "int3c_blocks_per_task", 4)))
+        )
+    else:
+        plan_policy = (
+            str(df_int3c_plan_policy).strip().lower()
+            if df_int3c_plan_policy is not None
+            else str(_cfg_get(cfg_in, "int3c_plan_policy", getattr(defaults, "int3c_plan_policy", "auto"))).strip().lower()
+        )
+        work_small_max = (
+            int(df_int3c_work_small_max)
+            if df_int3c_work_small_max is not None
+            else int(_cfg_get(cfg_in, "int3c_work_small_max", getattr(defaults, "int3c_work_small_max", 512)))
+        )
+        work_large_min = (
+            int(df_int3c_work_large_min)
+            if df_int3c_work_large_min is not None
+            else int(_cfg_get(cfg_in, "int3c_work_large_min", getattr(defaults, "int3c_work_large_min", 200_000)))
+        )
+        blocks_per_task = (
+            int(df_int3c_blocks_per_task)
+            if df_int3c_blocks_per_task is not None
+            else int(_cfg_get(cfg_in, "int3c_blocks_per_task", getattr(defaults, "int3c_blocks_per_task", 4)))
+        )
+
+    return CuERIDFConfig(
+        backend=str(_cfg_get(cfg_in, "backend", defaults.backend)),
+        mode=str(_cfg_get(cfg_in, "mode", defaults.mode)),
+        threads=int(_cfg_get(cfg_in, "threads", defaults.threads)),
+        stream=_cfg_get(cfg_in, "stream", defaults.stream),
+        int3c_work_small_max=max(1, int(work_small_max)),
+        int3c_work_large_min=max(2, int(work_large_min)),
+        int3c_blocks_per_task=max(1, int(blocks_per_task)),
+        int3c_plan_policy=str(plan_policy),
     )
 
 
@@ -875,6 +964,8 @@ def run_rhf_direct(
     eps_schwarz: float = 1e-12,
     direct_threads: int = 256,
     direct_max_tile_bytes: int = 256 << 20,
+    direct_gpu_task_budget_bytes: int | None = None,
+    direct_max_slab_tasks: int | None = None,
     max_cycle: int = 50,
     conv_tol: float = 1e-10,
     conv_tol_dm: float = 1e-8,
@@ -913,6 +1004,8 @@ def run_rhf_direct(
         eps_schwarz=float(eps_schwarz),
         threads=int(direct_threads),
         max_tile_bytes=int(direct_max_tile_bytes),
+        max_slab_tasks=direct_max_slab_tasks,
+        gpu_task_budget_bytes=direct_gpu_task_budget_bytes,
     )
 
     init_fock_cycles_i = int(_HF_INIT_FOCK_CYCLES) if init_fock_cycles is None else max(0, int(init_fock_cycles))
@@ -962,6 +1055,8 @@ def run_uhf_direct(
     eps_schwarz: float = 1e-12,
     direct_threads: int = 256,
     direct_max_tile_bytes: int = 256 << 20,
+    direct_gpu_task_budget_bytes: int | None = None,
+    direct_max_slab_tasks: int | None = None,
     max_cycle: int = 50,
     conv_tol: float = 1e-10,
     conv_tol_dm: float = 1e-8,
@@ -992,6 +1087,8 @@ def run_uhf_direct(
         eps_schwarz=float(eps_schwarz),
         threads=int(direct_threads),
         max_tile_bytes=int(direct_max_tile_bytes),
+        max_slab_tasks=direct_max_slab_tasks,
+        gpu_task_budget_bytes=direct_gpu_task_budget_bytes,
     )
 
     scf = uhf_direct(
@@ -1036,6 +1133,8 @@ def run_rohf_direct(
     eps_schwarz: float = 1e-12,
     direct_threads: int = 256,
     direct_max_tile_bytes: int = 256 << 20,
+    direct_gpu_task_budget_bytes: int | None = None,
+    direct_max_slab_tasks: int | None = None,
     max_cycle: int = 50,
     conv_tol: float = 1e-10,
     conv_tol_dm: float = 1e-8,
@@ -1066,6 +1165,8 @@ def run_rohf_direct(
         eps_schwarz=float(eps_schwarz),
         threads=int(direct_threads),
         max_tile_bytes=int(direct_max_tile_bytes),
+        max_slab_tasks=direct_max_slab_tasks,
+        gpu_task_budget_bytes=direct_gpu_task_budget_bytes,
     )
 
     scf = rohf_direct(
@@ -1280,6 +1381,11 @@ def run_rhf_df(
     basis: Any | None = None,
     auxbasis: Any = "autoaux",
     df_config: CuERIDFConfig | None = None,
+    df_int3c_plan_policy: str | None = None,
+    df_int3c_work_small_max: int | None = None,
+    df_int3c_work_large_min: int | None = None,
+    df_int3c_blocks_per_task: int | None = None,
+    df_k_cache_max_mb: int | None = None,
     df_layout: str = "mnQ",
     expand_contractions: bool = True,
     max_cycle: int = 50,
@@ -1313,6 +1419,13 @@ def run_rhf_df(
         raise ValueError("RHF requires an even, positive electron count")
 
     basis_in = mol.basis if basis is None else basis
+    cfg = _resolve_cueri_df_config(
+        df_config,
+        df_int3c_plan_policy=df_int3c_plan_policy,
+        df_int3c_work_small_max=df_int3c_work_small_max,
+        df_int3c_work_large_min=df_int3c_work_large_min,
+        df_int3c_blocks_per_task=df_int3c_blocks_per_task,
+    )
 
     df_layout_s = str(df_layout).strip().lower()
     if df_layout_s not in {"mnq", "qmn"}:
@@ -1324,7 +1437,7 @@ def run_rhf_df(
         basis_in=basis_in,
         auxbasis=auxbasis,
         expand_contractions=bool(expand_contractions),
-        df_config=df_config,
+        df_config=cfg,
         df_layout_build=str(df_build_layout),
     )
     prep_hit = _cache_get(_RHF_PREP_CACHE, prep_key)
@@ -1351,7 +1464,7 @@ def run_rhf_df(
         B, L_chol = build_df_B_from_cueri_packed_bases(
             ao_basis,
             aux_basis,
-            config=df_config,
+            config=cfg,
             layout=str(df_build_layout),
             ao_rep=str(df_ao_rep),
             profile=df_prof,
@@ -1439,6 +1552,7 @@ def run_rhf_df(
         dm0=dm0,
         mo_coeff0=mo_coeff0,
         init_fock_cycles=int(init_fock_cycles_i),
+        k_cache_max_mb=None if df_k_cache_max_mb is None else int(df_k_cache_max_mb),
         profile=scf_prof,
     )
 
@@ -1490,7 +1604,7 @@ def run_rhf_df(
             hf_method="rhf",
             basis=basis_in,
             auxbasis=auxbasis,
-            df_config=df_config,
+            df_config=cfg,
             expand_contractions=bool(expand_contractions),
             backend="cuda",
             max_cycle=int(max_cycle),
@@ -2825,6 +2939,11 @@ def run_hf_df(
         for key in (
             "auxbasis",
             "df_config",
+            "df_int3c_plan_policy",
+            "df_int3c_work_small_max",
+            "df_int3c_work_large_min",
+            "df_int3c_blocks_per_task",
+            "df_k_cache_max_mb",
             "df_threads",
             "jk_mode",
             "k_engine",
@@ -2861,6 +2980,11 @@ def run_hf_df(
         for key in (
             "auxbasis",
             "df_config",
+            "df_int3c_plan_policy",
+            "df_int3c_work_small_max",
+            "df_int3c_work_large_min",
+            "df_int3c_blocks_per_task",
+            "df_k_cache_max_mb",
             "df_threads",
             "jk_mode",
             "k_engine",
@@ -2951,11 +3075,20 @@ def run_hf_df(
 
         return _with_two_e_metadata(out, two_e_backend="df")
 
+    cpu_kwargs = dict(kwargs)
+    for key in (
+        "df_int3c_plan_policy",
+        "df_int3c_work_small_max",
+        "df_int3c_work_large_min",
+        "df_int3c_blocks_per_task",
+        "df_k_cache_max_mb",
+    ):
+        cpu_kwargs.pop(key, None)
     if method_s == "rhf":
-        return _with_two_e_metadata(run_rhf_df_cpu(mol, dm0=dm0, mo_coeff0=mo_coeff0, **kwargs), two_e_backend="df")
+        return _with_two_e_metadata(run_rhf_df_cpu(mol, dm0=dm0, mo_coeff0=mo_coeff0, **cpu_kwargs), two_e_backend="df")
     if method_s == "uhf":
-        return _with_two_e_metadata(run_uhf_df_cpu(mol, dm0=dm0, mo_coeff0=mo_coeff0, **kwargs), two_e_backend="df")
-    return _with_two_e_metadata(run_rohf_df_cpu(mol, dm0=dm0, mo_coeff0=mo_coeff0, **kwargs), two_e_backend="df")
+        return _with_two_e_metadata(run_uhf_df_cpu(mol, dm0=dm0, mo_coeff0=mo_coeff0, **cpu_kwargs), two_e_backend="df")
+    return _with_two_e_metadata(run_rohf_df_cpu(mol, dm0=dm0, mo_coeff0=mo_coeff0, **cpu_kwargs), two_e_backend="df")
 
 
 def run_hf(
@@ -3076,6 +3209,11 @@ def run_rks_df(
     basis: Any | None = None,
     auxbasis: Any = "autoaux",
     df_config: "CuERIDFConfig | None" = None,
+    df_int3c_plan_policy: str | None = None,
+    df_int3c_work_small_max: int | None = None,
+    df_int3c_work_large_min: int | None = None,
+    df_int3c_blocks_per_task: int | None = None,
+    df_k_cache_max_mb: int | None = None,
     df_layout: str = "mnQ",
     expand_contractions: bool = True,
     max_cycle: int = 100,
@@ -3115,6 +3253,13 @@ def run_rks_df(
         raise ValueError("RKS requires an even, positive electron count")
 
     basis_in = mol.basis if basis is None else basis
+    cfg = _resolve_cueri_df_config(
+        df_config,
+        df_int3c_plan_policy=df_int3c_plan_policy,
+        df_int3c_work_small_max=df_int3c_work_small_max,
+        df_int3c_work_large_min=df_int3c_work_large_min,
+        df_int3c_blocks_per_task=df_int3c_blocks_per_task,
+    )
 
     df_layout_s = str(df_layout).strip().lower()
     if df_layout_s not in {"mnq", "qmn"}:
@@ -3138,7 +3283,7 @@ def run_rks_df(
         df_prof = profile.setdefault("df_build", {})
 
     B, L_chol = build_df_B_from_cueri_packed_bases(
-        ao_basis, aux_basis, config=df_config, layout=str(df_build_layout),
+        ao_basis, aux_basis, config=cfg, layout=str(df_build_layout),
         ao_rep=str(df_ao_rep), profile=df_prof, return_L=True,
     )
 
@@ -3192,6 +3337,7 @@ def run_rks_df(
         level_shift=float(level_shift),
         k_q_block=int(k_q_block),
         cublas_math_mode=cublas_math_mode,
+        k_cache_max_mb=None if df_k_cache_max_mb is None else int(df_k_cache_max_mb),
         dm0=dm0,
         mo_coeff0=mo_coeff0,
         init_fock_cycles=int(init_fock_cycles_i),
@@ -3562,6 +3708,11 @@ def run_uhf_df(
     basis: Any | None = None,
     auxbasis: Any = "autoaux",
     df_config: CuERIDFConfig | None = None,
+    df_int3c_plan_policy: str | None = None,
+    df_int3c_work_small_max: int | None = None,
+    df_int3c_work_large_min: int | None = None,
+    df_int3c_blocks_per_task: int | None = None,
+    df_k_cache_max_mb: int | None = None,
     df_layout: str = "mnQ",
     expand_contractions: bool = True,
     max_cycle: int = 50,
@@ -3580,6 +3731,13 @@ def run_uhf_df(
 
     nalpha, nbeta = _nalpha_nbeta_from_mol(mol)
     basis_in = mol.basis if basis is None else basis
+    cfg = _resolve_cueri_df_config(
+        df_config,
+        df_int3c_plan_policy=df_int3c_plan_policy,
+        df_int3c_work_small_max=df_int3c_work_small_max,
+        df_int3c_work_large_min=df_int3c_work_large_min,
+        df_int3c_blocks_per_task=df_int3c_blocks_per_task,
+    )
 
     df_layout_s = str(df_layout).strip().lower()
     if df_layout_s not in {"mnq", "qmn"}:
@@ -3608,7 +3766,7 @@ def run_uhf_df(
     B, L_chol = build_df_B_from_cueri_packed_bases(
         ao_basis,
         aux_basis,
-        config=df_config,
+        config=cfg,
         layout=str(df_build_layout),
         ao_rep=str(df_ao_rep),
         profile=df_prof,
@@ -3638,6 +3796,7 @@ def run_uhf_df(
         diis_space=int(diis_space),
         damping=float(damping),
         k_q_block=int(k_q_block),
+        k_cache_max_mb=None if df_k_cache_max_mb is None else int(df_k_cache_max_mb),
         dm0=dm0,
         mo_coeff0=mo_coeff0,
         profile=scf_prof,
@@ -3673,7 +3832,7 @@ def run_uhf_df(
             hf_method="uhf",
             basis=basis_in,
             auxbasis=auxbasis,
-            df_config=df_config,
+            df_config=cfg,
             expand_contractions=bool(expand_contractions),
             backend="cuda",
             max_cycle=int(max_cycle),
@@ -3696,6 +3855,11 @@ def run_uks_df(
     basis: Any | None = None,
     auxbasis: Any = "autoaux",
     df_config: "CuERIDFConfig | None" = None,
+    df_int3c_plan_policy: str | None = None,
+    df_int3c_work_small_max: int | None = None,
+    df_int3c_work_large_min: int | None = None,
+    df_int3c_blocks_per_task: int | None = None,
+    df_k_cache_max_mb: int | None = None,
     df_layout: str = "mnQ",
     expand_contractions: bool = True,
     max_cycle: int = 100,
@@ -3728,6 +3892,13 @@ def run_uks_df(
     nalpha, nbeta = _nalpha_nbeta_from_mol(mol)
 
     basis_in = mol.basis if basis is None else basis
+    cfg = _resolve_cueri_df_config(
+        df_config,
+        df_int3c_plan_policy=df_int3c_plan_policy,
+        df_int3c_work_small_max=df_int3c_work_small_max,
+        df_int3c_work_large_min=df_int3c_work_large_min,
+        df_int3c_blocks_per_task=df_int3c_blocks_per_task,
+    )
     df_layout_s = str(df_layout).strip().lower()
     if df_layout_s not in {"mnq", "qmn"}:
         raise ValueError("df_layout must be one of: 'mnQ', 'Qmn'")
@@ -3747,7 +3918,7 @@ def run_uks_df(
         df_prof = profile.setdefault("df_build", {})
 
     B, L_chol = build_df_B_from_cueri_packed_bases(
-        ao_basis, aux_basis, config=df_config, layout=str(df_layout_s),
+        ao_basis, aux_basis, config=cfg, layout=str(df_layout_s),
         ao_rep=str(df_ao_rep), profile=df_prof, return_L=True,
     )
 
@@ -3794,6 +3965,7 @@ def run_uks_df(
         diis_space=int(diis_space),
         damping=float(damping),
         k_q_block=int(k_q_block),
+        k_cache_max_mb=None if df_k_cache_max_mb is None else int(df_k_cache_max_mb),
         dm0=dm0,
         mo_coeff0=mo_coeff0,
         profile=profile,
@@ -3821,7 +3993,7 @@ def run_uks_df(
             hf_method="uks",
             basis=basis_in,
             auxbasis=auxbasis,
-            df_config=df_config,
+            df_config=cfg,
             expand_contractions=bool(expand_contractions),
             backend="cuda",
             max_cycle=int(max_cycle),
@@ -3843,6 +4015,11 @@ def run_rohf_df(
     basis: Any | None = None,
     auxbasis: Any = "autoaux",
     df_config: CuERIDFConfig | None = None,
+    df_int3c_plan_policy: str | None = None,
+    df_int3c_work_small_max: int | None = None,
+    df_int3c_work_large_min: int | None = None,
+    df_int3c_blocks_per_task: int | None = None,
+    df_k_cache_max_mb: int | None = None,
     df_layout: str = "mnQ",
     expand_contractions: bool = True,
     max_cycle: int = 50,
@@ -3864,6 +4041,13 @@ def run_rohf_df(
         raise ValueError("run_rohf_df requires spin >= 0 (nalpha >= nbeta)")
 
     basis_in = mol.basis if basis is None else basis
+    cfg = _resolve_cueri_df_config(
+        df_config,
+        df_int3c_plan_policy=df_int3c_plan_policy,
+        df_int3c_work_small_max=df_int3c_work_small_max,
+        df_int3c_work_large_min=df_int3c_work_large_min,
+        df_int3c_blocks_per_task=df_int3c_blocks_per_task,
+    )
 
     df_layout_s = str(df_layout).strip().lower()
     if df_layout_s not in {"mnq", "qmn"}:
@@ -3892,7 +4076,7 @@ def run_rohf_df(
     B, L_chol = build_df_B_from_cueri_packed_bases(
         ao_basis,
         aux_basis,
-        config=df_config,
+        config=cfg,
         layout=str(df_build_layout),
         ao_rep=str(df_ao_rep),
         profile=df_prof,
@@ -3922,6 +4106,7 @@ def run_rohf_df(
         diis_space=int(diis_space),
         damping=float(damping),
         k_q_block=int(k_q_block),
+        k_cache_max_mb=None if df_k_cache_max_mb is None else int(df_k_cache_max_mb),
         dm0=dm0,
         mo_coeff0=mo_coeff0,
         profile=scf_prof,
@@ -3957,7 +4142,7 @@ def run_rohf_df(
             hf_method="rohf",
             basis=basis_in,
             auxbasis=auxbasis,
-            df_config=df_config,
+            df_config=cfg,
             expand_contractions=bool(expand_contractions),
             backend="cuda",
             max_cycle=int(max_cycle),

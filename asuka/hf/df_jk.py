@@ -334,12 +334,13 @@ def _autotune_q_block_ext(
     return int(best_q)
 
 
-def _cached_bq_from_mnq(cp, B_mnQ, *, nao: int, naux: int):
+def _cached_bq_from_mnq(cp, B_mnQ, *, nao: int, naux: int, cache_max_bytes: int | None = None):
     if not _hf_k_cache_mnq_enabled():
         return None
 
     bq_bytes = int(nao) * int(nao) * int(naux) * 8
-    if bq_bytes > _hf_k_cache_max_bytes():
+    max_bytes = _hf_k_cache_max_bytes() if cache_max_bytes is None else max(64 * 1024 * 1024, int(cache_max_bytes))
+    if bq_bytes > int(max_bytes):
         return None
 
     dev = int(cp.cuda.runtime.getDevice())
@@ -665,6 +666,7 @@ def df_K_from_BmnQ_Cocc(
     occ_vals,
     *,
     q_block: int = 128,
+    k_cache_max_mb: int | None = None,
     cublas_math_mode: str | None = None,
     profile: dict | None = None,
 ):
@@ -853,7 +855,14 @@ def df_K_from_BmnQ_Cocc(
 
         # Reuse a one-time mnQ->BQ transform when affordable; this removes repeated
         # per-block pack kernels across SCF iterations and improves extension throughput.
-        BQ_cached = _cached_bq_from_mnq(xp, B_mnQ, nao=int(nao), naux=int(naux))
+        cache_max_bytes = None if k_cache_max_mb is None else max(64, int(k_cache_max_mb)) * 1024 * 1024
+        BQ_cached = _cached_bq_from_mnq(
+            xp,
+            B_mnQ,
+            nao=int(nao),
+            naux=int(naux),
+            cache_max_bytes=cache_max_bytes,
+        )
         if BQ_cached is not None:
             q_block_cached = int(q_block)
             q_guess_cached = int(q_block_cached)

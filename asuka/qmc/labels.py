@@ -7,13 +7,15 @@ from asuka.cuguga.drt import DRT
 from .sparse import coalesce_coo_i32_f64, coalesce_coo_i64_f64
 
 
-_STATE_REP_VALUES = {"auto", "i32", "key64"}
+_STATE_REP_VALUES = {"auto", "i32", "i64", "key64"}
 
 
 def normalize_state_rep(state_rep: str) -> str:
     rep = str(state_rep).strip().lower()
+    if rep == "idx64":
+        rep = "i64"
     if rep not in _STATE_REP_VALUES:
-        raise ValueError("state_rep must be 'auto', 'i32', or 'key64'")
+        raise ValueError("state_rep must be 'auto', 'i32', 'i64' (or 'idx64'), or 'key64'")
     return rep
 
 
