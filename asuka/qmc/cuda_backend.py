@@ -337,6 +337,47 @@ def key64_to_csf_idx_host(drt: Any, key: np.ndarray, *, strict: bool = True) -> 
     return np.asarray(idx, dtype=np.int32)
 
 
+def _compact_spawn_events_i32(evt_idx: Any, evt_val: Any) -> tuple[Any, Any, int]:
+    """Compact valid int32-COO spawn events on device.
+
+    Valid events satisfy ``idx >= 0`` and ``val != 0``.
+    """
+
+    if cp is None:  # pragma: no cover
+        raise RuntimeError("CuPy is required")
+    n_evt = int(evt_idx.size)
+    if n_evt <= 0:
+        return evt_idx[:0], evt_val[:0], 0
+    keep = (evt_idx >= 0) & (evt_val != 0.0)
+    n_keep = int(cp.count_nonzero(keep).get())
+    if n_keep <= 0:
+        return evt_idx[:0], evt_val[:0], 0
+    if n_keep == n_evt:
+        return evt_idx, evt_val, n_keep
+    return evt_idx[keep], evt_val[keep], n_keep
+
+
+def _compact_spawn_events_u64(evt_key: Any, evt_val: Any) -> tuple[Any, Any, int]:
+    """Compact valid uint64-COO spawn events on device.
+
+    Valid events satisfy ``key != UINT64_MAX`` and ``val != 0``.
+    """
+
+    if cp is None:  # pragma: no cover
+        raise RuntimeError("CuPy is required")
+    n_evt = int(evt_key.size)
+    if n_evt <= 0:
+        return evt_key[:0], evt_val[:0], 0
+    invalid = np.uint64(0xFFFFFFFFFFFFFFFF)
+    keep = (evt_key != invalid) & (evt_val != 0.0)
+    n_keep = int(cp.count_nonzero(keep).get())
+    if n_keep <= 0:
+        return evt_key[:0], evt_val[:0], 0
+    if n_keep == n_evt:
+        return evt_key, evt_val, n_keep
+    return evt_key[keep], evt_val[keep], n_keep
+
+
 def filter_event_buffer_to_host(out_idx_dev: Any, out_val_dev: Any) -> tuple[np.ndarray, np.ndarray]:
     """Filter a GPU event buffer (idx==-1 sentinel) and return host COO arrays."""
 
@@ -724,10 +765,15 @@ class CudaBlockProjectorContext:
     nnz_u: Any | None = None
     nnz_out: Any | None = None
 
-    # Optional semi-stochastic deterministic subspace (host-built).
+    # Optional semi-stochastic deterministic subspace.
+    # Host structures are only construction-time artifacts; runtime correction stays on device.
     det_idx_host: np.ndarray | None = None  # sorted global CSF indices (int32)
     det_idx_dev: Any | None = None  # device mirror of det_idx_host
     det_cols: list[tuple[np.ndarray, np.ndarray]] | None = None  # per det-col: (i_pos:int32[], hij:float64[])
+    det_hdd_csr_dev: Any | None = None  # cupyx CSR for H_DD in det-subspace ordering
+    det_x_buf: Any | None = None  # device x_D scratch (len |D|)
+    det_y_buf: Any | None = None  # device y_D scratch (len |D|)
+    det_spawn_slot_offsets: Any | None = None  # device [0..nspawn_total) scratch for slot indexing
     det_idx_buf: Any | None = None  # device scratch for appending det events (global idx)
     det_val_buf: Any | None = None  # device scratch for appending det values
 
@@ -741,17 +787,28 @@ class CudaBlockProjectorContext:
     nnz_u_big: Any | None = None
     nnz_out_big: Any | None = None
 
+    # Optional composite-key (u64) workspace/buffers for segmented multi-root operators.
+    ws_u64: Any | None = None
+    key_all_u64: Any | None = None
+    val_all_u64: Any | None = None
+    key_u_u64: Any | None = None
+    val_u_u64: Any | None = None
+    nnz_u_u64: Any | None = None
+
     def release(self) -> None:
         if self.ws is not None:
             self.ws.release()
         if self.ws_big is not None:
             self.ws_big.release()
+        if self.ws_u64 is not None:
+            self.ws_u64.release()
         if self.state_dev is not None:
             self.state_dev.release()
         if self.drt_dev is not None:
             self.drt_dev.release()
         self.ws = None
         self.ws_big = None
+        self.ws_u64 = None
         self.state_dev = None
         self.drt_dev = None
 
@@ -924,6 +981,123 @@ def _det_subspace_matvec_cols(*, det_cols: list[tuple[np.ndarray, np.ndarray]], 
         if i_pos.size:
             y[i_pos] += np.asarray(hij, dtype=np.float64) * xj
     return y
+
+
+def _det_subspace_coo_from_cols(
+    det_cols: list[tuple[np.ndarray, np.ndarray]],
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Convert column-wise deterministic-subspace connectivity to COO triplets.
+
+    Returns
+    -------
+    row, col, data
+        Host COO arrays such that ``H_DD[row[t], col[t]] = data[t]``.
+    """
+
+    row_parts: list[np.ndarray] = []
+    col_parts: list[np.ndarray] = []
+    dat_parts: list[np.ndarray] = []
+    for j_pos, (i_pos, hij) in enumerate(det_cols):
+        i_pos_i32 = np.asarray(i_pos, dtype=np.int32).ravel()
+        hij_f64 = np.asarray(hij, dtype=np.float64).ravel()
+        if i_pos_i32.size != hij_f64.size:
+            raise ValueError("det_cols entry has idx/val size mismatch")
+        if i_pos_i32.size == 0:
+            continue
+        row_parts.append(i_pos_i32)
+        col_parts.append(np.full(i_pos_i32.size, np.int32(j_pos), dtype=np.int32))
+        dat_parts.append(hij_f64)
+    if not row_parts:
+        return (
+            np.zeros(0, dtype=np.int32),
+            np.zeros(0, dtype=np.int32),
+            np.zeros(0, dtype=np.float64),
+        )
+    return (
+        np.asarray(np.concatenate(row_parts), dtype=np.int32, order="C"),
+        np.asarray(np.concatenate(col_parts), dtype=np.int32, order="C"),
+        np.asarray(np.concatenate(dat_parts), dtype=np.float64, order="C"),
+    )
+
+
+def _apply_det_subspace_correction_gpu(
+    *,
+    ctx: CudaBlockProjectorContext,
+    x_idx: Any,
+    x_val: Any,
+    evt_idx: Any,
+    evt_val: Any,
+    eps: float,
+    nspawn_total: int,
+) -> int:
+    """Apply deterministic-subspace correction fully on GPU.
+
+    This performs the same logic as the legacy host path:
+    1) build ``x_D`` from parents in ``D``;
+    2) compute ``y_D = -eps * H_DD x_D`` on device;
+    3) append nonzero ``y_D`` events;
+    4) remove spawned ``D->D`` events from parents in ``D`` to avoid double counting.
+
+    Returns
+    -------
+    int
+        Number of deterministic correction events to append.
+    """
+
+    if cp is None:  # pragma: no cover
+        raise RuntimeError("CuPy is required")
+    if (
+        ctx.det_idx_dev is None
+        or ctx.det_hdd_csr_dev is None
+        or ctx.det_x_buf is None
+        or ctx.det_y_buf is None
+        or ctx.det_idx_buf is None
+        or ctx.det_val_buf is None
+    ):
+        return 0
+
+    ndet = int(ctx.det_idx_dev.size)
+    if ndet <= 0:
+        return 0
+
+    # Identify parents that are in D and map them to deterministic-subspace positions.
+    pos = cp.searchsorted(ctx.det_idx_dev, x_idx)
+    inr = pos < ndet
+    pos_clip = cp.clip(pos, 0, ndet - 1)
+    parent_is_det = inr & (ctx.det_idx_dev[pos_clip] == x_idx)
+    parent_pos_det = cp.nonzero(parent_is_det)[0].astype(cp.int64, copy=False)
+
+    # Build x_D on device.
+    x_det = ctx.det_x_buf
+    x_det[:] = 0.0
+    if int(parent_pos_det.size) > 0:
+        det_pos = pos[parent_pos_det].astype(cp.int64, copy=False)
+        x_det[det_pos] = x_val[parent_pos_det]
+
+    # Exact deterministic-subspace matvec on device.
+    y_det = ctx.det_y_buf
+    y_det[:] = ctx.det_hdd_csr_dev.dot(x_det)
+    y_det *= -float(eps)
+
+    nz = cp.nonzero(y_det != 0.0)[0].astype(cp.int64, copy=False)
+    nnz_det = int(nz.size)
+    if nnz_det > 0:
+        ctx.det_idx_buf[:nnz_det] = ctx.det_idx_dev[nz]
+        ctx.det_val_buf[:nnz_det] = y_det[nz]
+
+    # Remove spawned D->D events for parents in D.
+    if int(parent_pos_det.size) > 0:
+        if ctx.det_spawn_slot_offsets is None or int(ctx.det_spawn_slot_offsets.size) != int(nspawn_total):
+            ctx.det_spawn_slot_offsets = cp.arange(int(nspawn_total), dtype=cp.int64)
+        slot = (parent_pos_det[:, None] * int(nspawn_total) + ctx.det_spawn_slot_offsets[None, :]).reshape(-1)
+        evt_sel = evt_idx[slot]
+        pos2 = cp.searchsorted(ctx.det_idx_dev, evt_sel)
+        inr2 = (evt_sel >= 0) & (pos2 < ndet)
+        pos2_clip = cp.clip(pos2, 0, ndet - 1)
+        match = inr2 & (ctx.det_idx_dev[pos2_clip] == evt_sel)
+        evt_val[slot[match]] = 0.0
+
+    return nnz_det
 
 
 def make_cuda_projector_context(
@@ -1282,7 +1456,7 @@ def make_cuda_block_projector_context(
     ctx.nnz_u = cp.empty(1, dtype=cp.int32)
     ctx.nnz_out = cp.empty(1, dtype=cp.int32)
 
-    # Optional semi-stochastic deterministic subspace (CPU-built, used on GPU step).
+    # Optional semi-stochastic deterministic subspace.
     if det_idx is not None:
         det_idx_i32 = np.asarray(det_idx, dtype=np.int32).ravel()
         if det_idx_i32.size:
@@ -1300,6 +1474,30 @@ def make_cuda_block_projector_context(
                 max_out=int(det_max_out),
                 state_cache=cache,
             )
+            # Build a device CSR once so runtime deterministic correction stays on GPU.
+            try:
+                import cupyx.scipy.sparse as cpx_sparse  # type: ignore
+            except Exception as e:  # pragma: no cover
+                raise RuntimeError("deterministic-subspace CUDA correction requires cupyx.scipy.sparse") from e
+            row_h, col_h, dat_h = _det_subspace_coo_from_cols(ctx.det_cols)
+            ndet = int(det_idx_i32.size)
+            if int(dat_h.size) == 0:
+                ctx.det_hdd_csr_dev = cpx_sparse.csr_matrix((ndet, ndet), dtype=cp.float64)
+            else:
+                ctx.det_hdd_csr_dev = cpx_sparse.csr_matrix(
+                    (
+                        cp.asarray(dat_h, dtype=cp.float64),
+                        (
+                            cp.asarray(row_h, dtype=cp.int32),
+                            cp.asarray(col_h, dtype=cp.int32),
+                        ),
+                    ),
+                    shape=(ndet, ndet),
+                    dtype=cp.float64,
+                )
+            ctx.det_x_buf = cp.zeros(ndet, dtype=cp.float64)
+            ctx.det_y_buf = cp.zeros(ndet, dtype=cp.float64)
+            ctx.det_spawn_slot_offsets = cp.arange(int(nspawn_total), dtype=cp.int64)
     return ctx
 
 
@@ -1461,9 +1659,16 @@ def cuda_projector_step_hamiltonian_ws(
             False,
         )
 
-    # Merge identity and events.
+    # Compact spawn events before coalesce to reduce sort/reduce volume.
+    evt_idx_c, evt_val_c, n_evt = _compact_spawn_events_i32(evt_idx, evt_val)
+    all_len_eff = int(nnz + n_evt)
+
+    # Merge identity and (possibly compacted) events.
     idx_all[:nnz] = x_idx
     val_all[:nnz] = float(scale_identity) * x_val
+    if n_evt > 0:
+        idx_all[nnz:all_len_eff] = evt_idx_c
+        val_all[nnz:all_len_eff] = evt_val_c
 
     # Coalesce into (idx_u, val_u) with out_nnz in nnz_u.
     ctx.ws.coalesce_coo_i32_f64_inplace_device(
@@ -1472,7 +1677,7 @@ def cuda_projector_step_hamiltonian_ws(
         ctx.idx_u,
         ctx.val_u,
         ctx.nnz_u,
-        int(all_len),
+        int(all_len_eff),
         int(ctx.threads_qmc),
         int(ctx.stream),
         False,
@@ -1639,9 +1844,16 @@ def cuda_projector_step_hamiltonian_u64_ws(
             int(ctx.pair_sampling_mode),
         )
 
-    # Merge identity and events.
+    # Compact spawn events before coalesce to reduce sort/reduce volume.
+    evt_key_c, evt_val_c, n_evt = _compact_spawn_events_u64(evt_key, evt_val)
+    all_len_eff = int(nnz + n_evt)
+
+    # Merge identity and (possibly compacted) events.
     key_all[:nnz] = x_key
     val_all[:nnz] = float(scale_identity) * x_val
+    if n_evt > 0:
+        key_all[nnz:all_len_eff] = evt_key_c
+        val_all[nnz:all_len_eff] = evt_val_c
 
     # Coalesce into (key_u, val_u) with out_nnz in nnz_u.
     ctx.ws.coalesce_coo_u64_f64_inplace_device(
@@ -1650,7 +1862,7 @@ def cuda_projector_step_hamiltonian_u64_ws(
         ctx.key_u,
         ctx.val_u,
         ctx.nnz_u,
-        int(all_len),
+        int(all_len_eff),
         int(ctx.threads_qmc),
         int(ctx.stream),
         False,
@@ -1774,53 +1986,16 @@ def cuda_block_projector_step_hamiltonian_ws(
             False,
         )
 
-        # Optional semi-stochastic deterministic subspace correction:
-        # - add exact D->D contributions deterministically,
-        # - remove spawned events corresponding to D->D from parents in D (avoid double count).
-        nnz_det = 0
-        det_idx_nz: np.ndarray | None = None
-        det_val_nz: np.ndarray | None = None
-        if ctx.det_idx_host is not None and ctx.det_cols is not None and ctx.det_idx_dev is not None:
-            if not bool(sync):
-                raise ValueError("deterministic subspace requires sync=True")
-
-            det_idx_host = np.asarray(ctx.det_idx_host, dtype=np.int32).ravel()
-            ndet = int(det_idx_host.size)
-            if ndet > 0:
-                x_idx_h = cp.asnumpy(x_idx).astype(np.int32, copy=False)
-                x_val_h = cp.asnumpy(x_val).astype(np.float64, copy=False)
-
-                pos = np.searchsorted(det_idx_host, x_idx_h)
-                inr = pos < ndet
-                parent_is_det = np.zeros_like(inr, dtype=np.bool_)
-                if np.any(inr):
-                    parent_is_det[inr] = det_idx_host[pos[inr]] == x_idx_h[inr]
-
-                # Build x_D in deterministic-subspace ordering.
-                x_det = np.zeros(ndet, dtype=np.float64)
-                if np.any(parent_is_det):
-                    x_det[np.asarray(pos[parent_is_det], dtype=np.int64)] = np.asarray(x_val_h[parent_is_det], dtype=np.float64)
-
-                # Exact deterministic subspace matvec: y_D = -eps * H_DD x_D.
-                y_det = -float(eps) * _det_subspace_matvec_cols(det_cols=ctx.det_cols, x_det=x_det)
-                nz = np.nonzero(y_det != 0.0)[0]
-                if nz.size:
-                    det_idx_nz = np.asarray(det_idx_host[nz], dtype=np.int32, order="C")
-                    det_val_nz = np.asarray(y_det[nz], dtype=np.float64, order="C")
-                    nnz_det = int(det_idx_nz.size)
-
-                # Remove spawned D->D events from *parents in D* (keep outside->D stochastic contributions).
-                parent_pos_det = np.nonzero(parent_is_det)[0].astype(np.int64, copy=False)
-                if parent_pos_det.size:
-                    # Event buffer is laid out as blocks of length nspawn_total per parent position.
-                    slot = (parent_pos_det[:, None] * int(nspawn_total) + np.arange(int(nspawn_total), dtype=np.int64)[None, :]).reshape(-1)
-                    slot_dev = cp.asarray(slot, dtype=cp.int64)
-                    evt_sel = evt_idx[slot_dev]
-                    pos2 = cp.searchsorted(ctx.det_idx_dev, evt_sel)
-                    pos2 = cp.clip(pos2, 0, ndet - 1)
-                    match = (evt_sel >= 0) & (ctx.det_idx_dev[pos2] == evt_sel)
-                    if bool(cp.any(match)):
-                        evt_val[slot_dev[match]] = 0.0
+        # Optional semi-stochastic deterministic subspace correction (fully on GPU).
+        nnz_det = _apply_det_subspace_correction_gpu(
+            ctx=ctx,
+            x_idx=x_idx,
+            x_val=x_val,
+            evt_idx=evt_idx,
+            evt_val=evt_val,
+            eps=float(eps),
+            nspawn_total=int(nspawn_total),
+        )
 
         all_len = nnz_k + out_len + int(nnz_det)
         idx_all[:nnz_k] = x_idx
@@ -1828,9 +2003,6 @@ def cuda_block_projector_step_hamiltonian_ws(
         if nnz_det:
             if ctx.det_idx_buf is None or ctx.det_val_buf is None:
                 raise RuntimeError("deterministic subspace buffers not initialized")
-            assert det_idx_nz is not None and det_val_nz is not None
-            ctx.det_idx_buf[:nnz_det] = cp.asarray(det_idx_nz, dtype=cp.int32)
-            ctx.det_val_buf[:nnz_det] = cp.asarray(det_val_nz, dtype=cp.float64)
             idx_all[nnz_k + out_len : all_len] = ctx.det_idx_buf[:nnz_det]
             val_all[nnz_k + out_len : all_len] = ctx.det_val_buf[:nnz_det]
 
@@ -2505,61 +2677,26 @@ def cuda_block_build_sk_uthx_stochastic_ws(
             False,
         )
 
-        # Optional semi-stochastic deterministic subspace correction (same logic as the projector step):
-        # - add exact D->D contributions deterministically,
-        # - remove spawned events corresponding to D->D from parents in D (avoid double count).
-        nnz_det = 0
-        det_idx_nz: np.ndarray | None = None
-        det_val_nz: np.ndarray | None = None
-        if ctx.det_idx_host is not None and ctx.det_cols is not None and ctx.det_idx_dev is not None:
-            if not bool(sync):
-                raise ValueError("deterministic subspace requires sync=True")
-            det_idx_host = np.asarray(ctx.det_idx_host, dtype=np.int32).ravel()
-            ndet = int(det_idx_host.size)
-            if ndet > 0:
-                x_idx_h = cp.asnumpy(x_idx).astype(np.int32, copy=False)
-                x_val_h = cp.asnumpy(x_val).astype(np.float64, copy=False)
-
-                pos = np.searchsorted(det_idx_host, x_idx_h)
-                inr = pos < ndet
-                parent_is_det = np.zeros_like(inr, dtype=np.bool_)
-                if np.any(inr):
-                    parent_is_det[inr] = det_idx_host[pos[inr]] == x_idx_h[inr]
-
-                x_det = np.zeros(ndet, dtype=np.float64)
-                if np.any(parent_is_det):
-                    x_det[np.asarray(pos[parent_is_det], dtype=np.int64)] = np.asarray(x_val_h[parent_is_det], dtype=np.float64)
-
-                y_det = -float(eps) * _det_subspace_matvec_cols(det_cols=ctx.det_cols, x_det=x_det)
-                nz = np.nonzero(y_det != 0.0)[0]
-                if nz.size:
-                    det_idx_nz = np.asarray(det_idx_host[nz], dtype=np.int32, order="C")
-                    det_val_nz = np.asarray(y_det[nz], dtype=np.float64, order="C")
-                    nnz_det = int(det_idx_nz.size)
-
-                parent_pos_det = np.nonzero(parent_is_det)[0].astype(np.int64, copy=False)
-                if parent_pos_det.size:
-                    slot = (parent_pos_det[:, None] * int(nspawn_total) + np.arange(int(nspawn_total), dtype=np.int64)[None, :]).reshape(-1)
-                    slot_dev = cp.asarray(slot, dtype=cp.int64)
-                    evt_sel = evt_idx[slot_dev]
-                    pos2 = cp.searchsorted(ctx.det_idx_dev, evt_sel)
-                    pos2 = cp.clip(pos2, 0, ndet - 1)
-                    match = (evt_sel >= 0) & (ctx.det_idx_dev[pos2] == evt_sel)
-                    if bool(cp.any(match)):
-                        evt_val[slot_dev[match]] = 0.0
+        # Optional semi-stochastic deterministic subspace correction (fully on GPU).
+        nnz_det = _apply_det_subspace_correction_gpu(
+            ctx=ctx,
+            x_idx=x_idx,
+            x_val=x_val,
+            evt_idx=evt_idx,
+            evt_val=evt_val,
+            eps=float(eps),
+            nspawn_total=int(nspawn_total),
+        )
 
         # Coalesce events (with optional det merge) into (idx_u,val_u) with out_nnz in nnz_u.
         if nnz_det:
             if ctx.idx_all is None or ctx.val_all is None or ctx.det_idx_buf is None or ctx.det_val_buf is None:
                 raise RuntimeError("deterministic subspace buffers not initialized")
-            assert det_idx_nz is not None and det_val_nz is not None
             all_len = int(out_len) + int(nnz_det)
             if all_len > int(ctx.max_n):
                 raise RuntimeError("eval event merge exceeds workspace capacity (increase max_n)")
             ctx.idx_all[:out_len] = evt_idx
             ctx.val_all[:out_len] = evt_val
-            ctx.det_idx_buf[:nnz_det] = cp.asarray(det_idx_nz, dtype=cp.int32)
-            ctx.det_val_buf[:nnz_det] = cp.asarray(det_val_nz, dtype=cp.float64)
             ctx.idx_all[out_len:all_len] = ctx.det_idx_buf[:nnz_det]
             ctx.val_all[out_len:all_len] = ctx.det_val_buf[:nnz_det]
             in_idx = ctx.idx_all[:all_len]
@@ -2609,12 +2746,18 @@ def cuda_block_apply_right_matrix_phi_ws(
     seeds_phi: list[int] | np.ndarray,
     sync: bool = True,
     use_fused: bool = True,
+    use_composite_keys: bool = True,
 ) -> None:
     """Apply `X <- Φ(X @ mat)` on GPU (column-wise), writing into the alternate buffer then swapping.
 
     If `use_fused=True` (default), each output column is built as a single sparse
     linear combination and then compressed once (`coalesce` + `Φ`). This reduces
     `Φ` calls from O(nroots^2) to O(nroots).
+
+    If `use_composite_keys=True` (default), the fused path additionally performs a
+    single global coalesce over 64-bit composite keys ``(out_col << 32) | idx``,
+    then runs one `Φ` per output-column segment. This removes O(nroots) separate
+    coalesce calls.
 
     If `use_fused=False`, the legacy incremental update is used:
       `y <- Φ(y + w*x_j)`
@@ -2689,101 +2832,250 @@ def cuda_block_apply_right_matrix_phi_ws(
         if max_all_len <= 0:
             raise RuntimeError("apply_right_matrix: all output columns are empty (mat may be all zeros)")
 
-        ws = ctx.ws
-        idx_all = ctx.idx_all
-        val_all = ctx.val_all
-        idx_u = ctx.idx_u
-        val_u = ctx.val_u
-        nnz_u = ctx.nnz_u
+        ws_phi = ctx.ws
+        idx_tmp = ctx.idx_u
         nnz_out = ctx.nnz_out
+        if idx_tmp is None or nnz_out is None:
+            raise RuntimeError("CudaBlockProjectorContext scratch buffers not initialized")
 
-        if max_all_len > int(ws.max_n):
-            # Lazily allocate a larger workspace + scratch buffers for this operation.
+        if max_all_len > int(ws_phi.max_n):
+            # Lazily allocate a larger i32 workspace for Φ input columns.
             if ctx.ws_big is None or int(ctx.ws_big.max_n) < int(max_all_len):
                 ctx.ws_big = _guga_cuda_ext.QmcWorkspace(int(max_all_len), int(m))
-            ws = ctx.ws_big
+            ws_phi = ctx.ws_big
 
-            if ctx.idx_all_big is None or ctx.val_all_big is None or int(ctx.idx_all_big.size) < int(max_all_len):
-                ctx.idx_all_big = cp.empty(int(max_all_len), dtype=cp.int32)
-                ctx.val_all_big = cp.empty(int(max_all_len), dtype=cp.float64)
+            if ctx.idx_u_big is None or int(ctx.idx_u_big.size) < int(max_all_len):
                 ctx.idx_u_big = cp.empty(int(max_all_len), dtype=cp.int32)
-                ctx.val_u_big = cp.empty(int(max_all_len), dtype=cp.float64)
-            if ctx.idx_u_big is None or ctx.val_u_big is None:
-                raise RuntimeError("internal: big coalesce buffers missing")
-            if ctx.nnz_u_big is None or ctx.nnz_out_big is None:
-                ctx.nnz_u_big = cp.empty(1, dtype=cp.int32)
+            if ctx.nnz_out_big is None:
                 ctx.nnz_out_big = cp.empty(1, dtype=cp.int32)
-
-            idx_all = ctx.idx_all_big
-            val_all = ctx.val_all_big
-            idx_u = ctx.idx_u_big
-            val_u = ctx.val_u_big
-            nnz_u = ctx.nnz_u_big
+            if ctx.idx_u_big is None or ctx.nnz_out_big is None:
+                raise RuntimeError("internal: big Φ buffers missing")
+            idx_tmp = ctx.idx_u_big
             nnz_out = ctx.nnz_out_big
 
-        for k in range(nroots):
-            all_len = int(all_len_by_k[k])
-            if all_len <= 0:
-                raise RuntimeError("apply_right_matrix produced an empty column")
-            if all_len > int(ws.max_n):
-                raise RuntimeError("apply_right_matrix fused path exceeded workspace capacity (increase max_n)")
+        if bool(use_composite_keys) and not hasattr(_guga_cuda_ext, "QmcWorkspaceU64"):
+            # Keep compatibility with older CUDA extension builds: use the fused i32 fallback.
+            use_composite_keys = False
 
-            # Pack all contributions y <- sum_j mat[j,k] * x_j into (idx_all,val_all).
+        if bool(use_composite_keys):
+
+            total_all_len = int(np.sum(all_len_by_k, dtype=np.int64))
+            if total_all_len <= 0:
+                raise RuntimeError("apply_right_matrix: all output columns are empty (mat may be all zeros)")
+
+            # Lazily allocate/reuse u64 workspace and buffers for global composite-key coalesce.
+            if ctx.ws_u64 is None or int(ctx.ws_u64.max_n) < int(total_all_len):
+                if ctx.ws_u64 is not None:
+                    ctx.ws_u64.release()
+                ctx.ws_u64 = _guga_cuda_ext.QmcWorkspaceU64(int(total_all_len), int(m))
+
+            if (
+                ctx.key_all_u64 is None
+                or ctx.val_all_u64 is None
+                or int(ctx.key_all_u64.size) < int(total_all_len)
+            ):
+                ctx.key_all_u64 = cp.empty(int(total_all_len), dtype=cp.uint64)
+                ctx.val_all_u64 = cp.empty(int(total_all_len), dtype=cp.float64)
+            if (
+                ctx.key_u_u64 is None
+                or ctx.val_u_u64 is None
+                or int(ctx.key_u_u64.size) < int(total_all_len)
+            ):
+                ctx.key_u_u64 = cp.empty(int(total_all_len), dtype=cp.uint64)
+                ctx.val_u_u64 = cp.empty(int(total_all_len), dtype=cp.float64)
+            if ctx.nnz_u_u64 is None:
+                ctx.nnz_u_u64 = cp.empty(1, dtype=cp.int32)
+
+            if (
+                ctx.ws_u64 is None
+                or ctx.key_all_u64 is None
+                or ctx.val_all_u64 is None
+                or ctx.key_u_u64 is None
+                or ctx.val_u_u64 is None
+                or ctx.nnz_u_u64 is None
+            ):
+                raise RuntimeError("internal: composite-key fused buffers missing")
+
+            key_all_u64 = ctx.key_all_u64
+            val_all_u64 = ctx.val_all_u64
+
+            # Pack all (k,j) contributions with composite keys: (k << 32) | idx.
             pos = 0
-            for j in range(nroots):
-                w = float(mat[j, k])
-                if w == 0.0:
-                    continue
-                nnz_j = int(nnz_host[j])
-                if nnz_j <= 0:
-                    continue
-                idx_all[pos : pos + nnz_j] = ctx.x_idx[j, :nnz_j]
-                val_all[pos : pos + nnz_j] = float(w) * ctx.x_val[j, :nnz_j]
-                pos += nnz_j
-            if pos != all_len:
-                raise RuntimeError("internal: apply_right_matrix pack length mismatch")
+            low_mask = np.uint64(0xFFFFFFFF)
+            for k in range(nroots):
+                col_prefix = np.uint64(k) << np.uint64(32)
+                for j in range(nroots):
+                    w = float(mat[j, k])
+                    if w == 0.0:
+                        continue
+                    nnz_j = int(nnz_host[j])
+                    if nnz_j <= 0:
+                        continue
+                    idx_j_u64 = (ctx.x_idx[j, :nnz_j].astype(cp.uint64, copy=False) & low_mask)
+                    key_all_u64[pos : pos + nnz_j] = cp.uint64(col_prefix) | idx_j_u64
+                    val_all_u64[pos : pos + nnz_j] = float(w) * ctx.x_val[j, :nnz_j]
+                    pos += nnz_j
+            if pos != total_all_len:
+                raise RuntimeError("internal: apply_right_matrix composite pack length mismatch")
 
-            ws.coalesce_coo_i32_f64_inplace_device(
-                idx_all,
-                val_all,
-                idx_u,
-                val_u,
-                nnz_u,
-                int(all_len),
+            ctx.ws_u64.coalesce_coo_u64_f64_inplace_device(
+                key_all_u64,
+                val_all_u64,
+                ctx.key_u_u64,
+                ctx.val_u_u64,
+                ctx.nnz_u_u64,
+                int(total_all_len),
                 int(ctx.threads_qmc),
                 int(ctx.stream),
                 False,
             )
-            n_in = int(cp.asnumpy(nnz_u)[0])
-            if n_in <= 0:
-                raise RuntimeError("apply_right_matrix produced an empty intermediate column")
+            n_compact = int(cp.asnumpy(ctx.nnz_u_u64)[0])
+            if n_compact <= 0:
+                raise RuntimeError("apply_right_matrix produced an empty global intermediate column set")
 
-            seed_phi = int(seeds_phi[seed_pos])
-            seed_pos += 1
-
-            ws.phi_pivot_resample_i32_f64_inplace_device(
-                idx_u,
-                val_u,
-                ctx.x_idx_next[k],
-                ctx.x_val_next[k],
-                nnz_out,
-                int(n_in),
-                int(m),
-                int(pivot),
-                int(seed_phi),
-                int(ctx.threads_qmc),
-                int(ctx.stream),
-                bool(sync),
+            key_u_u64 = ctx.key_u_u64[:n_compact]
+            val_u_u64 = ctx.val_u_u64[:n_compact]
+            bounds = cp.searchsorted(
+                key_u_u64,
+                cp.arange(nroots + 1, dtype=cp.uint64) << cp.uint64(32),
             )
-            nnz_cur = int(cp.asnumpy(nnz_out)[0])
-            if nnz_cur <= 0:
-                raise RuntimeError("apply_right_matrix annihilated a column during Φ compression")
 
-            n2 = float(cp.linalg.norm(ctx.x_val_next[k, :nnz_cur]).get())
-            if n2 == 0.0:
-                raise RuntimeError("apply_right_matrix produced a zero-norm column")
-            ctx.x_val_next[k, :nnz_cur] /= n2
-            ctx.nnz_next[k] = np.int32(nnz_cur)
+            for k in range(nroots):
+                lo = int(cp.asnumpy(bounds[k : k + 1])[0])
+                hi = int(cp.asnumpy(bounds[k + 1 : k + 2])[0])
+                n_in = hi - lo
+                if n_in <= 0:
+                    raise RuntimeError("apply_right_matrix produced an empty intermediate column")
+
+                # Decode low 32-bit local keys back to int32 indices for i32 Φ.
+                idx_tmp[:n_in] = (key_u_u64[lo:hi] & low_mask).astype(cp.int32, copy=False)
+
+                seed_phi = int(seeds_phi[seed_pos])
+                seed_pos += 1
+
+                ws_phi.phi_pivot_resample_i32_f64_inplace_device(
+                    idx_tmp[:n_in],
+                    val_u_u64[lo:hi],
+                    ctx.x_idx_next[k],
+                    ctx.x_val_next[k],
+                    nnz_out,
+                    int(n_in),
+                    int(m),
+                    int(pivot),
+                    int(seed_phi),
+                    int(ctx.threads_qmc),
+                    int(ctx.stream),
+                    bool(sync),
+                )
+                nnz_cur = int(cp.asnumpy(nnz_out)[0])
+                if nnz_cur <= 0:
+                    raise RuntimeError("apply_right_matrix annihilated a column during Φ compression")
+
+                n2 = float(cp.linalg.norm(ctx.x_val_next[k, :nnz_cur]).get())
+                if n2 == 0.0:
+                    raise RuntimeError("apply_right_matrix produced a zero-norm column")
+                ctx.x_val_next[k, :nnz_cur] /= n2
+                ctx.nnz_next[k] = np.int32(nnz_cur)
+        else:
+            ws = ctx.ws
+            idx_all = ctx.idx_all
+            val_all = ctx.val_all
+            idx_u = ctx.idx_u
+            val_u = ctx.val_u
+            nnz_u = ctx.nnz_u
+            if idx_all is None or val_all is None or idx_u is None or val_u is None or nnz_u is None:
+                raise RuntimeError("CudaBlockProjectorContext scratch buffers not initialized")
+            nnz_out = ctx.nnz_out
+            if nnz_out is None:
+                raise RuntimeError("CudaBlockProjectorContext nnz_out buffer not initialized")
+
+            if max_all_len > int(ws.max_n):
+                # Lazily allocate a larger workspace + scratch buffers for this operation.
+                if ctx.ws_big is None or int(ctx.ws_big.max_n) < int(max_all_len):
+                    ctx.ws_big = _guga_cuda_ext.QmcWorkspace(int(max_all_len), int(m))
+                ws = ctx.ws_big
+
+                if ctx.idx_all_big is None or ctx.val_all_big is None or int(ctx.idx_all_big.size) < int(max_all_len):
+                    ctx.idx_all_big = cp.empty(int(max_all_len), dtype=cp.int32)
+                    ctx.val_all_big = cp.empty(int(max_all_len), dtype=cp.float64)
+                    ctx.idx_u_big = cp.empty(int(max_all_len), dtype=cp.int32)
+                    ctx.val_u_big = cp.empty(int(max_all_len), dtype=cp.float64)
+                if ctx.idx_u_big is None or ctx.val_u_big is None:
+                    raise RuntimeError("internal: big coalesce buffers missing")
+                if ctx.nnz_u_big is None or ctx.nnz_out_big is None:
+                    ctx.nnz_u_big = cp.empty(1, dtype=cp.int32)
+                    ctx.nnz_out_big = cp.empty(1, dtype=cp.int32)
+
+                idx_all = ctx.idx_all_big
+                val_all = ctx.val_all_big
+                idx_u = ctx.idx_u_big
+                val_u = ctx.val_u_big
+                nnz_u = ctx.nnz_u_big
+                nnz_out = ctx.nnz_out_big
+
+            for k in range(nroots):
+                all_len = int(all_len_by_k[k])
+                if all_len <= 0:
+                    raise RuntimeError("apply_right_matrix produced an empty column")
+                if all_len > int(ws.max_n):
+                    raise RuntimeError("apply_right_matrix fused path exceeded workspace capacity (increase max_n)")
+
+                # Pack all contributions y <- sum_j mat[j,k] * x_j into (idx_all,val_all).
+                pos = 0
+                for j in range(nroots):
+                    w = float(mat[j, k])
+                    if w == 0.0:
+                        continue
+                    nnz_j = int(nnz_host[j])
+                    if nnz_j <= 0:
+                        continue
+                    idx_all[pos : pos + nnz_j] = ctx.x_idx[j, :nnz_j]
+                    val_all[pos : pos + nnz_j] = float(w) * ctx.x_val[j, :nnz_j]
+                    pos += nnz_j
+                if pos != all_len:
+                    raise RuntimeError("internal: apply_right_matrix pack length mismatch")
+
+                ws.coalesce_coo_i32_f64_inplace_device(
+                    idx_all,
+                    val_all,
+                    idx_u,
+                    val_u,
+                    nnz_u,
+                    int(all_len),
+                    int(ctx.threads_qmc),
+                    int(ctx.stream),
+                    False,
+                )
+                n_in = int(cp.asnumpy(nnz_u)[0])
+                if n_in <= 0:
+                    raise RuntimeError("apply_right_matrix produced an empty intermediate column")
+
+                seed_phi = int(seeds_phi[seed_pos])
+                seed_pos += 1
+
+                ws.phi_pivot_resample_i32_f64_inplace_device(
+                    idx_u,
+                    val_u,
+                    ctx.x_idx_next[k],
+                    ctx.x_val_next[k],
+                    nnz_out,
+                    int(n_in),
+                    int(m),
+                    int(pivot),
+                    int(seed_phi),
+                    int(ctx.threads_qmc),
+                    int(ctx.stream),
+                    bool(sync),
+                )
+                nnz_cur = int(cp.asnumpy(nnz_out)[0])
+                if nnz_cur <= 0:
+                    raise RuntimeError("apply_right_matrix annihilated a column during Φ compression")
+
+                n2 = float(cp.linalg.norm(ctx.x_val_next[k, :nnz_cur]).get())
+                if n2 == 0.0:
+                    raise RuntimeError("apply_right_matrix produced a zero-norm column")
+                ctx.x_val_next[k, :nnz_cur] /= n2
+                ctx.nnz_next[k] = np.int32(nnz_cur)
     else:
         # Legacy incremental path: y <- Φ(y + w*x_j).
         for k in range(nroots):

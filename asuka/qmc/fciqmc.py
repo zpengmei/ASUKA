@@ -5,6 +5,7 @@ from dataclasses import dataclass
 import numpy as np
 
 from asuka.cuguga.drt import DRT
+from asuka.cuguga.oracle.sparse import connected_row_sparse
 from asuka.cuguga.state_cache import get_state_cache
 from .estimators import choose_reference_index, projected_energy_ref, rayleigh_energy_ref
 from .omp import maybe_set_openmp_threads
@@ -147,7 +148,7 @@ def run_fciqmc(
     if tgt_pop <= 0.0:
         raise ValueError("target_population must be > 0")
 
-    state_cache = get_state_cache(drt) if (bool(use_state_cache) and backend_impl in ("cpu", "cuda_key64")) else None
+    state_cache = get_state_cache(drt) if (bool(use_state_cache) and backend_impl in ("cpu", "cuda", "cuda_key64")) else None
 
     ref = choose_reference_index(x_idx_u, x_val_u, preferred=preferred_ref_idx)
     if energy_estimator == "rayleigh":
@@ -188,6 +189,7 @@ def run_fciqmc(
             energies=energies,
             ref_hist=ref_hist,
             e_pos=e_pos,
+            state_cache=state_cache,
         )
     if backend_impl == "cuda_key64":
         return _run_fciqmc_cuda_key64(
@@ -311,6 +313,7 @@ def _run_fciqmc_cuda(
     energies: np.ndarray,
     ref_hist: np.ndarray,
     e_pos: int,
+    state_cache,
 ) -> FCIQMCRun:
     from .cuda_backend import make_cuda_fciqmc_context, cuda_fciqmc_step_hamiltonian_ws  # noqa: PLC0415
 
@@ -337,6 +340,7 @@ def _run_fciqmc_cuda(
 
     try:
         pops_dev = cp.empty(int(niter) + 1, dtype=cp.float64)
+        proj_row_cache_i32: dict[int, tuple[cp.ndarray, cp.ndarray]] = {}
         for it in range(1, niter + 1):
             cuda_fciqmc_step_hamiltonian_ws(
                 ctx,
@@ -363,14 +367,66 @@ def _run_fciqmc_cuda(
                 )
 
             if it % energy_stride == 0:
-                # Full vector download only on energy evaluation steps.
-                x_idx_h = cp.asnumpy(ctx.x_idx[:nnz_now]).astype(np.int32, copy=False)
-                x_val_h = cp.asnumpy(ctx.x_val[:nnz_now]).astype(np.float64, copy=False)
-                ref = choose_reference_index(x_idx_h, x_val_h, preferred=preferred_ref_idx)
-                if energy_estimator == "rayleigh":
-                    e, _, _ = rayleigh_energy_ref(drt, h1e, eri, x_idx_h, x_val_h)
+                if energy_estimator == "projected":
+                    x_idx_dev = ctx.x_idx[:nnz_now]
+                    x_val_dev = ctx.x_val[:nnz_now]
+
+                    ref: int
+                    if preferred_ref_idx is not None:
+                        pref = int(preferred_ref_idx)
+                        pos_pref = int(cp.searchsorted(x_idx_dev, cp.asarray(np.int32(pref), dtype=cp.int32)).get())
+                        if (
+                            pos_pref < nnz_now
+                            and int(x_idx_dev[pos_pref].get()) == pref
+                            and float(x_val_dev[pos_pref].get()) != 0.0
+                        ):
+                            ref = pref
+                        else:
+                            k_ref = int(cp.argmax(cp.abs(x_val_dev)).get())
+                            ref = int(x_idx_dev[k_ref].get())
+                    else:
+                        k_ref = int(cp.argmax(cp.abs(x_val_dev)).get())
+                        ref = int(x_idx_dev[k_ref].get())
+
+                    row_cached = proj_row_cache_i32.get(ref)
+                    if row_cached is None:
+                        i_idx_h, hij_h = connected_row_sparse(
+                            drt,
+                            h1e,
+                            eri,
+                            int(ref),
+                            max_out=200_000,
+                            state_cache=state_cache,
+                        )
+                        row_cached = (
+                            cp.asarray(np.asarray(i_idx_h, dtype=np.int32, order="C"), dtype=cp.int32),
+                            cp.asarray(np.asarray(hij_h, dtype=np.float64, order="C"), dtype=cp.float64),
+                        )
+                        proj_row_cache_i32[ref] = row_cached
+                    row_idx_dev, row_hij_dev = row_cached
+
+                    if int(row_idx_dev.size) == 0:
+                        num = 0.0
+                    else:
+                        pos = cp.searchsorted(x_idx_dev, row_idx_dev)
+                        inr = pos < nnz_now
+                        pos2 = pos[inr]
+                        hit = x_idx_dev[pos2] == row_idx_dev[inr]
+                        num = float(cp.dot(row_hij_dev[inr][hit], x_val_dev[pos2[hit]]).get())
+
+                    pos_ref = int(cp.searchsorted(x_idx_dev, cp.asarray(np.int32(ref), dtype=cp.int32)).get())
+                    den = 0.0
+                    if pos_ref < nnz_now and int(x_idx_dev[pos_ref].get()) == ref:
+                        den = float(x_val_dev[pos_ref].get())
+                    if den == 0.0:
+                        raise RuntimeError("reference amplitude is zero (choose a different ref_idx)")
+                    e = float(num / den)
                 else:
-                    e, _, _ = projected_energy_ref(drt, h1e, eri, x_idx_h, x_val_h, ref_idx=ref)
+                    # Full vector download only on Rayleigh evaluation steps.
+                    x_idx_h = cp.asnumpy(ctx.x_idx[:nnz_now]).astype(np.int32, copy=False)
+                    x_val_h = cp.asnumpy(ctx.x_val[:nnz_now]).astype(np.float64, copy=False)
+                    ref = choose_reference_index(x_idx_h, x_val_h, preferred=preferred_ref_idx)
+                    e, _, _ = rayleigh_energy_ref(drt, h1e, eri, x_idx_h, x_val_h, state_cache=state_cache)
                 energies[e_pos] = float(e)
                 ref_hist[e_pos] = np.int32(ref)
                 e_pos += 1
@@ -486,6 +542,16 @@ def _run_fciqmc_cuda_key64(
 
     try:
         pops_dev = cp.empty(int(niter) + 1, dtype=cp.float64)
+        proj_row_cache_u64: dict[int, tuple[cp.ndarray, cp.ndarray]] = {}
+        pref_key64: int | None = None
+        if preferred_ref_idx is not None:
+            pref_key64 = int(
+                csf_idx_to_key64_host(
+                    drt,
+                    np.asarray([int(preferred_ref_idx)], dtype=np.int32),
+                    state_cache=state_cache,
+                )[0]
+            )
         for it in range(1, niter + 1):
             cuda_fciqmc_step_hamiltonian_u64_ws(
                 ctx,
@@ -512,19 +578,82 @@ def _run_fciqmc_cuda_key64(
                 )
 
             if it % energy_stride == 0:
-                # Full vector download only on energy evaluation steps.
-                x_key_h = cp.asnumpy(ctx.x_key[:nnz_now]).astype(np.uint64, copy=False)
-                x_val_h = cp.asnumpy(ctx.x_val[:nnz_now]).astype(np.float64, copy=False)
-                x_idx_h = key64_to_csf_idx_host(drt, x_key_h, strict=True)
-                order = np.argsort(x_idx_h)
-                x_idx_h = np.asarray(x_idx_h[order], dtype=np.int32, order="C")
-                x_val_h = np.asarray(x_val_h[order], dtype=np.float64, order="C")
+                if energy_estimator == "projected":
+                    x_key_dev = ctx.x_key[:nnz_now]
+                    x_val_dev = ctx.x_val[:nnz_now]
 
-                ref = choose_reference_index(x_idx_h, x_val_h, preferred=preferred_ref_idx)
-                if energy_estimator == "rayleigh":
-                    e, _, _ = rayleigh_energy_ref(drt, h1e, eri, x_idx_h, x_val_h, state_cache=state_cache)
+                    ref_key: int
+                    if pref_key64 is not None:
+                        pos_pref = int(cp.searchsorted(x_key_dev, cp.asarray(np.uint64(pref_key64), dtype=cp.uint64)).get())
+                        if (
+                            pos_pref < nnz_now
+                            and int(x_key_dev[pos_pref].get()) == int(pref_key64)
+                            and float(x_val_dev[pos_pref].get()) != 0.0
+                        ):
+                            ref_key = int(pref_key64)
+                        else:
+                            k_ref = int(cp.argmax(cp.abs(x_val_dev)).get())
+                            ref_key = int(x_key_dev[k_ref].get())
+                    else:
+                        k_ref = int(cp.argmax(cp.abs(x_val_dev)).get())
+                        ref_key = int(x_key_dev[k_ref].get())
+
+                    ref = int(
+                        key64_to_csf_idx_host(
+                            drt,
+                            np.asarray([np.uint64(ref_key)], dtype=np.uint64),
+                            strict=True,
+                        )[0]
+                    )
+
+                    row_cached = proj_row_cache_u64.get(ref)
+                    if row_cached is None:
+                        i_idx_h, hij_h = connected_row_sparse(
+                            drt,
+                            h1e,
+                            eri,
+                            int(ref),
+                            max_out=200_000,
+                            state_cache=state_cache,
+                        )
+                        row_key_h = csf_idx_to_key64_host(drt, i_idx_h, state_cache=state_cache)
+                        order = np.argsort(row_key_h)
+                        row_key_h = np.asarray(row_key_h[order], dtype=np.uint64, order="C")
+                        row_hij_h = np.asarray(np.asarray(hij_h, dtype=np.float64)[order], dtype=np.float64, order="C")
+                        row_cached = (
+                            cp.asarray(row_key_h, dtype=cp.uint64),
+                            cp.asarray(row_hij_h, dtype=cp.float64),
+                        )
+                        proj_row_cache_u64[ref] = row_cached
+                    row_key_dev, row_hij_dev = row_cached
+
+                    if int(row_key_dev.size) == 0:
+                        num = 0.0
+                    else:
+                        pos = cp.searchsorted(x_key_dev, row_key_dev)
+                        inr = pos < nnz_now
+                        pos2 = pos[inr]
+                        hit = x_key_dev[pos2] == row_key_dev[inr]
+                        num = float(cp.dot(row_hij_dev[inr][hit], x_val_dev[pos2[hit]]).get())
+
+                    pos_ref = int(cp.searchsorted(x_key_dev, cp.asarray(np.uint64(ref_key), dtype=cp.uint64)).get())
+                    den = 0.0
+                    if pos_ref < nnz_now and int(x_key_dev[pos_ref].get()) == int(ref_key):
+                        den = float(x_val_dev[pos_ref].get())
+                    if den == 0.0:
+                        raise RuntimeError("reference amplitude is zero (choose a different ref_idx)")
+                    e = float(num / den)
                 else:
-                    e, _, _ = projected_energy_ref(drt, h1e, eri, x_idx_h, x_val_h, ref_idx=ref, state_cache=state_cache)
+                    # Full vector download only on Rayleigh evaluation steps.
+                    x_key_h = cp.asnumpy(ctx.x_key[:nnz_now]).astype(np.uint64, copy=False)
+                    x_val_h = cp.asnumpy(ctx.x_val[:nnz_now]).astype(np.float64, copy=False)
+                    x_idx_h = key64_to_csf_idx_host(drt, x_key_h, strict=True)
+                    order = np.argsort(x_idx_h)
+                    x_idx_h = np.asarray(x_idx_h[order], dtype=np.int32, order="C")
+                    x_val_h = np.asarray(x_val_h[order], dtype=np.float64, order="C")
+
+                    ref = choose_reference_index(x_idx_h, x_val_h, preferred=preferred_ref_idx)
+                    e, _, _ = rayleigh_energy_ref(drt, h1e, eri, x_idx_h, x_val_h, state_cache=state_cache)
                 energies[e_pos] = float(e)
                 ref_hist[e_pos] = np.int32(ref)
                 e_pos += 1

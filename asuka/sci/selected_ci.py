@@ -32,10 +32,22 @@ except Exception as _e:  # pragma: no cover
 from asuka.cuguga.drt import DRT
 from asuka.cuguga.screening import RowScreening
 from asuka.cuguga.state_cache import DRTStateCache, get_state_cache
-from asuka.integrals.df_integrals import DFMOIntegrals
+from asuka.integrals.df_integrals import DFMOIntegrals, DeviceDFMOIntegrals
 from asuka.cuguga.oracle import _STEP_TO_OCC, _restore_eri_4d
 from asuka.cuguga.oracle.sparse import connected_row_sparse, connected_row_sparse_df
 from asuka.solver import GUGAFCISolver
+
+
+def _as_numpy_f64(a: Any) -> np.ndarray:
+    """Convert host/device array-like to contiguous float64 NumPy."""
+    try:
+        import cupy as cp  # type: ignore[import-not-found]
+    except Exception:
+        cp = None  # type: ignore[assignment]
+
+    if cp is not None and isinstance(a, cp.ndarray):
+        return np.asarray(cp.asnumpy(a), dtype=np.float64, order="C")
+    return np.asarray(a, dtype=np.float64, order="C")
 
 
 @dataclass
@@ -71,6 +83,27 @@ def _connected_row(
             screening=screening,
             state_cache=state_cache,
         )
+    if isinstance(eri, DeviceDFMOIntegrals):
+        if eri.l_full is None:
+            raise ValueError("DeviceDFMOIntegrals.l_full is required for sparse connected-row queries")
+        l_full = _as_numpy_f64(eri.l_full)
+        j_ps = _as_numpy_f64(eri.j_ps)
+        pair_norm = _as_numpy_f64(eri.pair_norm) if eri.pair_norm is not None else np.linalg.norm(l_full, axis=1)
+        eri_host = DFMOIntegrals(
+            norb=int(eri.norb),
+            l_full=np.asarray(l_full, dtype=np.float64, order="C"),
+            j_ps=np.asarray(j_ps, dtype=np.float64, order="C"),
+            pair_norm=np.asarray(pair_norm, dtype=np.float64, order="C"),
+        )
+        return connected_row_sparse_df(
+            drt,
+            h1e,
+            eri_host,
+            int(j),
+            max_out=int(max_out),
+            screening=screening,
+            state_cache=state_cache,
+        )
     return connected_row_sparse(
         drt,
         h1e,
@@ -99,14 +132,33 @@ def _make_hdiag_guess(drt: DRT, h1e: np.ndarray, eri: Any, *, state_cache: DRTSt
         raise ValueError("h1e has wrong shape")
     h1e_diag = np.diag(h1e)
 
-    if isinstance(eri, DFMOIntegrals):
-        l_full = np.asarray(eri.l_full, dtype=np.float64, order="C")
-        pair_norm = np.asarray(eri.pair_norm, dtype=np.float64, order="C")
-
+    if isinstance(eri, (DFMOIntegrals, DeviceDFMOIntegrals)):
         diag_ids = (np.arange(norb, dtype=np.int32) * (norb + 1)).astype(np.int32, copy=False)
-        l_diag = np.asarray(l_full[diag_ids], dtype=np.float64, order="C")
-        eri_ppqq = l_diag @ l_diag.T  # (p p| q q)
-        eri_pqqp = np.square(pair_norm.reshape(norb, norb))
+        l_full_obj = getattr(eri, "l_full", None)
+        pair_norm_obj = getattr(eri, "pair_norm", None)
+        eri_mat_obj = getattr(eri, "eri_mat", None)
+
+        if l_full_obj is not None:
+            l_full = _as_numpy_f64(l_full_obj)
+            if pair_norm_obj is None:
+                pair_norm = np.linalg.norm(l_full, axis=1)
+            else:
+                pair_norm = _as_numpy_f64(pair_norm_obj)
+            l_diag = np.asarray(l_full[diag_ids], dtype=np.float64, order="C")
+            eri_ppqq = l_diag @ l_diag.T  # (p p| q q)
+            eri_pqqp = np.square(pair_norm.reshape(norb, norb))
+        elif eri_mat_obj is not None:
+            eri_mat = _as_numpy_f64(eri_mat_obj)
+            eri_ppqq = np.asarray(eri_mat[np.ix_(diag_ids, diag_ids)], dtype=np.float64, order="C")
+            pq = np.arange(norb * norb, dtype=np.int32).reshape(norb, norb)
+            qp = pq.T.reshape(norb, norb)
+            eri_pqqp = np.asarray(
+                eri_mat[pq.reshape(-1), qp.reshape(-1)].reshape(norb, norb),
+                dtype=np.float64,
+                order="C",
+            )
+        else:
+            raise ValueError("DF integrals must provide either l_full or eri_mat for hdiag construction")
     else:
         eri4 = _restore_eri_4d(eri, norb).astype(np.float64, copy=False)
         eri_ppqq = np.einsum("iijj->ij", eri4)

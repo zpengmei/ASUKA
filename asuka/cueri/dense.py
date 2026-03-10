@@ -1425,6 +1425,457 @@ def _build_pq_uv_eri_mat_dense_rys_from_cached(
             prof["t_eri_pquv_s"] = float(profile["t_eri_pquv_s"])
 
 
+def _build_pu_qv_eri_mat_dense_rys_from_cached(
+    *,
+    builder,
+    C_mo,
+    C_act,
+    out_eri_puqv,
+    profile: dict | None = None,
+) -> None:
+    """Build exact mixed-index ERIs (pu|qv) with p,q in MO and u,v in active."""
+
+    import time
+    import cupy as cp
+
+    eps_ao_f = float(getattr(builder, "eps_ao", 0.0))
+
+    prof = None
+    t0 = None
+    if profile is not None:
+        profile.clear()
+        prof = profile.setdefault("cueri_pu_qv_dense_rys_cached", {})
+        prof["plan_cache_hit"] = True
+        t0 = time.perf_counter()
+
+    sp = getattr(builder, "sp", None)
+    basis = getattr(builder, "ao_basis", None)
+    class_ids = getattr(builder, "class_ids", None)
+    offsets = getattr(builder, "offsets", None)
+    task_ab_all = getattr(builder, "task_ab", None)
+    task_cd_all = getattr(builder, "task_cd", None)
+    dbasis = getattr(builder, "dbasis", None)
+    dsp = getattr(builder, "dsp", None)
+    pt = getattr(builder, "pair_tables", None)
+    if any(x is None for x in (sp, basis, class_ids, offsets, task_ab_all, task_cd_all, dbasis, dsp, pt)):
+        raise RuntimeError("builder is missing cached preprocessing/device artifacts")
+
+    C_mo = cp.asarray(C_mo, dtype=cp.float64)
+    C_act = cp.asarray(C_act, dtype=cp.float64)
+    C_mo = cp.ascontiguousarray(C_mo)
+    C_act = cp.ascontiguousarray(C_act)
+    if C_mo.ndim != 2 or C_act.ndim != 2:
+        raise ValueError("C_mo/C_act must have shape (nao,nmo)/(nao,ncas)")
+    nao, nmo = map(int, C_mo.shape)
+    nao2, ncas = map(int, C_act.shape)
+    if nao2 != nao:
+        raise ValueError("C_mo/C_act nao mismatch")
+
+    n_pair = int(nmo) * int(ncas)
+    if out_eri_puqv.shape != (n_pair, n_pair):
+        raise ValueError(f"out shape mismatch: expected ({n_pair},{n_pair}), got {out_eri_puqv.shape}")
+    out_eri_puqv.fill(0)
+
+    shell_ao_start = np.asarray(basis.shell_ao_start, dtype=np.int64)
+    spA = np.asarray(sp.sp_A, dtype=np.int32)
+    spB = np.asarray(sp.sp_B, dtype=np.int32)
+    sp_a0 = shell_ao_start[spA]
+    sp_b0 = shell_ao_start[spB]
+    sp_same = spA == spB
+    shell_l = np.asarray(basis.shell_l, dtype=np.int32)
+
+    threads = int(getattr(builder, "threads", 256))
+    max_tile_bytes_i = int(getattr(builder, "max_tile_bytes", 256 << 20))
+    max_work_bytes = int(max_tile_bytes_i)
+    mode = str(getattr(builder, "mode", "auto")).lower().strip()
+    work_small_max = int(getattr(builder, "work_small_max", 512))
+    work_large_min = int(getattr(builder, "work_large_min", 200_000))
+    blocks_per_task = int(getattr(builder, "blocks_per_task", 8))
+    boys = str(getattr(builder, "boys", "ref")).lower().strip()
+
+    n_tasks_total = int(getattr(getattr(builder, "tasks", None), "ntasks", int(task_ab_all.shape[0])))
+    arange_cache: dict[int, cp.ndarray] = {}
+
+    def _arange(n: int):
+        arr = arange_cache.get(int(n))
+        if arr is None:
+            arr = cp.arange(int(n), dtype=cp.int32)
+            arange_cache[int(n)] = arr
+        return arr
+
+    for g in range(int(class_ids.shape[0])):
+        j0 = int(offsets[g])
+        j1 = int(offsets[g + 1])
+        if j1 <= j0:
+            continue
+
+        task_group = TaskList(
+            task_spAB=np.asarray(task_ab_all[j0:j1], dtype=np.int32),
+            task_spCD=np.asarray(task_cd_all[j0:j1], dtype=np.int32),
+        )
+        if task_group.ntasks == 0:
+            continue
+
+        for tb in iter_tile_batches_spd(
+            task_group,
+            shell_pairs=sp,
+            shell_l=shell_l,
+            dbasis=dbasis,
+            dsp=dsp,
+            pt=pt,
+            stream=None,
+            threads=int(threads),
+            mode=mode,
+            work_small_max=int(work_small_max),
+            work_large_min=int(work_large_min),
+            blocks_per_task=int(blocks_per_task),
+            max_tile_bytes=int(max_tile_bytes_i),
+            boys=boys,
+            skip_transpose=True,
+            task_class_id=int(class_ids[g]),
+            preupload_tasks=True,
+        ):
+            tile = tb.tiles
+            tile_transposed = bool(getattr(tb, "kernel_transposed", False))
+            spab_batch = np.asarray(tb.task_spAB, dtype=np.int32)
+            spcd_batch = np.asarray(tb.task_spCD, dtype=np.int32)
+            nt = int(spab_batch.shape[0])
+            if nt == 0:
+                continue
+
+            if tile_transposed:
+                nCD = int(tile.shape[1])
+                nAB = int(tile.shape[2])
+            else:
+                nAB = int(tile.shape[1])
+                nCD = int(tile.shape[2])
+            bytes_work = (int(nAB) * n_pair + int(nCD) * n_pair + int(nAB) * n_pair) * 8
+            max_tasks = int(max(1, max_work_bytes // max(bytes_work, 1)))
+
+            for i0 in range(0, nt, max_tasks):
+                i1 = min(nt, i0 + max_tasks)
+                spab = spab_batch[i0:i1]
+                spcd = spcd_batch[i0:i1]
+                tile_chunk = tile[i0:i1]
+                m = int(spab.shape[0])
+                if m == 0:
+                    continue
+
+                A0 = int(spA[int(spab[0])])
+                B0 = int(spB[int(spab[0])])
+                C0 = int(spA[int(spcd[0])])
+                D0 = int(spB[int(spcd[0])])
+                nA = int(ncart(int(shell_l[A0])))
+                nB = int(ncart(int(shell_l[B0])))
+                nC = int(ncart(int(shell_l[C0])))
+                nD = int(ncart(int(shell_l[D0])))
+
+                ia = cp.asarray(sp_a0[spab], dtype=cp.int32)[:, None] + _arange(nA)[None, :]
+                ib = cp.asarray(sp_b0[spab], dtype=cp.int32)[:, None] + _arange(nB)[None, :]
+                ic = cp.asarray(sp_a0[spcd], dtype=cp.int32)[:, None] + _arange(nC)[None, :]
+                id_ = cp.asarray(sp_b0[spcd], dtype=cp.int32)[:, None] + _arange(nD)[None, :]
+
+                CA_p = C_mo[ia, :]
+                CB_p = C_mo[ib, :]
+                CA_u = C_act[ia, :]
+                CB_u = C_act[ib, :]
+                K_AB_mixed = _build_pair_coeff_ordered_mixed_batch(CA_p, CB_p, CA_u, CB_u, same_shell=sp_same[spab])
+
+                CC_p = C_mo[ic, :]
+                CD_p = C_mo[id_, :]
+                CC_u = C_act[ic, :]
+                CD_u = C_act[id_, :]
+                K_CD_mixed = _build_pair_coeff_ordered_mixed_batch(CC_p, CD_p, CC_u, CD_u, same_shell=sp_same[spcd])
+
+                if tile_transposed:
+                    tmp = cp.einsum("mca,mcp->map", tile_chunk, K_CD_mixed)
+                else:
+                    tmp = cp.matmul(tile_chunk, K_CD_mixed)
+                out_eri_puqv += (
+                    K_AB_mixed.reshape((m * nAB, n_pair)).T
+                    @ tmp.reshape((m * nAB, n_pair))
+                )
+
+                off = spab != spcd
+                if bool(np.any(off)):
+                    off_idx = np.nonzero(off)[0].astype(np.int32, copy=False)
+                    noff = int(off_idx.size)
+                    if noff:
+                        off_dev = cp.asarray(off_idx, dtype=cp.int32)
+                        tile_off = tile_chunk[off_dev]
+                        K_AB_off = K_AB_mixed[off_dev]
+                        K_CD_off = K_CD_mixed[off_dev]
+                        if tile_transposed:
+                            tmp2 = cp.matmul(tile_off, K_AB_off)
+                        else:
+                            tmp2 = cp.matmul(tile_off.transpose((0, 2, 1)), K_AB_off)
+                        out_eri_puqv += (
+                            K_CD_off.reshape((noff * nCD, n_pair)).T
+                            @ tmp2.reshape((noff * nCD, n_pair))
+                        )
+
+    out_eri_puqv[:] = 0.5 * (out_eri_puqv + out_eri_puqv.T)
+
+    if profile is not None:
+        try:
+            cp.cuda.get_current_stream().synchronize()
+        except Exception:
+            pass
+        profile["nao"] = int(nao)
+        profile["nmo"] = int(nmo)
+        profile["ncas"] = int(ncas)
+        profile["eri_puqv_nbytes"] = int(getattr(out_eri_puqv, "nbytes", 0))
+        profile["eps_ao"] = float(eps_ao_f)
+        profile["threads"] = int(threads)
+        profile["max_tile_bytes"] = int(max_tile_bytes_i)
+        profile["ntasks"] = int(n_tasks_total)
+        if prof is not None and t0 is not None:
+            profile["t_eri_puqv_s"] = float(time.perf_counter() - float(t0))
+            prof["t_eri_puqv_s"] = float(profile["t_eri_puqv_s"])
+
+
+def _contract_pu_wx_dm2_dense_rys_from_cached(
+    *,
+    builder,
+    C_mo,
+    C_act,
+    dm2_wxuv,
+    out_gdm2,
+    profile: dict | None = None,
+) -> None:
+    """Contract mixed ERIs with DM2 directly to g_dm2 without materializing pu_wx."""
+
+    import time
+    import cupy as cp
+
+    eps_ao_f = float(getattr(builder, "eps_ao", 0.0))
+
+    prof = None
+    t0 = None
+    if profile is not None:
+        profile.clear()
+        prof = profile.setdefault("cueri_contract_pu_wx_dm2_cached", {})
+        prof["plan_cache_hit"] = True
+        t0 = time.perf_counter()
+
+    sp = getattr(builder, "sp", None)
+    basis = getattr(builder, "ao_basis", None)
+    class_ids = getattr(builder, "class_ids", None)
+    offsets = getattr(builder, "offsets", None)
+    task_ab_all = getattr(builder, "task_ab", None)
+    task_cd_all = getattr(builder, "task_cd", None)
+    dbasis = getattr(builder, "dbasis", None)
+    dsp = getattr(builder, "dsp", None)
+    pt = getattr(builder, "pair_tables", None)
+    if any(x is None for x in (sp, basis, class_ids, offsets, task_ab_all, task_cd_all, dbasis, dsp, pt)):
+        raise RuntimeError("builder is missing cached preprocessing/device artifacts")
+
+    C_mo = cp.asarray(C_mo, dtype=cp.float64)
+    C_act = cp.asarray(C_act, dtype=cp.float64)
+    C_mo = cp.ascontiguousarray(C_mo)
+    C_act = cp.ascontiguousarray(C_act)
+    if C_mo.ndim != 2 or C_act.ndim != 2:
+        raise ValueError("C_mo/C_act must have shape (nao,nmo)/(nao,ncas)")
+    nao, nmo = map(int, C_mo.shape)
+    nao2, ncas = map(int, C_act.shape)
+    if nao2 != nao:
+        raise ValueError("C_mo/C_act nao mismatch")
+    if out_gdm2.shape != (nmo, ncas):
+        raise ValueError(f"out_gdm2 must have shape ({nmo},{ncas})")
+    out_gdm2.fill(0)
+
+    dm2_x = cp.asarray(dm2_wxuv, dtype=cp.float64)
+    if int(dm2_x.ndim) == 2:
+        if dm2_x.shape != (ncas * ncas, ncas * ncas):
+            raise ValueError("dm2_wxuv 2D shape mismatch")
+        dm2_x = dm2_x.reshape(ncas, ncas, ncas, ncas)
+    elif int(dm2_x.ndim) == 4:
+        if dm2_x.shape != (ncas, ncas, ncas, ncas):
+            raise ValueError("dm2_wxuv 4D shape mismatch")
+    else:
+        raise ValueError("dm2_wxuv must have shape (ncas^2,ncas^2) or (ncas,ncas,ncas,ncas)")
+
+    tri_w, tri_x = cp.tril_indices(int(ncas))
+    npair_act = int(tri_w.size)
+    dm2_pack = cp.asarray(dm2_x[tri_w, tri_x], dtype=cp.float64)  # (npair_act,ncas,ncas)
+    off = tri_w != tri_x
+    if bool(off.any()):
+        dm2_pack[off] = dm2_pack[off] + dm2_x[tri_x[off], tri_w[off]]
+    dm2_pack_2d = dm2_pack.reshape(npair_act, ncas * ncas)
+
+    shell_ao_start = np.asarray(basis.shell_ao_start, dtype=np.int64)
+    spA = np.asarray(sp.sp_A, dtype=np.int32)
+    spB = np.asarray(sp.sp_B, dtype=np.int32)
+    sp_a0 = shell_ao_start[spA]
+    sp_b0 = shell_ao_start[spB]
+    sp_same = spA == spB
+    shell_l = np.asarray(basis.shell_l, dtype=np.int32)
+
+    threads = int(getattr(builder, "threads", 256))
+    max_tile_bytes_i = int(getattr(builder, "max_tile_bytes", 256 << 20))
+    max_work_bytes = int(max_tile_bytes_i)
+    mode = str(getattr(builder, "mode", "auto")).lower().strip()
+    work_small_max = int(getattr(builder, "work_small_max", 512))
+    work_large_min = int(getattr(builder, "work_large_min", 200_000))
+    blocks_per_task = int(getattr(builder, "blocks_per_task", 8))
+    boys = str(getattr(builder, "boys", "ref")).lower().strip()
+
+    n_tasks_total = int(getattr(getattr(builder, "tasks", None), "ntasks", int(task_ab_all.shape[0])))
+    arange_cache: dict[int, cp.ndarray] = {}
+
+    def _arange(n: int):
+        arr = arange_cache.get(int(n))
+        if arr is None:
+            arr = cp.arange(int(n), dtype=cp.int32)
+            arange_cache[int(n)] = arr
+        return arr
+
+    for g in range(int(class_ids.shape[0])):
+        j0 = int(offsets[g])
+        j1 = int(offsets[g + 1])
+        if j1 <= j0:
+            continue
+
+        task_group = TaskList(
+            task_spAB=np.asarray(task_ab_all[j0:j1], dtype=np.int32),
+            task_spCD=np.asarray(task_cd_all[j0:j1], dtype=np.int32),
+        )
+        if task_group.ntasks == 0:
+            continue
+
+        for tb in iter_tile_batches_spd(
+            task_group,
+            shell_pairs=sp,
+            shell_l=shell_l,
+            dbasis=dbasis,
+            dsp=dsp,
+            pt=pt,
+            stream=None,
+            threads=int(threads),
+            mode=mode,
+            work_small_max=int(work_small_max),
+            work_large_min=int(work_large_min),
+            blocks_per_task=int(blocks_per_task),
+            max_tile_bytes=int(max_tile_bytes_i),
+            boys=boys,
+            skip_transpose=True,
+            task_class_id=int(class_ids[g]),
+            preupload_tasks=True,
+        ):
+            tile = tb.tiles
+            tile_transposed = bool(getattr(tb, "kernel_transposed", False))
+            spab_batch = np.asarray(tb.task_spAB, dtype=np.int32)
+            spcd_batch = np.asarray(tb.task_spCD, dtype=np.int32)
+            nt = int(spab_batch.shape[0])
+            if nt == 0:
+                continue
+
+            if tile_transposed:
+                nCD = int(tile.shape[1])
+                nAB = int(tile.shape[2])
+            else:
+                nAB = int(tile.shape[1])
+                nCD = int(tile.shape[2])
+            bytes_work = (int(nAB) * nmo * ncas + int(nCD) * npair_act + int(nAB) * npair_act) * 8
+            max_tasks = int(max(1, max_work_bytes // max(bytes_work, 1)))
+
+            for i0 in range(0, nt, max_tasks):
+                i1 = min(nt, i0 + max_tasks)
+                spab = spab_batch[i0:i1]
+                spcd = spcd_batch[i0:i1]
+                tile_chunk = tile[i0:i1]
+                m = int(spab.shape[0])
+                if m == 0:
+                    continue
+
+                A0 = int(spA[int(spab[0])])
+                B0 = int(spB[int(spab[0])])
+                C0 = int(spA[int(spcd[0])])
+                D0 = int(spB[int(spcd[0])])
+                nA = int(ncart(int(shell_l[A0])))
+                nB = int(ncart(int(shell_l[B0])))
+                nC = int(ncart(int(shell_l[C0])))
+                nD = int(ncart(int(shell_l[D0])))
+
+                ia = cp.asarray(sp_a0[spab], dtype=cp.int32)[:, None] + _arange(nA)[None, :]
+                ib = cp.asarray(sp_b0[spab], dtype=cp.int32)[:, None] + _arange(nB)[None, :]
+                ic = cp.asarray(sp_a0[spcd], dtype=cp.int32)[:, None] + _arange(nC)[None, :]
+                id_ = cp.asarray(sp_b0[spcd], dtype=cp.int32)[:, None] + _arange(nD)[None, :]
+
+                CA_p = C_mo[ia, :]
+                CB_p = C_mo[ib, :]
+                CA_u = C_act[ia, :]
+                CB_u = C_act[ib, :]
+                K_AB_mixed = _build_pair_coeff_ordered_mixed_batch(CA_p, CB_p, CA_u, CB_u, same_shell=sp_same[spab])
+
+                CC_u = C_act[ic, :]
+                CD_u = C_act[id_, :]
+                K_CD_act = _build_pair_coeff_packed_batch(CC_u, CD_u, same_shell=sp_same[spcd])
+
+                if tile_transposed:
+                    tmp = cp.einsum("mca,mcp->map", tile_chunk, K_CD_act)
+                else:
+                    tmp = cp.matmul(tile_chunk, K_CD_act)
+                tmp_dm2 = tmp.reshape((m * nAB, npair_act)) @ dm2_pack_2d
+                tmp_dm2 = tmp_dm2.reshape((m * nAB, ncas, ncas))
+                K_AB_3 = K_AB_mixed.reshape((m * nAB, nmo, ncas))
+                out_gdm2 += cp.einsum("tpu,tuv->pv", K_AB_3, tmp_dm2, optimize=True)
+
+                off_pairs = spab != spcd
+                if bool(np.any(off_pairs)):
+                    off_idx = np.nonzero(off_pairs)[0].astype(np.int32, copy=False)
+                    noff = int(off_idx.size)
+                    if noff:
+                        off_dev = cp.asarray(off_idx, dtype=cp.int32)
+                        tile_off = tile_chunk[off_dev]
+
+                        CA_u_off = CA_u[off_dev]
+                        CB_u_off = CB_u[off_dev]
+                        K_AB_act_off = _build_pair_coeff_packed_batch(
+                            CA_u_off,
+                            CB_u_off,
+                            same_shell=sp_same[spab[off_idx]],
+                        )
+
+                        CC_u_off = CC_u[off_dev]
+                        CD_u_off = CD_u[off_dev]
+                        CC_p_off = C_mo[ic[off_dev], :]
+                        CD_p_off = C_mo[id_[off_dev], :]
+                        K_CD_mixed_off = _build_pair_coeff_ordered_mixed_batch(
+                            CC_p_off,
+                            CD_p_off,
+                            CC_u_off,
+                            CD_u_off,
+                            same_shell=sp_same[spcd[off_idx]],
+                        )
+
+                        if tile_transposed:
+                            tmp2 = cp.matmul(tile_off, K_AB_act_off)
+                        else:
+                            tmp2 = cp.matmul(tile_off.transpose((0, 2, 1)), K_AB_act_off)
+                        tmp2_dm2 = tmp2.reshape((noff * nCD, npair_act)) @ dm2_pack_2d
+                        tmp2_dm2 = tmp2_dm2.reshape((noff * nCD, ncas, ncas))
+                        K_CD_3 = K_CD_mixed_off.reshape((noff * nCD, nmo, ncas))
+                        out_gdm2 += cp.einsum("tpu,tuv->pv", K_CD_3, tmp2_dm2, optimize=True)
+
+    if profile is not None:
+        try:
+            cp.cuda.get_current_stream().synchronize()
+        except Exception:
+            pass
+        profile["nao"] = int(nao)
+        profile["nmo"] = int(nmo)
+        profile["ncas"] = int(ncas)
+        profile["eps_ao"] = float(eps_ao_f)
+        profile["threads"] = int(threads)
+        profile["max_tile_bytes"] = int(max_tile_bytes_i)
+        profile["ntasks"] = int(n_tasks_total)
+        profile["g_dm2_nbytes"] = int(getattr(out_gdm2, "nbytes", 0))
+        if prof is not None and t0 is not None:
+            profile["t_contract_g_dm2_s"] = float(time.perf_counter() - float(t0))
+            prof["t_contract_g_dm2_s"] = float(profile["t_contract_g_dm2_s"])
+
+
 @with_stream
 def build_active_eri_mat_dense_rys(
     ao_basis,

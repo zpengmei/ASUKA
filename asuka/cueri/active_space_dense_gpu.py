@@ -695,6 +695,230 @@ class CuERIActiveSpaceDenseGPUBuilder:
 
             return out
 
+    def build_pu_qv_eri_mat(self, C_mo, C_act, *, out=None, profile: dict | None = None):
+        """Compute mixed-index ERIs (pu|qv) with p,q in MO and u,v in active."""
+
+        try:
+            import cupy as cp  # noqa: PLC0415
+        except Exception as e:  # pragma: no cover
+            raise RuntimeError("CuPy is required for GPU dense builder") from e
+
+        from .dense import _build_pu_qv_eri_mat_dense_rys_from_cached  # noqa: PLC0415
+
+        if int(cp.cuda.runtime.getDevice()) != int(self.device_id):
+            raise RuntimeError("CuERIActiveSpaceDenseGPUBuilder used on a different CUDA device")
+
+        with stream_ctx(self.stream):
+            if self.ready_event is not None:
+                cp.cuda.get_current_stream().wait_event(self.ready_event)
+
+            C_mo_dev = cp.asarray(C_mo, dtype=cp.float64)
+            C_act_dev = cp.asarray(C_act, dtype=cp.float64)
+            C_mo_dev = cp.ascontiguousarray(C_mo_dev)
+            C_act_dev = cp.ascontiguousarray(C_act_dev)
+            if C_mo_dev.ndim != 2 or C_act_dev.ndim != 2:
+                raise ValueError("C_mo/C_act must have shape (nao, nmo)/(nao, ncas)")
+            nao_in, nmo = map(int, C_mo_dev.shape)
+            nao_in2, ncas = map(int, C_act_dev.shape)
+            if nao_in2 != nao_in:
+                raise ValueError("C_mo/C_act nao mismatch")
+
+            nao_expected_in = int(self.nao_expected_in or 0)
+            if nao_expected_in != nao_in:
+                raise ValueError(
+                    f"C_mo/C_act have nao={nao_in}, but builder expects nao={nao_expected_in} for ao_rep={self.ao_rep!r}"
+                )
+
+            C_mo_eval = C_mo_dev
+            C_act_eval = C_act_dev
+            t_transform_s = 0.0
+            if str(self.ao_rep) == "sph":
+                d_shell_l = self.d_shell_l
+                d_ao2shell_cart = self.d_ao2shell_cart
+                d_ao2local_cart = self.d_ao2local_cart
+                d_shell_ao_start_sph = self.d_shell_ao_start_sph
+                if (
+                    d_shell_l is None
+                    or d_ao2shell_cart is None
+                    or d_ao2local_cart is None
+                    or d_shell_ao_start_sph is None
+                ):  # pragma: no cover
+                    raise RuntimeError("internal error: missing spherical mapping/device arrays on builder")
+                if profile is not None:
+                    cp.cuda.get_current_stream().synchronize()
+                    t_conv0 = time.perf_counter()
+                C_mo_eval = sph_coeff_sph_to_cart_device(
+                    C_mo_dev,
+                    ao2shell_cart=d_ao2shell_cart,
+                    ao2local_cart=d_ao2local_cart,
+                    shell_ao_start_sph=d_shell_ao_start_sph,
+                    shell_l=d_shell_l,
+                    out=None,
+                    stream=None,
+                    threads=int(self.threads),
+                )
+                C_act_eval = sph_coeff_sph_to_cart_device(
+                    C_act_dev,
+                    ao2shell_cart=d_ao2shell_cart,
+                    ao2local_cart=d_ao2local_cart,
+                    shell_ao_start_sph=d_shell_ao_start_sph,
+                    shell_l=d_shell_l,
+                    out=None,
+                    stream=None,
+                    threads=int(self.threads),
+                )
+                if profile is not None:
+                    cp.cuda.get_current_stream().synchronize()
+                    t_transform_s = float(time.perf_counter() - float(t_conv0))
+                nao_eval = int(self.nao_expected_eval or 0)
+                if int(C_mo_eval.shape[0]) != nao_eval or int(C_act_eval.shape[0]) != nao_eval:
+                    raise RuntimeError("internal error: spherical->cart transform produced unexpected AO dimension")
+            else:
+                nao_eval = int(self.nao_expected_eval or 0)
+                if nao_eval != nao_in:
+                    raise RuntimeError("internal error: cart ao_rep expects nao_in == nao_eval")
+
+            n_pair = int(nmo) * int(ncas)
+            if out is None:
+                out = cp.empty((n_pair, n_pair), dtype=cp.float64)
+            else:
+                if getattr(out, "shape", None) != (n_pair, n_pair):
+                    raise ValueError(f"out must have shape {(n_pair, n_pair)}, got {getattr(out, 'shape', None)}")
+                out = cp.asarray(out, dtype=cp.float64)
+
+            t0 = time.perf_counter() if profile is not None else None
+            _build_pu_qv_eri_mat_dense_rys_from_cached(
+                builder=self,
+                C_mo=C_mo_eval,
+                C_act=C_act_eval,
+                out_eri_puqv=out,
+                profile=profile,
+            )
+
+            if profile is not None and t0 is not None:
+                cp.cuda.get_current_stream().synchronize()
+                prof = profile.setdefault("cueri_pu_qv_dense_rys_cached", {})
+                prof["t_total_s"] = float(time.perf_counter() - float(t0))
+                prof["ao_rep"] = str(self.ao_rep)
+                prof["nao_in"] = int(nao_in)
+                prof["nao_eval"] = int(nao_eval)
+                if str(self.ao_rep) == "sph":
+                    prof["t_sph_to_cart_s"] = float(t_transform_s)
+
+            return out
+
+    def contract_pu_wx_dm2(self, C_mo, C_act, dm2_wxuv, *, out=None, profile: dict | None = None):
+        """Contract (pu|wx) against DM2 and return g_dm2[p,v] on GPU."""
+
+        try:
+            import cupy as cp  # noqa: PLC0415
+        except Exception as e:  # pragma: no cover
+            raise RuntimeError("CuPy is required for GPU dense builder") from e
+
+        from .dense import _contract_pu_wx_dm2_dense_rys_from_cached  # noqa: PLC0415
+
+        if int(cp.cuda.runtime.getDevice()) != int(self.device_id):
+            raise RuntimeError("CuERIActiveSpaceDenseGPUBuilder used on a different CUDA device")
+
+        with stream_ctx(self.stream):
+            if self.ready_event is not None:
+                cp.cuda.get_current_stream().wait_event(self.ready_event)
+
+            C_mo_dev = cp.asarray(C_mo, dtype=cp.float64)
+            C_act_dev = cp.asarray(C_act, dtype=cp.float64)
+            C_mo_dev = cp.ascontiguousarray(C_mo_dev)
+            C_act_dev = cp.ascontiguousarray(C_act_dev)
+            if C_mo_dev.ndim != 2 or C_act_dev.ndim != 2:
+                raise ValueError("C_mo/C_act must have shape (nao, nmo)/(nao, ncas)")
+            nao_in, nmo = map(int, C_mo_dev.shape)
+            nao_in2, ncas = map(int, C_act_dev.shape)
+            if nao_in2 != nao_in:
+                raise ValueError("C_mo/C_act nao mismatch")
+
+            nao_expected_in = int(self.nao_expected_in or 0)
+            if nao_expected_in != nao_in:
+                raise ValueError(
+                    f"C_mo/C_act have nao={nao_in}, but builder expects nao={nao_expected_in} for ao_rep={self.ao_rep!r}"
+                )
+
+            C_mo_eval = C_mo_dev
+            C_act_eval = C_act_dev
+            t_transform_s = 0.0
+            if str(self.ao_rep) == "sph":
+                d_shell_l = self.d_shell_l
+                d_ao2shell_cart = self.d_ao2shell_cart
+                d_ao2local_cart = self.d_ao2local_cart
+                d_shell_ao_start_sph = self.d_shell_ao_start_sph
+                if (
+                    d_shell_l is None
+                    or d_ao2shell_cart is None
+                    or d_ao2local_cart is None
+                    or d_shell_ao_start_sph is None
+                ):  # pragma: no cover
+                    raise RuntimeError("internal error: missing spherical mapping/device arrays on builder")
+                if profile is not None:
+                    cp.cuda.get_current_stream().synchronize()
+                    t_conv0 = time.perf_counter()
+                C_mo_eval = sph_coeff_sph_to_cart_device(
+                    C_mo_dev,
+                    ao2shell_cart=d_ao2shell_cart,
+                    ao2local_cart=d_ao2local_cart,
+                    shell_ao_start_sph=d_shell_ao_start_sph,
+                    shell_l=d_shell_l,
+                    out=None,
+                    stream=None,
+                    threads=int(self.threads),
+                )
+                C_act_eval = sph_coeff_sph_to_cart_device(
+                    C_act_dev,
+                    ao2shell_cart=d_ao2shell_cart,
+                    ao2local_cart=d_ao2local_cart,
+                    shell_ao_start_sph=d_shell_ao_start_sph,
+                    shell_l=d_shell_l,
+                    out=None,
+                    stream=None,
+                    threads=int(self.threads),
+                )
+                if profile is not None:
+                    cp.cuda.get_current_stream().synchronize()
+                    t_transform_s = float(time.perf_counter() - float(t_conv0))
+                nao_eval = int(self.nao_expected_eval or 0)
+                if int(C_mo_eval.shape[0]) != nao_eval or int(C_act_eval.shape[0]) != nao_eval:
+                    raise RuntimeError("internal error: spherical->cart transform produced unexpected AO dimension")
+            else:
+                nao_eval = int(self.nao_expected_eval or 0)
+                if nao_eval != nao_in:
+                    raise RuntimeError("internal error: cart ao_rep expects nao_in == nao_eval")
+
+            if out is None:
+                out = cp.empty((int(nmo), int(ncas)), dtype=cp.float64)
+            else:
+                if getattr(out, "shape", None) != (int(nmo), int(ncas)):
+                    raise ValueError(f"out must have shape {(int(nmo), int(ncas))}")
+                out = cp.asarray(out, dtype=cp.float64)
+
+            t0 = time.perf_counter() if profile is not None else None
+            _contract_pu_wx_dm2_dense_rys_from_cached(
+                builder=self,
+                C_mo=C_mo_eval,
+                C_act=C_act_eval,
+                dm2_wxuv=dm2_wxuv,
+                out_gdm2=out,
+                profile=profile,
+            )
+
+            if profile is not None and t0 is not None:
+                cp.cuda.get_current_stream().synchronize()
+                prof = profile.setdefault("cueri_contract_pu_wx_dm2_cached", {})
+                prof["t_total_s"] = float(time.perf_counter() - float(t0))
+                prof["ao_rep"] = str(self.ao_rep)
+                prof["nao_in"] = int(nao_in)
+                prof["nao_eval"] = int(nao_eval)
+                if str(self.ao_rep) == "sph":
+                    prof["t_sph_to_cart_s"] = float(t_transform_s)
+
+            return out
+
     def build_pq_uv_eri_mat(self, C_mo, C_act, *, out=None, profile: dict | None = None):
         """Compute (pq|uv) ERIs where p,q are general MOs and u,v are active.
 

@@ -15,7 +15,7 @@ Notes
 """
 
 from collections import OrderedDict
-from dataclasses import dataclass
+from dataclasses import dataclass, replace as _dc_replace
 import json
 import os
 import threading
@@ -219,6 +219,9 @@ class RHFDFRunResult(_SCFRunResultView):
     df_run_config: DFRunConfig | None = None
     thc_factors: Any | None = None
     thc_run_config: THCRunConfig | None = None
+    two_e_backend: str | None = None
+    direct_jk_ctx: Any | None = None
+    cueri_shared_ctx: Any | None = None
 
 
 @dataclass(frozen=True)
@@ -238,6 +241,9 @@ class UHFDFRunResult(_SCFRunResultView):
     df_run_config: DFRunConfig | None = None
     thc_factors: Any | None = None
     thc_run_config: THCRunConfig | None = None
+    two_e_backend: str | None = None
+    direct_jk_ctx: Any | None = None
+    cueri_shared_ctx: Any | None = None
 
 
 @dataclass(frozen=True)
@@ -257,6 +263,9 @@ class ROHFDFRunResult(_SCFRunResultView):
     df_run_config: DFRunConfig | None = None
     thc_factors: Any | None = None
     thc_run_config: THCRunConfig | None = None
+    two_e_backend: str | None = None
+    direct_jk_ctx: Any | None = None
+    cueri_shared_ctx: Any | None = None
 
 
 _HF_PREP_CACHE_MAX = max(0, int(os.environ.get("ASUKA_HF_PREP_CACHE_MAX", "0")))
@@ -940,6 +949,8 @@ def run_rhf_direct(
         df_B=None,
         scf=scf,
         profile=profile,
+        two_e_backend="direct",
+        direct_jk_ctx=jk_ctx,
     )
 
 
@@ -1012,6 +1023,8 @@ def run_uhf_direct(
         df_B=None,
         scf=scf,
         profile=profile,
+        two_e_backend="direct",
+        direct_jk_ctx=jk_ctx,
     )
 
 
@@ -1084,6 +1097,8 @@ def run_rohf_direct(
         df_B=None,
         scf=scf,
         profile=profile,
+        two_e_backend="direct",
+        direct_jk_ctx=jk_ctx,
     )
 
 
@@ -2710,6 +2725,24 @@ def run_rohf_thc(
     )
 
 
+def _with_two_e_metadata(
+    out: RHFDFRunResult | UHFDFRunResult | ROHFDFRunResult,
+    *,
+    two_e_backend: str,
+    direct_jk_ctx: Any | None = None,
+) -> RHFDFRunResult | UHFDFRunResult | ROHFDFRunResult:
+    """Attach normalized two-electron backend metadata to frontend SCF results."""
+
+    try:
+        return _dc_replace(
+            out,
+            two_e_backend=str(two_e_backend),
+            direct_jk_ctx=direct_jk_ctx if direct_jk_ctx is not None else getattr(out, "direct_jk_ctx", None),
+        )
+    except Exception:
+        return out
+
+
 def run_hf_df(
     mol: Molecule,
     *,
@@ -2766,13 +2799,25 @@ def run_hf_df(
 
         if two_e == "df":
             if method_s == "rks":
-                return run_rks_df(mol, functional=str(xc_name), dm0=dm0, mo_coeff0=mo_coeff0, **dft_kwargs)
-            return run_uks_df(mol, functional=str(xc_name), dm0=dm0, mo_coeff0=mo_coeff0, **dft_kwargs)
+                return _with_two_e_metadata(
+                    run_rks_df(mol, functional=str(xc_name), dm0=dm0, mo_coeff0=mo_coeff0, **dft_kwargs),
+                    two_e_backend="df",
+                )
+            return _with_two_e_metadata(
+                run_uks_df(mol, functional=str(xc_name), dm0=dm0, mo_coeff0=mo_coeff0, **dft_kwargs),
+                two_e_backend="df",
+            )
 
         # THC (global or local selected via thc_mode in kwargs)
         if method_s == "rks":
-            return run_rhf_thc(mol, functional=str(xc_name), dm0=dm0, mo_coeff0=mo_coeff0, **dft_kwargs)
-        return run_uhf_thc(mol, functional=str(xc_name), dm0=dm0, mo_coeff0=mo_coeff0, **dft_kwargs)
+            return _with_two_e_metadata(
+                run_rhf_thc(mol, functional=str(xc_name), dm0=dm0, mo_coeff0=mo_coeff0, **dft_kwargs),
+                two_e_backend="thc",
+            )
+        return _with_two_e_metadata(
+            run_uhf_thc(mol, functional=str(xc_name), dm0=dm0, mo_coeff0=mo_coeff0, **dft_kwargs),
+            two_e_backend="thc",
+        )
 
     if two_e == "dense":
         dense_kwargs = dict(kwargs)
@@ -2794,10 +2839,19 @@ def run_hf_df(
         ):
             dense_kwargs.pop(key, None)
         if method_s == "rhf":
-            return run_rhf_dense(mol, backend=backend_s, dm0=dm0, mo_coeff0=mo_coeff0, **dense_kwargs)
+            return _with_two_e_metadata(
+                run_rhf_dense(mol, backend=backend_s, dm0=dm0, mo_coeff0=mo_coeff0, **dense_kwargs),
+                two_e_backend="dense",
+            )
         if method_s == "uhf":
-            return run_uhf_dense(mol, backend=backend_s, dm0=dm0, mo_coeff0=mo_coeff0, **dense_kwargs)
-        return run_rohf_dense(mol, backend=backend_s, dm0=dm0, mo_coeff0=mo_coeff0, **dense_kwargs)
+            return _with_two_e_metadata(
+                run_uhf_dense(mol, backend=backend_s, dm0=dm0, mo_coeff0=mo_coeff0, **dense_kwargs),
+                two_e_backend="dense",
+            )
+        return _with_two_e_metadata(
+            run_rohf_dense(mol, backend=backend_s, dm0=dm0, mo_coeff0=mo_coeff0, **dense_kwargs),
+            two_e_backend="dense",
+        )
 
     if two_e == "direct":
         if backend_s != "cuda":
@@ -2826,19 +2880,31 @@ def run_hf_df(
         ):
             direct_kwargs.pop(key, None)
         if method_s == "rhf":
-            return run_rhf_direct(mol, dm0=dm0, mo_coeff0=mo_coeff0, **direct_kwargs)
+            out = run_rhf_direct(mol, dm0=dm0, mo_coeff0=mo_coeff0, **direct_kwargs)
+            return _with_two_e_metadata(out, two_e_backend="direct", direct_jk_ctx=getattr(out, "direct_jk_ctx", None))
         if method_s == "uhf":
-            return run_uhf_direct(mol, dm0=dm0, mo_coeff0=mo_coeff0, **direct_kwargs)
-        return run_rohf_direct(mol, dm0=dm0, mo_coeff0=mo_coeff0, **direct_kwargs)
+            out = run_uhf_direct(mol, dm0=dm0, mo_coeff0=mo_coeff0, **direct_kwargs)
+            return _with_two_e_metadata(out, two_e_backend="direct", direct_jk_ctx=getattr(out, "direct_jk_ctx", None))
+        out = run_rohf_direct(mol, dm0=dm0, mo_coeff0=mo_coeff0, **direct_kwargs)
+        return _with_two_e_metadata(out, two_e_backend="direct", direct_jk_ctx=getattr(out, "direct_jk_ctx", None))
 
     if two_e == "thc":
         if backend_s != "cuda":
             raise NotImplementedError("THC backend currently requires backend='cuda'")
         if method_s == "rhf":
-            return run_rhf_thc(mol, dm0=dm0, mo_coeff0=mo_coeff0, **kwargs)
+            return _with_two_e_metadata(
+                run_rhf_thc(mol, dm0=dm0, mo_coeff0=mo_coeff0, **kwargs),
+                two_e_backend="thc",
+            )
         if method_s == "uhf":
-            return run_uhf_thc(mol, dm0=dm0, mo_coeff0=mo_coeff0, **kwargs)
-        return run_rohf_thc(mol, dm0=dm0, mo_coeff0=mo_coeff0, **kwargs)
+            return _with_two_e_metadata(
+                run_uhf_thc(mol, dm0=dm0, mo_coeff0=mo_coeff0, **kwargs),
+                two_e_backend="thc",
+            )
+        return _with_two_e_metadata(
+            run_rohf_thc(mol, dm0=dm0, mo_coeff0=mo_coeff0, **kwargs),
+            two_e_backend="thc",
+        )
 
     if backend_s == "cuda":
         if method_s == "rhf":
@@ -2883,13 +2949,13 @@ def run_hf_df(
         except Exception:
             pass
 
-        return out
+        return _with_two_e_metadata(out, two_e_backend="df")
 
     if method_s == "rhf":
-        return run_rhf_df_cpu(mol, dm0=dm0, mo_coeff0=mo_coeff0, **kwargs)
+        return _with_two_e_metadata(run_rhf_df_cpu(mol, dm0=dm0, mo_coeff0=mo_coeff0, **kwargs), two_e_backend="df")
     if method_s == "uhf":
-        return run_uhf_df_cpu(mol, dm0=dm0, mo_coeff0=mo_coeff0, **kwargs)
-    return run_rohf_df_cpu(mol, dm0=dm0, mo_coeff0=mo_coeff0, **kwargs)
+        return _with_two_e_metadata(run_uhf_df_cpu(mol, dm0=dm0, mo_coeff0=mo_coeff0, **kwargs), two_e_backend="df")
+    return _with_two_e_metadata(run_rohf_df_cpu(mol, dm0=dm0, mo_coeff0=mo_coeff0, **kwargs), two_e_backend="df")
 
 
 def run_hf(

@@ -677,8 +677,33 @@ def _heat_bath_select_cuda(
     *,
     verbose: int = 0,
 ) -> tuple[list[int], np.ndarray]:
-    """CUDA fused HB selector using the native screen+apply kernel."""
+    """CUDA HB selector.
+
+    Default behavior is the exact screened-CSR implementation to preserve
+    parity with the reference path. The legacy fused kernel path remains
+    available for debugging/experiments by setting
+    ``ASUKA_HB_SCI_FUSED_IMPL=experimental``.
+    """
     _ = verbose
+    fused_impl = str(os.environ.get("ASUKA_HB_SCI_FUSED_IMPL", "exact")).strip().lower()
+    if fused_impl in ("", "default", "exact", "screened_csr"):
+        return _heat_bath_select_screened_csr(
+            hb_index,
+            sel_idx,
+            c_sel,
+            e_var,
+            max_add,
+            epsilon,
+            ws,
+            drt,
+            frontier_buffers,
+            nroots,
+            ncsf,
+            denom_floor,
+        )
+    if fused_impl not in ("experimental", "kernel"):
+        raise ValueError("ASUKA_HB_SCI_FUSED_IMPL must be one of: exact, experimental")
+
     try:
         import cupy as cp  # type: ignore[import-not-found]
     except Exception as e:  # pragma: no cover

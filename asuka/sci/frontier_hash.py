@@ -11,6 +11,7 @@ from asuka.cuguga.drt import DRT
 from asuka.cuda.cuda_backend import (
     GugaMatvecEriMatWorkspace,
     Kernel3BuildGDFWorkspace,
+    apply_g_flat_scatter_atomic_frontier_hash_inplace_device,
     apply_g_flat_scatter_atomic_frontier_hash_many_roots_inplace_device,
     build_occ_block_from_steps_inplace_device,
     cipsi_frontier_hash_clear_inplace_device,
@@ -173,6 +174,9 @@ class FrontierHashSelector:
         if score_impl not in ("v1", "v2"):
             raise ValueError("ASUKA_CIPSI_HASH_SELECT_IMPL must be one of: v1, v2")
         self.hash_select_impl = score_impl
+        agg_single_root = str(os.environ.get("ASUKA_FH_OFFDIAG_AGG_SINGLE_ROOT", "1")).strip().lower()
+        self.offdiag_single_root_aggregate = agg_single_root in ("1", "true", "yes", "on")
+        self.offdiag_agg_min_rows = max(1, int(_env_int("ASUKA_FH_OFFDIAG_AGG_MIN_ROWS", 256)))
 
         # Tile sizing: ensure (tile * rs_block) fits Kernel25Workspace.max_tasks.
         tile_i = int(tile)
@@ -272,8 +276,11 @@ class FrontierHashSelector:
         self.g_rows = int(g_rows_eff)
         self.g_rows_cap_mb = int(g_rows_cap_mb) if g_rows_cap_mb is not None else int(_env_int("ASUKA_FH_G_ROWS_CAP_MB", 128))
         self.g_buf = cp.empty((int(self.g_rows), int(self.nops)), dtype=cp.float64)
+        self.g_scaled_buf = cp.empty((int(self.g_rows), int(self.nops)), dtype=cp.float64)
         # Reusable per-row coefficient staging for offdiag many-roots apply.
         self.task_scale_rows_buf = cp.empty((int(self.g_rows), int(self.nroots)), dtype=cp.float64)
+        # Reusable per-row coefficient staging for nroots==1 single-root apply.
+        self.task_scale_rows1_buf = cp.empty((int(self.g_rows),), dtype=cp.float64)
 
         self.gdf_ws: Kernel3BuildGDFWorkspace | None = None
         if l_full is not None:
@@ -309,6 +316,37 @@ class FrontierHashSelector:
         new_i32 = np.asarray(new_idx, dtype=np.int32).ravel()
         if new_i32.size:
             self.selected_mask_d[cp.asarray(new_i32, dtype=cp.int32)] = np.uint8(1)
+
+    def _aggregate_single_root_offdiag_rows(self, row_k, g_rows, task_scale_rows):
+        """Scale rows by coefficients and merge duplicate target CSFs (single-root path)."""
+        cp = self.cp
+        nb = int(row_k.shape[0])
+        if nb <= 0:
+            return row_k, g_rows
+
+        g_scaled = self.g_scaled_buf[:nb]
+        g_scaled[...] = g_rows
+        g_scaled *= task_scale_rows[:, None]
+
+        if nb < int(self.offdiag_agg_min_rows):
+            return row_k, g_scaled
+
+        order = cp.argsort(row_k)
+        row_k_sorted = row_k[order]
+        g_sorted = g_scaled[order]
+        if nb <= 1:
+            return row_k_sorted, g_sorted
+
+        heads = cp.empty((nb,), dtype=cp.bool_)
+        heads[0] = True
+        heads[1:] = row_k_sorted[1:] != row_k_sorted[:-1]
+        starts = cp.nonzero(heads)[0]
+        if int(starts.size) == nb:
+            return row_k_sorted, g_sorted
+
+        row_k_agg = row_k_sorted[starts]
+        g_agg = cp.add.reduceat(g_sorted, starts, axis=0)
+        return row_k_agg, cp.ascontiguousarray(g_agg)
 
     def _choose_hash_cap(self, *, nsel: int) -> int:
         cap_in = int(self._hash_cap_hint or self.hash_cap or 0)
@@ -371,6 +409,7 @@ class FrontierHashSelector:
         e_var_d = cp.ascontiguousarray(cp.asarray(e_var, dtype=cp.float64).ravel())
         if e_var_d.shape != (int(self.nroots),):
             raise ValueError("e_var must have shape (nroots,)")
+        single_root = bool(int(self.nroots) == 1)
         # One global order for offdiag processing so scattered selections do not
         # force many tiny tile-id groups.
         sel_order_h = np.argsort(sel_idx_i32, kind="stable").astype(np.int32, copy=False)
@@ -433,23 +472,43 @@ class FrontierHashSelector:
             with _nvtx_range("cipsi_one_body", enabled=nvtx_enabled), _timed_phase(
                 "one_body_apply", enabled=profile_enabled, timings_ms=timings, stream=stream
             ):
-                apply_g_flat_scatter_atomic_frontier_hash_many_roots_inplace_device(
-                    self.drt,
-                    self.ws.drt_dev,
-                    self.ws.state_dev,
-                    sel_idx_d,
-                    h_eff_flat,
-                    task_scale_task_major=c_sel_d,
-                    hash_keys=self.hash_keys,
-                    hash_vals=self.hash_vals,
-                    selected_mask=self.selected_mask_d,
-                    overflow=self.hash_overflow,
-                    clear_overflow=False,
-                    threads=256,
-                    stream=stream,
-                    sync=False,
-                    check_overflow=False,
-                )
+                if single_root:
+                    apply_g_flat_scatter_atomic_frontier_hash_inplace_device(
+                        self.drt,
+                        self.ws.drt_dev,
+                        self.ws.state_dev,
+                        sel_idx_d,
+                        h_eff_flat,
+                        task_scale=c_sel_d[:, 0],
+                        hash_keys=self.hash_keys,
+                        hash_vals=self.hash_vals,
+                        root=0,
+                        selected_mask=self.selected_mask_d,
+                        overflow=self.hash_overflow,
+                        clear_overflow=False,
+                        threads=256,
+                        stream=stream,
+                        sync=False,
+                        check_overflow=False,
+                    )
+                else:
+                    apply_g_flat_scatter_atomic_frontier_hash_many_roots_inplace_device(
+                        self.drt,
+                        self.ws.drt_dev,
+                        self.ws.state_dev,
+                        sel_idx_d,
+                        h_eff_flat,
+                        task_scale_task_major=c_sel_d,
+                        hash_keys=self.hash_keys,
+                        hash_vals=self.hash_vals,
+                        selected_mask=self.selected_mask_d,
+                        overflow=self.hash_overflow,
+                        clear_overflow=False,
+                        threads=256,
+                        stream=stream,
+                        sync=False,
+                        check_overflow=False,
+                    )
 
             # Two-body diagonal rs (r==s): build occ blocks once per tile and apply across roots.
             with _nvtx_range("cipsi_two_body_diag", enabled=nvtx_enabled), _timed_phase(
@@ -475,23 +534,43 @@ class FrontierHashSelector:
                     g_diag_sel *= 0.5
                     task_csf_tile = cp.asarray(sel_idx_i32[pos], dtype=cp.int32)
                     c_tile = cp.ascontiguousarray(c_sel_d[pos, :])
-                    apply_g_flat_scatter_atomic_frontier_hash_many_roots_inplace_device(
-                        self.drt,
-                        self.ws.drt_dev,
-                        self.ws.state_dev,
-                        task_csf_tile,
-                        g_diag_sel,
-                        task_scale_task_major=c_tile,
-                        hash_keys=self.hash_keys,
-                        hash_vals=self.hash_vals,
-                        selected_mask=self.selected_mask_d,
-                        overflow=self.hash_overflow,
-                        clear_overflow=False,
-                        threads=256,
-                        stream=stream,
-                        sync=False,
-                        check_overflow=False,
-                    )
+                    if single_root:
+                        apply_g_flat_scatter_atomic_frontier_hash_inplace_device(
+                            self.drt,
+                            self.ws.drt_dev,
+                            self.ws.state_dev,
+                            task_csf_tile,
+                            g_diag_sel,
+                            task_scale=c_tile[:, 0],
+                            hash_keys=self.hash_keys,
+                            hash_vals=self.hash_vals,
+                            root=0,
+                            selected_mask=self.selected_mask_d,
+                            overflow=self.hash_overflow,
+                            clear_overflow=False,
+                            threads=256,
+                            stream=stream,
+                            sync=False,
+                            check_overflow=False,
+                        )
+                    else:
+                        apply_g_flat_scatter_atomic_frontier_hash_many_roots_inplace_device(
+                            self.drt,
+                            self.ws.drt_dev,
+                            self.ws.state_dev,
+                            task_csf_tile,
+                            g_diag_sel,
+                            task_scale_task_major=c_tile,
+                            hash_keys=self.hash_keys,
+                            hash_vals=self.hash_vals,
+                            selected_mask=self.selected_mask_d,
+                            overflow=self.hash_overflow,
+                            clear_overflow=False,
+                            threads=256,
+                            stream=stream,
+                            sync=False,
+                            check_overflow=False,
+                        )
 
             # Two-body off-diagonal rs (r!=s): build CSR/build-g once per tile/pair block,
             # then apply across roots.
@@ -603,28 +682,70 @@ class FrontierHashSelector:
 
                                 row_k_b = row_k_d[int(row_start) : int(row_stop)]
                                 row_local = row_local_all[int(row_start) : int(row_stop)]
-                                task_scale_rows = self.task_scale_rows_buf[:nb, :]
-                                task_scale_rows[...] = c_tile[row_local, :]
-                                with _nvtx_range("cipsi_apply_to_hash_offdiag", enabled=nvtx_enabled), _timed_phase(
-                                    "offdiag_apply_hash", enabled=profile_enabled, timings_ms=timings, stream=stream
-                                ):
-                                    apply_g_flat_scatter_atomic_frontier_hash_many_roots_inplace_device(
-                                        self.drt,
-                                        self.ws.drt_dev,
-                                        self.ws.state_dev,
-                                        row_k_b,
-                                        g_b,
-                                        task_scale_task_major=task_scale_rows,
-                                        hash_keys=self.hash_keys,
-                                        hash_vals=self.hash_vals,
-                                        selected_mask=self.selected_mask_d,
-                                        overflow=self.hash_overflow,
-                                        clear_overflow=False,
-                                        threads=int(self.threads_apply_offdiag),
-                                        stream=stream,
-                                        sync=False,
-                                        check_overflow=False,
-                                    )
+                                if single_root:
+                                    task_scale_rows1 = self.task_scale_rows1_buf[:nb]
+                                    task_scale_rows1[...] = c_tile[row_local, 0]
+                                    row_k_apply = row_k_b
+                                    g_apply = g_b
+                                    use_task_scale = True
+                                    if bool(self.offdiag_single_root_aggregate):
+                                        with _timed_phase(
+                                            "offdiag_row_aggregate",
+                                            enabled=profile_enabled,
+                                            timings_ms=timings,
+                                            stream=stream,
+                                        ):
+                                            row_k_apply, g_apply = self._aggregate_single_root_offdiag_rows(
+                                                row_k_b,
+                                                g_b,
+                                                task_scale_rows1,
+                                            )
+                                        use_task_scale = False
+
+                                    with _nvtx_range("cipsi_apply_to_hash_offdiag", enabled=nvtx_enabled), _timed_phase(
+                                        "offdiag_apply_hash", enabled=profile_enabled, timings_ms=timings, stream=stream
+                                    ):
+                                        apply_g_flat_scatter_atomic_frontier_hash_inplace_device(
+                                            self.drt,
+                                            self.ws.drt_dev,
+                                            self.ws.state_dev,
+                                            row_k_apply,
+                                            g_apply,
+                                            task_scale=task_scale_rows1 if use_task_scale else None,
+                                            hash_keys=self.hash_keys,
+                                            hash_vals=self.hash_vals,
+                                            root=0,
+                                            selected_mask=self.selected_mask_d,
+                                            overflow=self.hash_overflow,
+                                            clear_overflow=False,
+                                            threads=int(self.threads_apply_offdiag),
+                                            stream=stream,
+                                            sync=False,
+                                            check_overflow=False,
+                                        )
+                                else:
+                                    task_scale_rows = self.task_scale_rows_buf[:nb, :]
+                                    task_scale_rows[...] = c_tile[row_local, :]
+                                    with _nvtx_range("cipsi_apply_to_hash_offdiag", enabled=nvtx_enabled), _timed_phase(
+                                        "offdiag_apply_hash", enabled=profile_enabled, timings_ms=timings, stream=stream
+                                    ):
+                                        apply_g_flat_scatter_atomic_frontier_hash_many_roots_inplace_device(
+                                            self.drt,
+                                            self.ws.drt_dev,
+                                            self.ws.state_dev,
+                                            row_k_b,
+                                            g_b,
+                                            task_scale_task_major=task_scale_rows,
+                                            hash_keys=self.hash_keys,
+                                            hash_vals=self.hash_vals,
+                                            selected_mask=self.selected_mask_d,
+                                            overflow=self.hash_overflow,
+                                            clear_overflow=False,
+                                            threads=int(self.threads_apply_offdiag),
+                                            stream=stream,
+                                            sync=False,
+                                            check_overflow=False,
+                                        )
 
                     if self.offdiag_grouping == "tile":
                         for _tile_id_val, pos in tile_groups:

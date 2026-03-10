@@ -301,8 +301,8 @@ __global__ void KernelFusedJKSsss(
       if (ab_neq && cd_neq) atomicAdd(&K_mat[b * N + d], sum * D_mat[a * N + c]);
       if (bk_swap) {
         atomicAdd(&K_mat[c * N + a], sum * D_mat[d * N + b]);
-        if (ab_neq) atomicAdd(&K_mat[d * N + a], sum * D_mat[c * N + b]);
-        if (cd_neq) atomicAdd(&K_mat[c * N + b], sum * D_mat[d * N + a]);
+        if (cd_neq) atomicAdd(&K_mat[d * N + a], sum * D_mat[c * N + b]);
+        if (ab_neq) atomicAdd(&K_mat[c * N + b], sum * D_mat[d * N + a]);
         if (ab_neq && cd_neq) atomicAdd(&K_mat[d * N + b], sum * D_mat[c * N + a]);
       }
     }

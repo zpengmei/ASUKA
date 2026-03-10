@@ -627,6 +627,12 @@ def run_casscf_df(
     casci_backend_s = str(casci_backend).strip().lower()
     if casci_backend_s not in {"df", "dense_cpu", "dense_gpu", "thc"}:
         raise ValueError("casci_backend must be one of: 'df', 'dense_cpu', 'dense_gpu', 'thc'")
+    direct_mode = bool(
+        getattr(scf_out, "direct_jk_ctx", None) is not None
+        or str(getattr(scf_out, "two_e_backend", "") or "").strip().lower() == "direct"
+    )
+    if direct_mode and casci_backend_s != "dense_gpu":
+        raise ValueError("direct two-electron backend requires casci_backend='dense_gpu'")
 
     # Keep the incoming SCF object unchanged in the returned result.
     # CASSCF now accepts both DF layouts directly:
@@ -1033,6 +1039,7 @@ def run_casscf_df(
             fcisolver_use.rdm_backend = "cuda"
     dense_cpu_builder = None
     dense_gpu_builder = None
+    two_e_provider = None
     if casci_backend_s == "dense_cpu":
         from asuka.cueri.active_space_dense_cpu import CuERIActiveSpaceDenseCPUBuilder  # noqa: PLC0415
 
@@ -1053,6 +1060,22 @@ def run_casscf_df(
             max_tile_bytes=int(max_tile_bytes),
             eps_ao=float(dense_gpu_eps_ao),
         )
+        if direct_mode:
+            from asuka.mcscf.two_e_provider import resolve_two_e_provider  # noqa: PLC0415
+
+            two_e_provider = resolve_two_e_provider(
+                scf_out,
+                dense_gpu_builder=dense_gpu_builder,
+                dense_gpu_builder_mol=dense_gpu_builder_mol,
+                dense_gpu_threads=int(dense_gpu_threads),
+                dense_max_tile_bytes=int(max_tile_bytes),
+                dense_eps_ao=float(dense_gpu_eps_ao),
+                dense_gpu_ao_rep=str(dense_gpu_ao_rep),
+            )
+            if two_e_provider is None:  # pragma: no cover
+                raise RuntimeError("failed to resolve two-electron provider for direct mode")
+            if profile is not None:
+                profile["two_e_provider_kind"] = str(getattr(two_e_provider, "kind", "unknown"))
 
     e_last = None
     e_ref = None
@@ -1273,6 +1296,7 @@ def run_casscf_df(
                 dense_gpu_ao_rep=str(dense_gpu_ao_rep),
                 dense_gpu_builder_mol=dense_gpu_builder_mol,
                 dense_gpu_builder=dense_gpu_builder,
+                two_e_provider=two_e_provider,
                 dense_exact_jk=bool(dense_exact_jk),
                 threads=int(dense_gpu_threads),
                 eps_ao=float(dense_gpu_eps_ao),
@@ -1493,6 +1517,8 @@ def run_casscf_df(
                 extrasym=None,
                 mixed_precision=bool(newton_mixed_precision),
                 aux_block_naux=int(newton_aux_block_naux),
+                jk_provider=two_e_provider if direct_mode else None,
+                eri_provider=two_e_provider if direct_mode else None,
             )
             mc_ah.max_stepsize = float(max_stepsize_cur)
             mc_ah.ah_level_shift = float(ah_level_shift)
@@ -1785,6 +1811,8 @@ def run_casscf_df(
                 extrasym=None,
                 mixed_precision=bool(newton_mixed_precision),
                 aux_block_naux=int(newton_aux_block_naux),
+                jk_provider=two_e_provider if direct_mode else None,
+                eri_provider=two_e_provider if direct_mode else None,
             )
             # PySCF mc1step defaults.
             mc_1s.max_stepsize = min(float(max_stepsize), 0.02)
@@ -1957,6 +1985,7 @@ def run_casscf_df(
                 dense_cpu_p_block_nmo=64,
                 dense_gpu_threads=int(threads_use),
                 dense_gpu_builder=dense_gpu_builder,
+                two_e_provider=two_e_provider,
                 dense_exact_jk=bool(dense_exact_jk),
                 profile=orbgrad_profile,
             )
@@ -2399,7 +2428,12 @@ def run_casscf(
     )
 
     C0 = getattr(scf_out.scf, "mo_coeff", None)
-    _xp_probe = scf_out.df_B if scf_out.df_B is not None else getattr(scf_out, "ao_eri", C0)
+    _direct_probe = getattr(getattr(scf_out, "direct_jk_ctx", None), "sp_A_dev", None)
+    _xp_probe = (
+        scf_out.df_B
+        if scf_out.df_B is not None
+        else (getattr(scf_out, "ao_eri", None) if getattr(scf_out, "ao_eri", None) is not None else (_direct_probe if _direct_probe is not None else C0))
+    )
     _, is_gpu = _df_scf._get_xp(_xp_probe, C0)  # noqa: SLF001
     if backend_s == "cuda" and not bool(is_gpu):
         raise ValueError("backend='cuda' requires scf_out with GPU arrays (use frontend.run_*_df or run_*_dense with backend='cuda')")
@@ -2423,6 +2457,24 @@ def run_casscf(
 
     if not df_b:
         kwargs.setdefault("dense_exact_jk", "auto")
+
+    direct_mode = bool(
+        getattr(scf_out, "direct_jk_ctx", None) is not None
+        or str(getattr(scf_out, "two_e_backend", "") or "").strip().lower() == "direct"
+    )
+    if direct_mode:
+        if backend_s != "cuda":
+            raise NotImplementedError("direct two-electron backend currently requires backend='cuda' for CASSCF")
+        result = run_casscf_df(
+            scf_out,
+            ncore=int(ncore),
+            ncas=int(ncas),
+            nelecas=nelecas,
+            casci_backend="dense_gpu",
+            matvec_backend=str(matvec_backend),
+            **kwargs,
+        )
+        return _dc_replace(result, run_config=run_config)
 
     if df_b:
         if scf_out.df_B is None and getattr(scf_out, "thc_factors", None) is not None:

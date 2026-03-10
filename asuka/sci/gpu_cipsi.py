@@ -1,15 +1,18 @@
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import dataclass
 from itertools import permutations
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import numpy as np
 
 from asuka.cuguga.drt import DRT, build_drt
 from asuka.cuguga.oracle import _restore_eri_4d
+from asuka.cuguga.state_cache import get_state_cache
 from asuka.cuda.cuda_backend import (
     GugaMatvecEriMatWorkspace,
     gather_project_batched_inplace_device,
@@ -23,7 +26,13 @@ from asuka.integrals.df_integrals import DFMOIntegrals, DeviceDFMOIntegrals
 from asuka.mcscf.casci import CASCIResult, _build_casci_df_integrals
 from asuka.qmc.sparse import SparseVector
 from asuka.sci.frontier_hash import FrontierHashSelector
-from asuka.sci.selected_ci import _initial_selection, _make_hdiag_guess, _normalize_ci0
+from asuka.sci.selected_ci import (
+    _build_variational_hamiltonian,
+    _initial_selection,
+    _make_hdiag_guess,
+    _normalize_ci0,
+    _solve_subspace,
+)
 
 
 def _require_cupy():
@@ -444,6 +453,154 @@ def _build_ci0_subspace(
     return out
 
 
+def _solve_davidson_with_retries(
+    *,
+    hop: Any,
+    x0: list[np.ndarray],
+    hdiag_sub: np.ndarray,
+    nroots: int,
+    max_cycle: int,
+    max_space: int,
+    tol: float,
+    tag: str,
+):
+    """Run GPU Davidson with bounded retry expansion until all roots converge."""
+
+    nroots_i = int(nroots)
+    hdiag_sub = np.asarray(hdiag_sub, dtype=np.float64).ravel()
+    nsel_i = int(hdiag_sub.size)
+    max_cycle_i = int(max_cycle)
+    max_space_i = min(int(max_space), int(nsel_i))
+    if max_space_i < nroots_i:
+        max_space_i = int(nroots_i)
+
+    retries = 2
+    cycle_cap = max(int(max_cycle_i), max(200, int(max_cycle_i) * 4))
+    space_cap = min(int(nsel_i), max(int(max_space_i), max(64, int(max_space_i) * 4)))
+
+    attempts: list[dict[str, Any]] = []
+    last_res = None
+    for attempt in range(retries + 1):
+        dres = davidson_sym_gpu(
+            hop,
+            x0=x0,
+            hdiag=hdiag_sub,
+            nroots=nroots_i,
+            max_cycle=int(max_cycle_i),
+            max_space=int(max_space_i),
+            tol=float(tol),
+            subspace_eigh_cpu=True,
+            subspace_eigh_cpu_max_m=64,
+        )
+        conv = np.asarray(getattr(dres, "converged", np.zeros((nroots_i,), dtype=np.bool_)), dtype=np.bool_).ravel()
+        conv_count = int(np.count_nonzero(conv))
+        attempts.append(
+            {
+                "attempt": int(attempt),
+                "max_cycle": int(max_cycle_i),
+                "max_space": int(max_space_i),
+                "niter": int(getattr(dres, "niter", -1)),
+                "converged_roots": int(conv_count),
+                "nroots": int(nroots_i),
+            }
+        )
+        if conv.shape == (nroots_i,) and bool(np.all(conv)):
+            return dres, {"attempts": attempts, "retry_count": int(attempt)}
+
+        last_res = dres
+        if attempt >= retries:
+            break
+        max_cycle_i = min(int(cycle_cap), max(int(max_cycle_i) + max(8, nroots_i * 4), int(max_cycle_i * 3 // 2)))
+        max_space_i = min(int(space_cap), max(int(max_space_i) + max(4, nroots_i), int(max_space_i * 3 // 2)))
+
+    dense_fallback_max_nsel = max(64, nroots_i * 8)
+    if nsel_i <= int(dense_fallback_max_nsel):
+        cp = _require_cupy()
+        eye = cp.eye(nsel_i, dtype=cp.float64)
+        h_cols = []
+        for ii in range(nsel_i):
+            col = cp.asarray(hop(eye[:, ii]), dtype=cp.float64).ravel()
+            h_cols.append(col)
+        h_sub = cp.asnumpy(cp.stack(h_cols, axis=1))
+        h_sub = 0.5 * (h_sub + h_sub.T)
+        evals, evecs = np.linalg.eigh(np.asarray(h_sub, dtype=np.float64))
+        e_out = np.asarray(evals[:nroots_i], dtype=np.float64)
+        x_out = [np.asarray(evecs[:, i], dtype=np.float64).copy() for i in range(nroots_i)]
+        attempts.append(
+            {
+                "attempt": int(len(attempts)),
+                "max_cycle": int(max_cycle_i),
+                "max_space": int(max_space_i),
+                "niter": -1,
+                "converged_roots": int(nroots_i),
+                "nroots": int(nroots_i),
+                "dense_fallback": True,
+            }
+        )
+        dres = SimpleNamespace(
+            converged=np.ones((nroots_i,), dtype=np.bool_),
+            e=e_out,
+            x=x_out,
+            niter=-1,
+            stats={"dense_fallback": 1.0},
+        )
+        return dres, {"attempts": attempts, "retry_count": int(retries), "used_dense_fallback": True}
+
+    raise RuntimeError(
+        f"GPU Davidson did not converge for {tag}; attempts={attempts}, "
+        f"last_niter={int(getattr(last_res, 'niter', -1)) if last_res is not None else -1}"
+    )
+
+
+def _maybe_refine_subspace_cpu(
+    *,
+    drt: DRT,
+    h1e: np.ndarray,
+    eri: Any,
+    sel_idx: np.ndarray,
+    loc: np.ndarray,
+    nroots: int,
+    davidson_tol: float,
+):
+    """Optionally refine small selected spaces with deterministic CPU subspace diagonalization."""
+
+    max_nsel = int(str(os.environ.get("ASUKA_GPU_CIPSI_CPU_SUBSPACE_REFINE_MAX_NSEL", "256")).strip() or "256")
+    if max_nsel <= 0:
+        return None
+    sel_idx_i64 = np.asarray(sel_idx, dtype=np.int64).ravel()
+    nsel = int(sel_idx_i64.size)
+    if nsel <= 0 or nsel > int(max_nsel):
+        return None
+
+    try:
+        state_cache = get_state_cache(drt)
+        h_sub = _build_variational_hamiltonian(
+            drt,
+            np.asarray(h1e, dtype=np.float64),
+            eri,
+            sel=sel_idx_i64.tolist(),
+            loc=np.asarray(loc, dtype=np.int32),
+            max_out=200_000,
+            screening=None,
+            state_cache=state_cache,
+        )
+        e_sub, c_sub = _solve_subspace(
+            h_sub,
+            nroots=int(nroots),
+            dense_limit=max(64, int(nsel)),
+            eigsh_tol=max(float(davidson_tol), 1e-12),
+            v0=None,
+        )
+    except Exception:
+        return None
+
+    return {
+        "e_var": np.asarray(e_sub, dtype=np.float64),
+        "c_sel": np.asarray(c_sub, dtype=np.float64, order="C"),
+        "cpu_subspace_refined": True,
+    }
+
+
 def run_cipsi_trials(
     drt: DRT,
     h1e: np.ndarray,
@@ -491,8 +648,6 @@ def run_cipsi_trials(
         raise ValueError("max_ncsf must be >= nroots")
 
     if hdiag is None:
-        from asuka.cuguga.state_cache import get_state_cache  # noqa: PLC0415
-
         state_cache = get_state_cache(drt)
         hdiag = _make_hdiag_guess(drt, h1e, eri, state_cache=state_cache)
     else:
@@ -531,7 +686,17 @@ def run_cipsi_trials(
 
     # Resolve EPQ mode before building the CUDA workspace so we can enforce constraints
     # (frontier-hash and heat-bath selection require the no-EPQ path).
-    epq_mode_s = _normalize_epq_mode(epq_mode)
+    requested_epq_mode = _normalize_epq_mode(epq_mode)
+    epq_mode_s = str(requested_epq_mode)
+    if epq_mode_s == "streamed_epq":
+        allow_streamed = str(os.environ.get("ASUKA_ALLOW_STREAMED_EPQ_EXPERIMENTAL", "")).strip().lower()
+        if allow_streamed not in ("1", "true", "yes", "on"):
+            epq_mode_s = "materialized_epq"
+            if verbose:
+                print(
+                    "[GPU-CIPSI] streamed_epq requested but currently disabled for stability; "
+                    "falling back to materialized_epq (set ASUKA_ALLOW_STREAMED_EPQ_EXPERIMENTAL=1 to force)"
+                )
     ws_kwargs = dict(workspace_kwargs or {})
     if selection_mode_s in ("frontier_hash", "heat_bath"):
         if select_threshold is not None:
@@ -548,6 +713,10 @@ def run_cipsi_trials(
 
     ws, profile = _build_cuda_workspace(drt, h1e, eri, epq_mode=epq_mode_s, workspace_kwargs=ws_kwargs)
     profile["selection_mode"] = str(selection_mode_s)
+    if str(requested_epq_mode) != str(epq_mode_s):
+        profile["epq_mode_requested"] = str(requested_epq_mode)
+        profile["epq_mode_effective"] = str(epq_mode_s)
+        profile["epq_mode_fallback_reason"] = "streamed_epq_temporarily_disabled"
     history: list[dict[str, Any]] = []
     prev_c_sel: np.ndarray | None = None
 
@@ -627,19 +796,37 @@ def run_cipsi_trials(
             ci0_list=ci0_list,
             prev_c_sel=prev_c_sel,
         )
-        dres = davidson_sym_gpu(
-            hop,
+        dres, dmeta = _solve_davidson_with_retries(
+            hop=hop,
             x0=ci0_sub,
-            hdiag=np.asarray(hdiag[sel_idx], dtype=np.float64),
-            nroots=nroots,
+            hdiag_sub=np.asarray(hdiag[sel_idx], dtype=np.float64),
+            nroots=int(nroots),
             max_cycle=int(davidson_max_cycle),
             max_space=int(davidson_max_space),
             tol=float(davidson_tol),
-            subspace_eigh_cpu=True,
-            subspace_eigh_cpu_max_m=64,
+            tag=f"iter={int(it)} nsel={int(sel_idx.size)}",
+        )
+        profile["davidson_max_retry_count"] = max(
+            int(profile.get("davidson_max_retry_count", 0)),
+            int(dmeta.get("retry_count", 0)),
         )
         e_var = np.asarray(dres.e, dtype=np.float64)
         c_sel = np.ascontiguousarray(np.column_stack(dres.x), dtype=np.float64)
+        refine_meta = _maybe_refine_subspace_cpu(
+            drt=drt,
+            h1e=h1e,
+            eri=eri,
+            sel_idx=np.asarray(sel_idx, dtype=np.int64),
+            loc=loc,
+            nroots=int(nroots),
+            davidson_tol=float(davidson_tol),
+        )
+        if refine_meta is not None:
+            e_var = np.asarray(refine_meta["e_var"], dtype=np.float64)
+            c_sel = np.asarray(refine_meta["c_sel"], dtype=np.float64, order="C")
+            dmeta["used_cpu_subspace_refine"] = True
+        else:
+            dmeta["used_cpu_subspace_refine"] = False
         perm = _match_roots_by_overlap(prev_c_sel, c_sel, e_var)
         if np.any(perm != np.arange(int(nroots), dtype=np.int32)):
             e_var = np.asarray(e_var[perm], dtype=np.float64)
@@ -715,6 +902,10 @@ def run_cipsi_trials(
             "active_sources": int(active_sources.size),
             "active_tiles": int(active_tiles),
             "epq_mode": str(profile.get("epq_mode", epq_mode)),
+            "davidson_niter": int(getattr(dres, "niter", -1)),
+            "davidson_retry_count": int(dmeta.get("retry_count", 0)),
+            "davidson_attempts": list(dmeta.get("attempts", [])),
+            "cpu_subspace_refined": bool(dmeta.get("used_cpu_subspace_refine", False)),
         }
         history.append(rec)
         prev_c_sel = np.asarray(c_sel, dtype=np.float64)
@@ -731,19 +922,36 @@ def run_cipsi_trials(
         ci0_list=ci0_list,
         prev_c_sel=prev_c_sel,
     )
-    dres = davidson_sym_gpu(
-        hop,
+    dres, dmeta_final = _solve_davidson_with_retries(
+        hop=hop,
         x0=ci0_sub,
-        hdiag=np.asarray(hdiag[sel_idx], dtype=np.float64),
-        nroots=nroots,
+        hdiag_sub=np.asarray(hdiag[sel_idx], dtype=np.float64),
+        nroots=int(nroots),
         max_cycle=int(davidson_max_cycle),
         max_space=int(davidson_max_space),
         tol=float(davidson_tol),
-        subspace_eigh_cpu=True,
-        subspace_eigh_cpu_max_m=64,
+        tag=f"final nsel={int(sel_idx.size)}",
     )
+    profile["davidson_final_retry_count"] = int(dmeta_final.get("retry_count", 0))
+    profile["davidson_final_attempts"] = list(dmeta_final.get("attempts", []))
+    profile["davidson_final_niter"] = int(getattr(dres, "niter", -1))
     e_var = np.asarray(dres.e, dtype=np.float64)
     c_sel = np.ascontiguousarray(np.column_stack(dres.x), dtype=np.float64)
+    refine_meta = _maybe_refine_subspace_cpu(
+        drt=drt,
+        h1e=h1e,
+        eri=eri,
+        sel_idx=np.asarray(sel_idx, dtype=np.int64),
+        loc=loc,
+        nroots=int(nroots),
+        davidson_tol=float(davidson_tol),
+    )
+    if refine_meta is not None:
+        e_var = np.asarray(refine_meta["e_var"], dtype=np.float64)
+        c_sel = np.asarray(refine_meta["c_sel"], dtype=np.float64, order="C")
+        profile["cpu_subspace_refined_final"] = 1.0
+    else:
+        profile["cpu_subspace_refined_final"] = 0.0
     perm = _match_roots_by_overlap(prev_c_sel, c_sel, e_var)
     if np.any(perm != np.arange(int(nroots), dtype=np.int32)):
         e_var = np.asarray(e_var[perm], dtype=np.float64)

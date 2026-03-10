@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
+from typing import Any
 import warnings
 
 import numpy as np
@@ -221,6 +222,19 @@ def run_fcifri_ground(
                 ctx.x_val[:nnz0] = cp.asarray(x_val_u, dtype=cp.float64)
                 ctx.nnz = nnz0
 
+            # Cache projected-energy row data to avoid repeated host rebuilds.
+            proj_row_cache_i32: dict[int, tuple[Any, Any]] = {}
+            proj_row_cache_u64: dict[int, tuple[Any, Any]] = {}
+            pref_key64: int | None = None
+            if use_key64 and preferred_ref_idx is not None:
+                pref_key64 = int(
+                    csf_idx_to_key64_host(
+                        drt,
+                        np.asarray([int(preferred_ref_idx)], dtype=np.int32),
+                        state_cache=state_cache,
+                    )[0]
+                )
+
             for it in range(1, niter + 1):
                 # Initiator threshold uses the current column l1 norm.
                 if float(initiator_na) != 0.0:
@@ -262,23 +276,144 @@ def run_fcifri_ground(
                 ctx.x_val[: ctx.nnz] /= n2_dev
 
                 if it % energy_stride == 0:
-                    if use_key64:
-                        x_key_h = cp.asnumpy(ctx.x_key[: ctx.nnz]).astype(np.uint64, copy=False)
-                        x_val_u = cp.asnumpy(ctx.x_val[: ctx.nnz]).astype(np.float64, copy=False)
-                        x_idx_u = key64_to_csf_idx_host(drt, x_key_h, strict=True)
-                        order = np.argsort(x_idx_u)
-                        x_idx_u = np.asarray(x_idx_u[order], dtype=np.int32, order="C")
-                        x_val_u = np.asarray(x_val_u[order], dtype=np.float64, order="C")
+                    nnz_now = int(ctx.nnz)
+                    if energy_estimator == "projected":
+                        if use_key64:
+                            x_key_dev = ctx.x_key[:nnz_now]
+                            x_val_dev = ctx.x_val[:nnz_now]
+
+                            # Prefer user-selected reference if present with nonzero amplitude.
+                            ref_key: int
+                            if pref_key64 is not None:
+                                pos_pref = int(cp.searchsorted(x_key_dev, cp.asarray(np.uint64(pref_key64), dtype=cp.uint64)).get())
+                                if (
+                                    pos_pref < nnz_now
+                                    and int(x_key_dev[pos_pref].get()) == int(pref_key64)
+                                    and float(x_val_dev[pos_pref].get()) != 0.0
+                                ):
+                                    ref_key = int(pref_key64)
+                                else:
+                                    k_ref = int(cp.argmax(cp.abs(x_val_dev)).get())
+                                    ref_key = int(x_key_dev[k_ref].get())
+                            else:
+                                k_ref = int(cp.argmax(cp.abs(x_val_dev)).get())
+                                ref_key = int(x_key_dev[k_ref].get())
+
+                            ref = int(
+                                key64_to_csf_idx_host(
+                                    drt,
+                                    np.asarray([np.uint64(ref_key)], dtype=np.uint64),
+                                    strict=True,
+                                )[0]
+                            )
+
+                            row_cached = proj_row_cache_u64.get(ref)
+                            if row_cached is None:
+                                i_idx_h, hij_h = connected_row_sparse(
+                                    drt,
+                                    h1e,
+                                    eri,
+                                    int(ref),
+                                    max_out=200_000,
+                                    state_cache=state_cache,
+                                )
+                                row_key_h = csf_idx_to_key64_host(drt, i_idx_h, state_cache=state_cache)
+                                order = np.argsort(row_key_h)
+                                row_key_h = np.asarray(row_key_h[order], dtype=np.uint64, order="C")
+                                row_hij_h = np.asarray(np.asarray(hij_h, dtype=np.float64)[order], dtype=np.float64, order="C")
+                                row_cached = (
+                                    cp.asarray(row_key_h, dtype=cp.uint64),
+                                    cp.asarray(row_hij_h, dtype=cp.float64),
+                                )
+                                proj_row_cache_u64[ref] = row_cached
+                            row_key_dev, row_hij_dev = row_cached
+
+                            if int(row_key_dev.size) == 0:
+                                num = 0.0
+                            else:
+                                pos = cp.searchsorted(x_key_dev, row_key_dev)
+                                inr = pos < nnz_now
+                                pos2 = pos[inr]
+                                hit = x_key_dev[pos2] == row_key_dev[inr]
+                                num = float(cp.dot(row_hij_dev[inr][hit], x_val_dev[pos2[hit]]).get())
+
+                            pos_ref = int(cp.searchsorted(x_key_dev, cp.asarray(np.uint64(ref_key), dtype=cp.uint64)).get())
+                            den = 0.0
+                            if pos_ref < nnz_now and int(x_key_dev[pos_ref].get()) == int(ref_key):
+                                den = float(x_val_dev[pos_ref].get())
+                            if den == 0.0:
+                                raise RuntimeError("reference amplitude is zero (choose a different ref_idx)")
+                            e = float(num / den)
+                        else:
+                            x_idx_dev = ctx.x_idx[:nnz_now]
+                            x_val_dev = ctx.x_val[:nnz_now]
+
+                            ref: int
+                            if preferred_ref_idx is not None:
+                                pref = int(preferred_ref_idx)
+                                pos_pref = int(cp.searchsorted(x_idx_dev, cp.asarray(np.int32(pref), dtype=cp.int32)).get())
+                                if (
+                                    pos_pref < nnz_now
+                                    and int(x_idx_dev[pos_pref].get()) == pref
+                                    and float(x_val_dev[pos_pref].get()) != 0.0
+                                ):
+                                    ref = pref
+                                else:
+                                    k_ref = int(cp.argmax(cp.abs(x_val_dev)).get())
+                                    ref = int(x_idx_dev[k_ref].get())
+                            else:
+                                k_ref = int(cp.argmax(cp.abs(x_val_dev)).get())
+                                ref = int(x_idx_dev[k_ref].get())
+
+                            row_cached = proj_row_cache_i32.get(ref)
+                            if row_cached is None:
+                                i_idx_h, hij_h = connected_row_sparse(
+                                    drt,
+                                    h1e,
+                                    eri,
+                                    int(ref),
+                                    max_out=200_000,
+                                    state_cache=state_cache,
+                                )
+                                row_cached = (
+                                    cp.asarray(np.asarray(i_idx_h, dtype=np.int32, order="C"), dtype=cp.int32),
+                                    cp.asarray(np.asarray(hij_h, dtype=np.float64, order="C"), dtype=cp.float64),
+                                )
+                                proj_row_cache_i32[ref] = row_cached
+                            row_idx_dev, row_hij_dev = row_cached
+
+                            if int(row_idx_dev.size) == 0:
+                                num = 0.0
+                            else:
+                                pos = cp.searchsorted(x_idx_dev, row_idx_dev)
+                                inr = pos < nnz_now
+                                pos2 = pos[inr]
+                                hit = x_idx_dev[pos2] == row_idx_dev[inr]
+                                num = float(cp.dot(row_hij_dev[inr][hit], x_val_dev[pos2[hit]]).get())
+
+                            pos_ref = int(cp.searchsorted(x_idx_dev, cp.asarray(np.int32(ref), dtype=cp.int32)).get())
+                            den = 0.0
+                            if pos_ref < nnz_now and int(x_idx_dev[pos_ref].get()) == ref:
+                                den = float(x_val_dev[pos_ref].get())
+                            if den == 0.0:
+                                raise RuntimeError("reference amplitude is zero (choose a different ref_idx)")
+                            e = float(num / den)
                     else:
-                        x_idx_u = cp.asnumpy(ctx.x_idx[: ctx.nnz]).astype(np.int32, copy=False)
-                        x_val_u = cp.asnumpy(ctx.x_val[: ctx.nnz]).astype(np.float64, copy=False)
-                    if float(np.linalg.norm(x_val_u)) == 0.0:
-                        raise RuntimeError("vector collapsed to zero (try smaller eps or more spawn)")
-                    ref = choose_reference_index(x_idx_u, x_val_u, preferred=preferred_ref_idx)
-                    if energy_estimator == "rayleigh":
+                        if use_key64:
+                            x_key_h = cp.asnumpy(ctx.x_key[: nnz_now]).astype(np.uint64, copy=False)
+                            x_val_u = cp.asnumpy(ctx.x_val[: nnz_now]).astype(np.float64, copy=False)
+                            x_idx_u = key64_to_csf_idx_host(drt, x_key_h, strict=True)
+                            order = np.argsort(x_idx_u)
+                            x_idx_u = np.asarray(x_idx_u[order], dtype=np.int32, order="C")
+                            x_val_u = np.asarray(x_val_u[order], dtype=np.float64, order="C")
+                        else:
+                            x_idx_u = cp.asnumpy(ctx.x_idx[: nnz_now]).astype(np.int32, copy=False)
+                            x_val_u = cp.asnumpy(ctx.x_val[: nnz_now]).astype(np.float64, copy=False)
+                        if float(np.linalg.norm(x_val_u)) == 0.0:
+                            raise RuntimeError("vector collapsed to zero (try smaller eps or more spawn)")
+                        ref = choose_reference_index(x_idx_u, x_val_u, preferred=preferred_ref_idx)
                         e, _, _ = rayleigh_energy_ref(drt, h1e, eri, x_idx_u, x_val_u, state_cache=state_cache)
-                    else:
-                        e, _, _ = projected_energy_ref(drt, h1e, eri, x_idx_u, x_val_u, ref_idx=ref, state_cache=state_cache)
+
                     energies[e_pos] = float(e)
                     ref_hist[e_pos] = np.int32(ref)
                     e_pos += 1

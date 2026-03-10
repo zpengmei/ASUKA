@@ -15,6 +15,7 @@ def jk_from_2e_source(
     ao_eri: Any | None,
     D: Any,
     *,
+    provider: Any | None = None,
     want_J: bool = True,
     want_K: bool = True,
 ) -> tuple[Any | None, Any | None]:
@@ -46,6 +47,9 @@ def jk_from_2e_source(
     if not bool(want_J) and not bool(want_K):
         return None, None
 
+    if provider is not None:
+        return provider.jk(D, want_J=want_J, want_K=want_K)
+
     if df_B is not None:
         from asuka.hf import df_scf as _df_scf  # noqa: PLC0415
 
@@ -56,7 +60,30 @@ def jk_from_2e_source(
 
         return dense_JK_from_eri_mat_D(ao_eri, D, want_J=want_J, want_K=want_K)
 
-    raise ValueError("jk_from_2e_source requires either df_B or ao_eri to be non-None")
+    raise ValueError("jk_from_2e_source requires provider, df_B, or ao_eri")
 
 
-__all__ = ["jk_from_2e_source"]
+def jk_multi2_from_2e_source(
+    df_B: Any | None,
+    ao_eri: Any | None,
+    Da: Any,
+    Db: Any,
+    *,
+    provider: Any | None = None,
+    want_J: bool = True,
+    want_K: bool = True,
+) -> tuple[Any | None, Any | None, Any | None, Any | None]:
+    """Compute J/K for two densities from provider or legacy 2e sources."""
+
+    if not bool(want_J) and not bool(want_K):
+        return None, None, None, None
+
+    if provider is not None:
+        return provider.jk_multi2(Da, Db, want_J=want_J, want_K=want_K)
+
+    Ja, Ka = jk_from_2e_source(df_B, ao_eri, Da, want_J=want_J, want_K=want_K)
+    Jb, Kb = jk_from_2e_source(df_B, ao_eri, Db, want_J=want_J, want_K=want_K)
+    return Ja, Ka, Jb, Kb
+
+
+__all__ = ["jk_from_2e_source", "jk_multi2_from_2e_source"]

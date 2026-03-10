@@ -1412,6 +1412,7 @@ def orbital_gradient_dense(
     dense_cpu_p_block_nmo: int = 64,
     dense_gpu_threads: int = 256,
     dense_gpu_builder: Any | None = None,
+    two_e_provider: Any | None = None,
     dense_exact_jk: bool = False,
     profile: dict | None = None,
 ) -> tuple[Any, float, Any]:
@@ -1480,8 +1481,25 @@ def orbital_gradient_dense(
 
     B = getattr(scf_out, "df_B", None)
     ao_eri = getattr(scf_out, "ao_eri", None)
-    if B is None and ao_eri is None:
-        raise ValueError("scf_out requires either df_B or ao_eri for J/K computation")
+    direct_mode = bool(
+        getattr(scf_out, "direct_jk_ctx", None) is not None
+        or str(getattr(scf_out, "two_e_backend", "") or "").strip().lower() == "direct"
+    )
+    provider = two_e_provider
+    if provider is None and direct_mode:
+        from asuka.mcscf.two_e_provider import resolve_two_e_provider  # noqa: PLC0415
+
+        provider = resolve_two_e_provider(
+            scf_out,
+            dense_gpu_builder=dense_gpu_builder,
+            dense_gpu_builder_mol=getattr(scf_out, "mol", None),
+            dense_gpu_threads=int(dense_gpu_threads),
+            dense_max_tile_bytes=int(dense_max_tile_bytes),
+            dense_eps_ao=float(dense_eps_ao),
+            dense_gpu_ao_rep="auto",
+        )
+    if provider is None and B is None and ao_eri is None:
+        raise ValueError("scf_out requires either provider, df_B, or ao_eri for J/K computation")
     int1e = getattr(scf_out, "int1e", None)
     if int1e is None:
         raise ValueError("scf_out.int1e is missing")
@@ -1493,7 +1511,14 @@ def orbital_gradient_dense(
     if ao_basis is None:
         raise ValueError("scf_out.ao_basis is missing (required for dense orbital gradients)")
 
-    _xp_probe = B if B is not None else ao_eri
+    _probe = None
+    if provider is not None:
+        _probe_fn = getattr(provider, "probe_array", None)
+        if callable(_probe_fn):
+            _probe = _probe_fn()
+    _xp_probe = _probe if _probe is not None else (B if B is not None else ao_eri)
+    if _xp_probe is None:
+        _xp_probe = C
     xp, _is_gpu = _df_scf._get_xp(_xp_probe, C)  # noqa: SLF001
     C = _as_xp_f64(xp, C)
     if B is not None:
@@ -1542,7 +1567,12 @@ def orbital_gradient_dense(
 
     # AO potentials: core and active JK (for generalized Fock pieces and preconditioner).
     dense_exact_jk = bool(dense_exact_jk)
-    if B is None and ao_eri is not None:
+    if provider is not None:
+        jk_prof = profile.setdefault("jk_provider", {}) if profile is not None else None
+        Jc, Kc, Ja, Ka = provider.jk_multi2(D_core_ao, D_act_ao, want_J=True, want_K=True, profile=jk_prof)
+        if Jc is None or Kc is None or Ja is None or Ka is None:  # pragma: no cover
+            raise RuntimeError("provider.jk_multi2 returned incomplete J/K tensors")
+    elif B is None and ao_eri is not None:
         # Dense J/K from materialized AO ERIs (works on GPU via CuPy).
         from asuka.hf.dense_jk import dense_JK_from_eri_mat_D  # noqa: PLC0415
 
@@ -1636,24 +1666,34 @@ def orbital_gradient_dense(
             raise RuntimeError("dense GPU orbital gradients require CuPy") from e
 
         dense_prof = profile.setdefault("dense_pu_wx_gpu", {}) if profile is not None else None
-        if dense_gpu_builder is not None:
-            pu_wx = dense_gpu_builder.build_pu_wx_eri_mat(C, C_act, profile=dense_prof)
-        else:
-            from asuka.cueri import dense as cueri_dense  # noqa: PLC0415
-
-            pu_wx = cueri_dense.build_pu_wx_eri_mat_dense_rys(
-                ao_basis,
-                C,
-                C_act,
-                threads=int(dense_gpu_threads),
-                max_tile_bytes=int(dense_max_tile_bytes),
-                eps_ao=float(dense_eps_ao),
+        if provider is not None and hasattr(provider, "contract_pu_wx_dm2"):
+            g_dm2_xp = provider.contract_pu_wx_dm2(
+                C_mo=C,
+                C_act=C_act,
+                dm2_wxuv=dm2_wxuv_xp,
+                out=None,
                 profile=dense_prof,
-            )  # (nmo*ncas, ncas^2)
-        pu_wx = cp.ascontiguousarray(pu_wx, dtype=cp.float64)
-        pu_wx = pu_wx.reshape(nmo, ncas, ncas, ncas)  # (p,u,w,x)
-        dm2_wxuv = dm2_wxuv_xp.reshape(ncas, ncas, ncas, ncas)  # (w,x,u,v)
-        g_dm2_xp = cached_einsum("puwx,wxuv->pv", pu_wx, dm2_wxuv, xp=cp)
+            )
+            g_dm2_xp = cp.ascontiguousarray(cp.asarray(g_dm2_xp, dtype=cp.float64))
+        else:
+            if dense_gpu_builder is not None:
+                pu_wx = dense_gpu_builder.build_pu_wx_eri_mat(C, C_act, profile=dense_prof)
+            else:
+                from asuka.cueri import dense as cueri_dense  # noqa: PLC0415
+
+                pu_wx = cueri_dense.build_pu_wx_eri_mat_dense_rys(
+                    ao_basis,
+                    C,
+                    C_act,
+                    threads=int(dense_gpu_threads),
+                    max_tile_bytes=int(dense_max_tile_bytes),
+                    eps_ao=float(dense_eps_ao),
+                    profile=dense_prof,
+                )  # (nmo*ncas, ncas^2)
+            pu_wx = cp.ascontiguousarray(pu_wx, dtype=cp.float64)
+            pu_wx = pu_wx.reshape(nmo, ncas, ncas, ncas)  # (p,u,w,x)
+            dm2_wxuv = dm2_wxuv_xp.reshape(ncas, ncas, ncas, ncas)  # (w,x,u,v)
+            g_dm2_xp = cached_einsum("puwx,wxuv->pv", pu_wx, dm2_wxuv, xp=cp)
     t_gdm2 = time.perf_counter() if profile is not None else 0.0
 
     # gpq columns for core + active only (virtual columns are 0)

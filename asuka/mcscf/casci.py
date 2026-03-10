@@ -1526,6 +1526,7 @@ def run_casci_dense_gpu(
     dense_gpu_ao_rep: str = "auto",
     dense_gpu_builder_mol: Any | None = None,
     dense_gpu_builder: Any | None = None,
+    two_e_provider: Any | None = None,
     dense_exact_jk: bool = False,
     threads: int = 256,
     eps_ao: float = 0.0,
@@ -1629,10 +1630,33 @@ def run_casci_dense_gpu(
     C_cas = C[:, ncore : ncore + ncas]
 
     # Core density and core Fock potential (AO basis).
-    # Use DF JK when available, otherwise fall back to dense AO ERIs.
+    # Prefer provider dispatch (direct-hybrid) when available; otherwise use
+    # legacy DF/dense fallbacks.
     B = scf_out.df_B
     ao_eri = getattr(scf_out, "ao_eri", None)
-    _xp_probe = B if B is not None else (ao_eri if ao_eri is not None else C_cas)
+    direct_mode = bool(
+        getattr(scf_out, "direct_jk_ctx", None) is not None
+        or str(getattr(scf_out, "two_e_backend", "") or "").strip().lower() == "direct"
+    )
+    provider = two_e_provider
+    if provider is None and direct_mode:
+        from asuka.mcscf.two_e_provider import resolve_two_e_provider  # noqa: PLC0415
+
+        provider = resolve_two_e_provider(
+            scf_out,
+            dense_gpu_builder=dense_gpu_builder,
+            dense_gpu_builder_mol=dense_gpu_builder_mol,
+            dense_gpu_threads=int(threads),
+            dense_max_tile_bytes=int(max_tile_bytes),
+            dense_eps_ao=float(eps_ao),
+            dense_gpu_ao_rep=str(dense_gpu_ao_rep),
+        )
+    _probe = None
+    if provider is not None:
+        _probe_fn = getattr(provider, "probe_array", None)
+        if callable(_probe_fn):
+            _probe = _probe_fn()
+    _xp_probe = _probe if _probe is not None else (B if B is not None else (ao_eri if ao_eri is not None else C_cas))
     xp, _is_gpu = _df_scf._get_xp(_xp_probe, C_cas)  # noqa: SLF001
     h_ao = xp.asarray(scf_out.int1e.hcore, dtype=xp.float64)
 
@@ -1651,6 +1675,11 @@ def run_casci_dense_gpu(
             except TypeError:
                 J_h, K_h = get_jk(d_h, hermi=1)
             return xp.asarray(J_h, dtype=xp.float64), xp.asarray(K_h, dtype=xp.float64)
+        if provider is not None:
+            J_p, K_p = provider.jk(D_in, want_J=True, want_K=True, profile=profile)
+            if J_p is None or K_p is None:  # pragma: no cover
+                raise RuntimeError("provider.jk returned None while J/K were requested")
+            return J_p, K_p
         if B is not None:
             return _df_scf._df_JK(B, D_in, want_J=True, want_K=True)  # noqa: SLF001
         if ao_eri is not None:
@@ -1684,12 +1713,17 @@ def run_casci_dense_gpu(
     _t_eri_start = time.perf_counter() if profile is not None else 0.0
     if profile is not None:
         eri_prof = profile.setdefault("active_dense_gpu", {})
+    dense_builder_use = dense_gpu_builder
+    if dense_builder_use is None and provider is not None:
+        _builder_fn = getattr(provider, "dense_builder", None)
+        if callable(_builder_fn):
+            dense_builder_use = _builder_fn()
     eri = build_device_dfmo_integrals_cueri_dense_rys(
         scf_out.ao_basis,
         C_cas,
         mol=dense_gpu_builder_mol if dense_gpu_builder_mol is not None else getattr(scf_out, "mol", None),
         ao_rep=str(dense_gpu_ao_rep),
-        builder=dense_gpu_builder,
+        builder=dense_builder_use,
         threads=int(threads),
         max_tile_bytes=int(max_tile_bytes),
         eps_ao=float(eps_ao),
@@ -1829,10 +1863,31 @@ def run_casci(
     )
 
     C = getattr(scf_out.scf, "mo_coeff", None)
-    _xp_probe = scf_out.df_B if scf_out.df_B is not None else getattr(scf_out, "ao_eri", C)
+    _direct_probe = getattr(getattr(scf_out, "direct_jk_ctx", None), "sp_A_dev", None)
+    _xp_probe = (
+        scf_out.df_B
+        if scf_out.df_B is not None
+        else (getattr(scf_out, "ao_eri", None) if getattr(scf_out, "ao_eri", None) is not None else (_direct_probe if _direct_probe is not None else C))
+    )
     _xp, is_gpu = _df_scf._get_xp(_xp_probe, C)  # noqa: SLF001
     if backend_s == "cuda" and not bool(is_gpu):
         raise ValueError("backend='cuda' requires scf_out with GPU arrays")
+
+    direct_mode = bool(
+        getattr(scf_out, "direct_jk_ctx", None) is not None
+        or str(getattr(scf_out, "two_e_backend", "") or "").strip().lower() == "direct"
+    )
+    if direct_mode:
+        if backend_s != "cuda":
+            raise NotImplementedError("direct two-electron backend currently requires backend='cuda' for CASCI")
+        return run_casci_dense_gpu(
+            scf_out,
+            ncore=int(ncore),
+            ncas=int(ncas),
+            nelecas=nelecas,
+            mo_coeff=mo_coeff,
+            **kwargs,
+        )
 
     if backend_s == "cuda" and df_b:
         if scf_out.df_B is None and getattr(scf_out, "thc_factors", None) is not None:
