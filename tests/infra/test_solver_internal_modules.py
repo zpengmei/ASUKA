@@ -1,9 +1,22 @@
 from __future__ import annotations
 
+from collections import OrderedDict
+import io
 from types import SimpleNamespace
 import numpy as np
 import pytest
 
+from asuka._solver.dump_flags_runtime import dump_flags
+from asuka._solver.matvec_cache_runtime import (
+    configure_matvec_cuda_ws_cache,
+    matvec_cuda_ws_cache_drop,
+    matvec_cuda_ws_cache_enforce_budget,
+    matvec_cuda_ws_cache_get,
+    matvec_cuda_ws_cache_profile,
+    matvec_cuda_ws_cache_put,
+    matvec_cuda_ws_cache_touch,
+    release_matvec_cuda_ws_cache,
+)
 from asuka._solver.cuda_policy import (
     apply_cuda_user_policy,
     normalize_cuda_accuracy_mode,
@@ -44,6 +57,24 @@ from asuka._solver.warm_state_runtime import (
     warm_state_ci0_if_compatible,
     warm_state_summary,
 )
+
+
+def _make_ws_cache_solver_stub(*, budget: int = 0, fraction: float = 0.2):
+    released: list[object] = []
+    solver = SimpleNamespace(
+        _matvec_cuda_ws_cache={},
+        _matvec_cuda_ws_cache_sizes={},
+        _matvec_cuda_ws_cache_lru=OrderedDict(),
+        _matvec_cuda_ws_cache_bytes=0,
+        _matvec_cuda_ws_cache_budget_bytes=int(budget),
+        _matvec_cuda_ws_cache_hits=0,
+        _matvec_cuda_ws_cache_misses=0,
+        _matvec_cuda_ws_cache_evictions=0,
+        matvec_cuda_ws_cache_fraction=float(fraction),
+        _release_matvec_cuda_workspace=lambda ws: released.append(ws),
+        _estimate_matvec_cuda_workspace_bytes=lambda ws: int(getattr(ws, "nbytes", 0)),
+    )
+    return solver, released
 
 
 def test_warm_state_constants_and_metadata_roundtrip():
@@ -301,6 +332,116 @@ def test_matvec_runtime_workspace_release_and_estimate_helpers():
     assert ws_fallback._w_block is None
     assert ws_fallback._w_offdiag is None
     assert ws_fallback._csr_tile_cache is None
+
+
+def test_matvec_cache_runtime_lifecycle_budget_and_profile():
+    solver, released = _make_ws_cache_solver_stub(budget=50, fraction=0.25)
+    ws_a = SimpleNamespace(nbytes=30)
+    ws_b = SimpleNamespace(nbytes=40)
+
+    matvec_cuda_ws_cache_touch(solver, "a")
+    assert list(solver._matvec_cuda_ws_cache_lru.keys()) == ["a"]
+
+    matvec_cuda_ws_cache_put(solver, "a", ws_a)
+    assert solver._matvec_cuda_ws_cache_bytes == 30
+    assert solver._matvec_cuda_ws_cache_sizes["a"] == 30
+
+    assert matvec_cuda_ws_cache_get(solver, "a") is ws_a
+    assert matvec_cuda_ws_cache_get(solver, "missing") is None
+    assert solver._matvec_cuda_ws_cache_hits == 1
+    assert solver._matvec_cuda_ws_cache_misses == 1
+
+    matvec_cuda_ws_cache_put(solver, "b", ws_b)
+    assert solver._matvec_cuda_ws_cache_bytes == 40
+    assert "a" not in solver._matvec_cuda_ws_cache
+    assert "b" in solver._matvec_cuda_ws_cache
+    assert solver._matvec_cuda_ws_cache_evictions == 1
+    assert released == [ws_a]
+
+    matvec_cuda_ws_cache_drop(solver, "b")
+    assert solver._matvec_cuda_ws_cache_bytes == 0
+    assert released == [ws_a, ws_b]
+    assert matvec_cuda_ws_cache_profile(solver)["matvec_cuda_ws_cache_entries"] == 0
+
+
+def test_matvec_cache_runtime_keep_keys_release_and_configure():
+    solver, released = _make_ws_cache_solver_stub(budget=80, fraction=0.2)
+    ws_a = SimpleNamespace(nbytes=45)
+    ws_b = SimpleNamespace(nbytes=45)
+    ws_c = SimpleNamespace(nbytes=45)
+    matvec_cuda_ws_cache_put(solver, "a", ws_a)
+    matvec_cuda_ws_cache_put(solver, "b", ws_b)
+    matvec_cuda_ws_cache_put(solver, "c", ws_c, keep_keys=("a",))
+
+    assert "a" not in solver._matvec_cuda_ws_cache
+    assert "c" in solver._matvec_cuda_ws_cache
+    assert solver._matvec_cuda_ws_cache_evictions == 2
+    assert released == [ws_a, ws_b]
+    assert solver._matvec_cuda_ws_cache_bytes <= solver._matvec_cuda_ws_cache_budget_bytes
+
+    total_before_release = release_matvec_cuda_ws_cache(solver)
+    assert total_before_release == 45
+    assert solver._matvec_cuda_ws_cache == {}
+    assert released[-1] is ws_c
+
+    calls = {}
+
+    def _norm(v):
+        calls["fraction_in"] = v
+        return 0.6
+
+    def _resolve(*, cp_mod, hard_cap_gib, fraction):
+        calls["resolve"] = (cp_mod, hard_cap_gib, fraction)
+        return 123
+
+    out_budget = configure_matvec_cuda_ws_cache(
+        solver,
+        cp_mod="cp",
+        hard_cap_gib=4.0,
+        fraction=0.4,
+        normalize_ws_cache_fraction_fn=_norm,
+        resolve_budget_bytes_fn=_resolve,
+    )
+    assert out_budget == 123
+    assert solver.matvec_cuda_ws_cache_fraction == 0.6
+    assert solver._matvec_cuda_ws_cache_budget_bytes == 123
+    assert calls["fraction_in"] == 0.4
+    assert calls["resolve"] == ("cp", 4.0, 0.6)
+
+    solver._matvec_cuda_ws_cache_bytes = 999
+    solver._matvec_cuda_ws_cache_budget_bytes = 0
+    matvec_cuda_ws_cache_enforce_budget(solver)
+    assert solver._matvec_cuda_ws_cache_bytes == 999
+
+
+def test_dump_flags_runtime_silent_and_verbose_output():
+    sink = io.StringIO()
+    solver = SimpleNamespace(
+        verbose=0,
+        stdout=sink,
+        twos=0,
+        wfnsym=1,
+        orbsym=np.asarray([1, 1, 2], dtype=np.int32),
+        conv_tol=1e-9,
+        kernel_blas_nthreads=4,
+        rdm_backend="auto",
+        matvec_cuda_policy="auto",
+    )
+
+    out = dump_flags(solver, verbose=None)
+    assert out is solver
+    assert sink.getvalue() == ""
+
+    dump_flags(solver, verbose=1)
+    text = sink.getvalue()
+    assert "GUGAFCISolver (CSF/GUGA)" in text
+    assert "twos = 0" in text
+    assert "wfnsym = 1" in text
+    assert "orbsym = [1, 1, 2]" in text
+    assert "conv_tol = 1e-09" in text
+    assert "kernel_blas_nthreads = 4" in text
+    assert "rdm_backend = auto" in text
+    assert "matvec_cuda_policy = auto" in text
 
 
 def test_warm_state_metadata_validation():

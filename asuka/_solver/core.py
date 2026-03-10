@@ -34,6 +34,17 @@ from .matvec_runtime import (
     resolve_kernel_cuda_execution_mode,
     ws_needs_rebuild,
 )
+from .matvec_cache_runtime import (
+    configure_matvec_cuda_ws_cache,
+    matvec_cuda_ws_cache_drop,
+    matvec_cuda_ws_cache_enforce_budget,
+    matvec_cuda_ws_cache_get,
+    matvec_cuda_ws_cache_profile,
+    matvec_cuda_ws_cache_put,
+    matvec_cuda_ws_cache_touch,
+    release_matvec_cuda_ws_cache,
+)
+from .dump_flags_runtime import dump_flags
 from .warm_state import (
     WARM_CUDA_MATVEC_BACKENDS,
     WARM_STATE_FORMAT_VERSION,
@@ -82,6 +93,15 @@ __all__ = [
     "resolve_matvec_cuda_ws_cache_budget_bytes",
     "resolve_kernel_cuda_execution_mode",
     "release_matvec_cuda_workspace",
+    "configure_matvec_cuda_ws_cache",
+    "matvec_cuda_ws_cache_drop",
+    "matvec_cuda_ws_cache_enforce_budget",
+    "matvec_cuda_ws_cache_get",
+    "matvec_cuda_ws_cache_profile",
+    "matvec_cuda_ws_cache_put",
+    "matvec_cuda_ws_cache_touch",
+    "release_matvec_cuda_ws_cache",
+    "dump_flags",
     "resolve_epq_overbudget_action",
     "resolve_mixed_low_workspace_oom_fallback",
     "save_warm_state",

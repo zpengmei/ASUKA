@@ -87,6 +87,28 @@ class THCNucGradMultirootResult:
     root_weights: np.ndarray
 
 
+def _validate_per_root_sa_weights(casscf: Any) -> tuple[int, np.ndarray]:
+    """Validate SA weights for per-root THC-CASSCF gradient path.
+
+    This guard is intentionally CuPy-independent so user-facing argument
+    errors are raised before optional CUDA runtime imports.
+    """
+
+    nroots = int(getattr(casscf, "nroots", 1))
+    weights = np.asarray(
+        normalize_weights(getattr(casscf, "root_weights", None), nroots=nroots),
+        dtype=np.float64,
+    ).ravel()
+    if int(nroots) > 1:
+        weights_eq = np.full((int(nroots),), 1.0 / float(nroots), dtype=np.float64)
+        if not np.allclose(weights, weights_eq, atol=1e-12, rtol=1e-10):
+            raise NotImplementedError(
+                "THC per-root SA-CASSCF gradients currently require equal SA weights "
+                "to match the projected SA gauge used by PySCF"
+            )
+    return int(nroots), weights
+
+
 def _symmetrize(cp, A):
     return 0.5 * (A + A.T)
 
@@ -2392,22 +2414,14 @@ def _casscf_nuc_grad_thc_per_root_impl(
 ) -> THCNucGradMultirootResult:
     """Per-root analytic gradients for SA-CASSCF with THC / local-THC integrals."""
 
+    nroots, weights = _validate_per_root_sa_weights(casscf)
+
     from . import newton_casscf as _newton_casscf  # noqa: PLC0415
     from .nac._df import _FixedRDMFcisolver  # noqa: PLC0415
     from .newton_thc import THCNewtonCASSCFAdapter  # noqa: PLC0415
     from .zvector import build_mcscf_hessian_operator, solve_mcscf_zvector  # noqa: PLC0415
 
     cp = _require_cupy()
-
-    nroots = int(getattr(casscf, "nroots", 1))
-    weights = normalize_weights(getattr(casscf, "root_weights", None), nroots=nroots)
-    if int(nroots) > 1:
-        weights_eq = np.full((int(nroots),), 1.0 / float(nroots), dtype=np.float64)
-        if not np.allclose(np.asarray(weights, dtype=np.float64).ravel(), weights_eq, atol=1e-12, rtol=1e-10):
-            raise NotImplementedError(
-                "THC per-root SA-CASSCF gradients currently require equal SA weights "
-                "to match the projected SA gauge used by PySCF"
-            )
 
     mol = getattr(scf_out, "mol", None)
     if mol is None:
@@ -2785,6 +2799,8 @@ def casscf_nuc_grad_thc_per_root(
     z_maxiter: int = 200,
 ) -> THCNucGradMultirootResult:
     """Per-root analytic gradients for SA-CASSCF with THC / local-THC integrals."""
+
+    _validate_per_root_sa_weights(casscf)
 
     return _casscf_nuc_grad_thc_per_root_impl(
         scf_out,

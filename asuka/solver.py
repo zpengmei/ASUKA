@@ -76,6 +76,17 @@ from asuka._solver.matvec_runtime import (
     resolve_approx_cuda_frontend as _resolve_approx_cuda_frontend_runtime,
     ws_needs_rebuild as _ws_needs_rebuild_runtime,
 )
+from asuka._solver.matvec_cache_runtime import (
+    configure_matvec_cuda_ws_cache as _configure_matvec_cuda_ws_cache_runtime,
+    matvec_cuda_ws_cache_drop as _matvec_cuda_ws_cache_drop_runtime,
+    matvec_cuda_ws_cache_enforce_budget as _matvec_cuda_ws_cache_enforce_budget_runtime,
+    matvec_cuda_ws_cache_get as _matvec_cuda_ws_cache_get_runtime,
+    matvec_cuda_ws_cache_profile as _matvec_cuda_ws_cache_profile_runtime,
+    matvec_cuda_ws_cache_put as _matvec_cuda_ws_cache_put_runtime,
+    matvec_cuda_ws_cache_touch as _matvec_cuda_ws_cache_touch_runtime,
+    release_matvec_cuda_ws_cache as _release_matvec_cuda_ws_cache_runtime,
+)
+from asuka._solver.dump_flags_runtime import dump_flags as _dump_flags_runtime
 
 if TYPE_CHECKING:  # pragma: no cover
     from asuka.contract import ContractWorkspace
@@ -225,45 +236,16 @@ class GUGAFCISolver(_StreamObject):
         )
 
     def _matvec_cuda_ws_cache_touch(self, key: Any) -> None:
-        if key in self._matvec_cuda_ws_cache_lru:
-            self._matvec_cuda_ws_cache_lru.move_to_end(key, last=True)
-        else:
-            self._matvec_cuda_ws_cache_lru[key] = None
+        _matvec_cuda_ws_cache_touch_runtime(self, key)
 
     def _matvec_cuda_ws_cache_get(self, key: Any) -> Any:
-        ws = self._matvec_cuda_ws_cache.get(key)
-        if ws is None:
-            self._matvec_cuda_ws_cache_misses += 1
-            return None
-        self._matvec_cuda_ws_cache_hits += 1
-        self._matvec_cuda_ws_cache_touch(key)
-        return ws
+        return _matvec_cuda_ws_cache_get_runtime(self, key)
 
     def _matvec_cuda_ws_cache_drop(self, key: Any) -> None:
-        ws = self._matvec_cuda_ws_cache.pop(key, None)
-        old_size = int(self._matvec_cuda_ws_cache_sizes.pop(key, 0))
-        self._matvec_cuda_ws_cache_lru.pop(key, None)
-        if old_size > 0:
-            self._matvec_cuda_ws_cache_bytes = max(0, int(self._matvec_cuda_ws_cache_bytes) - int(old_size))
-        if ws is not None:
-            self._release_matvec_cuda_workspace(ws)
+        _matvec_cuda_ws_cache_drop_runtime(self, key)
 
     def _matvec_cuda_ws_cache_enforce_budget(self, *, keep_keys: Sequence[Any] = ()) -> None:
-        budget = int(self._matvec_cuda_ws_cache_budget_bytes)
-        if budget <= 0:
-            return
-        keep = set(keep_keys)
-        if int(self._matvec_cuda_ws_cache_bytes) <= budget:
-            return
-        while int(self._matvec_cuda_ws_cache_bytes) > budget and len(self._matvec_cuda_ws_cache_lru) > 0:
-            if all(k in keep for k in self._matvec_cuda_ws_cache_lru.keys()):
-                break
-            victim = next(iter(self._matvec_cuda_ws_cache_lru.keys()))
-            if victim in keep:
-                self._matvec_cuda_ws_cache_lru.move_to_end(victim, last=True)
-                continue
-            self._matvec_cuda_ws_cache_drop(victim)
-            self._matvec_cuda_ws_cache_evictions += 1
+        _matvec_cuda_ws_cache_enforce_budget_runtime(self, keep_keys=keep_keys)
 
     def _matvec_cuda_ws_cache_put(
         self,
@@ -272,22 +254,7 @@ class GUGAFCISolver(_StreamObject):
         *,
         keep_keys: Sequence[Any] = (),
     ) -> None:
-        if ws is None:
-            return
-        old_ws = self._matvec_cuda_ws_cache.get(key)
-        old_size = int(self._matvec_cuda_ws_cache_sizes.get(key, 0))
-        if old_ws is not None and old_ws is not ws:
-            self._matvec_cuda_ws_cache_drop(key)
-            old_size = 0
-
-        self._matvec_cuda_ws_cache[key] = ws
-        est_size = self._estimate_matvec_cuda_workspace_bytes(ws)
-        self._matvec_cuda_ws_cache_sizes[key] = int(est_size)
-        delta = int(est_size) - int(old_size)
-        if delta != 0:
-            self._matvec_cuda_ws_cache_bytes = max(0, int(self._matvec_cuda_ws_cache_bytes) + int(delta))
-        self._matvec_cuda_ws_cache_touch(key)
-        self._matvec_cuda_ws_cache_enforce_budget(keep_keys=tuple(keep_keys))
+        _matvec_cuda_ws_cache_put_runtime(self, key, ws, keep_keys=keep_keys)
 
     def release_matvec_cuda_ws_cache(self) -> int:
         """Release cached CUDA matvec workspaces (to reduce peak VRAM).
@@ -302,27 +269,7 @@ class GUGAFCISolver(_StreamObject):
             Best-effort estimate of bytes held by the cache before release.
         """
 
-        total = 0
-        try:
-            for ws in list(getattr(self, "_matvec_cuda_ws_cache", {}).values()):
-                total += int(self._estimate_matvec_cuda_workspace_bytes(ws))
-        except Exception:
-            total = 0
-        try:
-            for k in list(getattr(self, "_matvec_cuda_ws_cache", {}).keys()):
-                self._matvec_cuda_ws_cache_drop(k)
-        except Exception:
-            # Best-effort: if the cache structure isn't as expected, fall back
-            # to clearing references without raising.
-            try:
-                cache = getattr(self, "_matvec_cuda_ws_cache", None)
-                if isinstance(cache, dict):
-                    for ws in list(cache.values()):
-                        self._release_matvec_cuda_workspace(ws)
-                    cache.clear()
-            except Exception:
-                pass
-        return int(max(0, total))
+        return _release_matvec_cuda_ws_cache_runtime(self)
 
     def _configure_matvec_cuda_ws_cache(
         self,
@@ -331,26 +278,17 @@ class GUGAFCISolver(_StreamObject):
         hard_cap_gib: float,
         fraction: float | None = None,
     ) -> int:
-        if fraction is not None:
-            self.matvec_cuda_ws_cache_fraction = _normalize_ws_cache_fraction(fraction)
-        self._matvec_cuda_ws_cache_budget_bytes = self._resolve_matvec_cuda_ws_cache_budget_bytes(
+        return _configure_matvec_cuda_ws_cache_runtime(
+            self,
             cp_mod=cp_mod,
-            hard_cap_gib=float(hard_cap_gib),
-            fraction=self.matvec_cuda_ws_cache_fraction,
+            hard_cap_gib=hard_cap_gib,
+            fraction=fraction,
+            normalize_ws_cache_fraction_fn=_normalize_ws_cache_fraction,
+            resolve_budget_bytes_fn=self._resolve_matvec_cuda_ws_cache_budget_bytes,
         )
-        self._matvec_cuda_ws_cache_enforce_budget()
-        return int(self._matvec_cuda_ws_cache_budget_bytes)
 
     def _matvec_cuda_ws_cache_profile(self) -> dict[str, Any]:
-        return {
-            "matvec_cuda_ws_cache_entries": int(len(self._matvec_cuda_ws_cache)),
-            "matvec_cuda_ws_cache_bytes": int(self._matvec_cuda_ws_cache_bytes),
-            "matvec_cuda_ws_cache_budget_bytes": int(self._matvec_cuda_ws_cache_budget_bytes),
-            "matvec_cuda_ws_cache_fraction": float(self.matvec_cuda_ws_cache_fraction),
-            "matvec_cuda_ws_cache_hits": int(self._matvec_cuda_ws_cache_hits),
-            "matvec_cuda_ws_cache_misses": int(self._matvec_cuda_ws_cache_misses),
-            "matvec_cuda_ws_cache_evictions": int(self._matvec_cuda_ws_cache_evictions),
-        }
+        return _matvec_cuda_ws_cache_profile_runtime(self)
 
     def __init__(
         self,
@@ -577,96 +515,7 @@ class GUGAFCISolver(_StreamObject):
         self._last_warm_start_info: dict[str, Any] | None = None
 
     def dump_flags(self, verbose: int | None = None):
-        v = self.verbose if verbose is None else int(verbose)
-        if v <= 0:
-            return self
-        out = getattr(self, "stdout", sys.stdout)
-        print("GUGAFCISolver (CSF/GUGA)", file=out)
-        print(f"twos = {None if self.twos is None else int(self.twos)}", file=out)
-        print(f"wfnsym = {None if self.wfnsym is None else int(self.wfnsym)}", file=out)
-        if self.orbsym is not None:
-            print(f"orbsym = {np.asarray(self.orbsym, dtype=np.int32).ravel().tolist()}", file=out)
-
-        for k in ("conv_tol", "lindep", "max_cycle", "max_space", "pspace_size", "max_memory"):
-            if hasattr(self, k):
-                print(f"{k} = {getattr(self, k)}", file=out)
-        if hasattr(self, "kernel_blas_nthreads"):
-            print(f"kernel_blas_nthreads = {getattr(self, 'kernel_blas_nthreads')}", file=out)
-        for k in (
-            "rdm_backend",
-            "rdm_block_nops",
-            "rdm_tmpdir",
-            "rdm_cuda_build_threads",
-            "rdm_cuda_enable_fp64_emulation",
-            "rdm_cuda_gemm_backend",
-            "rdm_cuda_math_mode",
-            "rdm_cuda_cublas_workspace_mb",
-            "rdm_cuda_emulation_strategy",
-            "rdm_cuda_fixed_point_mantissa_control",
-            "rdm_cuda_fixed_point_max_mantissa_bits",
-            "rdm_cuda_fixed_point_mantissa_bit_offset",
-            "rdm_cuda_symmetrize_gram",
-            "rdm_cuda_streaming_ncsf_cutoff",
-        ):
-            if hasattr(self, k):
-                print(f"{k} = {getattr(self, k)}", file=out)
-        for k in (
-            "strict_gpu",
-            "matvec_cuda_j_tile",
-            "matvec_cuda_epq_build_nthreads",
-            "matvec_cuda_epq_build_device",
-            "matvec_cuda_epq_build_j_tile",
-            "matvec_cuda_epq_streaming",
-            "matvec_cuda_epq_stream_j_tile",
-            "matvec_cuda_epq_stream_use_recompute",
-            "matvec_cuda_fixed_ell_max_ncsf",
-            "matvec_cuda_fixed_ell_max_width",
-            "matvec_cuda_fixed_ell_row_oracle",
-            "matvec_cuda_fixed_ell_threads_spmv",
-            "matvec_cuda_csr_capacity_mult",
-            "matvec_cuda_csr_host_cache",
-            "matvec_cuda_csr_host_cache_budget_gib",
-            "matvec_cuda_csr_host_cache_min_ncsf",
-            "matvec_cuda_csr_pipeline_streams",
-            "matvec_cuda_csr_pipeline_min_ncsf",
-            "matvec_cuda_prefilter_trivial_tasks",
-            "matvec_cuda_prefilter_trivial_tasks_min_ncsf",
-            "matvec_cuda_threads_enum",
-            "matvec_cuda_threads_g",
-            "matvec_cuda_threads_w",
-            "matvec_cuda_threads_apply",
-            "matvec_cuda_max_g_mib",
-            "matvec_cuda_mem_hard_cap_gib",
-            "matvec_cuda_coalesce",
-            "matvec_cuda_include_diagonal_rs",
-            "matvec_cuda_fuse_count_write",
-            "matvec_cuda_path_mode",
-            "matvec_cuda_use_fused_hop",
-            "matvec_cuda_fp32_coeff_data",
-            "matvec_cuda_aggregate_offdiag",
-            "matvec_cuda_enable_fp64_emulation",
-            "matvec_cuda_gemm_backend",
-            "matvec_cuda_emulation_strategy",
-            "matvec_cuda_cublas_workspace_cap_mb",
-            "matvec_cuda_apply_mode",
-            "matvec_cuda_policy",
-            "matvec_cuda_accuracy_mode",
-            "matvec_cuda_memory_cap_gib",
-            "approx_cuda_dtype",
-            "matvec_cuda_dtype",
-            "matvec_cuda_mixed_threshold",
-            "matvec_cuda_mixed_force_final_full_hop",
-            "matvec_cuda_mixed_final_full_subspace_refresh",
-            "matvec_cuda_mixed_low_precision_max_iter",
-            "matvec_cuda_davidson_subspace_eigh_cpu",
-            "matvec_cuda_davidson_subspace_eigh_cpu_ncsf_cutoff",
-            "matvec_cuda_davidson_subspace_eigh_cpu_max_m",
-            "matvec_cuda_make_hdiag_cpu",
-            "matvec_cuda_make_hdiag_cpu_ncsf_cutoff",
-        ):
-            if hasattr(self, k):
-                print(f"{k} = {getattr(self, k)}", file=out)
-        return self
+        return _dump_flags_runtime(self, verbose=verbose)
 
     def view(self, cls):  # noqa: D401
         """Return a lightweight view of this solver as `cls`.
