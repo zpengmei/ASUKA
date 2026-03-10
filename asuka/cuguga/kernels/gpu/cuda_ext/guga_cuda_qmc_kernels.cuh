@@ -510,6 +510,16 @@ __global__ void qmc_spawn_hamiltonian_kernel_t(
   }
   if (ns == 0) return;
 
+  // Precompute (rr_id, occ_r) for occupied orbitals so one-body sampling doesn't
+  // redo address/occupancy arithmetic for each sample.
+  int rr_id_src[MAX_NORB_T];
+  double occ_src[MAX_NORB_T];
+  for (int t = 0; t < ns; t++) {
+    int r = src[t];
+    rr_id_src[t] = r * norb + r;
+    occ_src[t] = (steps_j[r] == 3) ? 2.0 : 1.0;
+  }
+
   bool allow_new = true;
   if (initiator_t > 0.0 && fabs(xj) < initiator_t) allow_new = false;
 
@@ -532,10 +542,7 @@ __global__ void qmc_spawn_hamiltonian_kernel_t(
       double w_eff = h_base_flat[pq_id];
       double sum_rr = 0.0;
       for (int t = 0; t < ns; t++) {
-        int r = src[t];
-        int occ_r = (steps_j[r] == 3) ? 2 : 1;
-        int rr_id = r * norb + r;
-        sum_rr += eri_mat[(int64_t)pq_id * (int64_t)nops + (int64_t)rr_id] * (double)occ_r;
+        sum_rr += eri_mat[(int64_t)pq_id * (int64_t)nops + (int64_t)rr_id_src[t]] * occ_src[t];
       }
       w_eff += 0.5 * sum_rr;
       if (w_eff == 0.0) continue;
@@ -678,6 +685,16 @@ __global__ void qmc_spawn_hamiltonian_initiator_dev_kernel_t(
   }
   if (ns == 0) return;
 
+  // Precompute (rr_id, occ_r) for occupied orbitals so one-body sampling doesn't
+  // redo address/occupancy arithmetic for each sample.
+  int rr_id_src[MAX_NORB_T];
+  double occ_src[MAX_NORB_T];
+  for (int t = 0; t < ns; t++) {
+    int r = src[t];
+    rr_id_src[t] = r * norb + r;
+    occ_src[t] = (steps_j[r] == 3) ? 2.0 : 1.0;
+  }
+
   double initiator_t = qmc_initiator_load(initiator_t_dev);
   bool allow_new = true;
   if (initiator_t > 0.0 && fabs(xj) < initiator_t) allow_new = false;
@@ -701,10 +718,7 @@ __global__ void qmc_spawn_hamiltonian_initiator_dev_kernel_t(
       double w_eff = h_base_flat[pq_id];
       double sum_rr = 0.0;
       for (int t = 0; t < ns; t++) {
-        int r = src[t];
-        int occ_r = (steps_j[r] == 3) ? 2 : 1;
-        int rr_id = r * norb + r;
-        sum_rr += eri_mat[(int64_t)pq_id * (int64_t)nops + (int64_t)rr_id] * (double)occ_r;
+        sum_rr += eri_mat[(int64_t)pq_id * (int64_t)nops + (int64_t)rr_id_src[t]] * occ_src[t];
       }
       w_eff += 0.5 * sum_rr;
       if (w_eff == 0.0) continue;
@@ -810,6 +824,7 @@ __global__ void qmc_spawn_hamiltonian_u64_f64_kernel_t(
     int nspawn_two,
     uint64_t seed,
     double initiator_t,
+    const double* __restrict__ initiator_t_dev,
     const float* __restrict__ pair_alias_prob, // [nops] (optional)
     const int32_t* __restrict__ pair_alias_idx, // [nops] (optional)
     const double* __restrict__ pair_norm,       // [nops] (optional, weights used for alias)
@@ -846,6 +861,18 @@ __global__ void qmc_spawn_hamiltonian_u64_f64_kernel_t(
   }
   if (ns == 0) return;
 
+  // Precompute (rr_id, occ_r) for occupied orbitals so one-body sampling doesn't
+  // redo address/occupancy arithmetic for each sample.
+  int rr_id_src[MAX_NORB_T];
+  double occ_src[MAX_NORB_T];
+  for (int t = 0; t < ns; t++) {
+    int r = src[t];
+    rr_id_src[t] = r * norb + r;
+    occ_src[t] = (steps_j[r] == 3) ? 2.0 : 1.0;
+  }
+
+  // Prefer device-sourced initiator threshold when provided so callers can avoid host sync.
+  if (initiator_t_dev) initiator_t = *initiator_t_dev;
   bool allow_new = true;
   if (initiator_t > 0.0 && fabs(xj) < initiator_t) allow_new = false;
 
@@ -869,10 +896,7 @@ __global__ void qmc_spawn_hamiltonian_u64_f64_kernel_t(
       double w_eff = h_base_flat[pq_id];
       double sum_rr = 0.0;
       for (int t = 0; t < ns; t++) {
-        int r = src[t];
-        int occ_r = (steps_j[r] == 3) ? 2 : 1;
-        int rr_id = r * norb + r;
-        sum_rr += eri_mat[(int64_t)pq_id * (int64_t)nops + (int64_t)rr_id] * (double)occ_r;
+        sum_rr += eri_mat[(int64_t)pq_id * (int64_t)nops + (int64_t)rr_id_src[t]] * occ_src[t];
       }
       w_eff += 0.5 * sum_rr;
       if (w_eff == 0.0) continue;
@@ -1552,6 +1576,65 @@ extern "C" cudaError_t guga_qmc_spawn_hamiltonian_u64_f64_launch_stream(
       nspawn_two,
       seed,
       initiator_t,
+      /*initiator_t_dev=*/nullptr,
+      pair_alias_prob,
+      pair_alias_idx,
+      pair_norm,
+      pair_norm_sum,
+      pair_sampling_mode,
+      out_key,
+      out_val);
+  return cudaGetLastError();
+}
+
+extern "C" cudaError_t guga_qmc_spawn_hamiltonian_u64_f64_initiator_dev_launch_stream(
+    const int32_t* child,
+    const int16_t* node_twos,
+    int norb,
+    const uint64_t* x_key,
+    const double* x_val,
+    int m,
+    const double* h_base_flat,
+    const double* eri_mat,
+    const float* pair_alias_prob,
+    const int32_t* pair_alias_idx,
+    const double* pair_norm,
+    double pair_norm_sum,
+    int pair_sampling_mode,
+    double eps,
+    int nspawn_one,
+    int nspawn_two,
+    uint64_t seed,
+    const double* initiator_t_dev,
+    uint64_t* out_key,
+    double* out_val,
+    cudaStream_t stream,
+    int threads) {
+  if (!child || !node_twos) return cudaErrorInvalidValue;
+  if (!x_key || !x_val) return cudaErrorInvalidValue;
+  if (!h_base_flat || !eri_mat || !out_key || !out_val) return cudaErrorInvalidValue;
+  if (!initiator_t_dev) return cudaErrorInvalidValue;
+  if (m < 0 || norb <= 0 || norb > 32) return cudaErrorInvalidValue;
+  if (nspawn_one < 0 || nspawn_two < 0) return cudaErrorInvalidValue;
+  if (nspawn_one == 0 && nspawn_two == 0) return cudaErrorInvalidValue;
+  if (threads <= 0 || threads > 1024) return cudaErrorInvalidValue;
+
+  int blocks = (m + threads - 1) / threads;
+  qmc_spawn_hamiltonian_u64_f64_kernel_t<32><<<blocks, threads, 0, stream>>>(
+      child,
+      node_twos,
+      norb,
+      x_key,
+      x_val,
+      m,
+      h_base_flat,
+      eri_mat,
+      eps,
+      nspawn_one,
+      nspawn_two,
+      seed,
+      /*initiator_t=*/0.0,
+      initiator_t_dev,
       pair_alias_prob,
       pair_alias_idx,
       pair_norm,

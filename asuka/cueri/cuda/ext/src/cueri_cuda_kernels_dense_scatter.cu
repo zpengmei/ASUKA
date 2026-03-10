@@ -420,7 +420,7 @@ __device__ inline double warp_reduce_sum_jk(double x) {
   return x;
 }
 
-__device__ __forceinline__ void _contract_jk_warp_single(
+__device__ __noinline__ void _contract_jk_warp_single(
     const double* __restrict__ tile,
     const double* __restrict__ D_mat,
     double* J_mat,
@@ -644,6 +644,7 @@ __global__ void KernelContractJKTilesOrderedMulti2Warp(
                             nAB, nCD, nA, nB, nC, nD,
                             a0, b0, c0, d0,
                             ab_neq, cd_neq, bk_swap, f_ab, f_cd, N);
+  __syncwarp();  // ensure all threads complete first pass before second
   _contract_jk_warp_single(tile, Db_mat, Jb_mat, Kb_mat, lane,
                             nAB, nCD, nA, nB, nC, nD,
                             a0, b0, c0, d0,

@@ -92,6 +92,15 @@ def _sorted_desc_count(abs_sorted: np.ndarray, cutoff: float) -> int:
     return int(np.searchsorted(-abs_sorted, -float(cutoff), side="right"))
 
 
+def _resolve_hash_select_impl() -> str:
+    impl = str(os.environ.get("ASUKA_CIPSI_HASH_SELECT_IMPL", "v1")).strip().lower()
+    if impl in ("", "default", "auto"):
+        impl = "v1"
+    if impl not in ("v1", "v2"):
+        raise ValueError("ASUKA_CIPSI_HASH_SELECT_IMPL must be one of: v1, v2")
+    return impl
+
+
 def _ensure_hash_buffers(frontier_buffers: dict, cp: Any, cap: int, nroots: int) -> None:
     cap = int(cap)
     if int(frontier_buffers.get("hash_cap", 0)) == cap and frontier_buffers.get("hash_keys") is not None:
@@ -205,6 +214,7 @@ def _heat_bath_select_screened_csr(
         apply_g_flat_scatter_atomic_frontier_hash_many_roots_inplace_device,
         cipsi_frontier_hash_clear_inplace_device,
         cipsi_score_and_select_topk_from_hash_slots_inplace_device,
+        cipsi_score_and_select_topk_from_hash_slots_v2_inplace_device,
         kernel3_build_g_from_csr_eri_mat_range_inplace_device,
     )
     from asuka.cuguga.state_cache import get_state_cache  # noqa: PLC0415
@@ -291,6 +301,7 @@ def _heat_bath_select_screened_csr(
     g_buf = _ensure_g_buffer(frontier_buffers, cp, nrows=int(g_rows_eff), nops=int(nops))
 
     frontier_hash_max_retries = int(frontier_buffers.get("max_retries", 8))
+    hash_select_impl = _resolve_hash_select_impl()
     for _attempt in range(frontier_hash_max_retries):
         _ensure_hash_buffers(frontier_buffers, cp, cap, int(nroots))
         hash_keys = frontier_buffers["hash_keys"]
@@ -466,20 +477,36 @@ def _heat_bath_select_screened_csr(
         out_new_idx = cp.empty((max(1, max_add),), dtype=cp.int32)
         out_new_n = cp.empty((1,), dtype=cp.int32)
         out_pt2 = cp.empty((nroots,), dtype=cp.float64)
-        cipsi_score_and_select_topk_from_hash_slots_inplace_device(
-            hash_keys,
-            hash_vals,
-            e_var=e_var_d,
-            hdiag=hdiag_d,
-            selected_mask=selected_mask_d,
-            denom_floor=denom_floor,
-            out_new_idx=out_new_idx,
-            out_new_n=out_new_n,
-            out_pt2=out_pt2,
-            threads=256,
-            stream=stream,
-            sync=True,
-        )
+        if hash_select_impl == "v2":
+            cipsi_score_and_select_topk_from_hash_slots_v2_inplace_device(
+                hash_keys,
+                hash_vals,
+                e_var=e_var_d,
+                hdiag=hdiag_d,
+                selected_mask=selected_mask_d,
+                denom_floor=denom_floor,
+                out_new_idx=out_new_idx,
+                out_new_n=out_new_n,
+                out_pt2=out_pt2,
+                threads=256,
+                stream=stream,
+                sync=True,
+            )
+        else:
+            cipsi_score_and_select_topk_from_hash_slots_inplace_device(
+                hash_keys,
+                hash_vals,
+                e_var=e_var_d,
+                hdiag=hdiag_d,
+                selected_mask=selected_mask_d,
+                denom_floor=denom_floor,
+                out_new_idx=out_new_idx,
+                out_new_n=out_new_n,
+                out_pt2=out_pt2,
+                threads=256,
+                stream=stream,
+                sync=True,
+            )
 
         e_pt2_h = cp.asnumpy(out_pt2)
         n_new = int(out_new_n.get()[0])
@@ -660,7 +687,10 @@ def _heat_bath_select_cuda(
     from asuka.cuda.cuda_backend import (  # noqa: PLC0415
         cipsi_frontier_hash_clear_inplace_device,
         cipsi_score_and_select_topk_from_hash_slots_inplace_device,
+        cipsi_score_and_select_topk_from_hash_slots_v2_inplace_device,
         hb_screen_and_apply_inplace_device,
+        hb_screen_and_apply_many_roots_inplace_device,
+        has_hb_screen_and_apply_many_roots_device,
     )
 
     sel_idx_i32 = np.asarray(sel_idx, dtype=np.int32).ravel()
@@ -706,6 +736,7 @@ def _heat_bath_select_cuda(
 
     stream = cp.cuda.get_current_stream()
     frontier_hash_max_retries = int(frontier_buffers.get("max_retries", 8))
+    hash_select_impl = _resolve_hash_select_impl()
     for _attempt in range(frontier_hash_max_retries):
         _ensure_hash_buffers(frontier_buffers, cp, cap, int(nroots))
         hash_keys = frontier_buffers["hash_keys"]
@@ -715,16 +746,15 @@ def _heat_bath_select_cuda(
         cipsi_frontier_hash_clear_inplace_device(hash_keys, hash_vals, threads=256, stream=stream, sync=False)
         cp.cuda.runtime.memsetAsync(int(hash_overflow.data.ptr), 0, 4, int(stream.ptr))
 
-        for root in range(int(nroots)):
-            hb_screen_and_apply_inplace_device(
+        if bool(has_hb_screen_and_apply_many_roots_device()):
+            hb_screen_and_apply_many_roots_inplace_device(
                 drt,
                 ws.drt_dev,
                 ws.state_dev,
                 sel_idx_d,
-                c_sel_d[:, int(root)],
+                c_sel_d,
                 nsel=nsel_i,
                 nroots=int(nroots),
-                root=int(root),
                 h1_pq=h1_pq_d,
                 h1_abs=h1_abs_d,
                 h1_signed=h1_signed_d,
@@ -743,6 +773,35 @@ def _heat_bath_select_cuda(
                 stream=stream,
                 sync=False,
             )
+        else:
+            for root in range(int(nroots)):
+                hb_screen_and_apply_inplace_device(
+                    drt,
+                    ws.drt_dev,
+                    ws.state_dev,
+                    sel_idx_d,
+                    c_sel_d[:, int(root)],
+                    nsel=nsel_i,
+                    nroots=int(nroots),
+                    root=int(root),
+                    h1_pq=h1_pq_d,
+                    h1_abs=h1_abs_d,
+                    h1_signed=h1_signed_d,
+                    n_h1=n_h1,
+                    pq_ptr=pq_ptr_d,
+                    rs_idx=rs_idx_d,
+                    v_abs=v_abs_d,
+                    v_signed=v_signed_d,
+                    pq_max_v=pq_max_v_d,
+                    eps=float(epsilon),
+                    hash_keys=hash_keys,
+                    hash_vals=hash_vals,
+                    selected_mask=selected_mask_d,
+                    overflow=hash_overflow,
+                    threads=256,
+                    stream=stream,
+                    sync=False,
+                )
 
         stream.synchronize()
         if int(hash_overflow.get()[0]) != 0:
@@ -752,20 +811,36 @@ def _heat_bath_select_cuda(
         out_new_idx = cp.empty((max(1, int(max_add)),), dtype=cp.int32)
         out_new_n = cp.empty((1,), dtype=cp.int32)
         out_pt2 = cp.empty((int(nroots),), dtype=cp.float64)
-        cipsi_score_and_select_topk_from_hash_slots_inplace_device(
-            hash_keys,
-            hash_vals,
-            e_var=e_var_d,
-            hdiag=hdiag_d,
-            selected_mask=selected_mask_d,
-            denom_floor=denom_floor,
-            out_new_idx=out_new_idx,
-            out_new_n=out_new_n,
-            out_pt2=out_pt2,
-            threads=256,
-            stream=stream,
-            sync=True,
-        )
+        if hash_select_impl == "v2":
+            cipsi_score_and_select_topk_from_hash_slots_v2_inplace_device(
+                hash_keys,
+                hash_vals,
+                e_var=e_var_d,
+                hdiag=hdiag_d,
+                selected_mask=selected_mask_d,
+                denom_floor=denom_floor,
+                out_new_idx=out_new_idx,
+                out_new_n=out_new_n,
+                out_pt2=out_pt2,
+                threads=256,
+                stream=stream,
+                sync=True,
+            )
+        else:
+            cipsi_score_and_select_topk_from_hash_slots_inplace_device(
+                hash_keys,
+                hash_vals,
+                e_var=e_var_d,
+                hdiag=hdiag_d,
+                selected_mask=selected_mask_d,
+                denom_floor=denom_floor,
+                out_new_idx=out_new_idx,
+                out_new_n=out_new_n,
+                out_pt2=out_pt2,
+                threads=256,
+                stream=stream,
+                sync=True,
+            )
 
         e_pt2_h = cp.asnumpy(out_pt2)
         n_new = int(out_new_n.get()[0])

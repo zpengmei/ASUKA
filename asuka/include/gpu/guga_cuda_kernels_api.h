@@ -370,6 +370,32 @@ extern "C" cudaError_t guga_qmc_spawn_hamiltonian_u64_f64_launch_stream(
     cudaStream_t stream,
     int threads);
 
+// Variant that reads initiator threshold from device memory (scalar double on device).
+// This allows callers to compute initiator_t on the GPU without a host sync.
+extern "C" cudaError_t guga_qmc_spawn_hamiltonian_u64_f64_initiator_dev_launch_stream(
+    const int32_t* child,
+    const int16_t* node_twos,
+    int norb,
+    const uint64_t* x_key,
+    const double* x_val,
+    int m,
+    const double* h_base_flat,
+    const double* eri_mat,
+    const float* pair_alias_prob,
+    const int32_t* pair_alias_idx,
+    const double* pair_norm,
+    double pair_norm_sum,
+    int pair_sampling_mode,
+    double eps,
+    int nspawn_one,
+    int nspawn_two,
+    uint64_t seed,
+    const double* initiator_t_dev,
+    uint64_t* out_key,
+    double* out_val,
+    cudaStream_t stream,
+    int threads);
+
 extern "C" cudaError_t guga_qmc_coalesce_coo_i32_f64_launch_stream(
     const int32_t* idx_in,
     const double* val_in,

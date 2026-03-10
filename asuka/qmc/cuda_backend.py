@@ -1536,7 +1536,8 @@ def cuda_projector_step_hamiltonian_u64_ws(
     ctx: CudaProjectorContextKey64,
     *,
     eps: float,
-    initiator_t: float,
+    initiator_t: float = 0.0,
+    initiator_t_dev: Any | None = None,
     seed_spawn: int,
     seed_phi: int,
     scale_identity: float = 1.0,
@@ -1586,28 +1587,57 @@ def cuda_projector_step_hamiltonian_u64_ws(
     evt_key = key_all[nnz:all_len]
     evt_val = val_all[nnz:all_len]
 
-    _guga_cuda_ext.qmc_spawn_hamiltonian_u64_inplace_device(
-        ctx.drt_dev,
-        x_key,
-        x_val,
-        ctx.h_base_flat_dev,
-        ctx.eri_mat_dev,
-        evt_key,
-        evt_val,
-        float(eps),
-        int(ctx.nspawn_one),
-        int(ctx.nspawn_two),
-        int(seed_spawn),
-        float(initiator_t),
-        int(ctx.threads_spawn),
-        int(ctx.stream),
-        False,
-        ctx.pair_alias_prob_dev,
-        ctx.pair_alias_idx_dev,
-        ctx.pair_norm_dev,
-        float(ctx.pair_norm_sum),
-        int(ctx.pair_sampling_mode),
-    )
+    if initiator_t_dev is not None:
+        if float(initiator_t) != 0.0:
+            raise ValueError("provide either initiator_t or initiator_t_dev (not both)")
+        initiator_t_dev = cp.asarray(initiator_t_dev, dtype=cp.float64)
+        if int(initiator_t_dev.size) != 1:
+            raise ValueError("initiator_t_dev must be a device scalar (shape () or (1,))")
+        _guga_cuda_ext.qmc_spawn_hamiltonian_u64_inplace_device_initiator_dev(
+            ctx.drt_dev,
+            x_key,
+            x_val,
+            ctx.h_base_flat_dev,
+            ctx.eri_mat_dev,
+            evt_key,
+            evt_val,
+            float(eps),
+            int(ctx.nspawn_one),
+            int(ctx.nspawn_two),
+            int(seed_spawn),
+            initiator_t_dev,
+            int(ctx.threads_spawn),
+            int(ctx.stream),
+            False,
+            ctx.pair_alias_prob_dev,
+            ctx.pair_alias_idx_dev,
+            ctx.pair_norm_dev,
+            float(ctx.pair_norm_sum),
+            int(ctx.pair_sampling_mode),
+        )
+    else:
+        _guga_cuda_ext.qmc_spawn_hamiltonian_u64_inplace_device(
+            ctx.drt_dev,
+            x_key,
+            x_val,
+            ctx.h_base_flat_dev,
+            ctx.eri_mat_dev,
+            evt_key,
+            evt_val,
+            float(eps),
+            int(ctx.nspawn_one),
+            int(ctx.nspawn_two),
+            int(seed_spawn),
+            float(initiator_t),
+            int(ctx.threads_spawn),
+            int(ctx.stream),
+            False,
+            ctx.pair_alias_prob_dev,
+            ctx.pair_alias_idx_dev,
+            ctx.pair_norm_dev,
+            float(ctx.pair_norm_sum),
+            int(ctx.pair_sampling_mode),
+        )
 
     # Merge identity and events.
     key_all[:nnz] = x_key

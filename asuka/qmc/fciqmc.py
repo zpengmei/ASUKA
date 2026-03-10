@@ -117,8 +117,15 @@ def run_fciqmc(
         raise ValueError("energy_estimator must be 'projected' or 'rayleigh'")
 
     backend_s = str(backend).lower()
-    if backend_s not in ("cpu", "cuda", "cuda_key64"):
-        raise ValueError("backend must be 'cpu', 'cuda', or 'cuda_key64'")
+    if backend_s not in ("cpu", "cuda", "cuda_i32", "cuda_key64"):
+        raise ValueError("backend must be 'cpu', 'cuda', 'cuda_i32', or 'cuda_key64'")
+
+    # backend='cuda' defaults to Key64 when representable; cuda_i32 forces legacy index path.
+    backend_impl = backend_s
+    if backend_s == "cuda" and int(drt.norb) <= 32:
+        backend_impl = "cuda_key64"
+    elif backend_s == "cuda_i32":
+        backend_impl = "cuda"
 
     x_idx_u, x_val_u = coalesce_coo_i32_f64(x_idx, x_val)
     if x_idx_u.size == 0:
@@ -140,7 +147,7 @@ def run_fciqmc(
     if tgt_pop <= 0.0:
         raise ValueError("target_population must be > 0")
 
-    state_cache = get_state_cache(drt) if (bool(use_state_cache) and backend_s == "cpu") else None
+    state_cache = get_state_cache(drt) if (bool(use_state_cache) and backend_impl in ("cpu", "cuda_key64")) else None
 
     ref = choose_reference_index(x_idx_u, x_val_u, preferred=preferred_ref_idx)
     if energy_estimator == "rayleigh":
@@ -154,7 +161,7 @@ def run_fciqmc(
     pops[0] = pop0
     shifts[0] = shift
 
-    if backend_s == "cuda":
+    if backend_impl == "cuda":
         return _run_fciqmc_cuda(
             drt=drt,
             h1e=h1e,
@@ -182,7 +189,7 @@ def run_fciqmc(
             ref_hist=ref_hist,
             e_pos=e_pos,
         )
-    if backend_s == "cuda_key64":
+    if backend_impl == "cuda_key64":
         return _run_fciqmc_cuda_key64(
             drt=drt,
             h1e=h1e,
@@ -209,6 +216,7 @@ def run_fciqmc(
             energies=energies,
             ref_hist=ref_hist,
             e_pos=e_pos,
+            state_cache=state_cache,
             key64_pair_norm=key64_pair_norm,
             key64_pair_sampling_mode=int(key64_pair_sampling_mode),
         )
@@ -414,6 +422,7 @@ def _run_fciqmc_cuda_key64(
     energies: np.ndarray,
     ref_hist: np.ndarray,
     e_pos: int,
+    state_cache,
     key64_pair_norm: np.ndarray | None,
     key64_pair_sampling_mode: int,
 ) -> FCIQMCRun:
@@ -467,7 +476,7 @@ def _run_fciqmc_cuda_key64(
     nnz0 = int(x_idx_u.size)
     import cupy as cp  # noqa: PLC0415
 
-    key0 = csf_idx_to_key64_host(drt, x_idx_u, state_cache=None)
+    key0 = csf_idx_to_key64_host(drt, x_idx_u, state_cache=state_cache)
     order0 = np.argsort(key0)
     key0 = np.asarray(key0[order0], dtype=np.uint64, order="C")
     val0 = np.asarray(x_val_u[order0], dtype=np.float64, order="C")
@@ -513,9 +522,9 @@ def _run_fciqmc_cuda_key64(
 
                 ref = choose_reference_index(x_idx_h, x_val_h, preferred=preferred_ref_idx)
                 if energy_estimator == "rayleigh":
-                    e, _, _ = rayleigh_energy_ref(drt, h1e, eri, x_idx_h, x_val_h)
+                    e, _, _ = rayleigh_energy_ref(drt, h1e, eri, x_idx_h, x_val_h, state_cache=state_cache)
                 else:
-                    e, _, _ = projected_energy_ref(drt, h1e, eri, x_idx_h, x_val_h, ref_idx=ref)
+                    e, _, _ = projected_energy_ref(drt, h1e, eri, x_idx_h, x_val_h, ref_idx=ref, state_cache=state_cache)
                 energies[e_pos] = float(e)
                 ref_hist[e_pos] = np.int32(ref)
                 e_pos += 1

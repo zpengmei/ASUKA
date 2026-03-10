@@ -91,11 +91,17 @@ def run_fcifri_ground(
         raise ValueError("energy_estimator must be 'projected' or 'rayleigh'")
 
     backend = str(backend).lower()
-    if backend not in ("stochastic", "cuda", "cuda_key64"):
-        raise ValueError("backend must be 'stochastic', 'cuda', or 'cuda_key64'")
+    if backend not in ("stochastic", "cuda", "cuda_i32", "cuda_key64"):
+        raise ValueError("backend must be 'stochastic', 'cuda', 'cuda_i32', or 'cuda_key64'")
 
-    use_cuda = backend in ("cuda", "cuda_key64")
-    use_key64 = backend == "cuda_key64"
+    use_cuda = backend in ("cuda", "cuda_i32", "cuda_key64")
+    if backend == "cuda_key64":
+        use_key64 = True
+    elif backend == "cuda_i32":
+        use_key64 = False
+    else:
+        # backend == "cuda": auto-select Key64 when representable.
+        use_key64 = use_cuda and (int(drt.norb) <= 32)
     if use_cuda and (spawner is not None or spawner_kwargs is not None):
         warnings.warn(
             "CUDA backends do not support custom spawner/spawner_kwargs yet; falling back to CPU backend.",
@@ -107,6 +113,9 @@ def run_fcifri_ground(
     rng = np.random.default_rng(int(seed))
     maybe_set_openmp_threads(omp_threads)
     state_cache = get_state_cache(drt) if bool(use_state_cache) else None
+
+    if use_key64 and int(drt.norb) > 32:
+        raise ValueError("Key64 CUDA backend requires drt.norb <= 32")
 
     x_idx_u, x_val_u = coalesce_coo_i32_f64(x_idx, x_val)
     if x_idx_u.size == 0:
@@ -215,14 +224,9 @@ def run_fcifri_ground(
             for it in range(1, niter + 1):
                 # Initiator threshold uses the current column l1 norm.
                 if float(initiator_na) != 0.0:
-                    if use_key64:
-                        # Key64 spawn currently only accepts a host scalar initiator threshold.
-                        l1 = float(cp.sum(cp.abs(ctx.x_val[: ctx.nnz])).get())
-                        initiator_t_dev = float(initiator_na) * l1 / float(m - 1)
-                    else:
-                        # Keep initiator_t on device to avoid a host sync every iteration.
-                        l1_dev = cp.sum(cp.abs(ctx.x_val[: ctx.nnz]))
-                        initiator_t_dev = float(initiator_na) * l1_dev / float(m - 1)
+                    # Keep initiator_t on device to avoid a host sync every iteration.
+                    l1_dev = cp.sum(cp.abs(ctx.x_val[: ctx.nnz]))
+                    initiator_t_dev = float(initiator_na) * l1_dev / float(m - 1)
                 else:
                     initiator_t_dev = None
 
@@ -232,7 +236,8 @@ def run_fcifri_ground(
                     cuda_projector_step_hamiltonian_u64_ws(
                         ctx,
                         eps=float(eps),
-                        initiator_t=float(initiator_t_dev) if initiator_t_dev is not None else 0.0,
+                        initiator_t=0.0,
+                        initiator_t_dev=initiator_t_dev,
                         seed_spawn=seed_spawn,
                         seed_phi=seed_phi,
                         scale_identity=1.0,

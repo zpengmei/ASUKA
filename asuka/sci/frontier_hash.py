@@ -15,6 +15,7 @@ from asuka.cuda.cuda_backend import (
     build_occ_block_from_steps_inplace_device,
     cipsi_frontier_hash_clear_inplace_device,
     cipsi_score_and_select_topk_from_hash_slots_inplace_device,
+    cipsi_score_and_select_topk_from_hash_slots_v2_inplace_device,
     kernel3_build_g_from_csr_eri_mat_range_inplace_device,
 )
 
@@ -166,6 +167,12 @@ class FrontierHashSelector:
         if grouping_in not in ("tile", "chunk"):
             raise ValueError("ASUKA_FH_OFFDIAG_GROUPING must be one of: auto, tile, chunk")
         self.offdiag_grouping = grouping_in
+        score_impl = str(os.environ.get("ASUKA_CIPSI_HASH_SELECT_IMPL", "v1")).strip().lower()
+        if score_impl in ("", "default", "auto"):
+            score_impl = "v1"
+        if score_impl not in ("v1", "v2"):
+            raise ValueError("ASUKA_CIPSI_HASH_SELECT_IMPL must be one of: v1, v2")
+        self.hash_select_impl = score_impl
 
         # Tile sizing: ensure (tile * rs_block) fits Kernel25Workspace.max_tasks.
         tile_i = int(tile)
@@ -265,6 +272,8 @@ class FrontierHashSelector:
         self.g_rows = int(g_rows_eff)
         self.g_rows_cap_mb = int(g_rows_cap_mb) if g_rows_cap_mb is not None else int(_env_int("ASUKA_FH_G_ROWS_CAP_MB", 128))
         self.g_buf = cp.empty((int(self.g_rows), int(self.nops)), dtype=cp.float64)
+        # Reusable per-row coefficient staging for offdiag many-roots apply.
+        self.task_scale_rows_buf = cp.empty((int(self.g_rows), int(self.nroots)), dtype=cp.float64)
 
         self.gdf_ws: Kernel3BuildGDFWorkspace | None = None
         if l_full is not None:
@@ -506,7 +515,9 @@ class FrontierHashSelector:
                             if ntasks > int(self.max_tasks):
                                 raise RuntimeError("internal error: offdiag task batch exceeds Kernel25 workspace max_tasks")
 
-                            with _nvtx_range("cipsi_k25_csr_build", enabled=nvtx_enabled):
+                            with _nvtx_range("cipsi_k25_csr_build", enabled=nvtx_enabled), _timed_phase(
+                                "offdiag_k25_build", enabled=profile_enabled, timings_ms=timings, stream=stream
+                            ):
                                 task_csf_2d = self.task_csf_buf[:ntasks].reshape(int(nsel_tile), int(blk))
                                 task_p_2d = self.task_p_buf[:ntasks].reshape(int(nsel_tile), int(blk))
                                 task_q_2d = self.task_q_buf[:ntasks].reshape(int(nsel_tile), int(blk))
@@ -544,6 +555,8 @@ class FrontierHashSelector:
                             indptr_d = indptr_buf[: nrows + 1]
                             indices_d = indices_buf[:nnz]
                             data_d = data_buf[:nnz]
+                            # Map each CSR row's source-j to local selected index once per CSR build.
+                            row_local_all = cp.searchsorted(task_csf_tile, row_j_d)
 
                             for row_start in range(0, nrows, int(self.g_rows)):
                                 row_stop = min(nrows, int(row_start + int(self.g_rows)))
@@ -552,7 +565,9 @@ class FrontierHashSelector:
                                     continue
                                 g_b = self.g_buf[:nb]
 
-                                with _nvtx_range("cipsi_kernel3_build_g", enabled=nvtx_enabled):
+                                with _nvtx_range("cipsi_kernel3_build_g", enabled=nvtx_enabled), _timed_phase(
+                                    "offdiag_kernel3_build_g", enabled=profile_enabled, timings_ms=timings, stream=stream
+                                ):
                                     if l_full is not None:
                                         if self.gdf_ws is None:
                                             raise RuntimeError("internal error: gdf_ws is missing for DF path")
@@ -586,11 +601,13 @@ class FrontierHashSelector:
                                             sync=False,
                                         )
 
-                                row_j_b = row_j_d[int(row_start) : int(row_stop)]
                                 row_k_b = row_k_d[int(row_start) : int(row_stop)]
-                                row_local = cp.searchsorted(task_csf_tile, row_j_b)
-                                task_scale_rows = cp.ascontiguousarray(c_tile[row_local, :])
-                                with _nvtx_range("cipsi_apply_to_hash_offdiag", enabled=nvtx_enabled):
+                                row_local = row_local_all[int(row_start) : int(row_stop)]
+                                task_scale_rows = self.task_scale_rows_buf[:nb, :]
+                                task_scale_rows[...] = c_tile[row_local, :]
+                                with _nvtx_range("cipsi_apply_to_hash_offdiag", enabled=nvtx_enabled), _timed_phase(
+                                    "offdiag_apply_hash", enabled=profile_enabled, timings_ms=timings, stream=stream
+                                ):
                                     apply_g_flat_scatter_atomic_frontier_hash_many_roots_inplace_device(
                                         self.drt,
                                         self.ws.drt_dev,
@@ -642,20 +659,36 @@ class FrontierHashSelector:
             with _nvtx_range("cipsi_score_select", enabled=nvtx_enabled), _timed_phase(
                 "score_pt2_select", enabled=profile_enabled, timings_ms=timings, stream=stream
             ):
-                cipsi_score_and_select_topk_from_hash_slots_inplace_device(
-                    self.hash_keys,
-                    self.hash_vals,
-                    e_var=e_var_d,
-                    hdiag=self.hdiag_d,
-                    selected_mask=self.selected_mask_d,
-                    denom_floor=float(self.denom_floor),
-                    out_new_idx=out_new_idx,
-                    out_new_n=out_new_n,
-                    out_pt2=out_pt2,
-                    threads=256,
-                    stream=stream,
-                    sync=True,
-                )
+                if self.hash_select_impl == "v2":
+                    cipsi_score_and_select_topk_from_hash_slots_v2_inplace_device(
+                        self.hash_keys,
+                        self.hash_vals,
+                        e_var=e_var_d,
+                        hdiag=self.hdiag_d,
+                        selected_mask=self.selected_mask_d,
+                        denom_floor=float(self.denom_floor),
+                        out_new_idx=out_new_idx,
+                        out_new_n=out_new_n,
+                        out_pt2=out_pt2,
+                        threads=256,
+                        stream=stream,
+                        sync=True,
+                    )
+                else:
+                    cipsi_score_and_select_topk_from_hash_slots_inplace_device(
+                        self.hash_keys,
+                        self.hash_vals,
+                        e_var=e_var_d,
+                        hdiag=self.hdiag_d,
+                        selected_mask=self.selected_mask_d,
+                        denom_floor=float(self.denom_floor),
+                        out_new_idx=out_new_idx,
+                        out_new_n=out_new_n,
+                        out_pt2=out_pt2,
+                        threads=256,
+                        stream=stream,
+                        sync=True,
+                    )
             with _timed_phase("hash_count_nnz", enabled=profile_enabled, timings_ms=timings, stream=stream):
                 nnz_out = int(cp.count_nonzero(self.hash_keys >= 0).get())
 
