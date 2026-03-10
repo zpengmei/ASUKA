@@ -5149,9 +5149,97 @@ def cipsi_score_and_select_topk_from_hash_slots_inplace_device(
     return out_new_idx, out_new_n, out_pt2
 
 
+def cipsi_score_and_select_topk_from_hash_slots_v2_inplace_device(
+    keys,
+    vals_root_major,
+    *,
+    e_var,
+    hdiag,
+    selected_mask,
+    denom_floor: float,
+    out_new_idx,
+    out_new_n,
+    out_pt2,
+    threads: int = 256,
+    stream=None,
+    sync: bool = True,
+):
+    if _ext is None or not hasattr(_ext, "cipsi_score_and_select_topk_from_hash_slots_v2_inplace_device"):
+        raise RuntimeError(
+            "CUDA extension is missing hash-slot score/select v2 kernel; rebuild with python -m asuka.build.guga_cuda_ext"
+        )
+
+    try:
+        import cupy as cp
+    except Exception as e:  # pragma: no cover
+        raise RuntimeError("CuPy is required for the device-array path") from e
+
+    keys = cp.asarray(keys, dtype=cp.int32).ravel()
+    keys = cp.ascontiguousarray(keys)
+    vals_root_major = cp.asarray(vals_root_major, dtype=cp.float64)
+    vals_root_major = cp.ascontiguousarray(vals_root_major)
+    if vals_root_major.ndim != 2:
+        raise ValueError("vals_root_major must have shape (nroots, cap)")
+    nroots = int(vals_root_major.shape[0])
+    cap = int(keys.size)
+    if int(vals_root_major.shape[1]) != cap:
+        raise ValueError("vals_root_major must have shape (nroots, cap) with cap matching keys")
+
+    e_var = cp.asarray(e_var, dtype=cp.float64).ravel()
+    e_var = cp.ascontiguousarray(e_var)
+    if e_var.shape != (nroots,):
+        raise ValueError("e_var must have shape (nroots,)")
+    hdiag = cp.asarray(hdiag, dtype=cp.float64).ravel()
+    hdiag = cp.ascontiguousarray(hdiag)
+    ncsf = int(hdiag.size)
+
+    if selected_mask is not None:
+        selected_mask = cp.asarray(selected_mask, dtype=cp.uint8).ravel()
+        selected_mask = cp.ascontiguousarray(selected_mask)
+        if selected_mask.shape != (ncsf,):
+            raise ValueError("selected_mask must have shape (ncsf,)")
+
+    out_new_idx = cp.asarray(out_new_idx, dtype=cp.int32).ravel()
+    out_new_idx = cp.ascontiguousarray(out_new_idx)
+    out_new_n = cp.asarray(out_new_n, dtype=cp.int32).ravel()
+    out_new_n = cp.ascontiguousarray(out_new_n)
+    if out_new_n.shape != (1,):
+        raise ValueError("out_new_n must have shape (1,)")
+    out_pt2 = cp.asarray(out_pt2, dtype=cp.float64).ravel()
+    out_pt2 = cp.ascontiguousarray(out_pt2)
+    if out_pt2.shape != (nroots,):
+        raise ValueError("out_pt2 must have shape (nroots,)")
+
+    if stream is None:
+        stream_ptr = int(cp.cuda.get_current_stream().ptr)
+    else:
+        stream_ptr = int(getattr(stream, "ptr", stream))
+
+    _ext.cipsi_score_and_select_topk_from_hash_slots_v2_inplace_device(
+        keys,
+        vals_root_major,
+        e_var,
+        hdiag,
+        selected_mask if selected_mask is not None else None,
+        float(denom_floor),
+        out_new_idx,
+        out_new_n,
+        out_pt2,
+        int(threads),
+        int(stream_ptr),
+        bool(sync),
+    )
+    return out_new_idx, out_new_n, out_pt2
+
+
 def has_hb_screen_and_apply_device() -> bool:
     """Return True if the CUDA extension exposes the HB screen-and-apply kernel."""
     return _ext is not None and hasattr(_ext, "hb_screen_and_apply_inplace_device")
+
+
+def has_hb_screen_and_apply_many_roots_device() -> bool:
+    """Return True if the CUDA extension exposes the HB many-roots kernel."""
+    return _ext is not None and hasattr(_ext, "hb_screen_and_apply_many_roots_inplace_device")
 
 
 def hb_screen_and_apply_inplace_device(
@@ -5215,6 +5303,89 @@ def hb_screen_and_apply_inplace_device(
         int(nsel),
         int(nroots),
         int(root),
+        h1_pq,
+        h1_abs,
+        h1_signed,
+        int(n_h1),
+        pq_ptr,
+        rs_idx,
+        v_abs,
+        v_signed,
+        pq_max_v,
+        float(eps),
+        hash_keys,
+        hash_vals,
+        selected_mask if selected_mask is not None else None,
+        overflow,
+        int(threads),
+        int(stream_ptr),
+        bool(sync),
+    )
+
+
+def hb_screen_and_apply_many_roots_inplace_device(
+    drt,
+    drt_dev,
+    state_dev,
+    sel_idx,
+    c_sel,
+    *,
+    nsel: int,
+    nroots: int,
+    h1_pq,
+    h1_abs,
+    h1_signed,
+    n_h1: int,
+    pq_ptr,
+    rs_idx,
+    v_abs,
+    v_signed,
+    pq_max_v,
+    eps: float,
+    hash_keys,
+    hash_vals,
+    selected_mask=None,
+    overflow=None,
+    threads: int = 256,
+    stream=None,
+    sync: bool = True,
+):
+    """Launch the fused heat-bath screen+apply kernel for all roots."""
+    if _ext is None or not hasattr(_ext, "hb_screen_and_apply_many_roots_inplace_device"):
+        raise RuntimeError("CUDA extension is missing HB-SCI many-roots kernels; rebuild with python -m asuka.build.guga_cuda_ext")
+
+    try:
+        import cupy as cp
+    except Exception as e:  # pragma: no cover
+        raise RuntimeError("CuPy is required") from e
+
+    if stream is None:
+        stream_ptr = int(cp.cuda.get_current_stream().ptr)
+    else:
+        stream_ptr = int(getattr(stream, "ptr", stream))
+
+    sel_idx = cp.ascontiguousarray(cp.asarray(sel_idx, dtype=cp.int32).ravel())
+    c_sel = cp.ascontiguousarray(cp.asarray(c_sel, dtype=cp.float64))
+    if c_sel.ndim != 2:
+        raise ValueError("c_sel must have shape (nsel, nroots)")
+    if int(c_sel.shape[0]) != int(nsel) or int(c_sel.shape[1]) != int(nroots):
+        raise ValueError("c_sel must have shape (nsel, nroots)")
+    if selected_mask is not None:
+        selected_mask = cp.ascontiguousarray(cp.asarray(selected_mask, dtype=cp.uint8).ravel())
+    if overflow is None:
+        overflow = cp.empty((1,), dtype=cp.int32)
+    else:
+        overflow = cp.ascontiguousarray(cp.asarray(overflow, dtype=cp.int32).ravel())
+        if overflow.shape != (1,):
+            raise ValueError("overflow must have shape (1,)")
+
+    _ext.hb_screen_and_apply_many_roots_inplace_device(
+        drt_dev,
+        state_dev,
+        sel_idx,
+        c_sel,
+        int(nsel),
+        int(nroots),
         h1_pq,
         h1_abs,
         h1_signed,

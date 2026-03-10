@@ -253,6 +253,90 @@ def qmc_spawn_hamiltonian_events_u64_device(
     return out_key_dev, out_val_dev
 
 
+def pack_steps_to_key64_host(steps: np.ndarray) -> np.ndarray:
+    """Pack a step table (0..3 per orbital) into Key64 representation (2 bits per orbital).
+
+    Parameters
+    ----------
+    steps
+        int/uint array of shape ``(n, norb)`` with entries in ``{0,1,2,3}``.
+
+    Returns
+    -------
+    np.ndarray
+        uint64 array of shape ``(n,)``.
+    """
+
+    steps_u8 = np.asarray(steps, dtype=np.uint8)
+    if steps_u8.ndim != 2:
+        raise ValueError("steps must have shape (n, norb)")
+    n, norb = int(steps_u8.shape[0]), int(steps_u8.shape[1])
+    if norb < 0 or norb > 32:
+        raise ValueError("Key64 packing requires 0 <= norb <= 32")
+    if n == 0:
+        return np.zeros((0,), dtype=np.uint64)
+    key = np.zeros((n,), dtype=np.uint64)
+    for k in range(norb):
+        key |= (steps_u8[:, k].astype(np.uint64) & np.uint64(3)) << np.uint64(2 * k)
+    return key
+
+
+def csf_idx_to_key64_host(drt: Any, idx: np.ndarray, *, state_cache: Any | None = None) -> np.ndarray:
+    """Convert CSF indices to Key64 (uint64) using cached step tables if available."""
+
+    idx_i64 = np.asarray(idx, dtype=np.int64).ravel()
+    norb = int(drt.norb)
+    if norb > 32:
+        raise ValueError("Key64 representation requires drt.norb <= 32")
+    if idx_i64.size == 0:
+        return np.zeros((0,), dtype=np.uint64)
+
+    if state_cache is not None:
+        steps_table = np.asarray(state_cache.steps, dtype=np.int8, order="C")
+        steps = steps_table[idx_i64]
+    else:
+        steps = np.stack([np.asarray(drt.index_to_path(int(i)), dtype=np.int8, order="C") for i in idx_i64], axis=0)
+    return pack_steps_to_key64_host(steps)
+
+
+def key64_to_csf_idx_host(drt: Any, key: np.ndarray, *, strict: bool = True) -> np.ndarray:
+    """Convert Key64 (uint64) to CSF indices (int32) via DRT traversal.
+
+    This is vectorized across keys and runs in O(len(key) * norb).
+    """
+
+    key_u64 = np.asarray(key, dtype=np.uint64).ravel()
+    norb = int(drt.norb)
+    if norb > 32:
+        raise ValueError("Key64 representation requires drt.norb <= 32")
+    if key_u64.size == 0:
+        return np.zeros((0,), dtype=np.int32)
+
+    from asuka.cuguga.oracle import _child_prefix_walks  # noqa: PLC0415
+
+    child = np.asarray(drt.child, dtype=np.int32, order="C")
+    child_prefix = np.asarray(_child_prefix_walks(drt), dtype=np.int64, order="C")  # (nnodes, 5)
+
+    node = np.zeros((int(key_u64.size),), dtype=np.int32)
+    idx = np.zeros((int(key_u64.size),), dtype=np.int64)
+
+    for k in range(norb):
+        step = ((key_u64 >> np.uint64(2 * k)) & np.uint64(3)).astype(np.intp, copy=False)
+        idx += child_prefix[node, step]
+        node = child[node, step]
+
+    if bool(strict):
+        if np.any(node < 0):
+            raise ValueError("invalid Key64 path (child node < 0)")
+        leaf = int(getattr(drt, "leaf", -1))
+        if leaf >= 0 and np.any(node != leaf):
+            raise ValueError("invalid Key64 path (does not terminate at leaf)")
+
+    if np.any(idx < 0) or np.any(idx > np.iinfo(np.int32).max):
+        raise ValueError("CSF index out of int32 range")
+    return np.asarray(idx, dtype=np.int32)
+
+
 def filter_event_buffer_to_host(out_idx_dev: Any, out_val_dev: Any) -> tuple[np.ndarray, np.ndarray]:
     """Filter a GPU event buffer (idx==-1 sentinel) and return host COO arrays."""
 
@@ -517,6 +601,75 @@ class CudaProjectorContext:
     @property
     def x_idx_next(self):
         return self.x_idx_b if self.use_a else self.x_idx_a
+
+    @property
+    def x_val_next(self):
+        return self.x_val_b if self.use_a else self.x_val_a
+
+
+@dataclass
+class CudaProjectorContextKey64:
+    """Reusable CUDA projector context in Key64 walker space (uint64 keys)."""
+
+    drt_dev: Any
+    ws: Any
+
+    h_base_flat_dev: Any
+    eri_mat_dev: Any
+
+    m: int
+    pivot: int
+    nspawn_one: int
+    nspawn_two: int
+    max_n: int
+    max_evt: int
+
+    threads_spawn: int = 128
+    threads_qmc: int = 256
+    stream: int | None = None
+
+    # Optional alias/pair-norm sampling inputs for the Key64 spawn kernel.
+    pair_alias_prob_dev: Any | None = None
+    pair_alias_idx_dev: Any | None = None
+    pair_norm_dev: Any | None = None
+    pair_norm_sum: float = 0.0
+    pair_sampling_mode: int = 0
+
+    # Ping-pong sparse-vector buffers (capacity m; only prefix [:nnz] is valid).
+    x_key_a: Any | None = None
+    x_val_a: Any | None = None
+    x_key_b: Any | None = None
+    x_val_b: Any | None = None
+    nnz: int = 0
+    use_a: bool = True
+
+    # Preallocated step buffers.
+    key_all: Any | None = None
+    val_all: Any | None = None
+    key_u: Any | None = None
+    val_u: Any | None = None
+    nnz_u: Any | None = None
+    nnz_out: Any | None = None
+
+    def release(self) -> None:
+        if self.ws is not None:
+            self.ws.release()
+        if self.drt_dev is not None:
+            self.drt_dev.release()
+        self.ws = None
+        self.drt_dev = None
+
+    @property
+    def x_key(self):
+        return self.x_key_a if self.use_a else self.x_key_b
+
+    @property
+    def x_val(self):
+        return self.x_val_a if self.use_a else self.x_val_b
+
+    @property
+    def x_key_next(self):
+        return self.x_key_b if self.use_a else self.x_key_a
 
     @property
     def x_val_next(self):
@@ -870,6 +1023,146 @@ def make_cuda_projector_context(
     ctx.idx_all = cp.empty(max_n, dtype=cp.int32)
     ctx.val_all = cp.empty(max_n, dtype=cp.float64)
     ctx.idx_u = cp.empty(max_n, dtype=cp.int32)
+    ctx.val_u = cp.empty(max_n, dtype=cp.float64)
+    ctx.nnz_u = cp.empty(1, dtype=cp.int32)
+    ctx.nnz_out = cp.empty(1, dtype=cp.int32)
+    return ctx
+
+
+def make_cuda_projector_context_key64(
+    drt: Any,
+    h1e: Any,
+    eri: Any,
+    *,
+    m: int,
+    pivot: int,
+    nspawn_one: int,
+    nspawn_two: int,
+    threads_spawn: int = 128,
+    threads_qmc: int = 256,
+    stream: int | None = None,
+    pair_alias_prob: Any | None = None,
+    pair_alias_idx: Any | None = None,
+    pair_norm: Any | None = None,
+    pair_norm_sum: float = 0.0,
+    pair_sampling_mode: int = 0,
+) -> CudaProjectorContextKey64:
+    """Build a reusable CUDA projector context in Key64 walker space.
+
+    Notes
+    -----
+    This requires ``drt.norb <= 32`` so each CSF path can be packed into a 64-bit key
+    (2 bits per orbital step).
+    """
+
+    if cp is None or _guga_cuda_ext is None:  # pragma: no cover
+        raise RuntimeError("CUDA QMC backend unavailable (requires cupy and asuka._guga_cuda_ext)")
+    if not hasattr(_guga_cuda_ext, "QmcWorkspaceU64"):
+        raise RuntimeError("Key64 QMC workspace is unavailable (missing _guga_cuda_ext.QmcWorkspaceU64); rebuild the CUDA extension")
+
+    from asuka.cuguga.oracle import _child_prefix_walks  # noqa: PLC0415
+
+    norb = int(drt.norb)
+    if norb > 32:
+        raise ValueError("Key64 projector context requires drt.norb <= 32")
+    nops = norb * norb
+
+    h1e = np.asarray(h1e, dtype=np.float64).reshape(norb, norb)
+    eri = np.asarray(eri, dtype=np.float64)
+    if eri.ndim == 4:
+        if eri.shape != (norb, norb, norb, norb):
+            raise ValueError("eri4 has wrong shape")
+        eri_mat = eri.reshape(nops, nops)
+        eri4 = eri
+    elif eri.ndim == 2:
+        if eri.shape != (nops, nops):
+            raise ValueError("eri_mat has wrong shape")
+        eri_mat = eri
+        eri4 = eri.reshape(norb, norb, norb, norb)
+    else:
+        raise ValueError("eri must be eri_mat[pq,rs] (2D) or eri4[p,q,r,s] (4D) for CUDA projector")
+
+    h_base = h1e - 0.5 * np.einsum("pqqs->ps", eri4, optimize=True)
+    h_base_flat = h_base.ravel(order="C")
+
+    child_prefix = _child_prefix_walks(drt)
+    drt_dev = _guga_cuda_ext.make_device_drt(
+        int(drt.norb),
+        np.asarray(drt.child),
+        np.asarray(drt.node_twos),
+        np.asarray(child_prefix),
+    )
+
+    if stream is None:
+        stream = int(cp.cuda.get_current_stream().ptr)
+
+    m = int(m)
+    pivot = int(pivot)
+    nspawn_one = int(nspawn_one)
+    nspawn_two = int(nspawn_two)
+    if m < 1:
+        raise ValueError("m must be >= 1")
+    if pivot < 0:
+        raise ValueError("pivot must be >= 0")
+    if nspawn_one < 0 or nspawn_two < 0:
+        raise ValueError("nspawn_one/nspawn_two must be >= 0")
+    if nspawn_one == 0 and nspawn_two == 0:
+        raise ValueError("at least one of nspawn_one/nspawn_two must be > 0")
+
+    pair_sampling_mode = int(pair_sampling_mode)
+    pair_norm_sum = float(pair_norm_sum)
+    pair_alias_prob_dev = None
+    pair_alias_idx_dev = None
+    pair_norm_dev = None
+    if pair_sampling_mode != 0:
+        if pair_sampling_mode != 1:
+            raise ValueError("pair_sampling_mode must be 0 (uniform) or 1 (pair_norm alias)")
+        if pair_alias_prob is None or pair_alias_idx is None or pair_norm is None:
+            raise ValueError("pair_alias_prob/pair_alias_idx/pair_norm must be provided when pair_sampling_mode!=0")
+        if not np.isfinite(pair_norm_sum) or pair_norm_sum <= 0.0:
+            raise ValueError("pair_norm_sum must be finite and > 0 when pair_sampling_mode!=0")
+
+        pair_alias_prob_dev = cp.asarray(pair_alias_prob, dtype=cp.float32).ravel()
+        pair_alias_idx_dev = cp.asarray(pair_alias_idx, dtype=cp.int32).ravel()
+        pair_norm_dev = cp.asarray(pair_norm, dtype=cp.float64).ravel()
+        if int(pair_alias_prob_dev.size) != nops or int(pair_alias_idx_dev.size) != nops or int(pair_norm_dev.size) != nops:
+            raise ValueError(f"pair alias/norm arrays must have length nops={nops}")
+
+    nspawn_total = nspawn_one + nspawn_two
+    max_evt = m * nspawn_total
+    max_n = m * (1 + nspawn_total)
+
+    ws = _guga_cuda_ext.QmcWorkspaceU64(int(max_n), int(m))
+
+    ctx = CudaProjectorContextKey64(
+        drt_dev=drt_dev,
+        ws=ws,
+        h_base_flat_dev=cp.asarray(h_base_flat, dtype=cp.float64),
+        eri_mat_dev=cp.asarray(eri_mat, dtype=cp.float64),
+        m=int(m),
+        pivot=int(pivot),
+        nspawn_one=int(nspawn_one),
+        nspawn_two=int(nspawn_two),
+        max_n=int(max_n),
+        max_evt=int(max_evt),
+        threads_spawn=int(threads_spawn),
+        threads_qmc=int(threads_qmc),
+        stream=int(stream),
+        pair_alias_prob_dev=pair_alias_prob_dev,
+        pair_alias_idx_dev=pair_alias_idx_dev,
+        pair_norm_dev=pair_norm_dev,
+        pair_norm_sum=float(pair_norm_sum),
+        pair_sampling_mode=int(pair_sampling_mode),
+    )
+
+    # Preallocate buffers.
+    ctx.x_key_a = cp.empty(m, dtype=cp.uint64)
+    ctx.x_val_a = cp.empty(m, dtype=cp.float64)
+    ctx.x_key_b = cp.empty(m, dtype=cp.uint64)
+    ctx.x_val_b = cp.empty(m, dtype=cp.float64)
+    ctx.key_all = cp.empty(max_n, dtype=cp.uint64)
+    ctx.val_all = cp.empty(max_n, dtype=cp.float64)
+    ctx.key_u = cp.empty(max_n, dtype=cp.uint64)
     ctx.val_u = cp.empty(max_n, dtype=cp.float64)
     ctx.nnz_u = cp.empty(1, dtype=cp.int32)
     ctx.nnz_out = cp.empty(1, dtype=cp.int32)
@@ -1231,6 +1524,127 @@ def cuda_projector_step_hamiltonian_ws(
         bool(sync),
     )
     nnz_out = int(cp.asnumpy(ctx.nnz_out)[0]) if sync else int(cp.asnumpy(ctx.nnz_out)[0])
+    if nnz_out < 0:
+        nnz_out = 0
+
+    ctx.nnz = nnz_out
+    ctx.use_a = not ctx.use_a
+    return nnz_out
+
+
+def cuda_projector_step_hamiltonian_u64_ws(
+    ctx: CudaProjectorContextKey64,
+    *,
+    eps: float,
+    initiator_t: float,
+    seed_spawn: int,
+    seed_phi: int,
+    scale_identity: float = 1.0,
+    sync: bool = True,
+) -> int:
+    """One Key64 projector step on GPU: spawn + identity merge + coalesce + Φ (workspace path).
+
+    Notes
+    -----
+    Requires ``sync=True`` because the host reads device-written nnz counters
+    before swapping buffers.
+    """
+
+    if cp is None or _guga_cuda_ext is None:  # pragma: no cover
+        raise RuntimeError("CUDA QMC backend unavailable (requires cupy and asuka._guga_cuda_ext)")
+    if not bool(sync):
+        raise ValueError("cuda_projector_step_hamiltonian_u64_ws currently requires sync=True")
+    if ctx.ws is None or ctx.drt_dev is None:
+        raise RuntimeError("CudaProjectorContextKey64 is released")
+    if ctx.x_key is None or ctx.x_val is None or ctx.x_key_next is None or ctx.x_val_next is None:
+        raise RuntimeError("CudaProjectorContextKey64 buffers not initialized")
+    if ctx.key_all is None or ctx.val_all is None:
+        raise RuntimeError("CudaProjectorContextKey64 buffers not initialized")
+    if ctx.key_u is None or ctx.val_u is None or ctx.nnz_u is None or ctx.nnz_out is None:
+        raise RuntimeError("CudaProjectorContextKey64 buffers not initialized")
+
+    nnz = int(ctx.nnz)
+    if nnz <= 0:
+        raise ValueError("current x is empty")
+    if nnz > int(ctx.m):
+        raise ValueError("current nnz exceeds context m")
+
+    if ctx.stream is None:
+        ctx.stream = int(cp.cuda.get_current_stream().ptr)
+
+    nspawn_total = int(ctx.nspawn_one + ctx.nspawn_two)
+    out_len = nnz * nspawn_total
+    all_len = nnz + out_len
+    if all_len > int(ctx.max_n):
+        raise RuntimeError(f"merged buffer length {all_len} exceeds max_n={int(ctx.max_n)}")
+
+    x_key = ctx.x_key[:nnz]
+    x_val = ctx.x_val[:nnz]
+
+    key_all = ctx.key_all
+    val_all = ctx.val_all
+    evt_key = key_all[nnz:all_len]
+    evt_val = val_all[nnz:all_len]
+
+    _guga_cuda_ext.qmc_spawn_hamiltonian_u64_inplace_device(
+        ctx.drt_dev,
+        x_key,
+        x_val,
+        ctx.h_base_flat_dev,
+        ctx.eri_mat_dev,
+        evt_key,
+        evt_val,
+        float(eps),
+        int(ctx.nspawn_one),
+        int(ctx.nspawn_two),
+        int(seed_spawn),
+        float(initiator_t),
+        int(ctx.threads_spawn),
+        int(ctx.stream),
+        False,
+        ctx.pair_alias_prob_dev,
+        ctx.pair_alias_idx_dev,
+        ctx.pair_norm_dev,
+        float(ctx.pair_norm_sum),
+        int(ctx.pair_sampling_mode),
+    )
+
+    # Merge identity and events.
+    key_all[:nnz] = x_key
+    val_all[:nnz] = float(scale_identity) * x_val
+
+    # Coalesce into (key_u, val_u) with out_nnz in nnz_u.
+    ctx.ws.coalesce_coo_u64_f64_inplace_device(
+        key_all,
+        val_all,
+        ctx.key_u,
+        ctx.val_u,
+        ctx.nnz_u,
+        int(all_len),
+        int(ctx.threads_qmc),
+        int(ctx.stream),
+        False,
+    )
+    n_in = int(cp.asnumpy(ctx.nnz_u)[0])
+    if n_in < 0:
+        n_in = 0
+
+    # Φ compression into the next x buffer.
+    ctx.ws.phi_pivot_resample_u64_f64_inplace_device(
+        ctx.key_u,
+        ctx.val_u,
+        ctx.x_key_next,
+        ctx.x_val_next,
+        ctx.nnz_out,
+        int(n_in),
+        int(ctx.m),
+        int(ctx.pivot),
+        int(seed_phi),
+        int(ctx.threads_qmc),
+        int(ctx.stream),
+        bool(sync),
+    )
+    nnz_out = int(cp.asnumpy(ctx.nnz_out)[0])
     if nnz_out < 0:
         nnz_out = 0
 
@@ -2488,6 +2902,71 @@ class CudaFCIQMCContext:
         return self.x_val_b if self.use_a else self.x_val_a
 
 
+@dataclass
+class CudaFCIQMCContextKey64:
+    """Reusable GPU context for repeated Key64 FCIQMC steps (spawn + coalesce, no compression)."""
+
+    drt_dev: Any
+    ws: Any
+
+    h_base_flat_dev: Any
+    eri_mat_dev: Any
+
+    nspawn_one: int
+    nspawn_two: int
+    max_walker: int
+    max_n: int
+    max_evt: int
+
+    threads_spawn: int = 128
+    threads_qmc: int = 256
+    stream: int | None = None
+
+    # Optional alias/pair-norm sampling inputs for the Key64 spawn kernel.
+    pair_alias_prob_dev: Any | None = None
+    pair_alias_idx_dev: Any | None = None
+    pair_norm_dev: Any | None = None
+    pair_norm_sum: float = 0.0
+    pair_sampling_mode: int = 0
+
+    # Ping-pong merged buffers (capacity max_n):
+    # - prefix [:nnz] holds the current sparse vector x (sorted unique by key),
+    # - tail [nnz:nnz+nnz*(nspawn_one+nspawn_two)] is used for spawned events in-place.
+    x_key_a: Any | None = None
+    x_val_a: Any | None = None
+    x_key_b: Any | None = None
+    x_val_b: Any | None = None
+    nnz: int = 0
+    use_a: bool = True
+
+    # Device scalar written by coalesce kernels.
+    nnz_u: Any | None = None
+
+    def release(self) -> None:
+        if self.ws is not None:
+            self.ws.release()
+        if self.drt_dev is not None:
+            self.drt_dev.release()
+        self.ws = None
+        self.drt_dev = None
+
+    @property
+    def x_key(self):
+        return self.x_key_a if self.use_a else self.x_key_b
+
+    @property
+    def x_val(self):
+        return self.x_val_a if self.use_a else self.x_val_b
+
+    @property
+    def x_key_next(self):
+        return self.x_key_b if self.use_a else self.x_key_a
+
+    @property
+    def x_val_next(self):
+        return self.x_val_b if self.use_a else self.x_val_a
+
+
 def make_cuda_fciqmc_context(
     drt: Any,
     h1e: Any,
@@ -2577,6 +3056,129 @@ def make_cuda_fciqmc_context(
     ctx.x_idx_a = cp.empty(max_n, dtype=cp.int32)
     ctx.x_val_a = cp.empty(max_n, dtype=cp.float64)
     ctx.x_idx_b = cp.empty(max_n, dtype=cp.int32)
+    ctx.x_val_b = cp.empty(max_n, dtype=cp.float64)
+    ctx.nnz_u = cp.empty(1, dtype=cp.int32)
+    return ctx
+
+
+def make_cuda_fciqmc_context_key64(
+    drt: Any,
+    h1e: Any,
+    eri: Any,
+    *,
+    max_walker: int,
+    nspawn_one: int,
+    nspawn_two: int,
+    threads_spawn: int = 128,
+    threads_qmc: int = 256,
+    stream: int | None = None,
+    pair_alias_prob: Any | None = None,
+    pair_alias_idx: Any | None = None,
+    pair_norm: Any | None = None,
+    pair_norm_sum: float = 0.0,
+    pair_sampling_mode: int = 0,
+) -> CudaFCIQMCContextKey64:
+    """Build a reusable CUDA FCIQMC context in Key64 walker space (dense-ERI Hamiltonians)."""
+
+    if cp is None or _guga_cuda_ext is None:  # pragma: no cover
+        raise RuntimeError("CUDA QMC backend unavailable (requires cupy and asuka._guga_cuda_ext)")
+    if not hasattr(_guga_cuda_ext, "QmcWorkspaceU64"):
+        raise RuntimeError("Key64 QMC workspace is unavailable (missing _guga_cuda_ext.QmcWorkspaceU64); rebuild the CUDA extension")
+
+    from asuka.cuguga.oracle import _child_prefix_walks  # noqa: PLC0415
+
+    norb = int(drt.norb)
+    if norb > 32:
+        raise ValueError("Key64 FCIQMC context requires drt.norb <= 32")
+    nops = norb * norb
+
+    h1e = np.asarray(h1e, dtype=np.float64).reshape(norb, norb)
+    eri = np.asarray(eri, dtype=np.float64)
+    if eri.ndim == 4:
+        if eri.shape != (norb, norb, norb, norb):
+            raise ValueError("eri4 has wrong shape")
+        eri_mat = eri.reshape(nops, nops)
+        eri4 = eri
+    elif eri.ndim == 2:
+        if eri.shape != (nops, nops):
+            raise ValueError("eri_mat has wrong shape")
+        eri_mat = eri
+        eri4 = eri.reshape(norb, norb, norb, norb)
+    else:
+        raise ValueError("eri must be eri_mat[pq,rs] (2D) or eri4[p,q,r,s] (4D)")
+
+    h_base = h1e - 0.5 * np.einsum("pqqs->ps", eri4, optimize=True)
+
+    child_prefix = _child_prefix_walks(drt)
+    drt_dev = _guga_cuda_ext.make_device_drt(
+        int(drt.norb),
+        np.asarray(drt.child),
+        np.asarray(drt.node_twos),
+        np.asarray(child_prefix),
+    )
+
+    if stream is None:
+        stream = int(cp.cuda.get_current_stream().ptr)
+
+    max_walker = int(max_walker)
+    nspawn_one = int(nspawn_one)
+    nspawn_two = int(nspawn_two)
+    if max_walker < 1:
+        raise ValueError("max_walker must be >= 1")
+    if nspawn_one < 0 or nspawn_two < 0:
+        raise ValueError("nspawn_one/nspawn_two must be >= 0")
+    if nspawn_one == 0 and nspawn_two == 0:
+        raise ValueError("at least one of nspawn_one/nspawn_two must be > 0")
+
+    pair_sampling_mode = int(pair_sampling_mode)
+    pair_norm_sum = float(pair_norm_sum)
+    pair_alias_prob_dev = None
+    pair_alias_idx_dev = None
+    pair_norm_dev = None
+    if pair_sampling_mode != 0:
+        if pair_sampling_mode != 1:
+            raise ValueError("pair_sampling_mode must be 0 (uniform) or 1 (pair_norm alias)")
+        if pair_alias_prob is None or pair_alias_idx is None or pair_norm is None:
+            raise ValueError("pair_alias_prob/pair_alias_idx/pair_norm must be provided when pair_sampling_mode!=0")
+        if not np.isfinite(pair_norm_sum) or pair_norm_sum <= 0.0:
+            raise ValueError("pair_norm_sum must be finite and > 0 when pair_sampling_mode!=0")
+
+        pair_alias_prob_dev = cp.asarray(pair_alias_prob, dtype=cp.float32).ravel()
+        pair_alias_idx_dev = cp.asarray(pair_alias_idx, dtype=cp.int32).ravel()
+        pair_norm_dev = cp.asarray(pair_norm, dtype=cp.float64).ravel()
+        if int(pair_alias_prob_dev.size) != nops or int(pair_alias_idx_dev.size) != nops or int(pair_norm_dev.size) != nops:
+            raise ValueError(f"pair alias/norm arrays must have length nops={nops}")
+
+    nspawn_total = nspawn_one + nspawn_two
+    max_evt = max_walker * nspawn_total
+    max_n = max_walker + max_evt
+
+    # FCIQMC does not use Φ compression; keep max_m small to avoid allocating large Φ scratch.
+    ws = _guga_cuda_ext.QmcWorkspaceU64(int(max_n), 1)
+
+    ctx = CudaFCIQMCContextKey64(
+        drt_dev=drt_dev,
+        ws=ws,
+        h_base_flat_dev=cp.asarray(h_base.ravel(order="C"), dtype=cp.float64),
+        eri_mat_dev=cp.asarray(eri_mat, dtype=cp.float64),
+        nspawn_one=nspawn_one,
+        nspawn_two=nspawn_two,
+        max_walker=max_walker,
+        max_n=max_n,
+        max_evt=max_evt,
+        threads_spawn=int(threads_spawn),
+        threads_qmc=int(threads_qmc),
+        stream=int(stream),
+        pair_alias_prob_dev=pair_alias_prob_dev,
+        pair_alias_idx_dev=pair_alias_idx_dev,
+        pair_norm_dev=pair_norm_dev,
+        pair_norm_sum=float(pair_norm_sum),
+        pair_sampling_mode=int(pair_sampling_mode),
+    )
+
+    ctx.x_key_a = cp.empty(max_n, dtype=cp.uint64)
+    ctx.x_val_a = cp.empty(max_n, dtype=cp.float64)
+    ctx.x_key_b = cp.empty(max_n, dtype=cp.uint64)
     ctx.x_val_b = cp.empty(max_n, dtype=cp.float64)
     ctx.nnz_u = cp.empty(1, dtype=cp.int32)
     return ctx
@@ -2692,6 +3294,109 @@ def cuda_fciqmc_step_hamiltonian_ws(
         x_idx,
         x_val,
         ctx.x_idx_next,
+        ctx.x_val_next,
+        ctx.nnz_u,
+        int(all_len),
+        int(ctx.threads_qmc),
+        int(ctx.stream),
+        bool(sync),
+    )
+    n_out = int(cp.asnumpy(ctx.nnz_u)[0])
+    if n_out < 0:
+        n_out = 0
+    if n_out > int(ctx.max_walker):
+        raise RuntimeError(
+            f"walker population after coalescing ({n_out}) exceeds max_walker ({ctx.max_walker}). "
+            "Increase max_walker or tighten population control."
+        )
+
+    ctx.nnz = n_out
+    ctx.use_a = not ctx.use_a
+    return n_out
+
+
+def cuda_fciqmc_step_hamiltonian_u64_ws(
+    ctx: CudaFCIQMCContextKey64,
+    *,
+    dt: float,
+    shift: float,
+    initiator_t: float = 0.0,
+    seed_spawn: int,
+    sync: bool = True,
+) -> int:
+    """One Key64 FCIQMC step on GPU: spawn + shift-scale + coalesce (no compression).
+
+    Applies ``x <- (1 + dt*S)*x - dt*H*x`` entirely on device.
+
+    Notes
+    -----
+    Requires ``sync=True`` because the host reads ``nnz_u`` to update ``ctx.nnz``.
+    """
+
+    if cp is None or _guga_cuda_ext is None:  # pragma: no cover
+        raise RuntimeError("CUDA QMC backend unavailable (requires cupy and asuka._guga_cuda_ext)")
+    if not bool(sync):
+        raise ValueError("cuda_fciqmc_step_hamiltonian_u64_ws currently requires sync=True")
+    if ctx.ws is None or ctx.drt_dev is None:
+        raise RuntimeError("CudaFCIQMCContextKey64 is released")
+
+    nnz = int(ctx.nnz)
+    if nnz <= 0:
+        raise ValueError("current x is empty")
+    if nnz > int(ctx.max_walker):
+        raise ValueError(f"current nnz={nnz} exceeds max_walker={ctx.max_walker}")
+
+    if ctx.stream is None:
+        ctx.stream = int(cp.cuda.get_current_stream().ptr)
+
+    if ctx.x_key is None or ctx.x_val is None or ctx.x_key_next is None or ctx.x_val_next is None or ctx.nnz_u is None:
+        raise RuntimeError("CudaFCIQMCContextKey64 buffers not initialized")
+
+    nspawn_total = int(ctx.nspawn_one + ctx.nspawn_two)
+    out_len = nnz * nspawn_total
+    all_len = nnz + out_len
+
+    x_key = ctx.x_key
+    x_val = ctx.x_val
+    x_key_cur = x_key[:nnz]
+    x_val_cur = x_val[:nnz]
+
+    # Spawn events directly into the tail of the current buffer (merged input).
+    evt_key = x_key[nnz:all_len]
+    evt_val = x_val[nnz:all_len]
+
+    # Spawn: fills evt_key/evt_val with -dt*H*x events (UINT64_MAX sentinel for invalid slots).
+    _guga_cuda_ext.qmc_spawn_hamiltonian_u64_inplace_device(
+        ctx.drt_dev,
+        x_key_cur,
+        x_val_cur,
+        ctx.h_base_flat_dev,
+        ctx.eri_mat_dev,
+        evt_key,
+        evt_val,
+        float(dt),
+        int(ctx.nspawn_one),
+        int(ctx.nspawn_two),
+        int(seed_spawn),
+        float(initiator_t),
+        int(ctx.threads_spawn),
+        int(ctx.stream),
+        False,
+        ctx.pair_alias_prob_dev,
+        ctx.pair_alias_idx_dev,
+        ctx.pair_norm_dev,
+        float(ctx.pair_norm_sum),
+        int(ctx.pair_sampling_mode),
+    )
+
+    # Merge: scale the identity term in-place in the prefix; events are already in the tail.
+    x_val_cur *= float(1.0 + dt * shift)
+
+    # Coalesce (sort + reduce; UINT64_MAX sentinel contributes zero and is excluded via zero-pruning).
+    ctx.ws.coalesce_coo_u64_f64_inplace_device(
+        x_key,
+        x_val,
+        ctx.x_key_next,
         ctx.x_val_next,
         ctx.nnz_u,
         int(all_len),

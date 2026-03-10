@@ -80,6 +80,8 @@ def run_fciqmc(
     preferred_ref_idx: int | None = None,
     initiator_t: float = 0.0,
     use_state_cache: bool = True,
+    key64_pair_norm: np.ndarray | None = None,
+    key64_pair_sampling_mode: int = 0,
 ) -> FCIQMCRun:
     """Single-root CSF-native FCIQMC loop.
 
@@ -115,8 +117,8 @@ def run_fciqmc(
         raise ValueError("energy_estimator must be 'projected' or 'rayleigh'")
 
     backend_s = str(backend).lower()
-    if backend_s not in ("cpu", "cuda"):
-        raise ValueError("backend must be 'cpu' or 'cuda'")
+    if backend_s not in ("cpu", "cuda", "cuda_key64"):
+        raise ValueError("backend must be 'cpu', 'cuda', or 'cuda_key64'")
 
     x_idx_u, x_val_u = coalesce_coo_i32_f64(x_idx, x_val)
     if x_idx_u.size == 0:
@@ -179,6 +181,36 @@ def run_fciqmc(
             energies=energies,
             ref_hist=ref_hist,
             e_pos=e_pos,
+        )
+    if backend_s == "cuda_key64":
+        return _run_fciqmc_cuda_key64(
+            drt=drt,
+            h1e=h1e,
+            eri=eri,
+            x_idx_u=x_idx_u,
+            x_val_u=x_val_u,
+            dt=dt,
+            niter=niter,
+            nspawn_one=nspawn_one,
+            nspawn_two=nspawn_two,
+            seed=seed,
+            max_walker=max_walker,
+            shift=shift,
+            tgt_pop=tgt_pop,
+            shift_damping=float(shift_damping),
+            shift_stride=int(shift_stride),
+            shift_start=int(shift_start),
+            energy_stride=int(energy_stride),
+            energy_estimator=str(energy_estimator),
+            preferred_ref_idx=preferred_ref_idx,
+            initiator_t=float(initiator_t),
+            pops=pops,
+            shifts=shifts,
+            energies=energies,
+            ref_hist=ref_hist,
+            e_pos=e_pos,
+            key64_pair_norm=key64_pair_norm,
+            key64_pair_sampling_mode=int(key64_pair_sampling_mode),
         )
 
     # CPU path
@@ -341,6 +373,164 @@ def _run_fciqmc_cuda(
         nnz_final = int(ctx.nnz)
         x_idx_out = cp.asnumpy(ctx.x_idx[:nnz_final]).astype(np.int32, copy=False)
         x_val_out = cp.asnumpy(ctx.x_val[:nnz_final]).astype(np.float64, copy=False)
+    finally:
+        ctx.release()
+
+    return FCIQMCRun(
+        idx=x_idx_out,
+        val=x_val_out,
+        energies=energies,
+        shifts=shifts,
+        populations=pops,
+        ref_idx=ref_hist,
+        energy_estimator=energy_estimator,
+    )
+
+
+def _run_fciqmc_cuda_key64(
+    *,
+    drt,
+    h1e,
+    eri,
+    x_idx_u: np.ndarray,
+    x_val_u: np.ndarray,
+    dt: float,
+    niter: int,
+    nspawn_one: int,
+    nspawn_two: int,
+    seed: int,
+    max_walker: int | None,
+    shift: float,
+    tgt_pop: float,
+    shift_damping: float,
+    shift_stride: int,
+    shift_start: int,
+    energy_stride: int,
+    energy_estimator: str,
+    preferred_ref_idx: int | None,
+    initiator_t: float,
+    pops: np.ndarray,
+    shifts: np.ndarray,
+    energies: np.ndarray,
+    ref_hist: np.ndarray,
+    e_pos: int,
+    key64_pair_norm: np.ndarray | None,
+    key64_pair_sampling_mode: int,
+) -> FCIQMCRun:
+    from .cuda_backend import (  # noqa: PLC0415
+        csf_idx_to_key64_host,
+        cuda_fciqmc_step_hamiltonian_u64_ws,
+        key64_to_csf_idx_host,
+        make_cuda_fciqmc_context_key64,
+    )
+
+    norb = int(drt.norb)
+    if norb > 32:
+        raise ValueError("backend='cuda_key64' requires drt.norb <= 32")
+
+    if max_walker is None:
+        # Default: 4x initial nnz, clamped to at least 1024
+        max_walker = max(1024, 4 * int(x_idx_u.size))
+    max_walker = int(max_walker)
+
+    pair_sampling_mode = int(key64_pair_sampling_mode)
+    pair_norm = None
+    pair_alias_prob = None
+    pair_alias_idx = None
+    pair_norm_sum = 0.0
+    if pair_sampling_mode != 0:
+        from .alias import build_alias_table_from_weights  # noqa: PLC0415
+
+        if key64_pair_norm is None:
+            raise ValueError("key64_pair_norm must be provided when key64_pair_sampling_mode!=0")
+        alias = build_alias_table_from_weights(np.asarray(key64_pair_norm, dtype=np.float64).ravel())
+        pair_norm = np.asarray(key64_pair_norm, dtype=np.float64).ravel()
+        pair_alias_prob = alias.prob
+        pair_alias_idx = alias.alias
+        pair_norm_sum = float(alias.weight_sum)
+
+    ctx = make_cuda_fciqmc_context_key64(
+        drt,
+        h1e,
+        eri,
+        max_walker=max_walker,
+        nspawn_one=int(nspawn_one),
+        nspawn_two=int(nspawn_two),
+        pair_alias_prob=pair_alias_prob,
+        pair_alias_idx=pair_alias_idx,
+        pair_norm=pair_norm,
+        pair_norm_sum=float(pair_norm_sum),
+        pair_sampling_mode=int(pair_sampling_mode),
+    )
+
+    # Upload initial vector (convert CSF indices -> Key64).
+    nnz0 = int(x_idx_u.size)
+    import cupy as cp  # noqa: PLC0415
+
+    key0 = csf_idx_to_key64_host(drt, x_idx_u, state_cache=None)
+    order0 = np.argsort(key0)
+    key0 = np.asarray(key0[order0], dtype=np.uint64, order="C")
+    val0 = np.asarray(x_val_u[order0], dtype=np.float64, order="C")
+    ctx.x_key[:nnz0] = cp.asarray(key0, dtype=cp.uint64)
+    ctx.x_val[:nnz0] = cp.asarray(val0, dtype=cp.float64)
+    ctx.nnz = nnz0
+
+    try:
+        pops_dev = cp.empty(int(niter) + 1, dtype=cp.float64)
+        for it in range(1, niter + 1):
+            cuda_fciqmc_step_hamiltonian_u64_ws(
+                ctx,
+                dt=dt,
+                shift=shift,
+                initiator_t=float(initiator_t),
+                seed_spawn=int(seed) + it,
+                sync=True,
+            )
+
+            nnz_now = int(ctx.nnz)
+            pop_dev = cp.sum(cp.abs(ctx.x_val[:nnz_now]))
+            pops_dev[it] = pop_dev
+            shifts[it] = shift
+
+            if it >= shift_start and (it % shift_stride == 0):
+                pop = float(pop_dev.get())
+                shift = update_shift(
+                    shift,
+                    pop,
+                    target_population=tgt_pop,
+                    dt=dt,
+                    damping=float(shift_damping),
+                )
+
+            if it % energy_stride == 0:
+                # Full vector download only on energy evaluation steps.
+                x_key_h = cp.asnumpy(ctx.x_key[:nnz_now]).astype(np.uint64, copy=False)
+                x_val_h = cp.asnumpy(ctx.x_val[:nnz_now]).astype(np.float64, copy=False)
+                x_idx_h = key64_to_csf_idx_host(drt, x_key_h, strict=True)
+                order = np.argsort(x_idx_h)
+                x_idx_h = np.asarray(x_idx_h[order], dtype=np.int32, order="C")
+                x_val_h = np.asarray(x_val_h[order], dtype=np.float64, order="C")
+
+                ref = choose_reference_index(x_idx_h, x_val_h, preferred=preferred_ref_idx)
+                if energy_estimator == "rayleigh":
+                    e, _, _ = rayleigh_energy_ref(drt, h1e, eri, x_idx_h, x_val_h)
+                else:
+                    e, _, _ = projected_energy_ref(drt, h1e, eri, x_idx_h, x_val_h, ref_idx=ref)
+                energies[e_pos] = float(e)
+                ref_hist[e_pos] = np.int32(ref)
+                e_pos += 1
+
+        # Final download.
+        if niter >= 1:
+            pops[1:] = cp.asnumpy(pops_dev[1:]).astype(np.float64, copy=False)
+
+        nnz_final = int(ctx.nnz)
+        x_key_out = cp.asnumpy(ctx.x_key[:nnz_final]).astype(np.uint64, copy=False)
+        x_val_out = cp.asnumpy(ctx.x_val[:nnz_final]).astype(np.float64, copy=False)
+        x_idx_out = key64_to_csf_idx_host(drt, x_key_out, strict=True)
+        order = np.argsort(x_idx_out)
+        x_idx_out = np.asarray(x_idx_out[order], dtype=np.int32, order="C")
+        x_val_out = np.asarray(x_val_out[order], dtype=np.float64, order="C")
     finally:
         ctx.release()
 

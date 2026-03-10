@@ -340,6 +340,7 @@ __global__ __launch_bounds__(256, 2)
 void hb_fused_dfs_kernel(
     const int32_t* __restrict__ sel_idx,
     const double*  __restrict__ c_root,
+    int c_root_stride,
     int nsel,
     int root,
     const int8_t*  __restrict__ steps_table,
@@ -374,7 +375,7 @@ void hb_fused_dfs_kernel(
         if (threadIdx.x == 0) atomicExch(overflow_flag, 1);
         return;
     }
-    double cj = c_root[j_local];
+    double cj = c_root[(int64_t)j_local * (int64_t)c_root_stride];
     double abs_cj = fabs(cj);
     if (abs_cj == 0.0) return;
     if (norb > MAX_NORB_T) {
@@ -675,7 +676,7 @@ extern "C" cudaError_t guga_hb_screen_and_apply_launch_stream(
     // Phase-3 fused DFS path: no materialized g_flat shared buffer.
     if (norb <= 16) {
         hb_fused_dfs_kernel<16><<<nsel, threads, 0, stream>>>(
-            sel_idx, c_root, nsel, root,
+            sel_idx, c_root, /*c_root_stride=*/1, nsel, root,
             steps_table, nodes_table, norb, ncsf,
             h1_pq, h1_abs, h1_signed, n_h1,
             pq_ptr, rs_idx, v_abs, v_signed, pq_max_v, eps,
@@ -683,7 +684,7 @@ extern "C" cudaError_t guga_hb_screen_and_apply_launch_stream(
             hash_keys, hash_vals, cap, selected_mask, overflow_flag);
     } else if (norb <= 24) {
         hb_fused_dfs_kernel<24><<<nsel, threads, 0, stream>>>(
-            sel_idx, c_root, nsel, root,
+            sel_idx, c_root, /*c_root_stride=*/1, nsel, root,
             steps_table, nodes_table, norb, ncsf,
             h1_pq, h1_abs, h1_signed, n_h1,
             pq_ptr, rs_idx, v_abs, v_signed, pq_max_v, eps,
@@ -691,7 +692,7 @@ extern "C" cudaError_t guga_hb_screen_and_apply_launch_stream(
             hash_keys, hash_vals, cap, selected_mask, overflow_flag);
     } else if (norb <= 32) {
         hb_fused_dfs_kernel<32><<<nsel, threads, 0, stream>>>(
-            sel_idx, c_root, nsel, root,
+            sel_idx, c_root, /*c_root_stride=*/1, nsel, root,
             steps_table, nodes_table, norb, ncsf,
             h1_pq, h1_abs, h1_signed, n_h1,
             pq_ptr, rs_idx, v_abs, v_signed, pq_max_v, eps,
@@ -699,7 +700,7 @@ extern "C" cudaError_t guga_hb_screen_and_apply_launch_stream(
             hash_keys, hash_vals, cap, selected_mask, overflow_flag);
     } else if (norb <= 48) {
         hb_fused_dfs_kernel<48><<<nsel, threads, 0, stream>>>(
-            sel_idx, c_root, nsel, root,
+            sel_idx, c_root, /*c_root_stride=*/1, nsel, root,
             steps_table, nodes_table, norb, ncsf,
             h1_pq, h1_abs, h1_signed, n_h1,
             pq_ptr, rs_idx, v_abs, v_signed, pq_max_v, eps,
@@ -707,7 +708,7 @@ extern "C" cudaError_t guga_hb_screen_and_apply_launch_stream(
             hash_keys, hash_vals, cap, selected_mask, overflow_flag);
     } else {
         hb_fused_dfs_kernel<64><<<nsel, threads, 0, stream>>>(
-            sel_idx, c_root, nsel, root,
+            sel_idx, c_root, /*c_root_stride=*/1, nsel, root,
             steps_table, nodes_table, norb, ncsf,
             h1_pq, h1_abs, h1_signed, n_h1,
             pq_ptr, rs_idx, v_abs, v_signed, pq_max_v, eps,
@@ -715,4 +716,89 @@ extern "C" cudaError_t guga_hb_screen_and_apply_launch_stream(
             hash_keys, hash_vals, cap, selected_mask, overflow_flag);
     }
     return cudaGetLastError();
+}
+
+extern "C" cudaError_t guga_hb_screen_and_apply_many_roots_launch_stream(
+    const int32_t* sel_idx,
+    const double*  c_sel_row_major,  // [nsel, nroots], C-order
+    int nsel,
+    int nroots,
+    const int8_t*  steps_table,
+    const int32_t* nodes_table,
+    int norb,
+    int ncsf,
+    const int32_t* h1_pq,
+    const double*  h1_abs,
+    const double*  h1_signed,
+    int n_h1,
+    const int64_t* pq_ptr,
+    const int32_t* rs_idx,
+    const double*  v_abs,
+    const double*  v_signed,
+    const double*  pq_max_v,
+    double eps,
+    const int32_t* child_table,
+    const int16_t* node_twos,
+    const int64_t* child_prefix,
+    int nnodes,
+    int32_t* hash_keys,
+    double*  hash_vals,
+    int cap,
+    const uint8_t* selected_mask,
+    int* overflow_flag,
+    cudaStream_t stream,
+    int threads)
+{
+    if (!sel_idx || !c_sel_row_major) return cudaErrorInvalidValue;
+    if (nsel <= 0 || nroots <= 0) return cudaSuccess;
+    if (norb <= 0 || norb > 64) return cudaErrorInvalidValue;
+    if (threads <= 0 || threads > 1024) return cudaErrorInvalidValue;
+
+    for (int root = 0; root < nroots; root++) {
+        const double* c_root = c_sel_row_major + (int64_t)root;
+        if (norb <= 16) {
+            hb_fused_dfs_kernel<16><<<nsel, threads, 0, stream>>>(
+                sel_idx, c_root, /*c_root_stride=*/nroots, nsel, root,
+                steps_table, nodes_table, norb, ncsf,
+                h1_pq, h1_abs, h1_signed, n_h1,
+                pq_ptr, rs_idx, v_abs, v_signed, pq_max_v, eps,
+                child_table, node_twos, child_prefix, nnodes,
+                hash_keys, hash_vals, cap, selected_mask, overflow_flag);
+        } else if (norb <= 24) {
+            hb_fused_dfs_kernel<24><<<nsel, threads, 0, stream>>>(
+                sel_idx, c_root, /*c_root_stride=*/nroots, nsel, root,
+                steps_table, nodes_table, norb, ncsf,
+                h1_pq, h1_abs, h1_signed, n_h1,
+                pq_ptr, rs_idx, v_abs, v_signed, pq_max_v, eps,
+                child_table, node_twos, child_prefix, nnodes,
+                hash_keys, hash_vals, cap, selected_mask, overflow_flag);
+        } else if (norb <= 32) {
+            hb_fused_dfs_kernel<32><<<nsel, threads, 0, stream>>>(
+                sel_idx, c_root, /*c_root_stride=*/nroots, nsel, root,
+                steps_table, nodes_table, norb, ncsf,
+                h1_pq, h1_abs, h1_signed, n_h1,
+                pq_ptr, rs_idx, v_abs, v_signed, pq_max_v, eps,
+                child_table, node_twos, child_prefix, nnodes,
+                hash_keys, hash_vals, cap, selected_mask, overflow_flag);
+        } else if (norb <= 48) {
+            hb_fused_dfs_kernel<48><<<nsel, threads, 0, stream>>>(
+                sel_idx, c_root, /*c_root_stride=*/nroots, nsel, root,
+                steps_table, nodes_table, norb, ncsf,
+                h1_pq, h1_abs, h1_signed, n_h1,
+                pq_ptr, rs_idx, v_abs, v_signed, pq_max_v, eps,
+                child_table, node_twos, child_prefix, nnodes,
+                hash_keys, hash_vals, cap, selected_mask, overflow_flag);
+        } else {
+            hb_fused_dfs_kernel<64><<<nsel, threads, 0, stream>>>(
+                sel_idx, c_root, /*c_root_stride=*/nroots, nsel, root,
+                steps_table, nodes_table, norb, ncsf,
+                h1_pq, h1_abs, h1_signed, n_h1,
+                pq_ptr, rs_idx, v_abs, v_signed, pq_max_v, eps,
+                child_table, node_twos, child_prefix, nnodes,
+                hash_keys, hash_vals, cap, selected_mask, overflow_flag);
+        }
+        cudaError_t err = cudaGetLastError();
+        if (err != cudaSuccess) return err;
+    }
+    return cudaSuccess;
 }

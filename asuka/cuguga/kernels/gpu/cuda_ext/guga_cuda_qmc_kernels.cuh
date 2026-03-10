@@ -2134,6 +2134,21 @@ __global__ void qmc_pack_abs_and_pairs_kernel(const int32_t* idx, const double* 
   pair_out[i].val = v;
 }
 
+__global__ void qmc_pack_abs_and_pairs_u64_kernel(
+    const uint64_t* __restrict__ key,
+    const double* __restrict__ val,
+    double* __restrict__ abs_out,
+    QmcKeyValU64* __restrict__ pair_out,
+    int n) {
+  int i = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+  if (i >= n) return;
+  uint64_t k = key[i];
+  double v = val[i];
+  abs_out[i] = fabs(v);
+  pair_out[i].key = k;
+  pair_out[i].val = v;
+}
+
 __device__ __forceinline__ int lower_bound_cdf_f64(const double* __restrict__ cdf, int n, double x) {
   int lo = 0;
   int hi = n;
@@ -2185,6 +2200,42 @@ __global__ void qmc_systematic_resample_kernel(
   out_val[k] = (it.val >= 0.0 ? 1.0 : -1.0) * step;
 }
 
+__global__ void qmc_systematic_resample_u64_kernel(
+    const QmcKeyValU64* __restrict__ pairs_r,
+    const double* __restrict__ cdf_r,
+    int r_len,
+    int k_samp,
+    uint64_t seed,
+    uint64_t* __restrict__ out_key,
+    double* __restrict__ out_val) {
+  int k = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+  if (k >= k_samp) return;
+  if (r_len <= 0) {
+    out_key[k] = 0xffffffffffffffffull;
+    out_val[k] = 0.0;
+    return;
+  }
+
+  double W = cdf_r[r_len - 1];
+  if (W <= 0.0) {
+    out_key[k] = 0xffffffffffffffffull;
+    out_val[k] = 0.0;
+    return;
+  }
+
+  double step = W / (double)k_samp;
+  uint64_t st = seed;
+  double u0 = rand_u01(&st) * step;
+  double u = u0 + (double)k * step;
+  int pos = lower_bound_cdf_f64(cdf_r, r_len, u);
+  if (pos < 0) pos = 0;
+  if (pos >= r_len) pos = r_len - 1;
+
+  QmcKeyValU64 it = pairs_r[pos];
+  out_key[k] = it.key;
+  out_val[k] = (it.val >= 0.0 ? 1.0 : -1.0) * step;
+}
+
 __global__ void qmc_build_phi_buffer_kernel(
     const QmcIdxVal* __restrict__ pairs_sorted,
     int n_in,
@@ -2204,6 +2255,29 @@ __global__ void qmc_build_phi_buffer_kernel(
   } else {
     int k = i - p_piv;
     out_idx[i] = samp_idx[k];
+    out_val[i] = samp_val[k];
+  }
+}
+
+__global__ void qmc_build_phi_buffer_u64_kernel(
+    const QmcKeyValU64* __restrict__ pairs_sorted,
+    int n_in,
+    int p_piv,
+    const uint64_t* __restrict__ samp_key,
+    const double* __restrict__ samp_val,
+    int k_samp,
+    uint64_t* __restrict__ out_key,
+    double* __restrict__ out_val) {
+  int i = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+  int n_out = p_piv + k_samp;
+  if (i >= n_out) return;
+  if (i < p_piv) {
+    QmcKeyValU64 it = pairs_sorted[i];
+    out_key[i] = it.key;
+    out_val[i] = it.val;
+  } else {
+    int k = i - p_piv;
+    out_key[i] = samp_key[k];
     out_val[i] = samp_val[k];
   }
 }
@@ -2363,6 +2437,160 @@ extern "C" cudaError_t guga_qmc_phi_pivot_resample_i32_f64_launch_stream(
   }
 
   return guga_qmc_coalesce_coo_i32_f64_launch_stream(d_idx_buf.get(), d_val_buf.get(), m, idx_out, val_out, out_nnz, stream, threads);
+}
+
+extern "C" cudaError_t guga_qmc_phi_pivot_resample_u64_f64_launch_stream(
+    const uint64_t* key_in,
+    const double* val_in,
+    int n_in,
+    uint64_t* key_out,
+    double* val_out,
+    int* out_nnz,
+    int m,
+    int pivot,
+    uint64_t seed,
+    cudaStream_t stream,
+    int threads) {
+  if (!key_in || !val_in || !key_out || !val_out || !out_nnz) return cudaErrorInvalidValue;
+  if (n_in < 0 || m < 0 || pivot < 0) return cudaErrorInvalidValue;
+  if (threads <= 0 || threads > 1024) return cudaErrorInvalidValue;
+
+  if (n_in == 0 || m == 0) {
+    return cudaMemsetAsync(out_nnz, 0, sizeof(int), stream);
+  }
+
+  if (n_in <= m) {
+    cudaError_t err = cudaMemcpyAsync(key_out, key_in, (size_t)n_in * sizeof(uint64_t), cudaMemcpyDeviceToDevice, stream);
+    if (err != cudaSuccess) return err;
+    err = cudaMemcpyAsync(val_out, val_in, (size_t)n_in * sizeof(double), cudaMemcpyDeviceToDevice, stream);
+    if (err != cudaSuccess) return err;
+    err = cudaMemcpyAsync(out_nnz, &n_in, sizeof(int), cudaMemcpyHostToDevice, stream);
+    return err;
+  }
+
+  int p = pivot;
+  if (p > m) p = m;
+  if (p > n_in) p = n_in;
+  int k_samp = m - p;
+  int r_len = n_in - p;
+
+  // Sort by |val| descending.
+  double* d_abs_a_raw = nullptr;
+  double* d_abs_b_raw = nullptr;
+  QmcKeyValU64* d_pair_a_raw = nullptr;
+  QmcKeyValU64* d_pair_b_raw = nullptr;
+  cudaError_t err = guga_cuda_malloc(&d_abs_a_raw, (size_t)n_in * sizeof(double), stream);
+  if (err != cudaSuccess) return err;
+  err = guga_cuda_malloc(&d_abs_b_raw, (size_t)n_in * sizeof(double), stream);
+  if (err != cudaSuccess) return err;
+  err = guga_cuda_malloc(&d_pair_a_raw, (size_t)n_in * sizeof(QmcKeyValU64), stream);
+  if (err != cudaSuccess) return err;
+  err = guga_cuda_malloc(&d_pair_b_raw, (size_t)n_in * sizeof(QmcKeyValU64), stream);
+  if (err != cudaSuccess) return err;
+  cuda_unique_ptr_stream<double> d_abs_a(d_abs_a_raw, CudaFreeStreamDeleter<double>{stream});
+  cuda_unique_ptr_stream<double> d_abs_b(d_abs_b_raw, CudaFreeStreamDeleter<double>{stream});
+  cuda_unique_ptr_stream<QmcKeyValU64> d_pair_a(d_pair_a_raw, CudaFreeStreamDeleter<QmcKeyValU64>{stream});
+  cuda_unique_ptr_stream<QmcKeyValU64> d_pair_b(d_pair_b_raw, CudaFreeStreamDeleter<QmcKeyValU64>{stream});
+
+  {
+    int blocks = (n_in + threads - 1) / threads;
+    qmc_pack_abs_and_pairs_u64_kernel<<<blocks, threads, 0, stream>>>(key_in, val_in, d_abs_a.get(), d_pair_a.get(), n_in);
+    err = cudaGetLastError();
+    if (err != cudaSuccess) return err;
+  }
+
+  cub::DoubleBuffer<double> keys(d_abs_a.get(), d_abs_b.get());
+  cub::DoubleBuffer<QmcKeyValU64> vals(d_pair_a.get(), d_pair_b.get());
+
+  size_t temp_sort = 0;
+  err = cub::DeviceRadixSort::SortPairsDescending(nullptr, temp_sort, keys, vals, n_in, 0, 64, stream);
+  if (err != cudaSuccess) return err;
+  void* d_temp_sort_raw = nullptr;
+  err = guga_cuda_malloc(&d_temp_sort_raw, temp_sort, stream);
+  if (err != cudaSuccess) return err;
+  cuda_unique_ptr_stream<void> d_temp_sort((void*)d_temp_sort_raw, CudaFreeStreamDeleter<void>{stream});
+
+  err = cub::DeviceRadixSort::SortPairsDescending(d_temp_sort.get(), temp_sort, keys, vals, n_in, 0, 64, stream);
+  if (err != cudaSuccess) return err;
+
+  const QmcKeyValU64* d_pairs_sorted = vals.Current();
+  const double* d_abs_sorted = keys.Current();
+
+  // If we have no sampling mass, fall back to pivots-only.
+  if (k_samp <= 0 || r_len <= 0) {
+    uint64_t* d_key_buf_raw = nullptr;
+    double* d_val_buf_raw = nullptr;
+    err = guga_cuda_malloc(&d_key_buf_raw, (size_t)p * sizeof(uint64_t), stream);
+    if (err != cudaSuccess) return err;
+    err = guga_cuda_malloc(&d_val_buf_raw, (size_t)p * sizeof(double), stream);
+    if (err != cudaSuccess) return err;
+    cuda_unique_ptr_stream<uint64_t> d_key_buf(d_key_buf_raw, CudaFreeStreamDeleter<uint64_t>{stream});
+    cuda_unique_ptr_stream<double> d_val_buf(d_val_buf_raw, CudaFreeStreamDeleter<double>{stream});
+
+    {
+      int blocks = (p + threads - 1) / threads;
+      qmc_build_phi_buffer_u64_kernel<<<blocks, threads, 0, stream>>>(d_pairs_sorted, n_in, p, nullptr, nullptr, 0, d_key_buf.get(), d_val_buf.get());
+      err = cudaGetLastError();
+      if (err != cudaSuccess) return err;
+    }
+
+    return guga_qmc_coalesce_coo_u64_f64_launch_stream(d_key_buf.get(), d_val_buf.get(), p, key_out, val_out, out_nnz, stream, threads);
+  }
+
+  // Remainder CDF via inclusive scan on |val| for entries [p, n_in).
+  double* d_cdf_raw = nullptr;
+  err = guga_cuda_malloc(&d_cdf_raw, (size_t)r_len * sizeof(double), stream);
+  if (err != cudaSuccess) return err;
+  cuda_unique_ptr_stream<double> d_cdf(d_cdf_raw, CudaFreeStreamDeleter<double>{stream});
+
+  size_t temp_scan = 0;
+  err = cub::DeviceScan::InclusiveSum(nullptr, temp_scan, d_abs_sorted + p, d_cdf.get(), r_len, stream);
+  if (err != cudaSuccess) return err;
+  void* d_temp_scan_raw = nullptr;
+  err = guga_cuda_malloc(&d_temp_scan_raw, temp_scan, stream);
+  if (err != cudaSuccess) return err;
+  cuda_unique_ptr_stream<void> d_temp_scan((void*)d_temp_scan_raw, CudaFreeStreamDeleter<void>{stream});
+
+  err = cub::DeviceScan::InclusiveSum(d_temp_scan.get(), temp_scan, d_abs_sorted + p, d_cdf.get(), r_len, stream);
+  if (err != cudaSuccess) return err;
+
+  // Sample K keys/values.
+  uint64_t* d_samp_key_raw = nullptr;
+  double* d_samp_val_raw = nullptr;
+  err = guga_cuda_malloc(&d_samp_key_raw, (size_t)k_samp * sizeof(uint64_t), stream);
+  if (err != cudaSuccess) return err;
+  err = guga_cuda_malloc(&d_samp_val_raw, (size_t)k_samp * sizeof(double), stream);
+  if (err != cudaSuccess) return err;
+  cuda_unique_ptr_stream<uint64_t> d_samp_key(d_samp_key_raw, CudaFreeStreamDeleter<uint64_t>{stream});
+  cuda_unique_ptr_stream<double> d_samp_val(d_samp_val_raw, CudaFreeStreamDeleter<double>{stream});
+
+  {
+    int blocks = (k_samp + threads - 1) / threads;
+    qmc_systematic_resample_u64_kernel<<<blocks, threads, 0, stream>>>(
+        d_pairs_sorted + p, d_cdf.get(), r_len, k_samp, seed, d_samp_key.get(), d_samp_val.get());
+    err = cudaGetLastError();
+    if (err != cudaSuccess) return err;
+  }
+
+  // Build (pivot + samples) buffer of length m, then coalesce by key.
+  uint64_t* d_key_buf_raw = nullptr;
+  double* d_val_buf_raw = nullptr;
+  err = guga_cuda_malloc(&d_key_buf_raw, (size_t)m * sizeof(uint64_t), stream);
+  if (err != cudaSuccess) return err;
+  err = guga_cuda_malloc(&d_val_buf_raw, (size_t)m * sizeof(double), stream);
+  if (err != cudaSuccess) return err;
+  cuda_unique_ptr_stream<uint64_t> d_key_buf(d_key_buf_raw, CudaFreeStreamDeleter<uint64_t>{stream});
+  cuda_unique_ptr_stream<double> d_val_buf(d_val_buf_raw, CudaFreeStreamDeleter<double>{stream});
+
+  {
+    int blocks = (m + threads - 1) / threads;
+    qmc_build_phi_buffer_u64_kernel<<<blocks, threads, 0, stream>>>(
+        d_pairs_sorted, n_in, p, d_samp_key.get(), d_samp_val.get(), k_samp, d_key_buf.get(), d_val_buf.get());
+    err = cudaGetLastError();
+    if (err != cudaSuccess) return err;
+  }
+
+  return guga_qmc_coalesce_coo_u64_f64_launch_stream(d_key_buf.get(), d_val_buf.get(), m, key_out, val_out, out_nnz, stream, threads);
 }
 
 extern "C" cudaError_t guga_qmc_phi_pivot_resample_i32_f64_launch(
@@ -2848,6 +3076,148 @@ inline void qmc_ensure_ws_device(QmcWorkspace* ws) {
   }
 }
 
+struct QmcWorkspaceU64 {
+  int device = 0;
+  int max_n = 0;
+  int max_m = 0;
+
+  // Coalesce scratch (length max_n).
+  uint64_t* d_key_tmp = nullptr;
+  uint64_t* d_key_alt = nullptr;
+  double* d_val_tmp = nullptr;
+  double* d_val_alt = nullptr;
+  int* d_nnz_tmp = nullptr;
+
+  // Φ scratch (length max_n or max_m).
+  double* d_abs_a = nullptr;
+  double* d_abs_b = nullptr;
+  QmcKeyValU64* d_pair_a = nullptr;
+  QmcKeyValU64* d_pair_b = nullptr;
+  double* d_cdf = nullptr;
+  uint64_t* d_samp_key = nullptr;
+  double* d_samp_val = nullptr;
+  uint64_t* d_phi_key = nullptr;
+  double* d_phi_val = nullptr;
+
+  void* d_temp = nullptr;
+  size_t temp_bytes = 0;
+
+  QmcWorkspaceU64(int max_n_, int max_m_) : max_n(max_n_), max_m(max_m_) {
+    qmc_throw_on_cuda_error_ws(cudaGetDevice(&device), "cudaGetDevice");
+    if (max_n_ <= 0) throw std::invalid_argument("max_n must be >= 1");
+    if (max_m_ <= 0) throw std::invalid_argument("max_m must be >= 1");
+    if (max_n < max_m) max_n = max_m;
+
+    qmc_throw_on_cuda_error_ws(cudaMalloc((void**)&d_key_tmp, (size_t)max_n * sizeof(uint64_t)), "cudaMalloc(qmc_u64 key_tmp)");
+    qmc_throw_on_cuda_error_ws(cudaMalloc((void**)&d_key_alt, (size_t)max_n * sizeof(uint64_t)), "cudaMalloc(qmc_u64 key_alt)");
+    qmc_throw_on_cuda_error_ws(cudaMalloc((void**)&d_val_tmp, (size_t)max_n * sizeof(double)), "cudaMalloc(qmc_u64 val_tmp)");
+    qmc_throw_on_cuda_error_ws(cudaMalloc((void**)&d_val_alt, (size_t)max_n * sizeof(double)), "cudaMalloc(qmc_u64 val_alt)");
+    qmc_throw_on_cuda_error_ws(cudaMalloc((void**)&d_nnz_tmp, sizeof(int)), "cudaMalloc(qmc_u64 nnz_tmp)");
+
+    qmc_throw_on_cuda_error_ws(cudaMalloc((void**)&d_abs_a, (size_t)max_n * sizeof(double)), "cudaMalloc(qmc_u64 abs_a)");
+    qmc_throw_on_cuda_error_ws(cudaMalloc((void**)&d_abs_b, (size_t)max_n * sizeof(double)), "cudaMalloc(qmc_u64 abs_b)");
+    qmc_throw_on_cuda_error_ws(cudaMalloc((void**)&d_pair_a, (size_t)max_n * sizeof(QmcKeyValU64)), "cudaMalloc(qmc_u64 pair_a)");
+    qmc_throw_on_cuda_error_ws(cudaMalloc((void**)&d_pair_b, (size_t)max_n * sizeof(QmcKeyValU64)), "cudaMalloc(qmc_u64 pair_b)");
+    qmc_throw_on_cuda_error_ws(cudaMalloc((void**)&d_cdf, (size_t)max_n * sizeof(double)), "cudaMalloc(qmc_u64 cdf)");
+
+    qmc_throw_on_cuda_error_ws(cudaMalloc((void**)&d_samp_key, (size_t)max_m * sizeof(uint64_t)), "cudaMalloc(qmc_u64 samp_key)");
+    qmc_throw_on_cuda_error_ws(cudaMalloc((void**)&d_samp_val, (size_t)max_m * sizeof(double)), "cudaMalloc(qmc_u64 samp_val)");
+    qmc_throw_on_cuda_error_ws(cudaMalloc((void**)&d_phi_key, (size_t)max_m * sizeof(uint64_t)), "cudaMalloc(qmc_u64 phi_key)");
+    qmc_throw_on_cuda_error_ws(cudaMalloc((void**)&d_phi_val, (size_t)max_m * sizeof(double)), "cudaMalloc(qmc_u64 phi_val)");
+
+    // Query CUB temp storage sizes for the maximum problem sizes.
+    size_t tmp = 0;
+
+    cub::DoubleBuffer<uint64_t> keys_u64(d_key_tmp, d_key_alt);
+    cub::DoubleBuffer<double> vals_f64(d_val_tmp, d_val_alt);
+    qmc_throw_on_cuda_error_ws(
+        cub::DeviceRadixSort::SortPairs(nullptr, tmp, keys_u64, vals_f64, max_n, 0, 64, /*stream=*/0), "cub::SortPairs(u64) query");
+    temp_bytes = std::max(temp_bytes, tmp);
+
+    qmc_throw_on_cuda_error_ws(
+        cub::DeviceReduce::ReduceByKey(
+            nullptr, tmp, d_key_tmp, d_key_alt, d_val_tmp, d_val_alt, d_nnz_tmp, QmcF64Sum(), max_n, /*stream=*/0),
+        "cub::ReduceByKey(u64) query");
+    temp_bytes = std::max(temp_bytes, tmp);
+
+    qmc_throw_on_cuda_error_ws(
+        cub::DeviceSelect::If(nullptr, tmp, d_pair_a, d_pair_b, d_nnz_tmp, max_n, QmcPairNonZeroU64(), /*stream=*/0),
+        "cub::DeviceSelect::If(pair!=0) u64 query");
+    temp_bytes = std::max(temp_bytes, tmp);
+
+    cub::DoubleBuffer<double> keys_abs(d_abs_a, d_abs_b);
+    cub::DoubleBuffer<QmcKeyValU64> vals_abs(d_pair_a, d_pair_b);
+    qmc_throw_on_cuda_error_ws(
+        cub::DeviceRadixSort::SortPairsDescending(nullptr, tmp, keys_abs, vals_abs, max_n, 0, 64, /*stream=*/0),
+        "cub::SortPairsDescending(abs) u64 query");
+    temp_bytes = std::max(temp_bytes, tmp);
+
+    qmc_throw_on_cuda_error_ws(
+        cub::DeviceScan::InclusiveSum(nullptr, tmp, d_abs_a, d_cdf, max_n, /*stream=*/0), "cub::InclusiveSum(abs) u64 query");
+    temp_bytes = std::max(temp_bytes, tmp);
+
+    if (temp_bytes == 0) temp_bytes = 1;
+    qmc_throw_on_cuda_error_ws(cudaMalloc((void**)&d_temp, temp_bytes), "cudaMalloc(qmc_u64 temp)");
+  }
+
+  ~QmcWorkspaceU64() { release(); }
+
+  QmcWorkspaceU64(const QmcWorkspaceU64&) = delete;
+  QmcWorkspaceU64& operator=(const QmcWorkspaceU64&) = delete;
+
+  void release() noexcept {
+    if (d_key_tmp) cudaFree(d_key_tmp);
+    if (d_key_alt) cudaFree(d_key_alt);
+    if (d_val_tmp) cudaFree(d_val_tmp);
+    if (d_val_alt) cudaFree(d_val_alt);
+    if (d_nnz_tmp) cudaFree(d_nnz_tmp);
+
+    if (d_abs_a) cudaFree(d_abs_a);
+    if (d_abs_b) cudaFree(d_abs_b);
+    if (d_pair_a) cudaFree(d_pair_a);
+    if (d_pair_b) cudaFree(d_pair_b);
+    if (d_cdf) cudaFree(d_cdf);
+    if (d_samp_key) cudaFree(d_samp_key);
+    if (d_samp_val) cudaFree(d_samp_val);
+    if (d_phi_key) cudaFree(d_phi_key);
+    if (d_phi_val) cudaFree(d_phi_val);
+
+    if (d_temp) cudaFree(d_temp);
+
+    d_key_tmp = nullptr;
+    d_key_alt = nullptr;
+    d_val_tmp = nullptr;
+    d_val_alt = nullptr;
+    d_nnz_tmp = nullptr;
+
+    d_abs_a = nullptr;
+    d_abs_b = nullptr;
+    d_pair_a = nullptr;
+    d_pair_b = nullptr;
+    d_cdf = nullptr;
+    d_samp_key = nullptr;
+    d_samp_val = nullptr;
+    d_phi_key = nullptr;
+    d_phi_val = nullptr;
+
+    d_temp = nullptr;
+    temp_bytes = 0;
+  }
+};
+
+inline QmcWorkspaceU64* qmc_ws_u64_from_handle(void* ws_handle) {
+  if (!ws_handle) throw std::invalid_argument("QmcWorkspaceU64 handle is null");
+  return reinterpret_cast<QmcWorkspaceU64*>(ws_handle);
+}
+
+inline void qmc_ensure_ws_u64_device(QmcWorkspaceU64* ws) {
+  int dev = 0;
+  qmc_throw_on_cuda_error_ws(cudaGetDevice(&dev), "cudaGetDevice");
+  if (dev != ws->device) {
+    throw std::runtime_error("QmcWorkspaceU64 was created on a different CUDA device");
+  }
+}
+
 }  // namespace
 
 extern "C" void* guga_qmc_workspace_create(int max_n, int max_m) {
@@ -2856,6 +3226,15 @@ extern "C" void* guga_qmc_workspace_create(int max_n, int max_m) {
 
 extern "C" void guga_qmc_workspace_destroy(void* ws_handle) {
   auto* ws = reinterpret_cast<QmcWorkspace*>(ws_handle);
+  delete ws;
+}
+
+extern "C" void* guga_qmc_workspace_u64_create(int max_n, int max_m) {
+  return reinterpret_cast<void*>(new QmcWorkspaceU64(int(max_n), int(max_m)));
+}
+
+extern "C" void guga_qmc_workspace_u64_destroy(void* ws_handle) {
+  auto* ws = reinterpret_cast<QmcWorkspaceU64*>(ws_handle);
   delete ws;
 }
 
@@ -2920,6 +3299,66 @@ extern "C" cudaError_t guga_qmc_coalesce_coo_i32_f64_ws_launch_stream(
     if (err != cudaSuccess) return err;
 
     qmc_unpack_pairs_prefix_kernel<<<blocks, threads, 0, stream>>>(ws->d_pair_b, out_nnz, idx_out, val_out, n);
+    err = cudaGetLastError();
+    if (err != cudaSuccess) return err;
+  }
+
+  return cudaSuccess;
+}
+
+extern "C" cudaError_t guga_qmc_coalesce_coo_u64_f64_ws_launch_stream(
+    void* ws_handle,
+    const uint64_t* key_in,
+    const double* val_in,
+    int n,
+    uint64_t* key_out,
+    double* val_out,
+    int* out_nnz,
+    cudaStream_t stream,
+    int threads) {
+  QmcWorkspaceU64* ws = qmc_ws_u64_from_handle(ws_handle);
+  qmc_ensure_ws_u64_device(ws);
+  if (!key_in || !val_in || !key_out || !val_out || !out_nnz) return cudaErrorInvalidValue;
+  if (n < 0 || n > ws->max_n) return cudaErrorInvalidValue;
+  if (threads <= 0 || threads > 1024) return cudaErrorInvalidValue;
+
+  if (n == 0) {
+    return cudaMemsetAsync(out_nnz, 0, sizeof(int), stream);
+  }
+
+  cudaError_t err = cudaMemcpyAsync(ws->d_key_tmp, key_in, (size_t)n * sizeof(uint64_t), cudaMemcpyDeviceToDevice, stream);
+  if (err != cudaSuccess) return err;
+  err = cudaMemcpyAsync(ws->d_val_tmp, val_in, (size_t)n * sizeof(double), cudaMemcpyDeviceToDevice, stream);
+  if (err != cudaSuccess) return err;
+
+  {
+    int blocks = (n + threads - 1) / threads;
+    qmc_sanitize_invalid_key_u64_kernel<<<blocks, threads, 0, stream>>>(ws->d_key_tmp, ws->d_val_tmp, n);
+    err = cudaGetLastError();
+    if (err != cudaSuccess) return err;
+  }
+
+  cub::DoubleBuffer<uint64_t> keys(ws->d_key_tmp, ws->d_key_alt);
+  cub::DoubleBuffer<double> vals(ws->d_val_tmp, ws->d_val_alt);
+
+  err = cub::DeviceRadixSort::SortPairs(ws->d_temp, ws->temp_bytes, keys, vals, n, 0, 64, stream);
+  if (err != cudaSuccess) return err;
+
+  err = cub::DeviceReduce::ReduceByKey(
+      ws->d_temp, ws->temp_bytes, keys.Current(), key_out, vals.Current(), val_out, out_nnz, QmcF64Sum(), n, stream);
+  if (err != cudaSuccess) return err;
+
+  // Prune exact zeros after reduction.
+  {
+    int blocks = (n + threads - 1) / threads;
+    qmc_pack_pairs_prefix_u64_kernel<<<blocks, threads, 0, stream>>>(key_out, val_out, out_nnz, ws->d_pair_a, n);
+    err = cudaGetLastError();
+    if (err != cudaSuccess) return err;
+
+    err = cub::DeviceSelect::If(ws->d_temp, ws->temp_bytes, ws->d_pair_a, ws->d_pair_b, out_nnz, n, QmcPairNonZeroU64(), stream);
+    if (err != cudaSuccess) return err;
+
+    qmc_unpack_pairs_prefix_u64_kernel<<<blocks, threads, 0, stream>>>(ws->d_pair_b, out_nnz, key_out, val_out, n);
     err = cudaGetLastError();
     if (err != cudaSuccess) return err;
   }
@@ -3008,6 +3447,89 @@ extern "C" cudaError_t guga_qmc_phi_pivot_resample_i32_f64_ws_launch_stream(
   }
 
   return guga_qmc_coalesce_coo_i32_f64_ws_launch_stream(ws_handle, ws->d_phi_idx, ws->d_phi_val, m, idx_out, val_out, out_nnz, stream, threads);
+}
+
+extern "C" cudaError_t guga_qmc_phi_pivot_resample_u64_f64_ws_launch_stream(
+    void* ws_handle,
+    const uint64_t* key_in,
+    const double* val_in,
+    int n_in,
+    uint64_t* key_out,
+    double* val_out,
+    int* out_nnz,
+    int m,
+    int pivot,
+    uint64_t seed,
+    cudaStream_t stream,
+    int threads) {
+  QmcWorkspaceU64* ws = qmc_ws_u64_from_handle(ws_handle);
+  qmc_ensure_ws_u64_device(ws);
+  if (!key_in || !val_in || !key_out || !val_out || !out_nnz) return cudaErrorInvalidValue;
+  if (n_in < 0 || n_in > ws->max_n) return cudaErrorInvalidValue;
+  if (m < 0 || m > ws->max_m) return cudaErrorInvalidValue;
+  if (pivot < 0) return cudaErrorInvalidValue;
+  if (threads <= 0 || threads > 1024) return cudaErrorInvalidValue;
+
+  if (n_in == 0 || m == 0) {
+    return cudaMemsetAsync(out_nnz, 0, sizeof(int), stream);
+  }
+
+  if (n_in <= m) {
+    cudaError_t err = cudaMemcpyAsync(key_out, key_in, (size_t)n_in * sizeof(uint64_t), cudaMemcpyDeviceToDevice, stream);
+    if (err != cudaSuccess) return err;
+    err = cudaMemcpyAsync(val_out, val_in, (size_t)n_in * sizeof(double), cudaMemcpyDeviceToDevice, stream);
+    if (err != cudaSuccess) return err;
+    err = cudaMemcpyAsync(out_nnz, &n_in, sizeof(int), cudaMemcpyHostToDevice, stream);
+    return err;
+  }
+
+  int p = pivot;
+  if (p > m) p = m;
+  if (p > n_in) p = n_in;
+  int k_samp = m - p;
+  int r_len = n_in - p;
+
+  // Sort by |val| descending.
+  {
+    int blocks = (n_in + threads - 1) / threads;
+    qmc_pack_abs_and_pairs_u64_kernel<<<blocks, threads, 0, stream>>>(key_in, val_in, ws->d_abs_a, ws->d_pair_a, n_in);
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) return err;
+  }
+
+  cub::DoubleBuffer<double> keys_abs(ws->d_abs_a, ws->d_abs_b);
+  cub::DoubleBuffer<QmcKeyValU64> vals_abs(ws->d_pair_a, ws->d_pair_b);
+
+  cudaError_t err = cub::DeviceRadixSort::SortPairsDescending(ws->d_temp, ws->temp_bytes, keys_abs, vals_abs, n_in, 0, 64, stream);
+  if (err != cudaSuccess) return err;
+
+  const QmcKeyValU64* d_pairs_sorted = vals_abs.Current();
+  const double* d_abs_sorted = keys_abs.Current();
+
+  if (k_samp > 0 && r_len > 0) {
+    err = cub::DeviceScan::InclusiveSum(ws->d_temp, ws->temp_bytes, d_abs_sorted + p, ws->d_cdf, r_len, stream);
+    if (err != cudaSuccess) return err;
+
+    int blocks = (k_samp + threads - 1) / threads;
+    qmc_systematic_resample_u64_kernel<<<blocks, threads, 0, stream>>>(
+        d_pairs_sorted + p, ws->d_cdf, r_len, k_samp, seed, ws->d_samp_key, ws->d_samp_val);
+    err = cudaGetLastError();
+    if (err != cudaSuccess) return err;
+
+    blocks = (m + threads - 1) / threads;
+    qmc_build_phi_buffer_u64_kernel<<<blocks, threads, 0, stream>>>(
+        d_pairs_sorted, n_in, p, ws->d_samp_key, ws->d_samp_val, k_samp, ws->d_phi_key, ws->d_phi_val);
+    err = cudaGetLastError();
+    if (err != cudaSuccess) return err;
+  } else {
+    int blocks = (p + threads - 1) / threads;
+    qmc_build_phi_buffer_u64_kernel<<<blocks, threads, 0, stream>>>(d_pairs_sorted, n_in, p, nullptr, nullptr, 0, ws->d_phi_key, ws->d_phi_val);
+    err = cudaGetLastError();
+    if (err != cudaSuccess) return err;
+    m = p;
+  }
+
+  return guga_qmc_coalesce_coo_u64_f64_ws_launch_stream(ws_handle, ws->d_phi_key, ws->d_phi_val, m, key_out, val_out, out_nnz, stream, threads);
 }
 
 

@@ -527,3 +527,40 @@ extern "C" cudaError_t guga_cipsi_score_and_select_topk_from_hash_slots_launch_s
       keys_score.Current(), vals_tie.Current(), h_nsel, max_add, out_new_idx, out_new_n);
   return cudaGetLastError();
 }
+
+// V2 path: deterministic full-cap sort without host synchronization.
+// This avoids the DeviceSelect + D2H nsel synchronization point used by v1.
+extern "C" cudaError_t guga_cipsi_score_and_select_topk_from_hash_slots_v2_launch_stream(
+    const int32_t* keys,           // [cap]
+    const double* vals_root_major, // [nroots*cap]
+    int cap,
+    int nroots,
+    const double* e_var,           // [nroots]
+    const double* hdiag,           // [ncsf]
+    int ncsf,
+    const uint8_t* selected_mask,  // [ncsf] or NULL
+    double denom_floor,
+    int max_add,
+    int32_t* out_new_idx,          // [max_add]
+    int* out_new_n,                // [1]
+    double* out_pt2,               // [nroots]
+    cudaStream_t stream,
+    int threads) {
+  return guga_cipsi_score_and_select_topk_launch_stream(
+      keys,
+      vals_root_major,
+      (int64_t)cap,
+      cap,
+      nroots,
+      e_var,
+      hdiag,
+      ncsf,
+      selected_mask,
+      denom_floor,
+      max_add,
+      out_new_idx,
+      out_new_n,
+      out_pt2,
+      stream,
+      threads);
+}

@@ -58,6 +58,8 @@ def run_fcifri_ground(
     compressor: Callable[..., tuple[np.ndarray, np.ndarray]] | None = None,
     spawner: Callable[..., tuple[np.ndarray, np.ndarray]] | None = None,
     spawner_kwargs: Mapping[str, object] | None = None,
+    key64_pair_norm: np.ndarray | None = None,
+    key64_pair_sampling_mode: int = 0,
 ) -> FCIFRIRun:
     """Single-root FCI-FRI-like projector iteration (CPU implementation).
 
@@ -89,16 +91,18 @@ def run_fcifri_ground(
         raise ValueError("energy_estimator must be 'projected' or 'rayleigh'")
 
     backend = str(backend).lower()
-    if backend not in ("stochastic", "cuda"):
-        raise ValueError("backend must be 'stochastic' or 'cuda'")
+    if backend not in ("stochastic", "cuda", "cuda_key64"):
+        raise ValueError("backend must be 'stochastic', 'cuda', or 'cuda_key64'")
 
-    use_cuda = backend == "cuda"
+    use_cuda = backend in ("cuda", "cuda_key64")
+    use_key64 = backend == "cuda_key64"
     if use_cuda and (spawner is not None or spawner_kwargs is not None):
         warnings.warn(
-            "backend='cuda' does not support custom spawner/spawner_kwargs yet; falling back to CPU backend.",
+            "CUDA backends do not support custom spawner/spawner_kwargs yet; falling back to CPU backend.",
             stacklevel=2,
         )
         use_cuda = False
+        use_key64 = False
 
     rng = np.random.default_rng(int(seed))
     maybe_set_openmp_threads(omp_threads)
@@ -135,53 +139,117 @@ def run_fcifri_ground(
             raise RuntimeError(f"backend='cuda' requires cupy: {e}") from e
 
         try:  # optional
-            from .cuda_backend import cuda_projector_step_hamiltonian_ws, make_cuda_projector_context  # noqa: PLC0415
+            from .cuda_backend import (  # noqa: PLC0415
+                csf_idx_to_key64_host,
+                cuda_projector_step_hamiltonian_u64_ws,
+                cuda_projector_step_hamiltonian_ws,
+                key64_to_csf_idx_host,
+                make_cuda_projector_context,
+                make_cuda_projector_context_key64,
+            )
         except Exception as e:  # pragma: no cover
             raise RuntimeError(f"failed to import CUDA QMC backend: {e}") from e
 
         if state_cache is None:
             state_cache = get_state_cache(drt)
 
-        ctx = make_cuda_projector_context(
-            drt,
-            h1e,
-            eri,
-            m=int(m),
-            pivot=int(pivot),
-            nspawn_one=int(nspawn_one),
-            nspawn_two=int(nspawn_two),
-        )
+        if use_key64:
+            pair_sampling_mode = int(key64_pair_sampling_mode)
+            pair_norm = None
+            pair_alias_prob = None
+            pair_alias_idx = None
+            pair_norm_sum = 0.0
+            if pair_sampling_mode != 0:
+                from .alias import build_alias_table_from_weights  # noqa: PLC0415
+
+                if key64_pair_norm is None:
+                    raise ValueError("key64_pair_norm must be provided when key64_pair_sampling_mode!=0")
+                alias = build_alias_table_from_weights(np.asarray(key64_pair_norm, dtype=np.float64).ravel())
+                pair_norm = np.asarray(key64_pair_norm, dtype=np.float64).ravel()
+                pair_alias_prob = alias.prob
+                pair_alias_idx = alias.alias
+                pair_norm_sum = float(alias.weight_sum)
+
+            ctx = make_cuda_projector_context_key64(
+                drt,
+                h1e,
+                eri,
+                m=int(m),
+                pivot=int(pivot),
+                nspawn_one=int(nspawn_one),
+                nspawn_two=int(nspawn_two),
+                pair_alias_prob=pair_alias_prob,
+                pair_alias_idx=pair_alias_idx,
+                pair_norm=pair_norm,
+                pair_norm_sum=float(pair_norm_sum),
+                pair_sampling_mode=int(pair_sampling_mode),
+            )
+        else:
+            ctx = make_cuda_projector_context(
+                drt,
+                h1e,
+                eri,
+                m=int(m),
+                pivot=int(pivot),
+                nspawn_one=int(nspawn_one),
+                nspawn_two=int(nspawn_two),
+            )
         try:
             # Upload initial x into ctx buffers.
             nnz0 = int(x_idx_u.size)
             if nnz0 > int(m):
                 raise ValueError("initial x nnz exceeds m")
-            ctx.x_idx[:nnz0] = cp.asarray(x_idx_u, dtype=cp.int32)
-            ctx.x_val[:nnz0] = cp.asarray(x_val_u, dtype=cp.float64)
-            ctx.nnz = nnz0
+            if use_key64:
+                key0 = csf_idx_to_key64_host(drt, x_idx_u, state_cache=state_cache)
+                order0 = np.argsort(key0)
+                key0 = np.asarray(key0[order0], dtype=np.uint64, order="C")
+                val0 = np.asarray(x_val_u[order0], dtype=np.float64, order="C")
+                ctx.x_key[:nnz0] = cp.asarray(key0, dtype=cp.uint64)
+                ctx.x_val[:nnz0] = cp.asarray(val0, dtype=cp.float64)
+                ctx.nnz = nnz0
+            else:
+                ctx.x_idx[:nnz0] = cp.asarray(x_idx_u, dtype=cp.int32)
+                ctx.x_val[:nnz0] = cp.asarray(x_val_u, dtype=cp.float64)
+                ctx.nnz = nnz0
 
             for it in range(1, niter + 1):
                 # Initiator threshold uses the current column l1 norm.
                 if float(initiator_na) != 0.0:
-                    # Keep initiator_t on device to avoid a host sync every iteration.
-                    l1_dev = cp.sum(cp.abs(ctx.x_val[: ctx.nnz]))
-                    initiator_t_dev = float(initiator_na) * l1_dev / float(m - 1)
+                    if use_key64:
+                        # Key64 spawn currently only accepts a host scalar initiator threshold.
+                        l1 = float(cp.sum(cp.abs(ctx.x_val[: ctx.nnz])).get())
+                        initiator_t_dev = float(initiator_na) * l1 / float(m - 1)
+                    else:
+                        # Keep initiator_t on device to avoid a host sync every iteration.
+                        l1_dev = cp.sum(cp.abs(ctx.x_val[: ctx.nnz]))
+                        initiator_t_dev = float(initiator_na) * l1_dev / float(m - 1)
                 else:
                     initiator_t_dev = None
 
                 seed_spawn = int(rng.integers(0, np.iinfo(np.int64).max, dtype=np.int64))
                 seed_phi = int(rng.integers(0, np.iinfo(np.int64).max, dtype=np.int64))
-                cuda_projector_step_hamiltonian_ws(
-                    ctx,
-                    eps=float(eps),
-                    initiator_t=0.0,
-                    initiator_t_dev=initiator_t_dev,
-                    seed_spawn=seed_spawn,
-                    seed_phi=seed_phi,
-                    scale_identity=1.0,
-                    sync=True,
-                    compressor=compressor,
-                )
+                if use_key64:
+                    cuda_projector_step_hamiltonian_u64_ws(
+                        ctx,
+                        eps=float(eps),
+                        initiator_t=float(initiator_t_dev) if initiator_t_dev is not None else 0.0,
+                        seed_spawn=seed_spawn,
+                        seed_phi=seed_phi,
+                        scale_identity=1.0,
+                        sync=True,
+                    )
+                else:
+                    cuda_projector_step_hamiltonian_ws(
+                        ctx,
+                        eps=float(eps),
+                        initiator_t=0.0,
+                        initiator_t_dev=initiator_t_dev,
+                        seed_spawn=seed_spawn,
+                        seed_phi=seed_phi,
+                        scale_identity=1.0,
+                        sync=True,
+                        compressor=compressor,
+                    )
 
                 # Keep normalization on GPU to avoid a host sync every iteration.
                 # Collapse is detected at energy evaluation points when we sync anyway.
@@ -189,8 +257,16 @@ def run_fcifri_ground(
                 ctx.x_val[: ctx.nnz] /= n2_dev
 
                 if it % energy_stride == 0:
-                    x_idx_u = cp.asnumpy(ctx.x_idx[: ctx.nnz]).astype(np.int32, copy=False)
-                    x_val_u = cp.asnumpy(ctx.x_val[: ctx.nnz]).astype(np.float64, copy=False)
+                    if use_key64:
+                        x_key_h = cp.asnumpy(ctx.x_key[: ctx.nnz]).astype(np.uint64, copy=False)
+                        x_val_u = cp.asnumpy(ctx.x_val[: ctx.nnz]).astype(np.float64, copy=False)
+                        x_idx_u = key64_to_csf_idx_host(drt, x_key_h, strict=True)
+                        order = np.argsort(x_idx_u)
+                        x_idx_u = np.asarray(x_idx_u[order], dtype=np.int32, order="C")
+                        x_val_u = np.asarray(x_val_u[order], dtype=np.float64, order="C")
+                    else:
+                        x_idx_u = cp.asnumpy(ctx.x_idx[: ctx.nnz]).astype(np.int32, copy=False)
+                        x_val_u = cp.asnumpy(ctx.x_val[: ctx.nnz]).astype(np.float64, copy=False)
                     if float(np.linalg.norm(x_val_u)) == 0.0:
                         raise RuntimeError("vector collapsed to zero (try smaller eps or more spawn)")
                     ref = choose_reference_index(x_idx_u, x_val_u, preferred=preferred_ref_idx)
@@ -203,8 +279,16 @@ def run_fcifri_ground(
                     e_pos += 1
 
             # Final host output.
-            x_idx_u = cp.asnumpy(ctx.x_idx[: ctx.nnz]).astype(np.int32, copy=False)
-            x_val_u = cp.asnumpy(ctx.x_val[: ctx.nnz]).astype(np.float64, copy=False)
+            if use_key64:
+                x_key_h = cp.asnumpy(ctx.x_key[: ctx.nnz]).astype(np.uint64, copy=False)
+                x_val_u = cp.asnumpy(ctx.x_val[: ctx.nnz]).astype(np.float64, copy=False)
+                x_idx_u = key64_to_csf_idx_host(drt, x_key_h, strict=True)
+                order = np.argsort(x_idx_u)
+                x_idx_u = np.asarray(x_idx_u[order], dtype=np.int32, order="C")
+                x_val_u = np.asarray(x_val_u[order], dtype=np.float64, order="C")
+            else:
+                x_idx_u = cp.asnumpy(ctx.x_idx[: ctx.nnz]).astype(np.int32, copy=False)
+                x_val_u = cp.asnumpy(ctx.x_val[: ctx.nnz]).astype(np.float64, copy=False)
         finally:
             ctx.release()
     else:
