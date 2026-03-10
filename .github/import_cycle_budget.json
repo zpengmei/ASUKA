@@ -1,0 +1,19 @@
+{
+  "core_packages": [
+    "asuka",
+    "asuka.contract",
+    "asuka.cuda",
+    "asuka.cueri",
+    "asuka.cuguga",
+    "asuka.density",
+    "asuka.frontend",
+    "asuka.hf",
+    "asuka.integrals",
+    "asuka.mcscf",
+    "asuka.orbitals",
+    "asuka.rdm",
+    "asuka.solver",
+    "asuka.xc"
+  ],
+  "max_core_scc_size": 14
+}

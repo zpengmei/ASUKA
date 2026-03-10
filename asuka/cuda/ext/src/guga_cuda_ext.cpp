@@ -10799,6 +10799,286 @@ void cas36_cipsi_score_pt2_compact_u64_inplace_device(
   }
 }
 
+void cas36_hb_screen_and_apply_u64_inplace_device(
+    const DeviceDRT& drt,
+    uint64_t ncsf_u64,
+    py::object sel_idx_u64_obj,
+    py::object c_root_obj,
+    int nsel,
+    int root,
+    py::object h1_pq_obj,
+    py::object h1_abs_obj,
+    py::object h1_signed_obj,
+    int n_h1,
+    py::object pq_ptr_obj,
+    py::object rs_idx_obj,
+    py::object v_abs_obj,
+    py::object v_signed_obj,
+    py::object pq_max_v_obj,
+    double eps,
+    py::object hash_keys_u64_obj,
+    py::object hash_vals_obj,
+    py::object selected_idx_sorted_u64_obj,
+    py::object overflow_obj,
+    int threads,
+    uint64_t stream,
+    bool sync) {
+  if (drt.child == nullptr || drt.node_twos == nullptr || drt.child_prefix == nullptr) {
+    throw std::runtime_error("DeviceDRT is not initialized");
+  }
+  if (drt.norb <= 0 || drt.norb > 64) {
+    throw std::invalid_argument("cas36_hb_screen_and_apply_u64 requires drt.norb in 1..64");
+  }
+  if (ncsf_u64 == 0ull) {
+    throw std::invalid_argument("ncsf must be > 0");
+  }
+  if (threads <= 0 || threads > 1024) {
+    throw std::invalid_argument("threads must be in 1..1024");
+  }
+  if (nsel < 0) {
+    throw std::invalid_argument("nsel must be >= 0");
+  }
+  if (root < 0) {
+    throw std::invalid_argument("root must be >= 0");
+  }
+  if (n_h1 < 0) {
+    throw std::invalid_argument("n_h1 must be >= 0");
+  }
+  if (sel_idx_u64_obj.is_none() || c_root_obj.is_none() || h1_pq_obj.is_none() || h1_abs_obj.is_none() ||
+      h1_signed_obj.is_none() || pq_ptr_obj.is_none() || rs_idx_obj.is_none() || v_abs_obj.is_none() ||
+      v_signed_obj.is_none() || pq_max_v_obj.is_none() || hash_keys_u64_obj.is_none() || hash_vals_obj.is_none() ||
+      overflow_obj.is_none()) {
+    throw std::invalid_argument("cas36_hb_screen_and_apply_u64 inputs must be device arrays (cannot be None)");
+  }
+
+  auto sel_idx_dev = cuda_array_view_from_object(sel_idx_u64_obj, "sel_idx_u64");
+  auto c_root_dev = cuda_array_view_from_object(c_root_obj, "c_root");
+  auto h1_pq_dev = cuda_array_view_from_object(h1_pq_obj, "h1_pq");
+  auto h1_abs_dev = cuda_array_view_from_object(h1_abs_obj, "h1_abs");
+  auto h1_signed_dev = cuda_array_view_from_object(h1_signed_obj, "h1_signed");
+  auto pq_ptr_dev = cuda_array_view_from_object(pq_ptr_obj, "pq_ptr");
+  auto rs_idx_dev = cuda_array_view_from_object(rs_idx_obj, "rs_idx");
+  auto v_abs_dev = cuda_array_view_from_object(v_abs_obj, "v_abs");
+  auto v_signed_dev = cuda_array_view_from_object(v_signed_obj, "v_signed");
+  auto pq_max_v_dev = cuda_array_view_from_object(pq_max_v_obj, "pq_max_v");
+  auto hash_keys_dev = cuda_array_view_from_object(hash_keys_u64_obj, "hash_keys_u64");
+  auto hash_vals_dev = cuda_array_view_from_object(hash_vals_obj, "hash_vals");
+  auto overflow_dev = cuda_array_view_from_object(overflow_obj, "overflow");
+
+  require_typestr(sel_idx_dev, "sel_idx_u64", "<u8");
+  require_typestr(c_root_dev, "c_root", "<f8");
+  require_typestr(h1_pq_dev, "h1_pq", "<i4");
+  require_typestr(h1_abs_dev, "h1_abs", "<f8");
+  require_typestr(h1_signed_dev, "h1_signed", "<f8");
+  require_typestr(pq_ptr_dev, "pq_ptr", "<i8");
+  require_typestr(rs_idx_dev, "rs_idx", "<i4");
+  require_typestr(v_abs_dev, "v_abs", "<f8");
+  require_typestr(v_signed_dev, "v_signed", "<f8");
+  require_typestr(pq_max_v_dev, "pq_max_v", "<f8");
+  require_typestr(hash_keys_dev, "hash_keys_u64", "<u8");
+  require_typestr(hash_vals_dev, "hash_vals", "<f8");
+  require_typestr(overflow_dev, "overflow", "<i4");
+
+  if (overflow_dev.read_only || hash_keys_dev.read_only || hash_vals_dev.read_only) {
+    throw std::invalid_argument("hash_keys_u64/hash_vals/overflow must be writable");
+  }
+
+  if (sel_idx_dev.shape.size() != 1 || c_root_dev.shape.size() != 1) {
+    throw std::invalid_argument("sel_idx_u64 and c_root must be 1D");
+  }
+  if (pq_ptr_dev.shape.size() != 1 || rs_idx_dev.shape.size() != 1 || v_abs_dev.shape.size() != 1 ||
+      v_signed_dev.shape.size() != 1 || pq_max_v_dev.shape.size() != 1) {
+    throw std::invalid_argument("pq_ptr/rs_idx/v_abs/v_signed/pq_max_v must be 1D");
+  }
+  if (hash_keys_dev.shape.size() != 1) {
+    throw std::invalid_argument("hash_keys_u64 must be 1D");
+  }
+  if (hash_vals_dev.shape.size() != 2) {
+    throw std::invalid_argument("hash_vals must have shape (nroots, cap)");
+  }
+  if (overflow_dev.shape.size() != 1 || overflow_dev.shape[0] != 1) {
+    throw std::invalid_argument("overflow must have shape (1,)");
+  }
+
+  int norb = drt.norb;
+  int64_t nops64 = (int64_t)norb * (int64_t)norb;
+  if (pq_ptr_dev.shape[0] != nops64 + 1) {
+    throw std::invalid_argument("pq_ptr must have shape (norb*norb + 1)");
+  }
+  if (pq_max_v_dev.shape[0] != nops64) {
+    throw std::invalid_argument("pq_max_v must have shape (norb*norb,)");
+  }
+  if (rs_idx_dev.shape[0] != v_abs_dev.shape[0] || rs_idx_dev.shape[0] != v_signed_dev.shape[0]) {
+    throw std::invalid_argument("rs_idx/v_abs/v_signed must have matching lengths");
+  }
+  if (h1_abs_dev.shape.size() != 1 || h1_signed_dev.shape.size() != 1) {
+    throw std::invalid_argument("h1_abs and h1_signed must be 1D");
+  }
+  if (h1_abs_dev.shape[0] < (int64_t)n_h1 || h1_signed_dev.shape[0] < (int64_t)n_h1) {
+    throw std::invalid_argument("h1_abs/h1_signed lengths must be >= n_h1");
+  }
+  if (h1_pq_dev.shape.size() != 2 || h1_pq_dev.shape[1] != 2 || h1_pq_dev.shape[0] < (int64_t)n_h1) {
+    throw std::invalid_argument("h1_pq must have shape (>=n_h1, 2)");
+  }
+
+  int64_t sel_len64 = sel_idx_dev.shape[0];
+  if (sel_len64 > (int64_t)std::numeric_limits<int>::max()) {
+    throw std::invalid_argument("sel_idx_u64 length out of range");
+  }
+  if ((int)sel_len64 < nsel) {
+    throw std::invalid_argument("nsel exceeds sel_idx_u64 length");
+  }
+  if (c_root_dev.shape[0] < (int64_t)nsel) {
+    throw std::invalid_argument("c_root length must be >= nsel");
+  }
+
+  int cap = (int)hash_keys_dev.shape[0];
+  int nroots = (int)hash_vals_dev.shape[0];
+  if ((int)hash_vals_dev.shape[1] != cap) {
+    throw std::invalid_argument("hash_vals must have shape (nroots, cap) with cap matching hash_keys_u64");
+  }
+  if (root >= nroots) {
+    throw std::invalid_argument("root is out of range for hash_vals first dimension");
+  }
+  if (cap <= 0 || (cap & (cap - 1)) != 0) {
+    throw std::invalid_argument("hash capacity must be a positive power of two");
+  }
+
+  if (!sel_idx_dev.strides_bytes.empty()) {
+    if (sel_idx_dev.strides_bytes.size() != 1 || sel_idx_dev.strides_bytes[0] != (int64_t)sizeof(uint64_t)) {
+      throw std::invalid_argument("sel_idx_u64 must be contiguous");
+    }
+  }
+  if (!c_root_dev.strides_bytes.empty()) {
+    if (c_root_dev.strides_bytes.size() != 1 || c_root_dev.strides_bytes[0] != (int64_t)sizeof(double)) {
+      throw std::invalid_argument("c_root must be contiguous");
+    }
+  }
+  if (!h1_pq_dev.strides_bytes.empty()) {
+    if (h1_pq_dev.strides_bytes.size() != 2 || h1_pq_dev.strides_bytes[1] != (int64_t)sizeof(int32_t) ||
+        h1_pq_dev.strides_bytes[0] != (int64_t)2 * (int64_t)sizeof(int32_t)) {
+      throw std::invalid_argument("h1_pq must be C-contiguous");
+    }
+  }
+  if (!h1_abs_dev.strides_bytes.empty()) {
+    if (h1_abs_dev.strides_bytes.size() != 1 || h1_abs_dev.strides_bytes[0] != (int64_t)sizeof(double)) {
+      throw std::invalid_argument("h1_abs must be contiguous");
+    }
+  }
+  if (!h1_signed_dev.strides_bytes.empty()) {
+    if (h1_signed_dev.strides_bytes.size() != 1 || h1_signed_dev.strides_bytes[0] != (int64_t)sizeof(double)) {
+      throw std::invalid_argument("h1_signed must be contiguous");
+    }
+  }
+  if (!pq_ptr_dev.strides_bytes.empty()) {
+    if (pq_ptr_dev.strides_bytes.size() != 1 || pq_ptr_dev.strides_bytes[0] != (int64_t)sizeof(int64_t)) {
+      throw std::invalid_argument("pq_ptr must be contiguous");
+    }
+  }
+  if (!rs_idx_dev.strides_bytes.empty()) {
+    if (rs_idx_dev.strides_bytes.size() != 1 || rs_idx_dev.strides_bytes[0] != (int64_t)sizeof(int32_t)) {
+      throw std::invalid_argument("rs_idx must be contiguous");
+    }
+  }
+  if (!v_abs_dev.strides_bytes.empty()) {
+    if (v_abs_dev.strides_bytes.size() != 1 || v_abs_dev.strides_bytes[0] != (int64_t)sizeof(double)) {
+      throw std::invalid_argument("v_abs must be contiguous");
+    }
+  }
+  if (!v_signed_dev.strides_bytes.empty()) {
+    if (v_signed_dev.strides_bytes.size() != 1 || v_signed_dev.strides_bytes[0] != (int64_t)sizeof(double)) {
+      throw std::invalid_argument("v_signed must be contiguous");
+    }
+  }
+  if (!pq_max_v_dev.strides_bytes.empty()) {
+    if (pq_max_v_dev.strides_bytes.size() != 1 || pq_max_v_dev.strides_bytes[0] != (int64_t)sizeof(double)) {
+      throw std::invalid_argument("pq_max_v must be contiguous");
+    }
+  }
+  if (!hash_keys_dev.strides_bytes.empty()) {
+    if (hash_keys_dev.strides_bytes.size() != 1 || hash_keys_dev.strides_bytes[0] != (int64_t)sizeof(uint64_t)) {
+      throw std::invalid_argument("hash_keys_u64 must be contiguous");
+    }
+  }
+  if (!hash_vals_dev.strides_bytes.empty()) {
+    if (hash_vals_dev.strides_bytes.size() != 2 || hash_vals_dev.strides_bytes[1] != (int64_t)sizeof(double) ||
+        hash_vals_dev.strides_bytes[0] != (int64_t)cap * (int64_t)sizeof(double)) {
+      throw std::invalid_argument("hash_vals must be C-contiguous");
+    }
+  }
+  if (!overflow_dev.strides_bytes.empty()) {
+    if (overflow_dev.strides_bytes.size() != 1 || overflow_dev.strides_bytes[0] != (int64_t)sizeof(int32_t)) {
+      throw std::invalid_argument("overflow must be contiguous");
+    }
+  }
+
+  const uint64_t* d_selected_idx = nullptr;
+  int nselected = 0;
+  uint64_t selected_stream = 0;
+  if (!selected_idx_sorted_u64_obj.is_none()) {
+    auto selected_dev = cuda_array_view_from_object(selected_idx_sorted_u64_obj, "selected_idx_sorted_u64");
+    require_typestr(selected_dev, "selected_idx_sorted_u64", "<u8");
+    if (selected_dev.shape.size() != 1) {
+      throw std::invalid_argument("selected_idx_sorted_u64 must be 1D");
+    }
+    if (!selected_dev.strides_bytes.empty()) {
+      if (selected_dev.strides_bytes.size() != 1 || selected_dev.strides_bytes[0] != (int64_t)sizeof(uint64_t)) {
+        throw std::invalid_argument("selected_idx_sorted_u64 must be contiguous");
+      }
+    }
+    if (selected_dev.shape[0] > (int64_t)std::numeric_limits<int>::max()) {
+      throw std::invalid_argument("selected_idx_sorted_u64 length out of range");
+    }
+    d_selected_idx = reinterpret_cast<const uint64_t*>(selected_dev.ptr);
+    nselected = (int)selected_dev.shape[0];
+    selected_stream = selected_dev.stream;
+  }
+
+  uint64_t stream_u = stream;
+  if (stream_u == 0) {
+    if (hash_vals_dev.stream) stream_u = hash_vals_dev.stream;
+    else if (hash_keys_dev.stream) stream_u = hash_keys_dev.stream;
+    else if (sel_idx_dev.stream) stream_u = sel_idx_dev.stream;
+    else if (c_root_dev.stream) stream_u = c_root_dev.stream;
+    else if (selected_stream) stream_u = selected_stream;
+  }
+  cudaStream_t stream_t = reinterpret_cast<cudaStream_t>(stream_u);
+
+  throw_on_cuda_error(
+      cas36_hb_screen_and_apply_u64_launch_stream(
+          reinterpret_cast<const uint64_t*>(sel_idx_dev.ptr),
+          reinterpret_cast<const double*>(c_root_dev.ptr),
+          int(nsel),
+          int(root),
+          int(norb),
+          ncsf_u64,
+          reinterpret_cast<const int32_t*>(h1_pq_dev.ptr),
+          reinterpret_cast<const double*>(h1_abs_dev.ptr),
+          reinterpret_cast<const double*>(h1_signed_dev.ptr),
+          int(n_h1),
+          reinterpret_cast<const int64_t*>(pq_ptr_dev.ptr),
+          reinterpret_cast<const int32_t*>(rs_idx_dev.ptr),
+          reinterpret_cast<const double*>(v_abs_dev.ptr),
+          reinterpret_cast<const double*>(v_signed_dev.ptr),
+          reinterpret_cast<const double*>(pq_max_v_dev.ptr),
+          double(eps),
+          drt.child,
+          drt.node_twos,
+          drt.child_prefix,
+          reinterpret_cast<uint64_t*>(hash_keys_dev.ptr),
+          reinterpret_cast<double*>(hash_vals_dev.ptr),
+          int(cap),
+          d_selected_idx,
+          int(nselected),
+          reinterpret_cast<int*>(overflow_dev.ptr),
+          stream_t,
+          int(threads)),
+      "cas36_hb_screen_and_apply_u64_launch_stream");
+  if (sync) {
+    throw_on_cuda_error(cudaStreamSynchronize(stream_t), "cudaStreamSynchronize(cas36_hb_screen_and_apply_u64)");
+  }
+}
+
 void hb_screen_and_apply_inplace_device(
     const DeviceDRT& drt,
     const DeviceStateCache& state,
@@ -22449,6 +22729,33 @@ PYBIND11_MODULE(_guga_cuda_ext, m) {
       py::arg("denom_floor"),
       py::arg("score_bits_out"),
       py::arg("pt2_out"),
+      py::arg("threads") = 256,
+      py::arg("stream") = 0,
+      py::arg("sync") = true);
+
+  m.def(
+      "cas36_hb_screen_and_apply_u64_inplace_device",
+      &cas36_hb_screen_and_apply_u64_inplace_device,
+      py::arg("drt"),
+      py::arg("ncsf"),
+      py::arg("sel_idx_u64"),
+      py::arg("c_root"),
+      py::arg("nsel"),
+      py::arg("root"),
+      py::arg("h1_pq"),
+      py::arg("h1_abs"),
+      py::arg("h1_signed"),
+      py::arg("n_h1"),
+      py::arg("pq_ptr"),
+      py::arg("rs_idx"),
+      py::arg("v_abs"),
+      py::arg("v_signed"),
+      py::arg("pq_max_v"),
+      py::arg("eps"),
+      py::arg("hash_keys_u64"),
+      py::arg("hash_vals"),
+      py::arg("selected_idx_sorted_u64") = py::none(),
+      py::arg("overflow"),
       py::arg("threads") = 256,
       py::arg("stream") = 0,
       py::arg("sync") = true);

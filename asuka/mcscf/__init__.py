@@ -60,11 +60,7 @@ from .zvector import (
     solve_mcscf_zvector,
 )
 from .ras_gas_mcscf import attach_gas_orbital_rotation_mask, attach_ras_orbital_rotation_mask
-try:
-    from .sort_mo import sort_mo, sort_mo_by_irrep
-except ModuleNotFoundError:  # Optional helper not present in some branches.
-    sort_mo = None  # type: ignore[assignment]
-    sort_mo_by_irrep = None  # type: ignore[assignment]
+from .sort_mo import sort_mo, sort_mo_by_irrep
 
 __all__ = [
     "CASCIResult",

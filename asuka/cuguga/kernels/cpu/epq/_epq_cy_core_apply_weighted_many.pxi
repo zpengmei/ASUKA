@@ -1,6 +1,6 @@
 def epq_apply_weighted_many_cy(
     drt,
-    int csf_idx,
+    long long csf_idx,
     cnp.ndarray[cnp.int32_t, ndim=1] p_idx,
     cnp.ndarray[cnp.int32_t, ndim=1] q_idx,
     cnp.ndarray[cnp.float64_t, ndim=1] weights,
@@ -21,6 +21,7 @@ def epq_apply_weighted_many_cy(
     """
 
     _ensure_tables()
+    cdef bint use_i64 = int(drt.ncsf) > 2147483647
 
     cdef Py_ssize_t n_pairs = p_idx.shape[0]
     if q_idx.shape[0] != n_pairs or weights.shape[0] != n_pairs:
@@ -42,7 +43,7 @@ def epq_apply_weighted_many_cy(
     # Cached prefix-walk counts (shared across all pairs for this DRT).
     cdef cnp.int64_t[:, ::1] child_prefix = _get_child_prefix(drt)
 
-    cdef vector[int] out_idx
+    cdef vector[long long] out_idx
     cdef vector[double] out_val
     if n_pairs > 0:
         # Heuristic reserve to reduce vector re-allocations (typical ~2-4 nnz per (p,q)).
@@ -106,7 +107,6 @@ def epq_apply_weighted_many_cy(
     cdef double w2
     cdef long long seg_idx2
     cdef long long csf_i_ll
-    cdef int csf_i
     cdef double val
 
     for kk in range(norb):
@@ -203,12 +203,11 @@ def epq_apply_weighted_many_cy(
                             if is_last:
                                 if child_k == node_end_target:
                                     csf_i_ll = prefix_offset + seg_idx2 + suffix_offset
-                                    csf_i = <int>csf_i_ll
-                                    if csf_i != csf_idx:
+                                    if csf_i_ll != csf_idx:
                                         val = wgt * w2
                                         if thresh_contrib <= 0.0 or fabs(val) > thresh_contrib:
                                             if val != 0.0:
-                                                out_idx.push_back(csf_i)
+                                                out_idx.push_back(csf_i_ll)
                                                 out_val.push_back(val)
                             else:
                                 st_k.push_back(k_next)
@@ -228,12 +227,11 @@ def epq_apply_weighted_many_cy(
                             if is_last:
                                 if child_k == node_end_target:
                                     csf_i_ll = prefix_offset + seg_idx2 + suffix_offset
-                                    csf_i = <int>csf_i_ll
-                                    if csf_i != csf_idx:
+                                    if csf_i_ll != csf_idx:
                                         val = wgt * w2
                                         if thresh_contrib <= 0.0 or fabs(val) > thresh_contrib:
                                             if val != 0.0:
-                                                out_idx.push_back(csf_i)
+                                                out_idx.push_back(csf_i_ll)
                                                 out_val.push_back(val)
                             else:
                                 st_k.push_back(k_next)
@@ -253,12 +251,11 @@ def epq_apply_weighted_many_cy(
                             if is_last:
                                 if child_k == node_end_target:
                                     csf_i_ll = prefix_offset + seg_idx2 + suffix_offset
-                                    csf_i = <int>csf_i_ll
-                                    if csf_i != csf_idx:
+                                    if csf_i_ll != csf_idx:
                                         val = wgt * w2
                                         if thresh_contrib <= 0.0 or fabs(val) > thresh_contrib:
                                             if val != 0.0:
-                                                out_idx.push_back(csf_i)
+                                                out_idx.push_back(csf_i_ll)
                                                 out_val.push_back(val)
                             else:
                                 st_k.push_back(k_next)
@@ -281,14 +278,13 @@ def epq_apply_weighted_many_cy(
                             if child_k != node_end_target:
                                 continue
                             csf_i_ll = prefix_offset + seg_idx2 + suffix_offset
-                            csf_i = <int>csf_i_ll
-                            if csf_i == csf_idx:
+                            if csf_i_ll == csf_idx:
                                 continue
                             val = wgt * w2
                             if thresh_contrib > 0.0 and fabs(val) <= thresh_contrib:
                                 continue
                             if val != 0.0:
-                                out_idx.push_back(csf_i)
+                                out_idx.push_back(csf_i_ll)
                                 out_val.push_back(val)
                         else:
                             st_k.push_back(k_next)
@@ -297,14 +293,350 @@ def epq_apply_weighted_many_cy(
                             st_seg.push_back(seg_idx2)
 
     cdef Py_ssize_t n_out = <Py_ssize_t>out_idx.size()
-    cdef cnp.ndarray[cnp.int32_t, ndim=1] idx_arr = np.empty(n_out, dtype=np.int32)
+    cdef cnp.ndarray[cnp.int64_t, ndim=1] idx_arr64
+    cdef cnp.ndarray[cnp.int32_t, ndim=1] idx_arr32
     cdef cnp.ndarray[cnp.float64_t, ndim=1] val_arr = np.empty(n_out, dtype=np.float64)
-    cdef cnp.int32_t[::1] idx_view = idx_arr
+    cdef cnp.int64_t[::1] idx_view64
+    cdef cnp.int32_t[::1] idx_view32
     cdef double[::1] val_view = val_arr
     cdef Py_ssize_t i
+    if use_i64:
+        idx_arr64 = np.empty(n_out, dtype=np.int64)
+        idx_view64 = idx_arr64
+        for i in range(n_out):
+            idx_view64[i] = <cnp.int64_t>out_idx[i]
+            val_view[i] = <double>out_val[i]
+        return idx_arr64, val_arr
+
+    idx_arr32 = np.empty(n_out, dtype=np.int32)
+    idx_view32 = idx_arr32
     for i in range(n_out):
-        idx_view[i] = <cnp.int32_t>out_idx[i]
+        idx_view32[i] = <cnp.int32_t>out_idx[i]
         val_view[i] = <double>out_val[i]
-    return idx_arr, val_arr
+    return idx_arr32, val_arr
 
 
+def epq_collect_rs_terms_cy(
+    drt,
+    long long csf_idx,
+    cnp.ndarray[cnp.int32_t, ndim=1] r_idx,
+    cnp.ndarray[cnp.int32_t, ndim=1] s_idx,
+    cnp.ndarray[cnp.int8_t, ndim=1] steps,
+    cnp.ndarray[cnp.int32_t, ndim=1] nodes,
+    double thresh_coeff=0.0,
+    bint trusted=False,
+):
+    """Collect COO triples (k_idx, rs_id, coeff) for k = E_rs | csf_idx>.
+
+    Returns
+    -------
+    (k_idx, rs_id, coeff)
+        Arrays of equal length where each entry corresponds to one nonzero
+        contribution from a specific (r,s) pair:
+          coeff[t] = <k_idx[t] | E_{r,s} | csf_idx>
+          rs_id[t] = r * norb + s
+    """
+
+    _ensure_tables()
+    cdef bint use_i64 = int(drt.ncsf) > 2147483647
+
+    cdef Py_ssize_t n_pairs = r_idx.shape[0]
+    if s_idx.shape[0] != n_pairs:
+        raise ValueError("r_idx and s_idx must have the same length")
+
+    cdef int norb = int(drt.norb)
+    if int(drt.nelec) > _seg_lut_max_b:
+        raise ValueError("DRT nelec exceeds segment-value LUT max; increase _SEG_LUT_MAX_B")
+
+    cdef i8[::1] steps_v = steps
+    cdef cnp.int32_t[::1] nodes_v = nodes
+    cdef cnp.int32_t[::1] r_v = r_idx
+    cdef cnp.int32_t[::1] s_v = s_idx
+
+    cdef cnp.int32_t[:, ::1] child = drt.child
+    cdef cnp.int16_t[::1] node_twos = drt.node_twos
+
+    # Cached prefix-walk counts (shared across all pairs for this DRT).
+    cdef cnp.int64_t[:, ::1] child_prefix = _get_child_prefix(drt)
+
+    cdef vector[long long] out_k
+    cdef vector[int] out_rs
+    cdef vector[double] out_c
+    if n_pairs > 0:
+        # Heuristic reserve to reduce vector re-allocations.
+        out_k.reserve(<size_t>(n_pairs * 4))
+        out_rs.reserve(<size_t>(n_pairs * 4))
+        out_c.reserve(<size_t>(n_pairs * 4))
+
+    # Prefix offsets for the reference path:
+    #   idx_prefix[k] = sum_{t=0..k-1} child_prefix[nodes[t], steps[t]]
+    # so we can get:
+    #   prefix_offset    = idx_prefix[start]
+    #   prefix_endplus1  = idx_prefix[end+1]
+    # without an O(end) scan per (r,s).
+    cdef vector[long long] idx_prefix
+    idx_prefix.resize(norb + 1)
+    idx_prefix[0] = 0
+
+    # Reusable DFS stacks (SOA vectors).
+    cdef vector[int] st_k
+    cdef vector[int] st_node
+    cdef vector[double] st_w
+    cdef vector[long long] st_seg
+
+    cdef Py_ssize_t t
+    cdef int r
+    cdef int s
+    cdef int rs_id
+    cdef int occ_r
+    cdef int occ_s
+    cdef int start
+    cdef int end
+    cdef int q_start
+    cdef int q_mid
+    cdef int q_end
+    cdef int node_start
+    cdef int node_end_target
+    cdef long long prefix_offset
+    cdef long long prefix_endplus1
+    cdef long long suffix_offset
+    cdef int kk
+    cdef int node_kk
+    cdef int step_kk
+
+    cdef int k
+    cdef int node_k
+    cdef double w
+    cdef long long seg_idx
+    cdef int is_first
+    cdef int is_last
+    cdef int qk
+    cdef int d_k
+    cdef int b_k
+    cdef int k_next
+    cdef int dprime
+    cdef int dp0
+    cdef int dp1
+    cdef int ndp
+    cdef int child_k
+    cdef int bprime
+    cdef int db
+    cdef double seg
+    cdef double w2
+    cdef long long seg_idx2
+    cdef long long csf_k_ll
+    cdef double cval
+    cdef double thr = float(thresh_coeff)
+
+    for kk in range(norb):
+        node_kk = <int>nodes_v[kk]
+        step_kk = <int>steps_v[kk]
+        idx_prefix[kk + 1] = idx_prefix[kk] + <long long>child_prefix[node_kk, step_kk]
+
+    if not trusted:
+        for t in range(n_pairs):
+            r = <int>r_v[t]
+            s = <int>s_v[t]
+            if r < 0 or r >= norb or s < 0 or s >= norb:
+                raise ValueError("orbital indices out of range")
+
+    if 1:
+        for t in range(n_pairs):
+            r = <int>r_v[t]
+            s = <int>s_v[t]
+            if r == s:
+                continue
+
+            if not trusted:
+                occ_r = _step_to_occ(<i8>steps_v[r])
+                occ_s = _step_to_occ(<i8>steps_v[s])
+                # E_rs moves one electron s -> r.
+                if occ_s <= 0 or occ_r >= 2:
+                    continue
+
+            rs_id = r * norb + s
+
+            if r < s:
+                start = r
+                end = s
+                q_start = _Q_uR
+                q_mid = _Q_R
+                q_end = _Q_oR
+            else:
+                start = s
+                end = r
+                q_start = _Q_uL
+                q_mid = _Q_L
+                q_end = _Q_oL
+
+            node_start = <int>nodes_v[start]
+            node_end_target = <int>nodes_v[end + 1]
+
+            prefix_offset = idx_prefix[start]
+            prefix_endplus1 = idx_prefix[end + 1]
+            suffix_offset = (<long long>csf_idx) - prefix_endplus1
+
+            # Reset DFS stack.
+            st_k.clear()
+            st_node.clear()
+            st_w.clear()
+            st_seg.clear()
+            st_k.push_back(start)
+            st_node.push_back(node_start)
+            st_w.push_back(1.0)
+            st_seg.push_back(0)
+
+            while st_k.size() != 0:
+                k = st_k.back()
+                st_k.pop_back()
+                node_k = st_node.back()
+                st_node.pop_back()
+                w = st_w.back()
+                st_w.pop_back()
+                seg_idx = st_seg.back()
+                st_seg.pop_back()
+
+                is_first = 1 if k == start else 0
+                is_last = 1 if k == end else 0
+                qk = q_start if is_first else (q_end if is_last else q_mid)
+
+                d_k = <int>steps_v[k]
+                b_k = <int>node_twos[<int>nodes_v[k + 1]]
+                k_next = k + 1
+
+                ndp = _candidate_dprimes(qk, d_k, &dp0, &dp1)
+                if ndp == 0:
+                    continue
+                if ndp == 1:
+                    dprime = dp0
+                    child_k = <int>child[node_k, dprime]
+                    if child_k >= 0:
+                        bprime = <int>node_twos[child_k]
+                        db = b_k - bprime
+                        seg = _segment_value_int_tbl(qk, dprime, d_k, db, b_k)
+                        if seg != 0.0:
+                            w2 = w * seg
+                            seg_idx2 = seg_idx + <long long>child_prefix[node_k, dprime]
+                            if is_last:
+                                if child_k == node_end_target:
+                                    csf_k_ll = prefix_offset + seg_idx2 + suffix_offset
+                                    if csf_k_ll != csf_idx:
+                                        cval = w2
+                                        if thr <= 0.0 or fabs(cval) > thr:
+                                            if cval != 0.0:
+                                                out_k.push_back(csf_k_ll)
+                                                out_rs.push_back(rs_id)
+                                                out_c.push_back(cval)
+                            else:
+                                st_k.push_back(k_next)
+                                st_node.push_back(child_k)
+                                st_w.push_back(w2)
+                                st_seg.push_back(seg_idx2)
+                elif ndp == 2:
+                    dprime = dp0
+                    child_k = <int>child[node_k, dprime]
+                    if child_k >= 0:
+                        bprime = <int>node_twos[child_k]
+                        db = b_k - bprime
+                        seg = _segment_value_int_tbl(qk, dprime, d_k, db, b_k)
+                        if seg != 0.0:
+                            w2 = w * seg
+                            seg_idx2 = seg_idx + <long long>child_prefix[node_k, dprime]
+                            if is_last:
+                                if child_k == node_end_target:
+                                    csf_k_ll = prefix_offset + seg_idx2 + suffix_offset
+                                    if csf_k_ll != csf_idx:
+                                        cval = w2
+                                        if thr <= 0.0 or fabs(cval) > thr:
+                                            if cval != 0.0:
+                                                out_k.push_back(csf_k_ll)
+                                                out_rs.push_back(rs_id)
+                                                out_c.push_back(cval)
+                            else:
+                                st_k.push_back(k_next)
+                                st_node.push_back(child_k)
+                                st_w.push_back(w2)
+                                st_seg.push_back(seg_idx2)
+
+                    dprime = dp1
+                    child_k = <int>child[node_k, dprime]
+                    if child_k >= 0:
+                        bprime = <int>node_twos[child_k]
+                        db = b_k - bprime
+                        seg = _segment_value_int_tbl(qk, dprime, d_k, db, b_k)
+                        if seg != 0.0:
+                            w2 = w * seg
+                            seg_idx2 = seg_idx + <long long>child_prefix[node_k, dprime]
+                            if is_last:
+                                if child_k == node_end_target:
+                                    csf_k_ll = prefix_offset + seg_idx2 + suffix_offset
+                                    if csf_k_ll != csf_idx:
+                                        cval = w2
+                                        if thr <= 0.0 or fabs(cval) > thr:
+                                            if cval != 0.0:
+                                                out_k.push_back(csf_k_ll)
+                                                out_rs.push_back(rs_id)
+                                                out_c.push_back(cval)
+                            else:
+                                st_k.push_back(k_next)
+                                st_node.push_back(child_k)
+                                st_w.push_back(w2)
+                                st_seg.push_back(seg_idx2)
+                else:
+                    for dprime in range(4):
+                        child_k = <int>child[node_k, dprime]
+                        if child_k < 0:
+                            continue
+                        bprime = <int>node_twos[child_k]
+                        db = b_k - bprime
+                        seg = _segment_value_int_tbl(qk, dprime, d_k, db, b_k)
+                        if seg == 0.0:
+                            continue
+                        w2 = w * seg
+                        seg_idx2 = seg_idx + <long long>child_prefix[node_k, dprime]
+                        if is_last:
+                            if child_k != node_end_target:
+                                continue
+                            csf_k_ll = prefix_offset + seg_idx2 + suffix_offset
+                            if csf_k_ll == csf_idx:
+                                continue
+                            cval = w2
+                            if thr > 0.0 and fabs(cval) <= thr:
+                                continue
+                            if cval != 0.0:
+                                out_k.push_back(csf_k_ll)
+                                out_rs.push_back(rs_id)
+                                out_c.push_back(cval)
+                        else:
+                            st_k.push_back(k_next)
+                            st_node.push_back(child_k)
+                            st_w.push_back(w2)
+                            st_seg.push_back(seg_idx2)
+
+    cdef Py_ssize_t n_out = <Py_ssize_t>out_k.size()
+    cdef cnp.ndarray[cnp.int64_t, ndim=1] k_arr64
+    cdef cnp.ndarray[cnp.int32_t, ndim=1] k_arr32
+    cdef cnp.ndarray[cnp.int32_t, ndim=1] rs_arr = np.empty(n_out, dtype=np.int32)
+    cdef cnp.ndarray[cnp.float64_t, ndim=1] c_arr = np.empty(n_out, dtype=np.float64)
+    cdef cnp.int64_t[::1] k_view64
+    cdef cnp.int32_t[::1] k_view32
+    cdef cnp.int32_t[::1] rs_view = rs_arr
+    cdef double[::1] c_view = c_arr
+    cdef Py_ssize_t i
+
+    if use_i64:
+        k_arr64 = np.empty(n_out, dtype=np.int64)
+        k_view64 = k_arr64
+        for i in range(n_out):
+            k_view64[i] = <cnp.int64_t>out_k[i]
+            rs_view[i] = <cnp.int32_t>out_rs[i]
+            c_view[i] = <double>out_c[i]
+        return k_arr64, rs_arr, c_arr
+
+    k_arr32 = np.empty(n_out, dtype=np.int32)
+    k_view32 = k_arr32
+    for i in range(n_out):
+        k_view32[i] = <cnp.int32_t>out_k[i]
+        rs_view[i] = <cnp.int32_t>out_rs[i]
+        c_view[i] = <double>out_c[i]
+    return k_arr32, rs_arr, c_arr

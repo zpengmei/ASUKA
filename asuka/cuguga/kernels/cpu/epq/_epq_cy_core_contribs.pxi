@@ -1,6 +1,6 @@
 def epq_contribs_from_csf_index_arrays_cy(
     drt,
-    int csf_idx,
+    long long csf_idx,
     int p,
     int q,
     cnp.ndarray[cnp.int8_t, ndim=1] steps,
@@ -13,6 +13,7 @@ def epq_contribs_from_csf_index_arrays_cy(
       asuka.cuguga.oracle._e_pq_contribs_from_csf_index_arrays(...)
     """
     _ensure_tables()
+    cdef bint use_i64 = int(drt.ncsf) > 2147483647
 
     cdef int norb = int(drt.norb)
     if int(drt.nelec) > _seg_lut_max_b:
@@ -85,7 +86,7 @@ def epq_contribs_from_csf_index_arrays_cy(
     st_w.push_back(1.0)
     st_seg.push_back(0)
 
-    cdef vector[int] out_idx
+    cdef vector[long long] out_idx
     cdef vector[double] out_coeff
 
     cdef int k
@@ -109,7 +110,6 @@ def epq_contribs_from_csf_index_arrays_cy(
     cdef double w2
     cdef long long seg_idx2
     cdef long long csf_i_ll
-    cdef int csf_i
 
     if 1:
         while st_k.size() != 0:
@@ -146,9 +146,8 @@ def epq_contribs_from_csf_index_arrays_cy(
                         if is_last:
                             if child_k == node_end_target:
                                 csf_i_ll = prefix_offset + seg_idx2 + suffix_offset
-                                csf_i = <int>csf_i_ll
-                                if csf_i != csf_idx and w2 != 0.0:
-                                    out_idx.push_back(csf_i)
+                                if csf_i_ll != csf_idx and w2 != 0.0:
+                                    out_idx.push_back(csf_i_ll)
                                     out_coeff.push_back(w2)
                         else:
                             st_k.push_back(k_next)
@@ -168,9 +167,8 @@ def epq_contribs_from_csf_index_arrays_cy(
                         if is_last:
                             if child_k == node_end_target:
                                 csf_i_ll = prefix_offset + seg_idx2 + suffix_offset
-                                csf_i = <int>csf_i_ll
-                                if csf_i != csf_idx and w2 != 0.0:
-                                    out_idx.push_back(csf_i)
+                                if csf_i_ll != csf_idx and w2 != 0.0:
+                                    out_idx.push_back(csf_i_ll)
                                     out_coeff.push_back(w2)
                         else:
                             st_k.push_back(k_next)
@@ -190,9 +188,8 @@ def epq_contribs_from_csf_index_arrays_cy(
                         if is_last:
                             if child_k == node_end_target:
                                 csf_i_ll = prefix_offset + seg_idx2 + suffix_offset
-                                csf_i = <int>csf_i_ll
-                                if csf_i != csf_idx and w2 != 0.0:
-                                    out_idx.push_back(csf_i)
+                                if csf_i_ll != csf_idx and w2 != 0.0:
+                                    out_idx.push_back(csf_i_ll)
                                     out_coeff.push_back(w2)
                         else:
                             st_k.push_back(k_next)
@@ -215,9 +212,8 @@ def epq_contribs_from_csf_index_arrays_cy(
                         if child_k != node_end_target:
                             continue
                         csf_i_ll = prefix_offset + seg_idx2 + suffix_offset
-                        csf_i = <int>csf_i_ll
-                        if csf_i != csf_idx and w2 != 0.0:
-                            out_idx.push_back(csf_i)
+                        if csf_i_ll != csf_idx and w2 != 0.0:
+                            out_idx.push_back(csf_i_ll)
                             out_coeff.push_back(w2)
                     else:
                         st_k.push_back(k_next)
@@ -226,14 +222,24 @@ def epq_contribs_from_csf_index_arrays_cy(
                         st_seg.push_back(seg_idx2)
 
     cdef Py_ssize_t n = <Py_ssize_t>out_idx.size()
-    cdef cnp.ndarray[cnp.int32_t, ndim=1] idx_arr = np.empty(n, dtype=np.int32)
+    cdef cnp.ndarray[cnp.int64_t, ndim=1] idx_arr64
+    cdef cnp.ndarray[cnp.int32_t, ndim=1] idx_arr32
     cdef cnp.ndarray[cnp.float64_t, ndim=1] coeff_arr = np.empty(n, dtype=np.float64)
-    cdef cnp.int32_t[::1] idx_view = idx_arr
+    cdef cnp.int64_t[::1] idx_view64
+    cdef cnp.int32_t[::1] idx_view32
     cdef double[::1] coeff_view = coeff_arr
     cdef Py_ssize_t i
+    if use_i64:
+        idx_arr64 = np.empty(n, dtype=np.int64)
+        idx_view64 = idx_arr64
+        for i in range(n):
+            idx_view64[i] = <cnp.int64_t>out_idx[i]
+            coeff_view[i] = <double>out_coeff[i]
+        return idx_arr64, coeff_arr
+
+    idx_arr32 = np.empty(n, dtype=np.int32)
+    idx_view32 = idx_arr32
     for i in range(n):
-        idx_view[i] = <cnp.int32_t>out_idx[i]
+        idx_view32[i] = <cnp.int32_t>out_idx[i]
         coeff_view[i] = <double>out_coeff[i]
-    return idx_arr, coeff_arr
-
-
+    return idx_arr32, coeff_arr

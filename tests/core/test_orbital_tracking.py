@@ -219,6 +219,7 @@ def test_reorder_mo_to_active_space_preserves_orthonormality():
     assert np.allclose(mo_reordered.T @ mo_reordered, np.eye(nmo), atol=1e-12)
 
 
+@pytest.mark.cuda
 def test_h2_dissociation_tracking():
     """Orbital tracking should prevent active space drift in H2 scan."""
     pytest.importorskip("cupy")  # Skip if CuPy not available (DF requires it)
@@ -267,6 +268,7 @@ def test_h2_dissociation_tracking():
     assert abs(energies[2] - energies[1]) < 0.2
 
 
+@pytest.mark.cuda
 def test_orbital_tracking_disabled():
     """When orbital tracking is disabled, it should behave as before."""
     pytest.importorskip("cupy")  # Skip if CuPy not available (DF requires it)
@@ -298,7 +300,7 @@ def test_orbital_tracking_disabled():
 
     assert isinstance(E, float)
     assert isinstance(grad, np.ndarray)
-    assert grad.shape == (6,)
+    assert grad.shape == (int(mol.natm), 3)
 
 
 def test_orbital_tracking_requires_ncore_ncas():

@@ -404,13 +404,33 @@ void cas36_hb_screen_and_apply_u64_kernel(
   int nops = norb * norb;
 
   extern __shared__ char smem_raw[];
-  double* g_flat_s = reinterpret_cast<double*>(smem_raw);
-  int8_t* steps_s = reinterpret_cast<int8_t*>(g_flat_s + nops);
-  int32_t* nodes_s = reinterpret_cast<int32_t*>(steps_s + ((norb + 7) & ~7));
-  int8_t* occ_s = reinterpret_cast<int8_t*>(nodes_s + norb + 1);
-  int16_t* b_s = reinterpret_cast<int16_t*>(occ_s + ((norb + 3) & ~3));
-  uint64_t* idx_prefix_s = reinterpret_cast<uint64_t*>(
-      reinterpret_cast<char*>(b_s) + ((norb * 2 + 7) & ~7));
+  auto align_up_ptr = [](uintptr_t x, uintptr_t a) -> uintptr_t {
+    return (x + (a - 1u)) & ~(a - 1u);
+  };
+  char* smem_p = smem_raw;
+
+  smem_p = reinterpret_cast<char*>(align_up_ptr((uintptr_t)smem_p, (uintptr_t)alignof(double)));
+  double* g_flat_s = reinterpret_cast<double*>(smem_p);
+  smem_p += (size_t)nops * sizeof(double);
+
+  smem_p = reinterpret_cast<char*>(align_up_ptr((uintptr_t)smem_p, (uintptr_t)alignof(int8_t)));
+  int8_t* steps_s = reinterpret_cast<int8_t*>(smem_p);
+  smem_p += (size_t)norb * sizeof(int8_t);
+
+  smem_p = reinterpret_cast<char*>(align_up_ptr((uintptr_t)smem_p, (uintptr_t)alignof(int32_t)));
+  int32_t* nodes_s = reinterpret_cast<int32_t*>(smem_p);
+  smem_p += (size_t)(norb + 1) * sizeof(int32_t);
+
+  smem_p = reinterpret_cast<char*>(align_up_ptr((uintptr_t)smem_p, (uintptr_t)alignof(int8_t)));
+  int8_t* occ_s = reinterpret_cast<int8_t*>(smem_p);
+  smem_p += (size_t)norb * sizeof(int8_t);
+
+  smem_p = reinterpret_cast<char*>(align_up_ptr((uintptr_t)smem_p, (uintptr_t)alignof(int16_t)));
+  int16_t* b_s = reinterpret_cast<int16_t*>(smem_p);
+  smem_p += (size_t)norb * sizeof(int16_t);
+
+  smem_p = reinterpret_cast<char*>(align_up_ptr((uintptr_t)smem_p, (uintptr_t)alignof(uint64_t)));
+  uint64_t* idx_prefix_s = reinterpret_cast<uint64_t*>(smem_p);
 
   bool ok = cas36_sci_reconstruct_path_from_index_u64<MAX_NORB_T>(
       child_table, child_prefix, norb, ncsf, j_global, steps_s, nodes_s);
@@ -792,5 +812,206 @@ extern "C" cudaError_t cas36_cipsi_score_pt2_compact_u64_launch_stream(
   cas36_cipsi_score_pt2_compact_u64_kernel<<<blocks, threads, 0, stream>>>(
       idx_u64, vals_root_major, vals_stride, ncand, nroots, e_var, cand_hdiag,
       selected_idx_sorted_u64, nselected, denom_floor, score_bits_out, pt2_out);
+  return cudaGetLastError();
+}
+
+extern "C" cudaError_t cas36_hb_screen_and_apply_u64_launch_stream(
+    const uint64_t* sel_idx_u64,
+    const double* c_root,
+    int nsel,
+    int root,
+    int norb,
+    uint64_t ncsf,
+    const int32_t* h1_pq,
+    const double* h1_abs,
+    const double* h1_signed,
+    int n_h1,
+    const int64_t* pq_ptr,
+    const int32_t* rs_idx,
+    const double* v_abs,
+    const double* v_signed,
+    const double* pq_max_v,
+    double eps,
+    const int32_t* child_table,
+    const int16_t* node_twos,
+    const int64_t* child_prefix,
+    uint64_t* hash_keys,
+    double* hash_vals,
+    int cap,
+    const uint64_t* selected_idx_sorted_u64,
+    int nselected,
+    int* overflow_flag,
+    cudaStream_t stream,
+    int threads) {
+  if (!sel_idx_u64 || !c_root || !h1_pq || !h1_abs || !h1_signed || !pq_ptr || !rs_idx || !v_abs || !v_signed ||
+      !pq_max_v || !child_table || !node_twos || !child_prefix || !hash_keys || !hash_vals || !overflow_flag) {
+    return cudaErrorInvalidValue;
+  }
+  if (nsel < 0 || root < 0 || norb <= 0 || norb > 64 || n_h1 < 0 || cap <= 0 || threads <= 0 || threads > 1024) {
+    return cudaErrorInvalidValue;
+  }
+  if ((cap & (cap - 1)) != 0) {
+    return cudaErrorInvalidValue;
+  }
+  if (nsel == 0) {
+    return cudaSuccess;
+  }
+
+  auto align_up = [](size_t x, size_t a) -> size_t {
+    return (x + (a - 1u)) & ~(a - 1u);
+  };
+  const int nops = norb * norb;
+  size_t smem_bytes = 0u;
+  smem_bytes = align_up(smem_bytes, alignof(double));
+  smem_bytes += (size_t)nops * sizeof(double);
+  smem_bytes = align_up(smem_bytes, alignof(int8_t));
+  smem_bytes += (size_t)norb * sizeof(int8_t);
+  smem_bytes = align_up(smem_bytes, alignof(int32_t));
+  smem_bytes += (size_t)(norb + 1) * sizeof(int32_t);
+  smem_bytes = align_up(smem_bytes, alignof(int8_t));
+  smem_bytes += (size_t)norb * sizeof(int8_t);
+  smem_bytes = align_up(smem_bytes, alignof(int16_t));
+  smem_bytes += (size_t)norb * sizeof(int16_t);
+  smem_bytes = align_up(smem_bytes, alignof(uint64_t));
+  smem_bytes += (size_t)(norb + 1) * sizeof(uint64_t);
+
+  dim3 grid((unsigned)nsel);
+  dim3 block((unsigned)threads);
+  if (norb <= 16) {
+    cas36_hb_screen_and_apply_u64_kernel<16><<<grid, block, smem_bytes, stream>>>(
+        sel_idx_u64,
+        c_root,
+        nsel,
+        root,
+        norb,
+        ncsf,
+        h1_pq,
+        h1_abs,
+        h1_signed,
+        n_h1,
+        pq_ptr,
+        rs_idx,
+        v_abs,
+        v_signed,
+        pq_max_v,
+        eps,
+        child_table,
+        node_twos,
+        child_prefix,
+        hash_keys,
+        hash_vals,
+        cap,
+        selected_idx_sorted_u64,
+        nselected,
+        overflow_flag);
+  } else if (norb <= 24) {
+    cas36_hb_screen_and_apply_u64_kernel<24><<<grid, block, smem_bytes, stream>>>(
+        sel_idx_u64,
+        c_root,
+        nsel,
+        root,
+        norb,
+        ncsf,
+        h1_pq,
+        h1_abs,
+        h1_signed,
+        n_h1,
+        pq_ptr,
+        rs_idx,
+        v_abs,
+        v_signed,
+        pq_max_v,
+        eps,
+        child_table,
+        node_twos,
+        child_prefix,
+        hash_keys,
+        hash_vals,
+        cap,
+        selected_idx_sorted_u64,
+        nselected,
+        overflow_flag);
+  } else if (norb <= 32) {
+    cas36_hb_screen_and_apply_u64_kernel<32><<<grid, block, smem_bytes, stream>>>(
+        sel_idx_u64,
+        c_root,
+        nsel,
+        root,
+        norb,
+        ncsf,
+        h1_pq,
+        h1_abs,
+        h1_signed,
+        n_h1,
+        pq_ptr,
+        rs_idx,
+        v_abs,
+        v_signed,
+        pq_max_v,
+        eps,
+        child_table,
+        node_twos,
+        child_prefix,
+        hash_keys,
+        hash_vals,
+        cap,
+        selected_idx_sorted_u64,
+        nselected,
+        overflow_flag);
+  } else if (norb <= 48) {
+    cas36_hb_screen_and_apply_u64_kernel<48><<<grid, block, smem_bytes, stream>>>(
+        sel_idx_u64,
+        c_root,
+        nsel,
+        root,
+        norb,
+        ncsf,
+        h1_pq,
+        h1_abs,
+        h1_signed,
+        n_h1,
+        pq_ptr,
+        rs_idx,
+        v_abs,
+        v_signed,
+        pq_max_v,
+        eps,
+        child_table,
+        node_twos,
+        child_prefix,
+        hash_keys,
+        hash_vals,
+        cap,
+        selected_idx_sorted_u64,
+        nselected,
+        overflow_flag);
+  } else {
+    cas36_hb_screen_and_apply_u64_kernel<64><<<grid, block, smem_bytes, stream>>>(
+        sel_idx_u64,
+        c_root,
+        nsel,
+        root,
+        norb,
+        ncsf,
+        h1_pq,
+        h1_abs,
+        h1_signed,
+        n_h1,
+        pq_ptr,
+        rs_idx,
+        v_abs,
+        v_signed,
+        pq_max_v,
+        eps,
+        child_table,
+        node_twos,
+        child_prefix,
+        hash_keys,
+        hash_vals,
+        cap,
+        selected_idx_sorted_u64,
+        nselected,
+        overflow_flag);
+  }
   return cudaGetLastError();
 }

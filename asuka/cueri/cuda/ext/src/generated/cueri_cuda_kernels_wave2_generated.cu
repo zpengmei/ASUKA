@@ -55,6 +55,37 @@ __device__ __forceinline__ void compute_G_stride_fixed(
   }
 }
 
+template <int NCOMP, int BLOCKS_PER_TASK>
+__global__ void KernelMultiblockReduceFixed(const double* partial_sums, double* eri_out) {
+  static_assert(NCOMP > 0, "NCOMP must be > 0");
+  static_assert(BLOCKS_PER_TASK > 0, "BLOCKS_PER_TASK must be > 0");
+  const int t = static_cast<int>(blockIdx.x);
+  for (int e = static_cast<int>(threadIdx.x); e < NCOMP; e += static_cast<int>(blockDim.x)) {
+    double s = 0.0;
+    const int64_t base = static_cast<int64_t>(t) * static_cast<int64_t>(BLOCKS_PER_TASK) * static_cast<int64_t>(NCOMP)
+                         + static_cast<int64_t>(e);
+    #pragma unroll
+    for (int b = 0; b < BLOCKS_PER_TASK; ++b) {
+      s += partial_sums[base + static_cast<int64_t>(b) * static_cast<int64_t>(NCOMP)];
+    }
+    eri_out[static_cast<int64_t>(t) * static_cast<int64_t>(NCOMP) + static_cast<int64_t>(e)] = s;
+  }
+}
+
+template <int NCOMP>
+__global__ void KernelMultiblockReduceDynamic(const double* partial_sums, int blocks_per_task, double* eri_out) {
+  const int t = static_cast<int>(blockIdx.x);
+  for (int e = static_cast<int>(threadIdx.x); e < NCOMP; e += static_cast<int>(blockDim.x)) {
+    double s = 0.0;
+    const int64_t base = static_cast<int64_t>(t) * static_cast<int64_t>(blocks_per_task) * static_cast<int64_t>(NCOMP)
+                         + static_cast<int64_t>(e);
+    for (int b = 0; b < blocks_per_task; ++b) {
+      s += partial_sums[base + static_cast<int64_t>(b) * static_cast<int64_t>(NCOMP)];
+    }
+    eri_out[static_cast<int64_t>(t) * static_cast<int64_t>(NCOMP) + static_cast<int64_t>(e)] = s;
+  }
+}
+
 __device__ __forceinline__ double eval_ssdp_x(
     int e,
     const double* G,
@@ -288,6 +319,158 @@ __global__ void KernelERI_ssdp_fixed(
     }
     if (active) {
       eri_out[static_cast<int64_t>(t) * static_cast<int64_t>(kNComp) + static_cast<int64_t>(e)] = val;
+    }
+  }
+}
+
+template <int NROOTS>
+__global__ void KernelERI_ssdp_multiblock_partial(
+    const int32_t* task_spAB,
+    const int32_t* task_spCD,
+    int ntasks,
+    const int32_t* sp_A,
+    const int32_t* sp_B,
+    const int32_t* sp_pair_start,
+    const int32_t* sp_npair,
+    const double* shell_cx,
+    const double* shell_cy,
+    const double* shell_cz,
+    const double* pair_eta,
+    const double* pair_Px,
+    const double* pair_Py,
+    const double* pair_Pz,
+    const double* pair_cK,
+    int blocks_per_task,
+    double* partial_sums) {
+  const int t = static_cast<int>(blockIdx.x);
+  const int b = static_cast<int>(blockIdx.y);
+  if (t >= ntasks || b >= blocks_per_task) return;
+
+  const int spAB = static_cast<int>(task_spAB[t]);
+  const int spCD = static_cast<int>(task_spCD[t]);
+  const int A = static_cast<int>(sp_A[spAB]);
+  const int B = static_cast<int>(sp_B[spAB]);
+  const int C = static_cast<int>(sp_A[spCD]);
+  const int D = static_cast<int>(sp_B[spCD]);
+
+  const double Ax = shell_cx[A];
+  const double Ay = shell_cy[A];
+  const double Az = shell_cz[A];
+  const double Bx = shell_cx[B];
+  const double By = shell_cy[B];
+  const double Bz = shell_cz[B];
+  const double Cx = shell_cx[C];
+  const double Cy = shell_cy[C];
+  const double Cz = shell_cz[C];
+  const double Dx = shell_cx[D];
+  const double Dy = shell_cy[D];
+  const double Dz = shell_cz[D];
+
+  const double xij = Ax - Bx;
+  const double yij = Ay - By;
+  const double zij = Az - Bz;
+  const double xkl = Cx - Dx;
+  const double ykl = Cy - Dy;
+  const double zkl = Cz - Dz;
+  const double xij2 = xij * xij;
+  const double yij2 = yij * yij;
+  const double zij2 = zij * zij;
+  const double xkl2 = xkl * xkl;
+  const double ykl2 = ykl * ykl;
+  const double zkl2 = zkl * zkl;
+
+  const int baseAB = static_cast<int>(sp_pair_start[spAB]);
+  const int baseCD = static_cast<int>(sp_pair_start[spCD]);
+  const int nPairAB = static_cast<int>(sp_npair[spAB]);
+  const int nPairCD = static_cast<int>(sp_npair[spCD]);
+  const int64_t nPairsTot = static_cast<int64_t>(nPairAB) * static_cast<int64_t>(nPairCD);
+
+  constexpr int kStride = 5;
+  constexpr int kNComp = 18;
+  constexpr int kNMax = 0;
+  constexpr int kMMax = 3;
+
+  __shared__ double Gx[kStride * kStride];
+  __shared__ double Gy[kStride * kStride];
+  __shared__ double Gz[kStride * kStride];
+  __shared__ double sh_scale;
+  __shared__ double sh_roots[NROOTS];
+  __shared__ double sh_weights[NROOTS];
+  __shared__ double sh_p;
+  __shared__ double sh_q;
+  __shared__ double sh_Px;
+  __shared__ double sh_Py;
+  __shared__ double sh_Pz;
+  __shared__ double sh_Qx;
+  __shared__ double sh_Qy;
+  __shared__ double sh_Qz;
+  __shared__ double sh_denom;
+  __shared__ double sh_base;
+
+  for (int ebase = 0; ebase < kNComp; ebase += static_cast<int>(blockDim.x)) {
+    const int e = ebase + static_cast<int>(threadIdx.x);
+    const bool active = (e < kNComp);
+    double val = 0.0;
+    for (int64_t upair = static_cast<int64_t>(b); upair < nPairsTot; upair += static_cast<int64_t>(blocks_per_task)) {
+      if (threadIdx.x == 0) {
+        const int ip = static_cast<int>(upair / static_cast<int64_t>(nPairCD));
+        const int jp = static_cast<int>(upair - static_cast<int64_t>(ip) * static_cast<int64_t>(nPairCD));
+        const int ki = baseAB + ip;
+        const int kj = baseCD + jp;
+        sh_p = pair_eta[ki];
+        sh_q = pair_eta[kj];
+        sh_Px = pair_Px[ki];
+        sh_Py = pair_Py[ki];
+        sh_Pz = pair_Pz[ki];
+        sh_Qx = pair_Px[kj];
+        sh_Qy = pair_Py[kj];
+        sh_Qz = pair_Pz[kj];
+        const double dx = sh_Px - sh_Qx;
+        const double dy = sh_Py - sh_Qy;
+        const double dz = sh_Pz - sh_Qz;
+        const double PQ2 = dx * dx + dy * dy + dz * dz;
+        sh_denom = sh_p + sh_q;
+        const double omega = sh_p * sh_q / sh_denom;
+        const double T = omega * PQ2;
+        sh_base = kTwoPiToFiveHalves / (sh_p * sh_q * ::sqrt(sh_denom)) * pair_cK[ki] * pair_cK[kj];
+        cueri_rys::rys_roots_weights<NROOTS>(T, sh_roots, sh_weights);
+      }
+      __syncthreads();
+      for (int u = 0; u < NROOTS; ++u) {
+        if (threadIdx.x == 0) {
+          const double x = sh_roots[u];
+          const double w = sh_weights[u];
+          const double inv_denom = 1.0 / sh_denom;
+          const double B0 = x * 0.5 * inv_denom;
+          const double B1 = (1.0 - x) * 0.5 / sh_p + B0;
+          const double B1p = (1.0 - x) * 0.5 / sh_q + B0;
+
+          const double Cx_ = (sh_Px - Ax) + (sh_q * inv_denom) * x * (sh_Qx - sh_Px);
+          const double Cy_ = (sh_Py - Ay) + (sh_q * inv_denom) * x * (sh_Qy - sh_Py);
+          const double Cz_ = (sh_Pz - Az) + (sh_q * inv_denom) * x * (sh_Qz - sh_Pz);
+          const double Cpx_ = (sh_Qx - Cx) + (sh_p * inv_denom) * x * (sh_Px - sh_Qx);
+          const double Cpy_ = (sh_Qy - Cy) + (sh_p * inv_denom) * x * (sh_Py - sh_Qy);
+          const double Cpz_ = (sh_Qz - Cz) + (sh_p * inv_denom) * x * (sh_Pz - sh_Qz);
+
+          compute_G_stride_fixed<kStride, kNMax, kMMax>(Gx, Cx_, Cpx_, B0, B1, B1p);
+          compute_G_stride_fixed<kStride, kNMax, kMMax>(Gy, Cy_, Cpy_, B0, B1, B1p);
+          compute_G_stride_fixed<kStride, kNMax, kMMax>(Gz, Cz_, Cpz_, B0, B1, B1p);
+          sh_scale = sh_base * w;
+        }
+        __syncthreads();
+        if (active) {
+          const double Ix = eval_ssdp_x(e, Gx, xij, xij2, xkl, xkl2);
+          const double Iy = eval_ssdp_y(e, Gy, yij, yij2, ykl, ykl2);
+          const double Iz = eval_ssdp_z(e, Gz, zij, zij2, zkl, zkl2);
+          val += sh_scale * (Ix * Iy * Iz);
+        }
+        __syncthreads();
+      }
+    }
+    if (active) {
+      const int64_t out = (static_cast<int64_t>(t) * static_cast<int64_t>(blocks_per_task) + static_cast<int64_t>(b))
+                        * static_cast<int64_t>(kNComp) + static_cast<int64_t>(e);
+      partial_sums[out] = val;
     }
   }
 }
@@ -801,6 +984,158 @@ __global__ void KernelERI_psdp_fixed(
     }
     if (active) {
       eri_out[static_cast<int64_t>(t) * static_cast<int64_t>(kNComp) + static_cast<int64_t>(e)] = val;
+    }
+  }
+}
+
+template <int NROOTS>
+__global__ void KernelERI_psdp_multiblock_partial(
+    const int32_t* task_spAB,
+    const int32_t* task_spCD,
+    int ntasks,
+    const int32_t* sp_A,
+    const int32_t* sp_B,
+    const int32_t* sp_pair_start,
+    const int32_t* sp_npair,
+    const double* shell_cx,
+    const double* shell_cy,
+    const double* shell_cz,
+    const double* pair_eta,
+    const double* pair_Px,
+    const double* pair_Py,
+    const double* pair_Pz,
+    const double* pair_cK,
+    int blocks_per_task,
+    double* partial_sums) {
+  const int t = static_cast<int>(blockIdx.x);
+  const int b = static_cast<int>(blockIdx.y);
+  if (t >= ntasks || b >= blocks_per_task) return;
+
+  const int spAB = static_cast<int>(task_spAB[t]);
+  const int spCD = static_cast<int>(task_spCD[t]);
+  const int A = static_cast<int>(sp_A[spAB]);
+  const int B = static_cast<int>(sp_B[spAB]);
+  const int C = static_cast<int>(sp_A[spCD]);
+  const int D = static_cast<int>(sp_B[spCD]);
+
+  const double Ax = shell_cx[A];
+  const double Ay = shell_cy[A];
+  const double Az = shell_cz[A];
+  const double Bx = shell_cx[B];
+  const double By = shell_cy[B];
+  const double Bz = shell_cz[B];
+  const double Cx = shell_cx[C];
+  const double Cy = shell_cy[C];
+  const double Cz = shell_cz[C];
+  const double Dx = shell_cx[D];
+  const double Dy = shell_cy[D];
+  const double Dz = shell_cz[D];
+
+  const double xij = Ax - Bx;
+  const double yij = Ay - By;
+  const double zij = Az - Bz;
+  const double xkl = Cx - Dx;
+  const double ykl = Cy - Dy;
+  const double zkl = Cz - Dz;
+  const double xij2 = xij * xij;
+  const double yij2 = yij * yij;
+  const double zij2 = zij * zij;
+  const double xkl2 = xkl * xkl;
+  const double ykl2 = ykl * ykl;
+  const double zkl2 = zkl * zkl;
+
+  const int baseAB = static_cast<int>(sp_pair_start[spAB]);
+  const int baseCD = static_cast<int>(sp_pair_start[spCD]);
+  const int nPairAB = static_cast<int>(sp_npair[spAB]);
+  const int nPairCD = static_cast<int>(sp_npair[spCD]);
+  const int64_t nPairsTot = static_cast<int64_t>(nPairAB) * static_cast<int64_t>(nPairCD);
+
+  constexpr int kStride = 5;
+  constexpr int kNComp = 54;
+  constexpr int kNMax = 1;
+  constexpr int kMMax = 3;
+
+  __shared__ double Gx[kStride * kStride];
+  __shared__ double Gy[kStride * kStride];
+  __shared__ double Gz[kStride * kStride];
+  __shared__ double sh_scale;
+  __shared__ double sh_roots[NROOTS];
+  __shared__ double sh_weights[NROOTS];
+  __shared__ double sh_p;
+  __shared__ double sh_q;
+  __shared__ double sh_Px;
+  __shared__ double sh_Py;
+  __shared__ double sh_Pz;
+  __shared__ double sh_Qx;
+  __shared__ double sh_Qy;
+  __shared__ double sh_Qz;
+  __shared__ double sh_denom;
+  __shared__ double sh_base;
+
+  for (int ebase = 0; ebase < kNComp; ebase += static_cast<int>(blockDim.x)) {
+    const int e = ebase + static_cast<int>(threadIdx.x);
+    const bool active = (e < kNComp);
+    double val = 0.0;
+    for (int64_t upair = static_cast<int64_t>(b); upair < nPairsTot; upair += static_cast<int64_t>(blocks_per_task)) {
+      if (threadIdx.x == 0) {
+        const int ip = static_cast<int>(upair / static_cast<int64_t>(nPairCD));
+        const int jp = static_cast<int>(upair - static_cast<int64_t>(ip) * static_cast<int64_t>(nPairCD));
+        const int ki = baseAB + ip;
+        const int kj = baseCD + jp;
+        sh_p = pair_eta[ki];
+        sh_q = pair_eta[kj];
+        sh_Px = pair_Px[ki];
+        sh_Py = pair_Py[ki];
+        sh_Pz = pair_Pz[ki];
+        sh_Qx = pair_Px[kj];
+        sh_Qy = pair_Py[kj];
+        sh_Qz = pair_Pz[kj];
+        const double dx = sh_Px - sh_Qx;
+        const double dy = sh_Py - sh_Qy;
+        const double dz = sh_Pz - sh_Qz;
+        const double PQ2 = dx * dx + dy * dy + dz * dz;
+        sh_denom = sh_p + sh_q;
+        const double omega = sh_p * sh_q / sh_denom;
+        const double T = omega * PQ2;
+        sh_base = kTwoPiToFiveHalves / (sh_p * sh_q * ::sqrt(sh_denom)) * pair_cK[ki] * pair_cK[kj];
+        cueri_rys::rys_roots_weights<NROOTS>(T, sh_roots, sh_weights);
+      }
+      __syncthreads();
+      for (int u = 0; u < NROOTS; ++u) {
+        if (threadIdx.x == 0) {
+          const double x = sh_roots[u];
+          const double w = sh_weights[u];
+          const double inv_denom = 1.0 / sh_denom;
+          const double B0 = x * 0.5 * inv_denom;
+          const double B1 = (1.0 - x) * 0.5 / sh_p + B0;
+          const double B1p = (1.0 - x) * 0.5 / sh_q + B0;
+
+          const double Cx_ = (sh_Px - Ax) + (sh_q * inv_denom) * x * (sh_Qx - sh_Px);
+          const double Cy_ = (sh_Py - Ay) + (sh_q * inv_denom) * x * (sh_Qy - sh_Py);
+          const double Cz_ = (sh_Pz - Az) + (sh_q * inv_denom) * x * (sh_Qz - sh_Pz);
+          const double Cpx_ = (sh_Qx - Cx) + (sh_p * inv_denom) * x * (sh_Px - sh_Qx);
+          const double Cpy_ = (sh_Qy - Cy) + (sh_p * inv_denom) * x * (sh_Py - sh_Qy);
+          const double Cpz_ = (sh_Qz - Cz) + (sh_p * inv_denom) * x * (sh_Pz - sh_Qz);
+
+          compute_G_stride_fixed<kStride, kNMax, kMMax>(Gx, Cx_, Cpx_, B0, B1, B1p);
+          compute_G_stride_fixed<kStride, kNMax, kMMax>(Gy, Cy_, Cpy_, B0, B1, B1p);
+          compute_G_stride_fixed<kStride, kNMax, kMMax>(Gz, Cz_, Cpz_, B0, B1, B1p);
+          sh_scale = sh_base * w;
+        }
+        __syncthreads();
+        if (active) {
+          const double Ix = eval_psdp_x(e, Gx, xij, xij2, xkl, xkl2);
+          const double Iy = eval_psdp_y(e, Gy, yij, yij2, ykl, ykl2);
+          const double Iz = eval_psdp_z(e, Gz, zij, zij2, zkl, zkl2);
+          val += sh_scale * (Ix * Iy * Iz);
+        }
+        __syncthreads();
+      }
+    }
+    if (active) {
+      const int64_t out = (static_cast<int64_t>(t) * static_cast<int64_t>(blocks_per_task) + static_cast<int64_t>(b))
+                        * static_cast<int64_t>(kNComp) + static_cast<int64_t>(e);
+      partial_sums[out] = val;
     }
   }
 }
@@ -1476,6 +1811,158 @@ __global__ void KernelERI_psdd_fixed(
     }
     if (active) {
       eri_out[static_cast<int64_t>(t) * static_cast<int64_t>(kNComp) + static_cast<int64_t>(e)] = val;
+    }
+  }
+}
+
+template <int NROOTS>
+__global__ void KernelERI_psdd_multiblock_partial(
+    const int32_t* task_spAB,
+    const int32_t* task_spCD,
+    int ntasks,
+    const int32_t* sp_A,
+    const int32_t* sp_B,
+    const int32_t* sp_pair_start,
+    const int32_t* sp_npair,
+    const double* shell_cx,
+    const double* shell_cy,
+    const double* shell_cz,
+    const double* pair_eta,
+    const double* pair_Px,
+    const double* pair_Py,
+    const double* pair_Pz,
+    const double* pair_cK,
+    int blocks_per_task,
+    double* partial_sums) {
+  const int t = static_cast<int>(blockIdx.x);
+  const int b = static_cast<int>(blockIdx.y);
+  if (t >= ntasks || b >= blocks_per_task) return;
+
+  const int spAB = static_cast<int>(task_spAB[t]);
+  const int spCD = static_cast<int>(task_spCD[t]);
+  const int A = static_cast<int>(sp_A[spAB]);
+  const int B = static_cast<int>(sp_B[spAB]);
+  const int C = static_cast<int>(sp_A[spCD]);
+  const int D = static_cast<int>(sp_B[spCD]);
+
+  const double Ax = shell_cx[A];
+  const double Ay = shell_cy[A];
+  const double Az = shell_cz[A];
+  const double Bx = shell_cx[B];
+  const double By = shell_cy[B];
+  const double Bz = shell_cz[B];
+  const double Cx = shell_cx[C];
+  const double Cy = shell_cy[C];
+  const double Cz = shell_cz[C];
+  const double Dx = shell_cx[D];
+  const double Dy = shell_cy[D];
+  const double Dz = shell_cz[D];
+
+  const double xij = Ax - Bx;
+  const double yij = Ay - By;
+  const double zij = Az - Bz;
+  const double xkl = Cx - Dx;
+  const double ykl = Cy - Dy;
+  const double zkl = Cz - Dz;
+  const double xij2 = xij * xij;
+  const double yij2 = yij * yij;
+  const double zij2 = zij * zij;
+  const double xkl2 = xkl * xkl;
+  const double ykl2 = ykl * ykl;
+  const double zkl2 = zkl * zkl;
+
+  const int baseAB = static_cast<int>(sp_pair_start[spAB]);
+  const int baseCD = static_cast<int>(sp_pair_start[spCD]);
+  const int nPairAB = static_cast<int>(sp_npair[spAB]);
+  const int nPairCD = static_cast<int>(sp_npair[spCD]);
+  const int64_t nPairsTot = static_cast<int64_t>(nPairAB) * static_cast<int64_t>(nPairCD);
+
+  constexpr int kStride = 5;
+  constexpr int kNComp = 108;
+  constexpr int kNMax = 1;
+  constexpr int kMMax = 4;
+
+  __shared__ double Gx[kStride * kStride];
+  __shared__ double Gy[kStride * kStride];
+  __shared__ double Gz[kStride * kStride];
+  __shared__ double sh_scale;
+  __shared__ double sh_roots[NROOTS];
+  __shared__ double sh_weights[NROOTS];
+  __shared__ double sh_p;
+  __shared__ double sh_q;
+  __shared__ double sh_Px;
+  __shared__ double sh_Py;
+  __shared__ double sh_Pz;
+  __shared__ double sh_Qx;
+  __shared__ double sh_Qy;
+  __shared__ double sh_Qz;
+  __shared__ double sh_denom;
+  __shared__ double sh_base;
+
+  for (int ebase = 0; ebase < kNComp; ebase += static_cast<int>(blockDim.x)) {
+    const int e = ebase + static_cast<int>(threadIdx.x);
+    const bool active = (e < kNComp);
+    double val = 0.0;
+    for (int64_t upair = static_cast<int64_t>(b); upair < nPairsTot; upair += static_cast<int64_t>(blocks_per_task)) {
+      if (threadIdx.x == 0) {
+        const int ip = static_cast<int>(upair / static_cast<int64_t>(nPairCD));
+        const int jp = static_cast<int>(upair - static_cast<int64_t>(ip) * static_cast<int64_t>(nPairCD));
+        const int ki = baseAB + ip;
+        const int kj = baseCD + jp;
+        sh_p = pair_eta[ki];
+        sh_q = pair_eta[kj];
+        sh_Px = pair_Px[ki];
+        sh_Py = pair_Py[ki];
+        sh_Pz = pair_Pz[ki];
+        sh_Qx = pair_Px[kj];
+        sh_Qy = pair_Py[kj];
+        sh_Qz = pair_Pz[kj];
+        const double dx = sh_Px - sh_Qx;
+        const double dy = sh_Py - sh_Qy;
+        const double dz = sh_Pz - sh_Qz;
+        const double PQ2 = dx * dx + dy * dy + dz * dz;
+        sh_denom = sh_p + sh_q;
+        const double omega = sh_p * sh_q / sh_denom;
+        const double T = omega * PQ2;
+        sh_base = kTwoPiToFiveHalves / (sh_p * sh_q * ::sqrt(sh_denom)) * pair_cK[ki] * pair_cK[kj];
+        cueri_rys::rys_roots_weights<NROOTS>(T, sh_roots, sh_weights);
+      }
+      __syncthreads();
+      for (int u = 0; u < NROOTS; ++u) {
+        if (threadIdx.x == 0) {
+          const double x = sh_roots[u];
+          const double w = sh_weights[u];
+          const double inv_denom = 1.0 / sh_denom;
+          const double B0 = x * 0.5 * inv_denom;
+          const double B1 = (1.0 - x) * 0.5 / sh_p + B0;
+          const double B1p = (1.0 - x) * 0.5 / sh_q + B0;
+
+          const double Cx_ = (sh_Px - Ax) + (sh_q * inv_denom) * x * (sh_Qx - sh_Px);
+          const double Cy_ = (sh_Py - Ay) + (sh_q * inv_denom) * x * (sh_Qy - sh_Py);
+          const double Cz_ = (sh_Pz - Az) + (sh_q * inv_denom) * x * (sh_Qz - sh_Pz);
+          const double Cpx_ = (sh_Qx - Cx) + (sh_p * inv_denom) * x * (sh_Px - sh_Qx);
+          const double Cpy_ = (sh_Qy - Cy) + (sh_p * inv_denom) * x * (sh_Py - sh_Qy);
+          const double Cpz_ = (sh_Qz - Cz) + (sh_p * inv_denom) * x * (sh_Pz - sh_Qz);
+
+          compute_G_stride_fixed<kStride, kNMax, kMMax>(Gx, Cx_, Cpx_, B0, B1, B1p);
+          compute_G_stride_fixed<kStride, kNMax, kMMax>(Gy, Cy_, Cpy_, B0, B1, B1p);
+          compute_G_stride_fixed<kStride, kNMax, kMMax>(Gz, Cz_, Cpz_, B0, B1, B1p);
+          sh_scale = sh_base * w;
+        }
+        __syncthreads();
+        if (active) {
+          const double Ix = eval_psdd_x(e, Gx, xij, xij2, xkl, xkl2);
+          const double Iy = eval_psdd_y(e, Gy, yij, yij2, ykl, ykl2);
+          const double Iz = eval_psdd_z(e, Gz, zij, zij2, zkl, zkl2);
+          val += sh_scale * (Ix * Iy * Iz);
+        }
+        __syncthreads();
+      }
+    }
+    if (active) {
+      const int64_t out = (static_cast<int64_t>(t) * static_cast<int64_t>(blocks_per_task) + static_cast<int64_t>(b))
+                        * static_cast<int64_t>(kNComp) + static_cast<int64_t>(e);
+      partial_sums[out] = val;
     }
   }
 }
@@ -2313,6 +2800,158 @@ __global__ void KernelERI_ppdp_fixed(
     }
     if (active) {
       eri_out[static_cast<int64_t>(t) * static_cast<int64_t>(kNComp) + static_cast<int64_t>(e)] = val;
+    }
+  }
+}
+
+template <int NROOTS>
+__global__ void KernelERI_ppdp_multiblock_partial(
+    const int32_t* task_spAB,
+    const int32_t* task_spCD,
+    int ntasks,
+    const int32_t* sp_A,
+    const int32_t* sp_B,
+    const int32_t* sp_pair_start,
+    const int32_t* sp_npair,
+    const double* shell_cx,
+    const double* shell_cy,
+    const double* shell_cz,
+    const double* pair_eta,
+    const double* pair_Px,
+    const double* pair_Py,
+    const double* pair_Pz,
+    const double* pair_cK,
+    int blocks_per_task,
+    double* partial_sums) {
+  const int t = static_cast<int>(blockIdx.x);
+  const int b = static_cast<int>(blockIdx.y);
+  if (t >= ntasks || b >= blocks_per_task) return;
+
+  const int spAB = static_cast<int>(task_spAB[t]);
+  const int spCD = static_cast<int>(task_spCD[t]);
+  const int A = static_cast<int>(sp_A[spAB]);
+  const int B = static_cast<int>(sp_B[spAB]);
+  const int C = static_cast<int>(sp_A[spCD]);
+  const int D = static_cast<int>(sp_B[spCD]);
+
+  const double Ax = shell_cx[A];
+  const double Ay = shell_cy[A];
+  const double Az = shell_cz[A];
+  const double Bx = shell_cx[B];
+  const double By = shell_cy[B];
+  const double Bz = shell_cz[B];
+  const double Cx = shell_cx[C];
+  const double Cy = shell_cy[C];
+  const double Cz = shell_cz[C];
+  const double Dx = shell_cx[D];
+  const double Dy = shell_cy[D];
+  const double Dz = shell_cz[D];
+
+  const double xij = Ax - Bx;
+  const double yij = Ay - By;
+  const double zij = Az - Bz;
+  const double xkl = Cx - Dx;
+  const double ykl = Cy - Dy;
+  const double zkl = Cz - Dz;
+  const double xij2 = xij * xij;
+  const double yij2 = yij * yij;
+  const double zij2 = zij * zij;
+  const double xkl2 = xkl * xkl;
+  const double ykl2 = ykl * ykl;
+  const double zkl2 = zkl * zkl;
+
+  const int baseAB = static_cast<int>(sp_pair_start[spAB]);
+  const int baseCD = static_cast<int>(sp_pair_start[spCD]);
+  const int nPairAB = static_cast<int>(sp_npair[spAB]);
+  const int nPairCD = static_cast<int>(sp_npair[spCD]);
+  const int64_t nPairsTot = static_cast<int64_t>(nPairAB) * static_cast<int64_t>(nPairCD);
+
+  constexpr int kStride = 5;
+  constexpr int kNComp = 162;
+  constexpr int kNMax = 2;
+  constexpr int kMMax = 3;
+
+  __shared__ double Gx[kStride * kStride];
+  __shared__ double Gy[kStride * kStride];
+  __shared__ double Gz[kStride * kStride];
+  __shared__ double sh_scale;
+  __shared__ double sh_roots[NROOTS];
+  __shared__ double sh_weights[NROOTS];
+  __shared__ double sh_p;
+  __shared__ double sh_q;
+  __shared__ double sh_Px;
+  __shared__ double sh_Py;
+  __shared__ double sh_Pz;
+  __shared__ double sh_Qx;
+  __shared__ double sh_Qy;
+  __shared__ double sh_Qz;
+  __shared__ double sh_denom;
+  __shared__ double sh_base;
+
+  for (int ebase = 0; ebase < kNComp; ebase += static_cast<int>(blockDim.x)) {
+    const int e = ebase + static_cast<int>(threadIdx.x);
+    const bool active = (e < kNComp);
+    double val = 0.0;
+    for (int64_t upair = static_cast<int64_t>(b); upair < nPairsTot; upair += static_cast<int64_t>(blocks_per_task)) {
+      if (threadIdx.x == 0) {
+        const int ip = static_cast<int>(upair / static_cast<int64_t>(nPairCD));
+        const int jp = static_cast<int>(upair - static_cast<int64_t>(ip) * static_cast<int64_t>(nPairCD));
+        const int ki = baseAB + ip;
+        const int kj = baseCD + jp;
+        sh_p = pair_eta[ki];
+        sh_q = pair_eta[kj];
+        sh_Px = pair_Px[ki];
+        sh_Py = pair_Py[ki];
+        sh_Pz = pair_Pz[ki];
+        sh_Qx = pair_Px[kj];
+        sh_Qy = pair_Py[kj];
+        sh_Qz = pair_Pz[kj];
+        const double dx = sh_Px - sh_Qx;
+        const double dy = sh_Py - sh_Qy;
+        const double dz = sh_Pz - sh_Qz;
+        const double PQ2 = dx * dx + dy * dy + dz * dz;
+        sh_denom = sh_p + sh_q;
+        const double omega = sh_p * sh_q / sh_denom;
+        const double T = omega * PQ2;
+        sh_base = kTwoPiToFiveHalves / (sh_p * sh_q * ::sqrt(sh_denom)) * pair_cK[ki] * pair_cK[kj];
+        cueri_rys::rys_roots_weights<NROOTS>(T, sh_roots, sh_weights);
+      }
+      __syncthreads();
+      for (int u = 0; u < NROOTS; ++u) {
+        if (threadIdx.x == 0) {
+          const double x = sh_roots[u];
+          const double w = sh_weights[u];
+          const double inv_denom = 1.0 / sh_denom;
+          const double B0 = x * 0.5 * inv_denom;
+          const double B1 = (1.0 - x) * 0.5 / sh_p + B0;
+          const double B1p = (1.0 - x) * 0.5 / sh_q + B0;
+
+          const double Cx_ = (sh_Px - Ax) + (sh_q * inv_denom) * x * (sh_Qx - sh_Px);
+          const double Cy_ = (sh_Py - Ay) + (sh_q * inv_denom) * x * (sh_Qy - sh_Py);
+          const double Cz_ = (sh_Pz - Az) + (sh_q * inv_denom) * x * (sh_Qz - sh_Pz);
+          const double Cpx_ = (sh_Qx - Cx) + (sh_p * inv_denom) * x * (sh_Px - sh_Qx);
+          const double Cpy_ = (sh_Qy - Cy) + (sh_p * inv_denom) * x * (sh_Py - sh_Qy);
+          const double Cpz_ = (sh_Qz - Cz) + (sh_p * inv_denom) * x * (sh_Pz - sh_Qz);
+
+          compute_G_stride_fixed<kStride, kNMax, kMMax>(Gx, Cx_, Cpx_, B0, B1, B1p);
+          compute_G_stride_fixed<kStride, kNMax, kMMax>(Gy, Cy_, Cpy_, B0, B1, B1p);
+          compute_G_stride_fixed<kStride, kNMax, kMMax>(Gz, Cz_, Cpz_, B0, B1, B1p);
+          sh_scale = sh_base * w;
+        }
+        __syncthreads();
+        if (active) {
+          const double Ix = eval_ppdp_x(e, Gx, xij, xij2, xkl, xkl2);
+          const double Iy = eval_ppdp_y(e, Gy, yij, yij2, ykl, ykl2);
+          const double Iz = eval_ppdp_z(e, Gz, zij, zij2, zkl, zkl2);
+          val += sh_scale * (Ix * Iy * Iz);
+        }
+        __syncthreads();
+      }
+    }
+    if (active) {
+      const int64_t out = (static_cast<int64_t>(t) * static_cast<int64_t>(blocks_per_task) + static_cast<int64_t>(b))
+                        * static_cast<int64_t>(kNComp) + static_cast<int64_t>(e);
+      partial_sums[out] = val;
     }
   }
 }
@@ -3472,6 +4111,158 @@ __global__ void KernelERI_ppdd_fixed(
   }
 }
 
+template <int NROOTS>
+__global__ void KernelERI_ppdd_multiblock_partial(
+    const int32_t* task_spAB,
+    const int32_t* task_spCD,
+    int ntasks,
+    const int32_t* sp_A,
+    const int32_t* sp_B,
+    const int32_t* sp_pair_start,
+    const int32_t* sp_npair,
+    const double* shell_cx,
+    const double* shell_cy,
+    const double* shell_cz,
+    const double* pair_eta,
+    const double* pair_Px,
+    const double* pair_Py,
+    const double* pair_Pz,
+    const double* pair_cK,
+    int blocks_per_task,
+    double* partial_sums) {
+  const int t = static_cast<int>(blockIdx.x);
+  const int b = static_cast<int>(blockIdx.y);
+  if (t >= ntasks || b >= blocks_per_task) return;
+
+  const int spAB = static_cast<int>(task_spAB[t]);
+  const int spCD = static_cast<int>(task_spCD[t]);
+  const int A = static_cast<int>(sp_A[spAB]);
+  const int B = static_cast<int>(sp_B[spAB]);
+  const int C = static_cast<int>(sp_A[spCD]);
+  const int D = static_cast<int>(sp_B[spCD]);
+
+  const double Ax = shell_cx[A];
+  const double Ay = shell_cy[A];
+  const double Az = shell_cz[A];
+  const double Bx = shell_cx[B];
+  const double By = shell_cy[B];
+  const double Bz = shell_cz[B];
+  const double Cx = shell_cx[C];
+  const double Cy = shell_cy[C];
+  const double Cz = shell_cz[C];
+  const double Dx = shell_cx[D];
+  const double Dy = shell_cy[D];
+  const double Dz = shell_cz[D];
+
+  const double xij = Ax - Bx;
+  const double yij = Ay - By;
+  const double zij = Az - Bz;
+  const double xkl = Cx - Dx;
+  const double ykl = Cy - Dy;
+  const double zkl = Cz - Dz;
+  const double xij2 = xij * xij;
+  const double yij2 = yij * yij;
+  const double zij2 = zij * zij;
+  const double xkl2 = xkl * xkl;
+  const double ykl2 = ykl * ykl;
+  const double zkl2 = zkl * zkl;
+
+  const int baseAB = static_cast<int>(sp_pair_start[spAB]);
+  const int baseCD = static_cast<int>(sp_pair_start[spCD]);
+  const int nPairAB = static_cast<int>(sp_npair[spAB]);
+  const int nPairCD = static_cast<int>(sp_npair[spCD]);
+  const int64_t nPairsTot = static_cast<int64_t>(nPairAB) * static_cast<int64_t>(nPairCD);
+
+  constexpr int kStride = 5;
+  constexpr int kNComp = 324;
+  constexpr int kNMax = 2;
+  constexpr int kMMax = 4;
+
+  __shared__ double Gx[kStride * kStride];
+  __shared__ double Gy[kStride * kStride];
+  __shared__ double Gz[kStride * kStride];
+  __shared__ double sh_scale;
+  __shared__ double sh_roots[NROOTS];
+  __shared__ double sh_weights[NROOTS];
+  __shared__ double sh_p;
+  __shared__ double sh_q;
+  __shared__ double sh_Px;
+  __shared__ double sh_Py;
+  __shared__ double sh_Pz;
+  __shared__ double sh_Qx;
+  __shared__ double sh_Qy;
+  __shared__ double sh_Qz;
+  __shared__ double sh_denom;
+  __shared__ double sh_base;
+
+  for (int ebase = 0; ebase < kNComp; ebase += static_cast<int>(blockDim.x)) {
+    const int e = ebase + static_cast<int>(threadIdx.x);
+    const bool active = (e < kNComp);
+    double val = 0.0;
+    for (int64_t upair = static_cast<int64_t>(b); upair < nPairsTot; upair += static_cast<int64_t>(blocks_per_task)) {
+      if (threadIdx.x == 0) {
+        const int ip = static_cast<int>(upair / static_cast<int64_t>(nPairCD));
+        const int jp = static_cast<int>(upair - static_cast<int64_t>(ip) * static_cast<int64_t>(nPairCD));
+        const int ki = baseAB + ip;
+        const int kj = baseCD + jp;
+        sh_p = pair_eta[ki];
+        sh_q = pair_eta[kj];
+        sh_Px = pair_Px[ki];
+        sh_Py = pair_Py[ki];
+        sh_Pz = pair_Pz[ki];
+        sh_Qx = pair_Px[kj];
+        sh_Qy = pair_Py[kj];
+        sh_Qz = pair_Pz[kj];
+        const double dx = sh_Px - sh_Qx;
+        const double dy = sh_Py - sh_Qy;
+        const double dz = sh_Pz - sh_Qz;
+        const double PQ2 = dx * dx + dy * dy + dz * dz;
+        sh_denom = sh_p + sh_q;
+        const double omega = sh_p * sh_q / sh_denom;
+        const double T = omega * PQ2;
+        sh_base = kTwoPiToFiveHalves / (sh_p * sh_q * ::sqrt(sh_denom)) * pair_cK[ki] * pair_cK[kj];
+        cueri_rys::rys_roots_weights<NROOTS>(T, sh_roots, sh_weights);
+      }
+      __syncthreads();
+      for (int u = 0; u < NROOTS; ++u) {
+        if (threadIdx.x == 0) {
+          const double x = sh_roots[u];
+          const double w = sh_weights[u];
+          const double inv_denom = 1.0 / sh_denom;
+          const double B0 = x * 0.5 * inv_denom;
+          const double B1 = (1.0 - x) * 0.5 / sh_p + B0;
+          const double B1p = (1.0 - x) * 0.5 / sh_q + B0;
+
+          const double Cx_ = (sh_Px - Ax) + (sh_q * inv_denom) * x * (sh_Qx - sh_Px);
+          const double Cy_ = (sh_Py - Ay) + (sh_q * inv_denom) * x * (sh_Qy - sh_Py);
+          const double Cz_ = (sh_Pz - Az) + (sh_q * inv_denom) * x * (sh_Qz - sh_Pz);
+          const double Cpx_ = (sh_Qx - Cx) + (sh_p * inv_denom) * x * (sh_Px - sh_Qx);
+          const double Cpy_ = (sh_Qy - Cy) + (sh_p * inv_denom) * x * (sh_Py - sh_Qy);
+          const double Cpz_ = (sh_Qz - Cz) + (sh_p * inv_denom) * x * (sh_Pz - sh_Qz);
+
+          compute_G_stride_fixed<kStride, kNMax, kMMax>(Gx, Cx_, Cpx_, B0, B1, B1p);
+          compute_G_stride_fixed<kStride, kNMax, kMMax>(Gy, Cy_, Cpy_, B0, B1, B1p);
+          compute_G_stride_fixed<kStride, kNMax, kMMax>(Gz, Cz_, Cpz_, B0, B1, B1p);
+          sh_scale = sh_base * w;
+        }
+        __syncthreads();
+        if (active) {
+          const double Ix = eval_ppdd_x(e, Gx, xij, xij2, xkl, xkl2);
+          const double Iy = eval_ppdd_y(e, Gy, yij, yij2, ykl, ykl2);
+          const double Iz = eval_ppdd_z(e, Gz, zij, zij2, zkl, zkl2);
+          val += sh_scale * (Ix * Iy * Iz);
+        }
+        __syncthreads();
+      }
+    }
+    if (active) {
+      const int64_t out = (static_cast<int64_t>(t) * static_cast<int64_t>(blocks_per_task) + static_cast<int64_t>(b))
+                        * static_cast<int64_t>(kNComp) + static_cast<int64_t>(e);
+      partial_sums[out] = val;
+    }
+  }
+}
+
 __device__ __forceinline__ double eval_ddss_x(
     int e,
     const double* G,
@@ -3759,6 +4550,158 @@ __global__ void KernelERI_ddss_fixed(
     }
     if (active) {
       eri_out[static_cast<int64_t>(t) * static_cast<int64_t>(kNComp) + static_cast<int64_t>(e)] = val;
+    }
+  }
+}
+
+template <int NROOTS>
+__global__ void KernelERI_ddss_multiblock_partial(
+    const int32_t* task_spAB,
+    const int32_t* task_spCD,
+    int ntasks,
+    const int32_t* sp_A,
+    const int32_t* sp_B,
+    const int32_t* sp_pair_start,
+    const int32_t* sp_npair,
+    const double* shell_cx,
+    const double* shell_cy,
+    const double* shell_cz,
+    const double* pair_eta,
+    const double* pair_Px,
+    const double* pair_Py,
+    const double* pair_Pz,
+    const double* pair_cK,
+    int blocks_per_task,
+    double* partial_sums) {
+  const int t = static_cast<int>(blockIdx.x);
+  const int b = static_cast<int>(blockIdx.y);
+  if (t >= ntasks || b >= blocks_per_task) return;
+
+  const int spAB = static_cast<int>(task_spAB[t]);
+  const int spCD = static_cast<int>(task_spCD[t]);
+  const int A = static_cast<int>(sp_A[spAB]);
+  const int B = static_cast<int>(sp_B[spAB]);
+  const int C = static_cast<int>(sp_A[spCD]);
+  const int D = static_cast<int>(sp_B[spCD]);
+
+  const double Ax = shell_cx[A];
+  const double Ay = shell_cy[A];
+  const double Az = shell_cz[A];
+  const double Bx = shell_cx[B];
+  const double By = shell_cy[B];
+  const double Bz = shell_cz[B];
+  const double Cx = shell_cx[C];
+  const double Cy = shell_cy[C];
+  const double Cz = shell_cz[C];
+  const double Dx = shell_cx[D];
+  const double Dy = shell_cy[D];
+  const double Dz = shell_cz[D];
+
+  const double xij = Ax - Bx;
+  const double yij = Ay - By;
+  const double zij = Az - Bz;
+  const double xkl = Cx - Dx;
+  const double ykl = Cy - Dy;
+  const double zkl = Cz - Dz;
+  const double xij2 = xij * xij;
+  const double yij2 = yij * yij;
+  const double zij2 = zij * zij;
+  const double xkl2 = xkl * xkl;
+  const double ykl2 = ykl * ykl;
+  const double zkl2 = zkl * zkl;
+
+  const int baseAB = static_cast<int>(sp_pair_start[spAB]);
+  const int baseCD = static_cast<int>(sp_pair_start[spCD]);
+  const int nPairAB = static_cast<int>(sp_npair[spAB]);
+  const int nPairCD = static_cast<int>(sp_npair[spCD]);
+  const int64_t nPairsTot = static_cast<int64_t>(nPairAB) * static_cast<int64_t>(nPairCD);
+
+  constexpr int kStride = 5;
+  constexpr int kNComp = 36;
+  constexpr int kNMax = 4;
+  constexpr int kMMax = 0;
+
+  __shared__ double Gx[kStride * kStride];
+  __shared__ double Gy[kStride * kStride];
+  __shared__ double Gz[kStride * kStride];
+  __shared__ double sh_scale;
+  __shared__ double sh_roots[NROOTS];
+  __shared__ double sh_weights[NROOTS];
+  __shared__ double sh_p;
+  __shared__ double sh_q;
+  __shared__ double sh_Px;
+  __shared__ double sh_Py;
+  __shared__ double sh_Pz;
+  __shared__ double sh_Qx;
+  __shared__ double sh_Qy;
+  __shared__ double sh_Qz;
+  __shared__ double sh_denom;
+  __shared__ double sh_base;
+
+  for (int ebase = 0; ebase < kNComp; ebase += static_cast<int>(blockDim.x)) {
+    const int e = ebase + static_cast<int>(threadIdx.x);
+    const bool active = (e < kNComp);
+    double val = 0.0;
+    for (int64_t upair = static_cast<int64_t>(b); upair < nPairsTot; upair += static_cast<int64_t>(blocks_per_task)) {
+      if (threadIdx.x == 0) {
+        const int ip = static_cast<int>(upair / static_cast<int64_t>(nPairCD));
+        const int jp = static_cast<int>(upair - static_cast<int64_t>(ip) * static_cast<int64_t>(nPairCD));
+        const int ki = baseAB + ip;
+        const int kj = baseCD + jp;
+        sh_p = pair_eta[ki];
+        sh_q = pair_eta[kj];
+        sh_Px = pair_Px[ki];
+        sh_Py = pair_Py[ki];
+        sh_Pz = pair_Pz[ki];
+        sh_Qx = pair_Px[kj];
+        sh_Qy = pair_Py[kj];
+        sh_Qz = pair_Pz[kj];
+        const double dx = sh_Px - sh_Qx;
+        const double dy = sh_Py - sh_Qy;
+        const double dz = sh_Pz - sh_Qz;
+        const double PQ2 = dx * dx + dy * dy + dz * dz;
+        sh_denom = sh_p + sh_q;
+        const double omega = sh_p * sh_q / sh_denom;
+        const double T = omega * PQ2;
+        sh_base = kTwoPiToFiveHalves / (sh_p * sh_q * ::sqrt(sh_denom)) * pair_cK[ki] * pair_cK[kj];
+        cueri_rys::rys_roots_weights<NROOTS>(T, sh_roots, sh_weights);
+      }
+      __syncthreads();
+      for (int u = 0; u < NROOTS; ++u) {
+        if (threadIdx.x == 0) {
+          const double x = sh_roots[u];
+          const double w = sh_weights[u];
+          const double inv_denom = 1.0 / sh_denom;
+          const double B0 = x * 0.5 * inv_denom;
+          const double B1 = (1.0 - x) * 0.5 / sh_p + B0;
+          const double B1p = (1.0 - x) * 0.5 / sh_q + B0;
+
+          const double Cx_ = (sh_Px - Ax) + (sh_q * inv_denom) * x * (sh_Qx - sh_Px);
+          const double Cy_ = (sh_Py - Ay) + (sh_q * inv_denom) * x * (sh_Qy - sh_Py);
+          const double Cz_ = (sh_Pz - Az) + (sh_q * inv_denom) * x * (sh_Qz - sh_Pz);
+          const double Cpx_ = (sh_Qx - Cx) + (sh_p * inv_denom) * x * (sh_Px - sh_Qx);
+          const double Cpy_ = (sh_Qy - Cy) + (sh_p * inv_denom) * x * (sh_Py - sh_Qy);
+          const double Cpz_ = (sh_Qz - Cz) + (sh_p * inv_denom) * x * (sh_Pz - sh_Qz);
+
+          compute_G_stride_fixed<kStride, kNMax, kMMax>(Gx, Cx_, Cpx_, B0, B1, B1p);
+          compute_G_stride_fixed<kStride, kNMax, kMMax>(Gy, Cy_, Cpy_, B0, B1, B1p);
+          compute_G_stride_fixed<kStride, kNMax, kMMax>(Gz, Cz_, Cpz_, B0, B1, B1p);
+          sh_scale = sh_base * w;
+        }
+        __syncthreads();
+        if (active) {
+          const double Ix = eval_ddss_x(e, Gx, xij, xij2, xkl, xkl2);
+          const double Iy = eval_ddss_y(e, Gy, yij, yij2, ykl, ykl2);
+          const double Iz = eval_ddss_z(e, Gz, zij, zij2, zkl, zkl2);
+          val += sh_scale * (Ix * Iy * Iz);
+        }
+        __syncthreads();
+      }
+    }
+    if (active) {
+      const int64_t out = (static_cast<int64_t>(t) * static_cast<int64_t>(blocks_per_task) + static_cast<int64_t>(b))
+                        * static_cast<int64_t>(kNComp) + static_cast<int64_t>(e);
+      partial_sums[out] = val;
     }
   }
 }
@@ -5082,6 +6025,158 @@ __global__ void KernelERI_dpdp_fixed(
     }
     if (active) {
       eri_out[static_cast<int64_t>(t) * static_cast<int64_t>(kNComp) + static_cast<int64_t>(e)] = val;
+    }
+  }
+}
+
+template <int NROOTS>
+__global__ void KernelERI_dpdp_multiblock_partial(
+    const int32_t* task_spAB,
+    const int32_t* task_spCD,
+    int ntasks,
+    const int32_t* sp_A,
+    const int32_t* sp_B,
+    const int32_t* sp_pair_start,
+    const int32_t* sp_npair,
+    const double* shell_cx,
+    const double* shell_cy,
+    const double* shell_cz,
+    const double* pair_eta,
+    const double* pair_Px,
+    const double* pair_Py,
+    const double* pair_Pz,
+    const double* pair_cK,
+    int blocks_per_task,
+    double* partial_sums) {
+  const int t = static_cast<int>(blockIdx.x);
+  const int b = static_cast<int>(blockIdx.y);
+  if (t >= ntasks || b >= blocks_per_task) return;
+
+  const int spAB = static_cast<int>(task_spAB[t]);
+  const int spCD = static_cast<int>(task_spCD[t]);
+  const int A = static_cast<int>(sp_A[spAB]);
+  const int B = static_cast<int>(sp_B[spAB]);
+  const int C = static_cast<int>(sp_A[spCD]);
+  const int D = static_cast<int>(sp_B[spCD]);
+
+  const double Ax = shell_cx[A];
+  const double Ay = shell_cy[A];
+  const double Az = shell_cz[A];
+  const double Bx = shell_cx[B];
+  const double By = shell_cy[B];
+  const double Bz = shell_cz[B];
+  const double Cx = shell_cx[C];
+  const double Cy = shell_cy[C];
+  const double Cz = shell_cz[C];
+  const double Dx = shell_cx[D];
+  const double Dy = shell_cy[D];
+  const double Dz = shell_cz[D];
+
+  const double xij = Ax - Bx;
+  const double yij = Ay - By;
+  const double zij = Az - Bz;
+  const double xkl = Cx - Dx;
+  const double ykl = Cy - Dy;
+  const double zkl = Cz - Dz;
+  const double xij2 = xij * xij;
+  const double yij2 = yij * yij;
+  const double zij2 = zij * zij;
+  const double xkl2 = xkl * xkl;
+  const double ykl2 = ykl * ykl;
+  const double zkl2 = zkl * zkl;
+
+  const int baseAB = static_cast<int>(sp_pair_start[spAB]);
+  const int baseCD = static_cast<int>(sp_pair_start[spCD]);
+  const int nPairAB = static_cast<int>(sp_npair[spAB]);
+  const int nPairCD = static_cast<int>(sp_npair[spCD]);
+  const int64_t nPairsTot = static_cast<int64_t>(nPairAB) * static_cast<int64_t>(nPairCD);
+
+  constexpr int kStride = 5;
+  constexpr int kNComp = 324;
+  constexpr int kNMax = 3;
+  constexpr int kMMax = 3;
+
+  __shared__ double Gx[kStride * kStride];
+  __shared__ double Gy[kStride * kStride];
+  __shared__ double Gz[kStride * kStride];
+  __shared__ double sh_scale;
+  __shared__ double sh_roots[NROOTS];
+  __shared__ double sh_weights[NROOTS];
+  __shared__ double sh_p;
+  __shared__ double sh_q;
+  __shared__ double sh_Px;
+  __shared__ double sh_Py;
+  __shared__ double sh_Pz;
+  __shared__ double sh_Qx;
+  __shared__ double sh_Qy;
+  __shared__ double sh_Qz;
+  __shared__ double sh_denom;
+  __shared__ double sh_base;
+
+  for (int ebase = 0; ebase < kNComp; ebase += static_cast<int>(blockDim.x)) {
+    const int e = ebase + static_cast<int>(threadIdx.x);
+    const bool active = (e < kNComp);
+    double val = 0.0;
+    for (int64_t upair = static_cast<int64_t>(b); upair < nPairsTot; upair += static_cast<int64_t>(blocks_per_task)) {
+      if (threadIdx.x == 0) {
+        const int ip = static_cast<int>(upair / static_cast<int64_t>(nPairCD));
+        const int jp = static_cast<int>(upair - static_cast<int64_t>(ip) * static_cast<int64_t>(nPairCD));
+        const int ki = baseAB + ip;
+        const int kj = baseCD + jp;
+        sh_p = pair_eta[ki];
+        sh_q = pair_eta[kj];
+        sh_Px = pair_Px[ki];
+        sh_Py = pair_Py[ki];
+        sh_Pz = pair_Pz[ki];
+        sh_Qx = pair_Px[kj];
+        sh_Qy = pair_Py[kj];
+        sh_Qz = pair_Pz[kj];
+        const double dx = sh_Px - sh_Qx;
+        const double dy = sh_Py - sh_Qy;
+        const double dz = sh_Pz - sh_Qz;
+        const double PQ2 = dx * dx + dy * dy + dz * dz;
+        sh_denom = sh_p + sh_q;
+        const double omega = sh_p * sh_q / sh_denom;
+        const double T = omega * PQ2;
+        sh_base = kTwoPiToFiveHalves / (sh_p * sh_q * ::sqrt(sh_denom)) * pair_cK[ki] * pair_cK[kj];
+        cueri_rys::rys_roots_weights<NROOTS>(T, sh_roots, sh_weights);
+      }
+      __syncthreads();
+      for (int u = 0; u < NROOTS; ++u) {
+        if (threadIdx.x == 0) {
+          const double x = sh_roots[u];
+          const double w = sh_weights[u];
+          const double inv_denom = 1.0 / sh_denom;
+          const double B0 = x * 0.5 * inv_denom;
+          const double B1 = (1.0 - x) * 0.5 / sh_p + B0;
+          const double B1p = (1.0 - x) * 0.5 / sh_q + B0;
+
+          const double Cx_ = (sh_Px - Ax) + (sh_q * inv_denom) * x * (sh_Qx - sh_Px);
+          const double Cy_ = (sh_Py - Ay) + (sh_q * inv_denom) * x * (sh_Qy - sh_Py);
+          const double Cz_ = (sh_Pz - Az) + (sh_q * inv_denom) * x * (sh_Qz - sh_Pz);
+          const double Cpx_ = (sh_Qx - Cx) + (sh_p * inv_denom) * x * (sh_Px - sh_Qx);
+          const double Cpy_ = (sh_Qy - Cy) + (sh_p * inv_denom) * x * (sh_Py - sh_Qy);
+          const double Cpz_ = (sh_Qz - Cz) + (sh_p * inv_denom) * x * (sh_Pz - sh_Qz);
+
+          compute_G_stride_fixed<kStride, kNMax, kMMax>(Gx, Cx_, Cpx_, B0, B1, B1p);
+          compute_G_stride_fixed<kStride, kNMax, kMMax>(Gy, Cy_, Cpy_, B0, B1, B1p);
+          compute_G_stride_fixed<kStride, kNMax, kMMax>(Gz, Cz_, Cpz_, B0, B1, B1p);
+          sh_scale = sh_base * w;
+        }
+        __syncthreads();
+        if (active) {
+          const double Ix = eval_dpdp_x(e, Gx, xij, xij2, xkl, xkl2);
+          const double Iy = eval_dpdp_y(e, Gy, yij, yij2, ykl, ykl2);
+          const double Iz = eval_dpdp_z(e, Gz, zij, zij2, zkl, zkl2);
+          val += sh_scale * (Ix * Iy * Iz);
+        }
+        __syncthreads();
+      }
+    }
+    if (active) {
+      const int64_t out = (static_cast<int64_t>(t) * static_cast<int64_t>(blocks_per_task) + static_cast<int64_t>(b))
+                        * static_cast<int64_t>(kNComp) + static_cast<int64_t>(e);
+      partial_sums[out] = val;
     }
   }
 }
@@ -7209,6 +8304,158 @@ __global__ void KernelERI_dpdd_fixed(
     }
     if (active) {
       eri_out[static_cast<int64_t>(t) * static_cast<int64_t>(kNComp) + static_cast<int64_t>(e)] = val;
+    }
+  }
+}
+
+template <int NROOTS>
+__global__ void KernelERI_dpdd_multiblock_partial(
+    const int32_t* task_spAB,
+    const int32_t* task_spCD,
+    int ntasks,
+    const int32_t* sp_A,
+    const int32_t* sp_B,
+    const int32_t* sp_pair_start,
+    const int32_t* sp_npair,
+    const double* shell_cx,
+    const double* shell_cy,
+    const double* shell_cz,
+    const double* pair_eta,
+    const double* pair_Px,
+    const double* pair_Py,
+    const double* pair_Pz,
+    const double* pair_cK,
+    int blocks_per_task,
+    double* partial_sums) {
+  const int t = static_cast<int>(blockIdx.x);
+  const int b = static_cast<int>(blockIdx.y);
+  if (t >= ntasks || b >= blocks_per_task) return;
+
+  const int spAB = static_cast<int>(task_spAB[t]);
+  const int spCD = static_cast<int>(task_spCD[t]);
+  const int A = static_cast<int>(sp_A[spAB]);
+  const int B = static_cast<int>(sp_B[spAB]);
+  const int C = static_cast<int>(sp_A[spCD]);
+  const int D = static_cast<int>(sp_B[spCD]);
+
+  const double Ax = shell_cx[A];
+  const double Ay = shell_cy[A];
+  const double Az = shell_cz[A];
+  const double Bx = shell_cx[B];
+  const double By = shell_cy[B];
+  const double Bz = shell_cz[B];
+  const double Cx = shell_cx[C];
+  const double Cy = shell_cy[C];
+  const double Cz = shell_cz[C];
+  const double Dx = shell_cx[D];
+  const double Dy = shell_cy[D];
+  const double Dz = shell_cz[D];
+
+  const double xij = Ax - Bx;
+  const double yij = Ay - By;
+  const double zij = Az - Bz;
+  const double xkl = Cx - Dx;
+  const double ykl = Cy - Dy;
+  const double zkl = Cz - Dz;
+  const double xij2 = xij * xij;
+  const double yij2 = yij * yij;
+  const double zij2 = zij * zij;
+  const double xkl2 = xkl * xkl;
+  const double ykl2 = ykl * ykl;
+  const double zkl2 = zkl * zkl;
+
+  const int baseAB = static_cast<int>(sp_pair_start[spAB]);
+  const int baseCD = static_cast<int>(sp_pair_start[spCD]);
+  const int nPairAB = static_cast<int>(sp_npair[spAB]);
+  const int nPairCD = static_cast<int>(sp_npair[spCD]);
+  const int64_t nPairsTot = static_cast<int64_t>(nPairAB) * static_cast<int64_t>(nPairCD);
+
+  constexpr int kStride = 5;
+  constexpr int kNComp = 648;
+  constexpr int kNMax = 3;
+  constexpr int kMMax = 4;
+
+  __shared__ double Gx[kStride * kStride];
+  __shared__ double Gy[kStride * kStride];
+  __shared__ double Gz[kStride * kStride];
+  __shared__ double sh_scale;
+  __shared__ double sh_roots[NROOTS];
+  __shared__ double sh_weights[NROOTS];
+  __shared__ double sh_p;
+  __shared__ double sh_q;
+  __shared__ double sh_Px;
+  __shared__ double sh_Py;
+  __shared__ double sh_Pz;
+  __shared__ double sh_Qx;
+  __shared__ double sh_Qy;
+  __shared__ double sh_Qz;
+  __shared__ double sh_denom;
+  __shared__ double sh_base;
+
+  for (int ebase = 0; ebase < kNComp; ebase += static_cast<int>(blockDim.x)) {
+    const int e = ebase + static_cast<int>(threadIdx.x);
+    const bool active = (e < kNComp);
+    double val = 0.0;
+    for (int64_t upair = static_cast<int64_t>(b); upair < nPairsTot; upair += static_cast<int64_t>(blocks_per_task)) {
+      if (threadIdx.x == 0) {
+        const int ip = static_cast<int>(upair / static_cast<int64_t>(nPairCD));
+        const int jp = static_cast<int>(upair - static_cast<int64_t>(ip) * static_cast<int64_t>(nPairCD));
+        const int ki = baseAB + ip;
+        const int kj = baseCD + jp;
+        sh_p = pair_eta[ki];
+        sh_q = pair_eta[kj];
+        sh_Px = pair_Px[ki];
+        sh_Py = pair_Py[ki];
+        sh_Pz = pair_Pz[ki];
+        sh_Qx = pair_Px[kj];
+        sh_Qy = pair_Py[kj];
+        sh_Qz = pair_Pz[kj];
+        const double dx = sh_Px - sh_Qx;
+        const double dy = sh_Py - sh_Qy;
+        const double dz = sh_Pz - sh_Qz;
+        const double PQ2 = dx * dx + dy * dy + dz * dz;
+        sh_denom = sh_p + sh_q;
+        const double omega = sh_p * sh_q / sh_denom;
+        const double T = omega * PQ2;
+        sh_base = kTwoPiToFiveHalves / (sh_p * sh_q * ::sqrt(sh_denom)) * pair_cK[ki] * pair_cK[kj];
+        cueri_rys::rys_roots_weights<NROOTS>(T, sh_roots, sh_weights);
+      }
+      __syncthreads();
+      for (int u = 0; u < NROOTS; ++u) {
+        if (threadIdx.x == 0) {
+          const double x = sh_roots[u];
+          const double w = sh_weights[u];
+          const double inv_denom = 1.0 / sh_denom;
+          const double B0 = x * 0.5 * inv_denom;
+          const double B1 = (1.0 - x) * 0.5 / sh_p + B0;
+          const double B1p = (1.0 - x) * 0.5 / sh_q + B0;
+
+          const double Cx_ = (sh_Px - Ax) + (sh_q * inv_denom) * x * (sh_Qx - sh_Px);
+          const double Cy_ = (sh_Py - Ay) + (sh_q * inv_denom) * x * (sh_Qy - sh_Py);
+          const double Cz_ = (sh_Pz - Az) + (sh_q * inv_denom) * x * (sh_Qz - sh_Pz);
+          const double Cpx_ = (sh_Qx - Cx) + (sh_p * inv_denom) * x * (sh_Px - sh_Qx);
+          const double Cpy_ = (sh_Qy - Cy) + (sh_p * inv_denom) * x * (sh_Py - sh_Qy);
+          const double Cpz_ = (sh_Qz - Cz) + (sh_p * inv_denom) * x * (sh_Pz - sh_Qz);
+
+          compute_G_stride_fixed<kStride, kNMax, kMMax>(Gx, Cx_, Cpx_, B0, B1, B1p);
+          compute_G_stride_fixed<kStride, kNMax, kMMax>(Gy, Cy_, Cpy_, B0, B1, B1p);
+          compute_G_stride_fixed<kStride, kNMax, kMMax>(Gz, Cz_, Cpz_, B0, B1, B1p);
+          sh_scale = sh_base * w;
+        }
+        __syncthreads();
+        if (active) {
+          const double Ix = eval_dpdd_x(e, Gx, xij, xij2, xkl, xkl2);
+          const double Iy = eval_dpdd_y(e, Gy, yij, yij2, ykl, ykl2);
+          const double Iz = eval_dpdd_z(e, Gz, zij, zij2, zkl, zkl2);
+          val += sh_scale * (Ix * Iy * Iz);
+        }
+        __syncthreads();
+      }
+    }
+    if (active) {
+      const int64_t out = (static_cast<int64_t>(t) * static_cast<int64_t>(blocks_per_task) + static_cast<int64_t>(b))
+                        * static_cast<int64_t>(kNComp) + static_cast<int64_t>(e);
+      partial_sums[out] = val;
     }
   }
 }
@@ -11284,6 +12531,158 @@ __global__ void KernelERI_dddd_fixed(
   }
 }
 
+template <int NROOTS>
+__global__ void KernelERI_dddd_multiblock_partial(
+    const int32_t* task_spAB,
+    const int32_t* task_spCD,
+    int ntasks,
+    const int32_t* sp_A,
+    const int32_t* sp_B,
+    const int32_t* sp_pair_start,
+    const int32_t* sp_npair,
+    const double* shell_cx,
+    const double* shell_cy,
+    const double* shell_cz,
+    const double* pair_eta,
+    const double* pair_Px,
+    const double* pair_Py,
+    const double* pair_Pz,
+    const double* pair_cK,
+    int blocks_per_task,
+    double* partial_sums) {
+  const int t = static_cast<int>(blockIdx.x);
+  const int b = static_cast<int>(blockIdx.y);
+  if (t >= ntasks || b >= blocks_per_task) return;
+
+  const int spAB = static_cast<int>(task_spAB[t]);
+  const int spCD = static_cast<int>(task_spCD[t]);
+  const int A = static_cast<int>(sp_A[spAB]);
+  const int B = static_cast<int>(sp_B[spAB]);
+  const int C = static_cast<int>(sp_A[spCD]);
+  const int D = static_cast<int>(sp_B[spCD]);
+
+  const double Ax = shell_cx[A];
+  const double Ay = shell_cy[A];
+  const double Az = shell_cz[A];
+  const double Bx = shell_cx[B];
+  const double By = shell_cy[B];
+  const double Bz = shell_cz[B];
+  const double Cx = shell_cx[C];
+  const double Cy = shell_cy[C];
+  const double Cz = shell_cz[C];
+  const double Dx = shell_cx[D];
+  const double Dy = shell_cy[D];
+  const double Dz = shell_cz[D];
+
+  const double xij = Ax - Bx;
+  const double yij = Ay - By;
+  const double zij = Az - Bz;
+  const double xkl = Cx - Dx;
+  const double ykl = Cy - Dy;
+  const double zkl = Cz - Dz;
+  const double xij2 = xij * xij;
+  const double yij2 = yij * yij;
+  const double zij2 = zij * zij;
+  const double xkl2 = xkl * xkl;
+  const double ykl2 = ykl * ykl;
+  const double zkl2 = zkl * zkl;
+
+  const int baseAB = static_cast<int>(sp_pair_start[spAB]);
+  const int baseCD = static_cast<int>(sp_pair_start[spCD]);
+  const int nPairAB = static_cast<int>(sp_npair[spAB]);
+  const int nPairCD = static_cast<int>(sp_npair[spCD]);
+  const int64_t nPairsTot = static_cast<int64_t>(nPairAB) * static_cast<int64_t>(nPairCD);
+
+  constexpr int kStride = 5;
+  constexpr int kNComp = 1296;
+  constexpr int kNMax = 4;
+  constexpr int kMMax = 4;
+
+  __shared__ double Gx[kStride * kStride];
+  __shared__ double Gy[kStride * kStride];
+  __shared__ double Gz[kStride * kStride];
+  __shared__ double sh_scale;
+  __shared__ double sh_roots[NROOTS];
+  __shared__ double sh_weights[NROOTS];
+  __shared__ double sh_p;
+  __shared__ double sh_q;
+  __shared__ double sh_Px;
+  __shared__ double sh_Py;
+  __shared__ double sh_Pz;
+  __shared__ double sh_Qx;
+  __shared__ double sh_Qy;
+  __shared__ double sh_Qz;
+  __shared__ double sh_denom;
+  __shared__ double sh_base;
+
+  for (int ebase = 0; ebase < kNComp; ebase += static_cast<int>(blockDim.x)) {
+    const int e = ebase + static_cast<int>(threadIdx.x);
+    const bool active = (e < kNComp);
+    double val = 0.0;
+    for (int64_t upair = static_cast<int64_t>(b); upair < nPairsTot; upair += static_cast<int64_t>(blocks_per_task)) {
+      if (threadIdx.x == 0) {
+        const int ip = static_cast<int>(upair / static_cast<int64_t>(nPairCD));
+        const int jp = static_cast<int>(upair - static_cast<int64_t>(ip) * static_cast<int64_t>(nPairCD));
+        const int ki = baseAB + ip;
+        const int kj = baseCD + jp;
+        sh_p = pair_eta[ki];
+        sh_q = pair_eta[kj];
+        sh_Px = pair_Px[ki];
+        sh_Py = pair_Py[ki];
+        sh_Pz = pair_Pz[ki];
+        sh_Qx = pair_Px[kj];
+        sh_Qy = pair_Py[kj];
+        sh_Qz = pair_Pz[kj];
+        const double dx = sh_Px - sh_Qx;
+        const double dy = sh_Py - sh_Qy;
+        const double dz = sh_Pz - sh_Qz;
+        const double PQ2 = dx * dx + dy * dy + dz * dz;
+        sh_denom = sh_p + sh_q;
+        const double omega = sh_p * sh_q / sh_denom;
+        const double T = omega * PQ2;
+        sh_base = kTwoPiToFiveHalves / (sh_p * sh_q * ::sqrt(sh_denom)) * pair_cK[ki] * pair_cK[kj];
+        cueri_rys::rys_roots_weights<NROOTS>(T, sh_roots, sh_weights);
+      }
+      __syncthreads();
+      for (int u = 0; u < NROOTS; ++u) {
+        if (threadIdx.x == 0) {
+          const double x = sh_roots[u];
+          const double w = sh_weights[u];
+          const double inv_denom = 1.0 / sh_denom;
+          const double B0 = x * 0.5 * inv_denom;
+          const double B1 = (1.0 - x) * 0.5 / sh_p + B0;
+          const double B1p = (1.0 - x) * 0.5 / sh_q + B0;
+
+          const double Cx_ = (sh_Px - Ax) + (sh_q * inv_denom) * x * (sh_Qx - sh_Px);
+          const double Cy_ = (sh_Py - Ay) + (sh_q * inv_denom) * x * (sh_Qy - sh_Py);
+          const double Cz_ = (sh_Pz - Az) + (sh_q * inv_denom) * x * (sh_Qz - sh_Pz);
+          const double Cpx_ = (sh_Qx - Cx) + (sh_p * inv_denom) * x * (sh_Px - sh_Qx);
+          const double Cpy_ = (sh_Qy - Cy) + (sh_p * inv_denom) * x * (sh_Py - sh_Qy);
+          const double Cpz_ = (sh_Qz - Cz) + (sh_p * inv_denom) * x * (sh_Pz - sh_Qz);
+
+          compute_G_stride_fixed<kStride, kNMax, kMMax>(Gx, Cx_, Cpx_, B0, B1, B1p);
+          compute_G_stride_fixed<kStride, kNMax, kMMax>(Gy, Cy_, Cpy_, B0, B1, B1p);
+          compute_G_stride_fixed<kStride, kNMax, kMMax>(Gz, Cz_, Cpz_, B0, B1, B1p);
+          sh_scale = sh_base * w;
+        }
+        __syncthreads();
+        if (active) {
+          const double Ix = eval_dddd_x(e, Gx, xij, xij2, xkl, xkl2);
+          const double Iy = eval_dddd_y(e, Gy, yij, yij2, ykl, ykl2);
+          const double Iz = eval_dddd_z(e, Gz, zij, zij2, zkl, zkl2);
+          val += sh_scale * (Ix * Iy * Iz);
+        }
+        __syncthreads();
+      }
+    }
+    if (active) {
+      const int64_t out = (static_cast<int64_t>(t) * static_cast<int64_t>(blocks_per_task) + static_cast<int64_t>(b))
+                        * static_cast<int64_t>(kNComp) + static_cast<int64_t>(e);
+      partial_sums[out] = val;
+    }
+  }
+}
+
 }  // namespace
 
 extern "C" cudaError_t cueri_eri_ssdp_launch_stream(
@@ -11364,11 +12763,43 @@ extern "C" cudaError_t cueri_eri_ssdp_multiblock_launch_stream(
     double* eri_out,
     cudaStream_t stream,
     int threads) {
-  (void)partial_sums;
-  (void)blocks_per_task;
-  return cueri_eri_ssdp_launch_stream(
+  if (ntasks < 0 || blocks_per_task <= 0) return cudaErrorInvalidValue;
+  constexpr int kDefaultThreads = 64;
+  constexpr int kNComp = 18;
+  int launch_threads = (threads > 0) ? threads : kDefaultThreads;
+  if (launch_threads > 1024) launch_threads = 1024;
+  if (launch_threads < 32) launch_threads = 32;
+  launch_threads = (launch_threads / 32) * 32;
+  if (launch_threads < 32) launch_threads = 32;
+  if (ntasks == 0) return cudaSuccess;
+  const dim3 grid(static_cast<unsigned int>(ntasks), static_cast<unsigned int>(blocks_per_task), 1);
+  KernelERI_ssdp_multiblock_partial<2><<<grid, launch_threads, 0, stream>>>(
       task_spAB, task_spCD, ntasks, sp_A, sp_B, sp_pair_start, sp_npair, shell_cx, shell_cy, shell_cz,
-      pair_eta, pair_Px, pair_Py, pair_Pz, pair_cK, eri_out, stream, threads);
+      pair_eta, pair_Px, pair_Py, pair_Pz, pair_cK, blocks_per_task, partial_sums);
+  cudaError_t err = cudaGetLastError();
+  if (err != cudaSuccess) return err;
+  switch (blocks_per_task) {
+    case 1:
+      KernelMultiblockReduceFixed<kNComp, 1><<<static_cast<unsigned int>(ntasks), launch_threads, 0, stream>>>(partial_sums, eri_out);
+      break;
+    case 2:
+      KernelMultiblockReduceFixed<kNComp, 2><<<static_cast<unsigned int>(ntasks), launch_threads, 0, stream>>>(partial_sums, eri_out);
+      break;
+    case 4:
+      KernelMultiblockReduceFixed<kNComp, 4><<<static_cast<unsigned int>(ntasks), launch_threads, 0, stream>>>(partial_sums, eri_out);
+      break;
+    case 8:
+      KernelMultiblockReduceFixed<kNComp, 8><<<static_cast<unsigned int>(ntasks), launch_threads, 0, stream>>>(partial_sums, eri_out);
+      break;
+    case 16:
+      KernelMultiblockReduceFixed<kNComp, 16><<<static_cast<unsigned int>(ntasks), launch_threads, 0, stream>>>(partial_sums, eri_out);
+      break;
+    default:
+      KernelMultiblockReduceDynamic<kNComp><<<static_cast<unsigned int>(ntasks), launch_threads, 0, stream>>>(
+          partial_sums, blocks_per_task, eri_out);
+      break;
+  }
+  return cudaGetLastError();
 }
 
 extern "C" cudaError_t cueri_fused_fock_ssdp_launch_stream(
@@ -11396,17 +12827,21 @@ extern "C" cudaError_t cueri_fused_fock_ssdp_launch_stream(
   if (ntasks < 0 || nao <= 0) return cudaErrorInvalidValue;
   if (ntasks == 0) return cudaSuccess;
   constexpr int kDefaultThreads = 64;
-  int launch_threads = (threads > 0) ? threads : kDefaultThreads;
-  if (launch_threads > 1024) launch_threads = 1024;
-  if (launch_threads < 32) launch_threads = 32;
-  launch_threads = (launch_threads / 32) * 32;
-  if (launch_threads < 32) launch_threads = 32;
-  const int warps_per_block = launch_threads >> 5;
-  if (warps_per_block <= 0) return cudaErrorInvalidValue;
-  const int blocks = (ntasks + warps_per_block - 1) / warps_per_block;
+  int launch_threads = 0;
+  int blocks = 0;
   constexpr int kGSize_ssdp = 5 * 5;
   constexpr int kWarpDoubles_ssdp = 3 * kGSize_ssdp + 2 * 2 + 11 + 18;
-  const size_t shmem_ssdp = static_cast<size_t>(warps_per_block) * kWarpDoubles_ssdp * sizeof(double);
+  size_t shmem_ssdp = 0;
+  const cudaError_t prep_ssdp = cueri_prepare_fused_fock_warp_launch(
+      KernelFusedFock_ssdp_fixed<2>,
+      threads,
+      kDefaultThreads,
+      ntasks,
+      kWarpDoubles_ssdp,
+      &launch_threads,
+      &blocks,
+      &shmem_ssdp);
+  if (prep_ssdp != cudaSuccess) return prep_ssdp;
   KernelFusedFock_ssdp_fixed<2><<<blocks, launch_threads, shmem_ssdp, stream>>>(
       task_spAB, task_spCD, ntasks, sp_A, sp_B, sp_pair_start, sp_npair,
       shell_cx, shell_cy, shell_cz,
@@ -11493,11 +12928,43 @@ extern "C" cudaError_t cueri_eri_psdp_multiblock_launch_stream(
     double* eri_out,
     cudaStream_t stream,
     int threads) {
-  (void)partial_sums;
-  (void)blocks_per_task;
-  return cueri_eri_psdp_launch_stream(
+  if (ntasks < 0 || blocks_per_task <= 0) return cudaErrorInvalidValue;
+  constexpr int kDefaultThreads = 128;
+  constexpr int kNComp = 54;
+  int launch_threads = (threads > 0) ? threads : kDefaultThreads;
+  if (launch_threads > 1024) launch_threads = 1024;
+  if (launch_threads < 32) launch_threads = 32;
+  launch_threads = (launch_threads / 32) * 32;
+  if (launch_threads < 32) launch_threads = 32;
+  if (ntasks == 0) return cudaSuccess;
+  const dim3 grid(static_cast<unsigned int>(ntasks), static_cast<unsigned int>(blocks_per_task), 1);
+  KernelERI_psdp_multiblock_partial<3><<<grid, launch_threads, 0, stream>>>(
       task_spAB, task_spCD, ntasks, sp_A, sp_B, sp_pair_start, sp_npair, shell_cx, shell_cy, shell_cz,
-      pair_eta, pair_Px, pair_Py, pair_Pz, pair_cK, eri_out, stream, threads);
+      pair_eta, pair_Px, pair_Py, pair_Pz, pair_cK, blocks_per_task, partial_sums);
+  cudaError_t err = cudaGetLastError();
+  if (err != cudaSuccess) return err;
+  switch (blocks_per_task) {
+    case 1:
+      KernelMultiblockReduceFixed<kNComp, 1><<<static_cast<unsigned int>(ntasks), launch_threads, 0, stream>>>(partial_sums, eri_out);
+      break;
+    case 2:
+      KernelMultiblockReduceFixed<kNComp, 2><<<static_cast<unsigned int>(ntasks), launch_threads, 0, stream>>>(partial_sums, eri_out);
+      break;
+    case 4:
+      KernelMultiblockReduceFixed<kNComp, 4><<<static_cast<unsigned int>(ntasks), launch_threads, 0, stream>>>(partial_sums, eri_out);
+      break;
+    case 8:
+      KernelMultiblockReduceFixed<kNComp, 8><<<static_cast<unsigned int>(ntasks), launch_threads, 0, stream>>>(partial_sums, eri_out);
+      break;
+    case 16:
+      KernelMultiblockReduceFixed<kNComp, 16><<<static_cast<unsigned int>(ntasks), launch_threads, 0, stream>>>(partial_sums, eri_out);
+      break;
+    default:
+      KernelMultiblockReduceDynamic<kNComp><<<static_cast<unsigned int>(ntasks), launch_threads, 0, stream>>>(
+          partial_sums, blocks_per_task, eri_out);
+      break;
+  }
+  return cudaGetLastError();
 }
 
 extern "C" cudaError_t cueri_fused_fock_psdp_launch_stream(
@@ -11525,17 +12992,21 @@ extern "C" cudaError_t cueri_fused_fock_psdp_launch_stream(
   if (ntasks < 0 || nao <= 0) return cudaErrorInvalidValue;
   if (ntasks == 0) return cudaSuccess;
   constexpr int kDefaultThreads = 64;
-  int launch_threads = (threads > 0) ? threads : kDefaultThreads;
-  if (launch_threads > 1024) launch_threads = 1024;
-  if (launch_threads < 32) launch_threads = 32;
-  launch_threads = (launch_threads / 32) * 32;
-  if (launch_threads < 32) launch_threads = 32;
-  const int warps_per_block = launch_threads >> 5;
-  if (warps_per_block <= 0) return cudaErrorInvalidValue;
-  const int blocks = (ntasks + warps_per_block - 1) / warps_per_block;
+  int launch_threads = 0;
+  int blocks = 0;
   constexpr int kGSize_psdp = 5 * 5;
   constexpr int kWarpDoubles_psdp = 3 * kGSize_psdp + 2 * 3 + 11 + 54;
-  const size_t shmem_psdp = static_cast<size_t>(warps_per_block) * kWarpDoubles_psdp * sizeof(double);
+  size_t shmem_psdp = 0;
+  const cudaError_t prep_psdp = cueri_prepare_fused_fock_warp_launch(
+      KernelFusedFock_psdp_fixed<3>,
+      threads,
+      kDefaultThreads,
+      ntasks,
+      kWarpDoubles_psdp,
+      &launch_threads,
+      &blocks,
+      &shmem_psdp);
+  if (prep_psdp != cudaSuccess) return prep_psdp;
   KernelFusedFock_psdp_fixed<3><<<blocks, launch_threads, shmem_psdp, stream>>>(
       task_spAB, task_spCD, ntasks, sp_A, sp_B, sp_pair_start, sp_npair,
       shell_cx, shell_cy, shell_cz,
@@ -11622,11 +13093,43 @@ extern "C" cudaError_t cueri_eri_psdd_multiblock_launch_stream(
     double* eri_out,
     cudaStream_t stream,
     int threads) {
-  (void)partial_sums;
-  (void)blocks_per_task;
-  return cueri_eri_psdd_launch_stream(
+  if (ntasks < 0 || blocks_per_task <= 0) return cudaErrorInvalidValue;
+  constexpr int kDefaultThreads = 160;
+  constexpr int kNComp = 108;
+  int launch_threads = (threads > 0) ? threads : kDefaultThreads;
+  if (launch_threads > 1024) launch_threads = 1024;
+  if (launch_threads < 32) launch_threads = 32;
+  launch_threads = (launch_threads / 32) * 32;
+  if (launch_threads < 32) launch_threads = 32;
+  if (ntasks == 0) return cudaSuccess;
+  const dim3 grid(static_cast<unsigned int>(ntasks), static_cast<unsigned int>(blocks_per_task), 1);
+  KernelERI_psdd_multiblock_partial<3><<<grid, launch_threads, 0, stream>>>(
       task_spAB, task_spCD, ntasks, sp_A, sp_B, sp_pair_start, sp_npair, shell_cx, shell_cy, shell_cz,
-      pair_eta, pair_Px, pair_Py, pair_Pz, pair_cK, eri_out, stream, threads);
+      pair_eta, pair_Px, pair_Py, pair_Pz, pair_cK, blocks_per_task, partial_sums);
+  cudaError_t err = cudaGetLastError();
+  if (err != cudaSuccess) return err;
+  switch (blocks_per_task) {
+    case 1:
+      KernelMultiblockReduceFixed<kNComp, 1><<<static_cast<unsigned int>(ntasks), launch_threads, 0, stream>>>(partial_sums, eri_out);
+      break;
+    case 2:
+      KernelMultiblockReduceFixed<kNComp, 2><<<static_cast<unsigned int>(ntasks), launch_threads, 0, stream>>>(partial_sums, eri_out);
+      break;
+    case 4:
+      KernelMultiblockReduceFixed<kNComp, 4><<<static_cast<unsigned int>(ntasks), launch_threads, 0, stream>>>(partial_sums, eri_out);
+      break;
+    case 8:
+      KernelMultiblockReduceFixed<kNComp, 8><<<static_cast<unsigned int>(ntasks), launch_threads, 0, stream>>>(partial_sums, eri_out);
+      break;
+    case 16:
+      KernelMultiblockReduceFixed<kNComp, 16><<<static_cast<unsigned int>(ntasks), launch_threads, 0, stream>>>(partial_sums, eri_out);
+      break;
+    default:
+      KernelMultiblockReduceDynamic<kNComp><<<static_cast<unsigned int>(ntasks), launch_threads, 0, stream>>>(
+          partial_sums, blocks_per_task, eri_out);
+      break;
+  }
+  return cudaGetLastError();
 }
 
 extern "C" cudaError_t cueri_fused_fock_psdd_launch_stream(
@@ -11654,17 +13157,21 @@ extern "C" cudaError_t cueri_fused_fock_psdd_launch_stream(
   if (ntasks < 0 || nao <= 0) return cudaErrorInvalidValue;
   if (ntasks == 0) return cudaSuccess;
   constexpr int kDefaultThreads = 64;
-  int launch_threads = (threads > 0) ? threads : kDefaultThreads;
-  if (launch_threads > 1024) launch_threads = 1024;
-  if (launch_threads < 32) launch_threads = 32;
-  launch_threads = (launch_threads / 32) * 32;
-  if (launch_threads < 32) launch_threads = 32;
-  const int warps_per_block = launch_threads >> 5;
-  if (warps_per_block <= 0) return cudaErrorInvalidValue;
-  const int blocks = (ntasks + warps_per_block - 1) / warps_per_block;
+  int launch_threads = 0;
+  int blocks = 0;
   constexpr int kGSize_psdd = 5 * 5;
   constexpr int kWarpDoubles_psdd = 3 * kGSize_psdd + 2 * 3 + 11 + 108;
-  const size_t shmem_psdd = static_cast<size_t>(warps_per_block) * kWarpDoubles_psdd * sizeof(double);
+  size_t shmem_psdd = 0;
+  const cudaError_t prep_psdd = cueri_prepare_fused_fock_warp_launch(
+      KernelFusedFock_psdd_fixed<3>,
+      threads,
+      kDefaultThreads,
+      ntasks,
+      kWarpDoubles_psdd,
+      &launch_threads,
+      &blocks,
+      &shmem_psdd);
+  if (prep_psdd != cudaSuccess) return prep_psdd;
   KernelFusedFock_psdd_fixed<3><<<blocks, launch_threads, shmem_psdd, stream>>>(
       task_spAB, task_spCD, ntasks, sp_A, sp_B, sp_pair_start, sp_npair,
       shell_cx, shell_cy, shell_cz,
@@ -11751,11 +13258,43 @@ extern "C" cudaError_t cueri_eri_ppdp_multiblock_launch_stream(
     double* eri_out,
     cudaStream_t stream,
     int threads) {
-  (void)partial_sums;
-  (void)blocks_per_task;
-  return cueri_eri_ppdp_launch_stream(
+  if (ntasks < 0 || blocks_per_task <= 0) return cudaErrorInvalidValue;
+  constexpr int kDefaultThreads = 192;
+  constexpr int kNComp = 162;
+  int launch_threads = (threads > 0) ? threads : kDefaultThreads;
+  if (launch_threads > 1024) launch_threads = 1024;
+  if (launch_threads < 32) launch_threads = 32;
+  launch_threads = (launch_threads / 32) * 32;
+  if (launch_threads < 32) launch_threads = 32;
+  if (ntasks == 0) return cudaSuccess;
+  const dim3 grid(static_cast<unsigned int>(ntasks), static_cast<unsigned int>(blocks_per_task), 1);
+  KernelERI_ppdp_multiblock_partial<3><<<grid, launch_threads, 0, stream>>>(
       task_spAB, task_spCD, ntasks, sp_A, sp_B, sp_pair_start, sp_npair, shell_cx, shell_cy, shell_cz,
-      pair_eta, pair_Px, pair_Py, pair_Pz, pair_cK, eri_out, stream, threads);
+      pair_eta, pair_Px, pair_Py, pair_Pz, pair_cK, blocks_per_task, partial_sums);
+  cudaError_t err = cudaGetLastError();
+  if (err != cudaSuccess) return err;
+  switch (blocks_per_task) {
+    case 1:
+      KernelMultiblockReduceFixed<kNComp, 1><<<static_cast<unsigned int>(ntasks), launch_threads, 0, stream>>>(partial_sums, eri_out);
+      break;
+    case 2:
+      KernelMultiblockReduceFixed<kNComp, 2><<<static_cast<unsigned int>(ntasks), launch_threads, 0, stream>>>(partial_sums, eri_out);
+      break;
+    case 4:
+      KernelMultiblockReduceFixed<kNComp, 4><<<static_cast<unsigned int>(ntasks), launch_threads, 0, stream>>>(partial_sums, eri_out);
+      break;
+    case 8:
+      KernelMultiblockReduceFixed<kNComp, 8><<<static_cast<unsigned int>(ntasks), launch_threads, 0, stream>>>(partial_sums, eri_out);
+      break;
+    case 16:
+      KernelMultiblockReduceFixed<kNComp, 16><<<static_cast<unsigned int>(ntasks), launch_threads, 0, stream>>>(partial_sums, eri_out);
+      break;
+    default:
+      KernelMultiblockReduceDynamic<kNComp><<<static_cast<unsigned int>(ntasks), launch_threads, 0, stream>>>(
+          partial_sums, blocks_per_task, eri_out);
+      break;
+  }
+  return cudaGetLastError();
 }
 
 extern "C" cudaError_t cueri_eri_ppdd_launch_stream(
@@ -11836,11 +13375,43 @@ extern "C" cudaError_t cueri_eri_ppdd_multiblock_launch_stream(
     double* eri_out,
     cudaStream_t stream,
     int threads) {
-  (void)partial_sums;
-  (void)blocks_per_task;
-  return cueri_eri_ppdd_launch_stream(
+  if (ntasks < 0 || blocks_per_task <= 0) return cudaErrorInvalidValue;
+  constexpr int kDefaultThreads = 224;
+  constexpr int kNComp = 324;
+  int launch_threads = (threads > 0) ? threads : kDefaultThreads;
+  if (launch_threads > 1024) launch_threads = 1024;
+  if (launch_threads < 32) launch_threads = 32;
+  launch_threads = (launch_threads / 32) * 32;
+  if (launch_threads < 32) launch_threads = 32;
+  if (ntasks == 0) return cudaSuccess;
+  const dim3 grid(static_cast<unsigned int>(ntasks), static_cast<unsigned int>(blocks_per_task), 1);
+  KernelERI_ppdd_multiblock_partial<4><<<grid, launch_threads, 0, stream>>>(
       task_spAB, task_spCD, ntasks, sp_A, sp_B, sp_pair_start, sp_npair, shell_cx, shell_cy, shell_cz,
-      pair_eta, pair_Px, pair_Py, pair_Pz, pair_cK, eri_out, stream, threads);
+      pair_eta, pair_Px, pair_Py, pair_Pz, pair_cK, blocks_per_task, partial_sums);
+  cudaError_t err = cudaGetLastError();
+  if (err != cudaSuccess) return err;
+  switch (blocks_per_task) {
+    case 1:
+      KernelMultiblockReduceFixed<kNComp, 1><<<static_cast<unsigned int>(ntasks), launch_threads, 0, stream>>>(partial_sums, eri_out);
+      break;
+    case 2:
+      KernelMultiblockReduceFixed<kNComp, 2><<<static_cast<unsigned int>(ntasks), launch_threads, 0, stream>>>(partial_sums, eri_out);
+      break;
+    case 4:
+      KernelMultiblockReduceFixed<kNComp, 4><<<static_cast<unsigned int>(ntasks), launch_threads, 0, stream>>>(partial_sums, eri_out);
+      break;
+    case 8:
+      KernelMultiblockReduceFixed<kNComp, 8><<<static_cast<unsigned int>(ntasks), launch_threads, 0, stream>>>(partial_sums, eri_out);
+      break;
+    case 16:
+      KernelMultiblockReduceFixed<kNComp, 16><<<static_cast<unsigned int>(ntasks), launch_threads, 0, stream>>>(partial_sums, eri_out);
+      break;
+    default:
+      KernelMultiblockReduceDynamic<kNComp><<<static_cast<unsigned int>(ntasks), launch_threads, 0, stream>>>(
+          partial_sums, blocks_per_task, eri_out);
+      break;
+  }
+  return cudaGetLastError();
 }
 
 extern "C" cudaError_t cueri_eri_ddss_launch_stream(
@@ -11921,11 +13492,43 @@ extern "C" cudaError_t cueri_eri_ddss_multiblock_launch_stream(
     double* eri_out,
     cudaStream_t stream,
     int threads) {
-  (void)partial_sums;
-  (void)blocks_per_task;
-  return cueri_eri_ddss_launch_stream(
+  if (ntasks < 0 || blocks_per_task <= 0) return cudaErrorInvalidValue;
+  constexpr int kDefaultThreads = 96;
+  constexpr int kNComp = 36;
+  int launch_threads = (threads > 0) ? threads : kDefaultThreads;
+  if (launch_threads > 1024) launch_threads = 1024;
+  if (launch_threads < 32) launch_threads = 32;
+  launch_threads = (launch_threads / 32) * 32;
+  if (launch_threads < 32) launch_threads = 32;
+  if (ntasks == 0) return cudaSuccess;
+  const dim3 grid(static_cast<unsigned int>(ntasks), static_cast<unsigned int>(blocks_per_task), 1);
+  KernelERI_ddss_multiblock_partial<3><<<grid, launch_threads, 0, stream>>>(
       task_spAB, task_spCD, ntasks, sp_A, sp_B, sp_pair_start, sp_npair, shell_cx, shell_cy, shell_cz,
-      pair_eta, pair_Px, pair_Py, pair_Pz, pair_cK, eri_out, stream, threads);
+      pair_eta, pair_Px, pair_Py, pair_Pz, pair_cK, blocks_per_task, partial_sums);
+  cudaError_t err = cudaGetLastError();
+  if (err != cudaSuccess) return err;
+  switch (blocks_per_task) {
+    case 1:
+      KernelMultiblockReduceFixed<kNComp, 1><<<static_cast<unsigned int>(ntasks), launch_threads, 0, stream>>>(partial_sums, eri_out);
+      break;
+    case 2:
+      KernelMultiblockReduceFixed<kNComp, 2><<<static_cast<unsigned int>(ntasks), launch_threads, 0, stream>>>(partial_sums, eri_out);
+      break;
+    case 4:
+      KernelMultiblockReduceFixed<kNComp, 4><<<static_cast<unsigned int>(ntasks), launch_threads, 0, stream>>>(partial_sums, eri_out);
+      break;
+    case 8:
+      KernelMultiblockReduceFixed<kNComp, 8><<<static_cast<unsigned int>(ntasks), launch_threads, 0, stream>>>(partial_sums, eri_out);
+      break;
+    case 16:
+      KernelMultiblockReduceFixed<kNComp, 16><<<static_cast<unsigned int>(ntasks), launch_threads, 0, stream>>>(partial_sums, eri_out);
+      break;
+    default:
+      KernelMultiblockReduceDynamic<kNComp><<<static_cast<unsigned int>(ntasks), launch_threads, 0, stream>>>(
+          partial_sums, blocks_per_task, eri_out);
+      break;
+  }
+  return cudaGetLastError();
 }
 
 extern "C" cudaError_t cueri_fused_fock_ddss_launch_stream(
@@ -11953,17 +13556,21 @@ extern "C" cudaError_t cueri_fused_fock_ddss_launch_stream(
   if (ntasks < 0 || nao <= 0) return cudaErrorInvalidValue;
   if (ntasks == 0) return cudaSuccess;
   constexpr int kDefaultThreads = 64;
-  int launch_threads = (threads > 0) ? threads : kDefaultThreads;
-  if (launch_threads > 1024) launch_threads = 1024;
-  if (launch_threads < 32) launch_threads = 32;
-  launch_threads = (launch_threads / 32) * 32;
-  if (launch_threads < 32) launch_threads = 32;
-  const int warps_per_block = launch_threads >> 5;
-  if (warps_per_block <= 0) return cudaErrorInvalidValue;
-  const int blocks = (ntasks + warps_per_block - 1) / warps_per_block;
+  int launch_threads = 0;
+  int blocks = 0;
   constexpr int kGSize_ddss = 5 * 5;
   constexpr int kWarpDoubles_ddss = 3 * kGSize_ddss + 2 * 3 + 11 + 36;
-  const size_t shmem_ddss = static_cast<size_t>(warps_per_block) * kWarpDoubles_ddss * sizeof(double);
+  size_t shmem_ddss = 0;
+  const cudaError_t prep_ddss = cueri_prepare_fused_fock_warp_launch(
+      KernelFusedFock_ddss_fixed<3>,
+      threads,
+      kDefaultThreads,
+      ntasks,
+      kWarpDoubles_ddss,
+      &launch_threads,
+      &blocks,
+      &shmem_ddss);
+  if (prep_ddss != cudaSuccess) return prep_ddss;
   KernelFusedFock_ddss_fixed<3><<<blocks, launch_threads, shmem_ddss, stream>>>(
       task_spAB, task_spCD, ntasks, sp_A, sp_B, sp_pair_start, sp_npair,
       shell_cx, shell_cy, shell_cz,
@@ -12050,11 +13657,43 @@ extern "C" cudaError_t cueri_eri_dpdp_multiblock_launch_stream(
     double* eri_out,
     cudaStream_t stream,
     int threads) {
-  (void)partial_sums;
-  (void)blocks_per_task;
-  return cueri_eri_dpdp_launch_stream(
+  if (ntasks < 0 || blocks_per_task <= 0) return cudaErrorInvalidValue;
+  constexpr int kDefaultThreads = 224;
+  constexpr int kNComp = 324;
+  int launch_threads = (threads > 0) ? threads : kDefaultThreads;
+  if (launch_threads > 1024) launch_threads = 1024;
+  if (launch_threads < 32) launch_threads = 32;
+  launch_threads = (launch_threads / 32) * 32;
+  if (launch_threads < 32) launch_threads = 32;
+  if (ntasks == 0) return cudaSuccess;
+  const dim3 grid(static_cast<unsigned int>(ntasks), static_cast<unsigned int>(blocks_per_task), 1);
+  KernelERI_dpdp_multiblock_partial<4><<<grid, launch_threads, 0, stream>>>(
       task_spAB, task_spCD, ntasks, sp_A, sp_B, sp_pair_start, sp_npair, shell_cx, shell_cy, shell_cz,
-      pair_eta, pair_Px, pair_Py, pair_Pz, pair_cK, eri_out, stream, threads);
+      pair_eta, pair_Px, pair_Py, pair_Pz, pair_cK, blocks_per_task, partial_sums);
+  cudaError_t err = cudaGetLastError();
+  if (err != cudaSuccess) return err;
+  switch (blocks_per_task) {
+    case 1:
+      KernelMultiblockReduceFixed<kNComp, 1><<<static_cast<unsigned int>(ntasks), launch_threads, 0, stream>>>(partial_sums, eri_out);
+      break;
+    case 2:
+      KernelMultiblockReduceFixed<kNComp, 2><<<static_cast<unsigned int>(ntasks), launch_threads, 0, stream>>>(partial_sums, eri_out);
+      break;
+    case 4:
+      KernelMultiblockReduceFixed<kNComp, 4><<<static_cast<unsigned int>(ntasks), launch_threads, 0, stream>>>(partial_sums, eri_out);
+      break;
+    case 8:
+      KernelMultiblockReduceFixed<kNComp, 8><<<static_cast<unsigned int>(ntasks), launch_threads, 0, stream>>>(partial_sums, eri_out);
+      break;
+    case 16:
+      KernelMultiblockReduceFixed<kNComp, 16><<<static_cast<unsigned int>(ntasks), launch_threads, 0, stream>>>(partial_sums, eri_out);
+      break;
+    default:
+      KernelMultiblockReduceDynamic<kNComp><<<static_cast<unsigned int>(ntasks), launch_threads, 0, stream>>>(
+          partial_sums, blocks_per_task, eri_out);
+      break;
+  }
+  return cudaGetLastError();
 }
 
 extern "C" cudaError_t cueri_eri_dpdd_launch_stream(
@@ -12135,11 +13774,43 @@ extern "C" cudaError_t cueri_eri_dpdd_multiblock_launch_stream(
     double* eri_out,
     cudaStream_t stream,
     int threads) {
-  (void)partial_sums;
-  (void)blocks_per_task;
-  return cueri_eri_dpdd_launch_stream(
+  if (ntasks < 0 || blocks_per_task <= 0) return cudaErrorInvalidValue;
+  constexpr int kDefaultThreads = 256;
+  constexpr int kNComp = 648;
+  int launch_threads = (threads > 0) ? threads : kDefaultThreads;
+  if (launch_threads > 1024) launch_threads = 1024;
+  if (launch_threads < 32) launch_threads = 32;
+  launch_threads = (launch_threads / 32) * 32;
+  if (launch_threads < 32) launch_threads = 32;
+  if (ntasks == 0) return cudaSuccess;
+  const dim3 grid(static_cast<unsigned int>(ntasks), static_cast<unsigned int>(blocks_per_task), 1);
+  KernelERI_dpdd_multiblock_partial<4><<<grid, launch_threads, 0, stream>>>(
       task_spAB, task_spCD, ntasks, sp_A, sp_B, sp_pair_start, sp_npair, shell_cx, shell_cy, shell_cz,
-      pair_eta, pair_Px, pair_Py, pair_Pz, pair_cK, eri_out, stream, threads);
+      pair_eta, pair_Px, pair_Py, pair_Pz, pair_cK, blocks_per_task, partial_sums);
+  cudaError_t err = cudaGetLastError();
+  if (err != cudaSuccess) return err;
+  switch (blocks_per_task) {
+    case 1:
+      KernelMultiblockReduceFixed<kNComp, 1><<<static_cast<unsigned int>(ntasks), launch_threads, 0, stream>>>(partial_sums, eri_out);
+      break;
+    case 2:
+      KernelMultiblockReduceFixed<kNComp, 2><<<static_cast<unsigned int>(ntasks), launch_threads, 0, stream>>>(partial_sums, eri_out);
+      break;
+    case 4:
+      KernelMultiblockReduceFixed<kNComp, 4><<<static_cast<unsigned int>(ntasks), launch_threads, 0, stream>>>(partial_sums, eri_out);
+      break;
+    case 8:
+      KernelMultiblockReduceFixed<kNComp, 8><<<static_cast<unsigned int>(ntasks), launch_threads, 0, stream>>>(partial_sums, eri_out);
+      break;
+    case 16:
+      KernelMultiblockReduceFixed<kNComp, 16><<<static_cast<unsigned int>(ntasks), launch_threads, 0, stream>>>(partial_sums, eri_out);
+      break;
+    default:
+      KernelMultiblockReduceDynamic<kNComp><<<static_cast<unsigned int>(ntasks), launch_threads, 0, stream>>>(
+          partial_sums, blocks_per_task, eri_out);
+      break;
+  }
+  return cudaGetLastError();
 }
 
 extern "C" cudaError_t cueri_eri_dddd_launch_stream(
@@ -12220,9 +13891,41 @@ extern "C" cudaError_t cueri_eri_dddd_multiblock_launch_stream(
     double* eri_out,
     cudaStream_t stream,
     int threads) {
-  (void)partial_sums;
-  (void)blocks_per_task;
-  return cueri_eri_dddd_launch_stream(
+  if (ntasks < 0 || blocks_per_task <= 0) return cudaErrorInvalidValue;
+  constexpr int kDefaultThreads = 256;
+  constexpr int kNComp = 1296;
+  int launch_threads = (threads > 0) ? threads : kDefaultThreads;
+  if (launch_threads > 1024) launch_threads = 1024;
+  if (launch_threads < 32) launch_threads = 32;
+  launch_threads = (launch_threads / 32) * 32;
+  if (launch_threads < 32) launch_threads = 32;
+  if (ntasks == 0) return cudaSuccess;
+  const dim3 grid(static_cast<unsigned int>(ntasks), static_cast<unsigned int>(blocks_per_task), 1);
+  KernelERI_dddd_multiblock_partial<5><<<grid, launch_threads, 0, stream>>>(
       task_spAB, task_spCD, ntasks, sp_A, sp_B, sp_pair_start, sp_npair, shell_cx, shell_cy, shell_cz,
-      pair_eta, pair_Px, pair_Py, pair_Pz, pair_cK, eri_out, stream, threads);
+      pair_eta, pair_Px, pair_Py, pair_Pz, pair_cK, blocks_per_task, partial_sums);
+  cudaError_t err = cudaGetLastError();
+  if (err != cudaSuccess) return err;
+  switch (blocks_per_task) {
+    case 1:
+      KernelMultiblockReduceFixed<kNComp, 1><<<static_cast<unsigned int>(ntasks), launch_threads, 0, stream>>>(partial_sums, eri_out);
+      break;
+    case 2:
+      KernelMultiblockReduceFixed<kNComp, 2><<<static_cast<unsigned int>(ntasks), launch_threads, 0, stream>>>(partial_sums, eri_out);
+      break;
+    case 4:
+      KernelMultiblockReduceFixed<kNComp, 4><<<static_cast<unsigned int>(ntasks), launch_threads, 0, stream>>>(partial_sums, eri_out);
+      break;
+    case 8:
+      KernelMultiblockReduceFixed<kNComp, 8><<<static_cast<unsigned int>(ntasks), launch_threads, 0, stream>>>(partial_sums, eri_out);
+      break;
+    case 16:
+      KernelMultiblockReduceFixed<kNComp, 16><<<static_cast<unsigned int>(ntasks), launch_threads, 0, stream>>>(partial_sums, eri_out);
+      break;
+    default:
+      KernelMultiblockReduceDynamic<kNComp><<<static_cast<unsigned int>(ntasks), launch_threads, 0, stream>>>(
+          partial_sums, blocks_per_task, eri_out);
+      break;
+  }
+  return cudaGetLastError();
 }

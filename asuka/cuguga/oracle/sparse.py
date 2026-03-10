@@ -22,10 +22,17 @@ try:  # optional compiled fast path: apply g[p,q] directly into dense accumulato
 except Exception:  # pragma: no cover
     _epq_apply_g_accum_cy = None
 
+try:  # optional compiled fast path: collect (k, rs, coeff) COO terms for E_rs|j>
+    from asuka._epq_cy import epq_collect_rs_terms_cy as _epq_collect_rs_terms_cy
+except Exception:  # pragma: no cover
+    _epq_collect_rs_terms_cy = None
+
 
 _DENSE_ACC_NCSF_MAX = 10_000_000
 
 _DENSE_MASK_ACC_CACHE: dict[int, "_DenseRowMaskAccumulator"] = {}
+_H_EFF_STATIC_CACHE: dict[tuple[int, int, int], tuple[np.ndarray, np.ndarray]] = {}
+_H_EFF_STATIC_CACHE_MAX = 8
 
 
 def _csf_index_dtype(drt: DRT) -> np.dtype:
@@ -100,6 +107,113 @@ def _as_f64_square(a: np.ndarray, n: int, name: str) -> np.ndarray:
     if arr.shape != (int(n), int(n)):
         raise ValueError(f"{name} has wrong shape: {arr.shape} (expected {(int(n), int(n))})")
     return arr
+
+
+def _get_h_eff_static_dense(
+    h1e: np.ndarray,
+    eri4: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Return cached static terms for dense-row h_eff construction.
+
+    Returns
+    -------
+    h_base, eri_rr
+      h_base[p,q] = h1e[p,q] - 0.5 * sum_s (p,s|s,q)
+      eri_rr[p,q,r] = (p,q|r,r)
+    """
+
+    norb = int(h1e.shape[0])
+    key = (int(h1e.ctypes.data), int(eri4.ctypes.data), norb)
+    cached = _H_EFF_STATIC_CACHE.get(key)
+    if cached is not None:
+        return cached
+
+    h_base = np.asarray(h1e - 0.5 * np.einsum("pqqs->ps", eri4, optimize=True), dtype=np.float64, order="C")
+    rr = np.arange(norb, dtype=np.intp)
+    eri_rr = np.asarray(eri4[:, :, rr, rr], dtype=np.float64, order="C")
+
+    if len(_H_EFF_STATIC_CACHE) >= _H_EFF_STATIC_CACHE_MAX:
+        _H_EFF_STATIC_CACHE.pop(next(iter(_H_EFF_STATIC_CACHE)))
+    _H_EFF_STATIC_CACHE[key] = (h_base, eri_rr)
+    return h_base, eri_rr
+
+
+def _collect_rs_terms_for_source(
+    drt: DRT,
+    j: int,
+    *,
+    src_occ: list[int],
+    dst_occ: list[int],
+    steps_j: np.ndarray,
+    nodes_j: np.ndarray,
+    idx_dtype: np.dtype,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, int, int]:
+    """Collect COO terms for k = E_rs|j>, returning (k_idx, rs_id, coeff)."""
+
+    r_list: list[int] = []
+    s_list: list[int] = []
+    for s in src_occ:
+        for r in dst_occ:
+            if r == s:
+                continue
+            r_list.append(int(r))
+            s_list.append(int(s))
+
+    epq_calls_rs = int(len(r_list))
+    if epq_calls_rs == 0:
+        return (
+            np.zeros((0,), dtype=idx_dtype),
+            np.zeros((0,), dtype=np.int32),
+            np.zeros((0,), dtype=np.float64),
+            0,
+            0,
+        )
+
+    if _epq_collect_rs_terms_cy is not None:
+        k_idx, rs_id, coeff = _epq_collect_rs_terms_cy(
+            drt,
+            int(j),
+            np.asarray(r_list, dtype=np.int32),
+            np.asarray(s_list, dtype=np.int32),
+            np.asarray(steps_j, dtype=np.int8),
+            np.asarray(nodes_j, dtype=np.int32),
+            0.0,
+            True,
+        )
+        k_idx_all = np.asarray(k_idx, dtype=idx_dtype, order="C")
+        rs_id_all = np.asarray(rs_id, dtype=np.int32, order="C")
+        coeff_all = np.asarray(coeff, dtype=np.float64, order="C")
+        return k_idx_all, rs_id_all, coeff_all, epq_calls_rs, int(k_idx_all.size)
+
+    coo_k: list[int] = []
+    coo_rs: list[int] = []
+    coo_c: list[float] = []
+    for r, s in zip(r_list, s_list):
+        k_idx, c_rs = epq_contribs_one(drt, j, int(r), int(s), steps=steps_j, nodes=nodes_j)
+        if k_idx.size == 0:
+            continue
+        rs_id = int(r) * int(drt.norb) + int(s)
+        for kk, cc in zip(k_idx, c_rs):
+            coo_k.append(int(kk))
+            coo_rs.append(rs_id)
+            coo_c.append(float(cc))
+
+    if not coo_k:
+        return (
+            np.zeros((0,), dtype=idx_dtype),
+            np.zeros((0,), dtype=np.int32),
+            np.zeros((0,), dtype=np.float64),
+            epq_calls_rs,
+            0,
+        )
+
+    return (
+        np.asarray(coo_k, dtype=idx_dtype, order="C"),
+        np.asarray(coo_rs, dtype=np.int32, order="C"),
+        np.asarray(coo_c, dtype=np.float64, order="C"),
+        epq_calls_rs,
+        int(len(coo_k)),
+    )
 
 
 def _select_offdiag_pq(
@@ -284,8 +398,13 @@ def connected_row_sparse(
 
     t0 = time.perf_counter() if stats is not None else 0.0
     # h_eff = h1e - 0.5*Σ_q(p q| q s) + 0.5*Σ_r(p q| r r) occ_r(j)
-    h_eff = h1e - 0.5 * np.einsum("pqqs->ps", eri4, optimize=True)
-    h_eff = h_eff + 0.5 * np.einsum("pqrr,r->pq", eri4, occ_j, optimize=True)
+    # The first term is row-independent, so cache it by tensor identity.
+    h_base, eri_rr = _get_h_eff_static_dense(h1e, eri4)
+    h_eff = np.asarray(
+        h_base + 0.5 * np.tensordot(eri_rr, occ_j, axes=([2], [0])),
+        dtype=np.float64,
+        order="C",
+    )
     if stats is not None:
         stats.add_time("h_eff", time.perf_counter() - t0)
 
@@ -360,61 +479,81 @@ def connected_row_sparse(
     g_buf = np.empty(nops, dtype=np.float64)
 
     t0 = time.perf_counter() if stats is not None else 0.0
-    epq_calls_rs = 0
-    nnz_rs = 0
-    by_k: dict[int, list[tuple[int, float]]] = {}
-    for s in src1:
-        for r in dst1:
-            if r == s:
-                continue
-            epq_calls_rs += 1
-            k_idx, c_rs = epq_contribs_one(drt, j, int(r), int(s), steps=steps_j, nodes=nodes_j)
-            nnz_rs += int(k_idx.size)
-            if k_idx.size == 0:
-                continue
-            rs_id = int(r) * norb + int(s)
-            for kk, cc in zip(k_idx, c_rs):
-                by_k.setdefault(int(kk), []).append((rs_id, float(cc)))
+    k_idx_all, rs_id_all, coeff_all, epq_calls_rs, nnz_rs = _collect_rs_terms_for_source(
+        drt,
+        j,
+        src_occ=src1,
+        dst_occ=dst1,
+        steps_j=steps_j,
+        nodes_j=nodes_j,
+        idx_dtype=idx_dtype,
+    )
+    rs_coalesce_t = 0.0
+    if k_idx_all.size > 1:
+        t1 = time.perf_counter() if stats is not None else 0.0
+        order = np.lexsort((rs_id_all, k_idx_all))
+        k_idx_all = np.asarray(k_idx_all[order], dtype=idx_dtype, order="C")
+        rs_id_all = np.asarray(rs_id_all[order], dtype=np.int32, order="C")
+        coeff_all = np.asarray(coeff_all[order], dtype=np.float64, order="C")
+        change = (k_idx_all[1:] != k_idx_all[:-1]) | (rs_id_all[1:] != rs_id_all[:-1])
+        if np.any(change):
+            starts = np.concatenate(([0], np.nonzero(change)[0] + 1)).astype(np.int32, copy=False)
+            k_idx_all = np.asarray(k_idx_all[starts], dtype=idx_dtype, order="C")
+            rs_id_all = np.asarray(rs_id_all[starts], dtype=np.int32, order="C")
+            coeff_all = np.asarray(np.add.reduceat(coeff_all, starts), dtype=np.float64, order="C")
+        rs_coalesce_t = time.perf_counter() - t1 if stats is not None else 0.0
+
+    rs_screen_t = 0.0
+    if thresh_rs_coeff > 0.0 and coeff_all.size:
+        t1 = time.perf_counter() if stats is not None else 0.0
+        keep = np.abs(coeff_all) > thresh_rs_coeff
+        k_idx_all = np.asarray(k_idx_all[keep], dtype=idx_dtype, order="C")
+        rs_id_all = np.asarray(rs_id_all[keep], dtype=np.int32, order="C")
+        coeff_all = np.asarray(coeff_all[keep], dtype=np.float64, order="C")
+        rs_screen_t = time.perf_counter() - t1 if stats is not None else 0.0
+
+    n_k = int(np.count_nonzero(k_idx_all[1:] != k_idx_all[:-1]) + 1) if k_idx_all.size else 0
     if stats is not None:
         stats.add_time("rs_enum", time.perf_counter() - t0)
+        if rs_coalesce_t:
+            stats.add_time("rs_coalesce", rs_coalesce_t)
+        if rs_screen_t:
+            stats.add_time("rs_screen", rs_screen_t)
         stats.inc("epq_calls_rs", epq_calls_rs)
         stats.inc("nnz_rs", nnz_rs)
-        stats.inc("n_k", int(len(by_k)))
+        stats.inc("n_k", n_k)
 
     t_apply_total = time.perf_counter() if stats is not None else 0.0
     t_gbuild_total = 0.0
     epq_calls_apply = 0
     nnz_apply = 0
-    for k, rs_terms in by_k.items():
+    if k_idx_all.size:
+        if k_idx_all.size > 1:
+            k_change = k_idx_all[1:] != k_idx_all[:-1]
+            k_starts = np.concatenate(([0], np.nonzero(k_change)[0] + 1)).astype(np.int64, copy=False)
+        else:
+            k_starts = np.asarray([0], dtype=np.int64)
+        k_stops = np.empty_like(k_starts)
+        if k_starts.size > 1:
+            k_stops[:-1] = k_starts[1:]
+        k_stops[-1] = int(k_idx_all.size)
+    else:
+        k_starts = np.zeros(0, dtype=np.int64)
+        k_stops = np.zeros(0, dtype=np.int64)
+
+    for start, stop in zip(k_starts, k_stops):
+        k = int(k_idx_all[int(start)])
+        rs_ids = rs_id_all[int(start) : int(stop)]
+        rs_coeff = coeff_all[int(start) : int(stop)]
         t1 = time.perf_counter() if stats is not None else 0.0
-        if len(rs_terms) == 1:
-            rs_id, rs_c = rs_terms[0]
-            if thresh_rs_coeff > 0.0 and abs(float(rs_c)) <= thresh_rs_coeff:
-                continue
+        if int(rs_ids.size) == 1:
             np.multiply(
-                eri_mat[:, int(rs_id)],
-                0.5 * float(rs_c),
+                eri_mat[:, int(rs_ids[0])],
+                0.5 * float(rs_coeff[0]),
                 out=g_buf,
             )
             g_flat = g_buf
         else:
-            rs_ids = np.asarray([t[0] for t in rs_terms], dtype=np.int32)
-            rs_coeff = np.asarray([t[1] for t in rs_terms], dtype=np.float64)
-            if rs_ids.size > 1:
-                order = np.argsort(rs_ids, kind="mergesort")
-                rs_ids = rs_ids[order]
-                rs_coeff = rs_coeff[order]
-                change = np.nonzero(rs_ids[1:] != rs_ids[:-1])[0] + 1
-                if change.size:
-                    starts = np.concatenate(([0], change)).astype(np.int32, copy=False)
-                    rs_ids = rs_ids[starts]
-                    rs_coeff = np.add.reduceat(rs_coeff, starts)
-            if thresh_rs_coeff > 0.0:
-                keep = np.abs(rs_coeff) > thresh_rs_coeff
-                rs_ids = rs_ids[keep]
-                rs_coeff = rs_coeff[keep]
-                if rs_ids.size == 0:
-                    continue
             np.matmul(eri_mat[:, rs_ids], rs_coeff, out=g_buf)
             g_buf *= 0.5
             g_flat = g_buf
@@ -604,40 +743,29 @@ def connected_row_sparse_df(
     # 2-body product terms with r!=s (r==s already absorbed into h_eff above).
     # Collect sparse coefficients for all intermediates k = E_rs|j⟩ in COO form, then
     # build g_k[pq] in a batched DF contraction.
-    coo_k: list[int] = []
-    coo_rs: list[int] = []
-    coo_c: list[float] = []
-
     t0 = time.perf_counter() if stats is not None else 0.0
-    epq_calls_rs = 0
-    nnz_rs = 0
-    for s in src1:
-        for r in dst1:
-            if r == s:
-                continue
-            epq_calls_rs += 1
-            k_idx, c_rs = epq_contribs_one(drt, j, int(r), int(s), steps=steps_j, nodes=nodes_j)
-            nnz_rs += int(k_idx.size)
-            if k_idx.size == 0:
-                continue
-            rs_id = int(r) * norb + int(s)
-            for kk, cc in zip(k_idx, c_rs):
-                coo_k.append(int(kk))
-                coo_rs.append(rs_id)
-                coo_c.append(float(cc))
+    k_idx_all, rs_id_all, coeff_all, epq_calls_rs, nnz_rs = _collect_rs_terms_for_source(
+        drt,
+        j,
+        src_occ=src1,
+        dst_occ=dst1,
+        steps_j=steps_j,
+        nodes_j=nodes_j,
+        idx_dtype=idx_dtype,
+    )
     if stats is not None:
         stats.add_time("rs_enum", time.perf_counter() - t0)
         stats.inc("epq_calls_rs", epq_calls_rs)
         stats.inc("nnz_rs", nnz_rs)
-        stats.inc("coo_entries", int(len(coo_k)))
+        stats.inc("coo_entries", int(k_idx_all.size))
 
-    if coo_k:
+    if k_idx_all.size:
         from scipy import sparse
 
         nops = norb * norb
-        k_idx_all = np.asarray(coo_k, dtype=np.int32)
-        rs_id_all = np.asarray(coo_rs, dtype=np.int32)
-        coeff_all = np.asarray(coo_c, dtype=np.float64)
+        k_idx_all = np.asarray(k_idx_all, dtype=idx_dtype, order="C")
+        rs_id_all = np.asarray(rs_id_all, dtype=np.int32, order="C")
+        coeff_all = np.asarray(coeff_all, dtype=np.float64, order="C")
 
         # Coalesce duplicates in (k, rs_id) and apply screening on the summed coefficient,
         # matching the previous per-k coalesce semantics.

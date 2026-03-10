@@ -36,15 +36,23 @@ def _find_func_end(lines: list[str], start: int) -> int:
 def _kernel_trailing_gap(block_lines: list[str]) -> list[str]:
     """Return the lines AFTER the __global__ body in a kernel block.
 
-    These are device helper functions that appear after the __global__'s closing
-    brace but before the next kernel's template line.  They belong to the current
-    block but may be needed by the following part.
+    These are device helper functions that appear after the LAST __global__ body
+    in the block but before the next kernel's template line. They belong to the
+    current block but may be needed by the following part.
     """
     rx_global = re.compile(r"^__global__")
+    body_end = None
     for i, line in enumerate(block_lines):
         if rx_global.match(line):
             body_end = _find_func_end(block_lines, i)
-            return block_lines[body_end:]
+    if body_end is not None:
+        next_kernel = len(block_lines)
+        for j in range(body_end, len(block_lines)):
+            stripped = block_lines[j].strip()
+            if stripped == "template <int NROOTS>" or rx_global.match(block_lines[j]):
+                next_kernel = j
+                break
+        return block_lines[body_end:next_kernel]
     return []
 
 

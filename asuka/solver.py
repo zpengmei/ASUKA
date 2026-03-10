@@ -4,7 +4,6 @@ import contextlib
 from concurrent.futures import ThreadPoolExecutor
 from collections import OrderedDict
 from dataclasses import dataclass
-import json
 import os
 import sys
 import time
@@ -14,7 +13,7 @@ import warnings
 import numpy as np
 
 from asuka.integrals.df_integrals import DFMOIntegrals, DeviceDFMOIntegrals
-from asuka.cuguga.drt import DRT, build_drt
+from asuka.cuguga.drt import DRT
 from asuka.cuguga.blas_threads import blas_thread_limit, openblas_get_num_threads
 from asuka.cuguga.davidson import davidson1 as davidson1_sym
 from asuka.cuguga.davidson import davidson1_result as davidson1_sym_result
@@ -30,6 +29,53 @@ from asuka.cuguga.oracle import (
 from asuka.rdm.stream import make_rdm12_streaming, trans_rdm12_streaming
 from asuka.cuguga.screening import RowScreening
 from asuka.cuguga.state_cache import get_state_cache
+from asuka._solver.warm_state import (
+    normalize_warm_cas_metadata as _normalize_warm_cas_metadata,
+)
+from asuka._solver.cuda_policy import (
+    apply_cuda_pool_hard_cap as _apply_cuda_pool_hard_cap,
+    apply_cuda_user_policy as _apply_cuda_user_policy,
+    auto_gpu_mem_hard_cap as _auto_gpu_mem_hard_cap,
+    cuda_budget_free_bytes as _cuda_budget_free_bytes,
+    enforce_cuda_aggregate_offdiag_guard as _enforce_cuda_aggregate_offdiag_guard,
+    enforce_cuda_fp32_large_cas_epq_policy as _enforce_cuda_fp32_large_cas_epq_policy,
+    estimate_epq_peak_bytes as _estimate_epq_peak_bytes,
+    normalize_csr_host_cache_mode as _normalize_csr_host_cache_mode,
+    normalize_cuda_accuracy_mode as _normalize_cuda_accuracy_mode,
+    normalize_cuda_user_policy_mode as _normalize_cuda_user_policy_mode,
+    normalize_matvec_cuda_path_mode as _normalize_matvec_cuda_path_mode,
+    normalize_prefilter_trivial_tasks_mode as _normalize_prefilter_trivial_tasks_mode,
+    normalize_ws_cache_fraction as _normalize_ws_cache_fraction,
+    resolve_epq_overbudget_action as _resolve_epq_overbudget_action,
+    resolve_mixed_low_workspace_oom_fallback as _resolve_mixed_low_workspace_oom_fallback,
+)
+from asuka._solver.drt_cache import (
+    DRTKey as _DRTKey,
+    ne_constraints_key_to_dict as _ne_constraints_key_to_dict,
+    ne_constraints_to_key as _ne_constraints_to_key,
+    orbsym_to_tuple as _orbsym_to_tuple,
+)
+from asuka._solver.config import auto_num_threads as _auto_num_threads
+from asuka._solver.warm_state_runtime import (
+    allowed_ci_devices_for_backend as _allowed_ci_devices_for_backend_runtime,
+    load_warm_state as _load_warm_state_runtime,
+    save_warm_state as _save_warm_state_runtime,
+    update_warm_state as _update_warm_state_runtime,
+    warm_state_ci0_if_compatible as _warm_state_ci0_if_compatible_runtime,
+    warm_state_summary as _warm_state_summary_runtime,
+)
+from asuka._solver.drt_runtime import (
+    drt_key as _drt_key_runtime,
+    get_or_build_drt as _get_or_build_drt_runtime,
+)
+from asuka._solver.matvec_runtime import (
+    estimate_matvec_cuda_workspace_bytes as _estimate_matvec_cuda_workspace_bytes_runtime,
+    release_matvec_cuda_workspace as _release_matvec_cuda_workspace_runtime,
+    resolve_matvec_cuda_ws_cache_budget_bytes as _resolve_matvec_cuda_ws_cache_budget_bytes_runtime,
+    resolve_kernel_cuda_execution_mode as _resolve_kernel_cuda_execution_mode_runtime,
+    resolve_approx_cuda_frontend as _resolve_approx_cuda_frontend_runtime,
+    ws_needs_rebuild as _ws_needs_rebuild_runtime,
+)
 
 if TYPE_CHECKING:  # pragma: no cover
     from asuka.contract import ContractWorkspace
@@ -44,123 +90,6 @@ except Exception:  # pragma: no cover
     _csc_bilinear_form_cy = None
     _csc_matmul_dense_inplace_cy = None
     _csc_quadratic_form_cy = None
-
-
-def _orbsym_to_tuple(orbsym: Any | None) -> tuple[int, ...] | None:
-    if orbsym is None:
-        return None
-    return tuple(int(x) for x in np.asarray(orbsym).ravel().tolist())
-
-
-def _ne_constraints_to_key(
-    ne_constraints: dict[int, tuple[int, int]] | None,
-) -> tuple[tuple[int, int, int], ...] | None:
-    if not ne_constraints:
-        return None
-    items: list[tuple[int, int, int]] = []
-    for k, bounds in dict(ne_constraints).items():
-        kk = int(k)
-        if kk < 0:
-            raise ValueError("ne_constraints keys must be >= 0")
-        if bounds is None or len(bounds) != 2:
-            raise ValueError(f"ne_constraints[{kk}] must be a (ne_min, ne_max) tuple")
-        ne_min = int(bounds[0])
-        ne_max = int(bounds[1])
-        if ne_min < 0 or ne_max < 0:
-            raise ValueError(f"ne_constraints[{kk}] bounds must be >= 0")
-        if ne_min > ne_max:
-            raise ValueError(f"ne_constraints[{kk}] must satisfy ne_min <= ne_max")
-        items.append((kk, ne_min, ne_max))
-    items.sort(key=lambda x: x[0])
-    return tuple(items)
-
-
-def _ne_constraints_key_to_dict(
-    ne_constraints_key: tuple[tuple[int, int, int], ...] | None,
-) -> dict[int, tuple[int, int]] | None:
-    if ne_constraints_key is None:
-        return None
-    out: dict[int, tuple[int, int]] = {}
-    for k, ne_min, ne_max in ne_constraints_key:
-        out[int(k)] = (int(ne_min), int(ne_max))
-    return out
-
-
-_WARM_STATE_FORMAT_VERSION = 1
-_WARM_CUDA_MATVEC_BACKENDS = frozenset(
-    ("cuda_eri_mat", "cuda", "cuda_fixed_ell", "cuda_ell", "cuda_fixed_sell", "cuda_sell")
-)
-
-
-def _normalize_warm_cas_metadata(
-    metadata: dict[str, Any] | None,
-    *,
-    default_ncas: int,
-    default_nelecas: tuple[int, int],
-) -> dict[str, Any]:
-    out: dict[str, Any] = {
-        "ncas": int(default_ncas),
-        "nelecas": (int(default_nelecas[0]), int(default_nelecas[1])),
-    }
-    if metadata is None:
-        return out
-    if not isinstance(metadata, dict):
-        raise TypeError("warm_state_context must be a dict or None")
-
-    if metadata.get("ncore", None) is not None:
-        out["ncore"] = int(metadata["ncore"])
-    if metadata.get("ncas", None) is not None:
-        out["ncas"] = int(metadata["ncas"])
-    if metadata.get("nelecas", None) is not None:
-        nelecas_arr = np.asarray(metadata["nelecas"], dtype=np.int64).ravel()
-        if nelecas_arr.size != 2:
-            raise ValueError("warm_state_context['nelecas'] must contain exactly two integers")
-        out["nelecas"] = (int(nelecas_arr[0]), int(nelecas_arr[1]))
-    if metadata.get("cas_orbsym", None) is not None:
-        out["cas_orbsym"] = tuple(int(x) for x in np.asarray(metadata["cas_orbsym"], dtype=np.int64).ravel().tolist())
-    if metadata.get("active_orbital_indices", None) is not None:
-        out["active_orbital_indices"] = tuple(
-            int(x) for x in np.asarray(metadata["active_orbital_indices"], dtype=np.int64).ravel().tolist()
-        )
-    return out
-
-
-def _warm_cas_metadata_to_jsonable(metadata: dict[str, Any] | None) -> dict[str, Any] | None:
-    if metadata is None:
-        return None
-    out: dict[str, Any] = {}
-    for key, val in metadata.items():
-        if isinstance(val, tuple):
-            out[str(key)] = list(val)
-        else:
-            out[str(key)] = val
-    return out
-
-
-def _warm_cas_metadata_from_jsonable(metadata: Any) -> dict[str, Any] | None:
-    if metadata is None:
-        return None
-    if not isinstance(metadata, dict):
-        raise ValueError("warm state cas_metadata must be a dictionary")
-
-    out: dict[str, Any] = {}
-    if metadata.get("ncore", None) is not None:
-        out["ncore"] = int(metadata["ncore"])
-    if metadata.get("ncas", None) is not None:
-        out["ncas"] = int(metadata["ncas"])
-    if metadata.get("nelecas", None) is not None:
-        nelecas_arr = np.asarray(metadata["nelecas"], dtype=np.int64).ravel()
-        if nelecas_arr.size != 2:
-            raise ValueError("warm state cas_metadata['nelecas'] must contain exactly two integers")
-        out["nelecas"] = (int(nelecas_arr[0]), int(nelecas_arr[1]))
-    if metadata.get("cas_orbsym", None) is not None:
-        out["cas_orbsym"] = tuple(int(x) for x in np.asarray(metadata["cas_orbsym"], dtype=np.int64).ravel().tolist())
-    if metadata.get("active_orbital_indices", None) is not None:
-        out["active_orbital_indices"] = tuple(
-            int(x) for x in np.asarray(metadata["active_orbital_indices"], dtype=np.int64).ravel().tolist()
-        )
-    return out if out else None
-
 
 @dataclass(frozen=True)
 class H1E2EContractOp:
@@ -177,348 +106,6 @@ class H1E2EContractOp:
     eri: Any
     fac: float = 1.0
 
-
-def _auto_num_threads() -> int:
-    """Return a process-wide thread hint.
-
-    Prefers explicit environment variables, then falls back to the hardware
-    core count.
-    """
-
-    for key in ("CUGUGA_NUM_THREADS", "OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS"):
-        val = os.environ.get(key)
-        if not val:
-            continue
-        try:
-            n = int(val)
-        except Exception:
-            continue
-        if n > 0:
-            return n
-
-    return max(1, int(os.cpu_count() or 1))
-
-
-def _cuda_budget_free_bytes(cp_mod: Any, hard_cap_gib: float) -> int | None:
-    """Return available CUDA bytes after applying an optional hard-cap budget.
-
-    Uses CuPy runtime free/total memory and adds reclaimable bytes from the CuPy
-    default memory pool so long-lived processes are not penalized by cached blocks.
-    """
-
-    try:
-        free_b, total_b = cp_mod.cuda.runtime.memGetInfo()
-        free_b = int(free_b)
-        total_b = int(total_b)
-        try:
-            pool = cp_mod.get_default_memory_pool()
-            pool_free_b = int(pool.total_bytes()) - int(pool.used_bytes())
-            if pool_free_b > 0:
-                free_b += int(pool_free_b)
-        except Exception:
-            pass
-    except Exception:
-        return None
-
-    budget_free_b = int(free_b)
-    if float(hard_cap_gib) > 0.0:
-        hard_cap_b = int(float(hard_cap_gib) * 1024 * 1024 * 1024)
-        used_b = max(0, int(total_b) - int(free_b))
-        budget_free_b = min(int(budget_free_b), max(0, int(hard_cap_b) - int(used_b)))
-    return max(0, int(budget_free_b))
-
-
-def _apply_cuda_pool_hard_cap(cp_mod: Any, hard_cap_gib: float) -> int | None:
-    """Apply CuPy memory-pool hard cap (bytes) for the current device."""
-
-    if float(hard_cap_gib) <= 0.0:
-        return None
-    hard_cap_b = int(float(hard_cap_gib) * 1024 * 1024 * 1024)
-    try:
-        pool = cp_mod.get_default_memory_pool()
-        pool.set_limit(size=int(hard_cap_b))
-    except Exception:
-        return None
-    return int(hard_cap_b)
-
-
-def _estimate_epq_peak_bytes(ncsf: int, norb: int) -> int:
-    n_pairs = int(norb) * (int(norb) - 1)
-    ntasks = int(ncsf) * int(n_pairs)
-    est_counts_bytes = int(ntasks) * 4
-    est_table_bytes = (int(ncsf) + 1) * 8 + int(ntasks) * 16
-    return int(est_counts_bytes) + int(est_table_bytes)
-
-
-def _normalize_cuda_user_policy_mode(value: bool | str | None) -> str:
-    if isinstance(value, str):
-        mode = value.strip().lower()
-        if mode in ("", "auto"):
-            return "auto"
-        if mode in ("1", "true", "yes", "on", "enabled"):
-            return "on"
-        if mode in ("0", "false", "no", "off", "disabled"):
-            return "off"
-        raise ValueError("matvec_cuda_policy must be bool or one of: auto/on/off")
-    if value is None:
-        return "auto"
-    return "on" if bool(value) else "off"
-
-
-def _normalize_cuda_accuracy_mode(value: str | None) -> str:
-    if value is None:
-        return "balanced"
-    mode = str(value).strip().lower()
-    aliases = {
-        "default": "balanced",
-        "normal": "balanced",
-        "performance": "fast",
-        "accurate": "strict",
-    }
-    mode = aliases.get(mode, mode)
-    if mode not in ("fast", "balanced", "strict"):
-        raise ValueError("matvec_cuda_accuracy_mode must be one of: fast, balanced, strict")
-    return mode
-
-
-def _normalize_matvec_cuda_path_mode(value: str | None) -> str:
-    mode = "auto" if value is None else str(value).strip().lower()
-    aliases = {
-        "fused-coo": "fused_coo",
-        "coo": "fused_coo",
-        "epq-blocked": "epq_blocked",
-        "epq": "epq_blocked",
-        "fused-epq-hybrid": "fused_epq_hybrid",
-        "fused_epq": "fused_epq_hybrid",
-    }
-    mode = aliases.get(mode, mode)
-    if mode in ("", "auto"):
-        return "auto"
-    if mode == "fused_coo":
-        raise ValueError(
-            "matvec_cuda_path_mode='fused_coo' is disabled (no-go path due to performance). "
-            "Use 'auto', 'fused_epq_hybrid', or 'epq_blocked'."
-        )
-    if mode not in ("epq_blocked", "fused_epq_hybrid"):
-        raise ValueError(
-            "matvec_cuda_path_mode must be one of: auto, epq_blocked, fused_epq_hybrid"
-        )
-    return mode
-
-
-def _apply_cuda_user_policy(
-    *,
-    matvec_backend: str,
-    policy_mode: str,
-    accuracy_mode: str,
-    dtype_hint: str,
-    memory_cap_gib: float | None,
-    kwargs: dict[str, Any],
-    policy_explicit: bool,
-    policy_configured: bool,
-) -> tuple[bool, str, dict[str, Any]]:
-    """Apply high-level CUDA policy defaults without overriding expert knobs."""
-
-    backend = str(matvec_backend).strip().lower()
-    if backend not in _WARM_CUDA_MATVEC_BACKENDS:
-        return False, "non_cuda_backend", {}
-
-    mode = _normalize_cuda_user_policy_mode(policy_mode)
-    acc_mode = _normalize_cuda_accuracy_mode(accuracy_mode)
-    if mode == "off":
-        return False, "policy_off", {}
-    if mode == "auto" and (not policy_explicit) and (not policy_configured):
-        return False, "policy_auto_inactive", {}
-
-    dtype_mode = str(dtype_hint).strip().lower()
-    if dtype_mode in ("fp64", "f64", "double"):
-        dtype_mode = "float64"
-    elif dtype_mode in ("fp32", "f32", "single"):
-        dtype_mode = "float32"
-    elif dtype_mode in ("mixed_fp32", "float32_mixed"):
-        dtype_mode = "mixed"
-    if dtype_mode not in ("float64", "float32", "mixed"):
-        dtype_mode = "float64"
-
-    resolved: dict[str, Any] = {}
-
-    def _set_default(key: str, value: Any) -> None:
-        if key in kwargs:
-            return
-        kwargs[key] = value
-        resolved[key] = value
-
-    # High-level memory-cap alias.
-    if memory_cap_gib is not None:
-        _set_default("matvec_cuda_mem_hard_cap_gib", float(memory_cap_gib))
-
-    # Keep CUDA path shape stable by default.
-    _set_default("matvec_cuda_aggregate_offdiag", True)
-    _set_default("matvec_cuda_use_epq_table", True)
-    _set_default("matvec_cuda_epq_streaming", "off")
-    _set_default("matvec_cuda_cache_csr_tiles", False)
-    _set_default("matvec_cuda_prefilter_trivial_tasks", "auto")
-
-    if acc_mode == "fast":
-        _set_default("matvec_cuda_max_g_mib", 512.0)
-        if dtype_mode == "mixed":
-            _set_default("matvec_cuda_mixed_threshold", 1e-7)
-    elif acc_mode == "strict":
-        _set_default("matvec_cuda_max_g_mib", 128.0)
-        if dtype_mode == "mixed":
-            _set_default("matvec_cuda_mixed_threshold", 1e-3)
-    else:
-        _set_default("matvec_cuda_max_g_mib", 256.0)
-        if dtype_mode == "mixed":
-            _set_default("matvec_cuda_mixed_threshold", 1e-5)
-
-    if dtype_mode == "float64":
-        _set_default("matvec_cuda_gemm_backend", "cublaslt_fp64")
-    elif dtype_mode == "float32":
-        _set_default("matvec_cuda_gemm_backend", "cublaslt_tf32")
-    else:  # mixed
-        _set_default("matvec_cuda_gemm_backend", "cublaslt_fp64")
-
-    return True, ("policy_on" if mode == "on" else "policy_auto"), resolved
-
-
-def _enforce_cuda_fp32_large_cas_epq_policy(
-    *,
-    context: str,
-    matvec_cuda_dtype: str,
-    matvec_cuda_use_epq_table: bool,
-    matvec_cuda_aggregate_offdiag: bool,
-    ncsf: int,
-) -> None:
-    dtype_mode = str(matvec_cuda_dtype).strip().lower()
-    if dtype_mode != "mixed":
-        return
-    if not bool(matvec_cuda_aggregate_offdiag):
-        return
-    if bool(matvec_cuda_use_epq_table):
-        return
-    if int(ncsf) < 1_000_000:
-        return
-    raise ValueError(
-        f"{context}: matvec_cuda_dtype='{dtype_mode}' with large CAS (ncsf={int(ncsf)}) "
-        "requires matvec_cuda_use_epq_table=True when matvec_cuda_aggregate_offdiag=True; "
-        "the no-EPQ large-CAS mixed path is disabled to prevent CUDA crashes. "
-        "Use matvec_cuda_dtype='float64', reduce CAS size, or increase memory budget so EPQ stays enabled."
-    )
-
-
-def _resolve_epq_overbudget_action(
-    *,
-    matvec_cuda_dtype: str,
-    matvec_cuda_aggregate_offdiag: bool,
-    ncsf: int,
-    epq_table_forced: bool,
-    epq_streaming_mode: str,
-    has_epq_table_device_build: bool,
-) -> tuple[str, str]:
-    """Decide EPQ policy when estimated materialization exceeds budget."""
-
-    dtype_mode = str(matvec_cuda_dtype).strip().lower()
-    stream_mode = str(epq_streaming_mode).strip().lower()
-    streaming_explicit = stream_mode in ("on", "manual")
-    mixed_guarded = bool(
-        dtype_mode == "mixed"
-        and bool(matvec_cuda_aggregate_offdiag)
-        and int(ncsf) >= 1_000_000
-    )
-
-    if bool(epq_table_forced):
-        return "keep_materialized", "forced_use_epq_table"
-
-    if mixed_guarded:
-        # In guarded mixed mode, avoid silent auto-streaming and keep the deterministic
-        # materialized policy unless streaming was explicitly requested.
-        if streaming_explicit and bool(has_epq_table_device_build):
-            return "streaming", "explicit_streaming_mode"
-        return "keep_materialized", "mixed_guarded_keep_materialized"
-
-    if streaming_explicit:
-        if bool(has_epq_table_device_build):
-            return "streaming", "explicit_streaming_mode"
-        return "disable_epq", "streaming_requested_but_unavailable"
-
-    can_stream_auto = bool(
-        dtype_mode in ("float32", "mixed")
-        and bool(matvec_cuda_aggregate_offdiag)
-        and stream_mode != "off"
-        and bool(has_epq_table_device_build)
-    )
-    if can_stream_auto:
-        return "streaming", "auto_streaming_low_precision_overbudget"
-    return "disable_epq", "disable_epq_overbudget"
-
-
-def _resolve_mixed_low_workspace_oom_fallback(
-    *,
-    can_stream_fallback: bool,
-    can_noepq_fallback: bool,
-    guarded_requires_epq: bool,
-) -> tuple[str, str]:
-    """Pick mixed low-workspace fallback action after materialized-EPQ OOM."""
-
-    if bool(can_noepq_fallback):
-        if bool(guarded_requires_epq):
-            return "no_epq", "oom_materialized_epq_prefer_no_epq_guard_override"
-        return "no_epq", "oom_materialized_epq_prefer_no_epq"
-    if bool(can_stream_fallback):
-        if bool(guarded_requires_epq):
-            return "streaming", "oom_materialized_epq_guarded_requires_epq"
-        return "streaming", "oom_materialized_epq_streaming_fallback"
-    return "raise", "oom_no_supported_fallback"
-
-
-def _normalize_csr_host_cache_mode(value: bool | str | None) -> str:
-    if isinstance(value, str):
-        mode = value.strip().lower()
-        if mode in ("", "auto"):
-            return "auto"
-        if mode in ("1", "true", "yes", "on", "host", "enabled"):
-            return "on"
-        if mode in ("0", "false", "no", "off", "none", "disabled"):
-            return "off"
-        raise ValueError("matvec_cuda_csr_host_cache must be bool or one of: auto/on/off")
-    return "on" if bool(value) else "off"
-
-
-def _normalize_prefilter_trivial_tasks_mode(value: bool | str | None) -> str:
-    if isinstance(value, str):
-        mode = value.strip().lower()
-        if mode in ("", "auto"):
-            return "auto"
-        if mode in ("1", "true", "yes", "on", "enabled"):
-            return "on"
-        if mode in ("0", "false", "no", "off", "none", "disabled"):
-            return "off"
-        raise ValueError("matvec_cuda_prefilter_trivial_tasks must be bool or one of: auto/on/off")
-    return "on" if bool(value) else "off"
-
-
-def _enforce_cuda_aggregate_offdiag_guard(value: bool, *, context: str) -> bool:
-    """Hard guard: CUDA paths must keep aggregate_offdiag enabled."""
-    if not bool(value):
-        raise ValueError(
-            f"{context}: matvec_cuda_aggregate_offdiag=False is forbidden by hard guard; "
-            "set matvec_cuda_aggregate_offdiag=True"
-        )
-    return True
-
-
-def _normalize_ws_cache_fraction(value: Any) -> float:
-    try:
-        frac = float(value)
-    except Exception:
-        frac = 0.2
-    if not np.isfinite(frac):
-        frac = 0.2
-    # Keep some room for non-workspace allocations and runtime overhead.
-    return max(0.0, min(0.8, float(frac)))
-
-
 class _StreamObject:
     """Minimal solver base class for cuguga."""
 
@@ -528,62 +115,6 @@ class _StreamObject:
     def __init__(self) -> None:
         self.verbose = 0
         self.stdout = sys.stdout
-
-
-@dataclass(frozen=True)
-class _DRTKey:
-    norb: int
-    nelec_total: int
-    twos: int
-    wfnsym: int | None
-    orbsym: tuple[int, ...] | None
-    ne_constraints_key: tuple[tuple[int, int, int], ...] | None
-
-
-_DETECTED_GPU_MEM_CAP_GIB: float | None = None
-
-
-def _auto_gpu_mem_hard_cap() -> float:
-    """Return a safe VRAM hard cap based on the current CUDA device.
-
-    Uses the same formula as ``autotune._gpu_autofill_overrides``:
-    reserve 1.5 GiB for >=20 GiB GPUs, 1.0 for >=12, 0.75 otherwise;
-    cap = min(90% of total, total - reserve), at least 2.0 GiB.
-
-    Checks ``ASUKA_CUDA_MEM_HARD_CAP_GIB`` env var first, then auto-detects
-    via CuPy. Falls back to 11.5 GiB (legacy default) on failure.
-    """
-    global _DETECTED_GPU_MEM_CAP_GIB
-    if _DETECTED_GPU_MEM_CAP_GIB is not None:
-        return _DETECTED_GPU_MEM_CAP_GIB
-
-    env_val = os.environ.get("ASUKA_CUDA_MEM_HARD_CAP_GIB")
-    if env_val is not None:
-        try:
-            cap = float(env_val)
-            if cap > 0.0:
-                _DETECTED_GPU_MEM_CAP_GIB = cap
-                return cap
-        except (ValueError, TypeError):
-            pass
-
-    try:
-        from asuka.cuguga.autotune import detect_cuda_device_info
-
-        info = detect_cuda_device_info()
-        if info is not None and isinstance(info.get("total_mem_gib"), (int, float)):
-            total = float(info["total_mem_gib"])
-            if total > 0.0:
-                reserve = 1.5 if total >= 20.0 else (1.0 if total >= 12.0 else 0.75)
-                cap = max(2.0, min(total * 0.90, total - reserve))
-                _DETECTED_GPU_MEM_CAP_GIB = round(cap, 3)
-                return _DETECTED_GPU_MEM_CAP_GIB
-    except Exception:
-        pass
-
-    _DETECTED_GPU_MEM_CAP_GIB = 11.5
-    return 11.5
-
 
 class GUGAFCISolver(_StreamObject):
     """FCI-like solver interface for a native GUGA/CSF engine.
@@ -631,126 +162,53 @@ class GUGAFCISolver(_StreamObject):
         prefilter_trivial_tasks_min_ncsf,
     ) -> bool:
         """Return True if the cached workspace must be rebuilt."""
-        if ws is None:
-            return True
-        ws_path_mode = str(getattr(ws, "path_mode", "auto"))
-        return (
-            np.dtype(getattr(ws, "dtype", np.float64)) != np.dtype(expected_dtype)
-            or int(getattr(ws, "j_tile", -1)) != j_tile
-            or float(getattr(ws, "csr_capacity_mult", -1.0)) != float(csr_capacity_mult)
-            or int(getattr(ws, "threads_enum", -1)) != threads_enum
-            or int(getattr(ws, "threads_g", -1)) != threads_g
-            or int(getattr(ws, "threads_w", -1)) != threads_w
-            or int(getattr(ws, "threads_apply", -1)) != threads_apply
-            or int(getattr(ws, "max_g_bytes", -1)) != int(max_g_bytes)
-            or bool(getattr(ws, "coalesce", False)) != coalesce
-            or bool(getattr(ws, "include_diagonal_rs", False)) != include_diagonal_rs
-            or bool(getattr(ws, "fuse_count_write", False)) != bool(fuse_count_write)
-            or bool(getattr(ws, "fp32_coeff_data", False)) != bool(fp32_coeff_data)
-            or str(getattr(ws, "path_mode_requested", "auto")) != str(path_mode)
-            or bool(getattr(ws, "use_fused_hop", True)) != bool(use_fused_hop)
-            or (
-                ws_path_mode != "fused_coo"
-                and bool(getattr(ws, "use_epq_table", False)) != bool(use_epq_table)
-            )
-            or (
-                ws_path_mode not in ("fused_coo", "fused_epq_hybrid")
-                and bool(getattr(ws, "aggregate_offdiag_k", False)) != bool(aggregate_offdiag_k)
-            )
-            or bool(getattr(ws, "l_full", None) is not None) != bool(l_full_d is not None)
-            or bool(getattr(ws, "offdiag_enable_fp64_emulation", False)) != bool(enable_fp64_emulation)
-            or str(getattr(ws, "gemm_backend", "")) != str(gemm_backend)
-            or str(getattr(ws, "offdiag_emulation_strategy", "")) != str(emulation_strategy)
-            or int(getattr(ws, "offdiag_cublas_workspace_cap_mb", 0)) != int(cublas_workspace_cap_mb)
-            or str(getattr(ws, "apply_mode", "")) != str(apply_mode)
-            or bool(getattr(ws, "epq_build_device", False)) != bool(epq_build_device)
-            or int(getattr(ws, "epq_build_j_tile", 0)) != int(epq_build_j_tile)
-            or bool(getattr(ws, "epq_streaming", False)) != bool(epq_streaming)
-            or int(getattr(ws, "epq_stream_j_tile", 0)) != int(epq_stream_j_tile)
-            or str(getattr(ws, "epq_stream_use_recompute", "auto")) != str(epq_stream_use_recompute)
-            or bool(getattr(ws, "cache_csr_tiles", False)) != bool(cache_csr_tiles)
-            or str(getattr(ws, "csr_host_cache_mode", "off")) != str(csr_host_cache_mode)
-            or float(getattr(ws, "csr_host_cache_budget_gib", -1.0)) != float(csr_host_cache_budget_gib)
-            or int(getattr(ws, "csr_host_cache_min_ncsf", -1)) != int(csr_host_cache_min_ncsf)
-            or str(getattr(ws, "csr_pipeline_streams_mode", "off")) != str(csr_pipeline_streams_mode)
-            or (
-                csr_pipeline_streams_value is not None
-                and int(getattr(ws, "csr_pipeline_streams", 0)) != int(csr_pipeline_streams_value)
-            )
-            or int(getattr(ws, "csr_pipeline_min_ncsf", -1)) != int(csr_pipeline_min_ncsf)
-            or str(getattr(ws, "prefilter_trivial_tasks_mode", "off")) != str(prefilter_trivial_tasks_mode)
-            or int(getattr(ws, "prefilter_trivial_tasks_min_ncsf", -1)) != int(prefilter_trivial_tasks_min_ncsf)
-            or (
-                l_full_d is not None
-                and int(getattr(ws, "naux", 0)) != int(getattr(l_full_d, "shape", (0, 0))[1])
-            )
+        return _ws_needs_rebuild_runtime(
+            ws,
+            expected_dtype=expected_dtype,
+            j_tile=j_tile,
+            csr_capacity_mult=csr_capacity_mult,
+            threads_enum=threads_enum,
+            threads_g=threads_g,
+            threads_w=threads_w,
+            threads_apply=threads_apply,
+            max_g_bytes=max_g_bytes,
+            coalesce=coalesce,
+            include_diagonal_rs=include_diagonal_rs,
+            fuse_count_write=fuse_count_write,
+            fp32_coeff_data=fp32_coeff_data,
+            path_mode=path_mode,
+            use_fused_hop=use_fused_hop,
+            use_epq_table=use_epq_table,
+            aggregate_offdiag_k=aggregate_offdiag_k,
+            l_full_d=l_full_d,
+            enable_fp64_emulation=enable_fp64_emulation,
+            gemm_backend=gemm_backend,
+            emulation_strategy=emulation_strategy,
+            cublas_workspace_cap_mb=cublas_workspace_cap_mb,
+            apply_mode=apply_mode,
+            epq_build_device=epq_build_device,
+            epq_build_j_tile=epq_build_j_tile,
+            epq_streaming=epq_streaming,
+            epq_stream_j_tile=epq_stream_j_tile,
+            epq_stream_use_recompute=epq_stream_use_recompute,
+            cache_csr_tiles=cache_csr_tiles,
+            csr_host_cache_mode=csr_host_cache_mode,
+            csr_host_cache_budget_gib=csr_host_cache_budget_gib,
+            csr_host_cache_min_ncsf=csr_host_cache_min_ncsf,
+            csr_pipeline_streams_mode=csr_pipeline_streams_mode,
+            csr_pipeline_streams_value=csr_pipeline_streams_value,
+            csr_pipeline_min_ncsf=csr_pipeline_min_ncsf,
+            prefilter_trivial_tasks_mode=prefilter_trivial_tasks_mode,
+            prefilter_trivial_tasks_min_ncsf=prefilter_trivial_tasks_min_ncsf,
         )
 
     @staticmethod
     def _release_matvec_cuda_workspace(ws: Any) -> None:
-        if ws is None:
-            return
-        release_fn = getattr(ws, "release", None)
-        if callable(release_fn):
-            try:
-                release_fn()
-                return
-            except Exception:
-                pass
-        # Best-effort fallback for legacy workspaces without a release() API.
-        for attr in (
-            "_g_buf",
-            "_w_block",
-            "_w_offdiag",
-            "_epq_table",
-            "_epq_apply_tile_cache",
-            "_csr_tile_cache",
-            "_csr_host_tile_cache",
-            "_diag_g_cache",
-            "_k25_ws",
-            "_offdiag_gemm_ws",
-            "_gdf_ws",
-        ):
-            if hasattr(ws, attr):
-                try:
-                    setattr(ws, attr, None)
-                except Exception:
-                    pass
+        _release_matvec_cuda_workspace_runtime(ws)
 
     @staticmethod
     def _estimate_matvec_cuda_workspace_bytes(ws: Any) -> int:
-        if ws is None:
-            return 0
-        try:
-            est_fn = getattr(ws, "workspace_nbytes_estimate", None)
-            if callable(est_fn):
-                est = int(est_fn())
-                if est >= 0:
-                    return est
-        except Exception:
-            pass
-
-        seen: set[int] = set()
-        stack: list[Any] = [ws]
-        total = 0
-        while stack:
-            obj = stack.pop()
-            oid = id(obj)
-            if oid in seen:
-                continue
-            seen.add(oid)
-            nbytes = getattr(obj, "nbytes", None)
-            if nbytes is not None:
-                try:
-                    total += int(nbytes)
-                    continue
-                except Exception:
-                    pass
-            if isinstance(obj, dict):
-                stack.extend(obj.values())
-            elif isinstance(obj, (list, tuple)):
-                stack.extend(obj)
-        return int(max(0, total))
+        return _estimate_matvec_cuda_workspace_bytes_runtime(ws)
 
     def _resolve_matvec_cuda_ws_cache_budget_bytes(
         self,
@@ -759,23 +217,12 @@ class GUGAFCISolver(_StreamObject):
         hard_cap_gib: float,
         fraction: float | None = None,
     ) -> int:
-        frac = self.matvec_cuda_ws_cache_fraction if fraction is None else _normalize_ws_cache_fraction(fraction)
-        if frac <= 0.0:
-            return 0
-        total_b = 0
-        if cp_mod is not None:
-            try:
-                _free_b, _total_b = cp_mod.cuda.runtime.memGetInfo()
-                total_b = int(_total_b)
-            except Exception:
-                total_b = 0
-        cap_b = int(float(hard_cap_gib) * (1024**3)) if float(hard_cap_gib) > 0.0 else 0
-        base_b = int(cap_b if cap_b > 0 else total_b)
-        if base_b <= 0:
-            return 0
-        reserve_b = int(1.5 * 1024**3)
-        usable_b = max(0, int(base_b) - int(reserve_b))
-        return int(max(0, usable_b) * float(frac))
+        frac = self.matvec_cuda_ws_cache_fraction if fraction is None else fraction
+        return _resolve_matvec_cuda_ws_cache_budget_bytes_runtime(
+            cp_mod=cp_mod,
+            hard_cap_gib=hard_cap_gib,
+            fraction=frac,
+        )
 
     def _matvec_cuda_ws_cache_touch(self, key: Any) -> None:
         if key in self._matvec_cuda_ws_cache_lru:
@@ -1271,13 +718,13 @@ class GUGAFCISolver(_StreamObject):
         *,
         ne_constraints: dict[int, tuple[int, int]] | None = None,
     ) -> _DRTKey:
-        return _DRTKey(
-            norb=int(norb),
-            nelec_total=int(nelec_total),
-            twos=int(twos),
-            wfnsym=None if wfnsym is None else int(wfnsym),
-            orbsym=_orbsym_to_tuple(orbsym),
-            ne_constraints_key=_ne_constraints_to_key(ne_constraints),
+        return _drt_key_runtime(
+            int(norb),
+            int(nelec_total),
+            int(twos),
+            orbsym,
+            wfnsym,
+            ne_constraints=ne_constraints,
         )
 
     def _get_drt(
@@ -1290,46 +737,22 @@ class GUGAFCISolver(_StreamObject):
         *,
         ne_constraints: dict[int, tuple[int, int]] | None = None,
     ) -> DRT:
-        key = self._drt_key(norb, nelec_total, twos, orbsym, wfnsym, ne_constraints=ne_constraints)
-        drt = self._drt_cache.get(key)
-        if drt is None:
-            drt = build_drt(
-                norb=norb,
-                nelec=nelec_total,
-                twos_target=twos,
-                orbsym=orbsym,
-                wfnsym=wfnsym,
-                ne_constraints=ne_constraints,
-            )
-            self._drt_cache[key] = drt
+        _, drt = _get_or_build_drt_runtime(
+            self._drt_cache,
+            norb=norb,
+            nelec_total=nelec_total,
+            twos=twos,
+            orbsym=orbsym,
+            wfnsym=wfnsym,
+            ne_constraints=ne_constraints,
+        )
         return drt
 
     def _warm_state_summary(self) -> dict[str, Any] | None:
-        state = self._warm_state
-        if state is None:
-            return None
-        return {
-            "format_version": int(state.get("format_version", _WARM_STATE_FORMAT_VERSION)),
-            "norb": int(state["norb"]),
-            "nelec_total": int(state["nelec_total"]),
-            "twos": int(state["twos"]),
-            "nroots": int(state["nroots"]),
-            "ncsf": int(state["ncsf"]),
-            "wfnsym": None if state.get("wfnsym", None) is None else int(state["wfnsym"]),
-            "orbsym": state.get("orbsym", None),
-            "ne_constraints_key": state.get("ne_constraints_key", None),
-            "ci_dtype": str(state.get("ci_dtype", "float64")),
-            "ci_device": str(state.get("ci_device", "cpu")),
-            "has_ci": bool(state.get("ci", None) is not None),
-            "has_mo_coeff": bool(state.get("mo_coeff", None) is not None),
-            "has_mo_occ": bool(state.get("mo_occ", None) is not None),
-            "cas_metadata": state.get("cas_metadata", None),
-        }
+        return _warm_state_summary_runtime(self._warm_state)
 
     def _allowed_ci_devices_for_backend(self, matvec_backend: str) -> tuple[str, ...]:
-        if str(matvec_backend).strip().lower() in _WARM_CUDA_MATVEC_BACKENDS:
-            return ("cpu", "cuda")
-        return ("cpu",)
+        return _allowed_ci_devices_for_backend_runtime(matvec_backend)
 
     def _warm_state_ci0_if_compatible(
         self,
@@ -1345,49 +768,19 @@ class GUGAFCISolver(_StreamObject):
         matvec_backend: str,
         cas_metadata: dict[str, Any],
     ) -> tuple[list[np.ndarray] | None, str]:
-        state = self._warm_state
-        if state is None:
-            return None, "no_warm_state"
-        ci_stored = state.get("ci", None)
-        if ci_stored is None:
-            return None, "warm_state_has_no_ci"
-
-        if int(state.get("norb", -1)) != int(norb):
-            return None, "norb_mismatch"
-        if int(state.get("nelec_total", -1)) != int(nelec_total):
-            return None, "nelec_mismatch"
-        if int(state.get("twos", -1)) != int(twos):
-            return None, "twos_mismatch"
-        if int(state.get("nroots", -1)) != int(nroots):
-            return None, "nroots_mismatch"
-        if int(state.get("ncsf", -1)) != int(ncsf):
-            return None, "ci_size_mismatch"
-        if state.get("wfnsym", None) != (None if wfnsym is None else int(wfnsym)):
-            return None, "wfnsym_mismatch"
-        if state.get("orbsym", None) != _orbsym_to_tuple(orbsym):
-            return None, "orbsym_mismatch"
-        if state.get("ne_constraints_key", None) != _ne_constraints_to_key(ne_constraints):
-            return None, "constraints_mismatch"
-        if state.get("cas_metadata", None) != cas_metadata:
-            return None, "cas_metadata_mismatch"
-
-        ci_dtype = str(state.get("ci_dtype", "float64")).strip().lower()
-        if ci_dtype not in ("float64", "f8"):
-            return None, "ci_dtype_mismatch"
-        ci_device = str(state.get("ci_device", "cpu")).strip().lower()
-        if ci_device not in self._allowed_ci_devices_for_backend(matvec_backend):
-            return None, "ci_device_mismatch"
-
-        ci_arr = np.asarray(ci_stored)
-        if ci_arr.ndim != 2:
-            return None, "ci_rank_mismatch"
-        if ci_arr.shape != (int(nroots), int(ncsf)):
-            return None, "ci_shape_mismatch"
-        if np.asarray(ci_arr).dtype != np.float64:
-            return None, "ci_array_dtype_mismatch"
-
-        ci_out = [np.ascontiguousarray(ci_arr[i], dtype=np.float64) for i in range(int(nroots))]
-        return ci_out, "applied"
+        return _warm_state_ci0_if_compatible_runtime(
+            state=self._warm_state,
+            norb=int(norb),
+            nelec_total=int(nelec_total),
+            twos=int(twos),
+            nroots=int(nroots),
+            ncsf=int(ncsf),
+            orbsym_key=_orbsym_to_tuple(orbsym),
+            wfnsym=None if wfnsym is None else int(wfnsym),
+            ne_constraints_key=_ne_constraints_to_key(ne_constraints),
+            matvec_backend=matvec_backend,
+            cas_metadata=cas_metadata,
+        )
 
     def _update_warm_state(
         self,
@@ -1405,36 +798,22 @@ class GUGAFCISolver(_StreamObject):
         mo_coeff: Any | None,
         mo_occ: Any | None,
     ) -> None:
-        ci_rows = _normalize_ci0(ci, nroots=int(nroots), ncsf=int(ncsf))
-        ci_mat = np.ascontiguousarray(np.vstack(ci_rows), dtype=np.float64)
-
-        prev = self._warm_state if self._warm_state is not None else {}
-        if mo_coeff is None:
-            mo_coeff_arr = prev.get("mo_coeff", None)
-        else:
-            mo_coeff_arr = np.ascontiguousarray(np.asarray(mo_coeff, dtype=np.float64))
-        if mo_occ is None:
-            mo_occ_arr = prev.get("mo_occ", None)
-        else:
-            mo_occ_arr = np.ascontiguousarray(np.asarray(mo_occ))
-
-        self._warm_state = {
-            "format_version": int(_WARM_STATE_FORMAT_VERSION),
-            "norb": int(norb),
-            "nelec_total": int(nelec_total),
-            "twos": int(twos),
-            "nroots": int(nroots),
-            "ncsf": int(ncsf),
-            "wfnsym": None if wfnsym is None else int(wfnsym),
-            "orbsym": _orbsym_to_tuple(orbsym),
-            "ne_constraints_key": _ne_constraints_to_key(ne_constraints),
-            "ci_dtype": "float64",
-            "ci_device": "cpu",
-            "ci": ci_mat,
-            "mo_coeff": mo_coeff_arr,
-            "mo_occ": mo_occ_arr,
-            "cas_metadata": dict(cas_metadata),
-        }
+        self._warm_state = _update_warm_state_runtime(
+            prev_state=self._warm_state,
+            normalize_ci0_fn=_normalize_ci0,
+            ci=ci,
+            norb=int(norb),
+            nelec_total=int(nelec_total),
+            twos=int(twos),
+            nroots=int(nroots),
+            ncsf=int(ncsf),
+            orbsym_key=_orbsym_to_tuple(orbsym),
+            wfnsym=None if wfnsym is None else int(wfnsym),
+            ne_constraints_key=_ne_constraints_to_key(ne_constraints),
+            cas_metadata=cas_metadata,
+            mo_coeff=mo_coeff,
+            mo_occ=mo_occ,
+        )
 
     def save_warm_state(
         self,
@@ -1443,48 +822,12 @@ class GUGAFCISolver(_StreamObject):
         include_ci: bool = True,
         include_mo: bool = True,
     ) -> str:
-        state = self._warm_state
-        if state is None:
-            raise ValueError("no warm state is attached to this solver")
-
-        payload: dict[str, Any] = {}
-        meta = {
-            "format_version": int(state.get("format_version", _WARM_STATE_FORMAT_VERSION)),
-            "norb": int(state["norb"]),
-            "nelec_total": int(state["nelec_total"]),
-            "twos": int(state["twos"]),
-            "nroots": int(state["nroots"]),
-            "ncsf": int(state["ncsf"]),
-            "wfnsym": None if state.get("wfnsym", None) is None else int(state["wfnsym"]),
-            "orbsym": None if state.get("orbsym", None) is None else list(state["orbsym"]),
-            "ne_constraints_key": (
-                None
-                if state.get("ne_constraints_key", None) is None
-                else [list(x) for x in state["ne_constraints_key"]]
-            ),
-            "ci_dtype": str(state.get("ci_dtype", "float64")),
-            "ci_device": str(state.get("ci_device", "cpu")),
-            "cas_metadata": _warm_cas_metadata_to_jsonable(state.get("cas_metadata", None)),
-        }
-        payload["meta_json"] = np.asarray(
-            json.dumps(meta, sort_keys=True, separators=(",", ":")),
-            dtype=np.str_,
+        return _save_warm_state_runtime(
+            path,
+            state=self._warm_state,
+            include_ci=bool(include_ci),
+            include_mo=bool(include_mo),
         )
-
-        if bool(include_ci) and state.get("ci", None) is not None:
-            payload["ci"] = np.ascontiguousarray(np.asarray(state["ci"], dtype=np.float64))
-        if bool(include_mo) and state.get("mo_coeff", None) is not None:
-            payload["mo_coeff"] = np.ascontiguousarray(np.asarray(state["mo_coeff"], dtype=np.float64))
-        if bool(include_mo) and state.get("mo_occ", None) is not None:
-            payload["mo_occ"] = np.ascontiguousarray(np.asarray(state["mo_occ"]))
-
-        path_str = os.fspath(path)
-        outdir = os.path.dirname(path_str)
-        if outdir:
-            os.makedirs(outdir, exist_ok=True)
-        with open(path_str, "wb") as fobj:
-            np.savez_compressed(fobj, **payload)
-        return path_str
 
     def load_warm_state(
         self,
@@ -1492,80 +835,7 @@ class GUGAFCISolver(_StreamObject):
         *,
         require_ci: bool = False,
     ) -> dict[str, Any]:
-        path_str = os.fspath(path)
-        with np.load(path_str, allow_pickle=False) as data:
-            if "meta_json" not in data:
-                raise ValueError("warm state file is missing 'meta_json'")
-
-            meta_raw = json.loads(str(np.asarray(data["meta_json"]).item()))
-            if not isinstance(meta_raw, dict):
-                raise ValueError("warm state metadata must decode to a dictionary")
-
-            fmt_ver = int(meta_raw.get("format_version", -1))
-            if fmt_ver != int(_WARM_STATE_FORMAT_VERSION):
-                raise ValueError(
-                    f"unsupported warm-state format version {fmt_ver}; expected {_WARM_STATE_FORMAT_VERSION}"
-                )
-
-            ne_constraints_key = meta_raw.get("ne_constraints_key", None)
-            ne_constraints_norm: tuple[tuple[int, int, int], ...] | None = None
-            if ne_constraints_key is not None:
-                items: list[tuple[int, int, int]] = []
-                for x in ne_constraints_key:
-                    if len(x) != 3:
-                        raise ValueError("invalid warm state ne_constraints_key entry")
-                    items.append((int(x[0]), int(x[1]), int(x[2])))
-                ne_constraints_norm = tuple(items)
-
-            ci_data = None
-            if "ci" in data:
-                ci_arr = np.asarray(data["ci"])
-                if ci_arr.ndim != 2:
-                    raise ValueError("warm state 'ci' must be a 2D array")
-                if ci_arr.dtype != np.float64:
-                    raise ValueError("warm state currently supports only float64 CI vectors")
-                ci_data = np.ascontiguousarray(ci_arr, dtype=np.float64)
-            if require_ci and ci_data is None:
-                raise ValueError("warm state file does not contain CI data")
-
-            state = {
-                "format_version": int(fmt_ver),
-                "norb": int(meta_raw["norb"]),
-                "nelec_total": int(meta_raw["nelec_total"]),
-                "twos": int(meta_raw["twos"]),
-                "nroots": int(meta_raw["nroots"]),
-                "ncsf": int(meta_raw["ncsf"]),
-                "wfnsym": None if meta_raw.get("wfnsym", None) is None else int(meta_raw["wfnsym"]),
-                "orbsym": (
-                    None
-                    if meta_raw.get("orbsym", None) is None
-                    else tuple(int(x) for x in np.asarray(meta_raw["orbsym"], dtype=np.int64).ravel().tolist())
-                ),
-                "ne_constraints_key": ne_constraints_norm,
-                "ci_dtype": str(meta_raw.get("ci_dtype", "float64")).strip().lower(),
-                "ci_device": str(meta_raw.get("ci_device", "cpu")).strip().lower(),
-                "ci": ci_data,
-                "mo_coeff": (
-                    None
-                    if "mo_coeff" not in data
-                    else np.ascontiguousarray(np.asarray(data["mo_coeff"], dtype=np.float64))
-                ),
-                "mo_occ": None if "mo_occ" not in data else np.ascontiguousarray(np.asarray(data["mo_occ"])),
-                "cas_metadata": _warm_cas_metadata_from_jsonable(meta_raw.get("cas_metadata", None)),
-            }
-            if state["ci_dtype"] not in ("float64", "f8"):
-                raise ValueError(f"unsupported warm state ci_dtype={state['ci_dtype']!r}; expected float64")
-            if state["ci_device"] not in ("cpu", "cuda"):
-                raise ValueError(f"unsupported warm state ci_device={state['ci_device']!r}; expected cpu/cuda")
-
-        if state["ci"] is not None:
-            ci_shape = tuple(np.asarray(state["ci"]).shape)
-            if ci_shape != (int(state["nroots"]), int(state["ncsf"])):
-                raise ValueError(
-                    f"warm state CI shape mismatch: {ci_shape} vs ({state['nroots']}, {state['ncsf']})"
-                )
-
-        self._warm_state = state
+        self._warm_state = _load_warm_state_runtime(path, require_ci=bool(require_ci))
         self._last_warm_start_info = None
         summary = self._warm_state_summary()
         assert summary is not None
@@ -1890,88 +1160,27 @@ class GUGAFCISolver(_StreamObject):
             ne_constraints=ne_constraints,
         )
         ncsf = int(drt.ncsf)
-        if matvec_backend in ("cuda_eri_mat", "cuda", "cuda_fixed_ell", "cuda_ell", "cuda_fixed_sell", "cuda_sell"):
-            if strict_gpu and matvec_cuda_davidson_subspace_eigh_cpu_in is True:
-                raise ValueError("strict_gpu=True is incompatible with matvec_cuda_davidson_subspace_eigh_cpu=True")
-            if strict_gpu:
-                matvec_cuda_davidson_subspace_eigh_cpu = False
-            elif matvec_cuda_davidson_subspace_eigh_cpu_in is None:
-                matvec_cuda_davidson_subspace_eigh_cpu = bool(
-                    int(ncsf) <= int(matvec_cuda_davidson_subspace_eigh_cpu_ncsf_cutoff)
-                )
-            else:
-                matvec_cuda_davidson_subspace_eigh_cpu = bool(matvec_cuda_davidson_subspace_eigh_cpu_in)
-            matvec_cuda_make_hdiag_cpu_in = kwargs.pop(
-                "matvec_cuda_make_hdiag_cpu",
-                getattr(self, "matvec_cuda_make_hdiag_cpu", None),
-            )
-            matvec_cuda_make_hdiag_cpu_ncsf_cutoff = int(
-                kwargs.pop(
-                    "matvec_cuda_make_hdiag_cpu_ncsf_cutoff",
-                    getattr(self, "matvec_cuda_make_hdiag_cpu_ncsf_cutoff", 10_000),
-                )
-            )
-            if matvec_cuda_make_hdiag_cpu_ncsf_cutoff < 0:
-                matvec_cuda_make_hdiag_cpu_ncsf_cutoff = 0
-            if strict_gpu and matvec_cuda_make_hdiag_cpu_in is True:
-                raise ValueError("strict_gpu=True is incompatible with matvec_cuda_make_hdiag_cpu=True")
-            if strict_gpu:
-                matvec_cuda_make_hdiag_cpu = False
-            elif matvec_cuda_make_hdiag_cpu_in is None:
-                matvec_cuda_make_hdiag_cpu = bool(int(ncsf) <= int(matvec_cuda_make_hdiag_cpu_ncsf_cutoff))
-            else:
-                matvec_cuda_make_hdiag_cpu = bool(matvec_cuda_make_hdiag_cpu_in)
-            matvec_cuda_dtype_in = str(
-                kwargs.pop("matvec_cuda_dtype", getattr(self, "matvec_cuda_dtype", "float64"))
-            ).strip().lower()
-            if matvec_cuda_dtype_in in ("float64", "fp64", "f64", "double"):
-                matvec_cuda_dtype = "float64"
-            elif matvec_cuda_dtype_in in ("float32", "fp32", "f32", "single"):
-                matvec_cuda_dtype = "float32"
-            elif matvec_cuda_dtype_in in ("mixed", "mixed_fp32", "float32_mixed"):
-                matvec_cuda_dtype = "mixed"
-            else:
-                raise ValueError("matvec_cuda_dtype must be one of: float64, float32, mixed")
-            mixed_thr_in = kwargs.pop(
-                "matvec_cuda_mixed_threshold",
-                getattr(self, "matvec_cuda_mixed_threshold", 1e-5),
-            )
-            mixed_force_final_full_in = kwargs.pop(
-                "matvec_cuda_mixed_force_final_full_hop",
-                getattr(self, "matvec_cuda_mixed_force_final_full_hop", True),
-            )
-            mixed_final_full_subspace_refresh_in = kwargs.pop(
-                "matvec_cuda_mixed_final_full_subspace_refresh",
-                getattr(self, "matvec_cuda_mixed_final_full_subspace_refresh", False),
-            )
-            mixed_low_max_iter_in = kwargs.pop(
-                "matvec_cuda_mixed_low_precision_max_iter",
-                getattr(self, "matvec_cuda_mixed_low_precision_max_iter", 2),
-            )
-            matvec_cuda_mixed_threshold = None if mixed_thr_in is None else float(mixed_thr_in)
-            matvec_cuda_mixed_force_final_full_hop = bool(mixed_force_final_full_in)
-            matvec_cuda_mixed_final_full_subspace_refresh = bool(mixed_final_full_subspace_refresh_in)
-            if mixed_low_max_iter_in is None:
-                matvec_cuda_mixed_low_precision_max_iter = None
-            else:
-                mixed_low_max_iter_i = int(mixed_low_max_iter_in)
-                matvec_cuda_mixed_low_precision_max_iter = (
-                    None if mixed_low_max_iter_i <= 0 else int(mixed_low_max_iter_i)
-                )
-            if matvec_cuda_dtype == "mixed":
-                if matvec_cuda_mixed_threshold is None:
-                    matvec_cuda_mixed_threshold = 1e-5
-                if float(matvec_cuda_mixed_threshold) <= 0.0:
-                    raise ValueError("matvec_cuda_mixed_threshold must be > 0 for matvec_cuda_dtype='mixed'")
-        else:
-            matvec_cuda_davidson_subspace_eigh_cpu = None
-            matvec_cuda_make_hdiag_cpu = None
-            matvec_cuda_make_hdiag_cpu_ncsf_cutoff = None
-            matvec_cuda_dtype = "float64"
-            matvec_cuda_mixed_threshold = None
-            matvec_cuda_mixed_force_final_full_hop = False
-            matvec_cuda_mixed_final_full_subspace_refresh = False
-            matvec_cuda_mixed_low_precision_max_iter = None
+        _cuda_mode_cfg = _resolve_kernel_cuda_execution_mode_runtime(
+            kwargs=kwargs,
+            defaults=self,
+            matvec_backend=matvec_backend,
+            strict_gpu=bool(strict_gpu),
+            ncsf=int(ncsf),
+            matvec_cuda_davidson_subspace_eigh_cpu_in=matvec_cuda_davidson_subspace_eigh_cpu_in,
+            matvec_cuda_davidson_subspace_eigh_cpu_ncsf_cutoff=int(
+                matvec_cuda_davidson_subspace_eigh_cpu_ncsf_cutoff
+            ),
+        )
+        matvec_cuda_davidson_subspace_eigh_cpu = _cuda_mode_cfg["matvec_cuda_davidson_subspace_eigh_cpu"]
+        matvec_cuda_make_hdiag_cpu = _cuda_mode_cfg["matvec_cuda_make_hdiag_cpu"]
+        matvec_cuda_make_hdiag_cpu_ncsf_cutoff = _cuda_mode_cfg["matvec_cuda_make_hdiag_cpu_ncsf_cutoff"]
+        matvec_cuda_dtype = _cuda_mode_cfg["matvec_cuda_dtype"]
+        matvec_cuda_mixed_threshold = _cuda_mode_cfg["matvec_cuda_mixed_threshold"]
+        matvec_cuda_mixed_force_final_full_hop = _cuda_mode_cfg["matvec_cuda_mixed_force_final_full_hop"]
+        matvec_cuda_mixed_final_full_subspace_refresh = _cuda_mode_cfg[
+            "matvec_cuda_mixed_final_full_subspace_refresh"
+        ]
+        matvec_cuda_mixed_low_precision_max_iter = _cuda_mode_cfg["matvec_cuda_mixed_low_precision_max_iter"]
 
         if matvec_backend in ("cuda_eri_mat", "cuda"):
             matvec_cuda_use_epq_preview_in = kwargs.get(
@@ -4304,26 +3513,13 @@ class GUGAFCISolver(_StreamObject):
         kwargs["pspace_size"] = 0
 
         matvec_backend = str(kwargs.get("matvec_backend", getattr(self, "matvec_backend", "contract"))).strip().lower()
-        if matvec_backend in ("cuda_eri_mat", "cuda"):
-            matvec_cuda_aggregate_offdiag_preview_in = kwargs.get(
-                "matvec_cuda_aggregate_offdiag",
-                getattr(self, "matvec_cuda_aggregate_offdiag", None),
-            )
-            if matvec_cuda_aggregate_offdiag_preview_in is None:
-                matvec_cuda_aggregate_offdiag_preview = True
-            else:
-                matvec_cuda_aggregate_offdiag_preview = bool(matvec_cuda_aggregate_offdiag_preview_in)
-            _enforce_cuda_aggregate_offdiag_guard(
-                bool(matvec_cuda_aggregate_offdiag_preview),
-                context="approx_kernel(cuda)",
-            )
-        approx_cuda_dtype_in = str(kwargs.pop("approx_cuda_dtype", getattr(self, "approx_cuda_dtype", "float32"))).strip().lower()
-        if approx_cuda_dtype_in in ("float64", "fp64", "f64", "double"):
-            approx_cuda_dtype = "float64"
-        elif approx_cuda_dtype_in in ("float32", "fp32", "f32", "single"):
-            approx_cuda_dtype = "float32"
-        else:
-            raise ValueError("approx_cuda_dtype must be one of: float32, float64")
+        _approx_cuda_frontend = _resolve_approx_cuda_frontend_runtime(
+            kwargs=kwargs,
+            defaults=self,
+            matvec_backend=matvec_backend,
+        )
+        approx_cuda_dtype = _approx_cuda_frontend["approx_cuda_dtype"]
+        matvec_cuda_aggregate_offdiag_preview = _approx_cuda_frontend["matvec_cuda_aggregate_offdiag_preview"]
         nroots_i = int(nroots)
         if matvec_backend in ("cuda_eri_mat", "cuda"):
             default_cap_cycle = 2

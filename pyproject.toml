@@ -37,16 +37,41 @@ Repository = "https://github.com/zpengmei/ASUKA"
 Issues = "https://github.com/zpengmei/ASUKA/issues"
 
 [project.optional-dependencies]
-# CUDA packages (cupy, nvidia-* libs) are intentionally omitted here.
-# Install them via conda:
-#   conda install -c conda-forge cupy cudatoolkit
-# pip install -e ".[cuda]" only builds the CUDA C extensions from source.
-cuda = []
+# CUDA 13 runtime wheels.
+cuda = [
+  "cupy-cuda13x",
+  "nvidia-cuda-runtime",
+  "nvidia-cuda-nvrtc",
+  "nvidia-cublas",
+  "nvidia-curand",
+  "nvidia-cusolver",
+]
+# CUDA 12 runtime wheels.
+cuda12 = [
+  "cupy-cuda12x",
+  "nvidia-cuda-runtime-cu12",
+  "nvidia-cuda-nvrtc-cu12",
+  "nvidia-cublas-cu12",
+  "nvidia-curand-cu12",
+  "nvidia-cusolver-cu12",
+  "nvidia-cusparse-cu12",
+  "nvidia-nvjitlink-cu12",
+]
+test = [
+  "pytest",
+  "pyscf",
+]
 build = [
   "cmake",
   "ninja",
   "pybind11",
 ]
+
+[project.scripts]
+asuka-doctor = "asuka.cli.doctor:main"
+asuka-kernel-report = "asuka.cli.kernels:main"
+asuka-cuda-audit = "asuka.cli.cuda_audit:main"
+
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["asuka", "asuka.*"]

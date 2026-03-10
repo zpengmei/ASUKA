@@ -24,6 +24,7 @@ Usage::
 """
 
 import time
+import os
 from dataclasses import dataclass
 from typing import Any
 
@@ -90,6 +91,8 @@ class DirectJKContext:
     ntasks: int
     eps_schwarz: float
     threads: int
+    eval_threads: int
+    contract_threads: int
     max_tile_bytes: int
     gpu_task_budget_bytes_used: int
     max_slab_tasks_used: int
@@ -466,6 +469,85 @@ def make_direct_jk_context(
     from asuka.cueri.eri_dispatch import resolve_kernel_class_id  # noqa: PLC0415
     from asuka.cueri.tasks import decode_eri_class_id  # noqa: PLC0415
 
+    def _env_int_or_none(name: str) -> int | None:
+        v = os.environ.get(str(name), None)
+        if v is None:
+            return None
+        s = str(v).strip()
+        if not s:
+            return None
+        try:
+            return int(s)
+        except Exception:
+            return None
+
+    def _env_flag(name: str, default: bool = False) -> bool:
+        v = os.environ.get(str(name), None)
+        if v is None:
+            return bool(default)
+        s = str(v).strip().lower()
+        if s in ("1", "true", "yes", "on"):
+            return True
+        if s in ("0", "false", "no", "off"):
+            return False
+        return bool(default)
+
+    def _sanitize_threads(v: int, fallback: int) -> int:
+        try:
+            x = int(v)
+        except Exception:
+            x = int(fallback)
+        x = max(32, min(1024, int(x)))
+        x = int(x // 32) * 32
+        if x <= 0:
+            x = int(fallback)
+        return max(32, min(1024, int(x)))
+
+    large_workload = bool(int(ntasks) >= 1_000_000)
+
+    # Kernel launch geometry knobs:
+    # - eval threads for ERI class kernels
+    # - contract threads for dense scatter/contract kernels
+    # For large screened workloads, 128-thread eval/contract launch geometry is
+    # typically better than inheriting a larger generic block size.
+    # Keep an env override for reproducibility and local tuning.
+    auto_threads = _env_flag("ASUKA_DIRECT_JK_THREADS_AUTO", default=True)
+    eval_threads_env = _env_int_or_none("ASUKA_DIRECT_JK_EVAL_THREADS")
+    contract_threads_env = _env_int_or_none("ASUKA_DIRECT_JK_CONTRACT_THREADS")
+    if eval_threads_env is None:
+        eval_threads = _sanitize_threads(
+            min(int(threads), 128) if (auto_threads and large_workload) else int(threads),
+            int(threads),
+        )
+    else:
+        eval_threads = _sanitize_threads(int(eval_threads_env), int(threads))
+    if contract_threads_env is None:
+        contract_threads = _sanitize_threads(
+            min(int(threads), 128) if (auto_threads and large_workload) else int(threads),
+            int(threads),
+        )
+    else:
+        contract_threads = _sanitize_threads(int(contract_threads_env), int(threads))
+
+    # Warp kernels are beneficial for some tiny cases but can be slower on
+    # large resident task sets due to reduced per-block work / launch shape.
+    # Keep behavior tunable and use a workload-aware default.
+    warp_eri_ncomp_max_env = _env_int_or_none("ASUKA_DIRECT_JK_WARP_ERI_NCOMP_MAX")
+    warp_contract_ncomp_max_env = _env_int_or_none("ASUKA_DIRECT_JK_WARP_CONTRACT_NCOMP_MAX")
+    if warp_eri_ncomp_max_env is None:
+        if large_workload and int(max_l) <= 2:
+            warp_eri_ncomp_max = 108
+        elif large_workload:
+            warp_eri_ncomp_max = 0
+        else:
+            warp_eri_ncomp_max = 128
+    else:
+        warp_eri_ncomp_max = max(0, int(warp_eri_ncomp_max_env))
+    if warp_contract_ncomp_max_env is None:
+        warp_contract_ncomp_max = 0 if large_workload else 128
+    else:
+        warp_contract_ncomp_max = max(0, int(warp_contract_ncomp_max_env))
+
     plans: list[tuple[_DirectJKGroupPlan, ...]] = []
     for slab in slabs:
         slab_plans: list[_DirectJKGroupPlan] = []
@@ -481,7 +563,8 @@ def make_direct_jk_context(
             nD = int(ncart(int(ld)))
             ncomp = int(nA * nB * nC * nD)
             chunk_ntasks = int(max(1, int(max_tile_bytes) // max(int(ncomp) * 8, 1)))
-            use_warp = bool(ncomp <= 128)
+            use_warp_eri = bool(ncomp <= int(warp_eri_ncomp_max))
+            use_warp_contract = bool(ncomp <= int(warp_contract_ncomp_max))
             slab_plans.append(
                 _DirectJKGroupPlan(
                     orig_cid=int(orig_cid),
@@ -495,8 +578,8 @@ def make_direct_jk_context(
                     nD=int(nD),
                     ncomp=int(ncomp),
                     chunk_ntasks=int(chunk_ntasks),
-                    use_warp_eri=bool(use_warp),
-                    use_warp_contract=bool(use_warp),
+                    use_warp_eri=bool(use_warp_eri),
+                    use_warp_contract=bool(use_warp_contract),
                 )
             )
         plans.append(tuple(slab_plans))
@@ -519,6 +602,8 @@ def make_direct_jk_context(
         ntasks=int(ntasks),
         eps_schwarz=float(eps_f),
         threads=int(threads),
+        eval_threads=int(eval_threads),
+        contract_threads=int(contract_threads),
         max_tile_bytes=int(max_tile_bytes),
         gpu_task_budget_bytes_used=int(gpu_task_budget_bytes_i),
         max_slab_tasks_used=int(max_slab_tasks_i),
@@ -570,7 +655,9 @@ def direct_JK(
     from asuka.cueri.tasks import TaskList  # noqa: PLC0415
 
     nao = ctx.nao
-    threads = ctx.threads
+    base_threads = int(ctx.threads)
+    eval_threads = int(getattr(ctx, "eval_threads", base_threads))
+    contract_threads = int(getattr(ctx, "contract_threads", base_threads))
 
     D_gpu = cp.asarray(D, dtype=cp.float64)
     if D_gpu.ndim != 2 or D_gpu.shape != (nao, nao):
@@ -585,6 +672,37 @@ def direct_JK(
     ws = _get_direct_jk_workspace(cp, ctx)
     n_kernel_calls = 0
     t0 = time.perf_counter()
+    hot_s1_env = str(os.environ.get("ASUKA_DENSE_CONTRACT_HOT_S1", "") or "").strip().lower()
+    hot_s1_contract_enabled = hot_s1_env not in {"0", "false", "off", "no"}
+    eri_block_pref_env = str(os.environ.get("ASUKA_DIRECT_JK_ERI_BLOCK_MODE", "") or "").strip().lower()
+    if eri_block_pref_env:
+        eri_block_pref = eri_block_pref_env in {"1", "true", "on", "yes"}
+    else:
+        eri_block_pref = False
+    fused_supported = {
+        "ssss", "psss", "dsss", "ppss", "psps", "ppps",
+        "ddss", "ssdp", "psds", "psdp", "psdd", "ppds", "dsds", "dsdp",
+    }
+    fused_enabled: set[str] = {"ssss"}
+    fused_flag = str(os.environ.get("ASUKA_DIRECT_JK_FUSED", "") or "").strip().lower()
+    if fused_flag in ("1", "true", "on", "yes"):
+        fused_enabled = set(fused_supported)
+    elif fused_flag in ("0", "false", "off", "no"):
+        fused_enabled = set()
+    fused_only = str(os.environ.get("ASUKA_DIRECT_JK_FUSED_ONLY", "") or "").strip()
+    if fused_only:
+        fused_enabled = {x.strip().lower() for x in fused_only.replace(" ", ",").split(",") if x.strip()}
+    fused_disable = str(os.environ.get("ASUKA_DIRECT_JK_FUSED_DISABLE", "") or "").strip()
+    if fused_disable:
+        fused_enabled -= {x.strip().lower() for x in fused_disable.replace(" ", ",").split(",") if x.strip()}
+    fused_enable = str(os.environ.get("ASUKA_DIRECT_JK_FUSED_ENABLE", "") or "").strip()
+    if fused_enable:
+        fused_enabled |= {x.strip().lower() for x in fused_enable.replace(" ", ",").split(",") if x.strip()}
+    fused_enabled &= fused_supported
+
+    sp_pair_start_fused = ctx.dsp.sp_pair_start
+    if int(getattr(sp_pair_start_fused, "shape", (0,))[0]) == int(getattr(ctx.dsp.sp_npair, "shape", (0,))[0]) + 1:
+        sp_pair_start_fused = sp_pair_start_fused[:-1]
 
     if stats is not None:
         stats["direct_jk_ntasks"] = int(ctx.ntasks)
@@ -594,6 +712,7 @@ def direct_JK(
         stats.setdefault("n_eval_calls", 0)
         stats.setdefault("n_contract_calls", 0)
         stats.setdefault("n_fused_calls", 0)
+        stats.setdefault("fused_ntasks", 0)
         stats.setdefault("classes", {})
 
     buf_slab: list[int | None] = [None, None]
@@ -728,29 +847,41 @@ def direct_JK(
             kernel_spCD_full = ab_dev[j0:j1] if transpose else cd_dev[j0:j1]
 
             class_ntasks = j1 - j0
+            klabel = _class_label(kernel_cid).lower()
+            fused_fn = None
+            use_fused = False
+            if klabel in fused_enabled:
+                if klabel == "ssss":
+                    fused_fn = getattr(_ext, "fused_jk_ssss_inplace_device", None)
+                else:
+                    fused_fn = getattr(_ext, f"fused_jk_{klabel}_inplace_device", None)
+                use_fused = fused_fn is not None
             if stats is not None:
                 cls = _class_label(orig_cid)
                 row = stats.setdefault("classes", {}).setdefault(cls, {"ntasks": 0, "chunks": 0, "path": ""})
                 row["ntasks"] = int(row.get("ntasks", 0)) + int(class_ntasks)
-                row["chunks"] = int(row.get("chunks", 0)) + int((class_ntasks + chunk_ntasks - 1) // chunk_ntasks)
-                path = "fused_ssss" if int(orig_cid) == 0 else "staged"
+                if use_fused:
+                    row["chunks"] = int(row.get("chunks", 0)) + 1
+                else:
+                    row["chunks"] = int(row.get("chunks", 0)) + int((class_ntasks + chunk_ntasks - 1) // chunk_ntasks)
+                hot_s1 = bool(
+                    (int(nB) == 1 and int(nD) == 1)
+                    and (int(nA) in (1, 3, 6))
+                    and (int(nC) in (1, 3, 6))
+                )
+                path = "fused_jk" if use_fused else ("staged_hot_s1" if (hot_s1 and hot_s1_contract_enabled) else "staged")
                 prev = str(row.get("path", "") or "")
                 row["path"] = path if (not prev or prev == path) else "mixed"
 
-            # --- Fused ssss+JK path (D3 partial): skip tile alloc entirely ---
-            if orig_cid == 0:
-                for c0 in range(0, class_ntasks, chunk_ntasks):
-                    c1 = min(class_ntasks, c0 + chunk_ntasks)
-                    if c1 <= c0:
-                        continue
-                    n_kernel_calls += 1
-                    if profile is not None:
-                        _tc0 = cp.cuda.Event()
-                        _tc1 = cp.cuda.Event()
-                        _tc0.record()
-                    _ext.fused_jk_ssss_inplace_device(
-                        kernel_spAB_full[c0:c1],
-                        kernel_spCD_full[c0:c1],
+            if use_fused and fused_fn is not None:
+                if profile is not None:
+                    _tc0 = cp.cuda.Event()
+                    _tc1 = cp.cuda.Event()
+                    _tc0.record()
+                if klabel == "ssss":
+                    fused_fn(
+                        kernel_spAB_full,
+                        kernel_spCD_full,
                         ctx.dsp.sp_pair_start,
                         ctx.dsp.sp_npair,
                         ctx.pair_tables.pair_eta,
@@ -765,20 +896,48 @@ def direct_JK(
                         D_flat,
                         J_flat,
                         K_flat,
-                        int(threads),
+                        int(eval_threads),
                         int(stream_ptr),
                         False,
-                        False,  # fast_boys
+                        False,
                     )
-                    if stats is not None:
-                        stats["n_fused_calls"] = int(stats.get("n_fused_calls", 0)) + 1
-                    if profile is not None:
-                        _tc1.record()
-                        _tc1.synchronize()
-                        profile["contract_ms"] = float(profile.get("contract_ms", 0.0)) + float(
-                            cp.cuda.get_elapsed_time(_tc0, _tc1)
-                        )
-                continue  # fused path handled, skip normal tile path for this class
+                else:
+                    fused_fn(
+                        kernel_spAB_full,
+                        kernel_spCD_full,
+                        ctx.dsp.sp_A,
+                        ctx.dsp.sp_B,
+                        sp_pair_start_fused,
+                        ctx.dsp.sp_npair,
+                        ctx.dbasis.shell_cx,
+                        ctx.dbasis.shell_cy,
+                        ctx.dbasis.shell_cz,
+                        ctx.pair_tables.pair_eta,
+                        ctx.pair_tables.pair_Px,
+                        ctx.pair_tables.pair_Py,
+                        ctx.pair_tables.pair_Pz,
+                        ctx.pair_tables.pair_cK,
+                        ctx.shell_ao_start_dev,
+                        int(nao),
+                        D_flat,
+                        J_flat,
+                        K_flat,
+                        int(eval_threads),
+                        int(stream_ptr),
+                        False,
+                    )
+                n_kernel_calls += 1
+                if stats is not None:
+                    stats["n_fused_calls"] = int(stats.get("n_fused_calls", 0)) + 1
+                    stats["n_eval_calls"] = int(stats.get("n_eval_calls", 0)) + 1
+                    stats["fused_ntasks"] = int(stats.get("fused_ntasks", 0)) + int(class_ntasks)
+                if profile is not None:
+                    _tc1.record()
+                    _tc1.synchronize()
+                    _dt = float(cp.cuda.get_elapsed_time(_tc0, _tc1))
+                    profile["contract_ms"] = float(profile.get("contract_ms", 0.0)) + _dt
+                    profile["fused_jk_ms"] = float(profile.get("fused_jk_ms", 0.0)) + _dt
+                continue
 
             for c0 in range(0, class_ntasks, chunk_ntasks):
                 c1 = min(class_ntasks, c0 + chunk_ntasks)
@@ -801,8 +960,8 @@ def direct_JK(
                     dsp=ctx.dsp,
                     pt=ctx.pair_tables,
                     stream=None,
-                    threads=threads,
-                    mode="warp" if use_warp_mode else "auto",
+                    threads=eval_threads,
+                    mode="warp" if use_warp_mode else ("block" if eri_block_pref else "auto"),
                     profile=profile,
                     skip_transpose=True,
                 )
@@ -841,7 +1000,7 @@ def direct_JK(
                         D_flat,
                         J_flat,
                         K_flat,
-                        int(threads),
+                        int(contract_threads),
                         int(stream_ptr),
                         False,
                     )
@@ -861,7 +1020,7 @@ def direct_JK(
                         D_flat,
                         J_flat,
                         K_flat,
-                        int(threads),
+                        int(contract_threads),
                         int(stream_ptr),
                         False,
                     )
@@ -921,7 +1080,9 @@ def direct_fock_rhf(
     import os  # noqa: PLC0415
 
     nao = ctx.nao
-    threads = ctx.threads
+    base_threads = int(ctx.threads)
+    eval_threads = int(getattr(ctx, "eval_threads", base_threads))
+    contract_threads = int(getattr(ctx, "contract_threads", base_threads))
 
     D_gpu = cp.asarray(D, dtype=cp.float64)
     if D_gpu.ndim != 2 or D_gpu.shape != (nao, nao):
@@ -938,6 +1099,13 @@ def direct_fock_rhf(
     ws = _get_direct_jk_workspace(cp, ctx)
     n_kernel_calls = 0
     t0 = time.perf_counter()
+    hot_s1_env = str(os.environ.get("ASUKA_DENSE_CONTRACT_HOT_S1", "") or "").strip().lower()
+    hot_s1_contract_enabled = hot_s1_env not in {"0", "false", "off", "no"}
+    eri_block_pref_env = str(os.environ.get("ASUKA_DIRECT_JK_ERI_BLOCK_MODE", "") or "").strip().lower()
+    if eri_block_pref_env:
+        eri_block_pref = eri_block_pref_env in {"1", "true", "on", "yes"}
+    else:
+        eri_block_pref = False
 
     if stats is not None:
         stats["direct_jk_ntasks"] = int(ctx.ntasks)
@@ -984,14 +1152,18 @@ def direct_fock_rhf(
     # psss/dsss/ppss/psps/ppps: explicit Boys derivatives (step2.cu)
     # ddss/ssdp/psds/psdp/psdd/ppds/dsds/dsdp: Rys quadrature, converted
     #   from block-per-task to warp-per-task (wave1/wave2 generated files)
-    fused_default = {
+    fused_supported = {
         "ssss", "psss", "dsss", "ppss", "psps", "ppps",
         "ddss", "ssdp", "psds", "psdp", "ppds", "dsds", "dsdp", "psdd",
     }
-    fused_enabled = set(fused_default)
+    # Safety-first default: keep fused direct-Fock kernels opt-in until strict
+    # SCF parity coverage is in place for every fused class.
+    fused_enabled: set[str] = set()
     fused_flag = str(os.environ.get("ASUKA_DIRECT_FOCK_FUSED", "") or "").strip().lower()
-    if fused_flag in ("0", "false", "off", "no"):
-        fused_enabled.clear()
+    if fused_flag in ("1", "true", "on", "yes"):
+        fused_enabled = set(fused_supported)
+    elif fused_flag in ("0", "false", "off", "no"):
+        fused_enabled = set()
     fused_only = str(os.environ.get("ASUKA_DIRECT_FOCK_FUSED_ONLY", "") or "").strip()
     if fused_only:
         fused_enabled = {x.strip().lower() for x in fused_only.replace(" ", ",").split(",") if x.strip()}
@@ -1001,6 +1173,7 @@ def direct_fock_rhf(
     fused_enable = str(os.environ.get("ASUKA_DIRECT_FOCK_FUSED_ENABLE", "") or "").strip()
     if fused_enable:
         fused_enabled |= {x.strip().lower() for x in fused_enable.replace(" ", ",").split(",") if x.strip()}
+    fused_enabled &= fused_supported
 
     def _enqueue_upload(slab_idx: int, buf_idx: int) -> None:
         assert ws is not None
@@ -1125,7 +1298,12 @@ def direct_fock_rhf(
                     row["chunks"] = int(row.get("chunks", 0)) + 1
                 else:
                     row["chunks"] = int(row.get("chunks", 0)) + int((class_ntasks + chunk_ntasks - 1) // chunk_ntasks)
-                path = "fock_fused" if use_fused else "fock_staged"
+                hot_s1 = bool(
+                    (int(nB) == 1 and int(nD) == 1)
+                    and (int(nA) in (1, 3, 6))
+                    and (int(nC) in (1, 3, 6))
+                )
+                path = "fock_fused" if use_fused else ("fock_staged_hot_s1" if (hot_s1 and hot_s1_contract_enabled) else "fock_staged")
                 prev = str(row.get("path", "") or "")
                 row["path"] = path if (not prev or prev == path) else "mixed"
 
@@ -1150,7 +1328,7 @@ def direct_fock_rhf(
                     int(nao),
                     D_flat,
                     F_flat,
-                    int(threads),
+                    int(eval_threads),
                     int(stream_ptr),
                     False,
                 )
@@ -1182,8 +1360,8 @@ def direct_fock_rhf(
                     dsp=ctx.dsp,
                     pt=ctx.pair_tables,
                     stream=None,
-                    threads=threads,
-                    mode="warp" if use_warp_mode else "auto",
+                    threads=eval_threads,
+                    mode="warp" if use_warp_mode else ("block" if eri_block_pref else "auto"),
                     profile=profile,
                     skip_transpose=True,
                 )
@@ -1217,7 +1395,7 @@ def direct_fock_rhf(
                         tiles.ravel(),
                         D_flat,
                         F_flat,
-                        int(threads),
+                        int(contract_threads),
                         int(stream_ptr),
                         False,
                     )
@@ -1236,7 +1414,7 @@ def direct_fock_rhf(
                         tiles.ravel(),
                         D_flat,
                         F_flat,
-                        int(threads),
+                        int(contract_threads),
                         int(stream_ptr),
                         False,
                     )
@@ -1307,7 +1485,9 @@ def direct_JK_multi(
     from asuka.cueri.tasks import TaskList  # noqa: PLC0415
 
     nao = ctx.nao
-    threads = ctx.threads
+    base_threads = int(ctx.threads)
+    eval_threads = int(getattr(ctx, "eval_threads", base_threads))
+    contract_threads = int(getattr(ctx, "contract_threads", base_threads))
 
     Da_gpu = cp.asarray(Da, dtype=cp.float64)
     if Da_gpu.ndim != 2 or Da_gpu.shape != (nao, nao):
@@ -1330,6 +1510,13 @@ def direct_JK_multi(
     ws = _get_direct_jk_workspace(cp, ctx)
     n_kernel_calls = 0
     t0 = time.perf_counter()
+    hot_s1_env = str(os.environ.get("ASUKA_DENSE_CONTRACT_HOT_S1", "") or "").strip().lower()
+    hot_s1_contract_enabled = hot_s1_env not in {"0", "false", "off", "no"}
+    eri_block_pref_env = str(os.environ.get("ASUKA_DIRECT_JK_ERI_BLOCK_MODE", "") or "").strip().lower()
+    if eri_block_pref_env:
+        eri_block_pref = eri_block_pref_env in {"1", "true", "on", "yes"}
+    else:
+        eri_block_pref = False
 
     if stats is not None:
         stats["direct_jk_ntasks"] = int(ctx.ntasks)
@@ -1478,7 +1665,12 @@ def direct_JK_multi(
                 row = stats.setdefault("classes", {}).setdefault(cls, {"ntasks": 0, "chunks": 0, "path": ""})
                 row["ntasks"] = int(row.get("ntasks", 0)) + int(class_ntasks)
                 row["chunks"] = int(row.get("chunks", 0)) + int((class_ntasks + chunk_ntasks - 1) // chunk_ntasks)
-                path = "staged"
+                hot_s1 = bool(
+                    (int(nB) == 1 and int(nD) == 1)
+                    and (int(nA) in (1, 3, 6))
+                    and (int(nC) in (1, 3, 6))
+                )
+                path = "staged_hot_s1_multi2" if (hot_s1 and hot_s1_contract_enabled) else "staged"
                 prev = str(row.get("path", "") or "")
                 row["path"] = path if (not prev or prev == path) else "mixed"
 
@@ -1503,8 +1695,8 @@ def direct_JK_multi(
                     dsp=ctx.dsp,
                     pt=ctx.pair_tables,
                     stream=None,
-                    threads=threads,
-                    mode="warp" if use_warp_mode else "auto",
+                    threads=eval_threads,
+                    mode="warp" if use_warp_mode else ("block" if eri_block_pref else "auto"),
                     profile=profile,
                     skip_transpose=True,
                 )
@@ -1542,7 +1734,7 @@ def direct_JK_multi(
                         Ka_flat,
                         Jb_flat,
                         Kb_flat,
-                        int(threads),
+                        int(contract_threads),
                         int(stream_ptr),
                         False,
                     )
@@ -1565,7 +1757,7 @@ def direct_JK_multi(
                         Ka_flat,
                         Jb_flat,
                         Kb_flat,
-                        int(threads),
+                        int(contract_threads),
                         int(stream_ptr),
                         False,
                     )

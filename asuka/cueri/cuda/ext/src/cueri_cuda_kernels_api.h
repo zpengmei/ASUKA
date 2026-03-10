@@ -5,6 +5,78 @@
 
 #include <cstdint>
 
+inline int cueri_normalize_warp_launch_threads(int threads, int default_threads) {
+    int launch_threads = (threads > 0) ? threads : default_threads;
+    if (launch_threads > 1024) launch_threads = 1024;
+    if (launch_threads < 32) launch_threads = 32;
+    launch_threads = (launch_threads / 32) * 32;
+    if (launch_threads < 32) launch_threads = 32;
+    return launch_threads;
+}
+
+template <typename KernelFn>
+inline cudaError_t cueri_prepare_fused_fock_warp_launch(
+    KernelFn kernel,
+    int threads,
+    int default_threads,
+    int ntasks,
+    size_t warp_doubles,
+    int* launch_threads_out,
+    int* blocks_out,
+    size_t* shmem_out) {
+    if (ntasks < 0 || launch_threads_out == nullptr || blocks_out == nullptr || shmem_out == nullptr) {
+        return cudaErrorInvalidValue;
+    }
+    if (ntasks == 0) {
+        *launch_threads_out = 0;
+        *blocks_out = 0;
+        *shmem_out = 0;
+        return cudaSuccess;
+    }
+    const size_t bytes_per_warp = warp_doubles * sizeof(double);
+    if (bytes_per_warp == 0) return cudaErrorInvalidValue;
+
+    int dev = 0;
+    cudaError_t err = cudaGetDevice(&dev);
+    if (err != cudaSuccess) return err;
+
+    int smem_default = 0;
+    err = cudaDeviceGetAttribute(&smem_default, cudaDevAttrMaxSharedMemoryPerBlock, dev);
+    if (err != cudaSuccess) return err;
+
+    int smem_optin = 0;
+    err = cudaDeviceGetAttribute(&smem_optin, cudaDevAttrMaxSharedMemoryPerBlockOptin, dev);
+    if (err != cudaSuccess || smem_optin <= 0) smem_optin = smem_default;
+
+    for (int launch_threads = cueri_normalize_warp_launch_threads(threads, default_threads);
+         launch_threads >= 32;
+         launch_threads -= 32) {
+        const int warps_per_block = launch_threads >> 5;
+        if (warps_per_block <= 0) continue;
+        const size_t shmem = static_cast<size_t>(warps_per_block) * bytes_per_warp;
+        if (shmem > static_cast<size_t>(smem_optin)) continue;
+
+        if (shmem > static_cast<size_t>(smem_default)) {
+            err = cudaFuncSetAttribute(
+                kernel,
+                cudaFuncAttributeMaxDynamicSharedMemorySize,
+                static_cast<int>(shmem));
+            if (err != cudaSuccess) continue;
+        }
+
+        int active_blocks = 0;
+        err = cudaOccupancyMaxActiveBlocksPerMultiprocessor(&active_blocks, kernel, launch_threads, shmem);
+        if (err != cudaSuccess || active_blocks <= 0) continue;
+
+        *launch_threads_out = launch_threads;
+        *blocks_out = (ntasks + warps_per_block - 1) / warps_per_block;
+        *shmem_out = shmem;
+        return cudaSuccess;
+    }
+
+    return cudaErrorLaunchOutOfResources;
+}
+
 extern "C" cudaError_t cueri_build_pair_tables_ss_launch_stream(
     const double* shell_cx,
     const double* shell_cy,
@@ -2383,6 +2455,31 @@ extern "C" cudaError_t cueri_fused_fock_psss_launch_stream(
     cudaStream_t stream,
     int threads);
 
+
+extern "C" cudaError_t cueri_fused_jk_psss_launch_stream(
+    const int32_t* task_spAB,
+    const int32_t* task_spCD,
+    int ntasks,
+    const int32_t* sp_A,
+    const int32_t* sp_B,
+    const int32_t* sp_pair_start,
+    const int32_t* sp_npair,
+    const double* shell_cx,
+    const double* shell_cy,
+    const double* shell_cz,
+    const double* pair_eta,
+    const double* pair_Px,
+    const double* pair_Py,
+    const double* pair_Pz,
+    const double* pair_cK,
+    const int32_t* shell_ao_start,
+    int nao,
+    const double* D_mat,
+    double* J_mat,
+    double* K_mat,
+    cudaStream_t stream,
+    int threads);
+
 extern "C" cudaError_t cueri_fused_fock_dsss_launch_stream(
     const int32_t* task_spAB,
     const int32_t* task_spCD,
@@ -2403,6 +2500,31 @@ extern "C" cudaError_t cueri_fused_fock_dsss_launch_stream(
     int nao,
     const double* D_mat,
     double* F_mat,
+    cudaStream_t stream,
+    int threads);
+
+
+extern "C" cudaError_t cueri_fused_jk_dsss_launch_stream(
+    const int32_t* task_spAB,
+    const int32_t* task_spCD,
+    int ntasks,
+    const int32_t* sp_A,
+    const int32_t* sp_B,
+    const int32_t* sp_pair_start,
+    const int32_t* sp_npair,
+    const double* shell_cx,
+    const double* shell_cy,
+    const double* shell_cz,
+    const double* pair_eta,
+    const double* pair_Px,
+    const double* pair_Py,
+    const double* pair_Pz,
+    const double* pair_cK,
+    const int32_t* shell_ao_start,
+    int nao,
+    const double* D_mat,
+    double* J_mat,
+    double* K_mat,
     cudaStream_t stream,
     int threads);
 
@@ -2429,6 +2551,31 @@ extern "C" cudaError_t cueri_fused_fock_ppss_launch_stream(
     cudaStream_t stream,
     int threads);
 
+
+extern "C" cudaError_t cueri_fused_jk_ppss_launch_stream(
+    const int32_t* task_spAB,
+    const int32_t* task_spCD,
+    int ntasks,
+    const int32_t* sp_A,
+    const int32_t* sp_B,
+    const int32_t* sp_pair_start,
+    const int32_t* sp_npair,
+    const double* shell_cx,
+    const double* shell_cy,
+    const double* shell_cz,
+    const double* pair_eta,
+    const double* pair_Px,
+    const double* pair_Py,
+    const double* pair_Pz,
+    const double* pair_cK,
+    const int32_t* shell_ao_start,
+    int nao,
+    const double* D_mat,
+    double* J_mat,
+    double* K_mat,
+    cudaStream_t stream,
+    int threads);
+
 extern "C" cudaError_t cueri_fused_fock_psps_launch_stream(
     const int32_t* task_spAB,
     const int32_t* task_spCD,
@@ -2449,6 +2596,31 @@ extern "C" cudaError_t cueri_fused_fock_psps_launch_stream(
     int nao,
     const double* D_mat,
     double* F_mat,
+    cudaStream_t stream,
+    int threads);
+
+
+extern "C" cudaError_t cueri_fused_jk_psps_launch_stream(
+    const int32_t* task_spAB,
+    const int32_t* task_spCD,
+    int ntasks,
+    const int32_t* sp_A,
+    const int32_t* sp_B,
+    const int32_t* sp_pair_start,
+    const int32_t* sp_npair,
+    const double* shell_cx,
+    const double* shell_cy,
+    const double* shell_cz,
+    const double* pair_eta,
+    const double* pair_Px,
+    const double* pair_Py,
+    const double* pair_Pz,
+    const double* pair_cK,
+    const int32_t* shell_ao_start,
+    int nao,
+    const double* D_mat,
+    double* J_mat,
+    double* K_mat,
     cudaStream_t stream,
     int threads);
 
@@ -2475,6 +2647,31 @@ extern "C" cudaError_t cueri_fused_fock_ppps_launch_stream(
     cudaStream_t stream,
     int threads);
 
+
+extern "C" cudaError_t cueri_fused_jk_ppps_launch_stream(
+    const int32_t* task_spAB,
+    const int32_t* task_spCD,
+    int ntasks,
+    const int32_t* sp_A,
+    const int32_t* sp_B,
+    const int32_t* sp_pair_start,
+    const int32_t* sp_npair,
+    const double* shell_cx,
+    const double* shell_cy,
+    const double* shell_cz,
+    const double* pair_eta,
+    const double* pair_Px,
+    const double* pair_Py,
+    const double* pair_Pz,
+    const double* pair_cK,
+    const int32_t* shell_ao_start,
+    int nao,
+    const double* D_mat,
+    double* J_mat,
+    double* K_mat,
+    cudaStream_t stream,
+    int threads);
+
 extern "C" cudaError_t cueri_fused_fock_ddss_launch_stream(
     const int32_t* task_spAB,
     const int32_t* task_spCD,
@@ -2495,6 +2692,31 @@ extern "C" cudaError_t cueri_fused_fock_ddss_launch_stream(
     int nao,
     const double* D_mat,
     double* F_mat,
+    cudaStream_t stream,
+    int threads);
+
+
+extern "C" cudaError_t cueri_fused_jk_ddss_launch_stream(
+    const int32_t* task_spAB,
+    const int32_t* task_spCD,
+    int ntasks,
+    const int32_t* sp_A,
+    const int32_t* sp_B,
+    const int32_t* sp_pair_start,
+    const int32_t* sp_npair,
+    const double* shell_cx,
+    const double* shell_cy,
+    const double* shell_cz,
+    const double* pair_eta,
+    const double* pair_Px,
+    const double* pair_Py,
+    const double* pair_Pz,
+    const double* pair_cK,
+    const int32_t* shell_ao_start,
+    int nao,
+    const double* D_mat,
+    double* J_mat,
+    double* K_mat,
     cudaStream_t stream,
     int threads);
 
@@ -2521,6 +2743,31 @@ extern "C" cudaError_t cueri_fused_fock_ssdp_launch_stream(
     cudaStream_t stream,
     int threads);
 
+
+extern "C" cudaError_t cueri_fused_jk_ssdp_launch_stream(
+    const int32_t* task_spAB,
+    const int32_t* task_spCD,
+    int ntasks,
+    const int32_t* sp_A,
+    const int32_t* sp_B,
+    const int32_t* sp_pair_start,
+    const int32_t* sp_npair,
+    const double* shell_cx,
+    const double* shell_cy,
+    const double* shell_cz,
+    const double* pair_eta,
+    const double* pair_Px,
+    const double* pair_Py,
+    const double* pair_Pz,
+    const double* pair_cK,
+    const int32_t* shell_ao_start,
+    int nao,
+    const double* D_mat,
+    double* J_mat,
+    double* K_mat,
+    cudaStream_t stream,
+    int threads);
+
 extern "C" cudaError_t cueri_fused_fock_psds_launch_stream(
     const int32_t* task_spAB,
     const int32_t* task_spCD,
@@ -2541,6 +2788,31 @@ extern "C" cudaError_t cueri_fused_fock_psds_launch_stream(
     int nao,
     const double* D_mat,
     double* F_mat,
+    cudaStream_t stream,
+    int threads);
+
+
+extern "C" cudaError_t cueri_fused_jk_psds_launch_stream(
+    const int32_t* task_spAB,
+    const int32_t* task_spCD,
+    int ntasks,
+    const int32_t* sp_A,
+    const int32_t* sp_B,
+    const int32_t* sp_pair_start,
+    const int32_t* sp_npair,
+    const double* shell_cx,
+    const double* shell_cy,
+    const double* shell_cz,
+    const double* pair_eta,
+    const double* pair_Px,
+    const double* pair_Py,
+    const double* pair_Pz,
+    const double* pair_cK,
+    const int32_t* shell_ao_start,
+    int nao,
+    const double* D_mat,
+    double* J_mat,
+    double* K_mat,
     cudaStream_t stream,
     int threads);
 
@@ -2567,6 +2839,31 @@ extern "C" cudaError_t cueri_fused_fock_psdp_launch_stream(
     cudaStream_t stream,
     int threads);
 
+
+extern "C" cudaError_t cueri_fused_jk_psdp_launch_stream(
+    const int32_t* task_spAB,
+    const int32_t* task_spCD,
+    int ntasks,
+    const int32_t* sp_A,
+    const int32_t* sp_B,
+    const int32_t* sp_pair_start,
+    const int32_t* sp_npair,
+    const double* shell_cx,
+    const double* shell_cy,
+    const double* shell_cz,
+    const double* pair_eta,
+    const double* pair_Px,
+    const double* pair_Py,
+    const double* pair_Pz,
+    const double* pair_cK,
+    const int32_t* shell_ao_start,
+    int nao,
+    const double* D_mat,
+    double* J_mat,
+    double* K_mat,
+    cudaStream_t stream,
+    int threads);
+
 extern "C" cudaError_t cueri_fused_fock_psdd_launch_stream(
     const int32_t* task_spAB,
     const int32_t* task_spCD,
@@ -2587,6 +2884,31 @@ extern "C" cudaError_t cueri_fused_fock_psdd_launch_stream(
     int nao,
     const double* D_mat,
     double* F_mat,
+    cudaStream_t stream,
+    int threads);
+
+
+extern "C" cudaError_t cueri_fused_jk_psdd_launch_stream(
+    const int32_t* task_spAB,
+    const int32_t* task_spCD,
+    int ntasks,
+    const int32_t* sp_A,
+    const int32_t* sp_B,
+    const int32_t* sp_pair_start,
+    const int32_t* sp_npair,
+    const double* shell_cx,
+    const double* shell_cy,
+    const double* shell_cz,
+    const double* pair_eta,
+    const double* pair_Px,
+    const double* pair_Py,
+    const double* pair_Pz,
+    const double* pair_cK,
+    const int32_t* shell_ao_start,
+    int nao,
+    const double* D_mat,
+    double* J_mat,
+    double* K_mat,
     cudaStream_t stream,
     int threads);
 
@@ -2613,6 +2935,31 @@ extern "C" cudaError_t cueri_fused_fock_ppds_launch_stream(
     cudaStream_t stream,
     int threads);
 
+
+extern "C" cudaError_t cueri_fused_jk_ppds_launch_stream(
+    const int32_t* task_spAB,
+    const int32_t* task_spCD,
+    int ntasks,
+    const int32_t* sp_A,
+    const int32_t* sp_B,
+    const int32_t* sp_pair_start,
+    const int32_t* sp_npair,
+    const double* shell_cx,
+    const double* shell_cy,
+    const double* shell_cz,
+    const double* pair_eta,
+    const double* pair_Px,
+    const double* pair_Py,
+    const double* pair_Pz,
+    const double* pair_cK,
+    const int32_t* shell_ao_start,
+    int nao,
+    const double* D_mat,
+    double* J_mat,
+    double* K_mat,
+    cudaStream_t stream,
+    int threads);
+
 extern "C" cudaError_t cueri_fused_fock_dsds_launch_stream(
     const int32_t* task_spAB,
     const int32_t* task_spCD,
@@ -2636,6 +2983,31 @@ extern "C" cudaError_t cueri_fused_fock_dsds_launch_stream(
     cudaStream_t stream,
     int threads);
 
+
+extern "C" cudaError_t cueri_fused_jk_dsds_launch_stream(
+    const int32_t* task_spAB,
+    const int32_t* task_spCD,
+    int ntasks,
+    const int32_t* sp_A,
+    const int32_t* sp_B,
+    const int32_t* sp_pair_start,
+    const int32_t* sp_npair,
+    const double* shell_cx,
+    const double* shell_cy,
+    const double* shell_cz,
+    const double* pair_eta,
+    const double* pair_Px,
+    const double* pair_Py,
+    const double* pair_Pz,
+    const double* pair_cK,
+    const int32_t* shell_ao_start,
+    int nao,
+    const double* D_mat,
+    double* J_mat,
+    double* K_mat,
+    cudaStream_t stream,
+    int threads);
+
 extern "C" cudaError_t cueri_fused_fock_dsdp_launch_stream(
     const int32_t* task_spAB,
     const int32_t* task_spCD,
@@ -2656,6 +3028,31 @@ extern "C" cudaError_t cueri_fused_fock_dsdp_launch_stream(
     int nao,
     const double* D_mat,
     double* F_mat,
+    cudaStream_t stream,
+    int threads);
+
+
+extern "C" cudaError_t cueri_fused_jk_dsdp_launch_stream(
+    const int32_t* task_spAB,
+    const int32_t* task_spCD,
+    int ntasks,
+    const int32_t* sp_A,
+    const int32_t* sp_B,
+    const int32_t* sp_pair_start,
+    const int32_t* sp_npair,
+    const double* shell_cx,
+    const double* shell_cy,
+    const double* shell_cz,
+    const double* pair_eta,
+    const double* pair_Px,
+    const double* pair_Py,
+    const double* pair_Pz,
+    const double* pair_cK,
+    const int32_t* shell_ao_start,
+    int nao,
+    const double* D_mat,
+    double* J_mat,
+    double* K_mat,
     cudaStream_t stream,
     int threads);
 

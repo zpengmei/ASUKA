@@ -5232,6 +5232,252 @@ def cipsi_score_and_select_topk_from_hash_slots_v2_inplace_device(
     return out_new_idx, out_new_n, out_pt2
 
 
+def has_cas36_hb_screen_and_apply_u64_device() -> bool:
+    """Return True if the CUDA extension exposes CAS(36,36)-style u64 HB-SCI builders."""
+    return _ext is not None and hasattr(_ext, "cas36_hb_screen_and_apply_u64_inplace_device")
+
+
+def has_cas36_diag_guess_candidates_u64_dense_device() -> bool:
+    """Return True if compact candidate diagonal-guess u64 kernel is available."""
+    return _ext is not None and hasattr(_ext, "cas36_diag_guess_candidates_u64_dense_inplace_device")
+
+
+def has_cas36_cipsi_score_pt2_compact_u64_device() -> bool:
+    """Return True if compact candidate score/PT2 u64 kernel is available."""
+    return _ext is not None and hasattr(_ext, "cas36_cipsi_score_pt2_compact_u64_inplace_device")
+
+
+def cas36_hb_screen_and_apply_u64_inplace_device(
+    drt: DRT,
+    drt_dev,
+    sel_idx_u64,
+    c_root,
+    *,
+    nsel: int,
+    root: int,
+    h1_pq,
+    h1_abs,
+    h1_signed,
+    n_h1: int,
+    pq_ptr,
+    rs_idx,
+    v_abs,
+    v_signed,
+    pq_max_v,
+    eps: float,
+    hash_keys_u64,
+    hash_vals,
+    selected_idx_sorted_u64=None,
+    overflow=None,
+    threads: int = 256,
+    stream=None,
+    sync: bool = True,
+):
+    """Launch the u64 heat-bath screen+apply kernel (large-space CUDA SCI path)."""
+    if _ext is None or not hasattr(_ext, "cas36_hb_screen_and_apply_u64_inplace_device"):
+        raise RuntimeError(
+            "CUDA extension is missing CAS36 HB-SCI u64 kernels; rebuild with python -m asuka.build.guga_cuda_ext"
+        )
+
+    try:
+        import cupy as cp
+    except Exception as e:  # pragma: no cover
+        raise RuntimeError("CuPy is required") from e
+
+    sel_idx_u64 = cp.ascontiguousarray(cp.asarray(sel_idx_u64, dtype=cp.uint64).ravel())
+    c_root = cp.ascontiguousarray(cp.asarray(c_root, dtype=cp.float64).ravel())
+    h1_pq = cp.ascontiguousarray(cp.asarray(h1_pq, dtype=cp.int32))
+    h1_abs = cp.ascontiguousarray(cp.asarray(h1_abs, dtype=cp.float64).ravel())
+    h1_signed = cp.ascontiguousarray(cp.asarray(h1_signed, dtype=cp.float64).ravel())
+    pq_ptr = cp.ascontiguousarray(cp.asarray(pq_ptr, dtype=cp.int64).ravel())
+    rs_idx = cp.ascontiguousarray(cp.asarray(rs_idx, dtype=cp.int32).ravel())
+    v_abs = cp.ascontiguousarray(cp.asarray(v_abs, dtype=cp.float64).ravel())
+    v_signed = cp.ascontiguousarray(cp.asarray(v_signed, dtype=cp.float64).ravel())
+    pq_max_v = cp.ascontiguousarray(cp.asarray(pq_max_v, dtype=cp.float64).ravel())
+    hash_keys_u64 = cp.ascontiguousarray(cp.asarray(hash_keys_u64, dtype=cp.uint64).ravel())
+    hash_vals = cp.ascontiguousarray(cp.asarray(hash_vals, dtype=cp.float64))
+    if hash_vals.ndim != 2:
+        raise ValueError("hash_vals must have shape (nroots, cap)")
+    if int(hash_vals.shape[1]) != int(hash_keys_u64.size):
+        raise ValueError("hash_vals must have shape (nroots, cap) with cap matching hash_keys_u64")
+
+    if selected_idx_sorted_u64 is not None:
+        selected_idx_sorted_u64 = cp.ascontiguousarray(cp.asarray(selected_idx_sorted_u64, dtype=cp.uint64).ravel())
+    if overflow is None:
+        overflow = cp.empty((1,), dtype=cp.int32)
+    else:
+        overflow = cp.ascontiguousarray(cp.asarray(overflow, dtype=cp.int32).ravel())
+        if overflow.shape != (1,):
+            raise ValueError("overflow must have shape (1,)")
+
+    if stream is None:
+        stream_ptr = int(cp.cuda.get_current_stream().ptr)
+    else:
+        stream_ptr = int(getattr(stream, "ptr", stream))
+
+    _ext.cas36_hb_screen_and_apply_u64_inplace_device(
+        drt_dev,
+        int(drt.ncsf),
+        sel_idx_u64,
+        c_root,
+        int(nsel),
+        int(root),
+        h1_pq,
+        h1_abs,
+        h1_signed,
+        int(n_h1),
+        pq_ptr,
+        rs_idx,
+        v_abs,
+        v_signed,
+        pq_max_v,
+        float(eps),
+        hash_keys_u64,
+        hash_vals,
+        selected_idx_sorted_u64 if selected_idx_sorted_u64 is not None else None,
+        overflow,
+        int(threads),
+        int(stream_ptr),
+        bool(sync),
+    )
+    return hash_keys_u64, hash_vals, overflow
+
+
+def cas36_diag_guess_candidates_u64_dense_inplace_device(
+    drt: DRT,
+    drt_dev,
+    cand_idx_u64,
+    *,
+    h1_diag,
+    eri_ppqq,
+    eri_pqqp,
+    neleca: int,
+    nelecb: int,
+    hdiag_out=None,
+    threads: int = 256,
+    stream=None,
+    sync: bool = True,
+):
+    """Compute compact diagonal guesses on GPU for u64 candidate labels."""
+    if _ext is None or not hasattr(_ext, "cas36_diag_guess_candidates_u64_dense_inplace_device"):
+        raise RuntimeError(
+            "CUDA extension is missing CAS36 compact diagonal-guess kernels; rebuild with python -m asuka.build.guga_cuda_ext"
+        )
+
+    try:
+        import cupy as cp
+    except Exception as e:  # pragma: no cover
+        raise RuntimeError("CuPy is required") from e
+
+    cand_idx_u64 = cp.ascontiguousarray(cp.asarray(cand_idx_u64, dtype=cp.uint64).ravel())
+    h1_diag = cp.ascontiguousarray(cp.asarray(h1_diag, dtype=cp.float64).ravel())
+    eri_ppqq = cp.ascontiguousarray(cp.asarray(eri_ppqq, dtype=cp.float64).ravel())
+    eri_pqqp = cp.ascontiguousarray(cp.asarray(eri_pqqp, dtype=cp.float64).ravel())
+    if hdiag_out is None:
+        hdiag_out = cp.empty((int(cand_idx_u64.size),), dtype=cp.float64)
+    else:
+        hdiag_out = cp.ascontiguousarray(cp.asarray(hdiag_out, dtype=cp.float64).ravel())
+        if int(hdiag_out.size) != int(cand_idx_u64.size):
+            raise ValueError("hdiag_out must have the same length as cand_idx_u64")
+
+    if stream is None:
+        stream_ptr = int(cp.cuda.get_current_stream().ptr)
+    else:
+        stream_ptr = int(getattr(stream, "ptr", stream))
+
+    _ext.cas36_diag_guess_candidates_u64_dense_inplace_device(
+        drt_dev,
+        int(drt.ncsf),
+        cand_idx_u64,
+        h1_diag,
+        eri_ppqq,
+        eri_pqqp,
+        int(neleca),
+        int(nelecb),
+        hdiag_out,
+        int(threads),
+        int(stream_ptr),
+        bool(sync),
+    )
+    return hdiag_out
+
+
+def cas36_cipsi_score_pt2_compact_u64_inplace_device(
+    idx_u64,
+    vals_root_major,
+    *,
+    e_var,
+    cand_hdiag,
+    selected_idx_sorted_u64=None,
+    denom_floor: float,
+    score_bits_out=None,
+    pt2_out=None,
+    threads: int = 256,
+    stream=None,
+    sync: bool = True,
+):
+    """Compute compact candidate scores + deterministic PT2 using u64 labels on GPU."""
+    if _ext is None or not hasattr(_ext, "cas36_cipsi_score_pt2_compact_u64_inplace_device"):
+        raise RuntimeError(
+            "CUDA extension is missing CAS36 compact score/PT2 kernels; rebuild with python -m asuka.build.guga_cuda_ext"
+        )
+
+    try:
+        import cupy as cp
+    except Exception as e:  # pragma: no cover
+        raise RuntimeError("CuPy is required") from e
+
+    idx_u64 = cp.ascontiguousarray(cp.asarray(idx_u64, dtype=cp.uint64).ravel())
+    vals_root_major = cp.ascontiguousarray(cp.asarray(vals_root_major, dtype=cp.float64))
+    if vals_root_major.ndim != 2:
+        raise ValueError("vals_root_major must have shape (nroots, ncand)")
+    nroots = int(vals_root_major.shape[0])
+    ncand = int(idx_u64.size)
+    if int(vals_root_major.shape[1]) < ncand:
+        raise ValueError("vals_root_major second dimension must be >= number of candidates")
+    e_var = cp.ascontiguousarray(cp.asarray(e_var, dtype=cp.float64).ravel())
+    cand_hdiag = cp.ascontiguousarray(cp.asarray(cand_hdiag, dtype=cp.float64).ravel())
+    if int(e_var.size) != nroots:
+        raise ValueError("e_var must have shape (nroots,)")
+    if int(cand_hdiag.size) != ncand:
+        raise ValueError("cand_hdiag must have the same length as idx_u64")
+    if selected_idx_sorted_u64 is not None:
+        selected_idx_sorted_u64 = cp.ascontiguousarray(cp.asarray(selected_idx_sorted_u64, dtype=cp.uint64).ravel())
+
+    if score_bits_out is None:
+        score_bits_out = cp.empty((ncand,), dtype=cp.uint64)
+    else:
+        score_bits_out = cp.ascontiguousarray(cp.asarray(score_bits_out, dtype=cp.uint64).ravel())
+        if int(score_bits_out.size) != ncand:
+            raise ValueError("score_bits_out must have same length as idx_u64")
+    if pt2_out is None:
+        pt2_out = cp.zeros((nroots,), dtype=cp.float64)
+    else:
+        pt2_out = cp.ascontiguousarray(cp.asarray(pt2_out, dtype=cp.float64).ravel())
+        if int(pt2_out.size) != nroots:
+            raise ValueError("pt2_out must have shape (nroots,)")
+
+    if stream is None:
+        stream_ptr = int(cp.cuda.get_current_stream().ptr)
+    else:
+        stream_ptr = int(getattr(stream, "ptr", stream))
+
+    _ext.cas36_cipsi_score_pt2_compact_u64_inplace_device(
+        idx_u64,
+        vals_root_major,
+        e_var,
+        cand_hdiag,
+        selected_idx_sorted_u64 if selected_idx_sorted_u64 is not None else None,
+        float(denom_floor),
+        score_bits_out,
+        pt2_out,
+        int(threads),
+        int(stream_ptr),
+        bool(sync),
+    )
+    return score_bits_out, pt2_out
+
+
 def has_hb_screen_and_apply_device() -> bool:
     """Return True if the CUDA extension exposes the HB screen-and-apply kernel."""
     return _ext is not None and hasattr(_ext, "hb_screen_and_apply_inplace_device")

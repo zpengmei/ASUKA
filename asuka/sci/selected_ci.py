@@ -42,6 +42,11 @@ from asuka.solver import GUGAFCISolver
 
 _INT32_MAX = int(np.iinfo(np.int32).max)
 
+# Per-run connected-row cache entry:
+#   key: global CSF index j
+#   val: (i_idx, hij) arrays returned by _connected_row(...)
+ConnectedRowCache = dict[int, tuple[np.ndarray, np.ndarray]]
+
 
 def _as_numpy_f64(a: Any) -> np.ndarray:
     """Convert host/device array-like to contiguous float64 NumPy."""
@@ -98,7 +103,7 @@ class DiagonalGuessLookup:
                     l_full=np.asarray(l_full, dtype=np.float64, order="C"),
                     j_ps=np.asarray(_as_numpy_f64(eri.j_ps), dtype=np.float64, order="C"),
                     pair_norm=np.asarray(pair_norm, dtype=np.float64, order="C"),
-                    eri_mat=None if eri_mat is None else np.asarray(eri_mat, dtype=np.float64, order="C"),
+                    _eri_mat=None if eri_mat is None else np.asarray(eri_mat, dtype=np.float64, order="C"),
                 )
             else:
                 self._eri_dense = np.asarray(
@@ -304,6 +309,7 @@ def _build_variational_hamiltonian_sparse(
     max_out: int,
     screening: RowScreening | None,
     state_cache: DRTStateCache | None,
+    row_cache: ConnectedRowCache | None = None,
 ) -> "sp.csr_matrix":
     if sp is None:  # pragma: no cover
         raise RuntimeError("scipy is required for selected_ci")
@@ -314,15 +320,22 @@ def _build_variational_hamiltonian_sparse(
     data: list[float] = []
 
     for col, j in enumerate(sel):
-        i_idx, hij = _connected_row(
-            drt,
-            h1e,
-            eri,
-            int(j),
-            max_out=max_out,
-            screening=screening,
-            state_cache=state_cache,
-        )
+        jj = int(j)
+        cached = None if row_cache is None else row_cache.get(jj)
+        if cached is None:
+            i_idx, hij = _connected_row(
+                drt,
+                h1e,
+                eri,
+                jj,
+                max_out=max_out,
+                screening=screening,
+                state_cache=state_cache,
+            )
+            if row_cache is not None:
+                row_cache[jj] = (i_idx, hij)
+        else:
+            i_idx, hij = cached
         for i, v in zip(i_idx.tolist(), hij.tolist()):
             row = loc_map.get(int(i))
             if row is None:
@@ -354,6 +367,7 @@ def _select_external_sparse(
     screening: RowScreening | None,
     state_cache: DRTStateCache | None,
     select_screen_contrib: float,
+    row_cache: ConnectedRowCache | None = None,
 ) -> tuple[list[int], np.ndarray]:
     nroots = int(e_var.size)
     denom_floor = float(denom_floor)
@@ -367,15 +381,22 @@ def _select_external_sparse(
         if max_cj == 0.0:
             continue
 
-        i_idx, hij = _connected_row(
-            drt,
-            h1e,
-            eri,
-            int(j),
-            max_out=max_out,
-            screening=screening,
-            state_cache=state_cache,
-        )
+        jj = int(j)
+        cached = None if row_cache is None else row_cache.get(jj)
+        if cached is None:
+            i_idx, hij = _connected_row(
+                drt,
+                h1e,
+                eri,
+                jj,
+                max_out=max_out,
+                screening=screening,
+                state_cache=state_cache,
+            )
+            if row_cache is not None:
+                row_cache[jj] = (i_idx, hij)
+        else:
+            i_idx, hij = cached
 
         for i, v in zip(i_idx.tolist(), hij.tolist()):
             ii = int(i)

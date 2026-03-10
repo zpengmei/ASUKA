@@ -1,0 +1,84 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  import-cycle-budget:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Check import-cycle budget
+        run: python .github/scripts/check_import_cycle_budget.py
+
+  cuda-marker-guard:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Check CUDA test markers
+        run: python .github/scripts/check_cuda_test_markers.py
+
+  package-smoke:
+    runs-on: ubuntu-latest
+    env:
+      ASUKA_SKIP_CUDA_EXT: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install editable package
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e .
+      - name: Import smoke
+        run: |
+          python -c "import asuka; import asuka.audit; import asuka.mcscf.sort_mo; print(asuka.__version__)"
+
+  cpu-full:
+    runs-on: ubuntu-latest
+    env:
+      ASUKA_SKIP_CUDA_EXT: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[test]"
+      - name: CLI smoke
+        run: |
+          asuka-doctor
+          asuka-kernel-report --help
+          asuka-cuda-audit --help
+      - name: Run CPU test suite
+        run: pytest -q -m "not cuda"
+
+  cuda-full:
+    runs-on: [self-hosted, linux, x64, cuda12]
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install CUDA + test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[cuda12,test]"
+      - name: CLI smoke
+        run: |
+          asuka-doctor
+          asuka-kernel-report --help
+          asuka-cuda-audit --help
+      - name: Run full test suite
+        run: pytest -q

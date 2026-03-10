@@ -41,7 +41,10 @@ conda install -c conda-forge cmake ninja ccache
 pip install -e ".[cuda]"
 
 # CUDA 12.x
-# pip install -e ".[cuda12]"
+pip install -e ".[cuda12]"
+
+# test dependencies
+pip install -e ".[test]"
 ```
 
 This single command installs all dependencies, compiles Cython extensions, and builds the CUDA kernels. If `nvcc` is not found, CUDA extensions are skipped and only CPU paths are available.
@@ -52,10 +55,24 @@ CPU-only install (skip CUDA builds explicitly):
 ASUKA_SKIP_CUDA_EXT=1 pip install -e .
 ```
 
+Combined CUDA + test install:
+
+```bash
+pip install -e ".[cuda12,test]"
+```
+
 Verify:
 
 ```bash
 python -c "import asuka; print(asuka.__version__)"
+```
+
+CLI smoke checks:
+
+```bash
+asuka-doctor
+asuka-kernel-report --help
+asuka-cuda-audit --help
 ```
 
 ### Bundled ma-XZVP basis sets

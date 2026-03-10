@@ -10,11 +10,14 @@ from typing import Any
 import numpy as np
 
 from asuka.cuguga.drt import DRT, build_drt
+from asuka.cuguga.oracle import _restore_eri_4d
 from asuka.cuguga.state_cache import get_state_cache
+from asuka.integrals.df_integrals import DFMOIntegrals, DeviceDFMOIntegrals
 from asuka.mcscf.casci import CASCIResult, _build_casci_df_integrals
 from asuka.qmc.labels import normalize_state_rep
 from asuka.qmc.sparse import SparseVector
 from asuka.sci.frontier_hash import SparseFrontierSelector
+from asuka.sci.hb_integrals import build_hb_index, build_hb_index_from_df, upload_hb_index
 from asuka.sci.hb_selection import heat_bath_select_and_pt2_sparse
 from asuka.sci.selected_ci import (
     DiagonalGuessLookup,
@@ -149,9 +152,9 @@ def _normalize_epq_mode(epq_mode: str) -> str:
 
 def _normalize_cipsi_backend(backend: str) -> str:
     mode = str(backend).strip().lower()
-    allowed = {"auto", "cpu_sparse", "cuda_key64"}
+    allowed = {"auto", "cpu_sparse", "cuda_key64", "cuda_idx64"}
     if mode not in allowed:
-        raise ValueError("backend must be 'auto', 'cpu_sparse', or 'cuda_key64'")
+        raise ValueError("backend must be 'auto', 'cpu_sparse', 'cuda_key64', or 'cuda_idx64'")
     return mode
 
 
@@ -248,6 +251,62 @@ def _build_ci0_subspace_sparse(
     return out
 
 
+def _asnumpy_f64(a: Any) -> np.ndarray:
+    try:
+        import cupy as cp  # type: ignore[import-not-found]
+    except Exception:
+        cp = None  # type: ignore[assignment]
+    if cp is not None and isinstance(a, cp.ndarray):
+        return np.asarray(cp.asnumpy(a), dtype=np.float64, order="C")
+    return np.asarray(a, dtype=np.float64, order="C")
+
+
+def _next_pow2(x: int) -> int:
+    x_i = int(x)
+    if x_i <= 1:
+        return 1
+    return 1 << (x_i - 1).bit_length()
+
+
+def _build_hb_index_and_diag_inputs(
+    drt: DRT,
+    h1e: np.ndarray,
+    eri: Any,
+) -> tuple[Any, np.ndarray, np.ndarray, np.ndarray] | None:
+    norb = int(drt.norb)
+    h1e_f64 = np.asarray(h1e, dtype=np.float64, order="C")
+    h1_diag = np.asarray(np.diag(h1e_f64), dtype=np.float64, order="C")
+
+    if isinstance(eri, DeviceDFMOIntegrals):
+        if eri.l_full is None:
+            return None
+        l_full = _asnumpy_f64(eri.l_full)
+        j_ps = _asnumpy_f64(eri.j_ps)
+        if l_full.ndim != 2 or int(l_full.shape[0]) != norb * norb:
+            return None
+        h_eff = np.asarray(h1e_f64 - 0.5 * j_ps, dtype=np.float64, order="C")
+        hb_index = build_hb_index_from_df(h_eff, l_full, norb)
+        eri_2d = np.asarray(l_full @ l_full.T, dtype=np.float64, order="C")
+    elif isinstance(eri, DFMOIntegrals):
+        l_full = np.asarray(eri.l_full, dtype=np.float64, order="C")
+        if l_full.ndim != 2 or int(l_full.shape[0]) != norb * norb:
+            return None
+        h_eff = np.asarray(h1e_f64 - 0.5 * np.asarray(eri.j_ps, dtype=np.float64), dtype=np.float64, order="C")
+        hb_index = build_hb_index_from_df(h_eff, l_full, norb)
+        eri_2d = np.asarray(l_full @ l_full.T, dtype=np.float64, order="C")
+    else:
+        eri_4d = np.asarray(_restore_eri_4d(eri, norb), dtype=np.float64, order="C")
+        h_eff = np.asarray(h1e_f64 - 0.5 * np.einsum("pqqs->ps", eri_4d), dtype=np.float64, order="C")
+        hb_index = build_hb_index(h_eff, eri_4d, norb)
+        eri_2d = np.asarray(eri_4d.reshape(norb * norb, norb * norb), dtype=np.float64, order="C")
+
+    diag_ids = np.arange(norb, dtype=np.int64) * (norb + 1)
+    eri_ppqq = np.asarray(eri_2d[np.ix_(diag_ids, diag_ids)], dtype=np.float64, order="C")
+    pq_ids = np.arange(norb * norb, dtype=np.int64).reshape(norb, norb)
+    eri_pqqp = np.asarray(eri_2d[pq_ids, pq_ids.T], dtype=np.float64, order="C")
+    return hb_index, h1_diag, eri_ppqq, eri_pqqp
+
+
 def run_cipsi_trials(
     drt: DRT,
     h1e: np.ndarray,
@@ -302,17 +361,28 @@ def run_cipsi_trials(
 
     if backend_requested == "cuda_key64" and int(drt.norb) > 32:
         raise ValueError("backend='cuda_key64' requires drt.norb <= 32")
-    if backend_requested == "cuda_key64" and state_rep_s == "i32":
-        raise ValueError("backend='cuda_key64' is incompatible with state_rep='i32'")
+    if backend_requested == "cuda_key64" and state_rep_s in ("i32", "i64"):
+        raise ValueError("backend='cuda_key64' is incompatible with state_rep='i32' and 'i64'/'idx64'")
+    if backend_requested == "cuda_idx64" and state_rep_s == "key64":
+        raise ValueError("backend='cuda_idx64' is incompatible with state_rep='key64'")
+    if backend_requested == "cuda_idx64" and int(drt.ncsf) > np.iinfo(np.int64).max:
+        raise ValueError("backend='cuda_idx64' requires drt.ncsf <= int64 max")
 
     if backend_requested == "auto":
-        use_key64 = state_rep_s == "key64" or (state_rep_s == "auto" and int(drt.ncsf) > _INT32_MAX and int(drt.norb) <= 32)
-        backend_effective = "cuda_key64" if use_key64 else "cpu_sparse"
+        if state_rep_s == "key64":
+            backend_effective = "cuda_key64"
+        elif state_rep_s == "i64":
+            backend_effective = "cuda_idx64"
+        elif int(drt.ncsf) > _INT32_MAX:
+            backend_effective = "cuda_key64" if int(drt.norb) <= 32 else "cuda_idx64"
+        else:
+            backend_effective = "cpu_sparse"
     else:
         backend_effective = backend_requested
-        use_key64 = backend_effective == "cuda_key64"
-    if use_key64:
+    if backend_effective == "cuda_key64":
         state_rep_s = "key64"
+    elif backend_effective == "cuda_idx64":
+        state_rep_s = "i64"
 
     selection_mode_s = str(selection_mode).strip().lower()
     if selection_mode_s in ("frontier_hash", "hash", "frontier-hash"):
@@ -340,7 +410,7 @@ def run_cipsi_trials(
     if epq_mode_s != "no_epq_support_aware":
         raise RuntimeError(f"selection_mode='{selection_mode_s}' requires epq_mode='no_epq_support_aware' (no EPQ table)")
 
-    need_sparse_state = int(ncsf) > _INT32_MAX or state_rep_s == "key64"
+    need_sparse_state = int(ncsf) > _INT32_MAX or state_rep_s in ("key64", "i64")
     state_cache = None if need_sparse_state else get_state_cache(drt)
     hdiag_lookup = DiagonalGuessLookup(drt, h1e, eri, hdiag=None if hdiag is None else np.asarray(hdiag, dtype=np.float64))
     ci0_sparse = _normalize_ci0_sparse(ci0, nroots=nroots, ncsf=ncsf)
@@ -370,14 +440,17 @@ def run_cipsi_trials(
         "epq_mode": str(epq_mode_s),
         "driver": "sparse_row_oracle",
         "workspace_kwargs_ignored": bool(workspace_kwargs),
-        "frontier_hash_cap_ignored": frontier_hash_cap is not None,
-        "frontier_hash_tile_ignored": int(frontier_hash_tile),
-        "frontier_hash_rs_block_ignored": int(frontier_hash_rs_block),
-        "frontier_hash_g_rows_ignored": int(frontier_hash_g_rows),
-        "frontier_hash_offdiag_kernel_mode_ignored": frontier_hash_offdiag_kernel_mode,
-        "frontier_hash_csr_capacity_mult_ignored": float(frontier_hash_csr_capacity_mult),
-        "frontier_hash_max_retries_ignored": int(frontier_hash_max_retries),
+        "frontier_hash_cap": None if frontier_hash_cap is None else int(frontier_hash_cap),
+        "frontier_hash_tile": int(frontier_hash_tile),
+        "frontier_hash_rs_block": int(frontier_hash_rs_block),
+        "frontier_hash_g_rows": int(frontier_hash_g_rows),
+        "frontier_hash_offdiag_kernel_mode": frontier_hash_offdiag_kernel_mode,
+        "frontier_hash_csr_capacity_mult": float(frontier_hash_csr_capacity_mult),
+        "frontier_hash_max_retries": int(frontier_hash_max_retries),
     }
+    row_cache_env = str(os.environ.get("ASUKA_CIPSI_ROW_CACHE", "1")).strip().lower()
+    use_row_cache = row_cache_env not in ("0", "false", "off", "no")
+    profile["row_cache_enabled"] = bool(use_row_cache)
     if str(requested_epq_mode) != str(epq_mode_s):
         profile["epq_mode_requested"] = str(requested_epq_mode)
         profile["epq_mode_effective"] = str(epq_mode_s)
@@ -399,8 +472,266 @@ def run_cipsi_trials(
     )
     frontier_selector.reset_selected_mask(np.asarray(sel, dtype=np.int64))
 
+    cuda_selector_enabled = False
+    cuda_selector_reason = ""
+    _cp = None
+    _cuda_threads = int(max(64, min(256, int(frontier_hash_tile))))
+    _hash_cap = 0
+    _hash_keys_d = None
+    _hash_vals_d = None
+    _overflow_d = None
+    _drt_dev = None
+    _hb_dev = None
+    _h1_diag_d = None
+    _eri_ppqq_d = None
+    _eri_pqqp_d = None
+    _hb_effectively_zero = False
+    _neleca = 0
+    _nelecb = 0
+    _cas36_hb_apply = None
+    _cas36_diag_guess = None
+    _cas36_score_pt2 = None
+
+    if backend_effective in ("cuda_key64", "cuda_idx64"):
+        try:
+            import cupy as _cp  # type: ignore[import-not-found]
+            from asuka.cuda.cuda_backend import (  # noqa: PLC0415
+                cas36_cipsi_score_pt2_compact_u64_inplace_device as _cas36_score_pt2,
+                cas36_diag_guess_candidates_u64_dense_inplace_device as _cas36_diag_guess,
+                cas36_hb_screen_and_apply_u64_inplace_device as _cas36_hb_apply,
+                has_cas36_cipsi_score_pt2_compact_u64_device,
+                has_cas36_diag_guess_candidates_u64_dense_device,
+                has_cas36_hb_screen_and_apply_u64_device,
+                make_device_drt,
+            )
+
+            if int(drt.norb) > 64:
+                cuda_selector_reason = "norb_gt_64"
+            elif int(_cp.cuda.runtime.getDeviceCount()) <= 0:
+                cuda_selector_reason = "no_cuda_device"
+            elif not (
+                bool(has_cas36_hb_screen_and_apply_u64_device())
+                and bool(has_cas36_diag_guess_candidates_u64_dense_device())
+                and bool(has_cas36_cipsi_score_pt2_compact_u64_device())
+            ):
+                cuda_selector_reason = "missing_cas36_sci_kernels"
+            else:
+                hb_pack = _build_hb_index_and_diag_inputs(drt, h1e, eri)
+                if hb_pack is None:
+                    cuda_selector_reason = "unsupported_integrals_for_cuda_selector"
+                else:
+                    hb_index, h1_diag_h, eri_ppqq_h, eri_pqqp_h = hb_pack
+                    _drt_dev = make_device_drt(drt)
+                    _hb_dev = upload_hb_index(hb_index, _cp)
+                    _hb_effectively_zero = int(hb_index.n_h1) == 0 and int(hb_index.nnz_2e) == 0
+                    # The C++ launch helper currently requires non-null pointers even when
+                    # corresponding logical lengths are zero; provide tiny dummy buffers.
+                    if int(_hb_dev["h1_abs"].size) == 0:
+                        _hb_dev["h1_pq"] = _cp.zeros((1, 2), dtype=_cp.int32)
+                        _hb_dev["h1_abs"] = _cp.zeros((1,), dtype=_cp.float64)
+                        _hb_dev["h1_signed"] = _cp.zeros((1,), dtype=_cp.float64)
+                    if int(_hb_dev["rs_idx"].size) == 0:
+                        _hb_dev["rs_idx"] = _cp.zeros((1,), dtype=_cp.int32)
+                        _hb_dev["v_abs"] = _cp.zeros((1,), dtype=_cp.float64)
+                        _hb_dev["v_signed"] = _cp.zeros((1,), dtype=_cp.float64)
+                    _h1_diag_d = _cp.asarray(h1_diag_h, dtype=_cp.float64).ravel()
+                    _eri_ppqq_d = _cp.asarray(eri_ppqq_h, dtype=_cp.float64).ravel()
+                    _eri_pqqp_d = _cp.asarray(eri_pqqp_h, dtype=_cp.float64).ravel()
+                    nelec_tot = int(drt.nelec)
+                    twos_t = int(drt.twos_target)
+                    if ((nelec_tot + twos_t) & 1) != 0:
+                        cuda_selector_reason = "invalid_spin_parity"
+                    else:
+                        _neleca = (nelec_tot + twos_t) // 2
+                        _nelecb = nelec_tot - _neleca
+                        if _neleca < 0 or _nelecb < 0:
+                            cuda_selector_reason = "invalid_alpha_beta_counts"
+                        else:
+                            if frontier_hash_cap is None:
+                                cap_guess = max(
+                                    4096,
+                                    8 * max(1, int(init_ncsf)),
+                                    4 * max(1, int(grow_by)),
+                                )
+                            else:
+                                cap_guess = int(frontier_hash_cap)
+                            _hash_cap = _next_pow2(max(256, int(cap_guess)))
+                            _hash_keys_d = _cp.empty((_hash_cap,), dtype=_cp.uint64)
+                            _hash_vals_d = _cp.empty((int(nroots), _hash_cap), dtype=_cp.float64)
+                            _overflow_d = _cp.zeros((1,), dtype=_cp.int32)
+                            cuda_selector_enabled = True
+        except Exception as _cuda_e:
+            cuda_selector_reason = f"cuda_init_failed:{type(_cuda_e).__name__}"
+
+    if cuda_selector_enabled:
+        profile["driver"] = "cuda_cas36_hb_compact_u64"
+        profile["cuda_selector_enabled"] = True
+        profile["cuda_selector_hash_cap_init"] = int(_hash_cap)
+        profile["cuda_selector_threads"] = int(_cuda_threads)
+    else:
+        profile["cuda_selector_enabled"] = False
+        if backend_effective in ("cuda_key64", "cuda_idx64"):
+            profile["cuda_selector_disabled_reason"] = str(cuda_selector_reason or "unknown")
+
+    def _cuda_select_external(
+        *,
+        sel_idx_i64: np.ndarray,
+        c_sel_arr: np.ndarray,
+        e_var_arr: np.ndarray,
+        max_add_i: int,
+        eps_val: float,
+    ) -> tuple[list[int], np.ndarray, dict[str, Any]]:
+        nonlocal _hash_cap, _hash_keys_d, _hash_vals_d, _overflow_d
+        assert _cp is not None
+        assert _drt_dev is not None
+        assert _hb_dev is not None
+        assert _h1_diag_d is not None and _eri_ppqq_d is not None and _eri_pqqp_d is not None
+        assert _cas36_hb_apply is not None and _cas36_diag_guess is not None and _cas36_score_pt2 is not None
+
+        sel_idx_i64 = np.asarray(sel_idx_i64, dtype=np.int64).ravel()
+        if sel_idx_i64.size == 0:
+            return [], np.zeros((int(nroots),), dtype=np.float64), {"ncand": 0, "overflow_retries": 0, "hash_cap": int(_hash_cap)}
+        if bool(_hb_effectively_zero):
+            return [], np.zeros((int(nroots),), dtype=np.float64), {"ncand": 0, "overflow_retries": 0, "hash_cap": int(_hash_cap)}
+        if int(np.min(sel_idx_i64)) < 0:
+            raise ValueError("selected indices must be non-negative for CUDA selector")
+
+        sel_idx_u64_d = _cp.asarray(sel_idx_i64.astype(np.uint64, copy=False), dtype=_cp.uint64).ravel()
+        sel_idx_u64_d = _cp.ascontiguousarray(sel_idx_u64_d)
+        sel_idx_sorted_d = _cp.sort(sel_idx_u64_d)
+        c_sel_d = _cp.ascontiguousarray(_cp.asarray(c_sel_arr, dtype=_cp.float64))
+        e_var_d = _cp.ascontiguousarray(_cp.asarray(e_var_arr, dtype=_cp.float64).ravel())
+
+        retries = 0
+        empty_u64 = np.uint64(0xFFFFFFFFFFFFFFFF)
+        stream_u = int(_cp.cuda.get_current_stream().ptr)
+        while True:
+            _hash_keys_d.fill(empty_u64)
+            _hash_vals_d.fill(0.0)
+            _overflow_d.fill(0)
+
+            for root in range(int(nroots)):
+                _cas36_hb_apply(
+                    drt,
+                    _drt_dev,
+                    sel_idx_u64_d,
+                    _cp.ascontiguousarray(c_sel_d[:, int(root)].ravel()),
+                    nsel=int(sel_idx_u64_d.size),
+                    root=int(root),
+                    h1_pq=_hb_dev["h1_pq"],
+                    h1_abs=_hb_dev["h1_abs"],
+                    h1_signed=_hb_dev["h1_signed"],
+                    n_h1=int(_hb_dev["h1_abs"].size),
+                    pq_ptr=_hb_dev["pq_ptr"],
+                    rs_idx=_hb_dev["rs_idx"],
+                    v_abs=_hb_dev["v_abs"],
+                    v_signed=_hb_dev["v_signed"],
+                    pq_max_v=_hb_dev["pq_max_v"],
+                    eps=float(eps_val),
+                    hash_keys_u64=_hash_keys_d,
+                    hash_vals=_hash_vals_d,
+                    selected_idx_sorted_u64=sel_idx_sorted_d,
+                    overflow=_overflow_d,
+                    threads=int(_cuda_threads),
+                    stream=stream_u,
+                    sync=True,
+                )
+            overflow_h = int(_cp.asnumpy(_overflow_d)[0])
+            if overflow_h == 0:
+                break
+            retries += 1
+            if retries > int(frontier_hash_max_retries):
+                raise RuntimeError(
+                    f"CUDA selector hash overflow after {retries} retries (cap={int(_hash_cap)}); "
+                    "increase frontier_hash_cap or reduce growth"
+                )
+            _hash_cap = int(_hash_cap) * 2
+            _hash_keys_d = _cp.empty((int(_hash_cap),), dtype=_cp.uint64)
+            _hash_vals_d = _cp.empty((int(nroots), int(_hash_cap)), dtype=_cp.float64)
+            _overflow_d = _cp.zeros((1,), dtype=_cp.int32)
+
+        mask = _hash_keys_d != empty_u64
+        ncand = int(_cp.count_nonzero(mask).get())
+        if ncand <= 0:
+            return [], np.zeros((int(nroots),), dtype=np.float64), {
+                "ncand": 0,
+                "overflow_retries": int(retries),
+                "hash_cap": int(_hash_cap),
+            }
+
+        cand_idx_u64 = _cp.ascontiguousarray(_hash_keys_d[mask].ravel())
+        vals_root_major = _cp.ascontiguousarray(_hash_vals_d[:, mask])
+
+        cand_hdiag = _cas36_diag_guess(
+            drt,
+            _drt_dev,
+            cand_idx_u64,
+            h1_diag=_h1_diag_d,
+            eri_ppqq=_eri_ppqq_d,
+            eri_pqqp=_eri_pqqp_d,
+            neleca=int(_neleca),
+            nelecb=int(_nelecb),
+            threads=int(_cuda_threads),
+            stream=stream_u,
+            sync=True,
+        )
+        score_bits_d = _cp.empty((ncand,), dtype=_cp.uint64)
+        pt2_d = _cp.zeros((int(nroots),), dtype=_cp.float64)
+        _cas36_score_pt2(
+            cand_idx_u64,
+            vals_root_major,
+            e_var=e_var_d,
+            cand_hdiag=cand_hdiag,
+            selected_idx_sorted_u64=sel_idx_sorted_d,
+            denom_floor=float(denom_floor),
+            score_bits_out=score_bits_d,
+            pt2_out=pt2_d,
+            threads=int(_cuda_threads),
+            stream=stream_u,
+            sync=True,
+        )
+        e_pt2_h = np.asarray(_cp.asnumpy(pt2_d), dtype=np.float64)
+
+        max_add_i = int(max_add_i)
+        if max_add_i <= 0:
+            return [], e_pt2_h, {
+                "ncand": int(ncand),
+                "overflow_retries": int(retries),
+                "hash_cap": int(_hash_cap),
+            }
+
+        valid = score_bits_d > 0
+        nvalid = int(_cp.count_nonzero(valid).get())
+        if nvalid <= 0:
+            return [], e_pt2_h, {
+                "ncand": int(ncand),
+                "nvalid": 0,
+                "overflow_retries": int(retries),
+                "hash_cap": int(_hash_cap),
+            }
+
+        keep = min(int(max_add_i), int(nvalid))
+        valid_pos = _cp.nonzero(valid)[0]
+        if int(valid_pos.size) > int(keep):
+            part = _cp.argpartition(score_bits_d[valid_pos], -int(keep))[-int(keep):]
+            chosen = valid_pos[part]
+        else:
+            chosen = valid_pos
+
+        chosen_score = np.asarray(_cp.asnumpy(score_bits_d[chosen]), dtype=np.uint64)
+        chosen_idx_u64 = np.asarray(_cp.asnumpy(cand_idx_u64[chosen]), dtype=np.uint64)
+        order = np.lexsort((chosen_idx_u64, -chosen_score.astype(np.int64, copy=False)))
+        new_idx_h = [int(x) for x in chosen_idx_u64[order].tolist()]
+        return new_idx_h, e_pt2_h, {
+            "ncand": int(ncand),
+            "nvalid": int(nvalid),
+            "overflow_retries": int(retries),
+            "hash_cap": int(_hash_cap),
+        }
+
     for it in range(1, int(max_iter) + 1):
         sel_idx = np.asarray(sel, dtype=np.int64)
+        row_cache_iter: dict[int, tuple[np.ndarray, np.ndarray]] | None = {} if use_row_cache else None
         h_sub = _build_variational_hamiltonian_sparse(
             drt,
             h1e,
@@ -410,6 +741,7 @@ def run_cipsi_trials(
             max_out=200_000,
             screening=None,
             state_cache=state_cache,
+            row_cache=row_cache_iter,
         )
         ci0_sub = _build_ci0_subspace_sparse(
             sel_idx=sel_idx,
@@ -433,38 +765,62 @@ def run_cipsi_trials(
             c_sel = np.asarray(c_sel[:, perm], dtype=np.float64)
 
         max_add = min(int(grow_by), int(max_ncsf) - int(sel_idx.size))
-        if selection_mode_s == "frontier_hash":
-            new_idx, e_pt2, _stats = frontier_selector.build_and_score(
-                sel_idx=sel_idx,
-                c_sel=c_sel,
-                e_var=e_var,
-                max_add=int(max_add),
-                select_threshold=select_threshold,
-            )
-        else:
+        cuda_iter_stats: dict[str, Any] = {}
+        hb_eps_iter = 0.0
+        if selection_mode_s == "heat_bath":
             if str(hb_eps_schedule).lower() == "adaptive":
                 frac = 0.0 if int(max_ncsf) <= int(init_ncsf) else (int(sel_idx.size) - int(init_ncsf)) / max(
                     1, int(max_ncsf) - int(init_ncsf)
                 )
                 frac = float(np.clip(frac, 0.0, 1.0))
-                _eps = float(hb_eps_init) * (float(hb_eps_final) / float(hb_eps_init)) ** frac
+                hb_eps_iter = float(hb_eps_init) * (float(hb_eps_final) / float(hb_eps_init)) ** frac
             else:
-                _eps = float(hb_epsilon)
-            new_idx, e_pt2 = heat_bath_select_and_pt2_sparse(
-                drt,
-                h1e,
-                eri,
-                sel_idx=sel_idx,
-                c_sel=c_sel,
-                e_var=e_var,
-                max_add=int(max_add),
-                epsilon=float(_eps),
-                denom_floor=float(denom_floor),
-                hdiag_lookup=hdiag_lookup,
-                max_out=200_000,
-                screening=None,
-                state_cache=state_cache,
-            )
+                hb_eps_iter = float(hb_epsilon)
+
+        if cuda_selector_enabled:
+            try:
+                eps_run = 0.0 if selection_mode_s == "frontier_hash" else float(hb_eps_iter)
+                new_idx, e_pt2, cuda_iter_stats = _cuda_select_external(
+                    sel_idx_i64=sel_idx,
+                    c_sel_arr=c_sel,
+                    e_var_arr=e_var,
+                    max_add_i=int(max_add),
+                    eps_val=float(eps_run),
+                )
+            except Exception as cuda_step_e:
+                cuda_selector_enabled = False
+                profile["cuda_selector_step_fallback_iter"] = int(it)
+                profile["cuda_selector_step_fallback_reason"] = f"{type(cuda_step_e).__name__}: {cuda_step_e}"
+                profile["driver"] = "sparse_row_oracle"
+
+        if not cuda_selector_enabled:
+            if selection_mode_s == "frontier_hash":
+                new_idx, e_pt2, _stats = frontier_selector.build_and_score(
+                    sel_idx=sel_idx,
+                    c_sel=c_sel,
+                    e_var=e_var,
+                    max_add=int(max_add),
+                    select_threshold=select_threshold,
+                    row_cache=row_cache_iter,
+                )
+            else:
+                new_idx, e_pt2 = heat_bath_select_and_pt2_sparse(
+                    drt,
+                    h1e,
+                    eri,
+                    sel_idx=sel_idx,
+                    c_sel=c_sel,
+                    e_var=e_var,
+                    max_add=int(max_add),
+                    epsilon=float(hb_eps_iter),
+                    denom_floor=float(denom_floor),
+                    hdiag_lookup=hdiag_lookup,
+                    max_out=200_000,
+                    screening=None,
+                    state_cache=state_cache,
+                    row_cache=row_cache_iter,
+                )
+
         for ii in new_idx:
             jj = int(ii)
             if jj in loc_map:
@@ -495,6 +851,8 @@ def run_cipsi_trials(
             "davidson_attempts": [],
             "cpu_subspace_refined": False,
         }
+        if cuda_iter_stats:
+            rec["cuda_selector"] = dict(cuda_iter_stats)
         history.append(rec)
         prev_c_sel = np.asarray(c_sel, dtype=np.float64)
         if verbose:
@@ -503,6 +861,7 @@ def run_cipsi_trials(
             break
 
     sel_idx = np.asarray(sel, dtype=np.int64)
+    row_cache_final: dict[int, tuple[np.ndarray, np.ndarray]] | None = {} if use_row_cache else None
     h_sub = _build_variational_hamiltonian_sparse(
         drt,
         h1e,
@@ -512,6 +871,7 @@ def run_cipsi_trials(
         max_out=200_000,
         screening=None,
         state_cache=state_cache,
+        row_cache=row_cache_final,
     )
     ci0_sub = _build_ci0_subspace_sparse(
         sel_idx=sel_idx,
@@ -537,13 +897,27 @@ def run_cipsi_trials(
     if np.any(perm != np.arange(int(nroots), dtype=np.int32)):
         e_var = np.asarray(e_var[perm], dtype=np.float64)
         c_sel = np.asarray(c_sel[:, perm], dtype=np.float64)
-    if selection_mode_s == "frontier_hash":
+    if cuda_selector_enabled:
+        eps_final = 0.0
+        if selection_mode_s == "heat_bath":
+            eps_final = float(hb_eps_final) if str(hb_eps_schedule).lower() == "adaptive" else float(hb_epsilon)
+        _new_idx, e_pt2, cuda_final_stats = _cuda_select_external(
+            sel_idx_i64=np.asarray(sel_idx, dtype=np.int64),
+            c_sel_arr=c_sel,
+            e_var_arr=e_var,
+            max_add_i=0,
+            eps_val=float(eps_final),
+        )
+        profile["cuda_selector_final_stats"] = dict(cuda_final_stats)
+        assert len(_new_idx) == 0
+    elif selection_mode_s == "frontier_hash":
         _new_idx, e_pt2, _stats = frontier_selector.build_and_score(
             sel_idx=np.asarray(sel_idx, dtype=np.int64),
             c_sel=c_sel,
             e_var=e_var,
             max_add=0,
             select_threshold=select_threshold,
+            row_cache=row_cache_final,
         )
         assert len(_new_idx) == 0
     else:
@@ -562,6 +936,7 @@ def run_cipsi_trials(
             max_out=200_000,
             screening=None,
             state_cache=state_cache,
+            row_cache=row_cache_final,
         )
     roots = _sparse_roots_from_selected(sel_idx, c_sel)
     sel_key_u64 = None
@@ -571,6 +946,15 @@ def run_cipsi_trials(
 
         sel_key_u64 = np.asarray(csf_idx_to_key64_host(drt, sel_idx, state_cache=None), dtype=np.uint64, order="C")
         label_kind = "key64"
+    elif state_rep_s == "i64":
+        sel_idx_i64 = np.asarray(sel_idx, dtype=np.int64).ravel()
+        if sel_idx_i64.size:
+            if int(np.min(sel_idx_i64)) < 0:
+                raise ValueError("selected indices must be non-negative for idx64 label mode")
+            if int(np.max(sel_idx_i64)) >= int(ncsf):
+                raise ValueError("selected indices must be < drt.ncsf for idx64 label mode")
+        sel_key_u64 = np.asarray(sel_idx_i64, dtype=np.uint64, order="C")
+        label_kind = "idx64"
     return CIPSITrialSpaceResult(
         e_var=np.asarray(e_var + float(ecore), dtype=np.float64),
         e_pt2=np.asarray(e_pt2, dtype=np.float64),

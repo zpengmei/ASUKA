@@ -1,6 +1,6 @@
 def epq_apply_g_cy(
     drt,
-    int csf_idx,
+    long long csf_idx,
     cnp.ndarray[cnp.float64_t, ndim=1] g_flat,
     cnp.ndarray[cnp.int8_t, ndim=1] steps,
     cnp.ndarray[cnp.int32_t, ndim=1] nodes,
@@ -19,6 +19,7 @@ def epq_apply_g_cy(
     """
 
     _ensure_tables()
+    cdef bint use_i64 = int(drt.ncsf) > 2147483647
 
     cdef int norb = int(drt.norb)
     if int(drt.nelec) > _seg_lut_max_b:
@@ -37,7 +38,7 @@ def epq_apply_g_cy(
     # Cached prefix-walk counts (shared across all pairs for this DRT).
     cdef cnp.int64_t[:, ::1] child_prefix = _get_child_prefix(drt)
 
-    cdef vector[int] out_idx
+    cdef vector[long long] out_idx
     cdef vector[double] out_val
     # Typical ~3 contributions per selected (p,q) pair; reserve to reduce reallocs.
     out_idx.reserve(<size_t>(norb * norb * 3))
@@ -132,7 +133,6 @@ def epq_apply_g_cy(
     cdef double w2
     cdef long long seg_idx2
     cdef long long csf_i_ll
-    cdef int csf_i
     cdef double val
 
     cdef long long n_pairs = 0
@@ -223,12 +223,11 @@ def epq_apply_g_cy(
                                 if is_last:
                                     if child_k == node_end_target:
                                         csf_i_ll = prefix_offset + seg_idx2 + suffix_offset
-                                        csf_i = <int>csf_i_ll
-                                        if csf_i != csf_idx:
+                                        if csf_i_ll != csf_idx:
                                             val = wgt * w2
                                             if tc <= 0.0 or fabs(val) > tc:
                                                 if val != 0.0:
-                                                    out_idx.push_back(csf_i)
+                                                    out_idx.push_back(csf_i_ll)
                                                     out_val.push_back(val)
                                 else:
                                     st_k.push_back(k_next)
@@ -248,12 +247,11 @@ def epq_apply_g_cy(
                                 if is_last:
                                     if child_k == node_end_target:
                                         csf_i_ll = prefix_offset + seg_idx2 + suffix_offset
-                                        csf_i = <int>csf_i_ll
-                                        if csf_i != csf_idx:
+                                        if csf_i_ll != csf_idx:
                                             val = wgt * w2
                                             if tc <= 0.0 or fabs(val) > tc:
                                                 if val != 0.0:
-                                                    out_idx.push_back(csf_i)
+                                                    out_idx.push_back(csf_i_ll)
                                                     out_val.push_back(val)
                                 else:
                                     st_k.push_back(k_next)
@@ -273,12 +271,11 @@ def epq_apply_g_cy(
                                 if is_last:
                                     if child_k == node_end_target:
                                         csf_i_ll = prefix_offset + seg_idx2 + suffix_offset
-                                        csf_i = <int>csf_i_ll
-                                        if csf_i != csf_idx:
+                                        if csf_i_ll != csf_idx:
                                             val = wgt * w2
                                             if tc <= 0.0 or fabs(val) > tc:
                                                 if val != 0.0:
-                                                    out_idx.push_back(csf_i)
+                                                    out_idx.push_back(csf_i_ll)
                                                     out_val.push_back(val)
                                 else:
                                     st_k.push_back(k_next)
@@ -301,14 +298,13 @@ def epq_apply_g_cy(
                                 if child_k != node_end_target:
                                     continue
                                 csf_i_ll = prefix_offset + seg_idx2 + suffix_offset
-                                csf_i = <int>csf_i_ll
-                                if csf_i == csf_idx:
+                                if csf_i_ll == csf_idx:
                                     continue
                                 val = wgt * w2
                                 if tc > 0.0 and fabs(val) <= tc:
                                     continue
                                 if val != 0.0:
-                                    out_idx.push_back(csf_i)
+                                    out_idx.push_back(csf_i_ll)
                                     out_val.push_back(val)
                             else:
                                 st_k.push_back(k_next)
@@ -317,15 +313,26 @@ def epq_apply_g_cy(
                                 st_seg.push_back(seg_idx2)
 
     cdef Py_ssize_t n_out = <Py_ssize_t>out_idx.size()
-    cdef cnp.ndarray[cnp.int32_t, ndim=1] idx_arr = np.empty(n_out, dtype=np.int32)
+    cdef cnp.ndarray[cnp.int64_t, ndim=1] idx_arr64
+    cdef cnp.ndarray[cnp.int32_t, ndim=1] idx_arr32
     cdef cnp.ndarray[cnp.float64_t, ndim=1] val_arr = np.empty(n_out, dtype=np.float64)
-    cdef cnp.int32_t[::1] idx_view = idx_arr
+    cdef cnp.int64_t[::1] idx_view64
+    cdef cnp.int32_t[::1] idx_view32
     cdef double[::1] val_view = val_arr
     cdef Py_ssize_t i
+
+    if use_i64:
+        idx_arr64 = np.empty(n_out, dtype=np.int64)
+        idx_view64 = idx_arr64
+        for i in range(n_out):
+            idx_view64[i] = <cnp.int64_t>out_idx[i]
+            val_view[i] = <double>out_val[i]
+        return idx_arr64, val_arr, <int>n_pairs
+
+    idx_arr32 = np.empty(n_out, dtype=np.int32)
+    idx_view32 = idx_arr32
     for i in range(n_out):
-        idx_view[i] = <cnp.int32_t>out_idx[i]
+        idx_view32[i] = <cnp.int32_t>out_idx[i]
         val_view[i] = <double>out_val[i]
 
-    return idx_arr, val_arr, <int>n_pairs
-
-
+    return idx_arr32, val_arr, <int>n_pairs

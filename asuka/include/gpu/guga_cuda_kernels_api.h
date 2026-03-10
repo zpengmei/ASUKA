@@ -2487,4 +2487,33 @@ extern "C" cudaError_t cas36_cipsi_score_pt2_compact_u64_launch_stream(
     cudaStream_t stream,
     int threads);
 
+extern "C" cudaError_t cas36_hb_screen_and_apply_u64_launch_stream(
+    const uint64_t* sel_idx_u64,
+    const double* c_root,
+    int nsel,
+    int root,
+    int norb,
+    uint64_t ncsf,
+    const int32_t* h1_pq,
+    const double* h1_abs,
+    const double* h1_signed,
+    int n_h1,
+    const int64_t* pq_ptr,
+    const int32_t* rs_idx,
+    const double* v_abs,
+    const double* v_signed,
+    const double* pq_max_v,
+    double eps,
+    const int32_t* child_table,
+    const int16_t* node_twos,
+    const int64_t* child_prefix,
+    uint64_t* hash_keys,
+    double* hash_vals,
+    int cap,
+    const uint64_t* selected_idx_sorted_u64,
+    int nselected,
+    int* overflow_flag,
+    cudaStream_t stream,
+    int threads);
+
 #endif  // CUGUGA_GPU_GUGA_CUDA_KERNELS_API_H

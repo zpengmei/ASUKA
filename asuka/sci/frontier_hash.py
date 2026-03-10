@@ -8,7 +8,7 @@ import numpy as np
 from asuka.cuguga.drt import DRT
 from asuka.cuguga.state_cache import DRTStateCache
 from asuka.cuguga.screening import RowScreening
-from asuka.sci.selected_ci import DiagonalGuessLookup, _select_external_sparse
+from asuka.sci.selected_ci import ConnectedRowCache, DiagonalGuessLookup, _select_external_sparse
 
 
 @dataclass
@@ -66,6 +66,7 @@ class SparseFrontierSelector:
         max_add: int,
         select_threshold: float | None = None,
         profile: bool = False,
+        row_cache: ConnectedRowCache | None = None,
     ) -> tuple[list[int], np.ndarray, FrontierHashStats]:
         _ = bool(profile)
         new_idx, e_pt2 = _select_external_sparse(
@@ -84,6 +85,7 @@ class SparseFrontierSelector:
             screening=self.screening,
             state_cache=self.state_cache,
             select_screen_contrib=float(self.select_screen_contrib),
+            row_cache=row_cache,
         )
         stats = FrontierHashStats(
             hash_cap=0,

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import os
 from types import SimpleNamespace
 
 import numpy as np
@@ -200,6 +201,33 @@ _expanded_cart_basis_cache: dict[int, tuple[weakref.ref, object]] = {}
 # Kernel classes with native Step-2 kernels (centralized in native_class_sets.py).
 _STEP2_BASE_CLASS_IDS: set[int] = {int(cid) for cid in STEP2_NATIVE_CLASS_IDS}
 
+# Hot fixed-class kernels to tune in mode="auto" (DF int3c2e heavy hitters on 20-H2O).
+_HOTCLASS_TUNE_CLASS_IDS: set[int] = {
+    int(eri_class_id(1, 0, 2, 0)) & 0xFFFFFFFF,  # psds
+    int(eri_class_id(2, 0, 2, 0)) & 0xFFFFFFFF,  # dsds
+    int(eri_class_id(0, 0, 3, 0)) & 0xFFFFFFFF,  # ssfs
+    int(eri_class_id(1, 0, 3, 0)) & 0xFFFFFFFF,  # psfs
+    int(eri_class_id(1, 1, 2, 0)) & 0xFFFFFFFF,  # ppds
+    int(eri_class_id(2, 0, 2, 1)) & 0xFFFFFFFF,  # dsdp
+}
+
+# (device_id, class_id_u32, threads_cap, default_launch_threads) -> (mode, threads, blocks_per_task)
+_ERI_HOTCLASS_TUNE_CACHE: dict[tuple[int, int, int, int], tuple[str, int, int]] = {}
+_ERI_HOTCLASS_TUNED_CLASSES_BY_DEVICE: dict[int, set[int]] = {}
+
+
+def _env_flag(name: str, default: bool) -> bool:
+    v = str(os.environ.get(str(name), "1" if bool(default) else "0")).strip().lower()
+    return v not in {"0", "false", "off", "no", ""}
+
+
+def _env_int(name: str, default: int, *, min_value: int = 0) -> int:
+    try:
+        val = int(str(os.environ.get(str(name), str(int(default)))).strip())
+    except Exception:
+        val = int(default)
+    return max(int(min_value), int(val))
+
 
 def _task_arrays_device_cached(tasks: TaskList):
     """Return device-resident, contiguous int32 task arrays with per-TaskList caching.
@@ -285,6 +313,23 @@ def clear_plan_caches() -> None:
         pass
     try:
         _expanded_cart_basis_cache.clear()
+    except Exception:
+        pass
+    try:
+        clear_eri_hotclass_tune_cache()
+    except Exception:
+        pass
+
+
+def clear_eri_hotclass_tune_cache() -> None:
+    """Clear in-process hot fixed-class launch autotune cache."""
+
+    try:
+        _ERI_HOTCLASS_TUNE_CACHE.clear()
+    except Exception:
+        pass
+    try:
+        _ERI_HOTCLASS_TUNED_CLASSES_BY_DEVICE.clear()
     except Exception:
         pass
 
@@ -4413,6 +4458,7 @@ def _eri_fixed_class_specialized_device(
     lc = int(lc)
     ld = int(ld)
     ncomp = int(ncart(la)) * int(ncart(lb)) * int(ncart(lc)) * int(ncart(ld))
+    cid_u32 = int(eri_class_id(int(la), int(lb), int(lc), int(ld))) & 0xFFFFFFFF
     threads = int(threads)
     if threads <= 0:
         raise ValueError("threads must be > 0")
@@ -4428,6 +4474,15 @@ def _eri_fixed_class_specialized_device(
     mode = mode.lower().strip()
     if mode not in ("block", "warp", "multiblock", "auto"):
         raise ValueError("mode must be one of: 'block', 'warp', 'multiblock', 'auto'")
+    if mode == "warp":
+        min_warp_threads = int(_env_int("ASUKA_CUERI_FIXEDCLASS_WARP_MIN_THREADS", 32, min_value=32))
+        min_warp_threads = int(max(32, min(256, (min_warp_threads // 32) * 32)))
+    else:
+        min_warp_threads = 32
+    if mode == "warp" and int(threads_launch) < int(min_warp_threads):
+        # Allow raising minimum fixed-class warp launch width from env for
+        # device-specific tuning.
+        threads_launch = int(min_warp_threads)
 
     has_native = all(hasattr(_ext, name) for name in (ext_block_name, ext_warp_name, ext_multiblock_name))
     if not has_native:
@@ -4510,12 +4565,13 @@ def _eri_fixed_class_specialized_device(
 
     with stream_ctx(stream):
         task_ab, task_cd = _task_arrays_device_cached(tasks)
+        stream_ptr_i = int(_stream_ptr(stream))
 
         out = cp.empty((tasks.ntasks, ncomp), dtype=cp.float64)
         if tasks.ntasks == 0:
             return out.ravel()
 
-        def _launch_block(ab_idx, cd_idx, out_buf):
+        def _launch_block(ab_idx, cd_idx, out_buf, *, threads_i: int = threads_launch):
             block_fn(
                 ab_idx,
                 cd_idx,
@@ -4532,14 +4588,14 @@ def _eri_fixed_class_specialized_device(
                 pair_tables.pair_Pz,
                 pair_tables.pair_cK,
                 out_buf,
-                int(threads_launch),
-                int(_stream_ptr(stream)),
+                int(threads_i),
+                stream_ptr_i,
                 False,
             )
 
-        def _launch_warp_or_block(ab_idx, cd_idx, out_buf):
+        def _launch_warp_or_block(ab_idx, cd_idx, out_buf, *, threads_i: int = threads_launch):
             if not warp_supported:
-                _launch_block(ab_idx, cd_idx, out_buf)
+                _launch_block(ab_idx, cd_idx, out_buf, threads_i=int(threads_i))
                 return
             if not bool(fallback_invalid_warp_to_block):
                 warp_fn(
@@ -4558,8 +4614,8 @@ def _eri_fixed_class_specialized_device(
                     pair_tables.pair_Pz,
                     pair_tables.pair_cK,
                     out_buf,
-                    int(threads_launch),
-                    int(_stream_ptr(stream)),
+                    int(threads_i),
+                    stream_ptr_i,
                     False,
                 )
                 return
@@ -4580,31 +4636,31 @@ def _eri_fixed_class_specialized_device(
                     pair_tables.pair_Pz,
                     pair_tables.pair_cK,
                     out_buf,
-                    int(threads_launch),
-                    int(_stream_ptr(stream)),
+                    int(threads_i),
+                    stream_ptr_i,
                     False,
                 )
             except Exception as exc:
                 msg = str(exc).lower()
                 if "invalid argument" not in msg:
                     raise
-                _launch_block(ab_idx, cd_idx, out_buf)
+                _launch_block(ab_idx, cd_idx, out_buf, threads_i=int(threads_i))
 
-        if mode == "block":
-            _launch_block(task_ab, task_cd, out.ravel())
-            return out.ravel()
-
-        if mode == "warp":
-            _launch_warp_or_block(task_ab, task_cd, out.ravel())
-            return out.ravel()
-
-        if mode == "multiblock":
-            if blocks_per_task <= 0:
+        def _launch_multiblock(
+            ab_idx,
+            cd_idx,
+            out_buf,
+            *,
+            threads_i: int = threads_launch,
+            blocks_i: int = blocks_per_task,
+        ):
+            blocks_i = int(blocks_i)
+            if blocks_i <= 0:
                 raise ValueError("blocks_per_task must be > 0")
-            partial = cp.empty((tasks.ntasks * int(blocks_per_task) * ncomp,), dtype=cp.float64)
+            partial = cp.empty((int(ab_idx.shape[0]) * blocks_i * ncomp,), dtype=cp.float64)
             multiblock_fn(
-                task_ab,
-                task_cd,
+                ab_idx,
+                cd_idx,
                 shell_pairs.sp_A,
                 shell_pairs.sp_B,
                 shell_pairs.sp_pair_start,
@@ -4618,13 +4674,98 @@ def _eri_fixed_class_specialized_device(
                 pair_tables.pair_Pz,
                 pair_tables.pair_cK,
                 partial,
-                int(blocks_per_task),
-                out.ravel(),
-                int(threads_launch),
-                int(_stream_ptr(stream)),
+                int(blocks_i),
+                out_buf,
+                int(threads_i),
+                stream_ptr_i,
                 False,
             )
+
+        if mode == "block":
+            _launch_block(task_ab, task_cd, out.ravel())
             return out.ravel()
+
+        if mode == "warp":
+            _launch_warp_or_block(task_ab, task_cd, out.ravel())
+            return out.ravel()
+
+        if mode == "multiblock":
+            _launch_multiblock(task_ab, task_cd, out.ravel())
+            return out.ravel()
+
+        # Optional hot fixed-class launch autotune for mode="auto".
+        if bool(_env_flag("ASUKA_CUERI_HOTCLASS_AUTOTUNE", True)) and int(cid_u32) in _HOTCLASS_TUNE_CLASS_IDS:
+            device_id = int(cp.cuda.runtime.getDevice())
+            cache_key = (int(device_id), int(cid_u32), int(threads), int(threads_launch))
+            tuned = _ERI_HOTCLASS_TUNE_CACHE.get(cache_key)
+            if tuned is None:
+                max_classes = int(_env_int("ASUKA_CUERI_HOTCLASS_AUTOTUNE_MAX_CLASSES", 6, min_value=0))
+                tuned_classes = _ERI_HOTCLASS_TUNED_CLASSES_BY_DEVICE.setdefault(int(device_id), set())
+                may_tune = int(cid_u32) in tuned_classes or int(len(tuned_classes)) < int(max_classes)
+                if may_tune:
+                    sample_tasks = int(_env_int("ASUKA_CUERI_HOTCLASS_AUTOTUNE_SAMPLE_TASKS", 8192, min_value=1))
+                    nsamp = int(min(int(task_ab.shape[0]), int(sample_tasks)))
+                    if nsamp > 0:
+                        ab_s = cp.ascontiguousarray(task_ab[:nsamp])
+                        cd_s = cp.ascontiguousarray(task_cd[:nsamp])
+                        threads_256 = int(min(256, max(32, int(threads))))
+                        threads_256 = int(max(32, (threads_256 // 32) * 32))
+                        candidates_raw = [
+                            ("block", int(threads_launch), 1),
+                            ("block", int(threads_256), 1),
+                            ("multiblock", int(threads_launch), 4),
+                            ("multiblock", int(threads_launch), 8),
+                        ]
+                        candidates = []
+                        seen = set()
+                        for m, thr, bpt in candidates_raw:
+                            key = (str(m), int(thr), int(bpt))
+                            if key in seen:
+                                continue
+                            seen.add(key)
+                            candidates.append((str(m), int(thr), int(bpt)))
+
+                        s0 = cp.cuda.get_current_stream()
+                        best: tuple[str, int, int] | None = None
+                        best_ms = float("inf")
+                        for m, thr, bpt in candidates:
+                            try:
+                                out_s = cp.empty((nsamp, ncomp), dtype=cp.float64)
+                                # Warm-up candidate once to reduce first-launch noise.
+                                if m == "multiblock":
+                                    _launch_multiblock(ab_s, cd_s, out_s.ravel(), threads_i=int(thr), blocks_i=int(bpt))
+                                else:
+                                    _launch_block(ab_s, cd_s, out_s.ravel(), threads_i=int(thr))
+                                s0.synchronize()
+
+                                e0 = cp.cuda.Event()
+                                e1 = cp.cuda.Event()
+                                e0.record(s0)
+                                if m == "multiblock":
+                                    _launch_multiblock(ab_s, cd_s, out_s.ravel(), threads_i=int(thr), blocks_i=int(bpt))
+                                else:
+                                    _launch_block(ab_s, cd_s, out_s.ravel(), threads_i=int(thr))
+                                e1.record(s0)
+                                e1.synchronize()
+                                ms = float(cp.cuda.get_elapsed_time(e0, e1))
+                                if ms < best_ms:
+                                    best_ms = ms
+                                    best = (str(m), int(thr), int(bpt))
+                            except Exception:
+                                continue
+
+                        if best is not None:
+                            _ERI_HOTCLASS_TUNE_CACHE[cache_key] = best
+                            tuned_classes.add(int(cid_u32))
+                            tuned = best
+
+            if tuned is not None:
+                m, thr, bpt = tuned
+                if str(m) == "multiblock":
+                    _launch_multiblock(task_ab, task_cd, out.ravel(), threads_i=int(thr), blocks_i=int(bpt))
+                else:
+                    _launch_block(task_ab, task_cd, out.ravel(), threads_i=int(thr))
+                return out.ravel()
 
         # mode == "auto": bin by a crude work proxy.
         if work_small_max < 0 or work_large_min < 0:
@@ -4656,34 +4797,10 @@ def _eri_fixed_class_specialized_device(
             out[med_idx] = out_med
 
         if int(large_idx.size) > 0:
-            if blocks_per_task <= 0:
-                raise ValueError("blocks_per_task must be > 0")
             ab_large = cp.ascontiguousarray(task_ab[large_idx])
             cd_large = cp.ascontiguousarray(task_cd[large_idx])
             out_large = cp.empty((int(ab_large.shape[0]), ncomp), dtype=cp.float64)
-            partial = cp.empty((int(ab_large.shape[0]) * int(blocks_per_task) * ncomp,), dtype=cp.float64)
-            multiblock_fn(
-                ab_large,
-                cd_large,
-                shell_pairs.sp_A,
-                shell_pairs.sp_B,
-                shell_pairs.sp_pair_start,
-                shell_pairs.sp_npair,
-                basis.shell_cx,
-                basis.shell_cy,
-                basis.shell_cz,
-                pair_tables.pair_eta,
-                pair_tables.pair_Px,
-                pair_tables.pair_Py,
-                pair_tables.pair_Pz,
-                pair_tables.pair_cK,
-                partial,
-                int(blocks_per_task),
-                out_large.ravel(),
-                int(threads_launch),
-                int(_stream_ptr(stream)),
-                False,
-            )
+            _launch_multiblock(ab_large, cd_large, out_large.ravel(), threads_i=int(threads_launch), blocks_i=int(blocks_per_task))
             out[large_idx] = out_large
         return out.ravel()
 
@@ -4719,7 +4836,7 @@ def eri_ssdp_device(
         work_small_max=work_small_max,
         work_large_min=work_large_min,
         blocks_per_task=blocks_per_task,
-        tuned_threads=256,
+        tuned_threads=128,
         allow_generic_fallback=False,
         fallback_invalid_warp_to_block=False,
     )
@@ -6728,6 +6845,8 @@ __all__ = [
     "DeviceShellPairs",
     "build_entry_csr_device",
     "build_pair_tables_ss_device",
+    "clear_eri_hotclass_tune_cache",
+    "clear_plan_caches",
     "df_int3c2e_ss_device",
     "df_int3c2e_sp_device",
     "df_int3c2e_rys_device",

@@ -16,9 +16,7 @@ Notes
 
 from collections import OrderedDict
 from dataclasses import dataclass, replace as _dc_replace
-import json
 import os
-import threading
 from typing import Any, TYPE_CHECKING
 
 import numpy as np
@@ -30,11 +28,42 @@ from asuka.integrals.cueri_df import CuERIDFConfig, build_df_B_from_cueri_packed
 from asuka.integrals.cueri_df_cpu import build_df_B_from_cueri_packed_bases_cpu
 from asuka.integrals.int1e_cart import Int1eResult, build_int1e_cart
 
-from .basis_bse import load_autoaux_shells, load_basis_shells
-from .basis_packer import pack_cart_basis, parse_pyscf_basis_dict
 from .molecule import Molecule
 from .one_electron import build_ao_basis_cart
-from .periodic_table import atomic_number
+from ._scf_build import (
+    apply_sph_transform as _apply_sph_transform_impl,
+    atom_coords_charges_bohr as _atom_coords_charges_bohr_impl,
+    build_aux_basis_cart as _build_aux_basis_cart_impl,
+    init_guess_dm_atom_hcore_cart as _init_guess_dm_atom_hcore_cart_impl,
+    unique_elements as _unique_elements_impl,
+)
+from ._scf_cache import (
+    cache_clear_all as _cache_clear_all,
+    cache_get as _cache_get,
+    cache_put as _cache_put,
+    cuda_device_id_or_neg1 as _cuda_device_id_or_neg1,
+    mol_cache_key as _mol_cache_key,
+    normalize_basis_key as _normalize_basis_key,
+)
+from ._scf_config import (
+    df_config_key as _df_config_key,
+    resolve_cueri_df_config as _resolve_cueri_df_config,
+)
+from ._scf_df_build import (
+    build_df_metric_cholesky as _build_df_metric_cholesky_impl,
+    prepare_direct_df_inputs as _prepare_direct_df_inputs_impl,
+)
+from ._scf_dispatch import run_hf_df_dispatch as _run_hf_df_dispatch
+from ._scf_methods import (
+    run_rhf_df_impl as _run_rhf_df_impl,
+    run_rhf_df_cpu_impl as _run_rhf_df_cpu_impl,
+    run_rohf_df_cpu_impl as _run_rohf_df_cpu_impl,
+    run_rohf_df_impl as _run_rohf_df_impl,
+    run_rks_df_impl as _run_rks_df_impl,
+    run_uhf_df_cpu_impl as _run_uhf_df_cpu_impl,
+    run_uhf_df_impl as _run_uhf_df_impl,
+    run_uks_df_impl as _run_uks_df_impl,
+)
 
 if TYPE_CHECKING:
     from asuka.integrals.cart2sph import AOSphericalTransform
@@ -155,51 +184,13 @@ def _apply_sph_transform(
     *,
     df_B_layout: str = "mnQ",
 ) -> tuple[Int1eResult, Any, AOSphericalTransform | None]:
-    """If ``mol.cart=False``, transform int1e and B to spherical AOs.
-
-    Returns ``(int1e, B, sph_map_or_None)``.
-    """
-    if bool(mol.cart):
-        return int1e, B, None
-
-    from asuka.integrals.cart2sph import (  # noqa: PLC0415
-        AOSphericalTransform,
-        build_cart2sph_matrix,
-        compute_sph_layout_from_cart_basis,
-        transform_1e_cart_to_sph,
-        transform_df_B_cart_to_sph,
+    return _apply_sph_transform_impl(
+        mol,
+        int1e,
+        B,
+        ao_basis,
+        df_B_layout=df_B_layout,
     )
-
-    shell_l = np.asarray(ao_basis.shell_l, dtype=np.int32).ravel()
-    if int(shell_l.size) and int(np.max(shell_l)) > 5:
-        raise ValueError(
-            "Spherical AO transform supports basis shells up to l<=5. "
-            f"Got max(shell_l)={int(np.max(shell_l))}. Use cart=True for higher angular momentum."
-        )
-    shell_ao_start_cart = np.asarray(ao_basis.shell_ao_start, dtype=np.int32).ravel()
-    shell_ao_start_sph, nao_sph = compute_sph_layout_from_cart_basis(ao_basis)
-    nao_cart = int(int1e.S.shape[0])
-
-    T = build_cart2sph_matrix(shell_l, shell_ao_start_cart, shell_ao_start_sph, nao_cart, nao_sph)
-
-    S_sph = transform_1e_cart_to_sph(int1e.S, T)
-    T_kin_sph = transform_1e_cart_to_sph(int1e.T, T)
-    V_sph = transform_1e_cart_to_sph(int1e.V, T)
-    int1e_sph = Int1eResult(S=S_sph, T=T_kin_sph, V=V_sph)
-
-    if B is not None:
-        B_sph = transform_df_B_cart_to_sph(
-            B,
-            T,
-            shell_l=shell_l,
-            shell_ao_start_cart=shell_ao_start_cart,
-            shell_ao_start_sph=shell_ao_start_sph,
-            out_layout=str(df_B_layout),
-        )
-    else:
-        B_sph = None
-
-    return int1e_sph, B_sph, AOSphericalTransform(T_c2s=T, nao_cart=nao_cart, nao_sph=nao_sph)
 
 
 @dataclass(frozen=True)
@@ -281,59 +272,8 @@ def _env_float(name: str, default: float) -> float:
 
 
 _HF_DENSE_MEM_BUDGET_GIB = _env_float("ASUKA_HF_DENSE_MEM_BUDGET_GIB", 8.0)
-_HF_CACHE_LOCK = threading.Lock()
 _RHF_PREP_CACHE: "OrderedDict[tuple[Any, ...], tuple[Any, str, Int1eResult, Any, str, Any]]" = OrderedDict()
 _RHF_GUESS_CACHE: "OrderedDict[tuple[Any, ...], Any]" = OrderedDict()
-
-
-def _cache_get(cache: OrderedDict, key: tuple[Any, ...]):
-    with _HF_CACHE_LOCK:
-        hit = cache.get(key)
-        if hit is None:
-            return None
-        cache.move_to_end(key)
-        return hit
-
-
-def _cache_put(cache: OrderedDict, key: tuple[Any, ...], val: Any, max_size: int):
-    if int(max_size) <= 0:
-        return
-    with _HF_CACHE_LOCK:
-        cache[key] = val
-        cache.move_to_end(key)
-        while len(cache) > int(max_size):
-            cache.popitem(last=False)
-
-
-def _normalize_basis_key(spec: Any) -> tuple[str, str]:
-    if isinstance(spec, str):
-        return ("str", str(spec).strip().lower())
-    if isinstance(spec, dict):
-        try:
-            txt = json.dumps(spec, sort_keys=True, separators=(",", ":"), default=str)
-        except Exception:
-            txt = repr(spec)
-        return ("dict", txt)
-    return (type(spec).__name__, repr(spec))
-
-
-def _mol_cache_key(mol: Molecule) -> tuple[Any, ...]:
-    atoms = []
-    for sym, xyz in mol.atoms_bohr:
-        x, y, z = map(float, np.asarray(xyz, dtype=np.float64).reshape((3,)))
-        atoms.append((str(sym), round(x, 12), round(y, 12), round(z, 12)))
-    return (tuple(atoms), int(mol.charge), int(mol.spin), bool(mol.cart))
-
-
-def _cuda_device_id_or_neg1() -> int:
-    try:
-        import cupy as cp  # noqa: PLC0415
-    except Exception:
-        return -1
-    try:
-        return int(cp.cuda.Device().id)
-    except Exception:
-        return -1
 
 
 def _make_thc_run_config(
@@ -444,214 +384,56 @@ def _make_df_run_config(
     )
 
 
+def _build_df_metric_cholesky(
+    aux_basis,
+    *,
+    df_config: CuERIDFConfig | None = None,
+    profile: dict | None = None,
+):
+    return _build_df_metric_cholesky_impl(
+        aux_basis,
+        df_config=df_config,
+        profile=profile,
+    )
+
+
+def _prepare_direct_df_inputs(
+    mol: Molecule,
+    *,
+    basis_in: Any,
+    auxbasis: Any,
+    expand_contractions: bool,
+    df_config: CuERIDFConfig | None,
+    df_backend: str | None = None,
+    df_mode: str | None = None,
+    df_threads: int | None = None,
+    L_metric=None,
+    profile: dict | None = None,
+):
+    return _prepare_direct_df_inputs_impl(
+        mol,
+        basis_in=basis_in,
+        auxbasis=auxbasis,
+        expand_contractions=expand_contractions,
+        df_config=df_config,
+        df_backend=df_backend,
+        df_mode=df_mode,
+        df_threads=df_threads,
+        L_metric=L_metric,
+        profile=profile,
+    )
+
+
 def _init_guess_dm_atom_hcore_cart(
     mol: Molecule,
     *,
     ao_basis,
     int1e_cart: Int1eResult,
 ) -> np.ndarray:
-    """Build a SAD-like initial density from per-atom core-Hamiltonian blocks.
-
-    This is not a full SAD (which typically uses pretabulated atomic HF/DFT
-    densities). Instead, we:
-    - partition AOs by atom (shell centers)
-    - diagonalize the per-atom (hcore, S) blocks
-    - fill the lowest-energy atomic orbitals globally to match nelec
-
-    The resulting density is block-diagonal in the AO ordering and provides a
-    more localized starting guess than a full-molecule hcore diagonalization.
-    """
-
-    from asuka.cueri.cart import ncart  # noqa: PLC0415
-    from asuka.hf.local_thc_partition import map_shells_to_atoms  # noqa: PLC0415
-
-    S = np.asarray(int1e_cart.S, dtype=np.float64)
-    h = np.asarray(int1e_cart.hcore, dtype=np.float64)
-    nao = int(S.shape[0])
-    if S.shape != (nao, nao) or h.shape != (nao, nao):
-        raise ValueError("int1e_cart must have (nao,nao) S/hcore")
-
-    coords, _charges = _atom_coords_charges_bohr(mol)
-    _sh2a, atom_to_shells = map_shells_to_atoms(np.asarray(ao_basis.shell_cxyz), coords)
-
-    shell_l = np.asarray(ao_basis.shell_l, dtype=np.int32).ravel()
-    shell_start = np.asarray(ao_basis.shell_ao_start, dtype=np.int32).ravel()
-    if shell_l.shape != shell_start.shape:
-        raise ValueError("ao_basis.shell_l and shell_ao_start must have identical shape")
-    if int(shell_l.size) == 0:
-        return np.zeros((nao, nao), dtype=np.float64)
-
-    nfn_shell = np.asarray([ncart(int(l)) for l in shell_l.tolist()], dtype=np.int32)
-
-    # Collect per-atom eigenpairs (eps, idx_global, coeff_vector).
-    orb_eps: list[float] = []
-    orb_idx: list[np.ndarray] = []
-    orb_c: list[np.ndarray] = []
-
-    # Symmetrize inputs (defensive; should already be symmetric).
-    S = 0.5 * (S + S.T)
-    h = 0.5 * (h + h.T)
-
-    for ia in range(int(mol.natm)):
-        shells = atom_to_shells[int(ia)]
-        if not shells:
-            continue
-        idx: list[int] = []
-        for sh in shells:
-            s0 = int(shell_start[int(sh)])
-            n = int(nfn_shell[int(sh)])
-            idx.extend(range(s0, s0 + n))
-        if not idx:
-            continue
-        idx_np = np.asarray(idx, dtype=np.int32)
-
-        Sblk = np.asarray(S[np.ix_(idx_np, idx_np)], dtype=np.float64)
-        hblk = np.asarray(h[np.ix_(idx_np, idx_np)], dtype=np.float64)
-        Sblk = 0.5 * (Sblk + Sblk.T)
-        hblk = 0.5 * (hblk + hblk.T)
-
-        # Symmetric orthogonalization for this atom block.
-        w, U = np.linalg.eigh(Sblk)
-        w = np.asarray(w, dtype=np.float64)
-        U = np.asarray(U, dtype=np.float64)
-        wmax = float(np.max(w)) if int(w.size) else 0.0
-        if wmax <= 0.0:
-            continue
-        keep = w > (1e-12 * wmax)
-        if not bool(np.any(keep)):
-            continue
-        wk = w[keep]
-        Uk = U[:, keep]
-        Xk = Uk / np.sqrt(wk)[None, :]  # (n, m), with Xk.T S Xk = I
-        Fp = Xk.T @ hblk @ Xk
-        Fp = 0.5 * (Fp + Fp.T)
-        e, Cp = np.linalg.eigh(Fp)
-        e = np.asarray(e, dtype=np.float64).ravel()
-        Cp = np.asarray(Cp, dtype=np.float64)
-        C = Xk @ Cp  # (n, m), S-orthonormal columns
-
-        for j in range(int(C.shape[1])):
-            orb_eps.append(float(e[int(j)]))
-            orb_idx.append(idx_np)
-            orb_c.append(np.ascontiguousarray(C[:, int(j)], dtype=np.float64))
-
-    nelec = int(mol.nelectron)
-    if nelec <= 0 or nelec % 2 != 0:
-        raise ValueError("RHF requires an even, positive electron count")
-    nocc = int(nelec // 2)
-    if int(len(orb_eps)) < int(nocc):
-        raise RuntimeError("atom-hcore guess produced too few orbitals to fill nelec")
-
-    order = np.argsort(np.asarray(orb_eps, dtype=np.float64), kind="stable")
-    D = np.zeros((nao, nao), dtype=np.float64)
-    for k in range(int(nocc)):
-        j = int(order[int(k)])
-        idx_np = orb_idx[j]
-        c = orb_c[j]
-        D[np.ix_(idx_np, idx_np)] += 2.0 * np.outer(c, c)
-    return 0.5 * (D + D.T)
-    try:
-        return int(cp.cuda.Device().id)
-    except Exception:
-        return -1
-
-
-def _df_config_key(config: CuERIDFConfig | None) -> tuple[Any, ...]:
-    cfg = CuERIDFConfig() if config is None else config
-    return (
-        str(_cfg_get(cfg, "backend", "gpu_rys")).strip().lower(),
-        str(_cfg_get(cfg, "mode", "warp")).strip().lower(),
-        int(_cfg_get(cfg, "threads", 256)),
-        int(_cfg_get(cfg, "int3c_work_small_max", 512)),
-        int(_cfg_get(cfg, "int3c_work_large_min", 200_000)),
-        int(_cfg_get(cfg, "int3c_blocks_per_task", 4)),
-        str(_cfg_get(cfg, "int3c_plan_policy", "auto")).strip().lower(),
-        int(_cuda_device_id_or_neg1()),
-    )
-
-
-def _cfg_get(cfg: Any, name: str, default: Any) -> Any:
-    if cfg is None:
-        return default
-    if isinstance(cfg, dict):
-        return cfg.get(name, default)
-    return getattr(cfg, name, default)
-
-
-def _env_int_default(name: str, default: int) -> int:
-    try:
-        return int(str(os.environ.get(str(name), str(default))).strip())
-    except Exception:
-        return int(default)
-
-
-def _env_str_default(name: str, default: str) -> str:
-    return str(os.environ.get(str(name), str(default))).strip()
-
-
-def _resolve_cueri_df_config(
-    df_config: CuERIDFConfig | None,
-    *,
-    df_int3c_plan_policy: str | None = None,
-    df_int3c_work_small_max: int | None = None,
-    df_int3c_work_large_min: int | None = None,
-    df_int3c_blocks_per_task: int | None = None,
-) -> CuERIDFConfig:
-    defaults = CuERIDFConfig()
-    cfg_in = defaults if df_config is None else df_config
-
-    if df_config is None:
-        plan_policy = (
-            str(df_int3c_plan_policy).strip().lower()
-            if df_int3c_plan_policy is not None
-            else _env_str_default("ASUKA_DF_INT3C_PLAN_POLICY", str(getattr(defaults, "int3c_plan_policy", "auto")))
-        )
-        work_small_max = (
-            int(df_int3c_work_small_max)
-            if df_int3c_work_small_max is not None
-            else _env_int_default("ASUKA_DF_INT3C_WORK_SMALL_MAX", int(getattr(defaults, "int3c_work_small_max", 512)))
-        )
-        work_large_min = (
-            int(df_int3c_work_large_min)
-            if df_int3c_work_large_min is not None
-            else _env_int_default("ASUKA_DF_INT3C_WORK_LARGE_MIN", int(getattr(defaults, "int3c_work_large_min", 200_000)))
-        )
-        blocks_per_task = (
-            int(df_int3c_blocks_per_task)
-            if df_int3c_blocks_per_task is not None
-            else _env_int_default("ASUKA_DF_INT3C_BLOCKS_PER_TASK", int(getattr(defaults, "int3c_blocks_per_task", 4)))
-        )
-    else:
-        plan_policy = (
-            str(df_int3c_plan_policy).strip().lower()
-            if df_int3c_plan_policy is not None
-            else str(_cfg_get(cfg_in, "int3c_plan_policy", getattr(defaults, "int3c_plan_policy", "auto"))).strip().lower()
-        )
-        work_small_max = (
-            int(df_int3c_work_small_max)
-            if df_int3c_work_small_max is not None
-            else int(_cfg_get(cfg_in, "int3c_work_small_max", getattr(defaults, "int3c_work_small_max", 512)))
-        )
-        work_large_min = (
-            int(df_int3c_work_large_min)
-            if df_int3c_work_large_min is not None
-            else int(_cfg_get(cfg_in, "int3c_work_large_min", getattr(defaults, "int3c_work_large_min", 200_000)))
-        )
-        blocks_per_task = (
-            int(df_int3c_blocks_per_task)
-            if df_int3c_blocks_per_task is not None
-            else int(_cfg_get(cfg_in, "int3c_blocks_per_task", getattr(defaults, "int3c_blocks_per_task", 4)))
-        )
-
-    return CuERIDFConfig(
-        backend=str(_cfg_get(cfg_in, "backend", defaults.backend)),
-        mode=str(_cfg_get(cfg_in, "mode", defaults.mode)),
-        threads=int(_cfg_get(cfg_in, "threads", defaults.threads)),
-        stream=_cfg_get(cfg_in, "stream", defaults.stream),
-        int3c_work_small_max=max(1, int(work_small_max)),
-        int3c_work_large_min=max(2, int(work_large_min)),
-        int3c_blocks_per_task=max(1, int(blocks_per_task)),
-        int3c_plan_policy=str(plan_policy),
+    return _init_guess_dm_atom_hcore_cart_impl(
+        mol,
+        ao_basis=ao_basis,
+        int1e_cart=int1e_cart,
     )
 
 
@@ -702,19 +484,15 @@ def _copy_mo_coeff_for_cache(mo_coeff: Any):
 
 
 def clear_hf_frontend_caches() -> None:
-    with _HF_CACHE_LOCK:
-        _RHF_PREP_CACHE.clear()
-        _RHF_GUESS_CACHE.clear()
+    _cache_clear_all(_RHF_PREP_CACHE, _RHF_GUESS_CACHE)
 
 
 def _atom_coords_charges_bohr(mol: Molecule) -> tuple[np.ndarray, np.ndarray]:
-    coords = np.asarray([xyz for _sym, xyz in mol.atoms_bohr], dtype=np.float64).reshape((mol.natm, 3))
-    charges = np.asarray([atomic_number(sym) for sym, _xyz in mol.atoms_bohr], dtype=np.float64)
-    return coords, charges
+    return _atom_coords_charges_bohr_impl(mol)
 
 
 def _unique_elements(mol: Molecule) -> list[str]:
-    return sorted(set(mol.elements))
+    return _unique_elements_impl(mol)
 
 
 def _build_aux_basis_cart(
@@ -725,90 +503,13 @@ def _build_aux_basis_cart(
     expand_contractions: bool,
     ao_basis: Any = None,
 ) -> tuple[Any, str]:
-    """Build (aux_basis, auxbasis_name) as a cuERI packed cart basis.
-
-    When *auxbasis* is an RICD alias (``"ricd"``, ``"acd"``, ``"accd"``) or an
-    :class:`~asuka.integrals.ricd_types.RICDOptions` instance, the auxiliary
-    basis is generated on-the-fly from the orbital basis via the aCD/acCD
-    Cholesky decomposition.  In that case *ao_basis* **must** be provided.
-    """
-
-    # --- RICD on-the-fly auxiliary basis generation ---
-    from asuka.integrals.ricd_types import is_ricd_request  # noqa: PLC0415
-
-    if is_ricd_request(auxbasis):
-        if ao_basis is None:
-            raise ValueError(
-                "ao_basis must be provided when using RICD auxiliary basis generation "
-                "(auxbasis='ricd'/'acd'/'accd' or an RICDOptions instance)"
-            )
-        from asuka.integrals.ricd_types import normalize_ricd_options  # noqa: PLC0415
-        from asuka.integrals.ricd_builder import build_ricd_aux_basis  # noqa: PLC0415
-
-        opts = normalize_ricd_options(auxbasis)
-        atoms_bohr = list(mol.atoms_bohr)
-        gen = build_ricd_aux_basis(ao_basis, atoms_bohr, options=opts)
-        return gen.packed_basis, gen.basis_name
-
-    # --- Standard auxiliary basis paths ---
-    elements = _unique_elements(mol)
-    auxbasis_name = ""
-
-    def _autoaux_basis_name_hint() -> str | None:
-        """Return a basis name usable for BSE autoaux.
-
-        `auxbasis='autoaux'` normally requires `basis_in` to be a string name.
-        For workflows that pass an explicit basis dict (e.g., imported from
-        external codes), callers may stash the original basis name into
-        `mol.results['basis_name']` to keep using AutoAux.
-        """
-
-        if isinstance(basis_in, str):
-            base = str(basis_in).strip()
-            return base or None
-        try:
-            hint = mol.results.get("basis_name")
-        except Exception:
-            hint = None
-        if isinstance(hint, str):
-            hint_s = str(hint).strip()
-            return hint_s or None
-        return None
-
-    if isinstance(auxbasis, str) and str(auxbasis).strip().lower() in ("auto", "autoaux"):
-        base = _autoaux_basis_name_hint()
-        if base is None:
-            raise ValueError(
-                "auxbasis='autoaux' requires basis to be a string name "
-                "(or set mol.results['basis_name'] to the corresponding basis name)"
-            )
-        auxbasis_name, aux_shells = load_autoaux_shells(str(base), elements=elements)
-    elif isinstance(auxbasis, str):
-        auxbasis_name = str(auxbasis)
-        try:
-            aux_shells = load_basis_shells(auxbasis_name, elements=elements)
-        except Exception:
-            # Basis Set Exchange does not necessarily expose fitted aux bases as
-            # standalone names (e.g. "<basis>-jkfit"). Treat common JKFIT-like
-            # names as aliases for the BSE autoaux basis.
-            base = str(auxbasis_name).strip()
-            for suf in ("-jkfit", "-jfit", "-rifit", "-ri", "-mp2fit"):
-                if base.lower().endswith(suf):
-                    base = base[: -len(suf)]
-                    break
-            base = base or (_autoaux_basis_name_hint() or "")
-            if base:
-                auxbasis_name, aux_shells = load_autoaux_shells(str(base), elements=elements)
-            else:
-                raise
-    elif isinstance(auxbasis, dict):
-        auxbasis_name = "<explicit>"
-        aux_shells = parse_pyscf_basis_dict(auxbasis, elements=elements)
-    else:
-        raise TypeError("auxbasis must be 'autoaux', a string name, or an explicit per-element basis dict")
-
-    aux_basis = pack_cart_basis(list(mol.atoms_bohr), aux_shells, expand_contractions=bool(expand_contractions))
-    return aux_basis, auxbasis_name or "<unknown>"
+    return _build_aux_basis_cart_impl(
+        mol,
+        basis_in=basis_in,
+        auxbasis=auxbasis,
+        expand_contractions=expand_contractions,
+        ao_basis=ao_basis,
+    )
 
 
 def _nalpha_nbeta_from_mol(mol: Molecule) -> tuple[int, int]:
@@ -1203,6 +904,373 @@ def run_rohf_direct(
     )
 
 
+def run_rhf_direct_df(
+    mol: Molecule,
+    *,
+    basis: Any | None = None,
+    auxbasis: Any = "autoaux",
+    df_config: CuERIDFConfig | None = None,
+    expand_contractions: bool = True,
+    max_cycle: int = 50,
+    conv_tol: float = 1e-10,
+    conv_tol_dm: float = 1e-8,
+    diis: bool = True,
+    diis_start_cycle: int | None = None,
+    diis_space: int = 8,
+    damping: float = 0.0,
+    level_shift: float = 0.0,
+    k_q_block: int = 128,
+    cublas_math_mode: str | None = None,
+    df_backend: str | None = None,
+    df_mode: str | None = None,
+    df_threads: int | None = None,
+    df_aux_block_naux: int = 256,
+    L_metric=None,
+    dm0: Any | None = None,
+    mo_coeff0: Any | None = None,
+    init_fock_cycles: int | None = None,
+    profile: dict | None = None,
+) -> RHFDFRunResult:
+    """Run RHF with streamed DF J/K (direct SCF, no materialized DF tensor)."""
+
+    if int(mol.spin) != 0:
+        raise NotImplementedError("run_rhf_direct_df currently supports only closed-shell molecules (spin=0)")
+
+    nelec = int(mol.nelectron)
+    if nelec <= 0 or nelec % 2 != 0:
+        raise ValueError("RHF requires an even, positive electron count")
+
+    basis_in = mol.basis if basis is None else basis
+
+    if mo_coeff0 is None and dm0 is None:
+        guess_key = _rhf_guess_key(
+            mol,
+            basis_in=basis_in,
+            auxbasis=auxbasis,
+            expand_contractions=bool(expand_contractions),
+        )
+        guess_hit = _cache_get(_RHF_GUESS_CACHE, guess_key)
+        if guess_hit is not None:
+            mo_coeff0 = _copy_mo_coeff_for_cache(guess_hit)
+            if profile is not None:
+                profile.setdefault("scf_guess", {})["cache_hit"] = True
+        elif profile is not None:
+            profile.setdefault("scf_guess", {})["cache_hit"] = False
+
+    cfg, ao_basis, basis_name, int1e_scf, aux_basis, auxbasis_name, sph_map, df_ao_rep, L_chol = _prepare_direct_df_inputs(
+        mol,
+        basis_in=basis_in,
+        auxbasis=auxbasis,
+        expand_contractions=bool(expand_contractions),
+        df_config=df_config,
+        df_backend=df_backend,
+        df_mode=df_mode,
+        df_threads=df_threads,
+        L_metric=L_metric,
+        profile=profile,
+    )
+
+    from asuka.hf.direct_scf import rhf_direct_df as _rhf_direct_df_scf  # noqa: PLC0415
+
+    init_fock_cycles_i = int(_HF_INIT_FOCK_CYCLES) if init_fock_cycles is None else max(0, int(init_fock_cycles))
+    diis_start_cycle_i = (
+        int(diis_start_cycle) if diis_start_cycle is not None else (1 if int(init_fock_cycles_i) > 0 else 2)
+    )
+    scf = _rhf_direct_df_scf(
+        int1e_scf.S,
+        int1e_scf.hcore,
+        ao_basis=ao_basis,
+        aux_basis=aux_basis,
+        nelec=int(nelec),
+        enuc=float(mol.energy_nuc()),
+        max_cycle=int(max_cycle),
+        conv_tol=float(conv_tol),
+        conv_tol_dm=float(conv_tol_dm),
+        diis=bool(diis),
+        diis_start_cycle=int(diis_start_cycle_i),
+        diis_space=int(diis_space),
+        damping=float(damping),
+        level_shift=float(level_shift),
+        k_q_block=int(k_q_block),
+        cublas_math_mode=cublas_math_mode,
+        df_backend=str(cfg.backend),
+        df_ao_rep=str(df_ao_rep),
+        df_threads=int(cfg.threads),
+        df_mode=str(cfg.mode),
+        df_aux_block_naux=int(df_aux_block_naux),
+        L_metric=L_chol,
+        dm0=dm0,
+        mo_coeff0=mo_coeff0,
+        init_fock_cycles=int(init_fock_cycles_i),
+        profile=profile,
+    )
+
+    if bool(getattr(scf, "converged", False)):
+        guess_key = _rhf_guess_key(
+            mol,
+            basis_in=basis_in,
+            auxbasis=auxbasis,
+            expand_contractions=bool(expand_contractions),
+        )
+        _cache_put(
+            _RHF_GUESS_CACHE,
+            guess_key,
+            _copy_mo_coeff_for_cache(scf.mo_coeff),
+            max_size=int(_HF_GUESS_CACHE_MAX),
+        )
+
+    return RHFDFRunResult(
+        mol=mol,
+        basis_name=str(basis_name),
+        auxbasis_name=str(auxbasis_name),
+        ao_basis=ao_basis,
+        aux_basis=aux_basis,
+        int1e=int1e_scf,
+        df_B=None,
+        scf=scf,
+        profile=profile,
+        sph_map=sph_map,
+        df_L=L_chol,
+        df_run_config=_make_df_run_config(
+            hf_method="rhf",
+            basis=basis_in,
+            auxbasis=auxbasis,
+            df_config=cfg,
+            expand_contractions=bool(expand_contractions),
+            backend="cuda",
+            max_cycle=int(max_cycle),
+            conv_tol=float(conv_tol),
+            conv_tol_dm=float(conv_tol_dm),
+            diis=bool(diis),
+            diis_start_cycle=diis_start_cycle_i,
+            diis_space=int(diis_space),
+            damping=float(damping),
+            level_shift=float(level_shift),
+            k_q_block=int(k_q_block),
+            cublas_math_mode=cublas_math_mode,
+            init_fock_cycles=init_fock_cycles_i,
+        ),
+        two_e_backend="direct_df",
+    )
+
+
+def run_uhf_direct_df(
+    mol: Molecule,
+    *,
+    basis: Any | None = None,
+    auxbasis: Any = "autoaux",
+    df_config: CuERIDFConfig | None = None,
+    expand_contractions: bool = True,
+    max_cycle: int = 50,
+    conv_tol: float = 1e-10,
+    conv_tol_dm: float = 1e-8,
+    diis: bool = True,
+    diis_start_cycle: int = 2,
+    diis_space: int = 8,
+    damping: float = 0.0,
+    k_q_block: int = 128,
+    cublas_math_mode: str | None = None,
+    df_backend: str | None = None,
+    df_mode: str | None = None,
+    df_threads: int | None = None,
+    df_aux_block_naux: int = 256,
+    L_metric=None,
+    dm0: Any | None = None,
+    mo_coeff0: Any | None = None,
+    profile: dict | None = None,
+) -> UHFDFRunResult:
+    """Run UHF with streamed DF J/K (direct SCF, no materialized DF tensor)."""
+
+    nalpha, nbeta = _nalpha_nbeta_from_mol(mol)
+    basis_in = mol.basis if basis is None else basis
+
+    cfg, ao_basis, basis_name, int1e_scf, aux_basis, auxbasis_name, sph_map, df_ao_rep, L_chol = _prepare_direct_df_inputs(
+        mol,
+        basis_in=basis_in,
+        auxbasis=auxbasis,
+        expand_contractions=bool(expand_contractions),
+        df_config=df_config,
+        df_backend=df_backend,
+        df_mode=df_mode,
+        df_threads=df_threads,
+        L_metric=L_metric,
+        profile=profile,
+    )
+
+    from asuka.hf.direct_scf import uhf_direct_df as _uhf_direct_df_scf  # noqa: PLC0415
+
+    scf = _uhf_direct_df_scf(
+        int1e_scf.S,
+        int1e_scf.hcore,
+        ao_basis=ao_basis,
+        aux_basis=aux_basis,
+        nalpha=int(nalpha),
+        nbeta=int(nbeta),
+        enuc=float(mol.energy_nuc()),
+        max_cycle=int(max_cycle),
+        conv_tol=float(conv_tol),
+        conv_tol_dm=float(conv_tol_dm),
+        diis=bool(diis),
+        diis_start_cycle=int(diis_start_cycle),
+        diis_space=int(diis_space),
+        damping=float(damping),
+        k_q_block=int(k_q_block),
+        cublas_math_mode=cublas_math_mode,
+        df_backend=str(cfg.backend),
+        df_ao_rep=str(df_ao_rep),
+        df_threads=int(cfg.threads),
+        df_mode=str(cfg.mode),
+        df_aux_block_naux=int(df_aux_block_naux),
+        L_metric=L_chol,
+        dm0=dm0,
+        mo_coeff0=mo_coeff0,
+        profile=profile,
+    )
+
+    return UHFDFRunResult(
+        mol=mol,
+        basis_name=str(basis_name),
+        auxbasis_name=str(auxbasis_name),
+        ao_basis=ao_basis,
+        aux_basis=aux_basis,
+        int1e=int1e_scf,
+        df_B=None,
+        scf=scf,
+        profile=profile,
+        sph_map=sph_map,
+        df_L=L_chol,
+        df_run_config=_make_df_run_config(
+            hf_method="uhf",
+            basis=basis_in,
+            auxbasis=auxbasis,
+            df_config=cfg,
+            expand_contractions=bool(expand_contractions),
+            backend="cuda",
+            max_cycle=int(max_cycle),
+            conv_tol=float(conv_tol),
+            conv_tol_dm=float(conv_tol_dm),
+            diis=bool(diis),
+            diis_start_cycle=int(diis_start_cycle),
+            diis_space=int(diis_space),
+            damping=float(damping),
+            level_shift=0.0,
+            k_q_block=int(k_q_block),
+            cublas_math_mode=cublas_math_mode,
+        ),
+        two_e_backend="direct_df",
+    )
+
+
+def run_rohf_direct_df(
+    mol: Molecule,
+    *,
+    basis: Any | None = None,
+    auxbasis: Any = "autoaux",
+    df_config: CuERIDFConfig | None = None,
+    expand_contractions: bool = True,
+    max_cycle: int = 50,
+    conv_tol: float = 1e-10,
+    conv_tol_dm: float = 1e-8,
+    diis: bool = True,
+    diis_start_cycle: int = 2,
+    diis_space: int = 8,
+    damping: float = 0.0,
+    k_q_block: int = 128,
+    cublas_math_mode: str | None = None,
+    df_backend: str | None = None,
+    df_mode: str | None = None,
+    df_threads: int | None = None,
+    df_aux_block_naux: int = 256,
+    L_metric=None,
+    dm0: Any | None = None,
+    mo_coeff0: Any | None = None,
+    profile: dict | None = None,
+) -> ROHFDFRunResult:
+    """Run ROHF with streamed DF J/K (direct SCF, no materialized DF tensor)."""
+
+    nalpha, nbeta = _nalpha_nbeta_from_mol(mol)
+    if int(nalpha) < int(nbeta):
+        raise ValueError("run_rohf_direct_df requires spin >= 0 (nalpha >= nbeta)")
+
+    basis_in = mol.basis if basis is None else basis
+
+    cfg, ao_basis, basis_name, int1e_scf, aux_basis, auxbasis_name, sph_map, df_ao_rep, L_chol = _prepare_direct_df_inputs(
+        mol,
+        basis_in=basis_in,
+        auxbasis=auxbasis,
+        expand_contractions=bool(expand_contractions),
+        df_config=df_config,
+        df_backend=df_backend,
+        df_mode=df_mode,
+        df_threads=df_threads,
+        L_metric=L_metric,
+        profile=profile,
+    )
+
+    from asuka.hf.direct_scf import rohf_direct_df as _rohf_direct_df_scf  # noqa: PLC0415
+
+    scf = _rohf_direct_df_scf(
+        int1e_scf.S,
+        int1e_scf.hcore,
+        ao_basis=ao_basis,
+        aux_basis=aux_basis,
+        nalpha=int(nalpha),
+        nbeta=int(nbeta),
+        enuc=float(mol.energy_nuc()),
+        max_cycle=int(max_cycle),
+        conv_tol=float(conv_tol),
+        conv_tol_dm=float(conv_tol_dm),
+        diis=bool(diis),
+        diis_start_cycle=int(diis_start_cycle),
+        diis_space=int(diis_space),
+        damping=float(damping),
+        k_q_block=int(k_q_block),
+        cublas_math_mode=cublas_math_mode,
+        df_backend=str(cfg.backend),
+        df_ao_rep=str(df_ao_rep),
+        df_threads=int(cfg.threads),
+        df_mode=str(cfg.mode),
+        df_aux_block_naux=int(df_aux_block_naux),
+        L_metric=L_chol,
+        dm0=dm0,
+        mo_coeff0=mo_coeff0,
+        profile=profile,
+    )
+
+    return ROHFDFRunResult(
+        mol=mol,
+        basis_name=str(basis_name),
+        auxbasis_name=str(auxbasis_name),
+        ao_basis=ao_basis,
+        aux_basis=aux_basis,
+        int1e=int1e_scf,
+        df_B=None,
+        scf=scf,
+        profile=profile,
+        sph_map=sph_map,
+        df_L=L_chol,
+        df_run_config=_make_df_run_config(
+            hf_method="rohf",
+            basis=basis_in,
+            auxbasis=auxbasis,
+            df_config=cfg,
+            expand_contractions=bool(expand_contractions),
+            backend="cuda",
+            max_cycle=int(max_cycle),
+            conv_tol=float(conv_tol),
+            conv_tol_dm=float(conv_tol_dm),
+            diis=bool(diis),
+            diis_start_cycle=int(diis_start_cycle),
+            diis_space=int(diis_space),
+            damping=float(damping),
+            level_shift=0.0,
+            k_q_block=int(k_q_block),
+            cublas_math_mode=cublas_math_mode,
+        ),
+        two_e_backend="direct_df",
+    )
+
+
 def run_uhf_dense(
     mol: Molecule,
     *,
@@ -1411,214 +1479,45 @@ def run_rhf_df(
     - RHF is restricted to closed-shell (mol.spin==0).
     """
 
-    if int(mol.spin) != 0:
-        raise NotImplementedError("run_rhf_df currently supports only closed-shell molecules (spin=0)")
-
-    nelec = int(mol.nelectron)
-    if nelec <= 0 or nelec % 2 != 0:
-        raise ValueError("RHF requires an even, positive electron count")
-
-    basis_in = mol.basis if basis is None else basis
-    cfg = _resolve_cueri_df_config(
-        df_config,
+    return _run_rhf_df_impl(
+        mol,
+        basis=basis,
+        auxbasis=auxbasis,
+        df_config=df_config,
         df_int3c_plan_policy=df_int3c_plan_policy,
         df_int3c_work_small_max=df_int3c_work_small_max,
         df_int3c_work_large_min=df_int3c_work_large_min,
         df_int3c_blocks_per_task=df_int3c_blocks_per_task,
-    )
-
-    df_layout_s = str(df_layout).strip().lower()
-    if df_layout_s not in {"mnq", "qmn"}:
-        raise ValueError("df_layout must be one of: 'mnQ', 'Qmn'")
-    df_build_layout = df_layout_s
-    df_ao_rep = "cart" if bool(mol.cart) else "sph"
-    prep_key = _rhf_prep_key(
-        mol,
-        basis_in=basis_in,
-        auxbasis=auxbasis,
-        expand_contractions=bool(expand_contractions),
-        df_config=cfg,
-        df_layout_build=str(df_build_layout),
-    )
-    prep_hit = _cache_get(_RHF_PREP_CACHE, prep_key)
-    if prep_hit is None:
-        # AO basis + 1e integrals
-        ao_basis, basis_name = build_ao_basis_cart(mol, basis=basis_in, expand_contractions=bool(expand_contractions))
-        coords, charges = _atom_coords_charges_bohr(mol)
-        int1e = build_int1e_cart(ao_basis, atom_coords_bohr=coords, atom_charges=charges)
-
-        # DF auxiliary basis + whitened DF factors B[μ,ν,Q]
-        aux_basis, auxbasis_name = _build_aux_basis_cart(
-            mol,
-            basis_in=basis_in,
-            auxbasis=auxbasis,
-            expand_contractions=bool(expand_contractions),
-            ao_basis=ao_basis,
-        )
-
-        df_prof = None
-        if profile is not None:
-            df_prof = profile.setdefault("df_build", {})
-            df_prof["cache_hit"] = False
-
-        B, L_chol = build_df_B_from_cueri_packed_bases(
-            ao_basis,
-            aux_basis,
-            config=cfg,
-            layout=str(df_build_layout),
-            ao_rep=str(df_ao_rep),
-            profile=df_prof,
-            return_L=True,
-        )
-        _cache_put(
-            _RHF_PREP_CACHE,
-            prep_key,
-            (ao_basis, str(basis_name), int1e, aux_basis, str(auxbasis_name), B, L_chol),
-            max_size=int(_HF_PREP_CACHE_MAX),
-        )
-    else:
-        _prep_tuple = prep_hit
-        if len(_prep_tuple) == 7:
-            ao_basis, basis_name, int1e, aux_basis, auxbasis_name, B, L_chol = _prep_tuple
-        else:
-            # Legacy cache entry without L_chol
-            ao_basis, basis_name, int1e, aux_basis, auxbasis_name, B = _prep_tuple
-            L_chol = None
-        if profile is not None:
-            df_prof = profile.setdefault("df_build", {})
-            df_prof["cache_hit"] = True
-
-    # Spherical AO transform (if requested)
-    if bool(mol.cart):
-        int1e_scf, B_scf, sph_map = _apply_sph_transform(mol, int1e, B, ao_basis, df_B_layout=str(df_layout))
-    else:
-        int1e_scf, _B_unused, sph_map = _apply_sph_transform(mol, int1e, None, ao_basis, df_B_layout=str(df_layout))
-        B_scf = B
-    # For large bases, building and transforming DF factors can leave very large
-    # freed blocks cached in CuPy's default memory pool, inflating driver-visible
-    # VRAM and triggering avoidable OOM/non-deterministic failures downstream.
-    #
-    # In the spherical path, we also no longer need the Cartesian B tensor after
-    # the transform. Drop the reference early so its blocks are eligible for pool
-    # release/reuse.
-    try:  # pragma: no cover (best-effort memory hygiene)
-        if B is not None and B is not B_scf:
-            del B
-        import cupy as cp  # noqa: PLC0415
-
-        if isinstance(B_scf, cp.ndarray) and int(getattr(B_scf, "nbytes", 0)) >= 2_000_000_000:
-            cp.cuda.Device().synchronize()
-            cp.get_default_memory_pool().free_all_blocks()
-    except Exception:
-        pass
-
-    if mo_coeff0 is None and dm0 is None:
-        guess_key = _rhf_guess_key(
-            mol,
-            basis_in=basis_in,
-            auxbasis=auxbasis,
-            expand_contractions=bool(expand_contractions),
-        )
-        guess_hit = _cache_get(_RHF_GUESS_CACHE, guess_key)
-        if guess_hit is not None:
-            mo_coeff0 = _copy_mo_coeff_for_cache(guess_hit)
-            if profile is not None:
-                profile.setdefault("scf_guess", {})["cache_hit"] = True
-        elif profile is not None:
-            profile.setdefault("scf_guess", {})["cache_hit"] = False
-
-    # SCF solve
-    init_fock_cycles_i = int(_HF_INIT_FOCK_CYCLES) if init_fock_cycles is None else max(0, int(init_fock_cycles))
-    diis_start_cycle_i = (
-        int(diis_start_cycle) if diis_start_cycle is not None else (1 if int(init_fock_cycles_i) > 0 else 2)
-    )
-    scf_prof = profile if profile is not None else None
-    scf = rhf_df(
-        int1e_scf.S,
-        int1e_scf.hcore,
-        B_scf,
-        nelec=int(nelec),
-        enuc=float(mol.energy_nuc()),
-        max_cycle=int(max_cycle),
-        conv_tol=float(conv_tol),
-        conv_tol_dm=float(conv_tol_dm),
-        diis=bool(diis),
-        diis_start_cycle=int(diis_start_cycle_i),
-        diis_space=int(diis_space),
-        damping=float(damping),
-        level_shift=float(level_shift),
-        k_q_block=int(k_q_block),
+        df_k_cache_max_mb=df_k_cache_max_mb,
+        df_layout=df_layout,
+        expand_contractions=expand_contractions,
+        max_cycle=max_cycle,
+        conv_tol=conv_tol,
+        conv_tol_dm=conv_tol_dm,
+        diis=diis,
+        diis_start_cycle=diis_start_cycle,
+        diis_space=diis_space,
+        damping=damping,
+        level_shift=level_shift,
+        k_q_block=k_q_block,
         cublas_math_mode=cublas_math_mode,
         dm0=dm0,
         mo_coeff0=mo_coeff0,
-        init_fock_cycles=int(init_fock_cycles_i),
-        k_cache_max_mb=None if df_k_cache_max_mb is None else int(df_k_cache_max_mb),
-        profile=scf_prof,
-    )
-
-    # Optional: pack DF factors to unique AO-pair triangle (Qp layout) to reduce VRAM.
-    #
-    # Default behavior (CUDA): pack unless explicitly disabled via ASUKA_DF_AO_PACKED_S2=0.
-    # CPU behavior: preserve the historical full mnQ/Qmn tensor unless explicitly enabled.
-    if B_scf is not None:
-        try:  # pragma: no cover (best-effort: keep legacy behavior if something goes wrong)
-            import os as _os_dfpack  # noqa: PLC0415
-            import cupy as _cp_dfpack  # noqa: PLC0415
-            from asuka.integrals.df_packed_s2 import ao_packed_s2_enabled, pack_B_to_Qp  # noqa: PLC0415
-
-            _explicit = "ASUKA_DF_AO_PACKED_S2" in _os_dfpack.environ
-            _want_pack = bool(ao_packed_s2_enabled()) if _explicit else isinstance(B_scf, _cp_dfpack.ndarray)
-            if bool(_want_pack) and int(getattr(B_scf, "ndim", 0)) == 3:
-                layout = "mnQ" if str(df_layout_s) == "mnq" else "Qmn"
-                B_scf = pack_B_to_Qp(B_scf, layout=layout, nao=int(int1e_scf.S.shape[0]))
-        except Exception:
-            pass
-
-    if bool(getattr(scf, "converged", False)):
-        guess_key = _rhf_guess_key(
-            mol,
-            basis_in=basis_in,
-            auxbasis=auxbasis,
-            expand_contractions=bool(expand_contractions),
-        )
-        _cache_put(
-            _RHF_GUESS_CACHE,
-            guess_key,
-            _copy_mo_coeff_for_cache(scf.mo_coeff),
-            max_size=int(_HF_GUESS_CACHE_MAX),
-        )
-
-    return RHFDFRunResult(
-        mol=mol,
-        basis_name=str(basis_name),
-        auxbasis_name=str(auxbasis_name),
-        ao_basis=ao_basis,
-        aux_basis=aux_basis,
-        int1e=int1e_scf,
-        df_B=B_scf,
-        scf=scf,
+        init_fock_cycles=init_fock_cycles,
         profile=profile,
-        sph_map=sph_map,
-        df_L=L_chol,
-        df_run_config=_make_df_run_config(
-            hf_method="rhf",
-            basis=basis_in,
-            auxbasis=auxbasis,
-            df_config=cfg,
-            expand_contractions=bool(expand_contractions),
-            backend="cuda",
-            max_cycle=int(max_cycle),
-            conv_tol=float(conv_tol),
-            conv_tol_dm=float(conv_tol_dm),
-            diis=bool(diis),
-            diis_start_cycle=diis_start_cycle_i,
-            diis_space=int(diis_space),
-            damping=float(damping),
-            level_shift=float(level_shift),
-            k_q_block=int(k_q_block),
-            cublas_math_mode=cublas_math_mode,
-            init_fock_cycles=init_fock_cycles_i,
-        ),
+        init_fock_cycles_default=_HF_INIT_FOCK_CYCLES,
+        resolve_cueri_df_config=_resolve_cueri_df_config,
+        rhf_prep_key=_rhf_prep_key,
+        rhf_guess_key=_rhf_guess_key,
+        cache_get=_cache_get,
+        cache_put=_cache_put,
+        rhf_prep_cache=_RHF_PREP_CACHE,
+        rhf_guess_cache=_RHF_GUESS_CACHE,
+        hf_prep_cache_max=_HF_PREP_CACHE_MAX,
+        hf_guess_cache_max=_HF_GUESS_CACHE_MAX,
+        copy_mo_coeff_for_cache=_copy_mo_coeff_for_cache,
+        make_df_run_config=_make_df_run_config,
+        result_cls=RHFDFRunResult,
     )
 
 
@@ -2877,218 +2776,45 @@ def run_hf_df(
     - `two_e_backend="df"`: DF-HF via whitened DF factors `B[μ,ν,Q]`.
     - `two_e_backend="dense"`: dense AO-ERI HF (`ao_eri` is populated in the result; `df_B=None`).
     - `two_e_backend="thc"`: THC-HF (GPU-only).
+    - `two_e_backend="direct"`: 4-center integral-direct SCF (GPU-only).
+    - `two_e_backend="direct_df"`: streamed DF direct-SCF with no materialized `B` tensor (GPU-only).
     - `backend="cuda"`: build DF factors on GPU (CuPy).
     - `backend="cpu"`: build DF factors on CPU (requires `asuka.cueri._eri_rys_cpu`).
     """
-
-    method_s = str(method).strip().lower()
-    backend_s = str(backend).strip().lower()
-    if method_s not in {"rhf", "uhf", "rohf", "rks", "uks"}:
-        raise ValueError("method must be one of: 'rhf', 'uhf', 'rohf', 'rks', 'uks'")
-    if backend_s not in {"cpu", "cuda"}:
-        raise ValueError("backend must be 'cpu' or 'cuda'")
-
-    if mo_coeff0 is None and dm0 is None and guess is not None:
-        scf_guess = getattr(guess, "scf", guess)
-        try:
-            mo_coeff0 = getattr(scf_guess, "mo_coeff", None)
-        except Exception:
-            mo_coeff0 = None
-
-    if two_e_backend is None:
-        two_e = "df" if bool(df) else "dense"
-    else:
-        two_e = str(two_e_backend).strip().lower()
-        if two_e not in {"df", "dense", "thc", "direct"}:
-            raise ValueError("two_e_backend must be one of: 'df', 'dense', 'thc', 'direct'")
-
-    if method_s in {"rks", "uks"}:
-        if backend_s != "cuda":
-            raise NotImplementedError("RKS/UKS currently require backend='cuda'")
-        if two_e == "dense":
-            raise NotImplementedError("RKS/UKS currently do not support two_e_backend='dense'")
-
-        dft_kwargs = dict(kwargs)
-        xc_name = dft_kwargs.pop("functional", "mn15")
-
-        if two_e == "df":
-            if method_s == "rks":
-                return _with_two_e_metadata(
-                    run_rks_df(mol, functional=str(xc_name), dm0=dm0, mo_coeff0=mo_coeff0, **dft_kwargs),
-                    two_e_backend="df",
-                )
-            return _with_two_e_metadata(
-                run_uks_df(mol, functional=str(xc_name), dm0=dm0, mo_coeff0=mo_coeff0, **dft_kwargs),
-                two_e_backend="df",
-            )
-
-        # THC (global or local selected via thc_mode in kwargs)
-        if method_s == "rks":
-            return _with_two_e_metadata(
-                run_rhf_thc(mol, functional=str(xc_name), dm0=dm0, mo_coeff0=mo_coeff0, **dft_kwargs),
-                two_e_backend="thc",
-            )
-        return _with_two_e_metadata(
-            run_uhf_thc(mol, functional=str(xc_name), dm0=dm0, mo_coeff0=mo_coeff0, **dft_kwargs),
-            two_e_backend="thc",
-        )
-
-    if two_e == "dense":
-        dense_kwargs = dict(kwargs)
-        # Ignore DF-only knobs if users pass them through generic wrappers.
-        for key in (
-            "auxbasis",
-            "df_config",
-            "df_int3c_plan_policy",
-            "df_int3c_work_small_max",
-            "df_int3c_work_large_min",
-            "df_int3c_blocks_per_task",
-            "df_k_cache_max_mb",
-            "df_threads",
-            "jk_mode",
-            "k_engine",
-            "k_q_block",
-            "cublas_math_mode",
-            "ao_basis",
-            "aux_basis",
-            "df_backend",
-            "df_mode",
-            "df_aux_block_naux",
-            "L_metric",
-        ):
-            dense_kwargs.pop(key, None)
-        if method_s == "rhf":
-            return _with_two_e_metadata(
-                run_rhf_dense(mol, backend=backend_s, dm0=dm0, mo_coeff0=mo_coeff0, **dense_kwargs),
-                two_e_backend="dense",
-            )
-        if method_s == "uhf":
-            return _with_two_e_metadata(
-                run_uhf_dense(mol, backend=backend_s, dm0=dm0, mo_coeff0=mo_coeff0, **dense_kwargs),
-                two_e_backend="dense",
-            )
-        return _with_two_e_metadata(
-            run_rohf_dense(mol, backend=backend_s, dm0=dm0, mo_coeff0=mo_coeff0, **dense_kwargs),
-            two_e_backend="dense",
-        )
-
-    if two_e == "direct":
-        if backend_s != "cuda":
-            raise NotImplementedError("Direct integral backend currently requires backend='cuda'")
-        direct_kwargs = dict(kwargs)
-        # Ignore DF/dense-only knobs.
-        for key in (
-            "auxbasis",
-            "df_config",
-            "df_int3c_plan_policy",
-            "df_int3c_work_small_max",
-            "df_int3c_work_large_min",
-            "df_int3c_blocks_per_task",
-            "df_k_cache_max_mb",
-            "df_threads",
-            "jk_mode",
-            "k_engine",
-            "k_q_block",
-            "cublas_math_mode",
-            "ao_basis",
-            "aux_basis",
-            "df_backend",
-            "df_mode",
-            "df_aux_block_naux",
-            "L_metric",
-            "dense_threads",
-            "dense_max_tile_bytes",
-            "dense_eps_ao",
-            "dense_max_l",
-            "dense_mem_budget_gib",
-        ):
-            direct_kwargs.pop(key, None)
-        if method_s == "rhf":
-            out = run_rhf_direct(mol, dm0=dm0, mo_coeff0=mo_coeff0, **direct_kwargs)
-            return _with_two_e_metadata(out, two_e_backend="direct", direct_jk_ctx=getattr(out, "direct_jk_ctx", None))
-        if method_s == "uhf":
-            out = run_uhf_direct(mol, dm0=dm0, mo_coeff0=mo_coeff0, **direct_kwargs)
-            return _with_two_e_metadata(out, two_e_backend="direct", direct_jk_ctx=getattr(out, "direct_jk_ctx", None))
-        out = run_rohf_direct(mol, dm0=dm0, mo_coeff0=mo_coeff0, **direct_kwargs)
-        return _with_two_e_metadata(out, two_e_backend="direct", direct_jk_ctx=getattr(out, "direct_jk_ctx", None))
-
-    if two_e == "thc":
-        if backend_s != "cuda":
-            raise NotImplementedError("THC backend currently requires backend='cuda'")
-        if method_s == "rhf":
-            return _with_two_e_metadata(
-                run_rhf_thc(mol, dm0=dm0, mo_coeff0=mo_coeff0, **kwargs),
-                two_e_backend="thc",
-            )
-        if method_s == "uhf":
-            return _with_two_e_metadata(
-                run_uhf_thc(mol, dm0=dm0, mo_coeff0=mo_coeff0, **kwargs),
-                two_e_backend="thc",
-            )
-        return _with_two_e_metadata(
-            run_rohf_thc(mol, dm0=dm0, mo_coeff0=mo_coeff0, **kwargs),
-            two_e_backend="thc",
-        )
-
-    if backend_s == "cuda":
-        if method_s == "rhf":
-            out = run_rhf_df(mol, dm0=dm0, mo_coeff0=mo_coeff0, **kwargs)
-        elif method_s == "uhf":
-            out = run_uhf_df(mol, dm0=dm0, mo_coeff0=mo_coeff0, **kwargs)
-        else:
-            out = run_rohf_df(mol, dm0=dm0, mo_coeff0=mo_coeff0, **kwargs)
-
-        # Optional post-SCF cleanup: reduce driver-visible peak VRAM by releasing
-        # cached CUDA workspaces and returning unused CuPy pool blocks.
-        #
-        # Default heuristic: enable when VRAM telemetry is on (benchmarking /
-        # debugging) or when a GPU memory cap is set.
-        try:
-            import os as _os_scf  # noqa: PLC0415
-
-            _flag = _os_scf.environ.get("ASUKA_FLUSH_GPU_POOL_AFTER_SCF")
-            if _flag is None:
-                def _env_true(name: str) -> bool:
-                    v = _os_scf.environ.get(name)
-                    if v is None:
-                        return False
-                    return str(v).strip().lower() not in ("0", "false", "no", "off", "")
-
-                _flag = "1" if (_env_true("ASUKA_VRAM_DEBUG") or _env_true("ASUKA_GPU_MEM_CAP_GB")) else "0"
-            _v = str(_flag).strip().lower()
-            if _v not in ("0", "false", "no", "off", ""):
-                import cupy as _cp_scf  # noqa: PLC0415
-                from asuka.hf import df_jk as _df_jk  # noqa: PLC0415
-
-                _cp_scf.cuda.Device().synchronize()
-                try:
-                    _df_jk.release_cuda_ext_workspace_cache()
-                except Exception:
-                    pass
-                _cp_scf.get_default_memory_pool().free_all_blocks()
-                try:
-                    _cp_scf.get_default_pinned_memory_pool().free_all_blocks()
-                except Exception:
-                    pass
-        except Exception:
-            pass
-
-        return _with_two_e_metadata(out, two_e_backend="df")
-
-    cpu_kwargs = dict(kwargs)
-    for key in (
-        "df_int3c_plan_policy",
-        "df_int3c_work_small_max",
-        "df_int3c_work_large_min",
-        "df_int3c_blocks_per_task",
-        "df_k_cache_max_mb",
-    ):
-        cpu_kwargs.pop(key, None)
-    if method_s == "rhf":
-        return _with_two_e_metadata(run_rhf_df_cpu(mol, dm0=dm0, mo_coeff0=mo_coeff0, **cpu_kwargs), two_e_backend="df")
-    if method_s == "uhf":
-        return _with_two_e_metadata(run_uhf_df_cpu(mol, dm0=dm0, mo_coeff0=mo_coeff0, **cpu_kwargs), two_e_backend="df")
-    return _with_two_e_metadata(run_rohf_df_cpu(mol, dm0=dm0, mo_coeff0=mo_coeff0, **cpu_kwargs), two_e_backend="df")
+    return _run_hf_df_dispatch(
+        mol=mol,
+        method=method,
+        backend=backend,
+        df=df,
+        two_e_backend=two_e_backend,
+        guess=guess,
+        dm0=dm0,
+        mo_coeff0=mo_coeff0,
+        kwargs=kwargs,
+        with_two_e_metadata=_with_two_e_metadata,
+        ops={
+            "run_rks_df": run_rks_df,
+            "run_uks_df": run_uks_df,
+            "run_rhf_dense": run_rhf_dense,
+            "run_uhf_dense": run_uhf_dense,
+            "run_rohf_dense": run_rohf_dense,
+            "run_rhf_direct": run_rhf_direct,
+            "run_uhf_direct": run_uhf_direct,
+            "run_rohf_direct": run_rohf_direct,
+            "run_rhf_direct_df": run_rhf_direct_df,
+            "run_uhf_direct_df": run_uhf_direct_df,
+            "run_rohf_direct_df": run_rohf_direct_df,
+            "run_rhf_thc": run_rhf_thc,
+            "run_uhf_thc": run_uhf_thc,
+            "run_rohf_thc": run_rohf_thc,
+            "run_rhf_df": run_rhf_df,
+            "run_uhf_df": run_uhf_df,
+            "run_rohf_df": run_rohf_df,
+            "run_rhf_df_cpu": run_rhf_df_cpu,
+            "run_uhf_df_cpu": run_uhf_df_cpu,
+            "run_rohf_df_cpu": run_rohf_df_cpu,
+        },
+    )
 
 
 def run_hf(
@@ -3240,128 +2966,40 @@ def run_rks_df(
 
     This wraps the DF-RHF solver with an XC potential on a Becke grid.
     """
-    from asuka.xc.functional import get_functional
-    from asuka.density.grids_device import make_becke_grid_device
-
-    if int(mol.spin) != 0:
-        raise NotImplementedError("run_rks_df currently supports only closed-shell molecules (spin=0)")
-
-    xc_spec = get_functional(functional)
-
-    nelec = int(mol.nelectron)
-    if nelec <= 0 or nelec % 2 != 0:
-        raise ValueError("RKS requires an even, positive electron count")
-
-    basis_in = mol.basis if basis is None else basis
-    cfg = _resolve_cueri_df_config(
-        df_config,
+    return _run_rks_df_impl(
+        mol,
+        functional=functional,
+        basis=basis,
+        auxbasis=auxbasis,
+        df_config=df_config,
         df_int3c_plan_policy=df_int3c_plan_policy,
         df_int3c_work_small_max=df_int3c_work_small_max,
         df_int3c_work_large_min=df_int3c_work_large_min,
         df_int3c_blocks_per_task=df_int3c_blocks_per_task,
-    )
-
-    df_layout_s = str(df_layout).strip().lower()
-    if df_layout_s not in {"mnq", "qmn"}:
-        raise ValueError("df_layout must be one of: 'mnQ', 'Qmn'")
-    df_build_layout = df_layout_s
-    df_ao_rep = "cart" if bool(mol.cart) else "sph"
-
-    # AO basis + 1e integrals (reuse existing infrastructure)
-    ao_basis, basis_name = build_ao_basis_cart(mol, basis=basis_in, expand_contractions=bool(expand_contractions))
-    coords, charges = _atom_coords_charges_bohr(mol)
-    int1e = build_int1e_cart(ao_basis, atom_coords_bohr=coords, atom_charges=charges)
-
-    # DF auxiliary basis + whitened DF factors
-    aux_basis, auxbasis_name = _build_aux_basis_cart(
-        mol, basis_in=basis_in, auxbasis=auxbasis, expand_contractions=bool(expand_contractions),
-        ao_basis=ao_basis,
-    )
-
-    df_prof = None
-    if profile is not None:
-        df_prof = profile.setdefault("df_build", {})
-
-    B, L_chol = build_df_B_from_cueri_packed_bases(
-        ao_basis, aux_basis, config=cfg, layout=str(df_build_layout),
-        ao_rep=str(df_ao_rep), profile=df_prof, return_L=True,
-    )
-
-    # Spherical AO transform
-    if bool(mol.cart):
-        int1e_scf, B_scf, sph_map = _apply_sph_transform(mol, int1e, B, ao_basis, df_B_layout=str(df_layout))
-    else:
-        int1e_scf, _B_unused, sph_map = _apply_sph_transform(mol, int1e, None, ao_basis, df_B_layout=str(df_layout))
-        B_scf = B
-
-    # Build DFT grid on device (or use caller-supplied grid)
-    import cupy as _cp_grid
-    if xc_grid_coords is not None and xc_grid_weights is not None:
-        grid_coords = _cp_grid.asarray(xc_grid_coords, dtype=_cp_grid.float64)
-        grid_weights = _cp_grid.asarray(xc_grid_weights, dtype=_cp_grid.float64)
-    else:
-        grid_coords, grid_weights = make_becke_grid_device(
-            mol, radial_n=int(grid_radial_n), angular_n=int(grid_angular_n),
-            radial_scheme="treutler",
-        )
-
-    # Spherical transform for XC builder
-    xc_sph_transform = None
-    if not bool(mol.cart) and sph_map is not None:
-        import cupy as _cp_xc
-        if hasattr(sph_map, "T_c2s"):
-            xc_sph_transform = _cp_xc.asarray(sph_map.T_c2s, dtype=_cp_xc.float64)
-        elif hasattr(sph_map, "T_matrix"):
-            xc_sph_transform = _cp_xc.asarray(sph_map.T_matrix, dtype=_cp_xc.float64)
-        elif isinstance(sph_map, tuple) and len(sph_map) >= 1:
-            xc_sph_transform = _cp_xc.asarray(sph_map[0], dtype=_cp_xc.float64)
-
-    # SCF solve
-    init_fock_cycles_i = int(_HF_INIT_FOCK_CYCLES) if init_fock_cycles is None else max(0, int(init_fock_cycles))
-    diis_start_cycle_i = (
-        int(diis_start_cycle) if diis_start_cycle is not None else (1 if int(init_fock_cycles_i) > 0 else 2)
-    )
-    scf = rhf_df(
-        int1e_scf.S,
-        int1e_scf.hcore,
-        B_scf,
-        nelec=int(nelec),
-        enuc=float(mol.energy_nuc()),
-        max_cycle=int(max_cycle),
-        conv_tol=float(conv_tol),
-        conv_tol_dm=float(conv_tol_dm),
-        diis=bool(diis),
-        diis_start_cycle=int(diis_start_cycle_i),
-        diis_space=int(diis_space),
-        damping=float(damping),
-        level_shift=float(level_shift),
-        k_q_block=int(k_q_block),
+        df_k_cache_max_mb=df_k_cache_max_mb,
+        df_layout=df_layout,
+        expand_contractions=expand_contractions,
+        max_cycle=max_cycle,
+        conv_tol=conv_tol,
+        conv_tol_dm=conv_tol_dm,
+        diis=diis,
+        diis_start_cycle=diis_start_cycle,
+        diis_space=diis_space,
+        damping=damping,
+        level_shift=level_shift,
+        k_q_block=k_q_block,
         cublas_math_mode=cublas_math_mode,
-        k_cache_max_mb=None if df_k_cache_max_mb is None else int(df_k_cache_max_mb),
         dm0=dm0,
         mo_coeff0=mo_coeff0,
-        init_fock_cycles=int(init_fock_cycles_i),
+        init_fock_cycles=init_fock_cycles,
+        grid_radial_n=grid_radial_n,
+        grid_angular_n=grid_angular_n,
+        xc_grid_coords=xc_grid_coords,
+        xc_grid_weights=xc_grid_weights,
+        xc_batch_size=xc_batch_size,
         profile=profile,
-        xc_spec=xc_spec,
-        xc_grid_coords=grid_coords,
-        xc_grid_weights=grid_weights,
-        xc_ao_basis=ao_basis,
-        xc_sph_transform=xc_sph_transform,
-        xc_batch_size=int(xc_batch_size),
-    )
-
-    return RHFDFRunResult(
-        mol=mol,
-        basis_name=str(basis_name),
-        auxbasis_name=str(auxbasis_name),
-        ao_basis=ao_basis,
-        aux_basis=aux_basis,
-        int1e=int1e,
-        df_B=B_scf,
-        scf=scf,
-        profile=profile,
-        sph_map=sph_map,
-        df_L=L_chol,
+        init_fock_cycles_default=_HF_INIT_FOCK_CYCLES,
+        result_cls=RHFDFRunResult,
     )
 
 
@@ -3443,83 +3081,27 @@ def run_rhf_df_cpu(
     profile: dict | None = None,
 ) -> RHFDFRunResult:
     """Run RHF with DF factors built on CPU via cuERI-CPU."""
-
-    if int(mol.spin) != 0:
-        raise NotImplementedError("run_rhf_df_cpu currently supports only closed-shell molecules (spin=0)")
-
-    nelec = int(mol.nelectron)
-    if nelec <= 0 or nelec % 2 != 0:
-        raise ValueError("RHF requires an even, positive electron count")
-
-    basis_in = mol.basis if basis is None else basis
-
-    # AO basis + 1e integrals
-    ao_basis, basis_name = build_ao_basis_cart(mol, basis=basis_in, expand_contractions=bool(expand_contractions))
-    coords, charges = _atom_coords_charges_bohr(mol)
-    int1e = build_int1e_cart(ao_basis, atom_coords_bohr=coords, atom_charges=charges)
-
-    # DF auxiliary basis + whitened DF factors B[μ,ν,Q]
-    aux_basis, auxbasis_name = _build_aux_basis_cart(
+    return _run_rhf_df_cpu_impl(
         mol,
-        basis_in=basis_in,
+        basis=basis,
         auxbasis=auxbasis,
-        expand_contractions=bool(expand_contractions),
-        ao_basis=ao_basis,
-    )
-
-    df_prof = None
-    if profile is not None:
-        df_prof = profile.setdefault("df_build_cpu", {})
-    B, L_chol = build_df_B_from_cueri_packed_bases_cpu(
-        ao_basis,
-        aux_basis,
-        threads=int(df_threads),
-        profile=df_prof,
-        return_L=True,
-    )
-
-    # Spherical AO transform (if requested)
-    int1e_scf, B_scf, sph_map = _apply_sph_transform(mol, int1e, B, ao_basis)
-
-    # SCF solve on CPU.
-    init_fock_cycles_i = int(_HF_INIT_FOCK_CYCLES) if init_fock_cycles is None else max(0, int(init_fock_cycles))
-    diis_start_cycle_i = (
-        int(diis_start_cycle) if diis_start_cycle is not None else (1 if int(init_fock_cycles_i) > 0 else 2)
-    )
-    scf_prof = profile if profile is not None else None
-    scf = rhf_df(
-        int1e_scf.S,
-        int1e_scf.hcore,
-        B_scf,
-        nelec=int(nelec),
-        enuc=float(mol.energy_nuc()),
-        max_cycle=int(max_cycle),
-        conv_tol=float(conv_tol),
-        conv_tol_dm=float(conv_tol_dm),
-        diis=bool(diis),
-        diis_start_cycle=int(diis_start_cycle_i),
-        diis_space=int(diis_space),
-        damping=float(damping),
-        level_shift=float(level_shift),
-        k_q_block=int(k_q_block),
+        expand_contractions=expand_contractions,
+        df_threads=df_threads,
+        max_cycle=max_cycle,
+        conv_tol=conv_tol,
+        conv_tol_dm=conv_tol_dm,
+        diis=diis,
+        diis_start_cycle=diis_start_cycle,
+        diis_space=diis_space,
+        damping=damping,
+        level_shift=level_shift,
+        k_q_block=k_q_block,
         dm0=dm0,
         mo_coeff0=mo_coeff0,
-        init_fock_cycles=int(init_fock_cycles_i),
-        profile=scf_prof,
-    )
-
-    return RHFDFRunResult(
-        mol=mol,
-        basis_name=str(basis_name),
-        auxbasis_name=str(auxbasis_name),
-        ao_basis=ao_basis,
-        aux_basis=aux_basis,
-        int1e=int1e_scf,
-        df_B=B_scf,
-        scf=scf,
+        init_fock_cycles=init_fock_cycles,
         profile=profile,
-        sph_map=sph_map,
-        df_L=L_chol,
+        init_fock_cycles_default=_HF_INIT_FOCK_CYCLES,
+        result_cls=RHFDFRunResult,
     )
 
 
@@ -3544,70 +3126,25 @@ def run_uhf_df_cpu(
     profile: dict | None = None,
 ) -> UHFDFRunResult:
     """Run UHF with DF factors built on CPU via cuERI-CPU."""
-
-    nalpha, nbeta = _nalpha_nbeta_from_mol(mol)
-    basis_in = mol.basis if basis is None else basis
-
-    ao_basis, basis_name = build_ao_basis_cart(mol, basis=basis_in, expand_contractions=bool(expand_contractions))
-    coords, charges = _atom_coords_charges_bohr(mol)
-    int1e = build_int1e_cart(ao_basis, atom_coords_bohr=coords, atom_charges=charges)
-
-    aux_basis, auxbasis_name = _build_aux_basis_cart(
+    return _run_uhf_df_cpu_impl(
         mol,
-        basis_in=basis_in,
+        basis=basis,
         auxbasis=auxbasis,
-        expand_contractions=bool(expand_contractions),
-        ao_basis=ao_basis,
-    )
-
-    df_prof = None
-    if profile is not None:
-        df_prof = profile.setdefault("df_build_cpu", {})
-    B, L_chol = build_df_B_from_cueri_packed_bases_cpu(
-        ao_basis,
-        aux_basis,
-        threads=int(df_threads),
-        profile=df_prof,
-        return_L=True,
-    )
-
-    # Spherical AO transform (if requested)
-    int1e_scf, B_scf, sph_map = _apply_sph_transform(mol, int1e, B, ao_basis)
-
-    scf_prof = profile if profile is not None else None
-    scf = uhf_df(
-        int1e_scf.S,
-        int1e_scf.hcore,
-        B_scf,
-        nalpha=int(nalpha),
-        nbeta=int(nbeta),
-        enuc=float(mol.energy_nuc()),
-        max_cycle=int(max_cycle),
-        conv_tol=float(conv_tol),
-        conv_tol_dm=float(conv_tol_dm),
-        diis=bool(diis),
-        diis_start_cycle=int(diis_start_cycle),
-        diis_space=int(diis_space),
-        damping=float(damping),
-        k_q_block=int(k_q_block),
+        expand_contractions=expand_contractions,
+        df_threads=df_threads,
+        max_cycle=max_cycle,
+        conv_tol=conv_tol,
+        conv_tol_dm=conv_tol_dm,
+        diis=diis,
+        diis_start_cycle=diis_start_cycle,
+        diis_space=diis_space,
+        damping=damping,
+        k_q_block=k_q_block,
         cublas_math_mode=cublas_math_mode,
         dm0=dm0,
         mo_coeff0=mo_coeff0,
-        profile=scf_prof,
-    )
-
-    return UHFDFRunResult(
-        mol=mol,
-        basis_name=str(basis_name),
-        auxbasis_name=str(auxbasis_name),
-        ao_basis=ao_basis,
-        aux_basis=aux_basis,
-        int1e=int1e_scf,
-        df_B=B_scf,
-        scf=scf,
         profile=profile,
-        sph_map=sph_map,
-        df_L=L_chol,
+        result_cls=UHFDFRunResult,
     )
 
 
@@ -3632,73 +3169,25 @@ def run_rohf_df_cpu(
     profile: dict | None = None,
 ) -> ROHFDFRunResult:
     """Run ROHF with DF factors built on CPU via cuERI-CPU."""
-
-    nalpha, nbeta = _nalpha_nbeta_from_mol(mol)
-    if int(nalpha) < int(nbeta):
-        raise ValueError("run_rohf_df_cpu requires spin >= 0 (nalpha >= nbeta)")
-
-    basis_in = mol.basis if basis is None else basis
-
-    ao_basis, basis_name = build_ao_basis_cart(mol, basis=basis_in, expand_contractions=bool(expand_contractions))
-    coords, charges = _atom_coords_charges_bohr(mol)
-    int1e = build_int1e_cart(ao_basis, atom_coords_bohr=coords, atom_charges=charges)
-
-    aux_basis, auxbasis_name = _build_aux_basis_cart(
+    return _run_rohf_df_cpu_impl(
         mol,
-        basis_in=basis_in,
+        basis=basis,
         auxbasis=auxbasis,
-        expand_contractions=bool(expand_contractions),
-        ao_basis=ao_basis,
-    )
-
-    df_prof = None
-    if profile is not None:
-        df_prof = profile.setdefault("df_build_cpu", {})
-    B, L_chol = build_df_B_from_cueri_packed_bases_cpu(
-        ao_basis,
-        aux_basis,
-        threads=int(df_threads),
-        profile=df_prof,
-        return_L=True,
-    )
-
-    # Spherical AO transform (if requested)
-    int1e_scf, B_scf, sph_map = _apply_sph_transform(mol, int1e, B, ao_basis)
-
-    scf_prof = profile if profile is not None else None
-    scf = rohf_df(
-        int1e_scf.S,
-        int1e_scf.hcore,
-        B_scf,
-        nalpha=int(nalpha),
-        nbeta=int(nbeta),
-        enuc=float(mol.energy_nuc()),
-        max_cycle=int(max_cycle),
-        conv_tol=float(conv_tol),
-        conv_tol_dm=float(conv_tol_dm),
-        diis=bool(diis),
-        diis_start_cycle=int(diis_start_cycle),
-        diis_space=int(diis_space),
-        damping=float(damping),
-        k_q_block=int(k_q_block),
+        expand_contractions=expand_contractions,
+        df_threads=df_threads,
+        max_cycle=max_cycle,
+        conv_tol=conv_tol,
+        conv_tol_dm=conv_tol_dm,
+        diis=diis,
+        diis_start_cycle=diis_start_cycle,
+        diis_space=diis_space,
+        damping=damping,
+        k_q_block=k_q_block,
         cublas_math_mode=cublas_math_mode,
         dm0=dm0,
         mo_coeff0=mo_coeff0,
-        profile=scf_prof,
-    )
-
-    return ROHFDFRunResult(
-        mol=mol,
-        basis_name=str(basis_name),
-        auxbasis_name=str(auxbasis_name),
-        ao_basis=ao_basis,
-        aux_basis=aux_basis,
-        int1e=int1e_scf,
-        df_B=B_scf,
-        scf=scf,
         profile=profile,
-        sph_map=sph_map,
-        df_L=L_chol,
+        result_cls=ROHFDFRunResult,
     )
 
 
@@ -3728,123 +3217,31 @@ def run_uhf_df(
     profile: dict | None = None,
 ) -> UHFDFRunResult:
     """Run UHF with DF integrals from cuERI."""
-
-    nalpha, nbeta = _nalpha_nbeta_from_mol(mol)
-    basis_in = mol.basis if basis is None else basis
-    cfg = _resolve_cueri_df_config(
-        df_config,
+    return _run_uhf_df_impl(
+        mol,
+        basis=basis,
+        auxbasis=auxbasis,
+        df_config=df_config,
         df_int3c_plan_policy=df_int3c_plan_policy,
         df_int3c_work_small_max=df_int3c_work_small_max,
         df_int3c_work_large_min=df_int3c_work_large_min,
         df_int3c_blocks_per_task=df_int3c_blocks_per_task,
-    )
-
-    df_layout_s = str(df_layout).strip().lower()
-    if df_layout_s not in {"mnq", "qmn"}:
-        raise ValueError("df_layout must be one of: 'mnQ', 'Qmn'")
-    df_build_layout = df_layout_s
-    df_ao_rep = "cart" if bool(mol.cart) else "sph"
-
-    # AO basis + 1e integrals
-    ao_basis, basis_name = build_ao_basis_cart(mol, basis=basis_in, expand_contractions=bool(expand_contractions))
-    coords, charges = _atom_coords_charges_bohr(mol)
-    int1e = build_int1e_cart(ao_basis, atom_coords_bohr=coords, atom_charges=charges)
-
-    # DF auxiliary basis + whitened DF factors B[μ,ν,Q]
-    aux_basis, auxbasis_name = _build_aux_basis_cart(
-        mol,
-        basis_in=basis_in,
-        auxbasis=auxbasis,
-        expand_contractions=bool(expand_contractions),
-        ao_basis=ao_basis,
-    )
-
-    df_prof = None
-    if profile is not None:
-        df_prof = profile.setdefault("df_build", {})
-
-    B, L_chol = build_df_B_from_cueri_packed_bases(
-        ao_basis,
-        aux_basis,
-        config=cfg,
-        layout=str(df_build_layout),
-        ao_rep=str(df_ao_rep),
-        profile=df_prof,
-        return_L=True,
-    )
-
-    # Spherical AO transform (if requested)
-    if bool(mol.cart):
-        int1e_scf, B_scf, sph_map = _apply_sph_transform(mol, int1e, B, ao_basis, df_B_layout=str(df_layout))
-    else:
-        int1e_scf, _B_unused, sph_map = _apply_sph_transform(mol, int1e, None, ao_basis, df_B_layout=str(df_layout))
-        B_scf = B
-
-    scf_prof = profile if profile is not None else None
-    scf = uhf_df(
-        int1e_scf.S,
-        int1e_scf.hcore,
-        B_scf,
-        nalpha=int(nalpha),
-        nbeta=int(nbeta),
-        enuc=float(mol.energy_nuc()),
-        max_cycle=int(max_cycle),
-        conv_tol=float(conv_tol),
-        conv_tol_dm=float(conv_tol_dm),
-        diis=bool(diis),
-        diis_start_cycle=int(diis_start_cycle),
-        diis_space=int(diis_space),
-        damping=float(damping),
-        k_q_block=int(k_q_block),
-        k_cache_max_mb=None if df_k_cache_max_mb is None else int(df_k_cache_max_mb),
+        df_k_cache_max_mb=df_k_cache_max_mb,
+        df_layout=df_layout,
+        expand_contractions=expand_contractions,
+        max_cycle=max_cycle,
+        conv_tol=conv_tol,
+        conv_tol_dm=conv_tol_dm,
+        diis=diis,
+        diis_start_cycle=diis_start_cycle,
+        diis_space=diis_space,
+        damping=damping,
+        k_q_block=k_q_block,
         dm0=dm0,
         mo_coeff0=mo_coeff0,
-        profile=scf_prof,
-    )
-
-    if B_scf is not None:
-        try:  # pragma: no cover
-            import os as _os_dfpack  # noqa: PLC0415
-            import cupy as _cp_dfpack  # noqa: PLC0415
-            from asuka.integrals.df_packed_s2 import ao_packed_s2_enabled, pack_B_to_Qp  # noqa: PLC0415
-
-            _explicit = "ASUKA_DF_AO_PACKED_S2" in _os_dfpack.environ
-            _want_pack = bool(ao_packed_s2_enabled()) if _explicit else isinstance(B_scf, _cp_dfpack.ndarray)
-            if bool(_want_pack) and int(getattr(B_scf, "ndim", 0)) == 3:
-                layout = "mnQ" if str(df_layout_s) == "mnq" else "Qmn"
-                B_scf = pack_B_to_Qp(B_scf, layout=layout, nao=int(int1e_scf.S.shape[0]))
-        except Exception:
-            pass
-
-    return UHFDFRunResult(
-        mol=mol,
-        basis_name=str(basis_name),
-        auxbasis_name=str(auxbasis_name),
-        ao_basis=ao_basis,
-        aux_basis=aux_basis,
-        int1e=int1e_scf,
-        df_B=B_scf,
-        scf=scf,
         profile=profile,
-        sph_map=sph_map,
-        df_L=L_chol,
-        df_run_config=_make_df_run_config(
-            hf_method="uhf",
-            basis=basis_in,
-            auxbasis=auxbasis,
-            df_config=cfg,
-            expand_contractions=bool(expand_contractions),
-            backend="cuda",
-            max_cycle=int(max_cycle),
-            conv_tol=float(conv_tol),
-            conv_tol_dm=float(conv_tol_dm),
-            diis=bool(diis),
-            diis_start_cycle=int(diis_start_cycle),
-            diis_space=int(diis_space),
-            damping=float(damping),
-            level_shift=0.0,
-            k_q_block=int(k_q_block),
-        ),
+        result_cls=UHFDFRunResult,
+        make_df_run_config=_make_df_run_config,
     )
 
 
@@ -3885,127 +3282,37 @@ def run_uks_df(
     spin-polarized meta-GGA form (rho_a/rho_b, sigma_aa/sigma_ab/sigma_bb,
     tau_a/tau_b) to build V_xc and E_xc.
     """
-    from asuka.xc.functional import get_functional
-    from asuka.density.grids_device import make_becke_grid_device
-
-    xc_spec = get_functional(functional)
-    nalpha, nbeta = _nalpha_nbeta_from_mol(mol)
-
-    basis_in = mol.basis if basis is None else basis
-    cfg = _resolve_cueri_df_config(
-        df_config,
+    return _run_uks_df_impl(
+        mol,
+        functional=functional,
+        basis=basis,
+        auxbasis=auxbasis,
+        df_config=df_config,
         df_int3c_plan_policy=df_int3c_plan_policy,
         df_int3c_work_small_max=df_int3c_work_small_max,
         df_int3c_work_large_min=df_int3c_work_large_min,
         df_int3c_blocks_per_task=df_int3c_blocks_per_task,
-    )
-    df_layout_s = str(df_layout).strip().lower()
-    if df_layout_s not in {"mnq", "qmn"}:
-        raise ValueError("df_layout must be one of: 'mnQ', 'Qmn'")
-    df_ao_rep = "cart" if bool(mol.cart) else "sph"
-
-    ao_basis, basis_name = build_ao_basis_cart(mol, basis=basis_in, expand_contractions=bool(expand_contractions))
-    coords, charges = _atom_coords_charges_bohr(mol)
-    int1e = build_int1e_cart(ao_basis, atom_coords_bohr=coords, atom_charges=charges)
-
-    aux_basis, auxbasis_name = _build_aux_basis_cart(
-        mol, basis_in=basis_in, auxbasis=auxbasis, expand_contractions=bool(expand_contractions),
-        ao_basis=ao_basis,
-    )
-
-    df_prof = None
-    if profile is not None:
-        df_prof = profile.setdefault("df_build", {})
-
-    B, L_chol = build_df_B_from_cueri_packed_bases(
-        ao_basis, aux_basis, config=cfg, layout=str(df_layout_s),
-        ao_rep=str(df_ao_rep), profile=df_prof, return_L=True,
-    )
-
-    if bool(mol.cart):
-        int1e_scf, B_scf, sph_map = _apply_sph_transform(mol, int1e, B, ao_basis, df_B_layout=str(df_layout))
-    else:
-        int1e_scf, _B_unused, sph_map = _apply_sph_transform(mol, int1e, None, ao_basis, df_B_layout=str(df_layout))
-        B_scf = B
-
-    # Build DFT grid (or use caller-supplied)
-    import cupy as _cp_grid
-    if xc_grid_coords is not None and xc_grid_weights is not None:
-        grid_coords = _cp_grid.asarray(xc_grid_coords, dtype=_cp_grid.float64)
-        grid_weights = _cp_grid.asarray(xc_grid_weights, dtype=_cp_grid.float64)
-    else:
-        grid_coords, grid_weights = make_becke_grid_device(
-            mol, radial_n=int(grid_radial_n), angular_n=int(grid_angular_n),
-            radial_scheme="treutler",
-        )
-
-    xc_sph_transform = None
-    if not bool(mol.cart) and sph_map is not None:
-        import cupy as _cp_xc
-        if hasattr(sph_map, "T_c2s"):
-            xc_sph_transform = _cp_xc.asarray(sph_map.T_c2s, dtype=_cp_xc.float64)
-        elif hasattr(sph_map, "T_matrix"):
-            xc_sph_transform = _cp_xc.asarray(sph_map.T_matrix, dtype=_cp_xc.float64)
-        elif isinstance(sph_map, tuple) and len(sph_map) >= 1:
-            xc_sph_transform = _cp_xc.asarray(sph_map[0], dtype=_cp_xc.float64)
-
-    diis_start_cycle_i = int(diis_start_cycle)
-    scf = uhf_df(
-        int1e_scf.S,
-        int1e_scf.hcore,
-        B_scf,
-        nalpha=int(nalpha),
-        nbeta=int(nbeta),
-        enuc=float(mol.energy_nuc()),
-        max_cycle=int(max_cycle),
-        conv_tol=float(conv_tol),
-        conv_tol_dm=float(conv_tol_dm),
-        diis=bool(diis),
-        diis_start_cycle=int(diis_start_cycle_i),
-        diis_space=int(diis_space),
-        damping=float(damping),
-        k_q_block=int(k_q_block),
-        k_cache_max_mb=None if df_k_cache_max_mb is None else int(df_k_cache_max_mb),
+        df_k_cache_max_mb=df_k_cache_max_mb,
+        df_layout=df_layout,
+        expand_contractions=expand_contractions,
+        max_cycle=max_cycle,
+        conv_tol=conv_tol,
+        conv_tol_dm=conv_tol_dm,
+        diis=diis,
+        diis_start_cycle=diis_start_cycle,
+        diis_space=diis_space,
+        damping=damping,
+        k_q_block=k_q_block,
+        grid_radial_n=grid_radial_n,
+        grid_angular_n=grid_angular_n,
+        xc_grid_coords=xc_grid_coords,
+        xc_grid_weights=xc_grid_weights,
+        xc_batch_size=xc_batch_size,
         dm0=dm0,
         mo_coeff0=mo_coeff0,
         profile=profile,
-        xc_spec=xc_spec,
-        xc_grid_coords=grid_coords,
-        xc_grid_weights=grid_weights,
-        xc_ao_basis=ao_basis,
-        xc_sph_transform=xc_sph_transform,
-        xc_batch_size=int(xc_batch_size),
-    )
-
-    return UHFDFRunResult(
-        mol=mol,
-        basis_name=str(basis_name),
-        auxbasis_name=str(auxbasis_name),
-        ao_basis=ao_basis,
-        aux_basis=aux_basis,
-        int1e=int1e_scf,
-        df_B=B_scf,
-        scf=scf,
-        profile=profile,
-        sph_map=sph_map,
-        df_L=L_chol,
-        df_run_config=_make_df_run_config(
-            hf_method="uks",
-            basis=basis_in,
-            auxbasis=auxbasis,
-            df_config=cfg,
-            expand_contractions=bool(expand_contractions),
-            backend="cuda",
-            max_cycle=int(max_cycle),
-            conv_tol=float(conv_tol),
-            conv_tol_dm=float(conv_tol_dm),
-            diis=bool(diis),
-            diis_start_cycle=int(diis_start_cycle_i),
-            diis_space=int(diis_space),
-            damping=float(damping),
-            level_shift=0.0,
-            k_q_block=int(k_q_block),
-        ),
+        result_cls=UHFDFRunResult,
+        make_df_run_config=_make_df_run_config,
     )
 
 
@@ -4035,126 +3342,31 @@ def run_rohf_df(
     profile: dict | None = None,
 ) -> ROHFDFRunResult:
     """Run ROHF with DF integrals from cuERI."""
-
-    nalpha, nbeta = _nalpha_nbeta_from_mol(mol)
-    if int(nalpha) < int(nbeta):
-        raise ValueError("run_rohf_df requires spin >= 0 (nalpha >= nbeta)")
-
-    basis_in = mol.basis if basis is None else basis
-    cfg = _resolve_cueri_df_config(
-        df_config,
+    return _run_rohf_df_impl(
+        mol,
+        basis=basis,
+        auxbasis=auxbasis,
+        df_config=df_config,
         df_int3c_plan_policy=df_int3c_plan_policy,
         df_int3c_work_small_max=df_int3c_work_small_max,
         df_int3c_work_large_min=df_int3c_work_large_min,
         df_int3c_blocks_per_task=df_int3c_blocks_per_task,
-    )
-
-    df_layout_s = str(df_layout).strip().lower()
-    if df_layout_s not in {"mnq", "qmn"}:
-        raise ValueError("df_layout must be one of: 'mnQ', 'Qmn'")
-    df_build_layout = df_layout_s
-    df_ao_rep = "cart" if bool(mol.cart) else "sph"
-
-    # AO basis + 1e integrals
-    ao_basis, basis_name = build_ao_basis_cart(mol, basis=basis_in, expand_contractions=bool(expand_contractions))
-    coords, charges = _atom_coords_charges_bohr(mol)
-    int1e = build_int1e_cart(ao_basis, atom_coords_bohr=coords, atom_charges=charges)
-
-    # DF auxiliary basis + whitened DF factors B[μ,ν,Q]
-    aux_basis, auxbasis_name = _build_aux_basis_cart(
-        mol,
-        basis_in=basis_in,
-        auxbasis=auxbasis,
-        expand_contractions=bool(expand_contractions),
-        ao_basis=ao_basis,
-    )
-
-    df_prof = None
-    if profile is not None:
-        df_prof = profile.setdefault("df_build", {})
-
-    B, L_chol = build_df_B_from_cueri_packed_bases(
-        ao_basis,
-        aux_basis,
-        config=cfg,
-        layout=str(df_build_layout),
-        ao_rep=str(df_ao_rep),
-        profile=df_prof,
-        return_L=True,
-    )
-
-    # Spherical AO transform (if requested)
-    if bool(mol.cart):
-        int1e_scf, B_scf, sph_map = _apply_sph_transform(mol, int1e, B, ao_basis, df_B_layout=str(df_layout))
-    else:
-        int1e_scf, _B_unused, sph_map = _apply_sph_transform(mol, int1e, None, ao_basis, df_B_layout=str(df_layout))
-        B_scf = B
-
-    scf_prof = profile if profile is not None else None
-    scf = rohf_df(
-        int1e_scf.S,
-        int1e_scf.hcore,
-        B_scf,
-        nalpha=int(nalpha),
-        nbeta=int(nbeta),
-        enuc=float(mol.energy_nuc()),
-        max_cycle=int(max_cycle),
-        conv_tol=float(conv_tol),
-        conv_tol_dm=float(conv_tol_dm),
-        diis=bool(diis),
-        diis_start_cycle=int(diis_start_cycle),
-        diis_space=int(diis_space),
-        damping=float(damping),
-        k_q_block=int(k_q_block),
-        k_cache_max_mb=None if df_k_cache_max_mb is None else int(df_k_cache_max_mb),
+        df_k_cache_max_mb=df_k_cache_max_mb,
+        df_layout=df_layout,
+        expand_contractions=expand_contractions,
+        max_cycle=max_cycle,
+        conv_tol=conv_tol,
+        conv_tol_dm=conv_tol_dm,
+        diis=diis,
+        diis_start_cycle=diis_start_cycle,
+        diis_space=diis_space,
+        damping=damping,
+        k_q_block=k_q_block,
         dm0=dm0,
         mo_coeff0=mo_coeff0,
-        profile=scf_prof,
-    )
-
-    if B_scf is not None:
-        try:  # pragma: no cover
-            import os as _os_dfpack  # noqa: PLC0415
-            import cupy as _cp_dfpack  # noqa: PLC0415
-            from asuka.integrals.df_packed_s2 import ao_packed_s2_enabled, pack_B_to_Qp  # noqa: PLC0415
-
-            _explicit = "ASUKA_DF_AO_PACKED_S2" in _os_dfpack.environ
-            _want_pack = bool(ao_packed_s2_enabled()) if _explicit else isinstance(B_scf, _cp_dfpack.ndarray)
-            if bool(_want_pack) and int(getattr(B_scf, "ndim", 0)) == 3:
-                layout = "mnQ" if str(df_layout_s) == "mnq" else "Qmn"
-                B_scf = pack_B_to_Qp(B_scf, layout=layout, nao=int(int1e_scf.S.shape[0]))
-        except Exception:
-            pass
-
-    return ROHFDFRunResult(
-        mol=mol,
-        basis_name=str(basis_name),
-        auxbasis_name=str(auxbasis_name),
-        ao_basis=ao_basis,
-        aux_basis=aux_basis,
-        int1e=int1e_scf,
-        df_B=B_scf,
-        scf=scf,
         profile=profile,
-        sph_map=sph_map,
-        df_L=L_chol,
-        df_run_config=_make_df_run_config(
-            hf_method="rohf",
-            basis=basis_in,
-            auxbasis=auxbasis,
-            df_config=cfg,
-            expand_contractions=bool(expand_contractions),
-            backend="cuda",
-            max_cycle=int(max_cycle),
-            conv_tol=float(conv_tol),
-            conv_tol_dm=float(conv_tol_dm),
-            diis=bool(diis),
-            diis_start_cycle=int(diis_start_cycle),
-            diis_space=int(diis_space),
-            damping=float(damping),
-            level_shift=0.0,
-            k_q_block=int(k_q_block),
-        ),
+        result_cls=ROHFDFRunResult,
+        make_df_run_config=_make_df_run_config,
     )
 
 
@@ -4170,14 +3382,20 @@ __all__ = [
     "run_uks_df",
     "run_uks",
     "run_rhf_dense",
+    "run_rhf_direct",
+    "run_rhf_direct_df",
     "run_rhf_df_cpu",
     "run_rhf_df",
     "run_rhf",
     "run_rohf_dense",
+    "run_rohf_direct",
+    "run_rohf_direct_df",
     "run_rohf_df_cpu",
     "run_rohf_df",
     "run_rohf",
     "run_uhf_dense",
+    "run_uhf_direct",
+    "run_uhf_direct_df",
     "run_uhf_df_cpu",
     "run_uhf_df",
     "run_uhf",

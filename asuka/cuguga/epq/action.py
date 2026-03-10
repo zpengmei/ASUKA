@@ -111,7 +111,7 @@ def epq_contribs_one(
     if nodes is None:
         nodes = path_nodes(drt, steps)
 
-    if idx_dtype == np.dtype(np.int32) and _epq_contribs_one_cy is not None:
+    if _epq_contribs_one_cy is not None:
         idx, coeff = _epq_contribs_one_cy(drt, csf_idx, int(p), int(q), steps, nodes)
     else:
         idx, coeff = _e_pq_contribs_from_csf_index_arrays(
@@ -163,7 +163,7 @@ def epq_apply_weighted_many(
     steps = np.asarray(steps, dtype=np.int8).ravel()
     nodes = np.asarray(nodes, dtype=np.int32).ravel()
 
-    if idx_dtype == np.dtype(np.int32) and _epq_apply_weighted_many_cy is not None:
+    if _epq_apply_weighted_many_cy is not None:
         return _epq_apply_weighted_many_cy(
             drt,
             csf_idx,
@@ -235,7 +235,7 @@ def epq_apply_g(
     steps = np.asarray(steps, dtype=np.int8).ravel()
     nodes = np.asarray(nodes, dtype=np.int32).ravel()
 
-    if idx_dtype == np.dtype(np.int32) and _epq_apply_g_cy is not None:
+    if _epq_apply_g_cy is not None:
         i_idx, val, n_pairs = _epq_apply_g_cy(
             drt,
             csf_idx,

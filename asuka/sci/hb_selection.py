@@ -15,7 +15,7 @@ from asuka.cuguga.drt import DRT
 from asuka.cuguga.screening import RowScreening
 from asuka.cuguga.state_cache import DRTStateCache
 from asuka.sci.hb_integrals import HeatBathIntegralIndex
-from asuka.sci.selected_ci import DiagonalGuessLookup, _select_external_sparse
+from asuka.sci.selected_ci import ConnectedRowCache, DiagonalGuessLookup, _select_external_sparse
 
 
 def heat_bath_select_and_pt2_sparse(
@@ -33,6 +33,7 @@ def heat_bath_select_and_pt2_sparse(
     max_out: int,
     screening: RowScreening | None,
     state_cache: DRTStateCache | None,
+    row_cache: ConnectedRowCache | None = None,
 ) -> tuple[list[int], np.ndarray]:
     """Scalable heat-bath-style selection using exact matrix-element screening."""
 
@@ -55,6 +56,7 @@ def heat_bath_select_and_pt2_sparse(
         screening=screening,
         state_cache=state_cache,
         select_screen_contrib=float(eps),
+        row_cache=row_cache,
     )
 
 
