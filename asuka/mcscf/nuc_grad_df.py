@@ -2650,6 +2650,9 @@ def _build_bar_L_delta_casscf_df(
         for _q0 in range(0, naux, _chunk):
             _q1 = min(_q0 + _chunk, naux)
             _blk = xp.einsum("mvQ,nv->Qmn", tmp[:, :, _q0:_q1], C_act_x, optimize=True)
+            # Symmetrize before packing: _blk[q,m,n] is not symmetric per Q-block;
+            # the Qmn path symmetrizes the full accumulated bar_L at the end.
+            _blk = 0.5 * (_blk + _blk.transpose(0, 2, 1))
             _bp = _pack_qmn_block_to_qp(xp, _blk.astype(xp.float64, copy=False), nao=int(nao))
             bar[_q0:_q1] += _bp.astype(_od, copy=False)
             del _blk, _bp

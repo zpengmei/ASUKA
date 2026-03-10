@@ -790,11 +790,17 @@ def _build_bar_L_lorb_df(
 
         for _q0 in range(0, int(naux), int(_chunk)):
             _q1 = min(int(naux), int(_q0) + int(_chunk))
+            # Each einsum("mvQ,nv->Qmn") produces a non-symmetric per-Q block;
+            # symmetrize before packing to match the Qmn path (which symmetrizes
+            # the full accumulated bar_mean at the end via _symmetrize_bar_L_inplace).
             _blk = xp.einsum("mvQ,nv->Qmn", tmp_L[:, :, _q0:_q1], C_act, optimize=True)
+            _blk = 0.5 * (_blk + _blk.transpose(0, 2, 1))
             bar_mean[_q0:_q1] += _pack_qmn_block_to_qp(xp, _blk.astype(xp.float64, copy=False), nao=int(nao)).astype(_od, copy=False)
             _blk = xp.einsum("mvQ,nv->Qmn", tmp[:, :, _q0:_q1], C_L_act, optimize=True)
+            _blk = 0.5 * (_blk + _blk.transpose(0, 2, 1))
             bar_mean[_q0:_q1] += _pack_qmn_block_to_qp(xp, _blk.astype(xp.float64, copy=False), nao=int(nao)).astype(_od, copy=False)
             _blk = xp.einsum("mvQ,nv->Qmn", tmp_M[:, :, _q0:_q1], C_act, optimize=True)
+            _blk = 0.5 * (_blk + _blk.transpose(0, 2, 1))
             bar_mean[_q0:_q1] += _pack_qmn_block_to_qp(xp, _blk.astype(xp.float64, copy=False), nao=int(nao)).astype(_od, copy=False)
             del _blk
         del tmp_L, tmp, tmp_M, X, X_L, L_act_mo
