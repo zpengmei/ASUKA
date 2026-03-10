@@ -5,12 +5,68 @@ from dataclasses import dataclass
 import numpy as np
 
 from asuka.cuguga.drt import DRT
-from asuka.cuguga.oracle.sparse import connected_row_sparse
 from asuka.cuguga.state_cache import get_state_cache
-from .estimators import choose_reference_index, projected_energy_ref, rayleigh_energy_ref
+from .estimators import (
+    choose_reference_index,
+    projected_energy_ref,
+    projected_energy_ref_status,
+    rayleigh_energy_ref,
+    sparse_abs_l1_on_support,
+    sparse_dot_sorted,
+)
 from .omp import maybe_set_openmp_threads
-from .spawn import spawn_hamiltonian_events
+from .spawn import spawn_hamiltonian_events, spawn_hamiltonian_events_semi_stochastic
 from .sparse import coalesce_coo_i32_f64
+
+
+_TRIAL_DYNAMIC_REF_POLICIES = {"dynamic_max_abs", "fixed_idx_strict", "fixed_trial_max_abs"}
+_SHIFT_MIN_POP_FRAC = 0.8
+
+
+@dataclass(frozen=True)
+class FCIQMCRun:
+    idx: np.ndarray
+    val: np.ndarray
+    energies: np.ndarray
+    shifts: np.ndarray
+    populations: np.ndarray
+    ref_idx: np.ndarray
+    energy_estimator: str
+    sample_iters: np.ndarray
+    energies_projected_fixed: np.ndarray
+    energies_projected_dynamic: np.ndarray
+    energies_rayleigh: np.ndarray
+    fixed_ref_idx: int
+    dynamic_ref_idx: np.ndarray
+    fixed_ref_alive: np.ndarray
+    trial_cosine: np.ndarray
+    trial_support_l1_frac: np.ndarray
+    det_subspace_l1_frac: np.ndarray
+
+
+@dataclass
+class _FCIQMCTrace:
+    sample_iters: np.ndarray
+    energies_projected_fixed: np.ndarray
+    energies_projected_dynamic: np.ndarray
+    energies_rayleigh: np.ndarray
+    dynamic_ref_idx: np.ndarray
+    fixed_ref_alive: np.ndarray
+    trial_cosine: np.ndarray
+    trial_support_l1_frac: np.ndarray
+    det_subspace_l1_frac: np.ndarray
+
+
+@dataclass(frozen=True)
+class _CheckpointMetrics:
+    projected_fixed: float
+    projected_dynamic: float
+    rayleigh: float
+    dynamic_ref_idx: int
+    fixed_ref_alive: bool
+    trial_cosine: float
+    trial_support_l1_frac: float
+    det_subspace_l1_frac: float
 
 
 def update_shift(
@@ -20,16 +76,9 @@ def update_shift(
     target_population: float,
     dt: float,
     damping: float,
+    log_clip: float | None = None,
 ) -> float:
-    """Simple population-control shift update.
-
-    Convention:
-      x_{t+1} = x_t - dt (H - S I) x_t
-
-    With this sign convention, decreasing S increases death/cloning and tends to
-    reduce the walker population. The update below therefore decreases S when
-    population is above target.
-    """
+    """Simple population-control shift update."""
 
     shift = float(shift)
     pop = float(population)
@@ -42,18 +91,268 @@ def update_shift(
         return shift
     if pop <= 0.0 or tgt <= 0.0:
         raise ValueError("population and target_population must be > 0")
-    return shift - (damp / dt) * float(np.log(pop / tgt))
+    log_ratio = float(np.log(pop / tgt))
+    if log_clip is not None:
+        clip = abs(float(log_clip))
+        if clip == 0.0:
+            log_ratio = 0.0
+        else:
+            log_ratio = float(np.clip(log_ratio, -clip, clip))
+    return shift - (damp / dt) * log_ratio
 
 
-@dataclass(frozen=True)
-class FCIQMCRun:
-    idx: np.ndarray
-    val: np.ndarray
-    energies: np.ndarray
-    shifts: np.ndarray
-    populations: np.ndarray
-    ref_idx: np.ndarray
-    energy_estimator: str
+def _validate_trial_inputs(
+    *,
+    x_idx_u: np.ndarray,
+    x_val_u: np.ndarray,
+    trial_idx: np.ndarray | None,
+    trial_val: np.ndarray | None,
+) -> tuple[np.ndarray, np.ndarray, float]:
+    if (trial_idx is None) != (trial_val is None):
+        raise ValueError("trial_idx and trial_val must be provided together")
+    if trial_idx is None:
+        trial_idx_u = np.asarray(x_idx_u, dtype=np.int32, order="C")
+        trial_val_u = np.asarray(x_val_u, dtype=np.float64, order="C")
+    else:
+        trial_idx_u, trial_val_u = coalesce_coo_i32_f64(trial_idx, trial_val)
+    if trial_idx_u.size == 0:
+        raise ValueError("trial vector is empty")
+    trial_l2 = float(np.linalg.norm(trial_val_u))
+    if trial_l2 == 0.0:
+        raise ValueError("trial vector has zero norm")
+    return trial_idx_u, trial_val_u, trial_l2
+
+
+def _resolve_reference_policy(
+    *,
+    reference_policy: str,
+    preferred_ref_idx: int | None,
+    trial_idx_u: np.ndarray,
+    trial_val_u: np.ndarray,
+) -> int:
+    policy = str(reference_policy).lower()
+    if policy not in _TRIAL_DYNAMIC_REF_POLICIES:
+        raise ValueError(
+            "reference_policy must be 'dynamic_max_abs', 'fixed_idx_strict', or 'fixed_trial_max_abs'"
+        )
+    if policy == "fixed_idx_strict":
+        if preferred_ref_idx is None:
+            raise ValueError("preferred_ref_idx must be provided when reference_policy='fixed_idx_strict'")
+        return int(preferred_ref_idx)
+    k = int(np.argmax(np.abs(np.asarray(trial_val_u, dtype=np.float64).ravel())))
+    return int(np.asarray(trial_idx_u, dtype=np.int32).ravel()[k])
+
+
+def _prepare_det_subspace(
+    deterministic_subspace_idx: np.ndarray | None,
+    *,
+    fixed_ref_idx: int,
+) -> np.ndarray:
+    if deterministic_subspace_idx is None:
+        return np.zeros(0, dtype=np.int32)
+    det_idx = np.asarray(deterministic_subspace_idx, dtype=np.int32).ravel()
+    if det_idx.size == 0:
+        return np.zeros(0, dtype=np.int32)
+    det_idx = np.unique(np.concatenate((det_idx, np.asarray([int(fixed_ref_idx)], dtype=np.int32))))
+    det_idx.sort()
+    return np.asarray(det_idx, dtype=np.int32, order="C")
+
+
+def _make_trace(niter: int, energy_stride: int) -> _FCIQMCTrace:
+    n_sample = (int(niter) // int(energy_stride)) + 1
+    return _FCIQMCTrace(
+        sample_iters=np.empty(n_sample, dtype=np.int32),
+        energies_projected_fixed=np.full(n_sample, np.nan, dtype=np.float64),
+        energies_projected_dynamic=np.full(n_sample, np.nan, dtype=np.float64),
+        energies_rayleigh=np.full(n_sample, np.nan, dtype=np.float64),
+        dynamic_ref_idx=np.empty(n_sample, dtype=np.int32),
+        fixed_ref_alive=np.zeros(n_sample, dtype=np.bool_),
+        trial_cosine=np.full(n_sample, np.nan, dtype=np.float64),
+        trial_support_l1_frac=np.full(n_sample, np.nan, dtype=np.float64),
+        det_subspace_l1_frac=np.zeros(n_sample, dtype=np.float64),
+    )
+
+
+def _need_rayleigh(it: int, *, rayleigh_stride: int) -> bool:
+    return int(rayleigh_stride) > 0 and (int(it) % int(rayleigh_stride) == 0)
+
+
+def _evaluate_checkpoint(
+    *,
+    drt: DRT,
+    h1e: np.ndarray,
+    eri,
+    x_idx_u: np.ndarray,
+    x_val_u: np.ndarray,
+    fixed_ref_idx: int,
+    preferred_ref_idx: int | None,
+    trial_idx_u: np.ndarray,
+    trial_val_u: np.ndarray,
+    trial_l2: float,
+    det_idx_u: np.ndarray,
+    compute_rayleigh: bool,
+    state_cache,
+) -> _CheckpointMetrics:
+    dynamic_ref_idx = choose_reference_index(x_idx_u, x_val_u, preferred=preferred_ref_idx)
+    e_dynamic, _, _ = projected_energy_ref(
+        drt,
+        h1e,
+        eri,
+        x_idx_u,
+        x_val_u,
+        ref_idx=int(dynamic_ref_idx),
+        state_cache=state_cache,
+    )
+    e_fixed, _, _, fixed_ref_alive = projected_energy_ref_status(
+        drt,
+        h1e,
+        eri,
+        x_idx_u,
+        x_val_u,
+        ref_idx=int(fixed_ref_idx),
+        state_cache=state_cache,
+    )
+    e_rayleigh = np.nan
+    if bool(compute_rayleigh):
+        e_rayleigh, _, _ = rayleigh_energy_ref(
+            drt,
+            h1e,
+            eri,
+            x_idx_u,
+            x_val_u,
+            state_cache=state_cache,
+        )
+
+    x_l2 = float(np.linalg.norm(x_val_u))
+    trial_cosine = np.nan
+    if x_l2 > 0.0:
+        trial_cosine = float(
+            sparse_dot_sorted(x_idx_u, x_val_u, trial_idx_u, trial_val_u) / (x_l2 * float(trial_l2))
+        )
+    pop_l1 = float(np.sum(np.abs(x_val_u), dtype=np.float64))
+    trial_support_l1_frac = np.nan
+    det_subspace_l1_frac = 0.0
+    if pop_l1 > 0.0:
+        trial_support_l1_frac = float(sparse_abs_l1_on_support(x_idx_u, x_val_u, trial_idx_u) / pop_l1)
+        if int(det_idx_u.size) > 0:
+            det_subspace_l1_frac = float(sparse_abs_l1_on_support(x_idx_u, x_val_u, det_idx_u) / pop_l1)
+
+    return _CheckpointMetrics(
+        projected_fixed=float(e_fixed),
+        projected_dynamic=float(e_dynamic),
+        rayleigh=float(e_rayleigh),
+        dynamic_ref_idx=int(dynamic_ref_idx),
+        fixed_ref_alive=bool(fixed_ref_alive),
+        trial_cosine=float(trial_cosine),
+        trial_support_l1_frac=float(trial_support_l1_frac),
+        det_subspace_l1_frac=float(det_subspace_l1_frac),
+    )
+
+
+def _write_checkpoint(trace: _FCIQMCTrace, pos: int, it: int, metrics: _CheckpointMetrics) -> None:
+    trace.sample_iters[pos] = np.int32(it)
+    trace.energies_projected_fixed[pos] = float(metrics.projected_fixed)
+    trace.energies_projected_dynamic[pos] = float(metrics.projected_dynamic)
+    trace.energies_rayleigh[pos] = float(metrics.rayleigh)
+    trace.dynamic_ref_idx[pos] = np.int32(metrics.dynamic_ref_idx)
+    trace.fixed_ref_alive[pos] = bool(metrics.fixed_ref_alive)
+    trace.trial_cosine[pos] = float(metrics.trial_cosine)
+    trace.trial_support_l1_frac[pos] = float(metrics.trial_support_l1_frac)
+    trace.det_subspace_l1_frac[pos] = float(metrics.det_subspace_l1_frac)
+
+
+def _select_primary_history(
+    *,
+    trace: _FCIQMCTrace,
+    energy_estimator: str,
+    reference_policy: str,
+    fixed_ref_idx: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    estimator = str(energy_estimator).lower()
+    policy = str(reference_policy).lower()
+    if estimator == "rayleigh":
+        return (
+            np.asarray(trace.energies_rayleigh, dtype=np.float64, order="C"),
+            np.asarray(trace.dynamic_ref_idx, dtype=np.int32, order="C"),
+        )
+    if policy == "dynamic_max_abs":
+        return (
+            np.asarray(trace.energies_projected_dynamic, dtype=np.float64, order="C"),
+            np.asarray(trace.dynamic_ref_idx, dtype=np.int32, order="C"),
+        )
+    return (
+        np.asarray(trace.energies_projected_fixed, dtype=np.float64, order="C"),
+        np.full(trace.sample_iters.shape, np.int32(fixed_ref_idx), dtype=np.int32),
+    )
+
+
+def _build_run(
+    *,
+    idx: np.ndarray,
+    val: np.ndarray,
+    shifts: np.ndarray,
+    populations: np.ndarray,
+    trace: _FCIQMCTrace,
+    energy_estimator: str,
+    reference_policy: str,
+    fixed_ref_idx: int,
+) -> FCIQMCRun:
+    energies, ref_idx = _select_primary_history(
+        trace=trace,
+        energy_estimator=energy_estimator,
+        reference_policy=reference_policy,
+        fixed_ref_idx=fixed_ref_idx,
+    )
+    return FCIQMCRun(
+        idx=np.asarray(idx, dtype=np.int32, order="C"),
+        val=np.asarray(val, dtype=np.float64, order="C"),
+        energies=energies,
+        shifts=np.asarray(shifts, dtype=np.float64, order="C"),
+        populations=np.asarray(populations, dtype=np.float64, order="C"),
+        ref_idx=ref_idx,
+        energy_estimator=str(energy_estimator),
+        sample_iters=np.asarray(trace.sample_iters, dtype=np.int32, order="C"),
+        energies_projected_fixed=np.asarray(trace.energies_projected_fixed, dtype=np.float64, order="C"),
+        energies_projected_dynamic=np.asarray(trace.energies_projected_dynamic, dtype=np.float64, order="C"),
+        energies_rayleigh=np.asarray(trace.energies_rayleigh, dtype=np.float64, order="C"),
+        fixed_ref_idx=int(fixed_ref_idx),
+        dynamic_ref_idx=np.asarray(trace.dynamic_ref_idx, dtype=np.int32, order="C"),
+        fixed_ref_alive=np.asarray(trace.fixed_ref_alive, dtype=np.bool_, order="C"),
+        trial_cosine=np.asarray(trace.trial_cosine, dtype=np.float64, order="C"),
+        trial_support_l1_frac=np.asarray(trace.trial_support_l1_frac, dtype=np.float64, order="C"),
+        det_subspace_l1_frac=np.asarray(trace.det_subspace_l1_frac, dtype=np.float64, order="C"),
+    )
+
+
+def _maybe_update_shift(
+    *,
+    shift: float,
+    pop: float,
+    it: int,
+    dt: float,
+    tgt_pop: float,
+    shift_damping: float,
+    shift_stride: int,
+    shift_start: int,
+    shift_warmup_iters: int,
+    shift_log_clip: float | None,
+) -> float:
+    if float(shift_damping) <= 0.0:
+        return float(shift)
+    if int(it) < max(int(shift_start), int(shift_warmup_iters)):
+        return float(shift)
+    if int(it) % int(shift_stride) != 0:
+        return float(shift)
+    if float(pop) < (_SHIFT_MIN_POP_FRAC * float(tgt_pop)):
+        return float(shift)
+    return update_shift(
+        shift,
+        pop,
+        target_population=float(tgt_pop),
+        dt=float(dt),
+        damping=float(shift_damping),
+        log_clip=shift_log_clip,
+    )
 
 
 def run_fciqmc(
@@ -79,23 +378,19 @@ def run_fciqmc(
     energy_stride: int = 1,
     energy_estimator: str = "projected",
     preferred_ref_idx: int | None = None,
+    reference_policy: str = "dynamic_max_abs",
+    trial_idx: np.ndarray | None = None,
+    trial_val: np.ndarray | None = None,
+    deterministic_subspace_idx: np.ndarray | None = None,
+    shift_warmup_iters: int = 0,
+    shift_log_clip: float | None = None,
+    rayleigh_stride: int = 0,
     initiator_t: float = 0.0,
     use_state_cache: bool = True,
     key64_pair_norm: np.ndarray | None = None,
     key64_pair_sampling_mode: int = 0,
 ) -> FCIQMCRun:
-    """Single-root CSF-native FCIQMC loop.
-
-    This uses a continuous-walker update with annihilation via coalescing:
-
-      x <- x - dt * (H - S I) x
-
-    Notes
-    -----
-    - This driver uses a deterministic row oracle for the projected-energy
-      estimator.
-    - Integer walkers / stochastic rounding is a later milestone.
-    """
+    """Single-root CSF-native FCIQMC loop with trial-anchored diagnostics."""
 
     dt = float(dt)
     niter = int(niter)
@@ -106,22 +401,29 @@ def run_fciqmc(
     shift_stride = int(shift_stride)
     shift_start = int(shift_start)
     energy_stride = int(energy_stride)
+    shift_warmup_iters = int(shift_warmup_iters)
+    rayleigh_stride = int(rayleigh_stride)
     if shift_stride < 1:
         raise ValueError("shift_stride must be >= 1")
     if shift_start < 0:
         raise ValueError("shift_start must be >= 0")
+    if shift_warmup_iters < 0:
+        raise ValueError("shift_warmup_iters must be >= 0")
     if energy_stride < 1:
         raise ValueError("energy_stride must be >= 1")
+    if rayleigh_stride < 0:
+        raise ValueError("rayleigh_stride must be >= 0")
 
     energy_estimator = str(energy_estimator).lower()
     if energy_estimator not in ("projected", "rayleigh"):
         raise ValueError("energy_estimator must be 'projected' or 'rayleigh'")
+    if energy_estimator == "rayleigh" and rayleigh_stride == 0:
+        rayleigh_stride = energy_stride
 
     backend_s = str(backend).lower()
     if backend_s not in ("cpu", "cuda", "cuda_i32", "cuda_key64"):
         raise ValueError("backend must be 'cpu', 'cuda', 'cuda_i32', or 'cuda_key64'")
 
-    # backend='cuda' defaults to Key64 when representable; cuda_i32 forces legacy index path.
     backend_impl = backend_s
     if backend_s == "cuda" and int(drt.norb) <= 32:
         backend_impl = "cuda_key64"
@@ -132,32 +434,50 @@ def run_fciqmc(
     if x_idx_u.size == 0:
         raise ValueError("initial x is empty")
 
+    trial_idx_u, trial_val_u, trial_l2 = _validate_trial_inputs(
+        x_idx_u=x_idx_u,
+        x_val_u=x_val_u,
+        trial_idx=trial_idx,
+        trial_val=trial_val,
+    )
+    fixed_ref_idx = _resolve_reference_policy(
+        reference_policy=reference_policy,
+        preferred_ref_idx=preferred_ref_idx,
+        trial_idx_u=trial_idx_u,
+        trial_val_u=trial_val_u,
+    )
+    det_idx_u = _prepare_det_subspace(deterministic_subspace_idx, fixed_ref_idx=fixed_ref_idx)
+
     shift = float(shift_init)
     pops = np.empty(niter + 1, dtype=np.float64)
     shifts = np.empty(niter + 1, dtype=np.float64)
+    trace = _make_trace(niter=niter, energy_stride=energy_stride)
 
-    n_energy = (niter // energy_stride) + 1
-    energies = np.empty(n_energy, dtype=np.float64)
-    ref_hist = np.empty(n_energy, dtype=np.int32)
-    e_pos = 0
-
-    pop0 = float(np.sum(np.abs(x_val_u)))
+    pop0 = float(np.sum(np.abs(x_val_u), dtype=np.float64))
     if pop0 == 0.0:
         raise ValueError("initial population is zero")
     tgt_pop = float(pop0 if target_population is None else float(target_population))
     if tgt_pop <= 0.0:
         raise ValueError("target_population must be > 0")
 
-    state_cache = get_state_cache(drt) if (bool(use_state_cache) and backend_impl in ("cpu", "cuda", "cuda_key64")) else None
+    state_cache = get_state_cache(drt) if bool(use_state_cache) else None
 
-    ref = choose_reference_index(x_idx_u, x_val_u, preferred=preferred_ref_idx)
-    if energy_estimator == "rayleigh":
-        e0, _, _ = rayleigh_energy_ref(drt, h1e, eri, x_idx_u, x_val_u, state_cache=state_cache)
-    else:
-        e0, _, _ = projected_energy_ref(drt, h1e, eri, x_idx_u, x_val_u, ref_idx=ref, state_cache=state_cache)
-    energies[e_pos] = float(e0)
-    ref_hist[e_pos] = np.int32(ref)
-    e_pos += 1
+    metrics0 = _evaluate_checkpoint(
+        drt=drt,
+        h1e=h1e,
+        eri=eri,
+        x_idx_u=x_idx_u,
+        x_val_u=x_val_u,
+        fixed_ref_idx=int(fixed_ref_idx),
+        preferred_ref_idx=preferred_ref_idx,
+        trial_idx_u=trial_idx_u,
+        trial_val_u=trial_val_u,
+        trial_l2=float(trial_l2),
+        det_idx_u=det_idx_u,
+        compute_rayleigh=_need_rayleigh(0, rayleigh_stride=rayleigh_stride),
+        state_cache=state_cache,
+    )
+    _write_checkpoint(trace, 0, 0, metrics0)
 
     pops[0] = pop0
     shifts[0] = shift
@@ -180,16 +500,23 @@ def run_fciqmc(
             shift_damping=shift_damping,
             shift_stride=shift_stride,
             shift_start=shift_start,
+            shift_warmup_iters=shift_warmup_iters,
+            shift_log_clip=shift_log_clip,
             energy_stride=energy_stride,
-            energy_estimator=energy_estimator,
             preferred_ref_idx=preferred_ref_idx,
+            fixed_ref_idx=fixed_ref_idx,
             initiator_t=initiator_t,
             pops=pops,
             shifts=shifts,
-            energies=energies,
-            ref_hist=ref_hist,
-            e_pos=e_pos,
+            trace=trace,
+            trial_idx_u=trial_idx_u,
+            trial_val_u=trial_val_u,
+            trial_l2=trial_l2,
+            det_idx_u=det_idx_u,
+            rayleigh_stride=rayleigh_stride,
             state_cache=state_cache,
+            energy_estimator=energy_estimator,
+            reference_policy=reference_policy,
         )
     if backend_impl == "cuda_key64":
         return _run_fciqmc_cuda_key64(
@@ -209,38 +536,61 @@ def run_fciqmc(
             shift_damping=float(shift_damping),
             shift_stride=int(shift_stride),
             shift_start=int(shift_start),
+            shift_warmup_iters=int(shift_warmup_iters),
+            shift_log_clip=shift_log_clip,
             energy_stride=int(energy_stride),
-            energy_estimator=str(energy_estimator),
             preferred_ref_idx=preferred_ref_idx,
+            fixed_ref_idx=fixed_ref_idx,
             initiator_t=float(initiator_t),
             pops=pops,
             shifts=shifts,
-            energies=energies,
-            ref_hist=ref_hist,
-            e_pos=e_pos,
+            trace=trace,
+            trial_idx_u=trial_idx_u,
+            trial_val_u=trial_val_u,
+            trial_l2=float(trial_l2),
+            det_idx_u=det_idx_u,
+            rayleigh_stride=int(rayleigh_stride),
             state_cache=state_cache,
+            energy_estimator=str(energy_estimator),
+            reference_policy=str(reference_policy),
             key64_pair_norm=key64_pair_norm,
             key64_pair_sampling_mode=int(key64_pair_sampling_mode),
         )
 
-    # CPU path
     maybe_set_openmp_threads(omp_threads)
     rng = np.random.default_rng(int(seed))
+    sample_pos = 1
 
     for it in range(1, niter + 1):
-        evt_i, evt_v = spawn_hamiltonian_events(
-            drt,
-            h1e,
-            eri,
-            x_idx_u,
-            x_val_u,
-            eps=dt,
-            nspawn_one=int(nspawn_one),
-            nspawn_two=int(nspawn_two),
-            rng=rng,
-            initiator_t=float(initiator_t),
-            state_cache=state_cache,
-        )
+        if int(det_idx_u.size) > 0:
+            evt_i, evt_v = spawn_hamiltonian_events_semi_stochastic(
+                drt,
+                h1e,
+                eri,
+                x_idx_u,
+                x_val_u,
+                eps=dt,
+                nspawn_one=int(nspawn_one),
+                nspawn_two=int(nspawn_two),
+                rng=rng,
+                initiator_t=float(initiator_t),
+                state_cache=state_cache,
+                det_parent_idx=det_idx_u,
+            )
+        else:
+            evt_i, evt_v = spawn_hamiltonian_events(
+                drt,
+                h1e,
+                eri,
+                x_idx_u,
+                x_val_u,
+                eps=dt,
+                nspawn_one=int(nspawn_one),
+                nspawn_two=int(nspawn_two),
+                rng=rng,
+                initiator_t=float(initiator_t),
+                state_cache=state_cache,
+            )
 
         scale = 1.0 + dt * float(shift)
         if evt_i.size:
@@ -252,37 +602,50 @@ def run_fciqmc(
 
         x_idx_u, x_val_u = coalesce_coo_i32_f64(idx_all, val_all)
 
-        pop = float(np.sum(np.abs(x_val_u)))
+        pop = float(np.sum(np.abs(x_val_u), dtype=np.float64))
         pops[it] = pop
         shifts[it] = shift
-
-        if it >= shift_start and (it % shift_stride == 0):
-            shift = update_shift(
-                shift,
-                pop,
-                target_population=tgt_pop,
-                dt=dt,
-                damping=float(shift_damping),
-            )
+        shift = _maybe_update_shift(
+            shift=shift,
+            pop=pop,
+            it=it,
+            dt=dt,
+            tgt_pop=tgt_pop,
+            shift_damping=shift_damping,
+            shift_stride=shift_stride,
+            shift_start=shift_start,
+            shift_warmup_iters=shift_warmup_iters,
+            shift_log_clip=shift_log_clip,
+        )
 
         if it % energy_stride == 0:
-            ref = choose_reference_index(x_idx_u, x_val_u, preferred=preferred_ref_idx)
-            if energy_estimator == "rayleigh":
-                e, _, _ = rayleigh_energy_ref(drt, h1e, eri, x_idx_u, x_val_u, state_cache=state_cache)
-            else:
-                e, _, _ = projected_energy_ref(drt, h1e, eri, x_idx_u, x_val_u, ref_idx=ref, state_cache=state_cache)
-            energies[e_pos] = float(e)
-            ref_hist[e_pos] = np.int32(ref)
-            e_pos += 1
+            metrics = _evaluate_checkpoint(
+                drt=drt,
+                h1e=h1e,
+                eri=eri,
+                x_idx_u=x_idx_u,
+                x_val_u=x_val_u,
+                fixed_ref_idx=int(fixed_ref_idx),
+                preferred_ref_idx=preferred_ref_idx,
+                trial_idx_u=trial_idx_u,
+                trial_val_u=trial_val_u,
+                trial_l2=float(trial_l2),
+                det_idx_u=det_idx_u,
+                compute_rayleigh=_need_rayleigh(it, rayleigh_stride=rayleigh_stride),
+                state_cache=state_cache,
+            )
+            _write_checkpoint(trace, sample_pos, it, metrics)
+            sample_pos += 1
 
-    return FCIQMCRun(
+    return _build_run(
         idx=x_idx_u,
         val=x_val_u,
-        energies=energies,
         shifts=shifts,
         populations=pops,
-        ref_idx=ref_hist,
+        trace=trace,
         energy_estimator=energy_estimator,
+        reference_policy=reference_policy,
+        fixed_ref_idx=fixed_ref_idx,
     )
 
 
@@ -304,21 +667,27 @@ def _run_fciqmc_cuda(
     shift_damping: float,
     shift_stride: int,
     shift_start: int,
+    shift_warmup_iters: int,
+    shift_log_clip: float | None,
     energy_stride: int,
-    energy_estimator: str,
     preferred_ref_idx: int | None,
+    fixed_ref_idx: int,
     initiator_t: float,
     pops: np.ndarray,
     shifts: np.ndarray,
-    energies: np.ndarray,
-    ref_hist: np.ndarray,
-    e_pos: int,
+    trace: _FCIQMCTrace,
+    trial_idx_u: np.ndarray,
+    trial_val_u: np.ndarray,
+    trial_l2: float,
+    det_idx_u: np.ndarray,
+    rayleigh_stride: int,
     state_cache,
+    energy_estimator: str,
+    reference_policy: str,
 ) -> FCIQMCRun:
-    from .cuda_backend import make_cuda_fciqmc_context, cuda_fciqmc_step_hamiltonian_ws  # noqa: PLC0415
+    from .cuda_backend import cuda_fciqmc_step_hamiltonian_ws, make_cuda_fciqmc_context  # noqa: PLC0415
 
     if max_walker is None:
-        # Default: 4x initial nnz, clamped to at least 1024
         max_walker = max(1024, 4 * int(x_idx_u.size))
     max_walker = int(max_walker)
 
@@ -329,18 +698,20 @@ def _run_fciqmc_cuda(
         max_walker=max_walker,
         nspawn_one=int(nspawn_one),
         nspawn_two=int(nspawn_two),
+        det_idx=det_idx_u if int(det_idx_u.size) > 0 else None,
     )
 
-    # Upload initial vector.
     nnz0 = int(x_idx_u.size)
     import cupy as cp  # noqa: PLC0415
+
     ctx.x_idx[:nnz0] = cp.asarray(x_idx_u, dtype=cp.int32)
     ctx.x_val[:nnz0] = cp.asarray(x_val_u, dtype=cp.float64)
     ctx.nnz = nnz0
 
+    sample_pos = 1
     try:
         pops_dev = cp.empty(int(niter) + 1, dtype=cp.float64)
-        proj_row_cache_i32: dict[int, tuple[cp.ndarray, cp.ndarray]] = {}
+        pops_dev[0] = float(pops[0])
         for it in range(1, niter + 1):
             cuda_fciqmc_step_hamiltonian_ws(
                 ctx,
@@ -356,98 +727,58 @@ def _run_fciqmc_cuda(
             pops_dev[it] = pop_dev
             shifts[it] = shift
 
-            if it >= shift_start and (it % shift_stride == 0):
+            if float(shift_damping) > 0.0 and it >= max(int(shift_start), int(shift_warmup_iters)) and (it % int(shift_stride) == 0):
                 pop = float(pop_dev.get())
-                shift = update_shift(
-                    shift,
-                    pop,
-                    target_population=tgt_pop,
+                shift = _maybe_update_shift(
+                    shift=shift,
+                    pop=pop,
+                    it=it,
                     dt=dt,
-                    damping=float(shift_damping),
+                    tgt_pop=tgt_pop,
+                    shift_damping=shift_damping,
+                    shift_stride=shift_stride,
+                    shift_start=shift_start,
+                    shift_warmup_iters=shift_warmup_iters,
+                    shift_log_clip=shift_log_clip,
                 )
 
-            if it % energy_stride == 0:
-                if energy_estimator == "projected":
-                    x_idx_dev = ctx.x_idx[:nnz_now]
-                    x_val_dev = ctx.x_val[:nnz_now]
+            if it % int(energy_stride) == 0:
+                x_idx_h = cp.asnumpy(ctx.x_idx[:nnz_now]).astype(np.int32, copy=False)
+                x_val_h = cp.asnumpy(ctx.x_val[:nnz_now]).astype(np.float64, copy=False)
+                metrics = _evaluate_checkpoint(
+                    drt=drt,
+                    h1e=h1e,
+                    eri=eri,
+                    x_idx_u=x_idx_h,
+                    x_val_u=x_val_h,
+                    fixed_ref_idx=int(fixed_ref_idx),
+                    preferred_ref_idx=preferred_ref_idx,
+                    trial_idx_u=trial_idx_u,
+                    trial_val_u=trial_val_u,
+                    trial_l2=float(trial_l2),
+                    det_idx_u=det_idx_u,
+                    compute_rayleigh=_need_rayleigh(it, rayleigh_stride=rayleigh_stride),
+                    state_cache=state_cache,
+                )
+                _write_checkpoint(trace, sample_pos, it, metrics)
+                sample_pos += 1
 
-                    ref: int
-                    if preferred_ref_idx is not None:
-                        pref = int(preferred_ref_idx)
-                        pos_pref = int(cp.searchsorted(x_idx_dev, cp.asarray(np.int32(pref), dtype=cp.int32)).get())
-                        if (
-                            pos_pref < nnz_now
-                            and int(x_idx_dev[pos_pref].get()) == pref
-                            and float(x_val_dev[pos_pref].get()) != 0.0
-                        ):
-                            ref = pref
-                        else:
-                            k_ref = int(cp.argmax(cp.abs(x_val_dev)).get())
-                            ref = int(x_idx_dev[k_ref].get())
-                    else:
-                        k_ref = int(cp.argmax(cp.abs(x_val_dev)).get())
-                        ref = int(x_idx_dev[k_ref].get())
-
-                    row_cached = proj_row_cache_i32.get(ref)
-                    if row_cached is None:
-                        i_idx_h, hij_h = connected_row_sparse(
-                            drt,
-                            h1e,
-                            eri,
-                            int(ref),
-                            max_out=200_000,
-                            state_cache=state_cache,
-                        )
-                        row_cached = (
-                            cp.asarray(np.asarray(i_idx_h, dtype=np.int32, order="C"), dtype=cp.int32),
-                            cp.asarray(np.asarray(hij_h, dtype=np.float64, order="C"), dtype=cp.float64),
-                        )
-                        proj_row_cache_i32[ref] = row_cached
-                    row_idx_dev, row_hij_dev = row_cached
-
-                    if int(row_idx_dev.size) == 0:
-                        num = 0.0
-                    else:
-                        pos = cp.searchsorted(x_idx_dev, row_idx_dev)
-                        inr = pos < nnz_now
-                        pos2 = pos[inr]
-                        hit = x_idx_dev[pos2] == row_idx_dev[inr]
-                        num = float(cp.dot(row_hij_dev[inr][hit], x_val_dev[pos2[hit]]).get())
-
-                    pos_ref = int(cp.searchsorted(x_idx_dev, cp.asarray(np.int32(ref), dtype=cp.int32)).get())
-                    den = 0.0
-                    if pos_ref < nnz_now and int(x_idx_dev[pos_ref].get()) == ref:
-                        den = float(x_val_dev[pos_ref].get())
-                    if den == 0.0:
-                        raise RuntimeError("reference amplitude is zero (choose a different ref_idx)")
-                    e = float(num / den)
-                else:
-                    # Full vector download only on Rayleigh evaluation steps.
-                    x_idx_h = cp.asnumpy(ctx.x_idx[:nnz_now]).astype(np.int32, copy=False)
-                    x_val_h = cp.asnumpy(ctx.x_val[:nnz_now]).astype(np.float64, copy=False)
-                    ref = choose_reference_index(x_idx_h, x_val_h, preferred=preferred_ref_idx)
-                    e, _, _ = rayleigh_energy_ref(drt, h1e, eri, x_idx_h, x_val_h, state_cache=state_cache)
-                energies[e_pos] = float(e)
-                ref_hist[e_pos] = np.int32(ref)
-                e_pos += 1
-
-        # Final download.
-        if niter >= 1:
-            pops[1:] = cp.asnumpy(pops_dev[1:]).astype(np.float64, copy=False)
+        pops[1:] = cp.asnumpy(pops_dev[1:]).astype(np.float64, copy=False)
         nnz_final = int(ctx.nnz)
         x_idx_out = cp.asnumpy(ctx.x_idx[:nnz_final]).astype(np.int32, copy=False)
         x_val_out = cp.asnumpy(ctx.x_val[:nnz_final]).astype(np.float64, copy=False)
     finally:
         ctx.release()
 
-    return FCIQMCRun(
+    return _build_run(
         idx=x_idx_out,
         val=x_val_out,
-        energies=energies,
         shifts=shifts,
         populations=pops,
-        ref_idx=ref_hist,
+        trace=trace,
         energy_estimator=energy_estimator,
+        reference_policy=reference_policy,
+        fixed_ref_idx=fixed_ref_idx,
     )
 
 
@@ -469,16 +800,23 @@ def _run_fciqmc_cuda_key64(
     shift_damping: float,
     shift_stride: int,
     shift_start: int,
+    shift_warmup_iters: int,
+    shift_log_clip: float | None,
     energy_stride: int,
-    energy_estimator: str,
     preferred_ref_idx: int | None,
+    fixed_ref_idx: int,
     initiator_t: float,
     pops: np.ndarray,
     shifts: np.ndarray,
-    energies: np.ndarray,
-    ref_hist: np.ndarray,
-    e_pos: int,
+    trace: _FCIQMCTrace,
+    trial_idx_u: np.ndarray,
+    trial_val_u: np.ndarray,
+    trial_l2: float,
+    det_idx_u: np.ndarray,
+    rayleigh_stride: int,
     state_cache,
+    energy_estimator: str,
+    reference_policy: str,
     key64_pair_norm: np.ndarray | None,
     key64_pair_sampling_mode: int,
 ) -> FCIQMCRun:
@@ -494,7 +832,6 @@ def _run_fciqmc_cuda_key64(
         raise ValueError("backend='cuda_key64' requires drt.norb <= 32")
 
     if max_walker is None:
-        # Default: 4x initial nnz, clamped to at least 1024
         max_walker = max(1024, 4 * int(x_idx_u.size))
     max_walker = int(max_walker)
 
@@ -521,6 +858,7 @@ def _run_fciqmc_cuda_key64(
         max_walker=max_walker,
         nspawn_one=int(nspawn_one),
         nspawn_two=int(nspawn_two),
+        det_idx=det_idx_u if int(det_idx_u.size) > 0 else None,
         pair_alias_prob=pair_alias_prob,
         pair_alias_idx=pair_alias_idx,
         pair_norm=pair_norm,
@@ -528,7 +866,6 @@ def _run_fciqmc_cuda_key64(
         pair_sampling_mode=int(pair_sampling_mode),
     )
 
-    # Upload initial vector (convert CSF indices -> Key64).
     nnz0 = int(x_idx_u.size)
     import cupy as cp  # noqa: PLC0415
 
@@ -540,18 +877,10 @@ def _run_fciqmc_cuda_key64(
     ctx.x_val[:nnz0] = cp.asarray(val0, dtype=cp.float64)
     ctx.nnz = nnz0
 
+    sample_pos = 1
     try:
         pops_dev = cp.empty(int(niter) + 1, dtype=cp.float64)
-        proj_row_cache_u64: dict[int, tuple[cp.ndarray, cp.ndarray]] = {}
-        pref_key64: int | None = None
-        if preferred_ref_idx is not None:
-            pref_key64 = int(
-                csf_idx_to_key64_host(
-                    drt,
-                    np.asarray([int(preferred_ref_idx)], dtype=np.int32),
-                    state_cache=state_cache,
-                )[0]
-            )
+        pops_dev[0] = float(pops[0])
         for it in range(1, niter + 1):
             cuda_fciqmc_step_hamiltonian_u64_ws(
                 ctx,
@@ -567,100 +896,47 @@ def _run_fciqmc_cuda_key64(
             pops_dev[it] = pop_dev
             shifts[it] = shift
 
-            if it >= shift_start and (it % shift_stride == 0):
+            if float(shift_damping) > 0.0 and it >= max(int(shift_start), int(shift_warmup_iters)) and (it % int(shift_stride) == 0):
                 pop = float(pop_dev.get())
-                shift = update_shift(
-                    shift,
-                    pop,
-                    target_population=tgt_pop,
+                shift = _maybe_update_shift(
+                    shift=shift,
+                    pop=pop,
+                    it=it,
                     dt=dt,
-                    damping=float(shift_damping),
+                    tgt_pop=tgt_pop,
+                    shift_damping=shift_damping,
+                    shift_stride=shift_stride,
+                    shift_start=shift_start,
+                    shift_warmup_iters=shift_warmup_iters,
+                    shift_log_clip=shift_log_clip,
                 )
 
-            if it % energy_stride == 0:
-                if energy_estimator == "projected":
-                    x_key_dev = ctx.x_key[:nnz_now]
-                    x_val_dev = ctx.x_val[:nnz_now]
+            if it % int(energy_stride) == 0:
+                x_key_h = cp.asnumpy(ctx.x_key[:nnz_now]).astype(np.uint64, copy=False)
+                x_val_h = cp.asnumpy(ctx.x_val[:nnz_now]).astype(np.float64, copy=False)
+                x_idx_h = key64_to_csf_idx_host(drt, x_key_h, strict=True)
+                order = np.argsort(x_idx_h)
+                x_idx_h = np.asarray(x_idx_h[order], dtype=np.int32, order="C")
+                x_val_h = np.asarray(x_val_h[order], dtype=np.float64, order="C")
+                metrics = _evaluate_checkpoint(
+                    drt=drt,
+                    h1e=h1e,
+                    eri=eri,
+                    x_idx_u=x_idx_h,
+                    x_val_u=x_val_h,
+                    fixed_ref_idx=int(fixed_ref_idx),
+                    preferred_ref_idx=preferred_ref_idx,
+                    trial_idx_u=trial_idx_u,
+                    trial_val_u=trial_val_u,
+                    trial_l2=float(trial_l2),
+                    det_idx_u=det_idx_u,
+                    compute_rayleigh=_need_rayleigh(it, rayleigh_stride=rayleigh_stride),
+                    state_cache=state_cache,
+                )
+                _write_checkpoint(trace, sample_pos, it, metrics)
+                sample_pos += 1
 
-                    ref_key: int
-                    if pref_key64 is not None:
-                        pos_pref = int(cp.searchsorted(x_key_dev, cp.asarray(np.uint64(pref_key64), dtype=cp.uint64)).get())
-                        if (
-                            pos_pref < nnz_now
-                            and int(x_key_dev[pos_pref].get()) == int(pref_key64)
-                            and float(x_val_dev[pos_pref].get()) != 0.0
-                        ):
-                            ref_key = int(pref_key64)
-                        else:
-                            k_ref = int(cp.argmax(cp.abs(x_val_dev)).get())
-                            ref_key = int(x_key_dev[k_ref].get())
-                    else:
-                        k_ref = int(cp.argmax(cp.abs(x_val_dev)).get())
-                        ref_key = int(x_key_dev[k_ref].get())
-
-                    ref = int(
-                        key64_to_csf_idx_host(
-                            drt,
-                            np.asarray([np.uint64(ref_key)], dtype=np.uint64),
-                            strict=True,
-                        )[0]
-                    )
-
-                    row_cached = proj_row_cache_u64.get(ref)
-                    if row_cached is None:
-                        i_idx_h, hij_h = connected_row_sparse(
-                            drt,
-                            h1e,
-                            eri,
-                            int(ref),
-                            max_out=200_000,
-                            state_cache=state_cache,
-                        )
-                        row_key_h = csf_idx_to_key64_host(drt, i_idx_h, state_cache=state_cache)
-                        order = np.argsort(row_key_h)
-                        row_key_h = np.asarray(row_key_h[order], dtype=np.uint64, order="C")
-                        row_hij_h = np.asarray(np.asarray(hij_h, dtype=np.float64)[order], dtype=np.float64, order="C")
-                        row_cached = (
-                            cp.asarray(row_key_h, dtype=cp.uint64),
-                            cp.asarray(row_hij_h, dtype=cp.float64),
-                        )
-                        proj_row_cache_u64[ref] = row_cached
-                    row_key_dev, row_hij_dev = row_cached
-
-                    if int(row_key_dev.size) == 0:
-                        num = 0.0
-                    else:
-                        pos = cp.searchsorted(x_key_dev, row_key_dev)
-                        inr = pos < nnz_now
-                        pos2 = pos[inr]
-                        hit = x_key_dev[pos2] == row_key_dev[inr]
-                        num = float(cp.dot(row_hij_dev[inr][hit], x_val_dev[pos2[hit]]).get())
-
-                    pos_ref = int(cp.searchsorted(x_key_dev, cp.asarray(np.uint64(ref_key), dtype=cp.uint64)).get())
-                    den = 0.0
-                    if pos_ref < nnz_now and int(x_key_dev[pos_ref].get()) == int(ref_key):
-                        den = float(x_val_dev[pos_ref].get())
-                    if den == 0.0:
-                        raise RuntimeError("reference amplitude is zero (choose a different ref_idx)")
-                    e = float(num / den)
-                else:
-                    # Full vector download only on Rayleigh evaluation steps.
-                    x_key_h = cp.asnumpy(ctx.x_key[:nnz_now]).astype(np.uint64, copy=False)
-                    x_val_h = cp.asnumpy(ctx.x_val[:nnz_now]).astype(np.float64, copy=False)
-                    x_idx_h = key64_to_csf_idx_host(drt, x_key_h, strict=True)
-                    order = np.argsort(x_idx_h)
-                    x_idx_h = np.asarray(x_idx_h[order], dtype=np.int32, order="C")
-                    x_val_h = np.asarray(x_val_h[order], dtype=np.float64, order="C")
-
-                    ref = choose_reference_index(x_idx_h, x_val_h, preferred=preferred_ref_idx)
-                    e, _, _ = rayleigh_energy_ref(drt, h1e, eri, x_idx_h, x_val_h, state_cache=state_cache)
-                energies[e_pos] = float(e)
-                ref_hist[e_pos] = np.int32(ref)
-                e_pos += 1
-
-        # Final download.
-        if niter >= 1:
-            pops[1:] = cp.asnumpy(pops_dev[1:]).astype(np.float64, copy=False)
+        pops[1:] = cp.asnumpy(pops_dev[1:]).astype(np.float64, copy=False)
 
         nnz_final = int(ctx.nnz)
         x_key_out = cp.asnumpy(ctx.x_key[:nnz_final]).astype(np.uint64, copy=False)
@@ -672,12 +948,13 @@ def _run_fciqmc_cuda_key64(
     finally:
         ctx.release()
 
-    return FCIQMCRun(
+    return _build_run(
         idx=x_idx_out,
         val=x_val_out,
-        energies=energies,
         shifts=shifts,
         populations=pops,
-        ref_idx=ref_hist,
+        trace=trace,
         energy_estimator=energy_estimator,
+        reference_policy=reference_policy,
+        fixed_ref_idx=fixed_ref_idx,
     )

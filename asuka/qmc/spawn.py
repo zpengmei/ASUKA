@@ -588,6 +588,7 @@ def spawn_hamiltonian_events_semi_stochastic(
     state_cache: DRTStateCache | None = None,
     det_nparent: int = 0,
     det_abs_x_threshold: float | None = None,
+    det_parent_idx: np.ndarray | None = None,
     det_max_out: int | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Semi-stochastic version of :func:`spawn_hamiltonian_events`.
@@ -603,12 +604,14 @@ def spawn_hamiltonian_events_semi_stochastic(
     ----------
     det_nparent
         Number of parents treated deterministically (top-|x_j|). If <=0, no
-        deterministic parents are selected unless `det_abs_x_threshold` selects
-        some.
+        deterministic parents are selected unless `det_abs_x_threshold` or
+        `det_parent_idx` select some.
     det_abs_x_threshold
         Optional absolute amplitude cutoff: include any parent with
         `|x_j| >= det_abs_x_threshold` in the deterministic set (in addition to
         `det_nparent`).
+    det_parent_idx
+        Optional explicit list of parent CSF indices to treat deterministically.
     det_max_out
         Only used for dense-ERI connected-row oracle. Defaults to `drt.ncsf`.
     """
@@ -628,11 +631,22 @@ def spawn_hamiltonian_events_semi_stochastic(
         raise ValueError("det_nparent must be >= 0")
     if det_abs_x_threshold is not None and not np.isfinite(float(det_abs_x_threshold)):
         raise ValueError("det_abs_x_threshold must be finite when provided")
+    det_parent_idx_i32 = np.zeros(0, dtype=np.int32)
+    if det_parent_idx is not None:
+        det_parent_idx_i32 = np.asarray(det_parent_idx, dtype=np.int32).ravel()
 
     m = int(x_idx_i32.size)
     abs_x = np.abs(x_val_f64)
 
     det_mask = np.zeros(m, dtype=np.bool_)
+    if det_parent_idx_i32.size:
+        det_parent_idx_i32 = np.unique(det_parent_idx_i32)
+        det_parent_idx_i32.sort()
+        pos_parent = np.searchsorted(det_parent_idx_i32, x_idx_i32)
+        in_range = pos_parent < int(det_parent_idx_i32.size)
+        if np.any(in_range):
+            pos2 = pos_parent[in_range]
+            det_mask[in_range] |= det_parent_idx_i32[pos2] == x_idx_i32[in_range]
     if det_abs_x_threshold is not None:
         det_mask |= abs_x >= float(det_abs_x_threshold)
     if det_nparent > 0:

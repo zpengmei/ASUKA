@@ -1100,6 +1100,70 @@ def _apply_det_subspace_correction_gpu(
     return nnz_det
 
 
+def _apply_det_subspace_correction_gpu_u64(
+    *,
+    ctx: Any,
+    x_key: Any,
+    x_val: Any,
+    evt_key: Any,
+    evt_val: Any,
+    eps: float,
+    nspawn_total: int,
+) -> int:
+    """Apply deterministic-subspace correction for Key64 single-root FCIQMC."""
+
+    if cp is None:  # pragma: no cover
+        raise RuntimeError("CuPy is required")
+    if (
+        ctx.det_key_dev is None
+        or ctx.det_hdd_csr_dev is None
+        or ctx.det_x_buf is None
+        or ctx.det_y_buf is None
+        or ctx.det_key_buf is None
+        or ctx.det_val_buf is None
+    ):
+        return 0
+
+    ndet = int(ctx.det_key_dev.size)
+    if ndet <= 0:
+        return 0
+
+    pos = cp.searchsorted(ctx.det_key_dev, x_key)
+    inr = pos < ndet
+    pos_clip = cp.clip(pos, 0, ndet - 1)
+    parent_is_det = inr & (ctx.det_key_dev[pos_clip] == x_key)
+    parent_pos_det = cp.nonzero(parent_is_det)[0].astype(cp.int64, copy=False)
+
+    x_det = ctx.det_x_buf
+    x_det[:] = 0.0
+    if int(parent_pos_det.size) > 0:
+        det_pos = pos[parent_pos_det].astype(cp.int64, copy=False)
+        x_det[det_pos] = x_val[parent_pos_det]
+
+    y_det = ctx.det_y_buf
+    y_det[:] = ctx.det_hdd_csr_dev.dot(x_det)
+    y_det *= -float(eps)
+
+    nz = cp.nonzero(y_det != 0.0)[0].astype(cp.int64, copy=False)
+    nnz_det = int(nz.size)
+    if nnz_det > 0:
+        ctx.det_key_buf[:nnz_det] = ctx.det_key_dev[nz]
+        ctx.det_val_buf[:nnz_det] = y_det[nz]
+
+    if int(parent_pos_det.size) > 0:
+        if ctx.det_spawn_slot_offsets is None or int(ctx.det_spawn_slot_offsets.size) != int(nspawn_total):
+            ctx.det_spawn_slot_offsets = cp.arange(int(nspawn_total), dtype=cp.int64)
+        slot = (parent_pos_det[:, None] * int(nspawn_total) + ctx.det_spawn_slot_offsets[None, :]).reshape(-1)
+        evt_sel = evt_key[slot]
+        pos2 = cp.searchsorted(ctx.det_key_dev, evt_sel)
+        inr2 = (evt_sel != np.uint64(np.iinfo(np.uint64).max)) & (pos2 < ndet)
+        pos2_clip = cp.clip(pos2, 0, ndet - 1)
+        match = inr2 & (ctx.det_key_dev[pos2_clip] == evt_sel)
+        evt_val[slot[match]] = 0.0
+
+    return nnz_det
+
+
 def make_cuda_projector_context(
     drt: Any,
     h1e: Any,
@@ -3196,6 +3260,18 @@ class CudaFCIQMCContext:
     # Device scalar written by coalesce kernels.
     nnz_u: Any | None = None
 
+    # Optional semi-stochastic deterministic subspace (same construction as the
+    # block-projector path, but applied to the single-root FCIQMC step).
+    det_idx_host: np.ndarray | None = None
+    det_idx_dev: Any | None = None
+    det_cols: list[tuple[np.ndarray, np.ndarray]] | None = None
+    det_hdd_csr_dev: Any | None = None
+    det_x_buf: Any | None = None
+    det_y_buf: Any | None = None
+    det_spawn_slot_offsets: Any | None = None
+    det_idx_buf: Any | None = None
+    det_val_buf: Any | None = None
+
     def release(self) -> None:
         if self.ws is not None:
             self.ws.release()
@@ -3264,6 +3340,18 @@ class CudaFCIQMCContextKey64:
     # Device scalar written by coalesce kernels.
     nnz_u: Any | None = None
 
+    # Optional semi-stochastic deterministic subspace in CSF order with a Key64
+    # mirror for on-device support tests and event insertion.
+    det_idx_host: np.ndarray | None = None
+    det_key_dev: Any | None = None
+    det_cols: list[tuple[np.ndarray, np.ndarray]] | None = None
+    det_hdd_csr_dev: Any | None = None
+    det_x_buf: Any | None = None
+    det_y_buf: Any | None = None
+    det_spawn_slot_offsets: Any | None = None
+    det_key_buf: Any | None = None
+    det_val_buf: Any | None = None
+
     def release(self) -> None:
         if self.ws is not None:
             self.ws.release()
@@ -3297,6 +3385,8 @@ def make_cuda_fciqmc_context(
     max_walker: int,
     nspawn_one: int,
     nspawn_two: int,
+    det_idx: np.ndarray | None = None,
+    det_max_out: int = 200_000,
     threads_spawn: int = 128,
     threads_qmc: int = 256,
     stream: int | None = None,
@@ -3355,7 +3445,8 @@ def make_cuda_fciqmc_context(
 
     nspawn_total = nspawn_one + nspawn_two
     max_evt = max_walker * nspawn_total
-    max_n = max_walker + max_evt
+    det_n = 0 if det_idx is None else int(np.asarray(det_idx).size)
+    max_n = max_walker + max_evt + det_n
 
     ws = _guga_cuda_ext.QmcWorkspace(int(max_n), int(max_walker))
 
@@ -3380,6 +3471,47 @@ def make_cuda_fciqmc_context(
     ctx.x_idx_b = cp.empty(max_n, dtype=cp.int32)
     ctx.x_val_b = cp.empty(max_n, dtype=cp.float64)
     ctx.nnz_u = cp.empty(1, dtype=cp.int32)
+
+    if det_idx is not None:
+        det_idx_i32 = np.asarray(det_idx, dtype=np.int32).ravel()
+        if det_idx_i32.size:
+            det_idx_i32 = np.unique(det_idx_i32)
+            det_idx_i32.sort()
+            ctx.det_idx_host = det_idx_i32
+            ctx.det_idx_dev = cp.asarray(det_idx_i32, dtype=cp.int32)
+            ctx.det_idx_buf = cp.empty(int(det_idx_i32.size), dtype=cp.int32)
+            ctx.det_val_buf = cp.empty(int(det_idx_i32.size), dtype=cp.float64)
+            ctx.det_cols = _build_det_subspace_cols_dense(
+                drt=drt,
+                h1e=np.asarray(h1e, dtype=np.float64),
+                eri=eri4,
+                det_idx=det_idx_i32,
+                max_out=int(det_max_out),
+                state_cache=cache,
+            )
+            try:
+                import cupyx.scipy.sparse as cpx_sparse  # type: ignore
+            except Exception as e:  # pragma: no cover
+                raise RuntimeError("deterministic-subspace CUDA correction requires cupyx.scipy.sparse") from e
+            row_h, col_h, dat_h = _det_subspace_coo_from_cols(ctx.det_cols)
+            ndet = int(det_idx_i32.size)
+            if int(dat_h.size) == 0:
+                ctx.det_hdd_csr_dev = cpx_sparse.csr_matrix((ndet, ndet), dtype=cp.float64)
+            else:
+                ctx.det_hdd_csr_dev = cpx_sparse.csr_matrix(
+                    (
+                        cp.asarray(dat_h, dtype=cp.float64),
+                        (
+                            cp.asarray(row_h, dtype=cp.int32),
+                            cp.asarray(col_h, dtype=cp.int32),
+                        ),
+                    ),
+                    shape=(ndet, ndet),
+                    dtype=cp.float64,
+                )
+            ctx.det_x_buf = cp.zeros(ndet, dtype=cp.float64)
+            ctx.det_y_buf = cp.zeros(ndet, dtype=cp.float64)
+            ctx.det_spawn_slot_offsets = cp.arange(int(nspawn_total), dtype=cp.int64)
     return ctx
 
 
@@ -3391,6 +3523,8 @@ def make_cuda_fciqmc_context_key64(
     max_walker: int,
     nspawn_one: int,
     nspawn_two: int,
+    det_idx: np.ndarray | None = None,
+    det_max_out: int = 200_000,
     threads_spawn: int = 128,
     threads_qmc: int = 256,
     stream: int | None = None,
@@ -3408,6 +3542,7 @@ def make_cuda_fciqmc_context_key64(
         raise RuntimeError("Key64 QMC workspace is unavailable (missing _guga_cuda_ext.QmcWorkspaceU64); rebuild the CUDA extension")
 
     from asuka.cuguga.oracle import _child_prefix_walks  # noqa: PLC0415
+    from asuka.cuguga.state_cache import get_state_cache  # noqa: PLC0415
 
     norb = int(drt.norb)
     if norb > 32:
@@ -3473,7 +3608,8 @@ def make_cuda_fciqmc_context_key64(
 
     nspawn_total = nspawn_one + nspawn_two
     max_evt = max_walker * nspawn_total
-    max_n = max_walker + max_evt
+    det_n = 0 if det_idx is None else int(np.asarray(det_idx).size)
+    max_n = max_walker + max_evt + det_n
 
     # FCIQMC does not use Φ compression; keep max_m small to avoid allocating large Φ scratch.
     ws = _guga_cuda_ext.QmcWorkspaceU64(int(max_n), 1)
@@ -3503,6 +3639,51 @@ def make_cuda_fciqmc_context_key64(
     ctx.x_key_b = cp.empty(max_n, dtype=cp.uint64)
     ctx.x_val_b = cp.empty(max_n, dtype=cp.float64)
     ctx.nnz_u = cp.empty(1, dtype=cp.int32)
+
+    if det_idx is not None:
+        det_idx_i32 = np.asarray(det_idx, dtype=np.int32).ravel()
+        if det_idx_i32.size:
+            det_idx_i32 = np.unique(det_idx_i32)
+            det_idx_i32.sort()
+            cache = get_state_cache(drt)
+            ctx.det_idx_host = det_idx_i32
+            ctx.det_key_dev = cp.asarray(
+                np.asarray(csf_idx_to_key64_host(drt, det_idx_i32, state_cache=cache), dtype=np.uint64, order="C"),
+                dtype=cp.uint64,
+            )
+            ctx.det_key_buf = cp.empty(int(det_idx_i32.size), dtype=cp.uint64)
+            ctx.det_val_buf = cp.empty(int(det_idx_i32.size), dtype=cp.float64)
+            ctx.det_cols = _build_det_subspace_cols_dense(
+                drt=drt,
+                h1e=np.asarray(h1e, dtype=np.float64),
+                eri=eri4,
+                det_idx=det_idx_i32,
+                max_out=int(det_max_out),
+                state_cache=cache,
+            )
+            try:
+                import cupyx.scipy.sparse as cpx_sparse  # type: ignore
+            except Exception as e:  # pragma: no cover
+                raise RuntimeError("deterministic-subspace CUDA correction requires cupyx.scipy.sparse") from e
+            row_h, col_h, dat_h = _det_subspace_coo_from_cols(ctx.det_cols)
+            ndet = int(det_idx_i32.size)
+            if int(dat_h.size) == 0:
+                ctx.det_hdd_csr_dev = cpx_sparse.csr_matrix((ndet, ndet), dtype=cp.float64)
+            else:
+                ctx.det_hdd_csr_dev = cpx_sparse.csr_matrix(
+                    (
+                        cp.asarray(dat_h, dtype=cp.float64),
+                        (
+                            cp.asarray(row_h, dtype=cp.int32),
+                            cp.asarray(col_h, dtype=cp.int32),
+                        ),
+                    ),
+                    shape=(ndet, ndet),
+                    dtype=cp.float64,
+                )
+            ctx.det_x_buf = cp.zeros(ndet, dtype=cp.float64)
+            ctx.det_y_buf = cp.zeros(ndet, dtype=cp.float64)
+            ctx.det_spawn_slot_offsets = cp.arange(int(nspawn_total), dtype=cp.int64)
     return ctx
 
 
@@ -3546,7 +3727,16 @@ def cuda_fciqmc_step_hamiltonian_ws(
     if ctx.x_idx is None or ctx.x_val is None or ctx.x_idx_next is None or ctx.x_val_next is None or ctx.nnz_u is None:
         raise RuntimeError("CudaFCIQMCContext buffers not initialized")
 
-    if bool(use_fused) and hasattr(ctx.ws, "fciqmc_step_shift_i32_f64_inplace_device"):
+    use_det = (
+        ctx.det_idx_dev is not None
+        and ctx.det_hdd_csr_dev is not None
+        and ctx.det_x_buf is not None
+        and ctx.det_y_buf is not None
+        and ctx.det_idx_buf is not None
+        and ctx.det_val_buf is not None
+    )
+
+    if bool(use_fused) and (not use_det) and hasattr(ctx.ws, "fciqmc_step_shift_i32_f64_inplace_device"):
         n_out = int(
             ctx.ws.fciqmc_step_shift_i32_f64_inplace_device(
                 ctx.drt_dev,
@@ -3608,8 +3798,25 @@ def cuda_fciqmc_step_hamiltonian_ws(
         False,
     )
 
+    nnz_det = 0
+    if use_det:
+        nnz_det = _apply_det_subspace_correction_gpu(
+            ctx=ctx,
+            x_idx=x_idx_cur,
+            x_val=x_val_cur,
+            evt_idx=evt_idx,
+            evt_val=evt_val,
+            eps=float(dt),
+            nspawn_total=int(nspawn_total),
+        )
     # Merge: scale the identity term in-place in the prefix; events are already in the tail.
     x_val_cur *= float(1.0 + dt * shift)
+    if use_det:
+        all_len += int(nnz_det)
+        if all_len > int(ctx.max_n):
+            raise RuntimeError("deterministic-subspace merge exceeds workspace capacity (increase max_walker)")
+        x_idx[nnz + out_len : all_len] = ctx.det_idx_buf[:nnz_det]
+        x_val[nnz + out_len : all_len] = ctx.det_val_buf[:nnz_det]
 
     # Coalesce (sort + reduce; idx < 0 sentinels contribute zero and are excluded).
     ctx.ws.coalesce_coo_i32_f64_inplace_device(
@@ -3674,6 +3881,15 @@ def cuda_fciqmc_step_hamiltonian_u64_ws(
     if ctx.x_key is None or ctx.x_val is None or ctx.x_key_next is None or ctx.x_val_next is None or ctx.nnz_u is None:
         raise RuntimeError("CudaFCIQMCContextKey64 buffers not initialized")
 
+    use_det = (
+        ctx.det_key_dev is not None
+        and ctx.det_hdd_csr_dev is not None
+        and ctx.det_x_buf is not None
+        and ctx.det_y_buf is not None
+        and ctx.det_key_buf is not None
+        and ctx.det_val_buf is not None
+    )
+
     nspawn_total = int(ctx.nspawn_one + ctx.nspawn_two)
     out_len = nnz * nspawn_total
     all_len = nnz + out_len
@@ -3711,8 +3927,25 @@ def cuda_fciqmc_step_hamiltonian_u64_ws(
         int(ctx.pair_sampling_mode),
     )
 
+    nnz_det = 0
+    if use_det:
+        nnz_det = _apply_det_subspace_correction_gpu_u64(
+            ctx=ctx,
+            x_key=x_key_cur,
+            x_val=x_val_cur,
+            evt_key=evt_key,
+            evt_val=evt_val,
+            eps=float(dt),
+            nspawn_total=int(nspawn_total),
+        )
     # Merge: scale the identity term in-place in the prefix; events are already in the tail.
     x_val_cur *= float(1.0 + dt * shift)
+    if use_det:
+        all_len += int(nnz_det)
+        if all_len > int(ctx.max_n):
+            raise RuntimeError("deterministic-subspace merge exceeds workspace capacity (increase max_walker)")
+        x_key[nnz + out_len : all_len] = ctx.det_key_buf[:nnz_det]
+        x_val[nnz + out_len : all_len] = ctx.det_val_buf[:nnz_det]
 
     # Coalesce (sort + reduce; UINT64_MAX sentinel contributes zero and is excluded via zero-pruning).
     ctx.ws.coalesce_coo_u64_f64_inplace_device(

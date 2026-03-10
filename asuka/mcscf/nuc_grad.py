@@ -12,12 +12,15 @@ from typing import Any
 import numpy as np
 
 from .nuc_grad_df import (
+    DFNucGradMultirootResult,
     DFNucGradResult,
     casscf_nuc_grad_df,
+    casscf_nuc_grad_df_per_root,
     casci_nuc_grad_df_relaxed,
     casci_nuc_grad_df_unrelaxed,
 )
-from .nuc_grad_thc import casscf_nuc_grad_thc
+from .nuc_grad_direct import casscf_nuc_grad_direct, casscf_nuc_grad_direct_per_root
+from .nuc_grad_thc import casscf_nuc_grad_thc, casscf_nuc_grad_thc_per_root
 
 
 @dataclass(frozen=True)
@@ -124,13 +127,22 @@ def casscf_nuc_grad(*args: Any, **kwargs: Any) -> NucGradResult:
     if len(args) == 2:
         scf_out, casscf = args
         backend = str(kwargs.pop("backend", "auto")).strip().lower()
-        if backend not in {"auto", "df", "thc"}:
-            raise ValueError("backend must be one of: 'auto', 'df', 'thc'")
+        if backend not in {"auto", "df", "thc", "direct"}:
+            raise ValueError("backend must be one of: 'auto', 'df', 'thc', 'direct'")
 
+        use_direct = bool(backend == "direct")
         use_thc = bool(backend == "thc")
         if backend == "auto":
-            # THC-SCF runs do not cache DF factors; default to THC gradients in that case.
-            use_thc = getattr(scf_out, "df_B", None) is None and getattr(scf_out, "thc_factors", None) is not None
+            use_direct = bool(
+                getattr(scf_out, "direct_jk_ctx", None) is not None
+                or str(getattr(scf_out, "two_e_backend", "") or "").strip().lower() == "direct"
+            )
+            if not use_direct:
+                # THC-SCF runs do not cache DF factors; default to THC gradients in that case.
+                use_thc = getattr(scf_out, "df_B", None) is None and getattr(scf_out, "thc_factors", None) is not None
+
+        if use_direct:
+            return _from_df(casscf_nuc_grad_direct(scf_out, casscf, **kwargs))
 
         if use_thc:
             res = casscf_nuc_grad_thc(scf_out, casscf, **kwargs)
@@ -150,4 +162,43 @@ def casscf_nuc_grad(*args: Any, **kwargs: Any) -> NucGradResult:
     raise TypeError("casscf_nuc_grad expects (scf_out, casscf, ...)")
 
 
-__all__ = ["NucGradResult", "casci_nuc_grad", "casscf_nuc_grad"]
+def casscf_nuc_grad_per_root(*args: Any, **kwargs: Any) -> DFNucGradMultirootResult:
+    """Compute per-root SA-CASSCF nuclear gradients.
+
+    Call pattern
+    ------------
+    ``casscf_nuc_grad_per_root(scf_out, casscf, *, backend='auto', **kwargs)``
+    """
+
+    if len(args) == 2:
+        scf_out, casscf = args
+        backend = str(kwargs.pop("backend", "auto")).strip().lower()
+        if backend not in {"auto", "df", "thc", "direct"}:
+            raise ValueError("backend must be one of: 'auto', 'df', 'thc', 'direct'")
+
+        use_direct = bool(backend == "direct")
+        use_thc = bool(backend == "thc")
+        if backend == "auto":
+            use_direct = bool(
+                getattr(scf_out, "direct_jk_ctx", None) is not None
+                or str(getattr(scf_out, "two_e_backend", "") or "").strip().lower() == "direct"
+            )
+            if not use_direct:
+                use_thc = getattr(scf_out, "df_B", None) is None and getattr(scf_out, "thc_factors", None) is not None
+
+        if use_direct:
+            return casscf_nuc_grad_direct_per_root(scf_out, casscf, **kwargs)
+        if use_thc:
+            return casscf_nuc_grad_thc_per_root(scf_out, casscf, **kwargs)
+        return casscf_nuc_grad_df_per_root(scf_out, casscf, **kwargs)
+
+    if len(args) == 1:
+        raise TypeError(
+            "casscf_nuc_grad_per_root no longer supports legacy PySCF workflows. "
+            "Use `casscf_nuc_grad_per_root(scf_out, casscf, ...)`."
+        )
+
+    raise TypeError("casscf_nuc_grad_per_root expects (scf_out, casscf, ...)")
+
+
+__all__ = ["NucGradResult", "casci_nuc_grad", "casscf_nuc_grad", "casscf_nuc_grad_per_root"]

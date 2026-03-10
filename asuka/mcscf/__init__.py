@@ -30,7 +30,8 @@ from .casscf import (
     run_casscf_dense_cpu,
     run_casscf_df,
 )
-from .nuc_grad import NucGradResult, casci_nuc_grad, casscf_nuc_grad
+from .nuc_grad import NucGradResult, casci_nuc_grad, casscf_nuc_grad, casscf_nuc_grad_per_root
+from .nuc_grad_direct import casscf_nuc_grad_direct, casscf_nuc_grad_direct_per_root
 from .nuc_grad_df import DFNucGradResult, DFNucGradMultirootResult, casscf_nuc_grad_df, casscf_nuc_grad_df_per_root, casci_nuc_grad_df_relaxed, casci_nuc_grad_df_unrelaxed
 from .nuc_grad_thc import THCNucGradComponents, THCNucGradMultirootResult, casscf_nuc_grad_thc, casscf_nuc_grad_thc_per_root
 from .newton_thc import THCNewtonCASSCFAdapter, build_thc_newton_eris
@@ -85,6 +86,9 @@ __all__ = [
     "NucGradResult",
     "casci_nuc_grad",
     "casscf_nuc_grad",
+    "casscf_nuc_grad_per_root",
+    "casscf_nuc_grad_direct",
+    "casscf_nuc_grad_direct_per_root",
     "sacasscf_nonadiabatic_couplings_df",
     "sacasscf_nonadiabatic_couplings_df_densez",
     "sacasscf_nonadiabatic_couplings_dense",
