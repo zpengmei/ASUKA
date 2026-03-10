@@ -24,7 +24,12 @@ from asuka.frontend._scf_build import (
 )
 from asuka.frontend._scf_df_build import prepare_direct_df_inputs
 from asuka.frontend._scf_dispatch import run_hf_df_dispatch
+from asuka.frontend._scf_dense import build_dense_ao_eri, dense_default_threads
+import asuka.frontend._scf_keys as scf_keys_mod
+from asuka.frontend._scf_keys import copy_mo_coeff_for_cache, rhf_guess_key, rhf_prep_key
+import asuka.frontend._scf_methods as scf_methods
 from asuka.frontend._scf_methods import _maybe_pack_df_B
+from asuka.frontend._scf_spin import nalpha_nbeta_from_mol
 from asuka.frontend.molecule import Molecule
 import asuka.frontend.scf as scf_mod
 from asuka.integrals.cueri_df import CuERIDFConfig
@@ -158,6 +163,72 @@ def test_scf_build_apply_sph_transform_cart_passthrough():
     assert out_int1e is int1e
     assert out_B is B
     assert sph_map is None
+
+
+def test_scf_dense_default_threads_policy():
+    assert dense_default_threads("cpu") == 0
+    assert dense_default_threads("cuda") == 256
+    assert dense_default_threads(" CuDa ") == 256
+
+
+def test_scf_dense_build_backend_validation():
+    with np.testing.assert_raises(ValueError):
+        build_dense_ao_eri(
+            ao_basis=object(),
+            backend="bogus",
+            dense_threads=None,
+            dense_max_tile_bytes=1024,
+            dense_eps_ao=1e-12,
+            dense_max_l=None,
+            dense_mem_budget_gib=None,
+            default_mem_budget_gib=8.0,
+            profile=None,
+        )
+
+
+def test_scf_spin_helper_nalpha_nbeta_validation():
+    assert nalpha_nbeta_from_mol(SimpleNamespace(nelectron=10, spin=2)) == (6, 4)
+    with np.testing.assert_raises(ValueError):
+        nalpha_nbeta_from_mol(SimpleNamespace(nelectron=5, spin=0))
+    with np.testing.assert_raises(ValueError):
+        nalpha_nbeta_from_mol(SimpleNamespace(nelectron=0, spin=0))
+
+
+def test_scf_keys_helpers_key_shape_and_device_binding(monkeypatch):
+    monkeypatch.setattr(scf_keys_mod, "cuda_device_id_or_neg1", lambda: 7)
+    mol = SimpleNamespace(
+        atoms_bohr=[("H", (0.0, 0.0, 0.0))],
+        charge=0,
+        spin=0,
+        cart=True,
+    )
+    cfg = CuERIDFConfig(backend="gpu_rys", mode="warp", threads=64)
+    prep = rhf_prep_key(
+        mol,
+        basis_in="sto-3g",
+        auxbasis="autoaux",
+        expand_contractions=True,
+        df_config=cfg,
+        df_layout_build="Qmn",
+    )
+    guess = rhf_guess_key(
+        mol,
+        basis_in="sto-3g",
+        auxbasis="autoaux",
+        expand_contractions=True,
+    )
+    assert prep[-1] == "qmn"
+    assert guess[0] == "rhf"
+    assert guess[-1] == 7
+
+
+def test_scf_keys_copy_mo_coeff_numpy_copy():
+    src = np.asarray([[1.0, 2.0], [3.0, 4.0]], dtype=np.float32, order="F")
+    out = copy_mo_coeff_for_cache(src)
+    assert out.dtype == np.float64
+    assert bool(out.flags["C_CONTIGUOUS"])
+    src[0, 0] = 99.0
+    assert float(out[0, 0]) == 1.0
 
 
 def test_scf_df_build_prepare_direct_df_inputs_with_prebuilt_metric():
@@ -336,3 +407,178 @@ def test_scf_run_rhf_df_delegates_to_methods_impl(monkeypatch):
     assert captured["kwargs"]["init_fock_cycles_default"] == scf_mod._HF_INIT_FOCK_CYCLES
     assert captured["kwargs"]["resolve_cueri_df_config"] is scf_mod._resolve_cueri_df_config
     assert captured["kwargs"]["result_cls"] is scf_mod.RHFDFRunResult
+
+
+def test_scf_methods_rhf_df_impl_cache_hit_df_config_and_guess_flow(monkeypatch):
+    mol = SimpleNamespace(spin=0, nelectron=2, cart=True, energy_nuc=lambda: 1.25)
+    cfg = SimpleNamespace(name="cfg")
+    prep_cache = object()
+    guess_cache = object()
+    prep_tuple = (
+        "ao_basis",
+        "sto-3g",
+        SimpleNamespace(S=np.eye(2), hcore=np.eye(2)),
+        "aux_basis",
+        "autoaux",
+        np.ones((2, 2, 1)),
+        "Lchol",
+    )
+    calls = {"resolve": [], "prep_key": [], "guess_key": [], "cache_get": [], "cache_put": [], "run_cfg": []}
+
+    def _resolve(df_config, **kwargs):
+        calls["resolve"].append((df_config, kwargs))
+        return cfg
+
+    def _prep_key(*args, **kwargs):
+        calls["prep_key"].append((args, kwargs))
+        return ("prep",)
+
+    def _guess_key(*args, **kwargs):
+        calls["guess_key"].append((args, kwargs))
+        return ("guess",)
+
+    def _cache_get(cache, key):
+        calls["cache_get"].append((cache, key))
+        if cache is prep_cache:
+            return prep_tuple
+        if cache is guess_cache:
+            return np.eye(2)
+        return None
+
+    def _cache_put(cache, key, value, *, max_size):
+        calls["cache_put"].append((cache, key, value, max_size))
+
+    def _rhf_df(*args, **kwargs):
+        return SimpleNamespace(
+            converged=True,
+            mo_coeff=np.eye(2),
+            method="rhf",
+            niter=1,
+            e_tot=0.0,
+            e_elec=0.0,
+            e_nuc=1.25,
+            mo_energy=np.zeros(2),
+            mo_occ=np.array([2.0, 0.0]),
+        )
+
+    def _mk_cfg(**kwargs):
+        calls["run_cfg"].append(kwargs)
+        return SimpleNamespace(**kwargs)
+
+    monkeypatch.setattr(scf_methods, "rhf_df", _rhf_df)
+
+    out = scf_methods.run_rhf_df_impl(
+        mol,
+        basis="sto-3g",
+        auxbasis="autoaux",
+        df_config="in_cfg",
+        df_layout="mnQ",
+        max_cycle=4,
+        conv_tol=1e-9,
+        profile={},
+        init_fock_cycles_default=1,
+        resolve_cueri_df_config=_resolve,
+        rhf_prep_key=_prep_key,
+        rhf_guess_key=_guess_key,
+        cache_get=_cache_get,
+        cache_put=_cache_put,
+        rhf_prep_cache=prep_cache,
+        rhf_guess_cache=guess_cache,
+        hf_prep_cache_max=7,
+        hf_guess_cache_max=9,
+        copy_mo_coeff_for_cache=lambda x: x,
+        make_df_run_config=_mk_cfg,
+        result_cls=lambda **kw: SimpleNamespace(**kw),
+    )
+
+    assert calls["resolve"][0][0] == "in_cfg"
+    assert calls["prep_key"][0][1]["df_config"] is cfg
+    assert calls["prep_key"][0][1]["df_layout_build"] == "mnq"
+    assert out.profile["df_build"]["cache_hit"] is True
+    assert out.profile["scf_guess"]["cache_hit"] is True
+    assert calls["run_cfg"][0]["df_config"] is cfg
+    assert out.df_run_config.df_config is cfg
+    assert any(c[0] is guess_cache and c[1] == ("guess",) for c in calls["cache_put"])
+
+
+def test_scf_methods_rhf_df_impl_cache_miss_builds_and_records_cache(monkeypatch):
+    mol = SimpleNamespace(spin=0, nelectron=2, cart=True, energy_nuc=lambda: 0.5)
+    cfg = SimpleNamespace(name="cfg_miss")
+    prep_cache = object()
+    guess_cache = object()
+    calls = {"build": [], "cache_get": [], "cache_put": []}
+
+    def _resolve(*args, **kwargs):
+        return cfg
+
+    def _cache_get(cache, key):
+        calls["cache_get"].append((cache, key))
+        return None
+
+    def _cache_put(cache, key, value, *, max_size):
+        calls["cache_put"].append((cache, key, max_size))
+
+    def _build_problem(*args, **kwargs):
+        return (
+            "ao",
+            "sto-3g",
+            SimpleNamespace(S=np.eye(2), hcore=np.eye(2)),
+            "aux",
+            "autoaux",
+        )
+
+    def _build_df(mol_in, *, cfg, df_layout_s, **kwargs):
+        assert mol_in is mol
+        calls["build"].append((cfg, df_layout_s))
+        return np.ones((2, 2, 1)), "L"
+
+    def _transform(*args, **kwargs):
+        int1e = kwargs["int1e"]
+        B = kwargs["B"]
+        return int1e, B, None
+
+    def _rhf_df(*args, **kwargs):
+        return SimpleNamespace(
+            converged=False,
+            mo_coeff=np.eye(2),
+            method="rhf",
+            niter=1,
+            e_tot=0.0,
+            e_elec=0.0,
+            e_nuc=0.5,
+            mo_energy=np.zeros(2),
+            mo_occ=np.array([2.0, 0.0]),
+        )
+
+    monkeypatch.setattr(scf_methods, "_build_ao_int1e_aux_problem", _build_problem)
+    monkeypatch.setattr(scf_methods, "_build_df_factors_gpu", _build_df)
+    monkeypatch.setattr(scf_methods, "_transform_df_for_scf", _transform)
+    monkeypatch.setattr(scf_methods, "rhf_df", _rhf_df)
+
+    out = scf_methods.run_rhf_df_impl(
+        mol,
+        basis="sto-3g",
+        auxbasis="autoaux",
+        df_config="cfg_in",
+        df_layout="Qmn",
+        profile={},
+        init_fock_cycles_default=1,
+        resolve_cueri_df_config=_resolve,
+        rhf_prep_key=lambda *a, **k: ("prep_miss",),
+        rhf_guess_key=lambda *a, **k: ("guess_miss",),
+        cache_get=_cache_get,
+        cache_put=_cache_put,
+        rhf_prep_cache=prep_cache,
+        rhf_guess_cache=guess_cache,
+        hf_prep_cache_max=3,
+        hf_guess_cache_max=5,
+        copy_mo_coeff_for_cache=lambda x: x,
+        make_df_run_config=lambda **kw: SimpleNamespace(**kw),
+        result_cls=lambda **kw: SimpleNamespace(**kw),
+    )
+
+    assert calls["build"] == [(cfg, "qmn")]
+    assert out.profile["df_build"]["cache_hit"] is False
+    assert out.profile["scf_guess"]["cache_hit"] is False
+    assert (prep_cache, ("prep_miss",), 3) in calls["cache_put"]
+    assert not any(c[0] is guess_cache for c in calls["cache_put"])

@@ -21,7 +21,6 @@ from typing import Any, TYPE_CHECKING
 
 import numpy as np
 
-from asuka.hf.dense_eri import build_ao_eri_dense
 from asuka.hf.dense_scf import rhf_dense, rohf_dense, uhf_dense
 from asuka.hf.df_scf import SCFResult, rhf_df, rohf_df, uhf_df
 from asuka.integrals.cueri_df import CuERIDFConfig, build_df_B_from_cueri_packed_bases
@@ -53,7 +52,16 @@ from ._scf_df_build import (
     build_df_metric_cholesky as _build_df_metric_cholesky_impl,
     prepare_direct_df_inputs as _prepare_direct_df_inputs_impl,
 )
+from ._scf_dense import (
+    build_dense_ao_eri as _build_dense_ao_eri_impl,
+    dense_default_threads as _dense_default_threads_impl,
+)
 from ._scf_dispatch import run_hf_df_dispatch as _run_hf_df_dispatch
+from ._scf_keys import (
+    copy_mo_coeff_for_cache as _copy_mo_coeff_for_cache_impl,
+    rhf_guess_key as _rhf_guess_key_impl,
+    rhf_prep_key as _rhf_prep_key_impl,
+)
 from ._scf_methods import (
     run_rhf_df_impl as _run_rhf_df_impl,
     run_rhf_df_cpu_impl as _run_rhf_df_cpu_impl,
@@ -64,6 +72,7 @@ from ._scf_methods import (
     run_uhf_df_impl as _run_uhf_df_impl,
     run_uks_df_impl as _run_uks_df_impl,
 )
+from ._scf_spin import nalpha_nbeta_from_mol as _nalpha_nbeta_from_mol_impl
 
 if TYPE_CHECKING:
     from asuka.integrals.cart2sph import AOSphericalTransform
@@ -446,13 +455,13 @@ def _rhf_prep_key(
     df_config: CuERIDFConfig | None,
     df_layout_build: str = "mnQ",
 ) -> tuple[Any, ...]:
-    return (
-        _mol_cache_key(mol),
-        _normalize_basis_key(basis_in),
-        _normalize_basis_key(auxbasis),
-        bool(expand_contractions),
-        _df_config_key(df_config),
-        str(df_layout_build).strip().lower(),
+    return _rhf_prep_key_impl(
+        mol,
+        basis_in=basis_in,
+        auxbasis=auxbasis,
+        expand_contractions=expand_contractions,
+        df_config=df_config,
+        df_layout_build=df_layout_build,
     )
 
 
@@ -463,24 +472,16 @@ def _rhf_guess_key(
     auxbasis: Any,
     expand_contractions: bool,
 ) -> tuple[Any, ...]:
-    return (
-        "rhf",
-        _mol_cache_key(mol),
-        _normalize_basis_key(basis_in),
-        _normalize_basis_key(auxbasis),
-        bool(expand_contractions),
-        int(_cuda_device_id_or_neg1()),
+    return _rhf_guess_key_impl(
+        mol,
+        basis_in=basis_in,
+        auxbasis=auxbasis,
+        expand_contractions=expand_contractions,
     )
 
 
 def _copy_mo_coeff_for_cache(mo_coeff: Any):
-    try:
-        import cupy as cp  # noqa: PLC0415
-    except Exception:
-        cp = None  # type: ignore
-    if cp is not None and isinstance(mo_coeff, cp.ndarray):  # type: ignore[attr-defined]
-        return cp.ascontiguousarray(cp.asarray(mo_coeff, dtype=cp.float64))
-    return np.asarray(mo_coeff, dtype=np.float64, order="C").copy()
+    return _copy_mo_coeff_for_cache_impl(mo_coeff)
 
 
 def clear_hf_frontend_caches() -> None:
@@ -513,22 +514,11 @@ def _build_aux_basis_cart(
 
 
 def _nalpha_nbeta_from_mol(mol: Molecule) -> tuple[int, int]:
-    nelec = int(mol.nelectron)
-    spin = int(mol.spin)
-    if nelec <= 0:
-        raise ValueError("nelectron must be positive")
-    if (nelec + spin) % 2 != 0 or (nelec - spin) % 2 != 0:
-        raise ValueError("incompatible nelectron/spin parity (requires nelec±spin even)")
-    nalpha = (nelec + spin) // 2
-    nbeta = (nelec - spin) // 2
-    if nalpha < 0 or nbeta < 0:
-        raise ValueError("invalid nelectron/spin combination (negative nalpha/nbeta)")
-    return int(nalpha), int(nbeta)
+    return _nalpha_nbeta_from_mol_impl(mol)
 
 
 def _dense_default_threads(backend: str) -> int:
-    backend_s = str(backend).strip().lower()
-    return 0 if backend_s == "cpu" else 256
+    return _dense_default_threads_impl(backend)
 
 
 def _build_dense_ao_eri(
@@ -542,21 +532,16 @@ def _build_dense_ao_eri(
     dense_mem_budget_gib: float | None,
     profile: dict | None = None,
 ):
-    backend_s = str(backend).strip().lower()
-    if backend_s not in {"cpu", "cuda"}:
-        raise ValueError("backend must be 'cpu' or 'cuda'")
-    threads_i = _dense_default_threads(backend_s) if dense_threads is None else int(dense_threads)
-    budget_gib = float(_HF_DENSE_MEM_BUDGET_GIB) if dense_mem_budget_gib is None else float(dense_mem_budget_gib)
-    dense_prof = profile.setdefault("dense_eri_build", {}) if profile is not None else None
-    return build_ao_eri_dense(
+    return _build_dense_ao_eri_impl(
         ao_basis,
-        backend=str(backend_s),
-        threads=int(threads_i),
-        max_tile_bytes=int(dense_max_tile_bytes),
-        eps_ao=float(dense_eps_ao),
-        max_l=dense_max_l,
-        mem_budget_gib=float(budget_gib),
-        profile=dense_prof,
+        backend=backend,
+        dense_threads=dense_threads,
+        dense_max_tile_bytes=dense_max_tile_bytes,
+        dense_eps_ao=dense_eps_ao,
+        dense_max_l=dense_max_l,
+        dense_mem_budget_gib=dense_mem_budget_gib,
+        default_mem_budget_gib=float(_HF_DENSE_MEM_BUDGET_GIB),
+        profile=profile,
     )
 
 

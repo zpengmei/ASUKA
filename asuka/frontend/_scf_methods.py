@@ -16,20 +16,11 @@ from ._scf_build import (
 )
 from ._scf_config import resolve_cueri_df_config
 from .one_electron import build_ao_basis_cart
+from ._scf_spin import nalpha_nbeta_from_mol as _nalpha_nbeta_from_mol_impl
 
 
 def _nalpha_nbeta_from_mol(mol) -> tuple[int, int]:
-    nelec = int(mol.nelectron)
-    spin = int(mol.spin)
-    if nelec <= 0:
-        raise ValueError("nelectron must be positive")
-    if (nelec + spin) % 2 != 0 or (nelec - spin) % 2 != 0:
-        raise ValueError("incompatible nelectron/spin parity (requires nelec±spin even)")
-    nalpha = (nelec + spin) // 2
-    nbeta = (nelec - spin) // 2
-    if nalpha < 0 or nbeta < 0:
-        raise ValueError("invalid nelectron/spin combination (negative nalpha/nbeta)")
-    return int(nalpha), int(nbeta)
+    return _nalpha_nbeta_from_mol_impl(mol)
 
 
 def _maybe_pack_df_B(B_scf, *, df_layout_s: str, int1e_scf):
