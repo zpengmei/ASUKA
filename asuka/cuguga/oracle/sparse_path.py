@@ -1,10 +1,10 @@
 from __future__ import annotations
 
 from collections import defaultdict
+from typing import Any
 
 import numpy as np
 
-from asuka.integrals.df_integrals import DFMOIntegrals
 from asuka.cuguga.drt import DRT
 from asuka.cuguga.epq.action import epq_contribs_one_keys, path_nodes
 from asuka.cuguga.oracle import _STEP_TO_OCC, _restore_eri_4d
@@ -160,7 +160,7 @@ def connected_row_sparse_by_path(
 def connected_row_sparse_df_by_path(
     drt: DRT,
     h1e: np.ndarray,
-    df_eri: DFMOIntegrals,
+    df_eri: Any,
     ket_steps: np.ndarray,
     *,
     max_out: int = 200_000,

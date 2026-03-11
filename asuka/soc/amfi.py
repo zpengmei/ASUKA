@@ -551,7 +551,7 @@ def build_openmolcas_amfi_xyz_ao_asuka(
     """
 
     from asuka.cueri.basis_cart import BasisCartSoA  # noqa: PLC0415
-    from asuka.frontend.periodic_table import atomic_number  # noqa: PLC0415
+    from asuka.chem.periodic_table import atomic_number  # noqa: PLC0415
     from asuka.integrals.int1e_cart import build_V_cart, nao_cart_from_basis  # noqa: PLC0415
 
     mol = getattr(scf_out, "mol", None)

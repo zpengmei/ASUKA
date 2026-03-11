@@ -280,7 +280,7 @@ def soc_lagrange_response_nuc_grad_df(
     from types import SimpleNamespace  # noqa: PLC0415
 
     from asuka.frontend.molecule import Molecule  # noqa: PLC0415
-    from asuka.frontend.periodic_table import atomic_number  # noqa: PLC0415
+    from asuka.chem.periodic_table import atomic_number  # noqa: PLC0415
     from asuka.integrals.df_context import get_df_cholesky_context  # noqa: PLC0415
     from asuka.integrals.int1e_cart import build_int1e_cart  # noqa: PLC0415
     from asuka.mcscf.nac._df import _Lorb_dot_dgorb_dx_df as _Lorb_dot_dgorb_dx_df_impl  # noqa: PLC0415

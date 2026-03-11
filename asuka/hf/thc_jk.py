@@ -31,11 +31,15 @@ def _load_hf_thc_cuda_ext():
     if _HF_THC_CUDA_EXT is not None:
         return _HF_THC_CUDA_EXT
     try:
-        from asuka import _hf_thc_cuda_ext  # type: ignore[import-not-found]
+        from asuka.kernels import hf_thc as _hf_thc_kernels  # noqa: PLC0415
     except Exception:
         _HF_THC_CUDA_EXT = False
         return None
-    _HF_THC_CUDA_EXT = _hf_thc_cuda_ext
+    ext = _hf_thc_kernels.load_ext()
+    if ext is None:
+        _HF_THC_CUDA_EXT = False
+        return None
+    _HF_THC_CUDA_EXT = ext
     return _HF_THC_CUDA_EXT
 
 

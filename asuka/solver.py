@@ -35,14 +35,20 @@ from asuka._solver.warm_state import (
 from asuka._solver.cuda_policy import (
     apply_cuda_pool_hard_cap as _apply_cuda_pool_hard_cap,
     auto_gpu_mem_hard_cap as _auto_gpu_mem_hard_cap,
+    cap_cuda_max_g_mib_by_hard_cap as _cap_cuda_max_g_mib_by_hard_cap_runtime,
     cuda_budget_free_bytes as _cuda_budget_free_bytes,
     enforce_cuda_aggregate_offdiag_guard as _enforce_cuda_aggregate_offdiag_guard,
     enforce_cuda_fp32_large_cas_epq_policy as _enforce_cuda_fp32_large_cas_epq_policy,
     estimate_epq_peak_bytes as _estimate_epq_peak_bytes,
     normalize_csr_host_cache_mode as _normalize_csr_host_cache_mode,
     normalize_matvec_cuda_path_mode as _normalize_matvec_cuda_path_mode,
+    maybe_promote_cuda_apply_mode_scatter as _maybe_promote_cuda_apply_mode_scatter_runtime,
     normalize_prefilter_trivial_tasks_mode as _normalize_prefilter_trivial_tasks_mode,
+    resolve_cuda_apply_mode as _resolve_cuda_apply_mode_runtime,
+    resolve_cuda_cublas_workspace_cap_mb as _resolve_cuda_cublas_workspace_cap_mb_runtime,
+    resolve_cuda_epq_build_device as _resolve_cuda_epq_build_device_runtime,
     resolve_cuda_memory_controls as _resolve_cuda_memory_controls_runtime,
+    resolve_cuda_max_g_mib as _resolve_cuda_max_g_mib_runtime,
     resolve_kernel_cuda_policy as _resolve_kernel_cuda_policy_runtime,
     normalize_ws_cache_fraction as _normalize_ws_cache_fraction,
     resolve_epq_overbudget_action as _resolve_epq_overbudget_action,
@@ -74,12 +80,35 @@ from asuka._solver.drt_runtime import (
 )
 from asuka._solver.matvec_runtime import (
     estimate_matvec_cuda_workspace_bytes as _estimate_matvec_cuda_workspace_bytes_runtime,
+    get_or_create_cuda_matvec_state as _get_or_create_cuda_matvec_state_runtime,
     release_matvec_cuda_workspace as _release_matvec_cuda_workspace_runtime,
     resolve_matvec_cuda_ws_cache_budget_bytes as _resolve_matvec_cuda_ws_cache_budget_bytes_runtime,
+    resolve_cuda_workspace_controls as _resolve_cuda_workspace_controls_runtime,
     resolve_kernel_cuda_execution_mode as _resolve_kernel_cuda_execution_mode_runtime,
     resolve_approx_cuda_frontend as _resolve_approx_cuda_frontend_runtime,
     resolve_approx_kernel_iteration_caps as _resolve_approx_kernel_iteration_caps_runtime,
+    resolve_cuda_cache_csr_tiles as _resolve_cuda_cache_csr_tiles_runtime,
+    resolve_cuda_j_tile as _resolve_cuda_j_tile_runtime,
+    resolve_cuda_threads_apply as _resolve_cuda_threads_apply_runtime,
+    resolve_cuda_threads_w as _resolve_cuda_threads_w_runtime,
     ws_needs_rebuild as _ws_needs_rebuild_runtime,
+    tune_cuda_threads_for_large_cas_noepq as _tune_cuda_threads_for_large_cas_noepq_runtime,
+)
+from asuka._solver.kernel_runtime import (
+    autotune_cuda_max_g_mib_for_large_cas as _autotune_cuda_max_g_mib_for_large_cas_runtime,
+    build_cuda_hamiltonian_inputs as _build_cuda_hamiltonian_inputs_runtime,
+    build_kernel_dry_run_result as _build_kernel_dry_run_result_runtime,
+    maybe_restore_contract_eri as _maybe_restore_contract_eri_runtime,
+    normalize_row_screening as _normalize_row_screening_runtime,
+    prepare_kernel_precompute_and_state_cache as _prepare_kernel_precompute_and_state_cache_runtime,
+    resolve_kernel_nroots as _resolve_kernel_nroots_runtime,
+    resolve_kernel_warm_start as _resolve_kernel_warm_start_runtime,
+    run_kernel_dense_eigh_fastpath as _run_kernel_dense_eigh_fastpath_runtime,
+)
+from asuka._solver.kernel_cuda_runtime import (
+    apply_low_precision_and_workspace_policy as _apply_low_precision_and_workspace_policy_runtime,
+    auto_select_use_epq_table as _auto_select_use_epq_table_runtime,
+    resolve_epq_streaming_controls as _resolve_epq_streaming_controls_runtime,
 )
 from asuka._solver.matvec_cache_runtime import (
     configure_matvec_cuda_ws_cache as _configure_matvec_cuda_ws_cache_runtime,
@@ -694,9 +723,10 @@ class GUGAFCISolver(_StreamObject):
         matvec_cuda_aggregate_offdiag_preview = _cuda_policy["matvec_cuda_aggregate_offdiag_preview"]
         if kprof is not None:
             kprof.update(dict(_cuda_policy["profile"]))
-        row_screening = kwargs.pop("row_screening", None)
-        if row_screening is not None and not isinstance(row_screening, RowScreening):
-            raise TypeError("row_screening must be a RowScreening or None")
+        row_screening = _normalize_row_screening_runtime(
+            row_screening=kwargs.pop("row_screening", None),
+            row_screening_type=RowScreening,
+        )
         _runtime_controls = _resolve_kernel_runtime_controls_runtime(
             kwargs=kwargs,
             defaults=self,
@@ -717,16 +747,18 @@ class GUGAFCISolver(_StreamObject):
         # For the dense CPU contract backend, PySCF commonly supplies CAS ERIs in sym=4 pair-matrix
         # form (npair,npair). Restoring to a 4-index tensor inside each matvec hop would be extremely
         # costly; restore once up-front when needed.
-        if matvec_backend == "contract" and not isinstance(eri, (DFMOIntegrals, DeviceDFMOIntegrals)):
-            try:
-                eri_arr = np.asarray(eri)
-                if eri_arr.ndim != 4:
-                    from asuka.cuguga.eri import restore_eri1  # noqa: PLC0415
+        def _restore_eri1_lazy(eri_in, norb_in):
+            from asuka.cuguga.eri import restore_eri1  # noqa: PLC0415
 
-                    eri = restore_eri1(eri, int(norb))
-            except Exception:
-                # Fall back to downstream restore logic (may still error for unsupported formats).
-                pass
+            return restore_eri1(eri_in, int(norb_in))
+
+        eri = _maybe_restore_contract_eri_runtime(
+            matvec_backend=matvec_backend,
+            eri=eri,
+            norb=int(norb),
+            df_types=(DFMOIntegrals, DeviceDFMOIntegrals),
+            restore_eri1_fn=_restore_eri1_lazy,
+        )
 
         neleca, nelecb, nelec_total, _sz_twos = self._normalize_nelec(nelec)
         twos = self._get_twos_target(neleca, nelecb)
@@ -788,73 +820,43 @@ class GUGAFCISolver(_StreamObject):
                     ncsf=int(ncsf),
                 )
 
-        if nroots is None:
-            nroots = int(getattr(self, "nroots", 1))
-        nroots = int(nroots)
-        if nroots < 1:
-            raise ValueError("nroots must be >= 1")
-        if ncsf < nroots:
-            raise ValueError(f"nroots={nroots} > ncsf={ncsf}")
+        nroots = _resolve_kernel_nroots_runtime(
+            requested_nroots=nroots,
+            defaults=self,
+            ncsf=int(ncsf),
+        )
 
-        # --- Dense CPU eigh fast-path for tiny CI spaces ---
-        # For small ncsf the CUDA Davidson setup overhead dominates; a direct
-        # np.linalg.eigh on the full H matrix is orders of magnitude faster.
-        _dense_thresh = int(getattr(self, "dense_eigh_ncsf_threshold", 0))
-        if _dense_thresh > 0 and int(ncsf) <= _dense_thresh:
-            _t_dense0 = time.perf_counter()
-            hdiag_ps = None
-            addr_full, h_full = self.pspace(
-                h1e,
-                eri,
-                norb,
-                nelec,
-                npsp=int(ncsf),
-                max_out=int(max_out),
-                hdiag=hdiag_ps,
-                orbsym=orbsym,
-                wfnsym=wfnsym,
-                ne_constraints=ne_constraints,
-            )
-            addr_full = np.asarray(addr_full, dtype=np.int64).ravel()
-            if int(addr_full.size) != int(ncsf):
-                raise RuntimeError(
-                    "dense_eigh fast-path: pspace address size mismatch "
-                    f"(got {int(addr_full.size)}, expected {int(ncsf)})"
-                )
-            h_full = np.asarray(h_full, dtype=np.float64)
-            h_full = 0.5 * (h_full + h_full.T)
-            evals, evecs = np.linalg.eigh(h_full)
-            order = np.argsort(np.asarray(evals, dtype=np.float64))[:int(nroots)]
-            e = np.asarray(evals, dtype=np.float64)[order] + float(ecore)
-            ci: list[np.ndarray] = []
-            for col in order.tolist():
-                v_sub = np.asarray(evecs[:, int(col)], dtype=np.float64).ravel()
-                v_full = np.zeros((int(ncsf),), dtype=np.float64)
-                v_full[addr_full] = v_sub
-                ci.append(np.ascontiguousarray(v_full))
-            self.converged = np.ones((int(nroots),), dtype=np.bool_)
-            _t_dense1 = time.perf_counter()
-            # Update warm state
-            if warm_state_update:
-                self._update_warm_state(
-                    ci=ci,
-                    norb=int(norb),
-                    nelec_total=int(nelec_total),
-                    twos=int(twos),
-                    nroots=int(nroots),
-                    ncsf=int(ncsf),
-                    orbsym=orbsym,
-                    wfnsym=wfnsym,
-                    ne_constraints=ne_constraints,
-                    cas_metadata=warm_cas_metadata,
-                    mo_coeff=warm_state_mo_coeff,
-                    mo_occ=warm_state_mo_occ,
-                )
+        _dense_fast = _run_kernel_dense_eigh_fastpath_runtime(
+            solver=self,
+            h1e=h1e,
+            eri=eri,
+            norb=int(norb),
+            nelec=nelec,
+            ncsf=int(ncsf),
+            nroots=int(nroots),
+            ecore=float(ecore),
+            max_out=int(max_out),
+            orbsym=orbsym,
+            wfnsym=wfnsym,
+            ne_constraints=ne_constraints,
+            drt_key=drt_key,
+            warm_state_update=bool(warm_state_update),
+            nelec_total=int(nelec_total),
+            twos=int(twos),
+            cas_metadata=warm_cas_metadata,
+            warm_state_mo_coeff=warm_state_mo_coeff,
+            warm_state_mo_occ=warm_state_mo_occ,
+            t_kernel0=float(t_kernel0),
+        )
+        if _dense_fast is not None:
+            self.converged = _dense_fast["converged"]
+            e = np.asarray(_dense_fast["e"], dtype=np.float64)
+            ci = _dense_fast["ci"]
             if kprof is not None:
                 kprof["dense_eigh_used"] = True
-                kprof["dense_eigh_ncsf"] = int(ncsf)
-                kprof["dense_eigh_s"] = _t_dense1 - _t_dense0
-                kprof["total_s"] = _t_dense1 - t_kernel0
+                kprof["dense_eigh_ncsf"] = int(_dense_fast["dense_eigh_ncsf"])
+                kprof["dense_eigh_s"] = float(_dense_fast["dense_eigh_s"])
+                kprof["total_s"] = float(_dense_fast["total_s"])
                 self._last_kernel_profile = kprof
             if nroots == 1:
                 self.converged = bool(self.converged[0])
@@ -864,29 +866,25 @@ class GUGAFCISolver(_StreamObject):
             self.eci, self.ci = e, [np.ascontiguousarray(v) for v in ci]
             self._last_drt_key = drt_key
             return self.eci, self.ci
-        # --- end dense eigh fast-path ---
 
-        warm_applied = False
-        warm_reason = "warm_start_disabled" if not warm_state_enable else "ci0_provided"
-        if ci0 is None:
-            if warm_state_enable:
-                ci0_warm, warm_reason = self._warm_state_ci0_if_compatible(
-                    norb=int(norb),
-                    nelec_total=int(nelec_total),
-                    twos=int(twos),
-                    nroots=int(nroots),
-                    ncsf=int(ncsf),
-                    orbsym=orbsym,
-                    wfnsym=wfnsym,
-                    ne_constraints=ne_constraints,
-                    matvec_backend=matvec_backend,
-                    cas_metadata=warm_cas_metadata,
-                )
-                if ci0_warm is not None:
-                    ci0 = ci0_warm
-                    warm_applied = True
-            else:
-                warm_reason = "warm_start_disabled"
+        _warm = _resolve_kernel_warm_start_runtime(
+            ci0=ci0,
+            warm_state_enable=bool(warm_state_enable),
+            warm_state_ci0_if_compatible_fn=self._warm_state_ci0_if_compatible,
+            norb=int(norb),
+            nelec_total=int(nelec_total),
+            twos=int(twos),
+            nroots=int(nroots),
+            ncsf=int(ncsf),
+            orbsym=orbsym,
+            wfnsym=wfnsym,
+            ne_constraints=ne_constraints,
+            matvec_backend=matvec_backend,
+            cas_metadata=warm_cas_metadata,
+        )
+        ci0 = _warm["ci0"]
+        warm_applied = bool(_warm["warm_applied"])
+        warm_reason = str(_warm["warm_reason"])
 
         self._last_warm_start_info = {"applied": bool(warm_applied), "reason": str(warm_reason)}
         if kprof is not None:
@@ -894,16 +892,15 @@ class GUGAFCISolver(_StreamObject):
             kprof["warm_start_reason"] = str(warm_reason)
 
         if dry_run:
-            if ci0 is None:
-                ci = []
-                for root in range(nroots):
-                    v = np.zeros(ncsf, dtype=np.float64)
-                    v[root] = 1.0
-                    ci.append(v)
-            else:
-                ci = _normalize_ci0(ci0, nroots=nroots, ncsf=ncsf)
-
-            e = np.zeros(nroots, dtype=np.float64) + float(ecore)
+            _dry = _build_kernel_dry_run_result_runtime(
+                ci0=ci0,
+                nroots=int(nroots),
+                ncsf=int(ncsf),
+                ecore=float(ecore),
+                normalize_ci0_fn=_normalize_ci0,
+            )
+            e = np.asarray(_dry["e"], dtype=np.float64)
+            ci = _dry["ci"]
             if warm_state_update:
                 self._update_warm_state(
                     ci=ci,
@@ -932,12 +929,14 @@ class GUGAFCISolver(_StreamObject):
         max_memory = float(_solver_controls["max_memory"])
         pspace_size = int(_solver_controls["pspace_size"])
 
-        if precompute_epq:
-            precompute_epq_actions(drt)
-
-        state_cache = None
-        if matvec_backend == "row_oracle_df" and row_oracle_use_state_cache:
-            state_cache = get_state_cache(drt)
+        state_cache = _prepare_kernel_precompute_and_state_cache_runtime(
+            precompute_epq=bool(precompute_epq),
+            drt=drt,
+            matvec_backend=matvec_backend,
+            row_oracle_use_state_cache=bool(row_oracle_use_state_cache),
+            precompute_epq_actions_fn=precompute_epq_actions,
+            get_state_cache_fn=get_state_cache,
+        )
 
         # Cache the most recent Hamiltonian for `contract_2e` convenience.
         self._h1e = np.asarray(h1e, dtype=np.float64)
@@ -994,13 +993,13 @@ class GUGAFCISolver(_StreamObject):
                 wfnsym=wfnsym,
                 ne_constraints=ne_constraints,
             )
-            cuda_state = self._matvec_cuda_state_cache.get(ws_key)
-            if cuda_state is None:
-                drt_dev = make_device_drt(drt)
-                state_dev = make_device_state_cache(drt, drt_dev)
-                cuda_state = (drt_dev, state_dev)
-                self._matvec_cuda_state_cache[ws_key] = cuda_state
-            drt_dev, state_dev = cuda_state
+            drt_dev, state_dev = _get_or_create_cuda_matvec_state_runtime(
+                state_cache=self._matvec_cuda_state_cache,
+                ws_key=ws_key,
+                drt=drt,
+                make_device_drt_fn=make_device_drt,
+                make_device_state_cache_fn=make_device_state_cache,
+            )
 
             norb_i = int(drt.norb)
             nops = norb_i * norb_i
@@ -1016,46 +1015,19 @@ class GUGAFCISolver(_StreamObject):
             # GPU-resident coefficients (built once per solve call).
             if kprof is not None:
                 t0 = time.perf_counter()
-            eri_mat_d = None
-            l_full_d = None
-            if isinstance(eri, DeviceDFMOIntegrals):
-                j_ps_d = cp.asarray(eri.j_ps, dtype=cp.float64)
-                j_ps_d = cp.ascontiguousarray(j_ps_d)
-                h1e_d = cp.asarray(np.asarray(h1e, dtype=np.float64), dtype=cp.float64)
-                if eri.eri_mat is not None:
-                    eri_mat_d = cp.asarray(eri.eri_mat, dtype=cp.float64)
-                    eri_mat_d = cp.ascontiguousarray(eri_mat_d)
-                elif eri.l_full is not None:
-                    l_full_d = cp.asarray(eri.l_full, dtype=cp.float64)
-                    l_full_d = cp.ascontiguousarray(l_full_d)
-                    need = int(nops) * int(nops) * int(np.dtype(np.float64).itemsize)
-                    if matvec_cuda_df_eri_mat_max_bytes > 0 and need <= matvec_cuda_df_eri_mat_max_bytes:
-                        eri_mat_d = cp.dot(l_full_d, l_full_d.T)
-                        eri_mat_d = cp.ascontiguousarray(eri_mat_d)
-                        l_full_d = None
-                else:
-                    raise RuntimeError("DeviceDFMOIntegrals requires eri_mat or l_full for CUDA matvec")
-                h_eff_d = h1e_d - 0.5 * j_ps_d
-            else:
-                if isinstance(eri, DFMOIntegrals):
-                    # Prefer the DF L_full representation on GPU to avoid O(norb^4) ERI_mat storage.
-                    l_full_d = cp.asarray(eri.l_full, dtype=cp.float64)
-                    l_full_d = cp.ascontiguousarray(l_full_d)
-                    j_ps = np.asarray(eri.j_ps, dtype=np.float64, order="C")
-                    need = int(nops) * int(nops) * int(np.dtype(np.float64).itemsize)
-                    if matvec_cuda_df_eri_mat_max_bytes > 0 and need <= matvec_cuda_df_eri_mat_max_bytes:
-                        eri_mat_d = cp.dot(l_full_d, l_full_d.T)
-                        eri_mat_d = cp.ascontiguousarray(eri_mat_d)
-                        l_full_d = None
-                else:
-                    eri4 = _restore_eri_4d(eri, norb_i).astype(np.float64, copy=False)
-                    eri_mat_host = np.asarray(eri4.reshape(nops, nops), dtype=np.float64, order="C")
-                    j_ps = np.einsum("pqqs->ps", eri4).astype(np.float64, copy=False)
-
-                h_eff = np.asarray(h1e, dtype=np.float64) - 0.5 * np.asarray(j_ps, dtype=np.float64)
-                h_eff_d = cp.asarray(h_eff, dtype=cp.float64)
-                if not isinstance(eri, DFMOIntegrals):
-                    eri_mat_d = cp.asarray(eri_mat_host, dtype=cp.float64)
+            _ham_inputs = _build_cuda_hamiltonian_inputs_runtime(
+                cp=cp,
+                eri=eri,
+                h1e=h1e,
+                norb=int(norb_i),
+                df_eri_mat_max_bytes=int(matvec_cuda_df_eri_mat_max_bytes),
+                df_type=DFMOIntegrals,
+                device_df_type=DeviceDFMOIntegrals,
+                restore_eri_4d_fn=_restore_eri_4d,
+            )
+            eri_mat_d = _ham_inputs["eri_mat_d"]
+            l_full_d = _ham_inputs["l_full_d"]
+            h_eff_d = _ham_inputs["h_eff_d"]
             if matvec_backend == "cuda_eri_mat" and eri_mat_d is None:
                 raise RuntimeError(
                     "matvec_backend='cuda_eri_mat' requires eri_mat; use matvec_backend='cuda' to run the DF L_full path"
@@ -1065,133 +1037,50 @@ class GUGAFCISolver(_StreamObject):
                     cp.cuda.get_current_stream().synchronize()
                 kprof["h_eff_eri_to_gpu_s"] = time.perf_counter() - t0
 
-            matvec_cuda_target_ntasks = int(
-                kwargs.pop(
-                    "matvec_cuda_target_ntasks",
-                    getattr(self, "matvec_cuda_target_ntasks", 1_500_000),
-                )
+            _cuda_ws_controls = _resolve_cuda_workspace_controls_runtime(
+                kwargs=kwargs,
+                defaults=self,
+                consume=True,
+                context="kernel(cuda)",
             )
-            matvec_cuda_j_tile_align = int(
-                kwargs.pop(
-                    "matvec_cuda_j_tile_align",
-                    getattr(self, "matvec_cuda_j_tile_align", 256),
-                )
+            matvec_cuda_target_ntasks = int(_cuda_ws_controls["matvec_cuda_target_ntasks"])
+            matvec_cuda_j_tile_align = int(_cuda_ws_controls["matvec_cuda_j_tile_align"])
+            matvec_cuda_j_tile = int(_cuda_ws_controls["matvec_cuda_j_tile_requested"])
+            matvec_cuda_j_tile = _resolve_cuda_j_tile_runtime(
+                requested_j_tile=matvec_cuda_j_tile,
+                target_ntasks=matvec_cuda_target_ntasks,
+                j_tile_align=matvec_cuda_j_tile_align,
+                norb=norb_i,
+                ncsf=int(drt.ncsf),
             )
-            matvec_cuda_j_tile = int(kwargs.pop("matvec_cuda_j_tile", getattr(self, "matvec_cuda_j_tile", 0)))
-            if matvec_cuda_j_tile <= 0:
-                # Auto-tune j_tile so that the total number of (j, r, s) tasks per tile is roughly constant.
-                # This reduces overhead from repeated CSR builds and kernel launches on small/moderate problems.
-                rs_pairs = norb_i * norb_i - norb_i  # off-diagonal (r!=s) pairs
-                ncsf_i = int(drt.ncsf)
-                if rs_pairs <= 0 or matvec_cuda_target_ntasks <= 0:
-                    matvec_cuda_j_tile = min(ncsf_i, 1024)
-                else:
-                    matvec_cuda_j_tile = (int(matvec_cuda_target_ntasks) + int(rs_pairs) - 1) // int(rs_pairs)
-                    matvec_cuda_j_tile = max(1, min(ncsf_i, int(matvec_cuda_j_tile)))
-                    if matvec_cuda_j_tile_align > 1 and matvec_cuda_j_tile < ncsf_i:
-                        matvec_cuda_j_tile = min(
-                            ncsf_i,
-                            ((matvec_cuda_j_tile + matvec_cuda_j_tile_align - 1) // matvec_cuda_j_tile_align)
-                            * matvec_cuda_j_tile_align,
-                        )
-                # If we would end up with 2 tiles and a small remainder, prefer a single full tile.
-                # This avoids paying the CSR build + apply overhead twice per hop.
-                if 0 < matvec_cuda_j_tile < ncsf_i:
-                    tiles = (ncsf_i + matvec_cuda_j_tile - 1) // matvec_cuda_j_tile
-                    if tiles == 2:
-                        rem = ncsf_i - matvec_cuda_j_tile
-                        if rem > 0 and rem < max(1, matvec_cuda_j_tile // 4):
-                            matvec_cuda_j_tile = ncsf_i
-            matvec_cuda_csr_capacity_mult = float(
-                kwargs.pop("matvec_cuda_csr_capacity_mult", getattr(self, "matvec_cuda_csr_capacity_mult", 2.0))
-            )
-            matvec_cuda_csr_host_cache_mode = _normalize_csr_host_cache_mode(
-                kwargs.pop(
-                    "matvec_cuda_csr_host_cache",
-                    getattr(self, "matvec_cuda_csr_host_cache", "auto"),
-                )
-            )
-            matvec_cuda_csr_host_cache_budget_gib = max(
-                0.0,
-                float(
-                    kwargs.pop(
-                        "matvec_cuda_csr_host_cache_budget_gib",
-                        getattr(self, "matvec_cuda_csr_host_cache_budget_gib", 4.0),
-                    )
-                ),
-            )
-            matvec_cuda_csr_host_cache_min_ncsf = max(
-                1,
-                int(
-                    kwargs.pop(
-                        "matvec_cuda_csr_host_cache_min_ncsf",
-                        getattr(self, "matvec_cuda_csr_host_cache_min_ncsf", 1_000_000),
-                    )
-                ),
-            )
-            matvec_cuda_csr_pipeline_streams = kwargs.pop(
-                "matvec_cuda_csr_pipeline_streams",
-                getattr(self, "matvec_cuda_csr_pipeline_streams", "auto"),
-            )
-            matvec_cuda_csr_pipeline_min_ncsf = max(
-                1,
-                int(
-                    kwargs.pop(
-                        "matvec_cuda_csr_pipeline_min_ncsf",
-                        getattr(self, "matvec_cuda_csr_pipeline_min_ncsf", 1_000_000),
-                    )
-                ),
-            )
-            if isinstance(matvec_cuda_csr_pipeline_streams, str):
-                matvec_cuda_csr_pipeline_streams_mode = str(matvec_cuda_csr_pipeline_streams).strip().lower()
-                matvec_cuda_csr_pipeline_streams_value = None
+            matvec_cuda_csr_capacity_mult = float(_cuda_ws_controls["matvec_cuda_csr_capacity_mult"])
+            matvec_cuda_csr_host_cache_mode = str(_cuda_ws_controls["matvec_cuda_csr_host_cache_mode"])
+            matvec_cuda_csr_host_cache_budget_gib = float(_cuda_ws_controls["matvec_cuda_csr_host_cache_budget_gib"])
+            matvec_cuda_csr_host_cache_min_ncsf = int(_cuda_ws_controls["matvec_cuda_csr_host_cache_min_ncsf"])
+            matvec_cuda_csr_pipeline_streams_mode = str(_cuda_ws_controls["matvec_cuda_csr_pipeline_streams_mode"])
+            matvec_cuda_csr_pipeline_streams_value = _cuda_ws_controls["matvec_cuda_csr_pipeline_streams_value"]
+            if matvec_cuda_csr_pipeline_streams_value is None:
+                matvec_cuda_csr_pipeline_streams = str(matvec_cuda_csr_pipeline_streams_mode)
             else:
-                matvec_cuda_csr_pipeline_streams_mode = "manual"
-                matvec_cuda_csr_pipeline_streams_value = int(matvec_cuda_csr_pipeline_streams)
-            matvec_cuda_prefilter_trivial_tasks_mode = _normalize_prefilter_trivial_tasks_mode(
-                kwargs.pop(
-                    "matvec_cuda_prefilter_trivial_tasks",
-                    getattr(self, "matvec_cuda_prefilter_trivial_tasks", "auto"),
-                )
+                matvec_cuda_csr_pipeline_streams = int(matvec_cuda_csr_pipeline_streams_value)
+            matvec_cuda_csr_pipeline_min_ncsf = int(_cuda_ws_controls["matvec_cuda_csr_pipeline_min_ncsf"])
+            matvec_cuda_prefilter_trivial_tasks_mode = str(
+                _cuda_ws_controls["matvec_cuda_prefilter_trivial_tasks_mode"]
             )
-            matvec_cuda_prefilter_trivial_tasks_min_ncsf = max(
-                1,
-                int(
-                    kwargs.pop(
-                        "matvec_cuda_prefilter_trivial_tasks_min_ncsf",
-                        getattr(self, "matvec_cuda_prefilter_trivial_tasks_min_ncsf", 1_000_000),
-                    )
-                ),
+            matvec_cuda_prefilter_trivial_tasks_min_ncsf = int(
+                _cuda_ws_controls["matvec_cuda_prefilter_trivial_tasks_min_ncsf"]
             )
-            threads_enum_forced = "matvec_cuda_threads_enum" in kwargs
-            matvec_cuda_threads_enum = int(
-                kwargs.pop("matvec_cuda_threads_enum", getattr(self, "matvec_cuda_threads_enum", 128))
-            )
-            threads_g_forced = "matvec_cuda_threads_g" in kwargs
-            matvec_cuda_threads_g = int(kwargs.pop("matvec_cuda_threads_g", getattr(self, "matvec_cuda_threads_g", 256)))
-            matvec_cuda_threads_w = int(kwargs.pop("matvec_cuda_threads_w", getattr(self, "matvec_cuda_threads_w", 0)))
-            matvec_cuda_threads_apply_in = int(
-                kwargs.pop("matvec_cuda_threads_apply", getattr(self, "matvec_cuda_threads_apply", 0))
-            )
-            threads_apply_auto = matvec_cuda_threads_apply_in <= 0
-            matvec_cuda_threads_apply = int(matvec_cuda_threads_apply_in)
-            matvec_cuda_coalesce = bool(kwargs.pop("matvec_cuda_coalesce", getattr(self, "matvec_cuda_coalesce", True)))
-            matvec_cuda_include_diagonal_rs = bool(
-                kwargs.pop(
-                    "matvec_cuda_include_diagonal_rs",
-                    getattr(self, "matvec_cuda_include_diagonal_rs", True),
-                )
-            )
-            matvec_cuda_cache_csr_tiles = kwargs.pop(
-                "matvec_cuda_cache_csr_tiles",
-                getattr(self, "matvec_cuda_cache_csr_tiles", None),
-            )
-            matvec_cuda_fuse_count_write = bool(
-                kwargs.pop(
-                    "matvec_cuda_fuse_count_write",
-                    getattr(self, "matvec_cuda_fuse_count_write", True),
-                )
-            )
+            threads_enum_forced = bool(_cuda_ws_controls["threads_enum_forced"])
+            threads_g_forced = bool(_cuda_ws_controls["threads_g_forced"])
+            matvec_cuda_threads_enum = int(_cuda_ws_controls["matvec_cuda_threads_enum"])
+            matvec_cuda_threads_g = int(_cuda_ws_controls["matvec_cuda_threads_g"])
+            matvec_cuda_threads_w = int(_cuda_ws_controls["matvec_cuda_threads_w"])
+            matvec_cuda_threads_apply = int(_cuda_ws_controls["matvec_cuda_threads_apply"])
+            threads_apply_auto = bool(_cuda_ws_controls["threads_apply_auto"])
+            matvec_cuda_coalesce = bool(_cuda_ws_controls["matvec_cuda_coalesce"])
+            matvec_cuda_include_diagonal_rs = bool(_cuda_ws_controls["matvec_cuda_include_diagonal_rs"])
+            matvec_cuda_cache_csr_tiles = _cuda_ws_controls["matvec_cuda_cache_csr_tiles"]
+            matvec_cuda_fuse_count_write = bool(_cuda_ws_controls["matvec_cuda_fuse_count_write"])
             matvec_cuda_path_mode = _normalize_matvec_cuda_path_mode(
                 kwargs.pop(
                     "matvec_cuda_path_mode",
@@ -1204,78 +1093,28 @@ class GUGAFCISolver(_StreamObject):
                     getattr(self, "matvec_cuda_use_fused_hop", True),
                 )
             )
-            matvec_cuda_fp32_coeff_data = bool(
-                kwargs.pop(
-                    "matvec_cuda_fp32_coeff_data",
-                    getattr(self, "matvec_cuda_fp32_coeff_data", False),
-                )
-            )
-            matvec_cuda_use_epq_table_in = kwargs.pop(
-                "matvec_cuda_use_epq_table",
-                getattr(self, "matvec_cuda_use_epq_table", None),
-            )
+            matvec_cuda_fp32_coeff_data = bool(_cuda_ws_controls["matvec_cuda_fp32_coeff_data"])
+            matvec_cuda_use_epq_table_in = _cuda_ws_controls["matvec_cuda_use_epq_table_in"]
             epq_table_forced = matvec_cuda_use_epq_table_in is not None
-            matvec_cuda_aggregate_offdiag_in = kwargs.pop(
-                "matvec_cuda_aggregate_offdiag",
-                getattr(self, "matvec_cuda_aggregate_offdiag", None),
+            matvec_cuda_aggregate_offdiag = bool(_cuda_ws_controls["matvec_cuda_aggregate_offdiag"])
+            _max_g_cfg = _resolve_cuda_max_g_mib_runtime(
+                kwargs=kwargs,
+                defaults=self,
+                consume=True,
             )
-            if matvec_cuda_aggregate_offdiag_in is None:
-                # Hard guard policy: keep aggregate-offdiag enabled on all CUDA matvec runs.
-                matvec_cuda_aggregate_offdiag = True
-            else:
-                matvec_cuda_aggregate_offdiag = bool(matvec_cuda_aggregate_offdiag_in)
-            matvec_cuda_aggregate_offdiag = _enforce_cuda_aggregate_offdiag_guard(
-                bool(matvec_cuda_aggregate_offdiag),
-                context="kernel(cuda)",
+            matvec_cuda_max_g_mib = float(_max_g_cfg["matvec_cuda_max_g_mib"])
+            max_g_forced = bool(_max_g_cfg["max_g_forced"])
+            matvec_cuda_max_g_mib = _autotune_cuda_max_g_mib_for_large_cas_runtime(
+                max_g_mib=float(matvec_cuda_max_g_mib),
+                max_g_forced=bool(max_g_forced),
+                aggregate_offdiag=bool(matvec_cuda_aggregate_offdiag),
+                ncsf=int(drt.ncsf),
+                norb=int(norb_i),
+                matvec_cuda_dtype=str(matvec_cuda_dtype),
+                eri_mat_present=bool(eri_mat_d is not None),
+                mem_hard_cap_gib=float(matvec_cuda_mem_hard_cap_gib),
+                cuda_budget_free_bytes_fn=_cuda_budget_free_bytes,
             )
-            matvec_cuda_max_g_mib_in = kwargs.pop("matvec_cuda_max_g_mib", None)
-            max_g_forced = matvec_cuda_max_g_mib_in is not None
-            if matvec_cuda_max_g_mib_in is None:
-                matvec_cuda_max_g_mib = float(getattr(self, "matvec_cuda_max_g_mib", 256.0))
-            else:
-                matvec_cuda_max_g_mib = float(matvec_cuda_max_g_mib_in)
-            if float(matvec_cuda_max_g_mib) <= 0.0:
-                matvec_cuda_max_g_mib = float(getattr(self, "matvec_cuda_max_g_mib", 256.0))
-                if float(matvec_cuda_max_g_mib) <= 0.0:  # pragma: no cover
-                    matvec_cuda_max_g_mib = 256.0
-            # Auto-tune g-buffer size: for large CSF spaces on the aggregate-offdiag path, larger
-            # GEMM blocks can substantially improve throughput (fewer/larger GEMMs).
-            if (
-                (not max_g_forced)
-                and float(matvec_cuda_max_g_mib) == 256.0
-                and bool(matvec_cuda_aggregate_offdiag)
-                and int(drt.ncsf) >= 1_000_000
-                and int(norb_i) * int(norb_i) <= 256
-            ):
-                try:
-                    import cupy as cp  # type: ignore[import-not-found]
-
-                    free_b = _cuda_budget_free_bytes(cp, float(matvec_cuda_mem_hard_cap_gib))
-                    _free_raw_b, total_b = cp.cuda.runtime.memGetInfo()
-                    total_b = int(total_b)
-                except Exception:
-                    free_b = None
-                    total_b = None
-                # Full W buffer is only attempted for the ERI_mat aggregate path; for DF (L_full),
-                # `_w_offdiag` is not allocated, so do not reserve memory for it here.
-                w_itemsize = 4 if str(matvec_cuda_dtype) == "float32" else 8
-                w_bytes = int(drt.ncsf) * int(norb_i) * int(norb_i) * int(w_itemsize) if eri_mat_d is not None else 0
-                headroom = 4 * 1024 * 1024 * 1024
-                # Keep large-CAS auto sizing conservative on 12 GB-class private GPUs.
-                # The larger 1-2 GiB blocks can starve concurrent allocations (EPQ, CSR, Davidson vectors)
-                # and trigger OOM/allocator thrash despite improving raw GEMM throughput.
-                if total_b is not None and int(total_b) <= 14 * 1024 * 1024 * 1024:
-                    cand_mibs = (512.0, 256.0)
-                elif str(matvec_cuda_dtype) in ("float32", "mixed"):
-                    cand_mibs = (1024.0, 512.0, 256.0)
-                else:
-                    cand_mibs = (2048.0, 1024.0, 512.0)
-                if free_b is not None:
-                    for cand_mib in cand_mibs:
-                        cand_bytes = int(float(cand_mib) * 1024 * 1024)
-                        if int(free_b) >= int(w_bytes) + int(cand_bytes) + int(headroom):
-                            matvec_cuda_max_g_mib = float(cand_mib)
-                            break
             matvec_cuda_enable_fp64_emulation = bool(
                 kwargs.pop(
                     "matvec_cuda_enable_fp64_emulation",
@@ -1314,27 +1153,19 @@ class GUGAFCISolver(_StreamObject):
                     getattr(self, "matvec_cuda_emulation_strategy", "performant"),
                 )
             )
-            matvec_cuda_cublas_workspace_cap_mb = int(
-                kwargs.pop(
-                    "matvec_cuda_cublas_workspace_cap_mb",
-                    getattr(self, "matvec_cuda_cublas_workspace_cap_mb", 2048),
-                )
+            matvec_cuda_cublas_workspace_cap_mb = _resolve_cuda_cublas_workspace_cap_mb_runtime(
+                kwargs=kwargs,
+                defaults=self,
+                hard_cap_gib=float(matvec_cuda_mem_hard_cap_gib),
+                consume=True,
             )
-            if float(matvec_cuda_mem_hard_cap_gib) > 0.0:
-                hard_cap_mb = int(float(matvec_cuda_mem_hard_cap_gib) * 1024.0)
-                if hard_cap_mb <= 12 * 1024:
-                    matvec_cuda_cublas_workspace_cap_mb = min(int(matvec_cuda_cublas_workspace_cap_mb), 256)
-                elif hard_cap_mb <= 16 * 1024:
-                    matvec_cuda_cublas_workspace_cap_mb = min(int(matvec_cuda_cublas_workspace_cap_mb), 512)
-            apply_mode_forced = "matvec_cuda_apply_mode" in kwargs
-            matvec_cuda_apply_mode = str(
-                kwargs.pop(
-                    "matvec_cuda_apply_mode",
-                    getattr(self, "matvec_cuda_apply_mode", "auto"),
-                )
-            ).strip().lower()
-            if matvec_cuda_apply_mode not in ("auto", "scatter", "gather"):
-                raise ValueError("matvec_cuda_apply_mode must be one of: 'auto', 'scatter', 'gather'")
+            _apply_mode_cfg = _resolve_cuda_apply_mode_runtime(
+                kwargs=kwargs,
+                defaults=self,
+                consume=True,
+            )
+            apply_mode_forced = bool(_apply_mode_cfg["apply_mode_forced"])
+            matvec_cuda_apply_mode = str(_apply_mode_cfg["matvec_cuda_apply_mode"])
             matvec_cuda_use_graph = bool(
                 kwargs.pop(
                     "matvec_cuda_use_graph",
@@ -1363,193 +1194,81 @@ class GUGAFCISolver(_StreamObject):
                     getattr(self, "matvec_cuda_epq_build_j_tile", 0),
                 )
             )
-            matvec_cuda_epq_streaming_in = kwargs.pop(
-                "matvec_cuda_epq_streaming",
-                getattr(self, "matvec_cuda_epq_streaming", "auto"),
-            )
-            if isinstance(matvec_cuda_epq_streaming_in, str):
-                _epq_stream_mode = matvec_cuda_epq_streaming_in.strip().lower()
-                if _epq_stream_mode in ("", "auto"):
-                    matvec_cuda_epq_streaming_mode = "auto"
-                    matvec_cuda_epq_streaming = False
-                elif _epq_stream_mode in ("1", "true", "yes", "on"):
-                    matvec_cuda_epq_streaming_mode = "on"
-                    matvec_cuda_epq_streaming = True
-                elif _epq_stream_mode in ("0", "false", "no", "off"):
-                    matvec_cuda_epq_streaming_mode = "off"
-                    matvec_cuda_epq_streaming = False
-                else:
-                    raise ValueError("matvec_cuda_epq_streaming must be bool or one of: auto/on/off")
-            elif matvec_cuda_epq_streaming_in is None:
-                matvec_cuda_epq_streaming_mode = "auto"
-                matvec_cuda_epq_streaming = False
-            else:
-                matvec_cuda_epq_streaming_mode = "manual"
-                matvec_cuda_epq_streaming = bool(matvec_cuda_epq_streaming_in)
-            matvec_cuda_epq_stream_j_tile = int(
-                kwargs.pop(
+            _epq_stream_cfg = _resolve_epq_streaming_controls_runtime(
+                epq_streaming_in=kwargs.pop(
+                    "matvec_cuda_epq_streaming",
+                    getattr(self, "matvec_cuda_epq_streaming", "auto"),
+                ),
+                epq_stream_j_tile_in=kwargs.pop(
                     "matvec_cuda_epq_stream_j_tile",
                     getattr(self, "matvec_cuda_epq_stream_j_tile", 0),
-                )
+                ),
+                epq_stream_use_recompute_in=kwargs.pop(
+                    "matvec_cuda_epq_stream_use_recompute",
+                    getattr(self, "matvec_cuda_epq_stream_use_recompute", "auto"),
+                ),
             )
-            if matvec_cuda_epq_stream_j_tile < 0:
-                matvec_cuda_epq_stream_j_tile = 0
-            matvec_cuda_epq_stream_use_recompute_in = kwargs.pop(
-                "matvec_cuda_epq_stream_use_recompute",
-                getattr(self, "matvec_cuda_epq_stream_use_recompute", "auto"),
-            )
-            if isinstance(matvec_cuda_epq_stream_use_recompute_in, str):
-                _epq_recompute_mode = matvec_cuda_epq_stream_use_recompute_in.strip().lower()
-                if _epq_recompute_mode in ("", "auto"):
-                    matvec_cuda_epq_stream_use_recompute = "auto"
-                elif _epq_recompute_mode in ("1", "true", "yes", "on"):
-                    matvec_cuda_epq_stream_use_recompute = True
-                elif _epq_recompute_mode in ("0", "false", "no", "off"):
-                    matvec_cuda_epq_stream_use_recompute = False
-                else:
-                    raise ValueError(
-                        "matvec_cuda_epq_stream_use_recompute must be bool or one of: auto/on/off"
-                    )
-            elif matvec_cuda_epq_stream_use_recompute_in is None:
-                matvec_cuda_epq_stream_use_recompute = "auto"
-            else:
-                matvec_cuda_epq_stream_use_recompute = bool(matvec_cuda_epq_stream_use_recompute_in)
+            matvec_cuda_epq_streaming_mode = str(_epq_stream_cfg["streaming_mode"])
+            matvec_cuda_epq_streaming = bool(_epq_stream_cfg["streaming"])
+            matvec_cuda_epq_stream_j_tile = int(_epq_stream_cfg["stream_j_tile"])
+            matvec_cuda_epq_stream_use_recompute = _epq_stream_cfg["stream_use_recompute"]
             if matvec_cuda_use_epq_table_in is None:
-                # Auto: enable for small/moderate CSF spaces where a precomputed E_pq table is cheap.
-                #
-                # For larger CSF spaces (e.g. CAS(14,14)), the epq_table can still be a large win if:
-                # - we are on a GPU with enough memory (epq_table is O(ncsf*norb*(norb-1))),
-                # - we use the k-aggregated W@ERIᵀ matvec (aggregate-offdiag), where the alternative is
-                #   rebuilding the per-hop CSR structure (very expensive).
-                matvec_cuda_use_epq_table = False
-                ncsf_i = int(drt.ncsf)
-                if norb_i <= 16 and ncsf_i <= 300_000:
-                    matvec_cuda_use_epq_table = True
-                elif norb_i <= 16 and bool(matvec_cuda_aggregate_offdiag) and has_epq_table_device_build():
-                    # For the k-aggregated W@ERIᵀ path, epq_table avoids a per-hop CSR build that can dominate
-                    # runtime at large CSF dimensions (e.g. CAS(14,14)). Prefer trying epq_table and fall back
-                    # if the build fails due to insufficient device memory.
-                    n_pairs = int(norb_i) * (int(norb_i) - 1)
-                    ntasks = int(ncsf_i) * int(n_pairs)
-                    est_counts_bytes = int(ntasks) * 4
-                    est_table_bytes = (int(ncsf_i) + 1) * 8 + int(ntasks) * 16
-                    est_peak_bytes = int(est_counts_bytes) + int(est_table_bytes)
-                    try:
-                        free_bytes = _cuda_budget_free_bytes(cp, float(matvec_cuda_mem_hard_cap_gib))
-                    except Exception:
-                        free_bytes = 0
-                    matvec_cuda_use_epq_table = bool(
-                        free_bytes and int(est_peak_bytes) <= int(float(free_bytes) * 0.80)
-                    )
-                    # Guard: if the EPQ table would crowd out the full W buffer, the aggregate
-                    # path falls back to slow kernel4 DFS walks.  No-EPQ aggregate (CSR-based
-                    # W scatter + DFS apply) is faster than EPQ-on aggregate without W.
-                    if matvec_cuda_use_epq_table and bool(matvec_cuda_aggregate_offdiag) and free_bytes:
-                        nops_i = int(norb_i) * int(norb_i)
-                        _dtype_bytes = 4 if str(matvec_cuda_dtype) == "float32" else 8
-                        est_w_bytes = int(ncsf_i) * int(nops_i) * int(_dtype_bytes)
-                        est_epq_resident = int(est_table_bytes)
-                        if (int(est_epq_resident) + int(est_w_bytes)) > int(float(free_bytes) * 0.85):
-                            matvec_cuda_use_epq_table = False
+                matvec_cuda_use_epq_table = _auto_select_use_epq_table_runtime(
+                    cp=cp,
+                    norb=int(norb_i),
+                    ncsf=int(drt.ncsf),
+                    aggregate_offdiag=bool(matvec_cuda_aggregate_offdiag),
+                    has_epq_table_device_build=bool(has_epq_table_device_build()),
+                    mem_hard_cap_gib=float(matvec_cuda_mem_hard_cap_gib),
+                    dtype_mode=str(matvec_cuda_dtype),
+                    eri_mat_present=bool(eri_mat_d is not None),
+                )
             else:
                 matvec_cuda_use_epq_table = bool(matvec_cuda_use_epq_table_in)
 
-            if str(matvec_cuda_dtype) in ("float32", "mixed"):
-                if str(matvec_cuda_dtype) == "mixed":
-                    if not bool(matvec_cuda_use_epq_table):
-                        raise ValueError("matvec_cuda_dtype float32/mixed requires matvec_cuda_use_epq_table=True")
-                    if not bool(matvec_cuda_aggregate_offdiag):
-                        raise ValueError("matvec_cuda_dtype float32/mixed requires matvec_cuda_aggregate_offdiag=True")
-                elif str(matvec_cuda_dtype) == "float32":
-                    # Allow FP32 no-EPQ when dense ERI_mat is available.
-                    if (not bool(matvec_cuda_use_epq_table)) and (eri_mat_d is None):
-                        raise ValueError(
-                            "matvec_cuda_dtype='float32' with matvec_cuda_use_epq_table=False requires dense eri_mat"
-                        )
-                if bool(matvec_cuda_enable_fp64_emulation):
-                    raise ValueError("matvec_cuda_enable_fp64_emulation is incompatible with matvec_cuda_dtype float32/mixed")
-                if bool(matvec_cuda_use_graph):
-                    warnings.warn("matvec_cuda_dtype float32/mixed: disabling CUDA Graph capture (float64-only path)")
-                    matvec_cuda_use_graph = False
+            _policy_apply = _apply_low_precision_and_workspace_policy_runtime(
+                context="kernel(cuda)",
+                dtype_mode=str(matvec_cuda_dtype),
+                use_epq_table=bool(matvec_cuda_use_epq_table),
+                aggregate_offdiag=bool(matvec_cuda_aggregate_offdiag),
+                ncsf=int(drt.ncsf),
+                eri_mat_present=bool(eri_mat_d is not None),
+                enable_fp64_emulation=bool(matvec_cuda_enable_fp64_emulation),
+                use_graph=bool(matvec_cuda_use_graph),
+                apply_mode=str(matvec_cuda_apply_mode),
+                apply_mode_forced=bool(apply_mode_forced),
+                nops=int(nops),
+                threads_enum=int(matvec_cuda_threads_enum),
+                threads_g=int(matvec_cuda_threads_g),
+                threads_w=int(matvec_cuda_threads_w),
+                threads_apply=int(matvec_cuda_threads_apply),
+                threads_enum_forced=bool(threads_enum_forced),
+                threads_g_forced=bool(threads_g_forced),
+                threads_apply_auto=bool(threads_apply_auto),
+                max_g_mib=float(matvec_cuda_max_g_mib),
+                mem_hard_cap_gib=float(matvec_cuda_mem_hard_cap_gib),
+                cache_csr_tiles_in=matvec_cuda_cache_csr_tiles,
+                j_tile=int(matvec_cuda_j_tile),
+                norb=int(norb_i),
+                csr_capacity_mult=float(matvec_cuda_csr_capacity_mult),
+                noepq_large_ncsf_uses_64=True,
+            )
+            if bool(_policy_apply["graph_disabled"]):
+                warnings.warn("matvec_cuda_dtype float32/mixed: disabling CUDA Graph capture (float64-only path)")
+            matvec_cuda_use_graph = bool(_policy_apply["use_graph"])
+            matvec_cuda_apply_mode = str(_policy_apply["apply_mode"])
+            matvec_cuda_threads_enum = int(_policy_apply["threads_enum"])
+            matvec_cuda_threads_g = int(_policy_apply["threads_g"])
+            matvec_cuda_threads_w = int(_policy_apply["threads_w"])
+            matvec_cuda_threads_apply = int(_policy_apply["threads_apply"])
+            matvec_cuda_max_g_mib = float(_policy_apply["max_g_mib"])
+            matvec_cuda_cache_csr_tiles = _policy_apply["cache_csr_tiles"]
 
-            if (
-                (not bool(apply_mode_forced))
-                and str(matvec_cuda_apply_mode) == "auto"
-                and bool(matvec_cuda_use_epq_table)
-                and str(matvec_cuda_dtype) in ("float32", "mixed")
-                and int(drt.ncsf) >= 1_000_000
-            ):
-                # Large-CAS FP32/mixed EPQ apply is consistently faster and more stable with scatter.
-                matvec_cuda_apply_mode = "scatter"
-
-            if (
-                (not bool(threads_g_forced))
-                and eri_mat_d is not None
-                and (not bool(matvec_cuda_use_epq_table))
-                and (not bool(matvec_cuda_aggregate_offdiag))
-                and int(norb_i) * int(norb_i) <= 256
-                and int(drt.ncsf) >= 1_000_000
-            ):
-                # End-to-end CAS14 no-EPQ profiling shows the direct Kernel3 CSR->G path
-                # is launch/latency sensitive at nops<=256; 128 threads outperforms 256.
-                matvec_cuda_threads_g = 128
-
-            if (
-                (not bool(threads_enum_forced))
-                and int(matvec_cuda_threads_enum) == 128
-                and eri_mat_d is not None
-                and (not bool(matvec_cuda_use_epq_table))
-                and (not bool(matvec_cuda_aggregate_offdiag))
-                and int(norb_i) * int(norb_i) <= 256
-                and int(drt.ncsf) >= 1_000_000
-            ):
-                # Large-CAS no-EPQ CSR-build tuning under the 11.5 GiB hard-cap regime:
-                # - float64 benefits from a moderate enum block size (192),
-                # - float32 benefits from a larger enum block size (256).
-                if str(matvec_cuda_dtype) in ("float32", "mixed"):
-                    matvec_cuda_threads_enum = 256
-                else:
-                    matvec_cuda_threads_enum = 192
-
-            if matvec_cuda_threads_w <= 0:
-                matvec_cuda_threads_w = int(matvec_cuda_threads_g)
-
-            if matvec_cuda_epq_build_device is None:
-                # Auto: build the epq_table on GPU only when the extension supports it.
-                matvec_cuda_epq_build_device = bool(matvec_cuda_use_epq_table and has_epq_table_device_build())
-            else:
-                matvec_cuda_epq_build_device = bool(matvec_cuda_epq_build_device)
-                if matvec_cuda_epq_build_device and not has_epq_table_device_build():
-                    raise RuntimeError(
-                        "matvec_cuda_epq_build_device=True requires a rebuilt CUDA extension "
-                        "(missing epq-table device-build entrypoints)"
-                    )
-
-            if matvec_cuda_threads_apply <= 0:
-                # Auto policy:
-                # - When epq_table is enabled, the hot kernels are the epq-table scatter kernels and the fused Kernel4
-                #   (block-per-row, parallel over pq and epq entries). These benefit from larger blocks.
-                # - When epq_table is disabled, apply_g_flat uses a segment-walk kernel; threads==32 unlocks the warp32
-                #   shared-stack specialization to avoid local-memory DFS stacks.
-                if matvec_cuda_use_epq_table:
-                    # FP32 EPQ on current large-CAS shapes is fastest around 64-128 threads;
-                    # 256 often increases one_body/apply overhead.
-                    if str(matvec_cuda_dtype) in ("float32", "mixed"):
-                        matvec_cuda_threads_apply = 64 if int(drt.ncsf) >= 1_000_000 else 128
-                    else:
-                        matvec_cuda_threads_apply = 256 if nops >= 512 else 128
-                else:
-                    # For very large CI spaces, the extra parallelism from 2 warps per task (64 threads)
-                    # outweighs the warp32 shared-stack specialization.
-                    ncsf_i = int(drt.ncsf)
-                    matvec_cuda_threads_apply = 64 if ncsf_i >= 1_000_000 else 32
-
-            if float(matvec_cuda_mem_hard_cap_gib) > 0.0:
-                hard_cap_mb = int(float(matvec_cuda_mem_hard_cap_gib) * 1024.0)
-                if hard_cap_mb <= 12 * 1024:
-                    matvec_cuda_max_g_mib = min(float(matvec_cuda_max_g_mib), 512.0)
-                elif hard_cap_mb <= 16 * 1024:
-                    matvec_cuda_max_g_mib = min(float(matvec_cuda_max_g_mib), 1024.0)
+            matvec_cuda_epq_build_device = _resolve_cuda_epq_build_device_runtime(
+                epq_build_device=matvec_cuda_epq_build_device,
+                use_epq_table=bool(matvec_cuda_use_epq_table),
+                has_epq_table_device_build=bool(has_epq_table_device_build()),
+            )
 
             epq_overbudget_action = "none"
             epq_overbudget_reason = "none"
@@ -1584,39 +1303,43 @@ class GUGAFCISolver(_StreamObject):
             if int(matvec_cuda_epq_stream_j_tile) <= 0:
                 matvec_cuda_epq_stream_j_tile = int(matvec_cuda_j_tile)
 
-            _enforce_cuda_fp32_large_cas_epq_policy(
+            _policy_apply = _apply_low_precision_and_workspace_policy_runtime(
                 context="kernel(cuda)",
-                matvec_cuda_dtype=str(matvec_cuda_dtype),
-                matvec_cuda_use_epq_table=bool(matvec_cuda_use_epq_table),
-                matvec_cuda_aggregate_offdiag=bool(matvec_cuda_aggregate_offdiag),
+                dtype_mode=str(matvec_cuda_dtype),
+                use_epq_table=bool(matvec_cuda_use_epq_table),
+                aggregate_offdiag=bool(matvec_cuda_aggregate_offdiag),
                 ncsf=int(drt.ncsf),
+                eri_mat_present=bool(eri_mat_d is not None),
+                enable_fp64_emulation=bool(matvec_cuda_enable_fp64_emulation),
+                use_graph=bool(matvec_cuda_use_graph),
+                apply_mode=str(matvec_cuda_apply_mode),
+                apply_mode_forced=bool(apply_mode_forced),
+                nops=int(nops),
+                threads_enum=int(matvec_cuda_threads_enum),
+                threads_g=int(matvec_cuda_threads_g),
+                threads_w=int(matvec_cuda_threads_w),
+                threads_apply=int(matvec_cuda_threads_apply),
+                threads_enum_forced=bool(threads_enum_forced),
+                threads_g_forced=bool(threads_g_forced),
+                threads_apply_auto=bool(threads_apply_auto),
+                max_g_mib=float(matvec_cuda_max_g_mib),
+                mem_hard_cap_gib=float(matvec_cuda_mem_hard_cap_gib),
+                cache_csr_tiles_in=matvec_cuda_cache_csr_tiles,
+                j_tile=int(matvec_cuda_j_tile),
+                norb=int(norb_i),
+                csr_capacity_mult=float(matvec_cuda_csr_capacity_mult),
+                noepq_large_ncsf_uses_64=True,
             )
-
-            if matvec_cuda_cache_csr_tiles is None:
-                # Auto: cache CSR per j-tile across hops when the tile count is small enough to fit in memory.
-                #
-                # Note: when `aggregate_offdiag` + `epq_table` are enabled, the CUDA hop can build the
-                # off-diagonal W directly from the combined E_pq table and skip per-hop CSR construction.
-                # CSR caching is then unnecessary and can block that fast path (see `GugaMatvecEriMatWorkspace.hop`).
-                if bool(matvec_cuda_aggregate_offdiag) and bool(matvec_cuda_use_epq_table):
-                    matvec_cuda_cache_csr_tiles = False
-                else:
-                    ncsf_i = int(drt.ncsf)
-                    if matvec_cuda_j_tile >= ncsf_i:
-                        matvec_cuda_cache_csr_tiles = False
-                    else:
-                        rs_pairs = norb_i * norb_i - norb_i
-                        tiles = (ncsf_i + matvec_cuda_j_tile - 1) // matvec_cuda_j_tile
-                        cap_full = int(
-                            max(1.0, float(matvec_cuda_csr_capacity_mult)) * float(matvec_cuda_j_tile * rs_pairs)
-                        )
-                        # Rough device memory estimate for the cached CSR arrays (row_j,row_k,indptr,indices,data).
-                        est_bytes_total = int(tiles) * int(cap_full) * 28
-                        matvec_cuda_cache_csr_tiles = bool(
-                            tiles <= 32 and est_bytes_total <= 2 * 1024 * 1024 * 1024
-                        )
-            else:
-                matvec_cuda_cache_csr_tiles = bool(matvec_cuda_cache_csr_tiles)
+            if bool(_policy_apply["graph_disabled"]):
+                warnings.warn("matvec_cuda_dtype float32/mixed: disabling CUDA Graph capture (float64-only path)")
+            matvec_cuda_use_graph = bool(_policy_apply["use_graph"])
+            matvec_cuda_apply_mode = str(_policy_apply["apply_mode"])
+            matvec_cuda_threads_enum = int(_policy_apply["threads_enum"])
+            matvec_cuda_threads_g = int(_policy_apply["threads_g"])
+            matvec_cuda_threads_w = int(_policy_apply["threads_w"])
+            matvec_cuda_threads_apply = int(_policy_apply["threads_apply"])
+            matvec_cuda_max_g_mib = float(_policy_apply["max_g_mib"])
+            matvec_cuda_cache_csr_tiles = _policy_apply["cache_csr_tiles"]
 
             if l_full_d is not None:
                 # DF L_full path currently does not support CUDA Graph capture.
@@ -3188,13 +2911,13 @@ class GUGAFCISolver(_StreamObject):
                         wfnsym=wfnsym,
                         ne_constraints=ne_constraints,
                     )
-                    cuda_state = self._matvec_cuda_state_cache.get(ws_key)
-                    if cuda_state is None:
-                        drt_dev = make_device_drt(drt)
-                        state_dev = make_device_state_cache(drt, drt_dev)
-                        cuda_state = (drt_dev, state_dev)
-                        self._matvec_cuda_state_cache[ws_key] = cuda_state
-                    drt_dev, state_dev = cuda_state
+                    drt_dev, state_dev = _get_or_create_cuda_matvec_state_runtime(
+                        state_cache=self._matvec_cuda_state_cache,
+                        ws_key=ws_key,
+                        drt=drt,
+                        make_device_drt_fn=make_device_drt,
+                        make_device_state_cache_fn=make_device_state_cache,
+                    )
 
                     nops = norb_i * norb_i
                     if isinstance(eri, DeviceDFMOIntegrals):
@@ -3222,97 +2945,48 @@ class GUGAFCISolver(_StreamObject):
                         h_eff_d = cp.asarray(h_eff, dtype=cp.float64)
 
                     # Match the kernel() CUDA workspace heuristics to avoid tiny j-tiles and repeated CSR builds.
-                    matvec_cuda_target_ntasks = int(
-                        kwargs.get("matvec_cuda_target_ntasks", getattr(self, "matvec_cuda_target_ntasks", 1_500_000))
+                    _approx_cuda_ws_controls = _resolve_cuda_workspace_controls_runtime(
+                        kwargs=kwargs,
+                        defaults=self,
+                        consume=False,
+                        context="approx_kernel(cuda)",
                     )
-                    matvec_cuda_j_tile_align = int(
-                        kwargs.get("matvec_cuda_j_tile_align", getattr(self, "matvec_cuda_j_tile_align", 256))
+                    matvec_cuda_target_ntasks = int(_approx_cuda_ws_controls["matvec_cuda_target_ntasks"])
+                    matvec_cuda_j_tile_align = int(_approx_cuda_ws_controls["matvec_cuda_j_tile_align"])
+                    matvec_cuda_j_tile = int(_approx_cuda_ws_controls["matvec_cuda_j_tile_requested"])
+                    matvec_cuda_j_tile = _resolve_cuda_j_tile_runtime(
+                        requested_j_tile=matvec_cuda_j_tile,
+                        target_ntasks=matvec_cuda_target_ntasks,
+                        j_tile_align=matvec_cuda_j_tile_align,
+                        norb=norb_i,
+                        ncsf=int(drt.ncsf),
                     )
-                    matvec_cuda_j_tile = int(kwargs.get("matvec_cuda_j_tile", getattr(self, "matvec_cuda_j_tile", 0)))
-                    if matvec_cuda_j_tile <= 0:
-                        rs_pairs = norb_i * norb_i - norb_i
-                        ncsf_i = int(drt.ncsf)
-                        if rs_pairs <= 0 or matvec_cuda_target_ntasks <= 0:
-                            matvec_cuda_j_tile = min(ncsf_i, 1024)
-                        else:
-                            matvec_cuda_j_tile = (int(matvec_cuda_target_ntasks) + int(rs_pairs) - 1) // int(rs_pairs)
-                            matvec_cuda_j_tile = max(1, min(ncsf_i, int(matvec_cuda_j_tile)))
-                            if matvec_cuda_j_tile_align > 1 and matvec_cuda_j_tile < ncsf_i:
-                                matvec_cuda_j_tile = min(
-                                    ncsf_i,
-                                    ((matvec_cuda_j_tile + matvec_cuda_j_tile_align - 1) // matvec_cuda_j_tile_align)
-                                    * matvec_cuda_j_tile_align,
-                                )
-                        if 0 < matvec_cuda_j_tile < ncsf_i:
-                            tiles = (ncsf_i + matvec_cuda_j_tile - 1) // matvec_cuda_j_tile
-                            if tiles == 2:
-                                rem = ncsf_i - matvec_cuda_j_tile
-                                if rem > 0 and rem < max(1, matvec_cuda_j_tile // 4):
-                                    matvec_cuda_j_tile = ncsf_i
-
-                    matvec_cuda_csr_capacity_mult = float(
-                        kwargs.get(
-                            "matvec_cuda_csr_capacity_mult",
-                            getattr(self, "matvec_cuda_csr_capacity_mult", 2.0),
-                        )
+                    matvec_cuda_csr_capacity_mult = float(_approx_cuda_ws_controls["matvec_cuda_csr_capacity_mult"])
+                    matvec_cuda_csr_host_cache_mode = str(_approx_cuda_ws_controls["matvec_cuda_csr_host_cache_mode"])
+                    matvec_cuda_csr_host_cache_budget_gib = float(
+                        _approx_cuda_ws_controls["matvec_cuda_csr_host_cache_budget_gib"]
                     )
-                    matvec_cuda_csr_host_cache_mode = _normalize_csr_host_cache_mode(
-                        kwargs.get(
-                            "matvec_cuda_csr_host_cache",
-                            getattr(self, "matvec_cuda_csr_host_cache", "auto"),
-                        )
+                    matvec_cuda_csr_host_cache_min_ncsf = int(
+                        _approx_cuda_ws_controls["matvec_cuda_csr_host_cache_min_ncsf"]
                     )
-                    matvec_cuda_csr_host_cache_budget_gib = max(
-                        0.0,
-                        float(
-                            kwargs.get(
-                                "matvec_cuda_csr_host_cache_budget_gib",
-                                getattr(self, "matvec_cuda_csr_host_cache_budget_gib", 4.0),
-                            )
-                        ),
+                    matvec_cuda_csr_pipeline_streams_mode = str(
+                        _approx_cuda_ws_controls["matvec_cuda_csr_pipeline_streams_mode"]
                     )
-                    matvec_cuda_csr_host_cache_min_ncsf = max(
-                        1,
-                        int(
-                            kwargs.get(
-                                "matvec_cuda_csr_host_cache_min_ncsf",
-                                getattr(self, "matvec_cuda_csr_host_cache_min_ncsf", 1_000_000),
-                            )
-                        ),
-                    )
-                    matvec_cuda_csr_pipeline_streams = kwargs.get(
-                        "matvec_cuda_csr_pipeline_streams",
-                        getattr(self, "matvec_cuda_csr_pipeline_streams", "auto"),
-                    )
-                    matvec_cuda_csr_pipeline_min_ncsf = max(
-                        1,
-                        int(
-                            kwargs.get(
-                                "matvec_cuda_csr_pipeline_min_ncsf",
-                                getattr(self, "matvec_cuda_csr_pipeline_min_ncsf", 1_000_000),
-                            )
-                        ),
-                    )
-                    if isinstance(matvec_cuda_csr_pipeline_streams, str):
-                        matvec_cuda_csr_pipeline_streams_mode = str(matvec_cuda_csr_pipeline_streams).strip().lower()
-                        matvec_cuda_csr_pipeline_streams_value = None
+                    matvec_cuda_csr_pipeline_streams_value = _approx_cuda_ws_controls[
+                        "matvec_cuda_csr_pipeline_streams_value"
+                    ]
+                    if matvec_cuda_csr_pipeline_streams_value is None:
+                        matvec_cuda_csr_pipeline_streams = str(matvec_cuda_csr_pipeline_streams_mode)
                     else:
-                        matvec_cuda_csr_pipeline_streams_mode = "manual"
-                        matvec_cuda_csr_pipeline_streams_value = int(matvec_cuda_csr_pipeline_streams)
-                    matvec_cuda_prefilter_trivial_tasks_mode = _normalize_prefilter_trivial_tasks_mode(
-                        kwargs.get(
-                            "matvec_cuda_prefilter_trivial_tasks",
-                            getattr(self, "matvec_cuda_prefilter_trivial_tasks", "auto"),
-                        )
+                        matvec_cuda_csr_pipeline_streams = int(matvec_cuda_csr_pipeline_streams_value)
+                    matvec_cuda_csr_pipeline_min_ncsf = int(
+                        _approx_cuda_ws_controls["matvec_cuda_csr_pipeline_min_ncsf"]
                     )
-                    matvec_cuda_prefilter_trivial_tasks_min_ncsf = max(
-                        1,
-                        int(
-                            kwargs.get(
-                                "matvec_cuda_prefilter_trivial_tasks_min_ncsf",
-                                getattr(self, "matvec_cuda_prefilter_trivial_tasks_min_ncsf", 1_000_000),
-                            )
-                        ),
+                    matvec_cuda_prefilter_trivial_tasks_mode = str(
+                        _approx_cuda_ws_controls["matvec_cuda_prefilter_trivial_tasks_mode"]
+                    )
+                    matvec_cuda_prefilter_trivial_tasks_min_ncsf = int(
+                        _approx_cuda_ws_controls["matvec_cuda_prefilter_trivial_tasks_min_ncsf"]
                     )
                     _approx_cuda_mem_ctl2 = _resolve_cuda_memory_controls_runtime(
                         kwargs=kwargs,
@@ -3320,102 +2994,38 @@ class GUGAFCISolver(_StreamObject):
                         consume=False,
                     )
                     matvec_cuda_mem_hard_cap_gib = float(_approx_cuda_mem_ctl2["matvec_cuda_mem_hard_cap_gib"])
-                    threads_enum_forced = "matvec_cuda_threads_enum" in kwargs
-                    threads_g_forced = "matvec_cuda_threads_g" in kwargs
-                    matvec_cuda_threads_enum = int(
-                        kwargs.get("matvec_cuda_threads_enum", getattr(self, "matvec_cuda_threads_enum", 128))
+                    threads_enum_forced = bool(_approx_cuda_ws_controls["threads_enum_forced"])
+                    threads_g_forced = bool(_approx_cuda_ws_controls["threads_g_forced"])
+                    matvec_cuda_threads_enum = int(_approx_cuda_ws_controls["matvec_cuda_threads_enum"])
+                    matvec_cuda_threads_g = int(_approx_cuda_ws_controls["matvec_cuda_threads_g"])
+                    matvec_cuda_threads_w = int(_approx_cuda_ws_controls["matvec_cuda_threads_w"])
+                    matvec_cuda_threads_apply = int(_approx_cuda_ws_controls["matvec_cuda_threads_apply"])
+                    threads_apply_auto = bool(_approx_cuda_ws_controls["threads_apply_auto"])
+                    _max_g_cfg2 = _resolve_cuda_max_g_mib_runtime(
+                        kwargs=kwargs,
+                        defaults=self,
+                        consume=False,
                     )
-                    matvec_cuda_threads_g = int(
-                        kwargs.get("matvec_cuda_threads_g", getattr(self, "matvec_cuda_threads_g", 256))
+                    max_g_forced = bool(_max_g_cfg2["max_g_forced"])
+                    matvec_cuda_max_g_mib = float(_max_g_cfg2["matvec_cuda_max_g_mib"])
+                    matvec_cuda_coalesce = bool(_approx_cuda_ws_controls["matvec_cuda_coalesce"])
+                    matvec_cuda_include_diagonal_rs = bool(_approx_cuda_ws_controls["matvec_cuda_include_diagonal_rs"])
+                    matvec_cuda_cache_csr_tiles = _approx_cuda_ws_controls["matvec_cuda_cache_csr_tiles"]
+                    matvec_cuda_fuse_count_write = bool(_approx_cuda_ws_controls["matvec_cuda_fuse_count_write"])
+                    matvec_cuda_fp32_coeff_data = bool(_approx_cuda_ws_controls["matvec_cuda_fp32_coeff_data"])
+                    matvec_cuda_use_epq_table = _approx_cuda_ws_controls["matvec_cuda_use_epq_table_in"]
+                    matvec_cuda_aggregate_offdiag = bool(_approx_cuda_ws_controls["matvec_cuda_aggregate_offdiag"])
+                    matvec_cuda_max_g_mib = _autotune_cuda_max_g_mib_for_large_cas_runtime(
+                        max_g_mib=float(matvec_cuda_max_g_mib),
+                        max_g_forced=bool(max_g_forced),
+                        aggregate_offdiag=bool(matvec_cuda_aggregate_offdiag),
+                        ncsf=int(drt.ncsf),
+                        norb=int(norb),
+                        matvec_cuda_dtype=str(approx_cuda_dtype),
+                        eri_mat_present=bool(eri_mat_d is not None),
+                        mem_hard_cap_gib=float(matvec_cuda_mem_hard_cap_gib),
+                        cuda_budget_free_bytes_fn=_cuda_budget_free_bytes,
                     )
-                    matvec_cuda_threads_w = int(
-                        kwargs.get("matvec_cuda_threads_w", getattr(self, "matvec_cuda_threads_w", 0))
-                    )
-                    matvec_cuda_threads_apply = int(
-                        kwargs.get(
-                            "matvec_cuda_threads_apply",
-                            getattr(self, "matvec_cuda_threads_apply", 0),
-                        )
-                    )
-                    threads_apply_auto = matvec_cuda_threads_apply <= 0
-                    max_g_forced = "matvec_cuda_max_g_mib" in kwargs
-                    matvec_cuda_max_g_mib = float(
-                        kwargs.get("matvec_cuda_max_g_mib", getattr(self, "matvec_cuda_max_g_mib", 256.0))
-                    )
-                    if float(matvec_cuda_max_g_mib) <= 0.0:
-                        matvec_cuda_max_g_mib = float(getattr(self, "matvec_cuda_max_g_mib", 256.0))
-                        if float(matvec_cuda_max_g_mib) <= 0.0:  # pragma: no cover
-                            matvec_cuda_max_g_mib = 256.0
-                    matvec_cuda_coalesce = bool(
-                        kwargs.get("matvec_cuda_coalesce", getattr(self, "matvec_cuda_coalesce", True))
-                    )
-                    matvec_cuda_include_diagonal_rs = bool(
-                        kwargs.get(
-                            "matvec_cuda_include_diagonal_rs",
-                            getattr(self, "matvec_cuda_include_diagonal_rs", True),
-                        )
-                    )
-                    matvec_cuda_cache_csr_tiles = kwargs.get(
-                        "matvec_cuda_cache_csr_tiles",
-                        getattr(self, "matvec_cuda_cache_csr_tiles", None),
-                    )
-                    matvec_cuda_fuse_count_write = bool(
-                        kwargs.get(
-                            "matvec_cuda_fuse_count_write",
-                            getattr(self, "matvec_cuda_fuse_count_write", True),
-                        )
-                    )
-                    matvec_cuda_fp32_coeff_data = bool(
-                        kwargs.get(
-                            "matvec_cuda_fp32_coeff_data",
-                            getattr(self, "matvec_cuda_fp32_coeff_data", False),
-                        )
-                    )
-                    matvec_cuda_use_epq_table = kwargs.get(
-                        "matvec_cuda_use_epq_table",
-                        getattr(self, "matvec_cuda_use_epq_table", None),
-                    )
-                    matvec_cuda_aggregate_offdiag_in = kwargs.get(
-                        "matvec_cuda_aggregate_offdiag",
-                        getattr(self, "matvec_cuda_aggregate_offdiag", None),
-                    )
-                    if matvec_cuda_aggregate_offdiag_in is None:
-                        matvec_cuda_aggregate_offdiag = True
-                    else:
-                        matvec_cuda_aggregate_offdiag = bool(matvec_cuda_aggregate_offdiag_in)
-                    matvec_cuda_aggregate_offdiag = _enforce_cuda_aggregate_offdiag_guard(
-                        bool(matvec_cuda_aggregate_offdiag),
-                        context="approx_kernel(cuda)",
-                    )
-                    if (
-                        (not max_g_forced)
-                        and float(matvec_cuda_max_g_mib) == 256.0
-                        and bool(matvec_cuda_aggregate_offdiag)
-                        and int(drt.ncsf) >= 1_000_000
-                        and int(nops) <= 256
-	                    ):
-                        try:
-                            free_b = _cuda_budget_free_bytes(cp, float(matvec_cuda_mem_hard_cap_gib))
-                            _free_raw_b, total_b = cp.cuda.runtime.memGetInfo()
-                            total_b = int(total_b)
-                        except Exception:  # pragma: no cover
-                            free_b = None
-                            total_b = None
-                        w_itemsize = 4 if str(approx_cuda_dtype) == "float32" else 8
-                        w_bytes = int(drt.ncsf) * int(nops) * int(w_itemsize)
-                        headroom = 4 * 1024 * 1024 * 1024
-                        if total_b is not None and int(total_b) <= 14 * 1024 * 1024 * 1024:
-                            cand_mibs = (512.0, 256.0)
-                        elif str(approx_cuda_dtype) in ("float32", "mixed"):
-                            cand_mibs = (1024.0, 512.0, 256.0)
-                        else:
-                            cand_mibs = (2048.0, 1024.0, 512.0)
-                        if free_b is not None:
-                            for cand_mib in cand_mibs:
-                                cand_bytes = int(float(cand_mib) * 1024 * 1024)
-                                if int(free_b) >= int(w_bytes) + int(cand_bytes) + int(headroom):
-                                    matvec_cuda_max_g_mib = float(cand_mib)
-                                    break
                     matvec_cuda_enable_fp64_emulation = bool(
                         kwargs.get(
                             "matvec_cuda_enable_fp64_emulation",
@@ -3436,27 +3046,19 @@ class GUGAFCISolver(_StreamObject):
                             getattr(self, "matvec_cuda_emulation_strategy", "performant"),
                         )
                     )
-                    matvec_cuda_cublas_workspace_cap_mb = int(
-                        kwargs.get(
-                            "matvec_cuda_cublas_workspace_cap_mb",
-                            getattr(self, "matvec_cuda_cublas_workspace_cap_mb", 2048),
-                        )
+                    matvec_cuda_cublas_workspace_cap_mb = _resolve_cuda_cublas_workspace_cap_mb_runtime(
+                        kwargs=kwargs,
+                        defaults=self,
+                        hard_cap_gib=float(matvec_cuda_mem_hard_cap_gib),
+                        consume=False,
                     )
-                    if float(matvec_cuda_mem_hard_cap_gib) > 0.0:
-                        hard_cap_mb = int(float(matvec_cuda_mem_hard_cap_gib) * 1024.0)
-                        if hard_cap_mb <= 12 * 1024:
-                            matvec_cuda_cublas_workspace_cap_mb = min(int(matvec_cuda_cublas_workspace_cap_mb), 256)
-                        elif hard_cap_mb <= 16 * 1024:
-                            matvec_cuda_cublas_workspace_cap_mb = min(int(matvec_cuda_cublas_workspace_cap_mb), 512)
-                    apply_mode_forced = "matvec_cuda_apply_mode" in kwargs
-                    matvec_cuda_apply_mode = str(
-                        kwargs.get(
-                            "matvec_cuda_apply_mode",
-                            getattr(self, "matvec_cuda_apply_mode", "auto"),
-                        )
-                    ).strip().lower()
-                    if matvec_cuda_apply_mode not in ("auto", "scatter", "gather"):
-                        raise ValueError("matvec_cuda_apply_mode must be one of: 'auto', 'scatter', 'gather'")
+                    _apply_mode_cfg2 = _resolve_cuda_apply_mode_runtime(
+                        kwargs=kwargs,
+                        defaults=self,
+                        consume=False,
+                    )
+                    apply_mode_forced = bool(_apply_mode_cfg2["apply_mode_forced"])
+                    matvec_cuda_apply_mode = str(_apply_mode_cfg2["matvec_cuda_apply_mode"])
                     matvec_cuda_epq_build_nthreads = int(
                         kwargs.get(
                             "matvec_cuda_epq_build_nthreads",
@@ -3477,22 +3079,16 @@ class GUGAFCISolver(_StreamObject):
                     )
 
                     if matvec_cuda_use_epq_table is None:
-                        matvec_cuda_use_epq_table = False
-                        ncsf_i = int(drt.ncsf)
-                        if norb_i <= 16 and ncsf_i <= 300_000:
-                            matvec_cuda_use_epq_table = True
-                        elif norb_i <= 16 and bool(matvec_cuda_aggregate_offdiag) and has_epq_table_device_build():
-                            n_pairs = int(norb_i) * (int(norb_i) - 1)
-                            ntasks = int(ncsf_i) * int(n_pairs)
-                            est_counts_bytes = int(ntasks) * 4
-                            est_table_bytes = (int(ncsf_i) + 1) * 8 + int(ntasks) * 16
-                            est_peak_bytes = int(est_counts_bytes) + int(est_table_bytes)
-                            try:
-                                free_bytes = _cuda_budget_free_bytes(cp, float(matvec_cuda_mem_hard_cap_gib))
-                            except Exception:  # pragma: no cover
-                                free_bytes = 0
-                            if free_bytes and est_peak_bytes <= int(float(free_bytes) * 0.80):
-                                matvec_cuda_use_epq_table = True
+                        matvec_cuda_use_epq_table = _auto_select_use_epq_table_runtime(
+                            cp=cp,
+                            norb=int(norb_i),
+                            ncsf=int(drt.ncsf),
+                            aggregate_offdiag=bool(matvec_cuda_aggregate_offdiag),
+                            has_epq_table_device_build=bool(has_epq_table_device_build()),
+                            mem_hard_cap_gib=float(matvec_cuda_mem_hard_cap_gib),
+                            dtype_mode=str(approx_cuda_dtype),
+                            eri_mat_present=bool(eri_mat_d is not None),
+                        )
                     else:
                         matvec_cuda_use_epq_table = bool(matvec_cuda_use_epq_table)
 
@@ -3507,96 +3103,41 @@ class GUGAFCISolver(_StreamObject):
                             if threads_apply_auto:
                                 matvec_cuda_threads_apply = 64 if int(drt.ncsf) >= 1_000_000 else 32
 
-                    _enforce_cuda_fp32_large_cas_epq_policy(
+                    _policy_apply2 = _apply_low_precision_and_workspace_policy_runtime(
                         context="approx_kernel(cuda)",
-                        matvec_cuda_dtype=str(approx_cuda_dtype),
-                        matvec_cuda_use_epq_table=bool(matvec_cuda_use_epq_table),
-                        matvec_cuda_aggregate_offdiag=bool(matvec_cuda_aggregate_offdiag),
+                        dtype_mode=str(approx_cuda_dtype),
+                        use_epq_table=bool(matvec_cuda_use_epq_table),
+                        aggregate_offdiag=bool(matvec_cuda_aggregate_offdiag),
                         ncsf=int(drt.ncsf),
+                        eri_mat_present=bool(eri_mat_d is not None),
+                        enable_fp64_emulation=bool(matvec_cuda_enable_fp64_emulation),
+                        use_graph=bool(matvec_cuda_use_graph),
+                        apply_mode=str(matvec_cuda_apply_mode),
+                        apply_mode_forced=bool(apply_mode_forced),
+                        nops=int(nops),
+                        threads_enum=int(matvec_cuda_threads_enum),
+                        threads_g=int(matvec_cuda_threads_g),
+                        threads_w=int(matvec_cuda_threads_w),
+                        threads_apply=int(matvec_cuda_threads_apply),
+                        threads_enum_forced=bool(threads_enum_forced),
+                        threads_g_forced=bool(threads_g_forced),
+                        threads_apply_auto=bool(threads_apply_auto),
+                        max_g_mib=float(matvec_cuda_max_g_mib),
+                        mem_hard_cap_gib=float(matvec_cuda_mem_hard_cap_gib),
+                        cache_csr_tiles_in=matvec_cuda_cache_csr_tiles,
+                        j_tile=int(matvec_cuda_j_tile),
+                        norb=int(norb_i),
+                        csr_capacity_mult=float(matvec_cuda_csr_capacity_mult),
+                        noepq_large_ncsf_uses_64=False,
                     )
-
-                    if str(approx_cuda_dtype) == "float32":
-                        if (not bool(matvec_cuda_use_epq_table)) and (eri_mat_d is None):
-                            raise ValueError(
-                                "approx_cuda_dtype='float32' with matvec_cuda_use_epq_table=False requires dense eri_mat"
-                            )
-                        if bool(matvec_cuda_enable_fp64_emulation):
-                            raise ValueError("approx_cuda_dtype='float32' is incompatible with matvec_cuda_enable_fp64_emulation")
-                        if bool(matvec_cuda_use_graph):
-                            matvec_cuda_use_graph = False
-
-                    if (
-                        (not bool(apply_mode_forced))
-                        and str(matvec_cuda_apply_mode) == "auto"
-                        and bool(matvec_cuda_use_epq_table)
-                        and str(approx_cuda_dtype) in ("float32", "mixed")
-                        and int(drt.ncsf) >= 1_000_000
-                    ):
-                        matvec_cuda_apply_mode = "scatter"
-
-                    if (
-                        (not bool(threads_enum_forced))
-                        and int(matvec_cuda_threads_enum) == 128
-                        and eri_mat_d is not None
-                        and (not bool(matvec_cuda_use_epq_table))
-                        and (not bool(matvec_cuda_aggregate_offdiag))
-                        and int(norb_i) * int(norb_i) <= 256
-                        and int(drt.ncsf) >= 1_000_000
-                    ):
-                        if str(approx_cuda_dtype) in ("float32", "mixed"):
-                            matvec_cuda_threads_enum = 256
-                        else:
-                            matvec_cuda_threads_enum = 192
-
-                    if (
-                        (not bool(threads_g_forced))
-                        and eri_mat_d is not None
-                        and (not bool(matvec_cuda_use_epq_table))
-                        and (not bool(matvec_cuda_aggregate_offdiag))
-                        and int(norb_i) * int(norb_i) <= 256
-                        and int(drt.ncsf) >= 1_000_000
-                    ):
-                        matvec_cuda_threads_g = 128
-
-                    if matvec_cuda_threads_w <= 0:
-                        matvec_cuda_threads_w = int(matvec_cuda_threads_g)
-
-                    if matvec_cuda_threads_apply <= 0:
-                        if matvec_cuda_use_epq_table:
-                            if str(approx_cuda_dtype) in ("float32", "mixed"):
-                                matvec_cuda_threads_apply = 64 if int(drt.ncsf) >= 1_000_000 else 128
-                            else:
-                                matvec_cuda_threads_apply = 256 if nops >= 512 else 128
-                        else:
-                            matvec_cuda_threads_apply = 32
-
-                    if float(matvec_cuda_mem_hard_cap_gib) > 0.0:
-                        hard_cap_mb = int(float(matvec_cuda_mem_hard_cap_gib) * 1024.0)
-                        if hard_cap_mb <= 12 * 1024:
-                            matvec_cuda_max_g_mib = min(float(matvec_cuda_max_g_mib), 512.0)
-                        elif hard_cap_mb <= 16 * 1024:
-                            matvec_cuda_max_g_mib = min(float(matvec_cuda_max_g_mib), 1024.0)
-
-                    if matvec_cuda_cache_csr_tiles is None:
-                        if bool(matvec_cuda_aggregate_offdiag) and bool(matvec_cuda_use_epq_table):
-                            matvec_cuda_cache_csr_tiles = False
-                        else:
-                            ncsf_i = int(drt.ncsf)
-                            if matvec_cuda_j_tile >= ncsf_i:
-                                matvec_cuda_cache_csr_tiles = False
-                            else:
-                                rs_pairs = norb_i * norb_i - norb_i
-                                tiles = (ncsf_i + matvec_cuda_j_tile - 1) // matvec_cuda_j_tile
-                                cap_full = int(
-                                    max(1.0, float(matvec_cuda_csr_capacity_mult))
-                                    * float(matvec_cuda_j_tile * rs_pairs)
-                                )
-                                est_bytes_total = int(tiles) * int(cap_full) * 28
-                                matvec_cuda_cache_csr_tiles = bool(
-                                    tiles <= 32 and est_bytes_total <= 2 * 1024 * 1024 * 1024
-                                )
-                    else:
-                        matvec_cuda_cache_csr_tiles = bool(matvec_cuda_cache_csr_tiles)
+                    matvec_cuda_use_graph = bool(_policy_apply2["use_graph"])
+                    matvec_cuda_apply_mode = str(_policy_apply2["apply_mode"])
+                    matvec_cuda_threads_enum = int(_policy_apply2["threads_enum"])
+                    matvec_cuda_threads_g = int(_policy_apply2["threads_g"])
+                    matvec_cuda_threads_w = int(_policy_apply2["threads_w"])
+                    matvec_cuda_threads_apply = int(_policy_apply2["threads_apply"])
+                    matvec_cuda_max_g_mib = float(_policy_apply2["max_g_mib"])
+                    matvec_cuda_cache_csr_tiles = _policy_apply2["cache_csr_tiles"]
 
                     ws_cache_key = (ws_key, str(approx_cuda_dtype))
                     cuda_ws = self._matvec_cuda_ws_cache_get(ws_cache_key)
@@ -4007,13 +3548,13 @@ class GUGAFCISolver(_StreamObject):
                 )
 
             ws_state_key = drt_key
-            cuda_state = self._matvec_cuda_state_cache.get(ws_state_key)
-            if cuda_state is None:
-                drt_dev = make_device_drt(drt)
-                state_dev = make_device_state_cache(drt, drt_dev)
-                cuda_state = (drt_dev, state_dev)
-                self._matvec_cuda_state_cache[ws_state_key] = cuda_state
-            drt_dev, state_dev = cuda_state
+            drt_dev, state_dev = _get_or_create_cuda_matvec_state_runtime(
+                state_cache=self._matvec_cuda_state_cache,
+                ws_key=ws_state_key,
+                drt=drt,
+                make_device_drt_fn=make_device_drt,
+                make_device_state_cache_fn=make_device_state_cache,
+            )
 
             norb_i = int(drt.norb)
             nops = norb_i * norb_i

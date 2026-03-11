@@ -46,11 +46,15 @@ def _load_hf_df_jk_cuda_ext():
     if _HF_DF_JK_CUDA_EXT is not None:
         return _HF_DF_JK_CUDA_EXT
     try:
-        from asuka import _hf_df_jk_cuda_ext  # type: ignore[import-not-found]
+        from asuka.kernels import hf_df_jk as _hf_df_jk_kernels  # noqa: PLC0415
     except Exception:
         _HF_DF_JK_CUDA_EXT = False
         return None
-    _HF_DF_JK_CUDA_EXT = _hf_df_jk_cuda_ext
+    ext = _hf_df_jk_kernels.load_ext()
+    if ext is None:
+        _HF_DF_JK_CUDA_EXT = False
+        return None
+    _HF_DF_JK_CUDA_EXT = ext
     return _HF_DF_JK_CUDA_EXT
 
 
@@ -99,7 +103,9 @@ def _get_hf_df_jk_workspace(cp):
     if ws is None:
         ext = _load_hf_df_jk_cuda_ext()
         if ext is None:  # pragma: no cover
-            raise RuntimeError("HF DF-JK CUDA extension is not available")
+            from asuka.kernels import hf_df_jk as _hf_df_jk_kernels  # noqa: PLC0415
+
+            ext = _hf_df_jk_kernels.require_ext()
         ws = ext.DFJKWorkspace()
         _HF_DF_JK_WS_BY_DEVICE[dev] = ws
     return ws
@@ -586,7 +592,7 @@ def df_K_from_BQ_Cocc(
         use_ext = bool(ext is not None)
         if pref == "cuda_ext" and not use_ext:
             raise RuntimeError(
-                "ASUKA_HF_K_IMPL='cuda_ext' was set but asuka._hf_df_jk_cuda_ext is not available. "
+                "ASUKA_HF_K_IMPL='cuda_ext' was set but the HF DF-JK CUDA extension is not available. "
                 "Reinstall ASUKA with a CUDA toolkit available (nvcc)."
             )
 
@@ -746,7 +752,7 @@ def df_K_from_BmnQ_Cocc(
             use_ext = bool(_load_hf_df_jk_cuda_ext() is not None)
             if pref == "cuda_ext" and not use_ext:
                 raise RuntimeError(
-                    "ASUKA_HF_K_IMPL='cuda_ext' was set but asuka._hf_df_jk_cuda_ext is not available. "
+                    "ASUKA_HF_K_IMPL='cuda_ext' was set but the HF DF-JK CUDA extension is not available. "
                     "Reinstall ASUKA with a CUDA toolkit available (nvcc)."
                 )
 
@@ -844,7 +850,7 @@ def df_K_from_BmnQ_Cocc(
         use_ext = bool(_load_hf_df_jk_cuda_ext() is not None)
         if pref == "cuda_ext" and not use_ext:
             raise RuntimeError(
-                "ASUKA_HF_K_IMPL='cuda_ext' was set but asuka._hf_df_jk_cuda_ext is not available. "
+                "ASUKA_HF_K_IMPL='cuda_ext' was set but the HF DF-JK CUDA extension is not available. "
                 "Reinstall ASUKA with a CUDA toolkit available (nvcc)."
             )
 

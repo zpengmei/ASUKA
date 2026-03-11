@@ -2453,7 +2453,8 @@ extern "C" cudaError_t cueri_fused_fock_psss_launch_stream(
     const double* D_mat,
     double* F_mat,
     cudaStream_t stream,
-    int threads);
+    int threads,
+    int n_bufs);
 
 
 extern "C" cudaError_t cueri_fused_jk_psss_launch_stream(
@@ -2478,7 +2479,8 @@ extern "C" cudaError_t cueri_fused_jk_psss_launch_stream(
     double* J_mat,
     double* K_mat,
     cudaStream_t stream,
-    int threads);
+    int threads,
+    int n_bufs);
 
 extern "C" cudaError_t cueri_fused_fock_dsss_launch_stream(
     const int32_t* task_spAB,
@@ -2501,7 +2503,8 @@ extern "C" cudaError_t cueri_fused_fock_dsss_launch_stream(
     const double* D_mat,
     double* F_mat,
     cudaStream_t stream,
-    int threads);
+    int threads,
+    int n_bufs);
 
 
 extern "C" cudaError_t cueri_fused_jk_dsss_launch_stream(
@@ -2526,7 +2529,8 @@ extern "C" cudaError_t cueri_fused_jk_dsss_launch_stream(
     double* J_mat,
     double* K_mat,
     cudaStream_t stream,
-    int threads);
+    int threads,
+    int n_bufs);
 
 extern "C" cudaError_t cueri_fused_fock_ppss_launch_stream(
     const int32_t* task_spAB,
@@ -2549,7 +2553,8 @@ extern "C" cudaError_t cueri_fused_fock_ppss_launch_stream(
     const double* D_mat,
     double* F_mat,
     cudaStream_t stream,
-    int threads);
+    int threads,
+    int n_bufs);
 
 
 extern "C" cudaError_t cueri_fused_jk_ppss_launch_stream(
@@ -2574,7 +2579,8 @@ extern "C" cudaError_t cueri_fused_jk_ppss_launch_stream(
     double* J_mat,
     double* K_mat,
     cudaStream_t stream,
-    int threads);
+    int threads,
+    int n_bufs);
 
 extern "C" cudaError_t cueri_fused_fock_psps_launch_stream(
     const int32_t* task_spAB,
@@ -2597,7 +2603,8 @@ extern "C" cudaError_t cueri_fused_fock_psps_launch_stream(
     const double* D_mat,
     double* F_mat,
     cudaStream_t stream,
-    int threads);
+    int threads,
+    int n_bufs);
 
 
 extern "C" cudaError_t cueri_fused_jk_psps_launch_stream(
@@ -2622,7 +2629,8 @@ extern "C" cudaError_t cueri_fused_jk_psps_launch_stream(
     double* J_mat,
     double* K_mat,
     cudaStream_t stream,
-    int threads);
+    int threads,
+    int n_bufs);
 
 extern "C" cudaError_t cueri_fused_fock_ppps_launch_stream(
     const int32_t* task_spAB,
@@ -2645,7 +2653,8 @@ extern "C" cudaError_t cueri_fused_fock_ppps_launch_stream(
     const double* D_mat,
     double* F_mat,
     cudaStream_t stream,
-    int threads);
+    int threads,
+    int n_bufs);
 
 
 extern "C" cudaError_t cueri_fused_jk_ppps_launch_stream(
@@ -2670,7 +2679,8 @@ extern "C" cudaError_t cueri_fused_jk_ppps_launch_stream(
     double* J_mat,
     double* K_mat,
     cudaStream_t stream,
-    int threads);
+    int threads,
+    int n_bufs);
 
 extern "C" cudaError_t cueri_fused_fock_ddss_launch_stream(
     const int32_t* task_spAB,
@@ -2693,7 +2703,8 @@ extern "C" cudaError_t cueri_fused_fock_ddss_launch_stream(
     const double* D_mat,
     double* F_mat,
     cudaStream_t stream,
-    int threads);
+    int threads,
+    int n_bufs);
 
 
 extern "C" cudaError_t cueri_fused_jk_ddss_launch_stream(
@@ -2718,7 +2729,8 @@ extern "C" cudaError_t cueri_fused_jk_ddss_launch_stream(
     double* J_mat,
     double* K_mat,
     cudaStream_t stream,
-    int threads);
+    int threads,
+    int n_bufs);
 
 extern "C" cudaError_t cueri_fused_fock_ssdp_launch_stream(
     const int32_t* task_spAB,
@@ -2741,7 +2753,8 @@ extern "C" cudaError_t cueri_fused_fock_ssdp_launch_stream(
     const double* D_mat,
     double* F_mat,
     cudaStream_t stream,
-    int threads);
+    int threads,
+    int n_bufs);
 
 
 extern "C" cudaError_t cueri_fused_jk_ssdp_launch_stream(
@@ -2766,7 +2779,8 @@ extern "C" cudaError_t cueri_fused_jk_ssdp_launch_stream(
     double* J_mat,
     double* K_mat,
     cudaStream_t stream,
-    int threads);
+    int threads,
+    int n_bufs);
 
 extern "C" cudaError_t cueri_fused_fock_psds_launch_stream(
     const int32_t* task_spAB,
@@ -2789,7 +2803,8 @@ extern "C" cudaError_t cueri_fused_fock_psds_launch_stream(
     const double* D_mat,
     double* F_mat,
     cudaStream_t stream,
-    int threads);
+    int threads,
+    int n_bufs);
 
 
 extern "C" cudaError_t cueri_fused_jk_psds_launch_stream(
@@ -2814,7 +2829,8 @@ extern "C" cudaError_t cueri_fused_jk_psds_launch_stream(
     double* J_mat,
     double* K_mat,
     cudaStream_t stream,
-    int threads);
+    int threads,
+    int n_bufs);
 
 extern "C" cudaError_t cueri_fused_fock_psdp_launch_stream(
     const int32_t* task_spAB,
@@ -2837,7 +2853,8 @@ extern "C" cudaError_t cueri_fused_fock_psdp_launch_stream(
     const double* D_mat,
     double* F_mat,
     cudaStream_t stream,
-    int threads);
+    int threads,
+    int n_bufs);
 
 
 extern "C" cudaError_t cueri_fused_jk_psdp_launch_stream(
@@ -2862,7 +2879,8 @@ extern "C" cudaError_t cueri_fused_jk_psdp_launch_stream(
     double* J_mat,
     double* K_mat,
     cudaStream_t stream,
-    int threads);
+    int threads,
+    int n_bufs);
 
 extern "C" cudaError_t cueri_fused_fock_psdd_launch_stream(
     const int32_t* task_spAB,
@@ -2885,7 +2903,8 @@ extern "C" cudaError_t cueri_fused_fock_psdd_launch_stream(
     const double* D_mat,
     double* F_mat,
     cudaStream_t stream,
-    int threads);
+    int threads,
+    int n_bufs);
 
 
 extern "C" cudaError_t cueri_fused_jk_psdd_launch_stream(
@@ -2910,7 +2929,8 @@ extern "C" cudaError_t cueri_fused_jk_psdd_launch_stream(
     double* J_mat,
     double* K_mat,
     cudaStream_t stream,
-    int threads);
+    int threads,
+    int n_bufs);
 
 extern "C" cudaError_t cueri_fused_fock_ppds_launch_stream(
     const int32_t* task_spAB,
@@ -2933,7 +2953,8 @@ extern "C" cudaError_t cueri_fused_fock_ppds_launch_stream(
     const double* D_mat,
     double* F_mat,
     cudaStream_t stream,
-    int threads);
+    int threads,
+    int n_bufs);
 
 
 extern "C" cudaError_t cueri_fused_jk_ppds_launch_stream(
@@ -2958,7 +2979,8 @@ extern "C" cudaError_t cueri_fused_jk_ppds_launch_stream(
     double* J_mat,
     double* K_mat,
     cudaStream_t stream,
-    int threads);
+    int threads,
+    int n_bufs);
 
 extern "C" cudaError_t cueri_fused_fock_dsds_launch_stream(
     const int32_t* task_spAB,
@@ -2981,7 +3003,8 @@ extern "C" cudaError_t cueri_fused_fock_dsds_launch_stream(
     const double* D_mat,
     double* F_mat,
     cudaStream_t stream,
-    int threads);
+    int threads,
+    int n_bufs);
 
 
 extern "C" cudaError_t cueri_fused_jk_dsds_launch_stream(
@@ -3006,7 +3029,8 @@ extern "C" cudaError_t cueri_fused_jk_dsds_launch_stream(
     double* J_mat,
     double* K_mat,
     cudaStream_t stream,
-    int threads);
+    int threads,
+    int n_bufs);
 
 extern "C" cudaError_t cueri_fused_fock_dsdp_launch_stream(
     const int32_t* task_spAB,
@@ -3029,7 +3053,8 @@ extern "C" cudaError_t cueri_fused_fock_dsdp_launch_stream(
     const double* D_mat,
     double* F_mat,
     cudaStream_t stream,
-    int threads);
+    int threads,
+    int n_bufs);
 
 
 extern "C" cudaError_t cueri_fused_jk_dsdp_launch_stream(
@@ -3054,7 +3079,8 @@ extern "C" cudaError_t cueri_fused_jk_dsdp_launch_stream(
     double* J_mat,
     double* K_mat,
     cudaStream_t stream,
-    int threads);
+    int threads,
+    int n_bufs);
 
 // Fused ssss->Fock: evaluates (ss|ss) ERI inline, accumulates F = J - 0.5*K.
 extern "C" cudaError_t cueri_fused_fock_ssss_launch_stream(
@@ -3078,7 +3104,8 @@ extern "C" cudaError_t cueri_fused_fock_ssss_launch_stream(
     const double* D_mat,
     double* F_mat,
     cudaStream_t stream,
-    int threads);
+    int threads,
+    int n_bufs);
 
 // Fused ssss+JK (D3 partial): evaluates (ss|ss) ERI inline, eliminates tile round-trip.
 extern "C" cudaError_t cueri_fused_jk_ssss_launch_stream(
@@ -3101,7 +3128,8 @@ extern "C" cudaError_t cueri_fused_jk_ssss_launch_stream(
     double* K_mat,
     cudaStream_t stream,
     int threads,
-    bool use_fast_boys);
+    bool use_fast_boys,
+    int n_bufs);
 
 // Cartesian->spherical transform for ERI tiles.
 extern "C" cudaError_t cueri_cart2sph_eri_right_launch_stream(

@@ -20,8 +20,7 @@ import warnings
 
 import numpy as np
 
-from asuka.frontend.molecule import Molecule
-from asuka.frontend.periodic_table import atomic_number
+from asuka.chem.periodic_table import atomic_number
 from asuka.hf import df_jk as _df_jk
 from asuka.hf import df_scf as _df_scf
 from asuka.integrals.df_context import DFCholeskyContext
@@ -213,7 +212,27 @@ def _mol_coords_charges_bohr(mol: Any) -> tuple[np.ndarray, np.ndarray]:
     return coords, charges
 
 
-def _displaced_molecule(mol: Molecule, *, ia: int, axis: int, delta_bohr: float) -> Molecule:
+def _atoms_bohr_from_mol_like(mol: Any) -> list[tuple[str, np.ndarray]]:
+    atoms_bohr = getattr(mol, "atoms_bohr", None)
+    if atoms_bohr is not None:
+        out: list[tuple[str, np.ndarray]] = []
+        for sym, xyz in atoms_bohr:
+            out.append((str(sym), np.asarray(xyz, dtype=np.float64).reshape((3,))))
+        return out
+
+    natm = getattr(mol, "natm", None)
+    atom_symbol = getattr(mol, "atom_symbol", None)
+    atom_coord = getattr(mol, "atom_coord", None)
+    if natm is None or not callable(atom_symbol) or not callable(atom_coord):
+        raise TypeError("mol must provide atoms_bohr or natm/atom_symbol(i)/atom_coord(i)")
+
+    out: list[tuple[str, np.ndarray]] = []
+    for i in range(int(natm)):
+        out.append((str(atom_symbol(int(i))), np.asarray(atom_coord(int(i)), dtype=np.float64).reshape((3,))))
+    return out
+
+
+def _displaced_molecule(mol: Any, *, ia: int, axis: int, delta_bohr: float) -> Any:
     ia = int(ia)
     axis = int(axis)
     delta_bohr = float(delta_bohr)
@@ -223,17 +242,31 @@ def _displaced_molecule(mol: Molecule, *, ia: int, axis: int, delta_bohr: float)
         raise ValueError("delta_bohr must be non-zero")
 
     atoms = []
-    for sym, xyz in mol.atoms_bohr:
+    for sym, xyz in _atoms_bohr_from_mol_like(mol):
         atoms.append((str(sym), np.asarray(xyz, dtype=np.float64).copy()))
     atoms[ia][1][axis] += delta_bohr
-    return Molecule.from_atoms(
-        atoms,
-        unit="Bohr",
-        charge=int(getattr(mol, "charge", 0)),
-        spin=int(getattr(mol, "spin", 0)),
-        basis=getattr(mol, "basis", None),
-        cart=bool(getattr(mol, "cart", True)),
-    )
+
+    # ASUKA Molecule (and compatible containers) path.
+    from_atoms = getattr(type(mol), "from_atoms", None)
+    if callable(from_atoms):
+        return from_atoms(
+            atoms,
+            unit="Bohr",
+            charge=int(getattr(mol, "charge", 0)),
+            spin=int(getattr(mol, "spin", 0)),
+            basis=getattr(mol, "basis", None),
+            cart=bool(getattr(mol, "cart", True)),
+        )
+
+    # PySCF-like fallback: copy and set geometry in Bohr.
+    mol_copy = getattr(mol, "copy", None)
+    set_geom = getattr(mol, "set_geom_", None)
+    if callable(mol_copy) and callable(set_geom):
+        mol2 = mol_copy()
+        mol2.set_geom_([(sym, xyz.tolist()) for sym, xyz in atoms], unit="Bohr", inplace=True)
+        return mol2
+
+    raise TypeError("unable to build displaced molecule from the provided mol object")
 
 
 def _core_energy_weighted_density(
@@ -1510,7 +1543,7 @@ def sacasscf_nonadiabatic_couplings_df(
     df_threads: int = 0,
     response_term: Literal["fd", "fd_jacobian", "split_orbfd"] = "split_orbfd",
     delta_bohr: float = 1e-4,
-    fd_integrals_builder: Callable[[Molecule], tuple[Any, Any, Any]] | None = None,
+    fd_integrals_builder: Callable[[Any], tuple[Any, Any, Any]] | None = None,
     z_tol: float = 1e-10,
     z_maxiter: int = 200,
 ) -> np.ndarray:
@@ -1695,7 +1728,7 @@ def sacasscf_nonadiabatic_couplings_df(
         S0_sqrt = _symm_sqrt(S0, inv=False)
         U = S0_sqrt @ C_ref  # orthonormal-AO representation
 
-        def _fd_build_arrays(mol_disp: Molecule) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        def _fd_build_arrays(mol_disp: Any) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
             if fd_integrals_builder is not None:
                 B_ao, hcore_ao, S_ao = fd_integrals_builder(mol_disp)
                 B_ao = _asnumpy_f64(B_ao)
@@ -1732,7 +1765,7 @@ def sacasscf_nonadiabatic_couplings_df(
                 mol_p2 = _displaced_molecule(mol, ia=int(ia), axis=int(ax), delta_bohr=+2.0 * delta)
                 mol_m2 = _displaced_molecule(mol, ia=int(ia), axis=int(ax), delta_bohr=-2.0 * delta)
 
-                def _g_at(mol_disp: Molecule) -> np.ndarray:
+                def _g_at(mol_disp: Any) -> np.ndarray:
                     B_d, hcore_d, S_d = _fd_build_arrays(mol_disp)
                     X = _symm_sqrt(S_d, inv=True)
                     C_d = X @ U

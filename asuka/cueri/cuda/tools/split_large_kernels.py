@@ -552,21 +552,56 @@ def split_file(src: Path, n_parts: int, no_cmake: bool = False) -> list[Path]:
     kernel_sizes = [len(block) for _, block in kernel_groups]
     groups = _balance_groups(kernel_sizes, n_parts)
 
-    # Merge groups that would share the same extern "C" symbol — duplicate extern "C"
-    # symbols cause linker errors.  Keep merging until no extern spans multiple groups.
+    # Identify "shared" kernels: kernels referenced by externs from multiple groups.
+    # These externs (e.g. multiblock launchers that reference a shared reduce kernel +
+    # a class-specific kernel) would normally force all groups to merge into one giant
+    # TU.  Instead, we collect these cross-group externs and assign them to a single
+    # "home" part (group 0) alongside ALL kernels they reference, merging only the
+    # necessary kernel groups into group 0.
+    _kernel_name_to_group: dict[str, int] = {}
+    for gi, group in enumerate(groups):
+        for kidx in group:
+            _kernel_name_to_group[kernel_groups[kidx][0]] = gi
+
+    shared_kernel_names: set[str] = set()
+    for _, _, refs in extern_blocks:
+        if not refs:
+            continue
+        ref_groups = {_kernel_name_to_group.get(k, -1) for k in refs} - {-1}
+        if len(ref_groups) > 1:
+            shared_kernel_names |= refs
+
+    if shared_kernel_names:
+        # Find the set of groups that own shared kernels — merge those into group 0.
+        shared_groups = {_kernel_name_to_group[k] for k in shared_kernel_names
+                         if k in _kernel_name_to_group}
+        if 0 not in shared_groups:
+            shared_groups.add(0)
+        if len(shared_groups) > 1:
+            # Merge shared groups into group 0
+            merge_targets = sorted(shared_groups - {0}, reverse=True)
+            for gi in merge_targets:
+                if gi < len(groups):
+                    groups[0].extend(groups.pop(gi))
+            groups[0].sort()
+            print(
+                f"  Note: merged {len(merge_targets)+1} shared-kernel groups into part 1"
+                f" ({len(shared_kernel_names)} shared kernels).",
+                file=sys.stderr,
+            )
+
+    # Standard merge for remaining non-shared cross-references.
     merged = True
     while merged:
         merged = False
         for _, _, refs in extern_blocks:
             if not refs:
                 continue
-            # Find which group indices this extern touches
             touching = [
                 gi for gi, group in enumerate(groups)
                 if refs & {kernel_groups[kidx][0] for kidx in group}
             ]
             if len(touching) > 1:
-                # Merge all touching groups into the first one
                 base = touching[0]
                 for other in reversed(touching[1:]):
                     groups[base].extend(groups.pop(other))
@@ -648,17 +683,30 @@ def split_file(src: Path, n_parts: int, no_cmake: bool = False) -> list[Path]:
         # Preamble: namespace { + shared constants/helpers
         out_lines.extend(preamble_lines)
 
-        # Bridge code: trailing inter-kernel gap lines from the PREVIOUS part's last kernel.
-        # These may contain type/struct definitions needed by this part's first kernel.
+        # Bridge code: trailing inter-kernel gap lines from earlier kernel groups.
+        # These may contain type/struct/helper definitions needed by this part's kernels.
         # Since everything is in an anonymous namespace with internal linkage (templates,
         # static helpers), duplicating them here is safe (no ODR violation).
         if part_idx > 0:
-            prev_last_kidx = groups[part_idx - 1][-1]
-            _, prev_last_klines = kernel_groups[prev_last_kidx]
-            body_end = _kernel_body_end(prev_last_klines)
-            bridge = _filter_bridge_code(prev_last_klines[body_end:])
-            if bridge:
-                out_lines.append("// Bridge: gap code from previous part (types needed here).")
+            bridge_kernel_indices = [groups[part_idx - 1][-1]]
+            if src.name == "cueri_cuda_kernels_step2.cu":
+                # step2 keeps shared Boys/reduction helpers after its first kernel instead of
+                # in the namespace preamble. Later parts need those helper definitions too.
+                bridge_kernel_indices = [
+                    kidx
+                    for prior_group in groups[:part_idx]
+                    for kidx in prior_group
+                ]
+            saw_bridge = False
+            for bridge_kidx in bridge_kernel_indices:
+                _, bridge_klines = kernel_groups[bridge_kidx]
+                body_end = _kernel_body_end(bridge_klines)
+                bridge = _filter_bridge_code(bridge_klines[body_end:])
+                if not bridge:
+                    continue
+                if not saw_bridge:
+                    out_lines.append("// Bridge: gap code from previous part(s) (types/helpers needed here).")
+                    saw_bridge = True
                 out_lines.extend(bridge)
 
         # Kernel blocks (with attached inline helpers)
@@ -771,6 +819,7 @@ def main(argv: list[str] | None = None) -> None:
     else:
         sources = [
             src_dir / "cueri_cuda_kernels_df_deriv.cu",
+            src_dir / "cueri_cuda_kernels_step2.cu",
             src_dir / "cueri_cuda_kernels_rys_generic.cu",
             src_dir / "cueri_cuda_kernels_rys_generic_deriv.cu",
         ]

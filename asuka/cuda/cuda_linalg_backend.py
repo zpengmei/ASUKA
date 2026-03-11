@@ -2,10 +2,9 @@ from __future__ import annotations
 
 import numpy as np
 
-try:  # optional CUDA extension
-    from asuka import _guga_cuda_linalg_ext as _ext
-except Exception:  # pragma: no cover
-    _ext = None
+from asuka.kernels import guga as guga_kernels
+
+_ext = guga_kernels.load_linalg_ext()
 
 
 def has_cuda_linalg_ext() -> bool:

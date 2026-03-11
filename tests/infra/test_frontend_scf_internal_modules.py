@@ -30,6 +30,11 @@ from asuka.frontend._scf_keys import copy_mo_coeff_for_cache, rhf_guess_key, rhf
 import asuka.frontend._scf_methods as scf_methods
 from asuka.frontend._scf_methods import _maybe_pack_df_B
 from asuka.frontend._scf_spin import nalpha_nbeta_from_mol
+from asuka.frontend._scf_thc_common import (
+    coerce_local_thc_config,
+    resolve_thc_grid_and_dvr_basis,
+    resolve_thc_mp_store_policy,
+)
 from asuka.frontend.molecule import Molecule
 import asuka.frontend.scf as scf_mod
 from asuka.integrals.cueri_df import CuERIDFConfig
@@ -194,6 +199,41 @@ def test_scf_spin_helper_nalpha_nbeta_validation():
         nalpha_nbeta_from_mol(SimpleNamespace(nelectron=0, spin=0))
 
 
+def test_scf_thc_common_grid_mp_and_local_config_helpers():
+    class _Cfg:
+        def __init__(self, x=1):
+            self.x = int(x)
+
+    def _build_basis(_mol, *, basis, expand_contractions):
+        _ = (basis, expand_contractions)
+        return ("dvr_basis", "name")
+
+    grid_kind, dvr_basis = resolve_thc_grid_and_dvr_basis(
+        mol=SimpleNamespace(),
+        aux_basis="aux_basis",
+        thc_grid_kind="rdvr",
+        thc_dvr_basis="my-basis",
+        expand_contractions=True,
+        build_ao_basis_cart_fn=_build_basis,
+    )
+    assert grid_kind == "rdvr"
+    assert dvr_basis == "dvr_basis"
+
+    prof = {}
+    mp_mode, store_z = resolve_thc_mp_store_policy(thc_mp_mode="tf32", thc_store_Z=None, thc_profile=prof)
+    assert mp_mode == "tf32"
+    assert store_z is False
+    assert prof["mp_mode"] == "tf32"
+    assert prof["store_Z"] is False
+
+    cfg0 = coerce_local_thc_config(thc_local_config=None, local_config_type=_Cfg)
+    assert isinstance(cfg0, _Cfg) and cfg0.x == 1
+    cfg1 = coerce_local_thc_config(thc_local_config={"x": 7}, local_config_type=_Cfg)
+    assert cfg1.x == 7
+    cfg2 = coerce_local_thc_config(thc_local_config=_Cfg(3), local_config_type=_Cfg)
+    assert cfg2.x == 3
+
+
 def test_scf_keys_helpers_key_shape_and_device_binding(monkeypatch):
     monkeypatch.setattr(scf_keys_mod, "cuda_device_id_or_neg1", lambda: 7)
     mol = SimpleNamespace(
@@ -255,6 +295,37 @@ def test_scf_df_build_prepare_direct_df_inputs_with_prebuilt_metric():
     assert df_ao_rep == "cart"
     assert L_metric is marker
     assert ao_basis is not None and aux_basis is not None
+
+
+def test_scf_methods_gpu_df_build_fallbacks_to_cpu_when_cuda_ext_symbol_missing(monkeypatch):
+    cfg = CuERIDFConfig()
+    marker = {"cpu_called": 0}
+
+    def _raise_missing_symbol(*_args, **_kwargs):
+        raise AttributeError("scatter_df_metric_tiles_inplace_device")
+
+    def _cpu_build(*, ao_basis, aux_basis, df_threads, df_profile):
+        marker["cpu_called"] += 1
+        assert df_threads == 0
+        assert ao_basis == "ao_basis"
+        assert aux_basis == "aux_basis"
+        _ = df_profile
+        return np.ones((2, 2, 1), dtype=np.float64), np.eye(1, dtype=np.float64)
+
+    monkeypatch.setattr(scf_methods, "build_df_B_from_cueri_packed_bases", _raise_missing_symbol)
+    monkeypatch.setattr(scf_methods, "_build_df_factors_cpu", _cpu_build)
+
+    B, L = scf_methods._build_df_factors_gpu(
+        SimpleNamespace(cart=True),
+        ao_basis="ao_basis",
+        aux_basis="aux_basis",
+        cfg=cfg,
+        df_layout_s="mnq",
+        df_profile={},
+    )
+    assert marker["cpu_called"] == 1
+    assert tuple(map(int, B.shape)) == (2, 2, 1)
+    assert tuple(map(int, L.shape)) == (1, 1)
 
 
 def _dispatch_ops(call_log):
@@ -582,3 +653,87 @@ def test_scf_methods_rhf_df_impl_cache_miss_builds_and_records_cache(monkeypatch
     assert out.profile["scf_guess"]["cache_hit"] is False
     assert (prep_cache, ("prep_miss",), 3) in calls["cache_put"]
     assert not any(c[0] is guess_cache for c in calls["cache_put"])
+
+
+def test_scf_wrappers_run_rhf_direct_df_delegate_to_methods(monkeypatch):
+    captured = {}
+    marker = SimpleNamespace(tag="rhf_direct_df")
+
+    def _stub(*args, **kwargs):
+        captured["args"] = args
+        captured["kwargs"] = kwargs
+        return marker
+
+    monkeypatch.setattr(scf_mod, "_run_rhf_direct_df_impl", _stub)
+    mol = SimpleNamespace(spin=0, nelectron=2)
+    out = scf_mod.run_rhf_direct_df(mol, basis="sto-3g", max_cycle=9)
+
+    assert out is marker
+    assert captured["args"][0] is mol
+    assert captured["kwargs"]["basis"] == "sto-3g"
+    assert captured["kwargs"]["max_cycle"] == 9
+    assert captured["kwargs"]["init_fock_cycles_default"] == scf_mod._HF_INIT_FOCK_CYCLES
+    assert captured["kwargs"]["result_cls"] is scf_mod.RHFDFRunResult
+
+
+def test_scf_wrappers_run_uhf_rohf_direct_df_delegate_to_methods(monkeypatch):
+    calls = []
+
+    def _stub_uhf(*args, **kwargs):
+        calls.append(("uhf", args, kwargs))
+        return SimpleNamespace(tag="uhf")
+
+    def _stub_rohf(*args, **kwargs):
+        calls.append(("rohf", args, kwargs))
+        return SimpleNamespace(tag="rohf")
+
+    monkeypatch.setattr(scf_mod, "_run_uhf_direct_df_impl", _stub_uhf)
+    monkeypatch.setattr(scf_mod, "_run_rohf_direct_df_impl", _stub_rohf)
+
+    mol = SimpleNamespace(spin=1, nelectron=3)
+    out_uhf = scf_mod.run_uhf_direct_df(mol, basis="sto-3g", diis=False)
+    out_rohf = scf_mod.run_rohf_direct_df(mol, basis="sto-3g", diis=False)
+
+    assert out_uhf.tag == "uhf"
+    assert out_rohf.tag == "rohf"
+    assert calls[0][0] == "uhf"
+    assert calls[0][2]["result_cls"] is scf_mod.UHFDFRunResult
+    assert calls[1][0] == "rohf"
+    assert calls[1][2]["result_cls"] is scf_mod.ROHFDFRunResult
+
+
+def test_scf_wrappers_run_thc_delegate_to_thc_methods(monkeypatch):
+    import asuka.frontend._scf_thc_methods as thc_methods
+
+    calls = []
+
+    def _stub(name):
+        def _runner(*args, **kwargs):
+            calls.append((name, args, kwargs))
+            return SimpleNamespace(tag=name)
+
+        return _runner
+
+    monkeypatch.setattr(thc_methods, "run_rhf_thc_impl", _stub("rhf"))
+    monkeypatch.setattr(thc_methods, "run_uhf_thc_impl", _stub("uhf"))
+    monkeypatch.setattr(thc_methods, "run_rohf_thc_impl", _stub("rohf"))
+
+    mol = SimpleNamespace(spin=0, nelectron=2)
+    out_rhf = scf_mod.run_rhf_thc(mol, basis="sto-3g", max_cycle=7, init_guess="sad")
+    out_uhf = scf_mod.run_uhf_thc(mol, basis="sto-3g", q_block=64, diis=False)
+    out_rohf = scf_mod.run_rohf_thc(mol, basis="sto-3g", q_block=32, diis=False)
+
+    assert out_rhf.tag == "rhf"
+    assert out_uhf.tag == "uhf"
+    assert out_rohf.tag == "rohf"
+    assert calls[0][0] == "rhf"
+    assert calls[0][1][0] is mol
+    assert calls[0][2]["basis"] == "sto-3g"
+    assert calls[0][2]["max_cycle"] == 7
+    assert calls[0][2]["init_guess"] == "sad"
+    assert calls[1][0] == "uhf"
+    assert calls[1][2]["q_block"] == 64
+    assert calls[1][2]["diis"] is False
+    assert calls[2][0] == "rohf"
+    assert calls[2][2]["q_block"] == 32
+    assert calls[2][2]["diis"] is False

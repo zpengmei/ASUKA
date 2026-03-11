@@ -22,6 +22,22 @@ import numpy as np
 
 from asuka.cuguga.drt import DRT
 from asuka.mrci.ic_basis import ICDoubles, ICSingles, SCDoubles, SCSingles
+from asuka.mrci.ic_rdm_common import (
+    build_cas_drt_for_ic_res as _build_cas_drt_for_ic_res_common,
+    cas_dm123_for_ic_res as _cas_dm123_for_ic_res_common,
+    cas_dm23_for_ic_res as _cas_dm23_for_ic_res_common,
+    infer_n_act_n_virt as _infer_n_act_n_virt_common,
+    require_internal_external_contiguous as _require_internal_external_contiguous_common,
+)
+from asuka.mrci.ic_rdm_blocks_one_body import (
+    build_rdm1_external_external_block_impl as _build_rdm1_external_external_block_impl,
+    build_rdm1_external_internal_block_impl as _build_rdm1_external_internal_block_impl,
+    build_rdm1_internal_block_impl as _build_rdm1_internal_block_impl,
+)
+from asuka.mrci.ic_rdm_blocks_three_external import (
+    build_rdm2_extint_extext_block_impl as _build_rdm2_extint_extext_block_impl,
+    build_rdm2_intext_extext_block_impl as _build_rdm2_intext_extext_block_impl,
+)
 
 
 Contraction = Literal["fic", "sc"]
@@ -29,33 +45,9 @@ DensityBackend = Literal["reconstruct", "direct"]
 
 
 def _build_cas_drt_for_ic_res(ic_res: Any, *, n_act: int) -> DRT:
-    """Build a CAS DRT consistent with `ci_cas` ordering for Phase-3 higher-order contractions."""
+    """Compatibility wrapper around shared ic-RDM CAS DRT helper."""
 
-    drt_work = getattr(ic_res, "drt_work", None)
-    if drt_work is None:
-        raise NotImplementedError("Phase-3 dm2 blocks require ic_res.drt_work (semi-direct backend)")
-    if not isinstance(drt_work, DRT):
-        raise TypeError("ic_res.drt_work must be a DRT instance")
-
-    nelec = int(getattr(drt_work, "nelec"))
-    twos = int(getattr(drt_work, "twos_target"))
-
-    spaces = getattr(ic_res, "spaces", None)
-    orbsym_act = None
-    if spaces is not None:
-        orbsym = getattr(spaces, "orbsym", None)
-        if orbsym is not None:
-            orbsym_act = np.asarray(orbsym, dtype=np.int32).ravel()[: int(n_act)].tolist()
-
-    wfnsym = None
-    try:
-        wfnsym = int(np.asarray(getattr(drt_work, "node_sym"))[int(drt_work.leaf)])
-    except Exception:  # pragma: no cover
-        wfnsym = None
-
-    from asuka.cuguga import build_drt  # noqa: PLC0415
-
-    return build_drt(norb=int(n_act), nelec=nelec, twos_target=twos, orbsym=orbsym_act, wfnsym=wfnsym)
+    return _build_cas_drt_for_ic_res_common(ic_res, n_act=int(n_act))
 
 
 class _CasDm4ContractCtx:
@@ -422,14 +414,7 @@ def ic_mrcisd_make_rdm12(
 
 
 def _infer_n_act_n_virt(ic_res: Any) -> tuple[int, int]:
-    spaces = getattr(ic_res, "spaces", None)
-    if spaces is None:
-        raise TypeError("ic_res missing OrbitalSpaces")
-    n_act = int(getattr(spaces, "n_internal"))
-    n_virt = int(getattr(spaces, "n_external"))
-    if n_act < 0 or n_virt < 0:
-        raise ValueError("invalid orbital spaces (negative sizes)")
-    return n_act, n_virt
+    return _infer_n_act_n_virt_common(ic_res)
 
 
 def ic_mrcisd_make_rdm1_internal_phase3(
@@ -442,168 +427,18 @@ def ic_mrcisd_make_rdm1_internal_phase3(
     dm2_int: np.ndarray | None = None,
     dm3_int: np.ndarray | None = None,
 ) -> np.ndarray:
-    """Return the internal-internal block of correlated-space dm1 for ic-MRCISD.
+    """Return the internal-internal block of correlated-space dm1 for ic-MRCISD."""
 
-    Parameters
-    ----------
-    ic_res : Any
-        ICMRCISDResult object.
-    ci_cas : np.ndarray
-        Reference CAS CI vector.
-    backend : {"direct", "reconstruct"}, optional
-        Backend to use. If not "direct", falls back to reconstruction.
-    rdm_backend : {"cuda", "cpu"}, optional
-        RDM backend for fallback.
-    dm1_int : np.ndarray | None, optional
-        Pre-computed internal 1-RDM.
-    dm2_int : np.ndarray | None, optional
-        Pre-computed internal 2-RDM.
-    dm3_int : np.ndarray | None, optional
-        Pre-computed internal 3-RDM.
-
-    Returns
-    -------
-    dm1_ii : np.ndarray
-        Internal-internal 1-RDM block. Shape: (n_act, n_act).
-    """
-
-    singles = getattr(ic_res, "singles")
-    doubles = getattr(ic_res, "doubles")
-    is_fic = isinstance(singles, ICSingles) and isinstance(doubles, ICDoubles)
-    is_sc = isinstance(singles, SCSingles) and isinstance(doubles, SCDoubles)
-    if not is_fic and not is_sc:
-        raise TypeError("unsupported ic-MRCISD label types for Phase-3 dm1 blocks")
-
-    backend_s = str(backend).strip().lower()
-    if backend_s != "direct":
-        contraction_s = "fic" if is_fic else "sc"
-        n_act, _n_virt = _infer_n_act_n_virt(ic_res)
-        dm1, _dm2 = ic_mrcisd_make_rdm12(
-            ic_res,
-            ci_cas=ci_cas,
-            contraction=contraction_s,  # type: ignore[arg-type]
-            backend=backend,
-            rdm_backend=rdm_backend,
-        )
-        return np.asarray(dm1[:n_act, :n_act], dtype=np.float64)
-
-    spaces = getattr(ic_res, "spaces")
-    n_act, n_virt = _infer_n_act_n_virt(ic_res)
-    _require_internal_external_contiguous(spaces, n_act=n_act, n_virt=n_virt)
-
-    c = np.asarray(getattr(ic_res, "c"), dtype=np.float64).ravel()
-    n_singles = int(singles.nlab)
-    n_doubles = int(doubles.nlab)
-    if int(c.size) != 1 + n_singles + n_doubles:
-        raise ValueError("ic_res.c has wrong length for (ref, singles, doubles)")
-    c0 = float(c[0])
-    c_s = np.asarray(c[1 : 1 + n_singles], dtype=np.float64)
-    c_d = np.asarray(c[1 + n_singles :], dtype=np.float64)
-
-    if dm1_int is None or dm2_int is None or dm3_int is None:
-        dm1_int, dm2_int, dm3_int = _cas_dm123_for_ic_res(ic_res, ci_cas=ci_cas, n_act=n_act)
-    else:
-        dm1_int = np.asarray(dm1_int, dtype=np.float64)
-        dm2_int = np.asarray(dm2_int, dtype=np.float64)
-        dm3_int = np.asarray(dm3_int, dtype=np.float64)
-
-    out = (float(c0) * float(c0)) * np.asarray(dm1_int, dtype=np.float64)
-
-    if is_sc:
-        diag = getattr(ic_res, "diagnostics", {}) or {}
-        allow_same_internal = bool(float(diag.get("allow_same_internal", 1.0)) > 0.0)
-
-        # Singles–singles: Σ_a c_a^2 * Σ_{r,s} dm2_int[r,s,j,i].
-        w_s = float(np.dot(c_s, c_s))
-        if w_s != 0.0:
-            ss_mat = np.einsum("rsji->ij", dm2_int, optimize=True)
-            out = out + w_s * ss_mat
-
-        if int(n_doubles) == 0 or not np.any(c_d):
-            return np.asarray(out, dtype=np.float64, order="C")
-
-        da = np.asarray(doubles.a, dtype=np.int64).ravel()
-        db = np.asarray(doubles.b, dtype=np.int64).ravel()
-        w_off = 0.0
-        w_diag = 0.0
-        for idx in range(n_doubles):
-            cd = float(c_d[idx])
-            if cd == 0.0:
-                continue
-            a = int(da[idx]) - int(n_act)
-            b = int(db[idx]) - int(n_act)
-            if not (0 <= a < int(n_virt) and 0 <= b < int(n_virt)):
-                raise ValueError("doubles external labels out of range for contiguous orbital convention")
-            if a == b:
-                w_diag += cd * cd
-            else:
-                w_off += cd * cd
-
-        if w_off != 0.0:
-            c_off = np.ones((int(n_act), int(n_act)), dtype=np.float64)
-            if not allow_same_internal:
-                np.fill_diagonal(c_off, 0.0)
-            m_off = np.einsum("rs,tu,rtsuji->ij", c_off, c_off, dm3_int, optimize=True)
-            out = out + w_off * m_off
-
-        if w_diag != 0.0:
-            c_diag = np.triu(np.ones((int(n_act), int(n_act)), dtype=np.float64), k=0 if allow_same_internal else 1)
-            m1 = np.einsum("rs,tu,rtsuji->ij", c_diag, c_diag, dm3_int, optimize=True)
-            m2 = np.einsum("rs,tu,struji->ij", c_diag, c_diag, dm3_int, optimize=True)
-            out = out + w_diag * (m1 + m2)
-
-        return np.asarray(out, dtype=np.float64, order="C")
-
-    # FIC path.
-    cs = np.zeros((int(n_virt), int(n_act)), dtype=np.float64)
-    a_all = np.asarray(singles.a, dtype=np.int64).ravel()
-    r_all = np.asarray(singles.r, dtype=np.int64).ravel()
-    for idx in range(n_singles):
-        a = int(a_all[idx]) - int(n_act)
-        r = int(r_all[idx])
-        if not (0 <= a < int(n_virt)) or not (0 <= r < int(n_act)):
-            raise ValueError("singles labels out of range for contiguous orbital convention")
-        cs[a, r] = float(c_s[idx])
-
-    if np.any(cs):
-        out = out + np.einsum("ar,as,rsji->ij", cs, cs, dm2_int, optimize=True)
-
-    if int(n_doubles) == 0 or not np.any(c_d):
-        return np.asarray(out, dtype=np.float64, order="C")
-
-    order = np.asarray(doubles.ab_group_order, dtype=np.int32)
-    offsets = np.asarray(doubles.ab_group_offsets, dtype=np.int32)
-    keys = np.asarray(doubles.ab_group_keys, dtype=np.int64)
-    r_all = np.asarray(doubles.r, dtype=np.int64).ravel()
-    s_all = np.asarray(doubles.s, dtype=np.int64).ravel()
-
-    for g in range(int(doubles.n_groups)):
-        start = int(offsets[g])
-        stop = int(offsets[g + 1])
-        if start == stop:
-            continue
-
-        idx = order[start:stop].astype(np.int64, copy=False)
-        cd = c_d[idx]
-        if not np.any(cd):
-            continue
-
-        r_idx = r_all[idx]
-        s_idx = s_all[idx]
-
-        cmat = np.zeros((int(n_act), int(n_act)), dtype=np.float64)
-        np.add.at(cmat, (r_idx, s_idx), cd)
-
-        a_glob = int(keys[g, 0])
-        b_glob = int(keys[g, 1])
-        if a_glob == b_glob:
-            m1 = np.einsum("rs,tu,rtsuji->ij", cmat, cmat, dm3_int, optimize=True)
-            m2 = np.einsum("rs,tu,struji->ij", cmat, cmat, dm3_int, optimize=True)
-            out = out + (m1 + m2)
-        else:
-            out = out + np.einsum("rs,tu,rtsuji->ij", cmat, cmat, dm3_int, optimize=True)
-
-    return np.asarray(out, dtype=np.float64, order="C")
+    return _build_rdm1_internal_block_impl(
+        ic_res,
+        ci_cas=ci_cas,
+        backend=backend,
+        rdm_backend=rdm_backend,
+        dm1_int=dm1_int,
+        dm2_int=dm2_int,
+        dm3_int=dm3_int,
+        make_rdm12_fn=ic_mrcisd_make_rdm12,
+    )
 
 
 def ic_mrcisd_make_rdm1_ext_int_phase3(
@@ -616,170 +451,18 @@ def ic_mrcisd_make_rdm1_ext_int_phase3(
     dm2_int: np.ndarray | None = None,
     dm3_int: np.ndarray | None = None,
 ) -> np.ndarray:
-    """Return the external-internal block dm1[ext, int] for ic-MRCISD.
+    """Return the external-internal block dm1[ext, int] for ic-MRCISD."""
 
-    Parameters
-    ----------
-    ic_res : Any
-        ICMRCISDResult object.
-    ci_cas : np.ndarray
-        Reference CAS CI vector.
-    backend : {"direct", "reconstruct"}, optional
-        Backend to use.
-    rdm_backend : {"cuda", "cpu"}, optional
-        RDM backend for fallback.
-    dm1_int : np.ndarray | None, optional
-        Pre-computed internal 1-RDM.
-    dm2_int : np.ndarray | None, optional
-        Pre-computed internal 2-RDM.
-    dm3_int : np.ndarray | None, optional
-        Pre-computed internal 3-RDM.
-
-    Returns
-    -------
-    dm1_ei : np.ndarray
-        External-internal 1-RDM block. Shape: (n_virt, n_act).
-    """
-
-    backend_s = str(backend).strip().lower()
-    if backend_s != "direct":
-        singles = getattr(ic_res, "singles")
-        doubles = getattr(ic_res, "doubles")
-        contraction_s = "fic"
-        if isinstance(singles, SCSingles) and isinstance(doubles, SCDoubles):
-            contraction_s = "sc"
-        elif not (isinstance(singles, ICSingles) and isinstance(doubles, ICDoubles)):
-            raise TypeError("unsupported ic-MRCISD label types for Phase-3 dm1 blocks")
-
-        n_act, _n_virt = _infer_n_act_n_virt(ic_res)
-        dm1, _dm2 = ic_mrcisd_make_rdm12(
-            ic_res,
-            ci_cas=ci_cas,
-            contraction=contraction_s,  # type: ignore[arg-type]
-            backend=backend,
-            rdm_backend=rdm_backend,
-        )
-        return np.asarray(dm1[n_act:, :n_act], dtype=np.float64)
-
-    singles = getattr(ic_res, "singles")
-    doubles = getattr(ic_res, "doubles")
-    is_fic = isinstance(singles, ICSingles) and isinstance(doubles, ICDoubles)
-    is_sc = isinstance(singles, SCSingles) and isinstance(doubles, SCDoubles)
-    if not is_fic and not is_sc:
-        raise TypeError("unsupported ic-MRCISD label types for Phase-3 dm1 blocks")
-
-    spaces = getattr(ic_res, "spaces")
-    n_act, n_virt = _infer_n_act_n_virt(ic_res)
-    _require_internal_external_contiguous(spaces, n_act=n_act, n_virt=n_virt)
-
-    c = np.asarray(getattr(ic_res, "c"), dtype=np.float64).ravel()
-    n_singles = int(singles.nlab)
-    n_doubles = int(doubles.nlab)
-    if int(c.size) != 1 + n_singles + n_doubles:
-        raise ValueError("ic_res.c has wrong length for (ref, singles, doubles)")
-    c0 = float(c[0])
-    c_s = np.asarray(c[1 : 1 + n_singles], dtype=np.float64)
-    c_d = np.asarray(c[1 + n_singles :], dtype=np.float64)
-
-    if dm1_int is None or dm2_int is None:
-        dm1_int, dm2_int, _dm3_int = _cas_dm123_for_ic_res(ic_res, ci_cas=ci_cas, n_act=n_act)
-    else:
-        dm1_int = np.asarray(dm1_int, dtype=np.float64)
-        dm2_int = np.asarray(dm2_int, dtype=np.float64)
-
-    if is_sc:
-        diag = getattr(ic_res, "diagnostics", {}) or {}
-        allow_same_internal = bool(float(diag.get("allow_same_internal", 1.0)) > 0.0)
-
-        cs = np.zeros(int(n_virt), dtype=np.float64)
-        a_all = np.asarray(singles.a, dtype=np.int64).ravel()
-        for idx in range(n_singles):
-            a = int(a_all[idx]) - int(n_act)
-            if not (0 <= a < int(n_virt)):
-                raise ValueError("singles labels out of range for contiguous orbital convention")
-            cs[a] = float(c_s[idx])
-
-        # Reference–singles: c0 * c_a * Σ_r <E_{i r}>.
-        g_int = dm1_int.sum(axis=0)
-        out = float(c0) * cs[:, None] * g_int[None, :]
-
-        # Singles–doubles: c_{ab} c_b * Σ_{r,s,t} dm2_int[i,r,t,s], with r!=s excluded if requested.
-        t_full = dm2_int.sum(axis=(1, 2, 3))
-        t_diag = np.einsum("irtr->i", dm2_int, optimize=True)
-        if allow_same_internal:
-            t_diff = t_full
-            t_same = t_full + t_diag
-        else:
-            t_diff = t_full - t_diag
-            t_same = t_diff
-
-        da = np.asarray(doubles.a, dtype=np.int64).ravel()
-        db = np.asarray(doubles.b, dtype=np.int64).ravel()
-        for idx in range(n_doubles):
-            cd = float(c_d[idx])
-            if cd == 0.0:
-                continue
-            a = int(da[idx]) - int(n_act)
-            b = int(db[idx]) - int(n_act)
-            if not (0 <= a < int(n_virt) and 0 <= b < int(n_virt)):
-                raise ValueError("doubles labels out of range for contiguous orbital convention")
-
-            if a == b:
-                if cs[a] != 0.0:
-                    out[a] += cd * cs[a] * t_same
-            else:
-                if cs[b] != 0.0:
-                    out[a] += cd * cs[b] * t_diff
-                if cs[a] != 0.0:
-                    out[b] += cd * cs[a] * t_diff
-
-        return np.asarray(out, dtype=np.float64, order="C")
-
-    # FIC path.
-    cs = np.zeros((int(n_virt), int(n_act)), dtype=np.float64)
-    a_all = np.asarray(singles.a, dtype=np.int64).ravel()
-    r_all = np.asarray(singles.r, dtype=np.int64).ravel()
-    for idx in range(n_singles):
-        a = int(a_all[idx]) - int(n_act)
-        r = int(r_all[idx])
-        if not (0 <= a < int(n_virt)) or not (0 <= r < int(n_act)):
-            raise ValueError("singles labels out of range for contiguous orbital convention")
-        cs[a, r] = float(c_s[idx])
-
-    # Reference–singles: c0 * Σ_r c_{a r} <E_{i r}>.
-    out = float(c0) * (cs @ dm1_int)
-
-    # Singles–doubles: Σ_{(a,b;r,s),t} c_{b t} c_{ab;rs} <E_{i r} E_{t s} - δ_{r t} E_{i s}>.
-    # Under the external-vacuum assumption this reduces to dm2_int[i,r,t,s] (see derivation in Phase-3 notes).
-    da = np.asarray(doubles.a, dtype=np.int64).ravel()
-    db = np.asarray(doubles.b, dtype=np.int64).ravel()
-    dr = np.asarray(doubles.r, dtype=np.int64).ravel()
-    ds = np.asarray(doubles.s, dtype=np.int64).ravel()
-    for idx in range(n_doubles):
-        cd = float(c_d[idx])
-        if cd == 0.0:
-            continue
-        a = int(da[idx]) - int(n_act)
-        b = int(db[idx]) - int(n_act)
-        r = int(dr[idx])
-        s = int(ds[idx])
-        if not (0 <= a < int(n_virt) and 0 <= b < int(n_virt) and 0 <= r < int(n_act) and 0 <= s < int(n_act)):
-            raise ValueError("doubles labels out of range for contiguous orbital convention")
-
-        if a == b:
-            cs_a = cs[a]
-            if np.any(cs_a):
-                out[a] += cd * np.einsum("t,it->i", cs_a, dm2_int[:, r, :, s] + dm2_int[:, s, :, r], optimize=True)
-        else:
-            cs_b = cs[b]
-            if np.any(cs_b):
-                out[a] += cd * np.einsum("t,it->i", cs_b, dm2_int[:, r, :, s], optimize=True)
-
-            cs_a = cs[a]
-            if np.any(cs_a):
-                out[b] += cd * np.einsum("t,it->i", cs_a, dm2_int[:, s, :, r], optimize=True)
-
-    return np.asarray(out, dtype=np.float64, order="C")
+    return _build_rdm1_external_internal_block_impl(
+        ic_res,
+        ci_cas=ci_cas,
+        backend=backend,
+        rdm_backend=rdm_backend,
+        dm1_int=dm1_int,
+        dm2_int=dm2_int,
+        dm3_int=dm3_int,
+        make_rdm12_fn=ic_mrcisd_make_rdm12,
+    )
 
 
 def ic_mrcisd_make_rdm1_ext_ext_phase3(
@@ -792,269 +475,18 @@ def ic_mrcisd_make_rdm1_ext_ext_phase3(
     dm2_int: np.ndarray | None = None,
     dm3_int: np.ndarray | None = None,
 ) -> np.ndarray:
-    """Return the external-external block dm1[ext, ext] for ic-MRCISD.
+    """Return the external-external block dm1[ext, ext] for ic-MRCISD."""
 
-    Parameters
-    ----------
-    ic_res : Any
-        ICMRCISDResult object.
-    ci_cas : np.ndarray
-        Reference CAS CI vector.
-    backend : {"direct", "reconstruct"}, optional
-        Backend to use.
-    rdm_backend : {"cuda", "cpu"}, optional
-        RDM backend for fallback.
-    dm1_int : np.ndarray | None, optional
-        Pre-computed internal 1-RDM.
-    dm2_int : np.ndarray | None, optional
-        Pre-computed internal 2-RDM.
-    dm3_int : np.ndarray | None, optional
-        Pre-computed internal 3-RDM.
-
-    Returns
-    -------
-    dm1_ee : np.ndarray
-        External-external 1-RDM block. Shape: (n_virt, n_virt).
-    """
-
-    backend_s = str(backend).strip().lower()
-    if backend_s != "direct":
-        singles = getattr(ic_res, "singles")
-        doubles = getattr(ic_res, "doubles")
-        contraction_s = "fic"
-        if isinstance(singles, SCSingles) and isinstance(doubles, SCDoubles):
-            contraction_s = "sc"
-        elif not (isinstance(singles, ICSingles) and isinstance(doubles, ICDoubles)):
-            raise TypeError("unsupported ic-MRCISD label types for Phase-3 dm1 blocks")
-
-        n_act, _n_virt = _infer_n_act_n_virt(ic_res)
-        dm1, _dm2 = ic_mrcisd_make_rdm12(
-            ic_res,
-            ci_cas=ci_cas,
-            contraction=contraction_s,  # type: ignore[arg-type]
-            backend=backend,
-            rdm_backend=rdm_backend,
-        )
-        return np.asarray(dm1[n_act:, n_act:], dtype=np.float64)
-
-    singles = getattr(ic_res, "singles")
-    doubles = getattr(ic_res, "doubles")
-    is_fic = isinstance(singles, ICSingles) and isinstance(doubles, ICDoubles)
-    is_sc = isinstance(singles, SCSingles) and isinstance(doubles, SCDoubles)
-    if not is_fic and not is_sc:
-        raise TypeError("unsupported ic-MRCISD label types for Phase-3 dm1 blocks")
-
-    spaces = getattr(ic_res, "spaces")
-    n_act, n_virt = _infer_n_act_n_virt(ic_res)
-    _require_internal_external_contiguous(spaces, n_act=n_act, n_virt=n_virt)
-
-    c = np.asarray(getattr(ic_res, "c"), dtype=np.float64).ravel()
-    n_singles = int(singles.nlab)
-    n_doubles = int(doubles.nlab)
-    if int(c.size) != 1 + n_singles + n_doubles:
-        raise ValueError("ic_res.c has wrong length for (ref, singles, doubles)")
-    c_s = np.asarray(c[1 : 1 + n_singles], dtype=np.float64)
-    c_d = np.asarray(c[1 + n_singles :], dtype=np.float64)
-
-    if dm1_int is None or dm2_int is None:
-        dm1_int, dm2_int, _dm3_int = _cas_dm123_for_ic_res(ic_res, ci_cas=ci_cas, n_act=n_act)
-    else:
-        dm1_int = np.asarray(dm1_int, dtype=np.float64)
-        dm2_int = np.asarray(dm2_int, dtype=np.float64)
-
-    if is_sc:
-        diag = getattr(ic_res, "diagnostics", {}) or {}
-        allow_same_internal = bool(float(diag.get("allow_same_internal", 1.0)) > 0.0)
-
-        cs = np.zeros(int(n_virt), dtype=np.float64)
-        a_all = np.asarray(singles.a, dtype=np.int64).ravel()
-        for idx in range(n_singles):
-            a = int(a_all[idx]) - int(n_act)
-            if not (0 <= a < int(n_virt)):
-                raise ValueError("singles labels out of range for contiguous orbital convention")
-            cs[a] = float(c_s[idx])
-
-        # Singles–singles: scalar internal contraction times outer product of SC singles coefficients.
-        s1 = float(np.sum(dm1_int))
-        out = (cs[:, None] * cs[None, :]) * s1
-
-        c_d = np.asarray(c_d, dtype=np.float64)
-        if not np.any(c_d):
-            return np.asarray(out, dtype=np.float64, order="C")
-
-        # SC doubles–doubles contributions require computing <ab|E_{b' a'}|cd> between
-        # *strongly contracted* doubles basis vectors; this is not a pure "pair relabeling"
-        # because the diagonal (a==b) SC doubles use an (r<=s) internal sum.
-        #
-        # Precompute the few internal contraction scalars needed to evaluate these
-        # matrix elements in the SC doubles subspace.
-        if allow_same_internal:
-            norm_off = float(np.sum(dm2_int))
-        else:
-            tot = float(np.sum(dm2_int))
-            diag_rs = float(np.einsum("rtru->", dm2_int, optimize=True))
-            diag_tu = float(np.einsum("rtst->", dm2_int, optimize=True))
-            diag_both = float(np.einsum("rtrt->", dm2_int, optimize=True))
-            norm_off = tot - diag_rs - diag_tu + diag_both
-
-        norm_diag = 0.0
-        for r in range(int(n_act)):
-            start_s = r if allow_same_internal else r + 1
-            for s in range(start_s, int(n_act)):
-                for t in range(int(n_act)):
-                    start_u = t if allow_same_internal else t + 1
-                    for u in range(start_u, int(n_act)):
-                        norm_diag += float(dm2_int[r, t, s, u] + dm2_int[s, t, r, u])
-
-        # offdiag -> diag (e.g. <bb|E_{b a}|ab>) and diag -> offdiag (e.g. <ab|E_{b a}|aa>)
-        m_off_to_diag = 0.0
-        for r in range(int(n_act)):
-            for s in range(int(n_act)):
-                if (not allow_same_internal) and r == s:
-                    continue
-                for t in range(int(n_act)):
-                    start_u = t if allow_same_internal else t + 1
-                    for u in range(start_u, int(n_act)):
-                        m_off_to_diag += float(dm2_int[t, r, u, s] + dm2_int[u, r, t, s])
-
-        m_diag_to_off = 0.0
-        for r in range(int(n_act)):
-            start_s = r if allow_same_internal else r + 1
-            for s in range(start_s, int(n_act)):
-                for t in range(int(n_act)):
-                    for u in range(int(n_act)):
-                        if (not allow_same_internal) and t == u:
-                            continue
-                        m_diag_to_off += float(dm2_int[t, r, u, s] + dm2_int[t, s, u, r])
-
-        da = np.asarray(doubles.a, dtype=np.int64).ravel()
-        db = np.asarray(doubles.b, dtype=np.int64).ravel()
-
-        label_to_idx: dict[tuple[int, int], int] = {}
-        for idx in range(n_doubles):
-            key = (int(da[idx]), int(db[idx]))
-            label_to_idx[key] = int(idx)
-
-        for a_rel in range(int(n_virt)):
-            a_glob = int(n_act) + int(a_rel)
-            for b_rel in range(int(n_virt)):
-                b_glob = int(n_act) + int(b_rel)
-
-                dd = 0.0
-                for q in range(n_doubles):
-                    cq = float(c_d[q])
-                    if cq == 0.0:
-                        continue
-                    qa = int(da[q])
-                    qb = int(db[q])
-
-                    if a_glob != qa and a_glob != qb:
-                        continue
-
-                    # Diagonal source pair (a_glob,a_glob).
-                    if qa == qb:
-                        if b_glob == a_glob:
-                            dd += cq * cq * 2.0 * float(norm_diag)
-                            continue
-                        na = min(int(a_glob), int(b_glob))
-                        nb = max(int(a_glob), int(b_glob))
-                        p = label_to_idx.get((na, nb))
-                        if p is None:
-                            continue
-                        cp = float(c_d[p])
-                        dd += cp * cq * float(m_diag_to_off)
-                        continue
-
-                    # Off-diagonal source pair with exactly one occurrence of a_glob.
-                    other = qb if qa == a_glob else qa
-                    if b_glob == other:
-                        p = label_to_idx.get((int(b_glob), int(b_glob)))
-                        if p is None:
-                            continue
-                        cp = float(c_d[p])
-                        dd += cp * cq * float(m_off_to_diag)
-                    else:
-                        na = min(int(b_glob), int(other))
-                        nb = max(int(b_glob), int(other))
-                        p = label_to_idx.get((na, nb))
-                        if p is None:
-                            continue
-                        cp = float(c_d[p])
-                        dd += cp * cq * float(norm_off)
-
-                out[a_rel, b_rel] += float(dd)
-
-        return np.asarray(out, dtype=np.float64, order="C")
-
-    # FIC path.
-    cs = np.zeros((int(n_virt), int(n_act)), dtype=np.float64)
-    a_all = np.asarray(singles.a, dtype=np.int64).ravel()
-    r_all = np.asarray(singles.r, dtype=np.int64).ravel()
-    for idx in range(n_singles):
-        a = int(a_all[idx]) - int(n_act)
-        r = int(r_all[idx])
-        if not (0 <= a < int(n_virt)) or not (0 <= r < int(n_act)):
-            raise ValueError("singles labels out of range for contiguous orbital convention")
-        cs[a, r] = float(c_s[idx])
-
-    # Singles–singles: out[a,b] = Σ_{r,s} c_{a s} c_{b r} <E_{r s}>
-    out = cs @ dm1_int @ cs.T
-
-    # Doubles–doubles: interpret E_{b a} as mapping doubles (source external a) to doubles (target external b),
-    # then take the overlap with the doubles sector.
-    from asuka.mrci.ic_overlap import apply_overlap_doubles  # noqa: PLC0415
-
-    da = np.asarray(doubles.a, dtype=np.int64).ravel()
-    db = np.asarray(doubles.b, dtype=np.int64).ravel()
-    dr = np.asarray(doubles.r, dtype=np.int64).ravel()
-    ds = np.asarray(doubles.s, dtype=np.int64).ravel()
-
-    label_to_idx: dict[tuple[int, int, int, int], int] = {}
-    for idx in range(n_doubles):
-        key = (int(da[idx]), int(db[idx]), int(dr[idx]), int(ds[idx]))
-        label_to_idx[key] = int(idx)
-
-    c_d = np.asarray(c_d, dtype=np.float64)
-    if not np.any(c_d):
-        return np.asarray(out, dtype=np.float64, order="C")
-
-    for a_rel in range(int(n_virt)):
-        a_glob = int(n_act) + int(a_rel)
-        for b_rel in range(int(n_virt)):
-            b_glob = int(n_act) + int(b_rel)
-
-            c_map = np.zeros_like(c_d)
-            for k in range(n_doubles):
-                w = float(c_d[k])
-                if w == 0.0:
-                    continue
-                aa = int(da[k])
-                bb = int(db[k])
-                rr = int(dr[k])
-                ss = int(ds[k])
-
-                # Replace occurrences of the source external index `a_glob` by `b_glob`.
-                if aa == a_glob:
-                    na, nb, nr, ns = b_glob, bb, rr, ss
-                    if (na > nb) or (na == nb and nr > ns):
-                        na, nb, nr, ns = nb, na, ns, nr
-                    idx2 = label_to_idx.get((na, nb, nr, ns))
-                    if idx2 is not None:
-                        c_map[idx2] += w
-
-                if bb == a_glob:
-                    na, nb, nr, ns = aa, b_glob, rr, ss
-                    if (na > nb) or (na == nb and nr > ns):
-                        na, nb, nr, ns = nb, na, ns, nr
-                    idx2 = label_to_idx.get((na, nb, nr, ns))
-                    if idx2 is not None:
-                        c_map[idx2] += w
-
-            if np.any(c_map):
-                rho_map = apply_overlap_doubles(c_doubles=c_map, doubles=doubles, dm2=dm2_int)
-                out[a_rel, b_rel] += float(np.dot(c_d, rho_map))
-
-    return np.asarray(out, dtype=np.float64, order="C")
+    return _build_rdm1_external_external_block_impl(
+        ic_res,
+        ci_cas=ci_cas,
+        backend=backend,
+        rdm_backend=rdm_backend,
+        dm1_int=dm1_int,
+        dm2_int=dm2_int,
+        dm3_int=dm3_int,
+        make_rdm12_fn=ic_mrcisd_make_rdm12,
+    )
 
 
 def ic_mrcisd_make_rdm1_phase3(
@@ -1658,64 +1090,17 @@ def ic_mrcisd_make_rdm2_intext_intext_phase3(
 
 
 def _require_internal_external_contiguous(spaces: Any, *, n_act: int, n_virt: int) -> None:
-    internal = np.asarray(getattr(spaces, "internal"), dtype=np.int32).ravel()
-    external = np.asarray(getattr(spaces, "external"), dtype=np.int32).ravel()
-    if internal.size != int(n_act) or external.size != int(n_virt):
-        raise ValueError("orbital spaces do not match n_act/n_virt")
-
-    want_internal = np.arange(int(n_act), dtype=np.int32)
-    want_external = np.arange(int(n_act), int(n_act) + int(n_virt), dtype=np.int32)
-    if not bool(np.all(internal == want_internal)) or not bool(np.all(external == want_external)):
-        raise NotImplementedError(
-            "Phase-3 dm2 blocks currently require contiguous correlated ordering: internal=0..n_act-1, external=n_act.."
-        )
+    _require_internal_external_contiguous_common(spaces, n_act=int(n_act), n_virt=int(n_virt))
 
 
 def _cas_dm23_for_ic_res(ic_res: Any, *, ci_cas: np.ndarray, n_act: int) -> tuple[np.ndarray, np.ndarray]:
-    """Return (dm2_int, dm3_int) for the reference CAS wavefunction.
-
-    Conventions match `GUGAFCISolver.make_rdm123(reorder=True)`, which is consistent with
-    cuGUGA's spin-free generator-form algebra (`E_pq`).
-    """
-
-    _dm1, dm2, dm3 = _cas_dm123_for_ic_res(ic_res, ci_cas=ci_cas, n_act=n_act)
-    return dm2, dm3
+    return _cas_dm23_for_ic_res_common(ic_res, ci_cas=ci_cas, n_act=int(n_act))
 
 
 def _cas_dm123_for_ic_res(
     ic_res: Any, *, ci_cas: np.ndarray, n_act: int
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Return (dm1_int, dm2_int, dm3_int) for the reference CAS wavefunction.
-
-    Conventions match `GUGAFCISolver.make_rdm123(reorder=True)`:
-      - dm1_int[p,q] = <E_{q p}>
-      - dm2_int uses the delta-corrected / reordered convention
-      - dm3_int matches `asuka.rdm.rdm123._make_rdm123_pyscf(reorder=True)`
-    """
-
-    drt_work = getattr(ic_res, "drt_work", None)
-    if drt_work is None:
-        raise NotImplementedError("Phase-3 dm2 blocks require ic_res.drt_work (semi-direct backend)")
-    if not isinstance(drt_work, DRT):
-        raise TypeError("ic_res.drt_work must be a DRT instance")
-
-    nelec = int(getattr(drt_work, "nelec"))
-    twos = int(getattr(drt_work, "twos_target"))
-
-    ci_cas = np.asarray(ci_cas, dtype=np.float64).ravel()
-    nrm = float(np.linalg.norm(ci_cas))
-    if not np.isfinite(nrm) or nrm <= 0.0:
-        raise ValueError("ci_cas must have nonzero finite norm")
-    ci_cas = np.asarray(ci_cas / nrm, dtype=np.float64)
-
-    from asuka import GUGAFCISolver  # noqa: PLC0415
-
-    cas = GUGAFCISolver(twos=twos)
-    dm1, dm2, dm3 = cas.make_rdm123(ci_cas, norb=int(n_act), nelec=nelec, reorder=True)
-    dm1 = np.asarray(dm1, dtype=np.float64, order="C")
-    dm2 = np.asarray(dm2, dtype=np.float64, order="C")
-    dm3 = np.asarray(dm3, dtype=np.float64, order="C")
-    return dm1, dm2, dm3
+    return _cas_dm123_for_ic_res_common(ic_res, ci_cas=ci_cas, n_act=int(n_act))
 
 
 def ic_mrcisd_make_rdm2_intint_intint_phase3(
@@ -3013,124 +2398,20 @@ def ic_mrcisd_make_rdm2_extint_extext_phase3(
     dm3_int: np.ndarray | None = None,
     dm4_ctx: _CasDm4ContractCtx | None = None,
 ) -> np.ndarray:
-    """Return dm2[ext,int,ext,ext] for ic-MRCISD (3-external block).
+    """Return dm2[ext,int,ext,ext] for ic-MRCISD (3-external block)."""
 
-    This corresponds to the correlated-space block:
-      dm2[a,i,b,c]  (a,b,c external; i internal).
-    """
-
-    backend_s = str(backend).strip().lower()
-    if backend_s != "direct":
-        singles = getattr(ic_res, "singles")
-        doubles = getattr(ic_res, "doubles")
-        contraction_s = "fic"
-        if isinstance(singles, SCSingles) and isinstance(doubles, SCDoubles):
-            contraction_s = "sc"
-        elif not (isinstance(singles, ICSingles) and isinstance(doubles, ICDoubles)):
-            raise TypeError("unsupported ic-MRCISD label types for Phase-3 dm2 blocks")
-
-        n_act, _n_virt = _infer_n_act_n_virt(ic_res)
-        _dm1, dm2 = ic_mrcisd_make_rdm12(
-            ic_res,
-            ci_cas=ci_cas,
-            contraction=contraction_s,  # type: ignore[arg-type]
-            backend=backend,
-            rdm_backend=rdm_backend,
-        )
-        return np.asarray(dm2[n_act:, :n_act, n_act:, n_act:], dtype=np.float64)
-
-    singles = getattr(ic_res, "singles")
-    doubles = getattr(ic_res, "doubles")
-    is_fic = isinstance(singles, ICSingles) and isinstance(doubles, ICDoubles)
-    is_sc = isinstance(singles, SCSingles) and isinstance(doubles, SCDoubles)
-    if not is_fic and not is_sc:
-        raise TypeError("unsupported ic-MRCISD label types for Phase-3 dm2 blocks")
-
-    spaces = getattr(ic_res, "spaces")
-    n_act, n_virt = _infer_n_act_n_virt(ic_res)
-    _require_internal_external_contiguous(spaces, n_act=n_act, n_virt=n_virt)
-
-    c = np.asarray(getattr(ic_res, "c"), dtype=np.float64).ravel()
-    n_singles = int(singles.nlab)
-    n_doubles = int(doubles.nlab)
-    if int(c.size) != 1 + n_singles + n_doubles:
-        raise ValueError("ic_res.c has wrong length for (ref, singles, doubles)")
-    c_s = np.asarray(c[1 : 1 + n_singles], dtype=np.float64)
-    c_d = np.asarray(c[1 + n_singles :], dtype=np.float64)
-
-    if int(n_singles) == 0 or not np.any(c_s) or int(n_doubles) == 0 or not np.any(c_d):
-        return np.zeros((int(n_virt), int(n_act), int(n_virt), int(n_virt)), dtype=np.float64)
-
-    if dm2_int is None:
-        dm2_int, _dm3_int = _cas_dm23_for_ic_res(ic_res, ci_cas=ci_cas, n_act=n_act)
-    else:
-        dm2_int = np.asarray(dm2_int, dtype=np.float64)
-    out = np.zeros((int(n_virt), int(n_act), int(n_virt), int(n_virt)), dtype=np.float64)
-
-    if is_sc:
-        diag = getattr(ic_res, "diagnostics", {}) or {}
-        allow_same_internal = bool(float(diag.get("allow_same_internal", 1.0)) > 0.0)
-
-        cs = np.zeros(int(n_virt), dtype=np.float64)
-        a_all = np.asarray(singles.a, dtype=np.int64).ravel()
-        for idx in range(n_singles):
-            a = int(a_all[idx]) - int(n_act)
-            if not (0 <= a < int(n_virt)):
-                raise ValueError("singles labels out of range for contiguous orbital convention")
-            cs[a] = float(c_s[idx])
-
-        blk_full = dm2_int.sum(axis=(0, 2, 3))
-        blk_diag = np.einsum("rirt->i", dm2_int, optimize=True)
-        if allow_same_internal:
-            blk_diff = blk_full
-            blk_same = blk_full + blk_diag
-        else:
-            blk_diff = blk_full - blk_diag
-            blk_same = blk_diff
-
-        da = np.asarray(doubles.a, dtype=np.int64).ravel()
-        db = np.asarray(doubles.b, dtype=np.int64).ravel()
-        for idx in range(n_doubles):
-            cd = float(c_d[idx])
-            if cd == 0.0:
-                continue
-            a = int(da[idx]) - int(n_act)
-            b = int(db[idx]) - int(n_act)
-            if not (0 <= a < int(n_virt) and 0 <= b < int(n_virt)):
-                raise ValueError("doubles external labels out of range for contiguous orbital convention")
-
-            blk = blk_same if a == b else blk_diff
-            if np.any(cs):
-                out[a, :, b, :] += cd * blk[:, None] * cs[None, :]
-                if a != b:
-                    out[b, :, a, :] += cd * blk[:, None] * cs[None, :]
-
-        return np.asarray(out, dtype=np.float64, order="C")
-
-    cs = np.zeros((int(n_virt), int(n_act)), dtype=np.float64)
-    a_all = np.asarray(singles.a, dtype=np.int64).ravel()
-    r_all = np.asarray(singles.r, dtype=np.int64).ravel()
-    for idx in range(n_singles):
-        a = int(a_all[idx]) - int(n_act)
-        r = int(r_all[idx])
-        if not (0 <= a < int(n_virt)) or not (0 <= r < int(n_act)):
-            raise ValueError("singles labels out of range for contiguous orbital convention")
-        cs[a, r] = float(c_s[idx])
-
-    pair_to_mat = _fic_build_doubles_pair_to_mat(doubles, c_d, n_act=n_act, n_virt=n_virt)
-    if not pair_to_mat:
-        return np.asarray(out, dtype=np.float64, order="C")
-
-    cs_t = cs.T
-    for (a, b), mat0 in pair_to_mat.items():
-        mat_ab = mat0 + mat0.T if a == b else mat0
-        tmp = np.einsum("rs,rist->it", mat_ab, dm2_int, optimize=True)
-        out[a, :, b, :] += tmp @ cs_t
-        if a != b:
-            tmp_ba = np.einsum("rs,rist->it", mat0.T, dm2_int, optimize=True)
-            out[b, :, a, :] += tmp_ba @ cs_t
-
-    return np.asarray(out, dtype=np.float64, order="C")
+    return _build_rdm2_extint_extext_block_impl(
+        ic_res,
+        ci_cas=ci_cas,
+        backend=backend,
+        rdm_backend=rdm_backend,
+        dm1_int=dm1_int,
+        dm2_int=dm2_int,
+        dm3_int=dm3_int,
+        dm4_ctx=dm4_ctx,
+        make_rdm12_fn=ic_mrcisd_make_rdm12,
+        pair_to_mat_builder=_fic_build_doubles_pair_to_mat,
+    )
 
 
 def ic_mrcisd_make_rdm2_intext_extext_phase3(
@@ -3144,124 +2425,20 @@ def ic_mrcisd_make_rdm2_intext_extext_phase3(
     dm3_int: np.ndarray | None = None,
     dm4_ctx: _CasDm4ContractCtx | None = None,
 ) -> np.ndarray:
-    """Return dm2[int,ext,ext,ext] for ic-MRCISD (3-external block).
+    """Return dm2[int,ext,ext,ext] for ic-MRCISD (3-external block)."""
 
-    This corresponds to the correlated-space block:
-      dm2[i,a,b,c]  (a,b,c external; i internal).
-    """
-
-    backend_s = str(backend).strip().lower()
-    if backend_s != "direct":
-        singles = getattr(ic_res, "singles")
-        doubles = getattr(ic_res, "doubles")
-        contraction_s = "fic"
-        if isinstance(singles, SCSingles) and isinstance(doubles, SCDoubles):
-            contraction_s = "sc"
-        elif not (isinstance(singles, ICSingles) and isinstance(doubles, ICDoubles)):
-            raise TypeError("unsupported ic-MRCISD label types for Phase-3 dm2 blocks")
-
-        n_act, _n_virt = _infer_n_act_n_virt(ic_res)
-        _dm1, dm2 = ic_mrcisd_make_rdm12(
-            ic_res,
-            ci_cas=ci_cas,
-            contraction=contraction_s,  # type: ignore[arg-type]
-            backend=backend,
-            rdm_backend=rdm_backend,
-        )
-        return np.asarray(dm2[:n_act, n_act:, n_act:, n_act:], dtype=np.float64)
-
-    singles = getattr(ic_res, "singles")
-    doubles = getattr(ic_res, "doubles")
-    is_fic = isinstance(singles, ICSingles) and isinstance(doubles, ICDoubles)
-    is_sc = isinstance(singles, SCSingles) and isinstance(doubles, SCDoubles)
-    if not is_fic and not is_sc:
-        raise TypeError("unsupported ic-MRCISD label types for Phase-3 dm2 blocks")
-
-    spaces = getattr(ic_res, "spaces")
-    n_act, n_virt = _infer_n_act_n_virt(ic_res)
-    _require_internal_external_contiguous(spaces, n_act=n_act, n_virt=n_virt)
-
-    c = np.asarray(getattr(ic_res, "c"), dtype=np.float64).ravel()
-    n_singles = int(singles.nlab)
-    n_doubles = int(doubles.nlab)
-    if int(c.size) != 1 + n_singles + n_doubles:
-        raise ValueError("ic_res.c has wrong length for (ref, singles, doubles)")
-    c_s = np.asarray(c[1 : 1 + n_singles], dtype=np.float64)
-    c_d = np.asarray(c[1 + n_singles :], dtype=np.float64)
-
-    if int(n_singles) == 0 or not np.any(c_s) or int(n_doubles) == 0 or not np.any(c_d):
-        return np.zeros((int(n_act), int(n_virt), int(n_virt), int(n_virt)), dtype=np.float64)
-
-    if dm2_int is None:
-        dm2_int, _dm3_int = _cas_dm23_for_ic_res(ic_res, ci_cas=ci_cas, n_act=n_act)
-    else:
-        dm2_int = np.asarray(dm2_int, dtype=np.float64)
-    out = np.zeros((int(n_act), int(n_virt), int(n_virt), int(n_virt)), dtype=np.float64)
-
-    if is_sc:
-        diag = getattr(ic_res, "diagnostics", {}) or {}
-        allow_same_internal = bool(float(diag.get("allow_same_internal", 1.0)) > 0.0)
-
-        cs = np.zeros(int(n_virt), dtype=np.float64)
-        a_all = np.asarray(singles.a, dtype=np.int64).ravel()
-        for idx in range(n_singles):
-            a = int(a_all[idx]) - int(n_act)
-            if not (0 <= a < int(n_virt)):
-                raise ValueError("singles labels out of range for contiguous orbital convention")
-            cs[a] = float(c_s[idx])
-
-        blk_full = dm2_int.sum(axis=(0, 2, 3))
-        blk_diag = np.einsum("rirt->i", dm2_int, optimize=True)
-        if allow_same_internal:
-            blk_diff = blk_full
-            blk_same = blk_full + blk_diag
-        else:
-            blk_diff = blk_full - blk_diag
-            blk_same = blk_diff
-
-        da = np.asarray(doubles.a, dtype=np.int64).ravel()
-        db = np.asarray(doubles.b, dtype=np.int64).ravel()
-        for idx in range(n_doubles):
-            cd = float(c_d[idx])
-            if cd == 0.0:
-                continue
-            a = int(da[idx]) - int(n_act)
-            b = int(db[idx]) - int(n_act)
-            if not (0 <= a < int(n_virt) and 0 <= b < int(n_virt)):
-                raise ValueError("doubles external labels out of range for contiguous orbital convention")
-
-            blk = blk_same if a == b else blk_diff
-            if np.any(cs):
-                out[:, a, :, b] += cd * blk[:, None] * cs[None, :]
-                if a != b:
-                    out[:, b, :, a] += cd * blk[:, None] * cs[None, :]
-
-        return np.asarray(out, dtype=np.float64, order="C")
-
-    cs = np.zeros((int(n_virt), int(n_act)), dtype=np.float64)
-    a_all = np.asarray(singles.a, dtype=np.int64).ravel()
-    r_all = np.asarray(singles.r, dtype=np.int64).ravel()
-    for idx in range(n_singles):
-        a = int(a_all[idx]) - int(n_act)
-        r = int(r_all[idx])
-        if not (0 <= a < int(n_virt)) or not (0 <= r < int(n_act)):
-            raise ValueError("singles labels out of range for contiguous orbital convention")
-        cs[a, r] = float(c_s[idx])
-
-    pair_to_mat = _fic_build_doubles_pair_to_mat(doubles, c_d, n_act=n_act, n_virt=n_virt)
-    if not pair_to_mat:
-        return np.asarray(out, dtype=np.float64, order="C")
-
-    cs_t = cs.T
-    for (a, b), mat0 in pair_to_mat.items():
-        mat_ab = mat0 + mat0.T if a == b else mat0
-        tmp = np.einsum("rs,rist->it", mat_ab, dm2_int, optimize=True)
-        out[:, a, :, b] += tmp @ cs_t
-        if a != b:
-            tmp_ba = np.einsum("rs,rist->it", mat0.T, dm2_int, optimize=True)
-            out[:, b, :, a] += tmp_ba @ cs_t
-
-    return np.asarray(out, dtype=np.float64, order="C")
+    return _build_rdm2_intext_extext_block_impl(
+        ic_res,
+        ci_cas=ci_cas,
+        backend=backend,
+        rdm_backend=rdm_backend,
+        dm1_int=dm1_int,
+        dm2_int=dm2_int,
+        dm3_int=dm3_int,
+        dm4_ctx=dm4_ctx,
+        make_rdm12_fn=ic_mrcisd_make_rdm12,
+        pair_to_mat_builder=_fic_build_doubles_pair_to_mat,
+    )
 
 
 def ic_mrcisd_make_rdm2_extext_intext_phase3(

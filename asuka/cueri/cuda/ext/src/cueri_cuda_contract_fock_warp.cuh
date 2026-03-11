@@ -38,8 +38,12 @@ __device__ __forceinline__ void cueri_contract_fock_warp_single(
     bool bk_swap,
     double f_ab,
     double f_cd,
-    int64_t N) {
+    int64_t N,
+    int n_bufs = 1,
+    int buf_id = 0) {
   if (F_mat == nullptr) return;
+  // Multi-buffer offset: each buffer is N*N doubles contiguous.
+  F_mat = F_mat + static_cast<int64_t>(buf_id) * N * N;
 
   // --- J contributions (to F) ---
   // Outer iab, inner warp-stride icd -> F[a,b]

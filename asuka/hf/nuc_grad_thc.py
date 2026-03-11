@@ -156,10 +156,9 @@ def _metric_2c2e_deriv_aux_atomgrad_cuda(
     """
 
     cp = _require_cupy()
-    try:
-        from asuka.cueri import _cueri_cuda_ext as _ext_cuda  # noqa: PLC0415
-    except Exception as e:  # pragma: no cover
-        raise RuntimeError("cuERI CUDA extension is required for THC metric derivative contraction") from e
+    from asuka.kernels import cueri as cueri_kernels  # noqa: PLC0415
+
+    _ext_cuda = cueri_kernels.require_ext()
 
     from asuka.cueri.basis_cart import BasisCartSoA  # noqa: PLC0415
     from asuka.cueri.shell_pairs import ShellPairs  # noqa: PLC0415
@@ -445,7 +444,7 @@ def rhf_nuc_grad_thc(
 
     # ---- 1e + Pulay (CPU for now; uses existing analytic int1e contractions) ----
     coords = np.asarray(mol.coords_bohr, dtype=np.float64).reshape((natm, 3))
-    from asuka.frontend.periodic_table import atomic_number  # noqa: PLC0415
+    from asuka.chem.periodic_table import atomic_number  # noqa: PLC0415
 
     charges = np.asarray([float(atomic_number(sym)) for sym, _xyz in mol.atoms_bohr], dtype=np.float64)
 

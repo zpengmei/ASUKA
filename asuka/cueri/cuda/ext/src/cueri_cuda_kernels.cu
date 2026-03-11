@@ -232,7 +232,8 @@ __global__ void KernelFusedJKSsss(
     const double* D_mat,
     double* J_mat,
     double* K_mat,
-    int warps_per_block) {
+    int warps_per_block,
+    int n_bufs) {
   const int lane = static_cast<int>(threadIdx.x) & 31;
   const int warp_id = static_cast<int>(threadIdx.x) >> 5;
   const int t = static_cast<int>(blockIdx.x) * warps_per_block + warp_id;
@@ -284,6 +285,12 @@ __global__ void KernelFusedJKSsss(
     const double f_cd = cd_neq ? 2.0 : 1.0;
     const int64_t N = static_cast<int64_t>(nao);
 
+    // Multi-buffer offset
+    const int buf_id = static_cast<int>(blockIdx.x) % n_bufs;
+    const int64_t buf_off = static_cast<int64_t>(buf_id) * N * N;
+    if (J_mat != nullptr) { J_mat = J_mat + buf_off; }
+    if (K_mat != nullptr) { K_mat = K_mat + buf_off; }
+
     if (J_mat != nullptr) {
       const double Dcd = D_mat[c * N + d];
       atomicAdd(&J_mat[a * N + b], f_cd * sum * Dcd);
@@ -329,7 +336,8 @@ __global__ void KernelFusedFock_ssss_warp(
     int nao,
     const double* D_mat,
     double* F_mat,
-    int warps_per_block) {
+    int warps_per_block,
+    int n_bufs) {
   const int lane = static_cast<int>(threadIdx.x) & 31;
   const int warp_id = static_cast<int>(threadIdx.x) >> 5;
   const int t = static_cast<int>(blockIdx.x) * warps_per_block + warp_id;
@@ -378,6 +386,10 @@ __global__ void KernelFusedFock_ssss_warp(
     const double f_cd = cd_neq ? 2.0 : 1.0;
     const double f_ab = ab_neq ? 2.0 : 1.0;
     const int64_t N = static_cast<int64_t>(nao);
+
+    // Multi-buffer offset
+    const int buf_id = static_cast<int>(blockIdx.x) % n_bufs;
+    F_mat = F_mat + static_cast<int64_t>(buf_id) * N * N;
 
     // J contribution: F[a,b] += f_cd * sum * D[c,d]
     const double Dcd = D_mat[c * N + d];
@@ -703,6 +715,55 @@ extern "C" cudaError_t cueri_schwarz_ssss_launch_stream(
   return cudaGetLastError();
 }
 
+// Flat ssss kernel: 1 thread per task, no shared memory / reduction.
+template <bool kFastBoys>
+__global__ void KernelERI_ssss_flat(
+    const int32_t* __restrict__ task_spAB,
+    const int32_t* __restrict__ task_spCD,
+    int ntasks,
+    const int32_t* __restrict__ sp_pair_start,
+    const int32_t* __restrict__ sp_npair,
+    const double* __restrict__ pair_eta,
+    const double* __restrict__ pair_Px,
+    const double* __restrict__ pair_Py,
+    const double* __restrict__ pair_Pz,
+    const double* __restrict__ pair_cK,
+    double* __restrict__ eri_out) {
+  const int t = static_cast<int>(blockIdx.x) * static_cast<int>(blockDim.x) + static_cast<int>(threadIdx.x);
+  if (t >= ntasks) return;
+
+  const int spAB = static_cast<int>(task_spAB[t]);
+  const int spCD = static_cast<int>(task_spCD[t]);
+  const int baseAB = static_cast<int>(sp_pair_start[spAB]);
+  const int baseCD = static_cast<int>(sp_pair_start[spCD]);
+  const int nAB = static_cast<int>(sp_npair[spAB]);
+  const int nCD = static_cast<int>(sp_npair[spCD]);
+
+  double sum = 0.0;
+  for (int i = 0; i < nAB; ++i) {
+    const int ki = baseAB + i;
+    const double eta_i = pair_eta[ki];
+    const double cKi = pair_cK[ki];
+    const double Pxi = pair_Px[ki];
+    const double Pyi = pair_Py[ki];
+    const double Pzi = pair_Pz[ki];
+    for (int j = 0; j < nCD; ++j) {
+      const int kj = baseCD + j;
+      const double zeta = pair_eta[kj];
+      const double dx = Pxi - pair_Px[kj];
+      const double dy = Pyi - pair_Py[kj];
+      const double dz = Pzi - pair_Pz[kj];
+      const double PQ2 = dx * dx + dy * dy + dz * dz;
+      const double denom = eta_i + zeta;
+      const double omega = eta_i * zeta / denom;
+      const double T = omega * PQ2;
+      const double pref = kTwoPiToFiveHalves / (eta_i * zeta * ::sqrt(denom));
+      sum += pref * cKi * pair_cK[kj] * boys_f0<kFastBoys>(T);
+    }
+  }
+  eri_out[t] = sum;
+}
+
 extern "C" cudaError_t cueri_eri_ssss_launch_stream(
     const int32_t* task_spAB,
     const int32_t* task_spCD,
@@ -718,12 +779,14 @@ extern "C" cudaError_t cueri_eri_ssss_launch_stream(
     cudaStream_t stream,
     int threads,
     bool use_fast_boys) {
+  if (ntasks <= 0) return cudaSuccess;
+  const int blocks = (ntasks + threads - 1) / threads;
   if (use_fast_boys) {
-    KernelERI_ssss<true><<<static_cast<unsigned int>(ntasks), threads, 0, stream>>>(
-        task_spAB, task_spCD, sp_pair_start, sp_npair, pair_eta, pair_Px, pair_Py, pair_Pz, pair_cK, eri_out);
+    KernelERI_ssss_flat<true><<<static_cast<unsigned int>(blocks), threads, 0, stream>>>(
+        task_spAB, task_spCD, ntasks, sp_pair_start, sp_npair, pair_eta, pair_Px, pair_Py, pair_Pz, pair_cK, eri_out);
   } else {
-    KernelERI_ssss<false><<<static_cast<unsigned int>(ntasks), threads, 0, stream>>>(
-        task_spAB, task_spCD, sp_pair_start, sp_npair, pair_eta, pair_Px, pair_Py, pair_Pz, pair_cK, eri_out);
+    KernelERI_ssss_flat<false><<<static_cast<unsigned int>(blocks), threads, 0, stream>>>(
+        task_spAB, task_spCD, ntasks, sp_pair_start, sp_npair, pair_eta, pair_Px, pair_Py, pair_Pz, pair_cK, eri_out);
   }
   return cudaGetLastError();
 }
@@ -743,37 +806,10 @@ extern "C" cudaError_t cueri_eri_ssss_warp_launch_stream(
     cudaStream_t stream,
     int threads,
     bool use_fast_boys) {
-  const int warps_per_block = threads >> 5;
-  const int tasks_per_block = warps_per_block * 4;
-  const int blocks = (ntasks + tasks_per_block - 1) / tasks_per_block;
-  if (use_fast_boys) {
-    KernelERI_ssss_subwarp8<true><<<static_cast<unsigned int>(blocks), threads, 0, stream>>>(
-        task_spAB,
-        task_spCD,
-        ntasks,
-        sp_pair_start,
-        sp_npair,
-        pair_eta,
-        pair_Px,
-        pair_Py,
-        pair_Pz,
-        pair_cK,
-        eri_out);
-  } else {
-    KernelERI_ssss_subwarp8<false><<<static_cast<unsigned int>(blocks), threads, 0, stream>>>(
-        task_spAB,
-        task_spCD,
-        ntasks,
-        sp_pair_start,
-        sp_npair,
-        pair_eta,
-        pair_Px,
-        pair_Py,
-        pair_Pz,
-        pair_cK,
-        eri_out);
-  }
-  return cudaGetLastError();
+  return cueri_eri_ssss_launch_stream(
+      task_spAB, task_spCD, ntasks, sp_pair_start, sp_npair,
+      pair_eta, pair_Px, pair_Py, pair_Pz, pair_cK,
+      eri_out, stream, threads, use_fast_boys);
 }
 
 extern "C" cudaError_t cueri_eri_ssss_multiblock_launch_stream(
@@ -793,42 +829,12 @@ extern "C" cudaError_t cueri_eri_ssss_multiblock_launch_stream(
     cudaStream_t stream,
     int threads,
     bool use_fast_boys) {
-  if (blocks_per_task <= 0) return cudaErrorInvalidValue;
-  dim3 grid(static_cast<unsigned int>(ntasks), static_cast<unsigned int>(blocks_per_task), 1);
-  if (use_fast_boys) {
-    KernelERI_ssss_multiblock_partial<true><<<grid, threads, 0, stream>>>(
-        task_spAB,
-        task_spCD,
-        ntasks,
-        sp_pair_start,
-        sp_npair,
-        pair_eta,
-        pair_Px,
-        pair_Py,
-        pair_Pz,
-        pair_cK,
-        blocks_per_task,
-        partial_sums);
-  } else {
-    KernelERI_ssss_multiblock_partial<false><<<grid, threads, 0, stream>>>(
-        task_spAB,
-        task_spCD,
-        ntasks,
-        sp_pair_start,
-        sp_npair,
-        pair_eta,
-        pair_Px,
-        pair_Py,
-        pair_Pz,
-        pair_cK,
-        blocks_per_task,
-        partial_sums);
-  }
-  auto err = cudaGetLastError();
-  if (err != cudaSuccess) return err;
-  KernelERI_ssss_multiblock_reduce<<<static_cast<unsigned int>(ntasks), threads, 0, stream>>>(
-      partial_sums, blocks_per_task, eri_out);
-  return cudaGetLastError();
+  (void)partial_sums;
+  (void)blocks_per_task;
+  return cueri_eri_ssss_launch_stream(
+      task_spAB, task_spCD, ntasks, sp_pair_start, sp_npair,
+      pair_eta, pair_Px, pair_Py, pair_Pz, pair_cK,
+      eri_out, stream, threads, use_fast_boys);
 }
 
 extern "C" cudaError_t cueri_fused_fock_ssss_launch_stream(
@@ -852,17 +858,18 @@ extern "C" cudaError_t cueri_fused_fock_ssss_launch_stream(
     const double* D_mat,
     double* F_mat,
     cudaStream_t stream,
-    int threads) {
+    int threads,
+    int n_bufs) {
   if (ntasks <= 0) return cudaSuccess;
   if (threads < 32 || (threads & 31) != 0) return cudaErrorInvalidValue;
   const int warps_per_block = threads >> 5;
   const int blocks = (ntasks + warps_per_block - 1) / warps_per_block;
-  KernelFusedFock_ssss_warp<true><<<static_cast<unsigned int>(blocks), threads, 0, stream>>>(
+  KernelFusedFock_ssss_warp<false><<<static_cast<unsigned int>(blocks), threads, 0, stream>>>(
       task_spAB, task_spCD, ntasks,
       sp_pair_start, sp_npair,
       pair_eta, pair_Px, pair_Py, pair_Pz, pair_cK,
       sp_A, sp_B, shell_ao_start, nao,
-      D_mat, F_mat, warps_per_block);
+      D_mat, F_mat, warps_per_block, n_bufs);
   return cudaPeekAtLastError();
 }
 
@@ -886,7 +893,8 @@ extern "C" cudaError_t cueri_fused_jk_ssss_launch_stream(
     double* K_mat,
     cudaStream_t stream,
     int threads,
-    bool use_fast_boys) {
+    bool use_fast_boys,
+    int n_bufs) {
   if (ntasks <= 0) return cudaSuccess;
   if (threads < 32 || (threads & 31) != 0) return cudaErrorInvalidValue;
   const int warps_per_block = threads >> 5;
@@ -897,14 +905,14 @@ extern "C" cudaError_t cueri_fused_jk_ssss_launch_stream(
         sp_pair_start, sp_npair,
         pair_eta, pair_Px, pair_Py, pair_Pz, pair_cK,
         sp_A, sp_B, shell_ao_start, nao,
-        D_mat, J_mat, K_mat, warps_per_block);
+        D_mat, J_mat, K_mat, warps_per_block, n_bufs);
   } else {
     KernelFusedJKSsss<false><<<static_cast<unsigned int>(blocks), threads, 0, stream>>>(
         task_spAB, task_spCD, ntasks,
         sp_pair_start, sp_npair,
         pair_eta, pair_Px, pair_Py, pair_Pz, pair_cK,
         sp_A, sp_B, shell_ao_start, nao,
-        D_mat, J_mat, K_mat, warps_per_block);
+        D_mat, J_mat, K_mat, warps_per_block, n_bufs);
   }
   return cudaPeekAtLastError();
 }

@@ -6,67 +6,140 @@ from typing import Callable, Sequence
 
 import numpy as np
 
+from asuka.cuda._backend_caps import (
+    device_info as _device_info_runtime,
+    has_build_w_from_epq_transpose_range_mm as _has_build_w_from_epq_transpose_range_mm_runtime,
+    has_build_w_from_epq_transpose_range_mm_scaled as _has_build_w_from_epq_transpose_range_mm_scaled_runtime,
+    has_cuda_ext as _has_cuda_ext_runtime,
+    has_epq_table_device_build as _has_epq_table_device_build_runtime,
+    has_epq_table_device_build_recompute as _has_epq_table_device_build_recompute_runtime,
+    has_epq_table_gather_apply_device as _has_epq_table_gather_apply_device_runtime,
+    has_t_from_epq_table_device_build as _has_t_from_epq_table_device_build_runtime,
+    mem_info as _mem_info_runtime,
+)
+from asuka.cuda._backend_epq_config import (
+    EPQ_I32_MAX_NNZ as _EPQ_I32_MAX_NNZ,
+    epq_indptr_cp_dtype_for_total_nnz as _epq_indptr_cp_dtype_for_total_nnz,
+    normalize_epq_blocked_transpose_mode as _normalize_epq_blocked_transpose_mode,
+    normalize_epq_indptr_mode as _normalize_epq_indptr_mode,
+    normalize_matvec_cuda_path_mode as _normalize_matvec_cuda_path_mode,
+    resolve_epq_blocked_transpose_mode_with_env as _resolve_epq_blocked_transpose_mode_with_env,
+    resolve_epq_blocked_transpose_reserve_mib_with_env as _resolve_epq_blocked_transpose_reserve_mib_with_env,
+)
+from asuka.cuda._backend_epq_table import (
+    init_workspace_epq_table as _init_workspace_epq_table,
+)
+from asuka.cuda._backend_workspace_config import (
+    resolve_apply_warp_coop as _resolve_apply_warp_coop,
+    resolve_check_overflow_mode as _resolve_check_overflow_mode,
+    resolve_epq_stream_double_buffer_mode as _resolve_epq_stream_double_buffer_mode,
+    resolve_epq_stream_panic_mode as _resolve_epq_stream_panic_mode,
+    resolve_epq_stream_use_recompute as _resolve_epq_stream_use_recompute,
+)
+from asuka.cuda._backend_workspace_policy import (
+    resolve_cache_csr_tiles as _resolve_cache_csr_tiles,
+    resolve_csr_host_cache_enabled as _resolve_csr_host_cache_enabled,
+    resolve_csr_host_cache_mode as _resolve_csr_host_cache_mode,
+    resolve_csr_pipeline_enabled as _resolve_csr_pipeline_enabled,
+    resolve_csr_pipeline_streams as _resolve_csr_pipeline_streams,
+    resolve_epq_apply_cache_budget_gib as _resolve_epq_apply_cache_budget_gib,
+    resolve_epq_apply_cache_enabled as _resolve_epq_apply_cache_enabled,
+    resolve_epq_apply_cache_mode as _resolve_epq_apply_cache_mode,
+    resolve_fp32_csr_cache as _resolve_fp32_csr_cache,
+    resolve_prefilter_trivial_tasks_enabled as _resolve_prefilter_trivial_tasks_enabled,
+    resolve_prefilter_trivial_tasks_mode as _resolve_prefilter_trivial_tasks_mode,
+    resolve_skip_zero_x_tiles_enabled as _resolve_skip_zero_x_tiles_enabled,
+    resolve_skip_zero_x_tiles_mode as _resolve_skip_zero_x_tiles_mode,
+)
+from asuka.cuda._backend_workspace_alloc import (
+    build_workspace_cache_state as _build_workspace_cache_state,
+    make_occ_buf_dtype as _make_occ_buf_dtype,
+    resolve_workspace_nrows_block as _resolve_workspace_nrows_block,
+)
+from asuka.cuda._backend_csr_pipeline import (
+    grow_csr_pipeline_slot as _grow_csr_pipeline_slot_runtime,
+    init_csr_pipeline_slots as _init_csr_pipeline_slots_runtime,
+)
+from asuka.cuda._backend_workspace_utils import (
+    csr_cache_ready as _csr_cache_ready_runtime,
+    estimate_object_nbytes as _estimate_object_nbytes_runtime,
+    release_tile_csr_scratch as _release_tile_csr_scratch_runtime,
+    release_workspace_resources as _release_workspace_resources_runtime,
+    workspace_nbytes_estimate_from_dict as _workspace_nbytes_estimate_from_dict_runtime,
+)
+from asuka.cuda._backend_cache_runtime import (
+    csr_host_cache_load_tile as _csr_host_cache_load_tile_runtime,
+    csr_host_cache_store_tile as _csr_host_cache_store_tile_runtime,
+    csr_host_cache_try_admit as _csr_host_cache_try_admit_runtime,
+    csr_host_entry_bytes as _csr_host_entry_bytes_runtime,
+    epq_apply_cache_load as _epq_apply_cache_load_runtime,
+    epq_apply_cache_store as _epq_apply_cache_store_runtime,
+    epq_apply_ensure_staging as _epq_apply_ensure_staging_runtime,
+)
+from asuka.cuda._backend_offdiag_setup import (
+    init_sym_pair_setup as _init_sym_pair_setup,
+    resolve_w_offdiag_prefer_blocked as _resolve_w_offdiag_prefer_blocked,
+)
+from asuka.cuda._backend_offdiag_workspace import (
+    autoset_offdiag_cublas_workspace_with_backoff as _autoset_offdiag_cublas_workspace_with_backoff,
+    configure_offdiag_gemm_workspace as _configure_offdiag_gemm_workspace,
+)
+from asuka.cuda._backend_hop_runtime import (
+    build_epq_stream_tile as _build_epq_stream_tile_runtime,
+    normalize_hop_x as _normalize_hop_x_runtime,
+    prepare_hop_runtime_inputs as _prepare_hop_runtime_inputs_runtime,
+    resolve_hop_runtime_flags as _resolve_hop_runtime_flags_runtime,
+    try_cuda_graph_fast_path as _try_cuda_graph_fast_path_runtime,
+)
 from asuka.cuguga.drt import DRT
 from asuka.cuguga.epq.action import epq_apply_g, epq_contribs_one, path_nodes
 from asuka.cuguga.oracle import _child_prefix_walks
 from asuka.cuguga.state_cache import DRTStateCache, get_state_cache
+from asuka.kernels import guga as guga_kernels
 
-try:  # optional CUDA extension
-    from asuka import _guga_cuda_ext as _ext
-except Exception:  # pragma: no cover
-    _ext = None
+_ext = guga_kernels.load_ext()
 
 
 def has_cuda_ext() -> bool:
-    return _ext is not None
+    return _has_cuda_ext_runtime(_ext)
 
 
 def has_epq_table_device_build() -> bool:
     """Return True if the CUDA extension exposes the epq-table device-build entrypoints."""
-
-    return _ext is not None and hasattr(_ext, "epq_contribs_many_count_allpairs_inplace_device")
+    return _has_epq_table_device_build_runtime(_ext)
 
 
 def has_epq_table_device_build_recompute() -> bool:
     """Return True if the CUDA extension exposes on-the-fly state recompute EPQ build entrypoints."""
-
-    return _ext is not None and hasattr(_ext, "epq_contribs_many_count_allpairs_recompute_inplace_device")
+    return _has_epq_table_device_build_recompute_runtime(_ext)
 
 
 def has_t_from_epq_table_device_build() -> bool:
     """Return True if the CUDA extension exposes the T-from-epq-table entrypoint."""
-
-    return _ext is not None and hasattr(_ext, "build_t_from_epq_table_inplace_device")
+    return _has_t_from_epq_table_device_build_runtime(_ext)
 
 
 def has_epq_table_gather_apply_device() -> bool:
     """Return True if the CUDA extension exposes the EPQ-table destination-gather apply entrypoint."""
-
-    return _ext is not None and hasattr(_ext, "apply_g_flat_gather_epq_table_inplace_device")
+    return _has_epq_table_gather_apply_device_runtime(_ext)
 
 
 def has_build_w_from_epq_transpose_range_mm_scaled() -> bool:
     """Return True if the CUDA extension exposes the mm-scaled EPQ transpose-range W builder."""
-
-    return _ext is not None and hasattr(_ext, "build_w_from_epq_transpose_range_mm_scaled_inplace_device")
+    return _has_build_w_from_epq_transpose_range_mm_scaled_runtime(_ext)
 
 
 def has_build_w_from_epq_transpose_range_mm() -> bool:
     """Return True if the CUDA extension exposes the mm EPQ transpose-range W builder."""
-
-    return _ext is not None and hasattr(_ext, "build_w_from_epq_transpose_range_mm_inplace_device")
+    return _has_build_w_from_epq_transpose_range_mm_runtime(_ext)
 
 
 def device_info() -> dict[str, object]:
-    if _ext is None:
-        raise RuntimeError("CUDA extension not available; build with python -m asuka.build.guga_cuda_ext")
-    return dict(_ext.device_info())
+    return _device_info_runtime(_ext)
 
 
 def mem_info() -> dict[str, int]:
-    if _ext is None:
-        raise RuntimeError("CUDA extension not available; build with python -m asuka.build.guga_cuda_ext")
-    return dict(_ext.mem_info())
+    return _mem_info_runtime(_ext)
 
 
 def ell_spmv_f64_inplace_device(
@@ -3184,106 +3257,6 @@ def _validate_epq_pq_capacity(cp, arr, *, norb: int, name: str = "epq_pq") -> No
         raise ValueError(f"{name} dtype uint8 is too small for norb={int(norb)}")
     if dt == cp.dtype(cp.uint16) and nops > 65535:
         raise ValueError(f"{name} dtype uint16 is too small for norb={int(norb)}")
-
-
-_EPQ_I32_MAX_NNZ = int(np.iinfo(np.int32).max)
-
-
-def _normalize_epq_indptr_mode(indptr_dtype) -> str:
-    """Normalize EPQ indptr dtype selector to one of: auto|int32|int64."""
-    if indptr_dtype is None:
-        return "auto"
-    if isinstance(indptr_dtype, str):
-        mode = indptr_dtype.strip().lower()
-        if mode in ("", "auto"):
-            return "auto"
-        if mode in ("int32", "i4"):
-            return "int32"
-        if mode in ("int64", "i8"):
-            return "int64"
-        raise ValueError("indptr_dtype must be one of: auto, int32, int64")
-    dt = np.dtype(indptr_dtype)
-    if dt == np.dtype(np.int32):
-        return "int32"
-    if dt == np.dtype(np.int64):
-        return "int64"
-    raise ValueError("indptr_dtype must be one of: auto, int32, int64")
-
-
-def _normalize_epq_blocked_transpose_mode(mode) -> str:
-    """Normalize blocked EPQ transpose mode to one of: auto|on|off."""
-    if mode is None:
-        return "auto"
-    if isinstance(mode, str):
-        m = mode.strip().lower()
-        if m in ("", "auto"):
-            return "auto"
-        if m in ("on", "true", "1", "yes", "force", "transpose"):
-            return "on"
-        if m in ("off", "false", "0", "no", "disable", "disabled", "fallback"):
-            return "off"
-        raise ValueError("epq_blocked_transpose must be one of: auto, on, off")
-    return "on" if bool(mode) else "off"
-
-
-def _resolve_epq_blocked_transpose_mode_with_env(mode, env_mode) -> str:
-    """Resolve blocked-transpose mode using env when caller leaves mode in auto/default."""
-    env = str(env_mode or "").strip()
-    raw = mode
-    if env:
-        raw_s = str(raw).strip().lower() if raw is not None else ""
-        if raw is None or raw_s in ("", "auto"):
-            raw = env
-    return _normalize_epq_blocked_transpose_mode(raw)
-
-
-def _resolve_epq_blocked_transpose_reserve_mib_with_env(reserve_mib, env_reserve_mib) -> int:
-    """Resolve reserve MiB using env when caller leaves default/auto-like reserve."""
-    raw = 512 if reserve_mib is None else int(reserve_mib)
-    env = str(env_reserve_mib or "").strip()
-    if env and (reserve_mib is None or int(raw) <= 0 or int(raw) == 512):
-        try:
-            raw = int(env)
-        except Exception as e:
-            raise ValueError("ASUKA_CUGUGA_EPQ_BLOCKED_TRANSPOSE_RESERVE_MIB must be an integer") from e
-    return max(0, int(raw))
-
-
-def _normalize_matvec_cuda_path_mode(mode) -> str:
-    """Normalize CUDA matvec path mode to one of: auto|epq_blocked|fused_epq_hybrid."""
-    if mode is None:
-        return "auto"
-    m = str(mode).strip().lower()
-    if m in ("", "auto"):
-        return "auto"
-    if m in ("fused_coo", "fused-coo", "coo"):
-        raise ValueError(
-            "matvec_cuda_path_mode='fused_coo' is disabled (no-go path due to performance). "
-            "Use 'auto', 'fused_epq_hybrid', or 'epq_blocked'."
-        )
-    if m in ("epq_blocked", "epq-blocked", "epq"):
-        return "epq_blocked"
-    if m in ("fused_epq_hybrid", "fused-epq-hybrid", "fused_epq"):
-        return "fused_epq_hybrid"
-    raise ValueError("matvec_cuda_path_mode must be one of: auto, epq_blocked, fused_epq_hybrid")
-
-
-def _epq_indptr_cp_dtype_for_total_nnz(cp, *, mode: str, total_nnz: int):
-    """Resolve concrete CuPy dtype for EPQ indptr under runtime nnz guard."""
-    total_nnz = int(total_nnz)
-    if total_nnz < 0:
-        raise ValueError("total_nnz must be >= 0")
-    if mode == "int64":
-        return cp.int64
-    if mode == "int32":
-        if total_nnz > _EPQ_I32_MAX_NNZ:
-            raise ValueError(
-                f"indptr_dtype=int32 requires total_nnz <= {_EPQ_I32_MAX_NNZ}, got {total_nnz}"
-            )
-        return cp.int32
-    if total_nnz <= _EPQ_I32_MAX_NNZ:
-        return cp.int32
-    return cp.int64
 
 
 def _as_epq_indptr_array(cp, arr, *, ncsf: int, name: str = "epq_indptr"):
@@ -7377,59 +7350,20 @@ class GugaMatvecEriMatWorkspace:
         if self.epq_stream_pq_block < 0:
             raise ValueError("epq_stream_pq_block must be >= 0")
 
-        if epq_stream_double_buffer is None:
-            env_epq_stream_db = str(os.getenv("ASUKA_CUGUGA_EPQ_STREAM_DOUBLE_BUFFER", "")).strip().lower()
-            if env_epq_stream_db in ("", "auto"):
-                self.epq_stream_double_buffer_mode = "auto"
-            elif env_epq_stream_db in ("1", "true", "yes", "on"):
-                self.epq_stream_double_buffer_mode = "on"
-            elif env_epq_stream_db in ("0", "false", "no", "off"):
-                self.epq_stream_double_buffer_mode = "off"
-            else:
-                raise ValueError("ASUKA_CUGUGA_EPQ_STREAM_DOUBLE_BUFFER must be auto/0/1")
-        elif isinstance(epq_stream_double_buffer, str):
-            _db_mode = epq_stream_double_buffer.strip().lower()
-            if _db_mode not in ("auto", "on", "off"):
-                raise ValueError("epq_stream_double_buffer must be bool or one of: auto/on/off")
-            self.epq_stream_double_buffer_mode = _db_mode
-        else:
-            self.epq_stream_double_buffer_mode = "on" if bool(epq_stream_double_buffer) else "off"
+        self.epq_stream_double_buffer_mode = _resolve_epq_stream_double_buffer_mode(
+            epq_stream_double_buffer,
+            os.getenv("ASUKA_CUGUGA_EPQ_STREAM_DOUBLE_BUFFER", ""),
+        )
 
-        if epq_stream_panic_mode is None:
-            env_epq_stream_panic = str(os.getenv("ASUKA_CUGUGA_EPQ_STREAM_PANIC_MODE", "")).strip().lower()
-            if env_epq_stream_panic in ("", "auto"):
-                self.epq_stream_panic_mode = "auto"
-            elif env_epq_stream_panic in ("1", "true", "yes", "on"):
-                self.epq_stream_panic_mode = "on"
-            elif env_epq_stream_panic in ("0", "false", "no", "off"):
-                self.epq_stream_panic_mode = "off"
-            else:
-                raise ValueError("ASUKA_CUGUGA_EPQ_STREAM_PANIC_MODE must be auto/0/1")
-        elif isinstance(epq_stream_panic_mode, str):
-            _panic_mode = epq_stream_panic_mode.strip().lower()
-            if _panic_mode not in ("auto", "on", "off"):
-                raise ValueError("epq_stream_panic_mode must be bool or one of: auto/on/off")
-            self.epq_stream_panic_mode = _panic_mode
-        else:
-            self.epq_stream_panic_mode = "on" if bool(epq_stream_panic_mode) else "off"
+        self.epq_stream_panic_mode = _resolve_epq_stream_panic_mode(
+            epq_stream_panic_mode,
+            os.getenv("ASUKA_CUGUGA_EPQ_STREAM_PANIC_MODE", ""),
+        )
 
-        if epq_stream_use_recompute is None:
-            env_recompute = str(os.getenv("ASUKA_CUGUGA_EPQ_STREAM_RECOMPUTE", "")).strip().lower()
-            if env_recompute in ("", "auto"):
-                self.epq_stream_use_recompute: bool | str = "auto"
-            elif env_recompute in ("1", "true", "yes", "on"):
-                self.epq_stream_use_recompute = True
-            elif env_recompute in ("0", "false", "no", "off"):
-                self.epq_stream_use_recompute = False
-            else:
-                raise ValueError("ASUKA_CUGUGA_EPQ_STREAM_RECOMPUTE must be auto/0/1")
-        elif isinstance(epq_stream_use_recompute, str):
-            mode = epq_stream_use_recompute.strip().lower()
-            if mode != "auto":
-                raise ValueError("epq_stream_use_recompute must be bool or 'auto'")
-            self.epq_stream_use_recompute = "auto"
-        else:
-            self.epq_stream_use_recompute = bool(epq_stream_use_recompute)
+        self.epq_stream_use_recompute = _resolve_epq_stream_use_recompute(
+            epq_stream_use_recompute,
+            os.getenv("ASUKA_CUGUGA_EPQ_STREAM_RECOMPUTE", ""),
+        )
 
         if epq_recompute_warp_coop is None:
             env_warp_coop = str(os.getenv("ASUKA_CUGUGA_EPQ_RECOMPUTE_WARP_COOP", "")).strip().lower()
@@ -7451,24 +7385,10 @@ class GugaMatvecEriMatWorkspace:
 
         # 10.16.3/10.18 Option A: Warp-cooperative segment walk kernel for apply path.
         # This eliminates per-thread DFS stack spills by distributing the segment walk across warp lanes.
-        if apply_warp_coop is None:
-            env_apply_warp_coop = str(os.getenv("ASUKA_CUGUGA_APPLY_WARP_COOP", "")).strip().lower()
-            if env_apply_warp_coop in ("", "auto"):
-                # Auto mode: enable warp-coop for larger norb where local memory traffic is a bottleneck
-                self.apply_warp_coop: bool | str = "auto"
-            elif env_apply_warp_coop in ("1", "true", "yes", "on"):
-                self.apply_warp_coop = True
-            elif env_apply_warp_coop in ("0", "false", "no", "off"):
-                self.apply_warp_coop = False
-            else:
-                raise ValueError("ASUKA_CUGUGA_APPLY_WARP_COOP must be auto/0/1")
-        elif isinstance(apply_warp_coop, str):
-            mode = apply_warp_coop.strip().lower()
-            if mode not in ("auto",):
-                raise ValueError("apply_warp_coop must be bool or 'auto'")
-            self.apply_warp_coop = "auto"
-        else:
-            self.apply_warp_coop = bool(apply_warp_coop)
+        self.apply_warp_coop = _resolve_apply_warp_coop(
+            apply_warp_coop,
+            os.getenv("ASUKA_CUGUGA_APPLY_WARP_COOP", ""),
+        )
 
         self.epq_table_build_s = 0.0
         self.use_cuda_graph = bool(use_cuda_graph)
@@ -7489,20 +7409,7 @@ class GugaMatvecEriMatWorkspace:
         self._cuda_graph_y = None
 
         self.check_overflow_first_tile_only = bool(check_overflow_first_tile_only)
-        if isinstance(check_overflow_mode, str):
-            mode = check_overflow_mode.strip().lower()
-            if mode in ("none", "off", "0", "false", "no"):
-                self.check_overflow_mode = 0
-            elif mode in ("deferred", "1", "true", "yes", "on"):
-                self.check_overflow_mode = 1
-            elif mode in ("per-stage", "per_stage", "stage", "staged", "2"):
-                self.check_overflow_mode = 2
-            else:
-                raise ValueError("check_overflow_mode must be one of: none, deferred, per-stage")
-        else:
-            self.check_overflow_mode = int(check_overflow_mode)
-            if self.check_overflow_mode not in (0, 1, 2):
-                raise ValueError("check_overflow_mode must be 0 (none), 1 (deferred), or 2 (per-stage)")
+        self.check_overflow_mode = _resolve_check_overflow_mode(check_overflow_mode)
         # Phase 2A (optional): fuse kernel2b count+write into one allpairs pass.
         self.fuse_count_write = bool(fuse_count_write)
         # Phase 2B (optional): use FP32 CSR coefficient buffers in FP32 mode.
@@ -7559,34 +7466,21 @@ class GugaMatvecEriMatWorkspace:
         self.csr_capacity_mult = float(csr_capacity_mult)
         if self.csr_capacity_mult <= 0.0:
             raise ValueError("csr_capacity_mult must be > 0")
-        # 10.16.2: Auto-enable CSR caching based on memory estimation for multi-tile problems.
-        if isinstance(cache_csr_tiles, str) and cache_csr_tiles.lower() == "auto":
-            # Auto-enable when: multi-tile, estimated cache fits in reasonable GPU memory,
-            # and not in FP32 mode (FP32 CSR caching needs investigation).
-            jt = int(self.j_tile)
-            ncsf = int(drt.ncsf)
-            is_multi_tile = jt < ncsf
-            if is_multi_tile:
-                ntiles = (ncsf + jt - 1) // jt
-                norb = int(drt.norb)
-                n_pairs = norb * (norb - 1)
-                # Estimate CSR bytes per tile: ~28 bytes per entry (row_j, row_k, indptr, indices, data)
-                avg_nnz_per_tile = int(float(jt) * float(n_pairs) * max(1.0, float(self.csr_capacity_mult)))
-                est_cache_bytes = ntiles * avg_nnz_per_tile * 28
-                # Enable caching if: <=32 tiles and estimated <= 2GB
-                self.cache_csr_tiles = bool(ntiles <= 32 and est_cache_bytes <= 2 * 1024 * 1024 * 1024)
-            else:
-                self.cache_csr_tiles = False
-        else:
-            self.cache_csr_tiles = bool(cache_csr_tiles)
+        self.cache_csr_tiles = _resolve_cache_csr_tiles(
+            cache_csr_tiles,
+            j_tile=int(self.j_tile),
+            ncsf=int(drt.ncsf),
+            norb=int(drt.norb),
+            csr_capacity_mult=float(self.csr_capacity_mult),
+        )
 
         # 10.20.4 Item #2: Store cached CSR tile data in FP32 for FP32 workspaces.
         # This halves the memory for cached tiles. The scratch buffer remains FP64
         # (for kernel25 precision), but we cast to FP32 before caching.
-        if isinstance(fp32_csr_cache, str) and fp32_csr_cache.lower() == "auto":
-            self.fp32_csr_cache = bool(self._dtype == cp.float32)
-        else:
-            self.fp32_csr_cache = bool(fp32_csr_cache)
+        self.fp32_csr_cache = _resolve_fp32_csr_cache(
+            fp32_csr_cache,
+            dtype_is_float32=bool(self._dtype == cp.float32),
+        )
 
         # Phase 3B (host-side CSR caching):
         # Keep selected CSR tiles in pinned host memory and upload on later hops.
@@ -7595,88 +7489,40 @@ class GugaMatvecEriMatWorkspace:
         self.csr_host_cache_budget_gib = max(0.0, float(csr_host_cache_budget_gib))
         self.csr_host_cache_budget_bytes = int(self.csr_host_cache_budget_gib * 1024 * 1024 * 1024)
         self.csr_host_cache_min_ncsf = max(1, int(csr_host_cache_min_ncsf))
-        if isinstance(csr_host_cache, str):
-            _host_mode = csr_host_cache.strip().lower()
-            if _host_mode in ("", "auto"):
-                self.csr_host_cache_mode = "auto"
-            elif _host_mode in ("1", "true", "yes", "on", "host", "enabled"):
-                self.csr_host_cache_mode = "on"
-            elif _host_mode in ("0", "false", "no", "off", "none", "disabled"):
-                self.csr_host_cache_mode = "off"
-            else:
-                raise ValueError("csr_host_cache must be bool or one of: auto/on/off")
-        else:
-            self.csr_host_cache_mode = "on" if bool(csr_host_cache) else "off"
+        self.csr_host_cache_mode = _resolve_csr_host_cache_mode(csr_host_cache)
 
-        self.csr_host_cache_enabled = False
-        if self.csr_host_cache_mode == "on":
-            self.csr_host_cache_enabled = bool(
-                int(self.j_tile) < int(self.ncsf)
-                and int(self.csr_host_cache_budget_bytes) > 0
-                and not (bool(self.aggregate_offdiag_k) and bool(self.use_epq_table))
-            )
-        elif self.csr_host_cache_mode == "auto":
-            self.csr_host_cache_enabled = bool(
-                int(self.j_tile) < int(self.ncsf)
-                and int(self.ncsf) >= int(self.csr_host_cache_min_ncsf)
-                and not bool(self.cache_csr_tiles)
-                and int(self.csr_host_cache_budget_bytes) > 0
-                and not (bool(self.aggregate_offdiag_k) and bool(self.use_epq_table))
-            )
+        self.csr_host_cache_enabled = _resolve_csr_host_cache_enabled(
+            mode=str(self.csr_host_cache_mode),
+            j_tile=int(self.j_tile),
+            ncsf=int(self.ncsf),
+            budget_bytes=int(self.csr_host_cache_budget_bytes),
+            min_ncsf=int(self.csr_host_cache_min_ncsf),
+            cache_csr_tiles=bool(self.cache_csr_tiles),
+            aggregate_offdiag_k=bool(self.aggregate_offdiag_k),
+            use_epq_table=bool(self.use_epq_table),
+        )
 
         # EPQ apply tile cache: host-pinned cache for streaming EPQ tiles used by
         # the aggregate post-loop apply.  On the first hop, tiles are built on device
         # and copied to host; on subsequent hops they are replayed from host, avoiding
         # costly DFS walks.
-        env_epq_apply_cache = str(os.getenv("ASUKA_CUGUGA_EPQ_APPLY_CACHE", "")).strip()
-        if env_epq_apply_cache:
-            _eac_raw = "" if epq_apply_cache is None else str(epq_apply_cache).strip().lower()
-            if _eac_raw in ("", "auto"):
-                epq_apply_cache = env_epq_apply_cache
-        env_epq_apply_cache_budget_gib = str(os.getenv("ASUKA_CUGUGA_EPQ_APPLY_CACHE_BUDGET_GIB", "")).strip()
-        if env_epq_apply_cache_budget_gib:
-            try:
-                _eac_budget_in = 4.0 if epq_apply_cache_budget_gib is None else float(epq_apply_cache_budget_gib)
-            except Exception as e:
-                raise ValueError("epq_apply_cache_budget_gib must be a float") from e
-            if epq_apply_cache_budget_gib is None or _eac_budget_in <= 0.0 or abs(_eac_budget_in - 4.0) < 1e-12:
-                try:
-                    epq_apply_cache_budget_gib = float(env_epq_apply_cache_budget_gib)
-                except Exception as e:
-                    raise ValueError("ASUKA_CUGUGA_EPQ_APPLY_CACHE_BUDGET_GIB must be a float") from e
-        self.epq_apply_cache_budget_gib = max(0.0, float(epq_apply_cache_budget_gib))
+        self.epq_apply_cache_budget_gib = _resolve_epq_apply_cache_budget_gib(
+            epq_apply_cache_budget_gib,
+            os.getenv("ASUKA_CUGUGA_EPQ_APPLY_CACHE_BUDGET_GIB", ""),
+        )
         self.epq_apply_cache_budget_bytes = int(self.epq_apply_cache_budget_gib * 1024 * 1024 * 1024)
-        if isinstance(epq_apply_cache, str):
-            _eac_mode = epq_apply_cache.strip().lower()
-            if _eac_mode in ("", "auto"):
-                self.epq_apply_cache_mode = "auto"
-            elif _eac_mode in ("1", "true", "yes", "on", "enabled"):
-                self.epq_apply_cache_mode = "on"
-            elif _eac_mode in ("0", "false", "no", "off", "none", "disabled"):
-                self.epq_apply_cache_mode = "off"
-            else:
-                raise ValueError("epq_apply_cache must be bool or one of: auto/on/off")
-        else:
-            self.epq_apply_cache_mode = "on" if bool(epq_apply_cache) else "off"
-
-        self.epq_apply_cache_enabled = False
-        if self.epq_apply_cache_mode == "on":
-            self.epq_apply_cache_enabled = bool(
-                bool(self.aggregate_offdiag_k)
-                and int(self.epq_apply_cache_budget_bytes) > 0
-                and has_epq_table_device_build()
-            )
-        elif self.epq_apply_cache_mode == "auto":
-            self.epq_apply_cache_enabled = bool(
-                bool(self.aggregate_offdiag_k)
-                and not bool(self.use_epq_table)
-                and int(self.epq_apply_cache_budget_bytes) > 0
-                and has_epq_table_device_build()
-            )
-            # Avoid host-memory thrash: if CSR host-cache is explicitly requested, keep
-            # EPQ apply cache auto-disabled and let CSR host-cache own the budget.
-            if str(getattr(self, "csr_host_cache_mode", "off")) == "on":
-                self.epq_apply_cache_enabled = False
+        self.epq_apply_cache_mode = _resolve_epq_apply_cache_mode(
+            epq_apply_cache,
+            os.getenv("ASUKA_CUGUGA_EPQ_APPLY_CACHE", ""),
+        )
+        self.epq_apply_cache_enabled = _resolve_epq_apply_cache_enabled(
+            mode=str(self.epq_apply_cache_mode),
+            aggregate_offdiag_k=bool(self.aggregate_offdiag_k),
+            use_epq_table=bool(self.use_epq_table),
+            budget_bytes=int(self.epq_apply_cache_budget_bytes),
+            has_epq_table_device_build=bool(has_epq_table_device_build()),
+            csr_host_cache_mode=str(getattr(self, "csr_host_cache_mode", "off")),
+        )
         # Auto arbitration: if EPQ apply cache is active, disable CSR host-cache auto path
         # so both caches do not compete for large pinned-host budgets.
         if bool(self.epq_apply_cache_enabled) and str(getattr(self, "csr_host_cache_mode", "off")) == "auto":
@@ -7686,104 +7532,46 @@ class GugaMatvecEriMatWorkspace:
         # Build CSR on one stream while applying the previous tile on another stream.
         # This is only useful for multi-tile uncached CSR builds.
         self.csr_pipeline_min_ncsf = max(1, int(csr_pipeline_min_ncsf))
-        if isinstance(csr_pipeline_streams, str):
-            _pipe_mode = csr_pipeline_streams.strip().lower()
-            if _pipe_mode in ("", "auto"):
-                self.csr_pipeline_streams_mode = "auto"
-                req_streams = 2
-            elif _pipe_mode in ("off", "none", "0", "false", "no"):
-                self.csr_pipeline_streams_mode = "off"
-                req_streams = 0
-            elif _pipe_mode in ("on", "1", "true", "yes"):
-                self.csr_pipeline_streams_mode = "on"
-                req_streams = 2
-            else:
-                req_streams = int(_pipe_mode)
-                self.csr_pipeline_streams_mode = "manual"
-        else:
-            req_streams = int(csr_pipeline_streams)
-            self.csr_pipeline_streams_mode = "manual"
-        req_streams = max(0, int(req_streams))
-        if req_streams in (0, 1):
-            self.csr_pipeline_streams = 0
-        else:
-            self.csr_pipeline_streams = min(3, int(req_streams))
-
-        self.csr_pipeline_enabled = False
-        if int(self.csr_pipeline_streams) >= 2:
-            if self.csr_pipeline_streams_mode == "auto":
-                self.csr_pipeline_enabled = bool(
-                    int(self.j_tile) < int(self.ncsf)
-                    and int(self.ncsf) >= int(self.csr_pipeline_min_ncsf)
-                    and not bool(self.cache_csr_tiles)
-                    and not bool(self.csr_host_cache_enabled)
-                    and not (bool(self.aggregate_offdiag_k) and bool(self.use_epq_table))
-                )
-            else:
-                self.csr_pipeline_enabled = bool(
-                    int(self.j_tile) < int(self.ncsf)
-                    and not bool(self.cache_csr_tiles)
-                    and not bool(self.csr_host_cache_enabled)
-                    and not (bool(self.aggregate_offdiag_k) and bool(self.use_epq_table))
-                )
+        self.csr_pipeline_streams_mode, self.csr_pipeline_streams = _resolve_csr_pipeline_streams(
+            csr_pipeline_streams
+        )
+        self.csr_pipeline_enabled = _resolve_csr_pipeline_enabled(
+            streams_mode=str(self.csr_pipeline_streams_mode),
+            streams=int(self.csr_pipeline_streams),
+            j_tile=int(self.j_tile),
+            ncsf=int(self.ncsf),
+            min_ncsf=int(self.csr_pipeline_min_ncsf),
+            cache_csr_tiles=bool(self.cache_csr_tiles),
+            csr_host_cache_enabled=bool(self.csr_host_cache_enabled),
+            aggregate_offdiag_k=bool(self.aggregate_offdiag_k),
+            use_epq_table=bool(self.use_epq_table),
+        )
 
         # Phase 2C (optional): pre-filter trivial (j,r,s) tasks using host occupancy checks.
         # This can reduce kernel2b DRT walks by dispatching only non-trivial tasks to the
         # tasks-based CSR builder path.
         self.prefilter_trivial_tasks_min_ncsf = max(1, int(prefilter_trivial_tasks_min_ncsf))
-        if isinstance(prefilter_trivial_tasks, str):
-            _pref_mode = prefilter_trivial_tasks.strip().lower()
-            if _pref_mode in ("", "auto"):
-                self.prefilter_trivial_tasks_mode = "auto"
-            elif _pref_mode in ("1", "true", "yes", "on", "enabled"):
-                self.prefilter_trivial_tasks_mode = "on"
-            elif _pref_mode in ("0", "false", "no", "off", "disabled", "none"):
-                self.prefilter_trivial_tasks_mode = "off"
-            else:
-                raise ValueError("prefilter_trivial_tasks must be bool or one of: auto/on/off")
-        else:
-            self.prefilter_trivial_tasks_mode = "on" if bool(prefilter_trivial_tasks) else "off"
-        if self.prefilter_trivial_tasks_mode == "auto":
-            # In no-EPQ aggregated W@ERI mode, host-side task prefilter often adds
-            # measurable overhead at large CAS and dense Davidson vectors.
-            # Keep manual override (`prefilter_trivial_tasks='on'`) available.
-            disable_prefilter_for_agg_noepq = bool(self.aggregate_offdiag_k) and (not bool(self.use_epq_table))
-            self.prefilter_trivial_tasks_enabled = bool(
-                int(self.j_tile) < int(self.ncsf)
-                and int(self.ncsf) >= int(self.prefilter_trivial_tasks_min_ncsf)
-                and not bool(self.use_epq_table)
-                and not bool(disable_prefilter_for_agg_noepq)
-            )
-        elif self.prefilter_trivial_tasks_mode == "on":
-            self.prefilter_trivial_tasks_enabled = bool(int(self.j_tile) < int(self.ncsf) and not bool(self.use_epq_table))
-        else:
-            self.prefilter_trivial_tasks_enabled = False
+        self.prefilter_trivial_tasks_mode = _resolve_prefilter_trivial_tasks_mode(prefilter_trivial_tasks)
+        self.prefilter_trivial_tasks_enabled = _resolve_prefilter_trivial_tasks_enabled(
+            mode=str(self.prefilter_trivial_tasks_mode),
+            j_tile=int(self.j_tile),
+            ncsf=int(self.ncsf),
+            min_ncsf=int(self.prefilter_trivial_tasks_min_ncsf),
+            use_epq_table=bool(self.use_epq_table),
+            aggregate_offdiag_k=bool(self.aggregate_offdiag_k),
+        )
 
         # Skip two-body j-tiles whose task scales are exactly zero.
         # This is especially valuable for early Davidson vectors (often sparse)
         # while adding minimal overhead for dense vectors (single count_nonzero pass).
         self.skip_zero_x_tiles_min_ncsf = max(1, int(skip_zero_x_tiles_min_ncsf))
-        if isinstance(skip_zero_x_tiles, str):
-            _skip_mode = skip_zero_x_tiles.strip().lower()
-            if _skip_mode in ("", "auto"):
-                self.skip_zero_x_tiles_mode = "auto"
-            elif _skip_mode in ("1", "true", "yes", "on", "enabled"):
-                self.skip_zero_x_tiles_mode = "on"
-            elif _skip_mode in ("0", "false", "no", "off", "disabled", "none"):
-                self.skip_zero_x_tiles_mode = "off"
-            else:
-                raise ValueError("skip_zero_x_tiles must be bool or one of: auto/on/off")
-        else:
-            self.skip_zero_x_tiles_mode = "on" if bool(skip_zero_x_tiles) else "off"
-        if self.skip_zero_x_tiles_mode == "auto":
-            self.skip_zero_x_tiles_enabled = bool(
-                int(self.j_tile) < int(self.ncsf)
-                and int(self.ncsf) >= int(self.skip_zero_x_tiles_min_ncsf)
-            )
-        elif self.skip_zero_x_tiles_mode == "on":
-            self.skip_zero_x_tiles_enabled = bool(int(self.j_tile) < int(self.ncsf))
-        else:
-            self.skip_zero_x_tiles_enabled = False
+        self.skip_zero_x_tiles_mode = _resolve_skip_zero_x_tiles_mode(skip_zero_x_tiles)
+        self.skip_zero_x_tiles_enabled = _resolve_skip_zero_x_tiles_enabled(
+            mode=str(self.skip_zero_x_tiles_mode),
+            j_tile=int(self.j_tile),
+            ncsf=int(self.ncsf),
+            min_ncsf=int(self.skip_zero_x_tiles_min_ncsf),
+        )
 
         if self.epq_streaming:
             if not self.use_epq_table:
@@ -7807,101 +7595,35 @@ class GugaMatvecEriMatWorkspace:
         self.drt_dev = drt_dev
         self.state_dev = state_dev
 
-        self._epq_table = None
-        if self.use_epq_table:
-            t0 = time.perf_counter()
-            if self.epq_streaming:
-                self._epq_table = None
-            elif self.epq_build_device:
-                # If the extension was built without the epq-table device build entrypoints,
-                # silently fall back to the host build path (keeps source checkouts usable
-                # when the extension is out of date).
-                if _ext is None or not hasattr(_ext, "epq_contribs_many_count_allpairs_inplace_device"):
-                    self.epq_build_device = False
-            if (not self.epq_streaming) and self.epq_build_device:
-                jt = int(self.epq_build_j_tile)
-                if jt <= 0:
-                    jt = int(self.j_tile)
-                n_pairs_epq = int(self.norb) * max(0, int(self.norb) - 1)
-                counts_bytes_est = int(self.ncsf) * int(n_pairs_epq) * int(np.dtype(np.int32).itemsize)
-                use_tiled_epq_build = bool(counts_bytes_est >= (512 * 1024 * 1024))
-                try:
-                    if use_tiled_epq_build:
-                        self._epq_table = build_epq_action_table_combined_device_tiled(
-                            drt,
-                            drt_dev,
-                            state_dev,
-                            j_tile=jt,
-                            build_tile=jt,
-                            threads=int(self.threads_enum),
-                            sync=True,
-                            check_overflow=True,
-                            use_cache=True,
-                            recompute_warp_coop=bool(self.epq_recompute_warp_coop),
-                            dtype=self._dtype,
-                            indptr_dtype=self.epq_indptr_dtype,
-                        )
-                    else:
-                        self._epq_table = build_epq_action_table_combined_device(
-                            drt,
-                            drt_dev,
-                            state_dev,
-                            j_tile=jt,
-                            threads=int(self.threads_enum),
-                            sync=True,
-                            check_overflow=True,
-                            use_cache=True,
-                            recompute_warp_coop=bool(self.epq_recompute_warp_coop),
-                            dtype=self._dtype,
-                            indptr_dtype=self.epq_indptr_dtype,
-                        )
-                except AttributeError:
-                    # Likely an out-of-date extension build; fall back to host path.
-                    self.epq_build_device = False
-
-            if (not self.epq_streaming) and (not self.epq_build_device):
-                nt = int(self.epq_build_nthreads)
-                if nt <= 0:
-                    # Heuristic: keep the default modest to avoid overwhelming shared login nodes.
-                    try:
-                        import os
-
-                        nt = max(1, min(8, int(os.cpu_count() or 1)))
-                    except Exception:  # pragma: no cover
-                        nt = 1
-                indptr_h, indices_h, pq_ids_h, data_h = _get_epq_action_table_combined_host(drt, precompute_nthreads=nt)
-                indptr_cp_dtype = _epq_indptr_cp_dtype_for_total_nnz(
-                    cp,
-                    mode=self.epq_indptr_dtype,
-                    total_nnz=int(indptr_h[-1]) if int(indptr_h.size) > 0 else 0,
-                )
-                self._epq_table = (
-                    cp.ascontiguousarray(cp.asarray(indptr_h, dtype=indptr_cp_dtype)),
-                    cp.ascontiguousarray(cp.asarray(indices_h, dtype=cp.int32)),
-                    cp.ascontiguousarray(cp.asarray(pq_ids_h, dtype=cp.int32)),
-                    cp.ascontiguousarray(cp.asarray(data_h, dtype=self._dtype)),
-                )
-            if self._epq_table is not None:
-                epq_indptr, epq_indices, epq_pq, epq_data = self._epq_table
-                epq_indptr = _as_epq_indptr_array(cp, epq_indptr, ncsf=int(self.ncsf), name="epq_indptr")
-                if self.epq_indptr_dtype != "auto":
-                    want_dtype = cp.int32 if self.epq_indptr_dtype == "int32" else cp.int64
-                    if cp.dtype(epq_indptr.dtype) != cp.dtype(want_dtype):
-                        total_nnz = int(cp.asnumpy(epq_indptr[-1])) if int(epq_indptr.size) > 0 else 0
-                        if cp.dtype(want_dtype) == cp.dtype(cp.int32) and total_nnz > _EPQ_I32_MAX_NNZ:
-                            raise RuntimeError(
-                                f"Cannot cast EPQ indptr to int32: total_nnz={total_nnz} exceeds {_EPQ_I32_MAX_NNZ}"
-                            )
-                        epq_indptr = cp.ascontiguousarray(epq_indptr.astype(want_dtype, copy=False))
-                self._epq_table = (
-                    epq_indptr,
-                    cp.ascontiguousarray(cp.asarray(epq_indices, dtype=cp.int32)),
-                    _as_epq_pq_array(cp, epq_pq, name="epq_pq"),
-                    cp.ascontiguousarray(cp.asarray(epq_data, dtype=self._dtype)),
-                )
-            if not self.epq_streaming:
-                cp.cuda.get_current_stream().synchronize()
-                self.epq_table_build_s = float(time.perf_counter() - t0)
+        _epq_tbl = _init_workspace_epq_table(
+            cp=cp,
+            drt=drt,
+            drt_dev=drt_dev,
+            state_dev=state_dev,
+            use_epq_table=bool(self.use_epq_table),
+            epq_streaming=bool(self.epq_streaming),
+            epq_build_device=bool(self.epq_build_device),
+            epq_build_j_tile=int(self.epq_build_j_tile),
+            j_tile=int(self.j_tile),
+            norb=int(self.norb),
+            ncsf=int(self.ncsf),
+            threads_enum=int(self.threads_enum),
+            epq_recompute_warp_coop=bool(self.epq_recompute_warp_coop),
+            dtype=self._dtype,
+            epq_indptr_dtype=str(self.epq_indptr_dtype),
+            epq_build_nthreads=int(self.epq_build_nthreads),
+            ext=_ext,
+            build_device_tiled_fn=build_epq_action_table_combined_device_tiled,
+            build_device_fn=build_epq_action_table_combined_device,
+            build_host_fn=_get_epq_action_table_combined_host,
+            indptr_dtype_resolver_fn=_epq_indptr_cp_dtype_for_total_nnz,
+            as_indptr_array_fn=_as_epq_indptr_array,
+            as_pq_array_fn=_as_epq_pq_array,
+            epq_i32_max_nnz=int(_EPQ_I32_MAX_NNZ),
+        )
+        self._epq_table = _epq_tbl["epq_table"]
+        self.epq_build_device = bool(_epq_tbl["epq_build_device"])
+        self.epq_table_build_s = float(_epq_tbl["epq_table_build_s"])
 
         self.eri_mat = None if eri_mat is None else cp.ascontiguousarray(cp.asarray(eri_mat, dtype=self._dtype))
         self.l_full = None if l_full is None else cp.ascontiguousarray(cp.asarray(l_full, dtype=self._dtype))
@@ -7956,130 +7678,88 @@ class GugaMatvecEriMatWorkspace:
 
         # CSR buffers (reused); allocate to the initial capacity for the configured j_tile.
         self._alloc_csr_buffers(capacity=self._initial_csr_capacity())
-        self._csr_single_tile_cache = None
-        self._csr_tile_cache: dict[int, tuple[object, object, object, object, object, int, int]] = {}
-        self._csr_host_tile_cache: dict[int, dict[str, object]] = {}
-        self._csr_host_cache_bytes = 0
-        self._csr_host_cache_hits = 0
-        self._csr_host_cache_misses = 0
-        self._csr_host_cache_store_attempts = 0
-        self._csr_host_cache_store_accepts = 0
-        self._csr_host_cache_evictions = 0
-
-        # EPQ apply tile cache (host-side, pinned).
-        # Stores per-k-block EPQ tiles built on the first hop for replay on later hops.
-        self._epq_apply_tile_cache: dict[int, dict[str, object]] = {}
-        self._epq_apply_cache_bytes: int = 0
-        self._epq_apply_cache_hits: int = 0
-        self._epq_apply_cache_misses: int = 0
-        # Device staging buffers for H2D uploads (reused across loads).
-        self._epq_apply_staging_capacity: int = 0
-        self._epq_apply_staging_indptr = None
-        self._epq_apply_staging_indices = None
-        self._epq_apply_staging_pq_ids = None
-        self._epq_apply_staging_data = None
-
-        # Phase 3A: optional CSR build/apply pipeline resources.
-        self._csr_pipeline_slots: list[dict[str, object]] = []
-        self._csr_pipeline_apply_stream = None
-
-        # 10.16.1: Pre-allocate tile CSR buffers for multi-tile caching to avoid hot-loop allocations.
-        self._tile_csr_row_j = None
-        self._tile_csr_row_k = None
-        self._tile_csr_indptr = None
-        self._tile_csr_indices = None
-        self._tile_csr_data = None
-        self._tile_csr_overflow = None
-        self._tile_csr_capacity = 0
-        if self.cache_csr_tiles and int(self.j_tile) < int(self.ncsf):
-            n_pairs = int(self._rs_n_pairs) if hasattr(self, "_rs_n_pairs") else int(self.norb) * (int(self.norb) - 1)
-            tile_cap = int(max(1.0, float(self.csr_capacity_mult)) * float(int(self.j_tile)) * float(n_pairs))
-            self._tile_csr_row_j = cp.empty((tile_cap,), dtype=cp.int32)
-            self._tile_csr_row_k = cp.empty((tile_cap,), dtype=cp.int32)
-            self._tile_csr_indptr = cp.empty((tile_cap + 1,), dtype=cp.int64)
-            self._tile_csr_indices = cp.empty((tile_cap,), dtype=cp.int32)
-            self._tile_csr_data = cp.empty((tile_cap,), dtype=self._csr_data_dtype)
-            self._tile_csr_overflow = cp.empty((1,), dtype=cp.int32)
-            self._tile_csr_capacity = tile_cap
+        _cache_state = _build_workspace_cache_state(
+            cp=cp,
+            cache_csr_tiles=bool(self.cache_csr_tiles),
+            j_tile=int(self.j_tile),
+            ncsf=int(self.ncsf),
+            csr_capacity_mult=float(self.csr_capacity_mult),
+            rs_n_pairs=int(self._rs_n_pairs) if hasattr(self, "_rs_n_pairs") else None,
+            norb=int(self.norb),
+            csr_data_dtype=self._csr_data_dtype,
+        )
+        self._csr_single_tile_cache = _cache_state["_csr_single_tile_cache"]
+        self._csr_tile_cache = _cache_state["_csr_tile_cache"]
+        self._csr_host_tile_cache = _cache_state["_csr_host_tile_cache"]
+        self._csr_host_cache_bytes = _cache_state["_csr_host_cache_bytes"]
+        self._csr_host_cache_hits = _cache_state["_csr_host_cache_hits"]
+        self._csr_host_cache_misses = _cache_state["_csr_host_cache_misses"]
+        self._csr_host_cache_store_attempts = _cache_state["_csr_host_cache_store_attempts"]
+        self._csr_host_cache_store_accepts = _cache_state["_csr_host_cache_store_accepts"]
+        self._csr_host_cache_evictions = _cache_state["_csr_host_cache_evictions"]
+        self._epq_apply_tile_cache = _cache_state["_epq_apply_tile_cache"]
+        self._epq_apply_cache_bytes = _cache_state["_epq_apply_cache_bytes"]
+        self._epq_apply_cache_hits = _cache_state["_epq_apply_cache_hits"]
+        self._epq_apply_cache_misses = _cache_state["_epq_apply_cache_misses"]
+        self._epq_apply_staging_capacity = _cache_state["_epq_apply_staging_capacity"]
+        self._epq_apply_staging_indptr = _cache_state["_epq_apply_staging_indptr"]
+        self._epq_apply_staging_indices = _cache_state["_epq_apply_staging_indices"]
+        self._epq_apply_staging_pq_ids = _cache_state["_epq_apply_staging_pq_ids"]
+        self._epq_apply_staging_data = _cache_state["_epq_apply_staging_data"]
+        self._csr_pipeline_slots = _cache_state["_csr_pipeline_slots"]
+        self._csr_pipeline_apply_stream = _cache_state["_csr_pipeline_apply_stream"]
+        self._tile_csr_row_j = _cache_state["_tile_csr_row_j"]
+        self._tile_csr_row_k = _cache_state["_tile_csr_row_k"]
+        self._tile_csr_indptr = _cache_state["_tile_csr_indptr"]
+        self._tile_csr_indices = _cache_state["_tile_csr_indices"]
+        self._tile_csr_data = _cache_state["_tile_csr_data"]
+        self._tile_csr_overflow = _cache_state["_tile_csr_overflow"]
+        self._tile_csr_capacity = _cache_state["_tile_csr_capacity"]
 
         self._init_csr_pipeline_slots()
 
         # 10.16.4: Pre-convert occupancy buffer to workspace dtype to avoid per-tile astype() allocations.
-        self._occ_buf_dtype = None
-        if self._dtype != cp.float64:
-            self._occ_buf_dtype = cp.empty((int(self.j_tile), int(self.norb)), dtype=self._dtype)
+        self._occ_buf_dtype = _make_occ_buf_dtype(
+            cp=cp,
+            dtype=self._dtype,
+            j_tile=int(self.j_tile),
+            norb=int(self.norb),
+        )
 
         # Temporary g buffer for Kernel4 row blocks.
-        bytes_per_row = int(self.nops) * int(self._itemsize)
-        # DF build-g requires an additional dense W buffer of size (nrows, naux).
-        if self.eri_mat is None and self.l_full is not None:
-            bytes_per_row += int(self.naux) * int(self._itemsize)
-        nrows_block = max(1, int(self.max_g_bytes // max(1, bytes_per_row)))
-        # Never allocate row-block workspaces larger than the CI dimension.
-        # This avoids multi-hundred-MB buffers for tiny active spaces (e.g. CAS(2,2)),
-        # where `nrows_eff = min(ncsf, nrows_block)` would otherwise waste VRAM.
-        try:
-            nrows_block = max(1, min(int(nrows_block), int(self.ncsf)))
-        except Exception:
-            pass
+        nrows_block = _resolve_workspace_nrows_block(
+            max_g_bytes=int(self.max_g_bytes),
+            nops=int(self.nops),
+            itemsize=int(self._itemsize),
+            ncsf=int(self.ncsf),
+            eri_mat_present=bool(self.eri_mat is not None),
+            l_full_present=bool(self.l_full is not None),
+            naux=int(self.naux),
+        )
         self._g_buf = cp.empty((int(nrows_block), int(self.nops)), dtype=self._dtype)
         self._task_scale_rows = cp.empty((int(nrows_block),), dtype=self._dtype)
         self._diag_g_cache: dict[int, object] = {}
 
-        # Symmetric-pair index maps for compressed GEMM (Opt 2).
-        # pack: W[k, nops] → W_pair[k, npair] where npair = norb*(norb+1)/2
-        # unpack: G_pair[k, npair] → G[k, nops]
-        self._sym_pair_pair_pq: object | None = None
-        self._sym_pair_pair_qp: object | None = None
-        self._sym_pair_full_to_pair: object | None = None
-        self._sym_pair_npair: int = 0
-        self._sym_pair_eri_pair: object | None = None
-        self._sym_pair_eri_pair_src_id: int | None = None
-        self._sym_pair_l_pair: object | None = None
-        self._sym_pair_l_pair_src_id: int | None = None
-        self._sym_pair_w_pair: object | None = None
-        self._sym_pair_g_pair: object | None = None
-        self._sym_pair_gemm_ws: Kernel3BuildGWorkspace | None = None
-        # Only enable sym-pair for norb >= 10 where GEMM dominates; for smaller
-        # active spaces, pack/unpack overhead exceeds the GEMM savings.
-        _sym_pair_min_norb = int(os.getenv("CUGUGA_SYM_PAIR_MIN_NORB", "10"))
-        if bool(self.aggregate_offdiag_k) and has_sym_pair_pack_device() and int(self.norb) >= _sym_pair_min_norb:
-            norb_int = int(self.norb)
-            npair = norb_int * (norb_int + 1) // 2
-            self._sym_pair_npair = npair
-            pair_pq_h = []
-            pair_qp_h = []
-            full_to_pair_h = np.empty(int(self.nops), dtype=np.int32)
-            u = 0
-            for p in range(norb_int):
-                for q in range(p, norb_int):
-                    pq = p * norb_int + q
-                    qp = q * norb_int + p
-                    pair_pq_h.append(pq)
-                    pair_qp_h.append(qp)
-                    full_to_pair_h[pq] = u
-                    full_to_pair_h[qp] = u
-                    u += 1
-            self._sym_pair_pair_pq = cp.asarray(np.array(pair_pq_h, dtype=np.int32))
-            self._sym_pair_pair_qp = cp.asarray(np.array(pair_qp_h, dtype=np.int32))
-            self._sym_pair_full_to_pair = cp.asarray(full_to_pair_h)
-            # cuBLAS workspace for pair-sized dense GEMM.
-            # Use cublasLt with heuristic algo selection for the npair×npair shape —
-            # better tile utilization than default cublasGemmEx for small K.
-            _sp_backend = os.getenv("CUGUGA_SYM_PAIR_GEMM_BACKEND", "cublaslt_fp64")
-            try:
-                self._sym_pair_gemm_ws = Kernel3BuildGWorkspace(
-                    npair, max_nrows=1, dtype=self._dtype,
-                    gemm_backend=_sp_backend,
-                )
-            except Exception:
-                try:
-                    self._sym_pair_gemm_ws = Kernel3BuildGWorkspace(
-                        npair, max_nrows=1, dtype=self._dtype,
-                        gemm_backend="gemmex_fp64",
-                    )
-                except Exception:
-                    pass  # fallback to cp.matmul
+        _sym_pair = _init_sym_pair_setup(
+            cp=cp,
+            aggregate_offdiag_k=bool(self.aggregate_offdiag_k),
+            has_sym_pair_pack_device=bool(has_sym_pair_pack_device()),
+            norb=int(self.norb),
+            nops=int(self.nops),
+            dtype=self._dtype,
+            kernel3_workspace_ctor=Kernel3BuildGWorkspace,
+        )
+        self._sym_pair_pair_pq = _sym_pair["_sym_pair_pair_pq"]
+        self._sym_pair_pair_qp = _sym_pair["_sym_pair_pair_qp"]
+        self._sym_pair_full_to_pair = _sym_pair["_sym_pair_full_to_pair"]
+        self._sym_pair_npair = _sym_pair["_sym_pair_npair"]
+        self._sym_pair_eri_pair = _sym_pair["_sym_pair_eri_pair"]
+        self._sym_pair_eri_pair_src_id = _sym_pair["_sym_pair_eri_pair_src_id"]
+        self._sym_pair_l_pair = _sym_pair["_sym_pair_l_pair"]
+        self._sym_pair_l_pair_src_id = _sym_pair["_sym_pair_l_pair_src_id"]
+        self._sym_pair_w_pair = _sym_pair["_sym_pair_w_pair"]
+        self._sym_pair_g_pair = _sym_pair["_sym_pair_g_pair"]
+        self._sym_pair_gemm_ws = _sym_pair["_sym_pair_gemm_ws"]
 
         # Optional k-aggregated off-diagonal buffers:
         #   W[k,rs] = sum_j x[j] * c(j->k,rs)
@@ -8098,70 +7778,23 @@ class GugaMatvecEriMatWorkspace:
                 dtype=self._dtype,
                 gemm_backend=str(self.gemm_backend),
             )
-            if self.offdiag_enable_fp64_emulation:
-                self._offdiag_gemm_ws.set_gemm_backend("gemmex_emulated_fixedpoint")
-                self._offdiag_gemm_ws.set_cublas_math_mode("fp64_emulated_fixedpoint")
-                if self.offdiag_emulation_strategy:
-                    strategy = str(self.offdiag_emulation_strategy).strip().lower()
-                    if strategy == "eager":
-                        allow = str(os.getenv("CUGUGA_ALLOW_CUBLAS_EAGER", "")).strip().lower()
-                        if allow not in ("1", "true", "yes"):
-                            raise RuntimeError(
-                                "offdiag_emulation_strategy='eager' is experimental and may crash for some shapes/GPUs; "
-                                "set CUGUGA_ALLOW_CUBLAS_EAGER=1 to enable anyway"
-                            )
-                    self._offdiag_gemm_ws.set_cublas_emulation_strategy(strategy)
-            else:
-                backend_name = str(self.gemm_backend)
-                self._offdiag_gemm_ws.set_gemm_backend(backend_name)
-                if backend_name not in ("gemmex_tf32", "cublaslt_tf32"):
-                    self._offdiag_gemm_ws.set_cublas_math_mode("default")
+            _configure_offdiag_gemm_workspace(
+                ws=self._offdiag_gemm_ws,
+                gemm_backend=str(self.gemm_backend),
+                offdiag_enable_fp64_emulation=bool(self.offdiag_enable_fp64_emulation),
+                offdiag_emulation_strategy=str(self.offdiag_emulation_strategy),
+            )
 
             from asuka.cuda.cublas_workspace import recommend_cublas_workspace_bytes_for_emulated_fp64_gemm
 
             nrows_eff = min(int(self.ncsf), int(getattr(self._g_buf, "shape", (0,))[0]))
-            cap_bytes = None
-            if int(self.offdiag_cublas_workspace_cap_mb) > 0:
-                cap_bytes = int(self.offdiag_cublas_workspace_cap_mb) * 1024 * 1024
-
-            ws_info = self._offdiag_gemm_ws.cublas_emulation_info()
-            rec = recommend_cublas_workspace_bytes_for_emulated_fp64_gemm(
-                ws_info=ws_info,
-                gemm_shapes=[(int(self.nops), int(nrows_eff), int(self.nops))],
-                batch_count=1,
-                is_complex=False,
-                cap_bytes=cap_bytes,
+            _autoset_offdiag_cublas_workspace_with_backoff(
+                ws=self._offdiag_gemm_ws,
+                nops=int(self.nops),
+                nrows_eff=int(nrows_eff),
+                cap_mb=int(self.offdiag_cublas_workspace_cap_mb),
+                recommend_fn=recommend_cublas_workspace_bytes_for_emulated_fp64_gemm,
             )
-            requested_ws = int(rec)
-            applied_ws = int(requested_ws)
-            if applied_ws > 0:
-                # Best-effort backoff for constrained GPUs: if the requested workspace cannot be
-                # allocated, progressively shrink it instead of failing workspace construction.
-                step_bytes = 64 * 1024 * 1024
-                while True:
-                    try:
-                        self._offdiag_gemm_ws.set_cublas_workspace_bytes(int(applied_ws))
-                        break
-                    except Exception as e:
-                        msg = str(e).lower()
-                        is_oom = ("out of memory" in msg) or ("memory" in msg) or ("alloc" in msg)
-                        if not is_oom:
-                            raise
-                        next_ws = (int(applied_ws) // 2 // int(step_bytes)) * int(step_bytes)
-                        if next_ws <= 0:
-                            applied_ws = 0
-                            self._offdiag_gemm_ws.set_cublas_workspace_bytes(0)
-                            break
-                        applied_ws = int(next_ws)
-            else:
-                self._offdiag_gemm_ws.set_cublas_workspace_bytes(0)
-            if int(applied_ws) < int(requested_ws):
-                import warnings
-
-                warnings.warn(
-                    f"CUDA offdiag emulation workspace reduced from {requested_ws // (1024 * 1024)} MiB "
-                    f"to {applied_ws // (1024 * 1024)} MiB due to device memory limits"
-                )
             self._offdiag_cublas_workspace_bytes = int(self._offdiag_gemm_ws.cublas_workspace_bytes())
             self._offdiag_cublas_info = self._offdiag_gemm_ws.cublas_emulation_info()
 
@@ -8169,17 +7802,13 @@ class GugaMatvecEriMatWorkspace:
             # For DF (L_full) we avoid allocating it to prevent GPU OOM.
             # Allocation is deferred to first use in hop() to avoid wasting VRAM
             # when fused hop mode is active (which bypasses the aggregate path).
-            if self.eri_mat is not None:
-                self._w_offdiag_prefer_blocked = bool(
-                    self._dtype == cp.float32
-                    and int(self.ncsf) >= 1_000_000
-                    and (
-                        (self._epq_table is not None)
-                        or (not bool(self.use_epq_table))
-                    )
-                )
-            else:
-                self._w_offdiag_prefer_blocked = True
+            self._w_offdiag_prefer_blocked = _resolve_w_offdiag_prefer_blocked(
+                dtype_is_float32=bool(self._dtype == cp.float32),
+                ncsf=int(self.ncsf),
+                epq_table_present=bool(self._epq_table is not None),
+                use_epq_table=bool(self.use_epq_table),
+                eri_mat_present=bool(self.eri_mat is not None),
+            )
 
     def _sym_pair_get_eri_pair(self, eri_mat):
         """Build or retrieve cached compressed ERI pair matrix: (npair, npair) from (nops, nops)."""
@@ -8331,64 +7960,25 @@ class GugaMatvecEriMatWorkspace:
             yield int(j0)
 
     def _csr_cache_ready(self) -> bool:
-        if int(self.j_tile) >= int(self.ncsf):
-            return self._csr_single_tile_cache is not None
-        if not bool(self.cache_csr_tiles):
-            return False
-        jt = int(self.j_tile)
-        ntiles = (int(self.ncsf) + jt - 1) // jt
-        if int(len(self._csr_tile_cache)) != int(ntiles):
-            return False
-        for j0 in self._iter_j_tile_starts():
-            if int(j0) not in self._csr_tile_cache:
-                return False
-        return True
+        return _csr_cache_ready_runtime(
+            j_tile=int(self.j_tile),
+            ncsf=int(self.ncsf),
+            cache_csr_tiles=bool(self.cache_csr_tiles),
+            csr_single_tile_cache=self._csr_single_tile_cache,
+            csr_tile_cache=self._csr_tile_cache,
+        )
 
     def _release_tile_csr_scratch(self) -> None:
         """Release multi-tile CSR build scratch once cache is fully populated."""
-
-        self._tile_csr_row_j = None
-        self._tile_csr_row_k = None
-        self._tile_csr_indptr = None
-        self._tile_csr_indices = None
-        self._tile_csr_data = None
-        self._tile_csr_overflow = None
-        self._tile_csr_capacity = 0
+        _release_tile_csr_scratch_runtime(self)
 
     @staticmethod
     def _estimate_object_nbytes(obj, seen: set[int]) -> int:
-        if obj is None:
-            return 0
-        oid = id(obj)
-        if oid in seen:
-            return 0
-        seen.add(oid)
-        nbytes = 0
-        arr_nbytes = getattr(obj, "nbytes", None)
-        if arr_nbytes is not None:
-            try:
-                return int(arr_nbytes)
-            except Exception:
-                return 0
-        if isinstance(obj, dict):
-            for v in obj.values():
-                nbytes += GugaMatvecEriMatWorkspace._estimate_object_nbytes(v, seen)
-            return int(nbytes)
-        if isinstance(obj, (list, tuple)):
-            for v in obj:
-                nbytes += GugaMatvecEriMatWorkspace._estimate_object_nbytes(v, seen)
-            return int(nbytes)
-        return 0
+        return _estimate_object_nbytes_runtime(obj, seen)
 
     def workspace_nbytes_estimate(self) -> int:
         """Best-effort estimate of live device/pinned workspace bytes."""
-        seen: set[int] = set()
-        total = 0
-        for name, value in self.__dict__.items():
-            if name.startswith("__"):
-                continue
-            total += self._estimate_object_nbytes(value, seen)
-        return int(max(0, total))
+        return _workspace_nbytes_estimate_from_dict_runtime(self.__dict__)
 
     def release(self) -> int:
         """Release large retained buffers and cache structures.
@@ -8398,89 +7988,7 @@ class GugaMatvecEriMatWorkspace:
         int
             Best-effort estimated bytes held before release.
         """
-        if bool(getattr(self, "_released", False)):
-            return 0
-
-        freed_est = int(self.workspace_nbytes_estimate())
-
-        self._cuda_graph = None
-        self._cuda_graph_x = None
-        self._cuda_graph_y = None
-
-        for slot in list(getattr(self, "_csr_pipeline_slots", [])):
-            try:
-                ws = slot.get("ws", None)
-                if ws is not None and hasattr(ws, "release"):
-                    ws.release()
-            except Exception:
-                pass
-        self._csr_pipeline_slots = []
-        self._csr_pipeline_apply_stream = None
-
-        for ws_name in ("_k25_ws", "_offdiag_gemm_ws", "_gdf_ws"):
-            try:
-                ws = getattr(self, ws_name, None)
-                if ws is not None and hasattr(ws, "release"):
-                    ws.release()
-            except Exception:
-                pass
-            setattr(self, ws_name, None)
-
-        for name in (
-            "_g_buf",
-            "_task_scale_rows",
-            "_diag_g_cache",
-            "_g_diag_buf",
-            "_diag_w_buf",
-            "_occ_buf",
-            "_occ_buf_dtype",
-            "_w_offdiag",
-            "_w_block",
-            "_l_full_t",
-            "_offdiag_df_t",
-            "_eri_diag_t",
-            "_eri_mat_t",
-            "_eri_mat_t_cache",
-            "_task_scale_j",
-            "_overflow_w",
-            "overflow_apply",
-            "_csr_row_j",
-            "_csr_row_k",
-            "_csr_indptr",
-            "_csr_indices",
-            "_csr_data",
-            "_csr_overflow",
-            "_csr_single_tile_cache",
-            "_csr_tile_cache",
-            "_csr_host_tile_cache",
-            "_tile_csr_row_j",
-            "_tile_csr_row_k",
-            "_tile_csr_indptr",
-            "_tile_csr_indices",
-            "_tile_csr_data",
-            "_tile_csr_overflow",
-            "_epq_table",
-            "_epq_apply_tile_cache",
-            "_epq_apply_staging_indptr",
-            "_epq_apply_staging_indices",
-            "_epq_apply_staging_pq_ids",
-            "_epq_apply_staging_data",
-            "task_csf_all",
-            "eri_mat",
-            "l_full",
-            "h_eff_flat",
-            "_rs_r_d",
-            "_rs_s_d",
-        ):
-            if hasattr(self, name):
-                setattr(self, name, None)
-
-        self._csr_host_cache_bytes = 0
-        self._epq_apply_cache_bytes = 0
-        self._epq_apply_staging_capacity = 0
-        self._tile_csr_capacity = 0
-        self._released = True
-        return int(freed_est)
+        return _release_workspace_resources_runtime(self)
 
     def __del__(self) -> None:
         try:
@@ -8491,70 +7999,32 @@ class GugaMatvecEriMatWorkspace:
     def _init_csr_pipeline_slots(self) -> None:
         import cupy as cp
 
-        self._csr_pipeline_slots = []
-        self._csr_pipeline_apply_stream = None
-        if not bool(getattr(self, "csr_pipeline_enabled", False)):
-            return
-        n_slots = max(0, int(getattr(self, "csr_pipeline_streams", 0)))
-        if n_slots < 2:
-            return
-        base_cap = int(max(1, self._initial_csr_capacity()))
-        max_tasks = int(self.j_tile) * int(self._rs_n_pairs)
-        for _ in range(int(n_slots)):
-            slot: dict[str, object] = {
-                "cap": int(base_cap),
-                "row_j": cp.empty((base_cap,), dtype=cp.int32),
-                "row_k": cp.empty((base_cap,), dtype=cp.int32),
-                "indptr": cp.empty((base_cap + 1,), dtype=cp.int64),
-                "indices": cp.empty((base_cap,), dtype=cp.int32),
-                "data": cp.empty((base_cap,), dtype=self._csr_data_dtype),
-                "overflow": cp.empty((1,), dtype=cp.int32),
-                "stream": cp.cuda.Stream(non_blocking=True),
-                "inflight_event": None,
-                "ws": None,
-            }
-            if _ext is not None and hasattr(_ext, "Kernel25Workspace"):
-                try:
-                    slot["ws"] = _ext.Kernel25Workspace(int(max_tasks), int(base_cap))
-                except Exception:
-                    slot["ws"] = None
-            self._csr_pipeline_slots.append(slot)
-        if len(self._csr_pipeline_slots) >= 2:
-            self._csr_pipeline_apply_stream = cp.cuda.Stream(non_blocking=True)
-        else:
-            self._csr_pipeline_slots = []
+        slots, apply_stream = _init_csr_pipeline_slots_runtime(
+            cp=cp,
+            ext=_ext,
+            enabled=bool(getattr(self, "csr_pipeline_enabled", False)),
+            n_slots=int(getattr(self, "csr_pipeline_streams", 0)),
+            initial_capacity=int(self._initial_csr_capacity()),
+            j_tile=int(self.j_tile),
+            rs_n_pairs=int(self._rs_n_pairs),
+            csr_data_dtype=self._csr_data_dtype,
+        )
+        self._csr_pipeline_slots = slots
+        self._csr_pipeline_apply_stream = apply_stream
 
     def _grow_csr_pipeline_slot(self, slot_idx: int, new_cap: int) -> None:
         import cupy as cp
 
-        if int(slot_idx) < 0 or int(slot_idx) >= len(self._csr_pipeline_slots):
-            raise IndexError("csr pipeline slot index out of range")
-        slot = self._csr_pipeline_slots[int(slot_idx)]
-        cap = int(max(1, new_cap))
-        old_cap = int(slot.get("cap", 0))
-        if old_cap >= cap:
-            return
-        slot["cap"] = cap
-        slot["row_j"] = cp.empty((cap,), dtype=cp.int32)
-        slot["row_k"] = cp.empty((cap,), dtype=cp.int32)
-        slot["indptr"] = cp.empty((cap + 1,), dtype=cp.int64)
-        slot["indices"] = cp.empty((cap,), dtype=cp.int32)
-        slot["data"] = cp.empty((cap,), dtype=self._csr_data_dtype)
-        slot["overflow"] = cp.empty((1,), dtype=cp.int32)
-        ws_old = slot.get("ws", None)
-        if ws_old is not None:
-            try:
-                ws_old.release()
-            except Exception:
-                pass
-        ws_new = None
-        if _ext is not None and hasattr(_ext, "Kernel25Workspace"):
-            max_tasks = int(self.j_tile) * int(self._rs_n_pairs)
-            try:
-                ws_new = _ext.Kernel25Workspace(int(max_tasks), int(cap))
-            except Exception:
-                ws_new = None
-        slot["ws"] = ws_new
+        _grow_csr_pipeline_slot_runtime(
+            cp=cp,
+            ext=_ext,
+            slots=self._csr_pipeline_slots,
+            slot_idx=int(slot_idx),
+            new_cap=int(new_cap),
+            j_tile=int(self.j_tile),
+            rs_n_pairs=int(self._rs_n_pairs),
+            csr_data_dtype=self._csr_data_dtype,
+        )
 
     def _prefilter_nontrivial_tasks_host(
         self,
@@ -8632,45 +8102,18 @@ class GugaMatvecEriMatWorkspace:
 
     @staticmethod
     def _csr_host_entry_bytes(*, nrows: int, nnz: int, data_itemsize: int) -> int:
-        return int(nrows) * 4 + int(nrows) * 4 + (int(nrows) + 1) * 8 + int(nnz) * 4 + int(nnz) * int(data_itemsize)
+        return _csr_host_entry_bytes_runtime(
+            nrows=int(nrows),
+            nnz=int(nnz),
+            data_itemsize=int(data_itemsize),
+        )
 
     def _csr_host_cache_try_admit(self, *, tile_bytes: int, score: float) -> bool:
-        budget = int(getattr(self, "csr_host_cache_budget_bytes", 0))
-        if int(tile_bytes) <= 0 or budget <= 0:
-            return False
-        if int(tile_bytes) > int(budget):
-            return False
-        if int(self._csr_host_cache_bytes) + int(tile_bytes) <= int(budget):
-            return True
-
-        entries = sorted(
-            self._csr_host_tile_cache.items(),
-            key=lambda kv: (float(kv[1].get("score", 0.0)), int(kv[1].get("bytes", 0))),
+        return _csr_host_cache_try_admit_runtime(
+            self,
+            tile_bytes=int(tile_bytes),
+            score=float(score),
         )
-        victims: list[int] = []
-        freed = 0
-        min_victim_score = float("inf")
-        for j0, ent in entries:
-            victims.append(int(j0))
-            ent_bytes = int(ent.get("bytes", 0))
-            freed += max(0, ent_bytes)
-            min_victim_score = min(min_victim_score, float(ent.get("score", 0.0)))
-            if int(self._csr_host_cache_bytes) - int(freed) + int(tile_bytes) <= int(budget):
-                break
-
-        if int(self._csr_host_cache_bytes) - int(freed) + int(tile_bytes) > int(budget):
-            return False
-        if victims and float(score) <= float(min_victim_score):
-            # Keep currently cached high-score tiles.
-            return False
-
-        for j0 in victims:
-            old = self._csr_host_tile_cache.pop(int(j0), None)
-            if old is not None:
-                self._csr_host_cache_bytes -= int(old.get("bytes", 0))
-                self._csr_host_cache_bytes = max(0, int(self._csr_host_cache_bytes))
-                self._csr_host_cache_evictions += 1
-        return True
 
     def _csr_host_cache_store_tile(
         self,
@@ -8686,153 +8129,27 @@ class GugaMatvecEriMatWorkspace:
         stream,
         profile: dict[str, float] | None,
     ) -> None:
-        if not bool(getattr(self, "csr_host_cache_enabled", False)):
-            return
-        if int(nrows) <= 0:
-            return
-        j0_i = int(j0)
-        if j0_i in self._csr_host_tile_cache:
-            return
-
-        self._csr_host_cache_store_attempts += 1
-        data_itemsize = int(np.dtype(getattr(data_d, "dtype", np.float64)).itemsize)
-        tile_bytes = self._csr_host_entry_bytes(nrows=int(nrows), nnz=int(nnz), data_itemsize=data_itemsize)
-        score = float(nnz)
-        if not self._csr_host_cache_try_admit(tile_bytes=int(tile_bytes), score=float(score)):
-            return
-
-        t0 = time.perf_counter() if profile is not None else None
-        row_j_mem, row_j_h = self._alloc_pinned_np((int(nrows),), np.int32)
-        row_k_mem, row_k_h = self._alloc_pinned_np((int(nrows),), np.int32)
-        indptr_mem, indptr_h = self._alloc_pinned_np((int(nrows) + 1,), np.int64)
-        indices_mem, indices_h = self._alloc_pinned_np((int(nnz),), np.int32)
-        data_mem, data_h = self._alloc_pinned_np((int(nnz),), np.dtype(getattr(data_d, "dtype", np.float64)))
-
-        import cupy as cp
-
-        cp.cuda.runtime.memcpyAsync(
-            int(row_j_h.ctypes.data),
-            int(row_j_d.data.ptr),
-            int(row_j_h.nbytes),
-            int(cp.cuda.runtime.memcpyDeviceToHost),
-            int(stream.ptr),
+        _csr_host_cache_store_tile_runtime(
+            self,
+            j0=int(j0),
+            row_j_d=row_j_d,
+            row_k_d=row_k_d,
+            indptr_d=indptr_d,
+            indices_d=indices_d,
+            data_d=data_d,
+            nrows=int(nrows),
+            nnz=int(nnz),
+            stream=stream,
+            profile=profile,
         )
-        cp.cuda.runtime.memcpyAsync(
-            int(row_k_h.ctypes.data),
-            int(row_k_d.data.ptr),
-            int(row_k_h.nbytes),
-            int(cp.cuda.runtime.memcpyDeviceToHost),
-            int(stream.ptr),
-        )
-        cp.cuda.runtime.memcpyAsync(
-            int(indptr_h.ctypes.data),
-            int(indptr_d.data.ptr),
-            int(indptr_h.nbytes),
-            int(cp.cuda.runtime.memcpyDeviceToHost),
-            int(stream.ptr),
-        )
-        cp.cuda.runtime.memcpyAsync(
-            int(indices_h.ctypes.data),
-            int(indices_d.data.ptr),
-            int(indices_h.nbytes),
-            int(cp.cuda.runtime.memcpyDeviceToHost),
-            int(stream.ptr),
-        )
-        cp.cuda.runtime.memcpyAsync(
-            int(data_h.ctypes.data),
-            int(data_d.data.ptr),
-            int(data_h.nbytes),
-            int(cp.cuda.runtime.memcpyDeviceToHost),
-            int(stream.ptr),
-        )
-
-        self._csr_host_tile_cache[j0_i] = {
-            "row_j_mem": row_j_mem,
-            "row_j": row_j_h,
-            "row_k_mem": row_k_mem,
-            "row_k": row_k_h,
-            "indptr_mem": indptr_mem,
-            "indptr": indptr_h,
-            "indices_mem": indices_mem,
-            "indices": indices_h,
-            "data_mem": data_mem,
-            "data": data_h,
-            "nrows": int(nrows),
-            "nnz": int(nnz),
-            "bytes": int(tile_bytes),
-            "score": float(score),
-        }
-        self._csr_host_cache_bytes += int(tile_bytes)
-        self._csr_host_cache_store_accepts += 1
-        if profile is not None and t0 is not None:
-            stream.synchronize()
-            profile["csr_host_cache_store_s"] = profile.get("csr_host_cache_store_s", 0.0) + (
-                time.perf_counter() - t0
-            )
 
     def _csr_host_cache_load_tile(self, *, j0: int, stream, profile: dict[str, float] | None):
-        ent = self._csr_host_tile_cache.get(int(j0))
-        if ent is None:
-            self._csr_host_cache_misses += 1
-            if profile is not None:
-                profile["csr_host_cache_misses"] = profile.get("csr_host_cache_misses", 0.0) + 1.0
-            return None
-
-        nrows = int(ent["nrows"])
-        nnz = int(ent["nnz"])
-        self._ensure_csr_staging_capacity(max(int(nnz), int(nrows)))
-        row_j_d = self._csr_row_j[:nrows]
-        row_k_d = self._csr_row_k[:nrows]
-        indptr_d = self._csr_indptr[: nrows + 1]
-        indices_d = self._csr_indices[:nnz]
-        data_d = self._csr_data[:nnz]
-
-        import cupy as cp
-
-        t0 = time.perf_counter() if profile is not None else None
-        cp.cuda.runtime.memcpyAsync(
-            int(row_j_d.data.ptr),
-            int(ent["row_j"].ctypes.data),
-            int(ent["row_j"].nbytes),
-            int(cp.cuda.runtime.memcpyHostToDevice),
-            int(stream.ptr),
+        return _csr_host_cache_load_tile_runtime(
+            self,
+            j0=int(j0),
+            stream=stream,
+            profile=profile,
         )
-        cp.cuda.runtime.memcpyAsync(
-            int(row_k_d.data.ptr),
-            int(ent["row_k"].ctypes.data),
-            int(ent["row_k"].nbytes),
-            int(cp.cuda.runtime.memcpyHostToDevice),
-            int(stream.ptr),
-        )
-        cp.cuda.runtime.memcpyAsync(
-            int(indptr_d.data.ptr),
-            int(ent["indptr"].ctypes.data),
-            int(ent["indptr"].nbytes),
-            int(cp.cuda.runtime.memcpyHostToDevice),
-            int(stream.ptr),
-        )
-        cp.cuda.runtime.memcpyAsync(
-            int(indices_d.data.ptr),
-            int(ent["indices"].ctypes.data),
-            int(ent["indices"].nbytes),
-            int(cp.cuda.runtime.memcpyHostToDevice),
-            int(stream.ptr),
-        )
-        cp.cuda.runtime.memcpyAsync(
-            int(data_d.data.ptr),
-            int(ent["data"].ctypes.data),
-            int(ent["data"].nbytes),
-            int(cp.cuda.runtime.memcpyHostToDevice),
-            int(stream.ptr),
-        )
-        self._csr_host_cache_hits += 1
-        if profile is not None:
-            profile["csr_host_cache_hits"] = profile.get("csr_host_cache_hits", 0.0) + 1.0
-        if profile is not None and t0 is not None:
-            stream.synchronize()
-            profile["csr_host_cache_load_s"] = profile.get("csr_host_cache_load_s", 0.0) + (time.perf_counter() - t0)
-
-        return row_j_d, row_k_d, indptr_d, indices_d, data_d, int(nrows), int(nnz)
 
     # ----- EPQ apply tile cache (host-pinned) -----
 
@@ -8849,74 +8166,26 @@ class GugaMatvecEriMatWorkspace:
         stream,
     ) -> None:
         """Copy an EPQ tile from device to pinned host memory for later replay."""
-        if not bool(getattr(self, "epq_apply_cache_enabled", False)):
-            return
-        k0_i = int(k0)
-        if k0_i in self._epq_apply_tile_cache:
-            return
-        if int(nnz) <= 0:
-            return
-
-        import cupy as cp
-
-        data_itemsize = int(np.dtype(getattr(data_d, "dtype", np.float64)).itemsize)
-        pq_itemsize = int(np.dtype(getattr(pq_ids_d, "dtype", np.uint8)).itemsize)
-        tile_bytes = (int(j_count) + 1) * 8 + int(nnz) * 4 + int(nnz) * pq_itemsize + int(nnz) * data_itemsize
-        budget = int(getattr(self, "epq_apply_cache_budget_bytes", 0))
-        if budget <= 0 or int(tile_bytes) > int(budget):
-            return
-        if int(self._epq_apply_cache_bytes) + int(tile_bytes) > int(budget):
-            return
-
-        indptr_mem, indptr_h = self._alloc_pinned_np((int(j_count) + 1,), np.int64)
-        indices_mem, indices_h = self._alloc_pinned_np((int(nnz),), np.int32)
-        pq_dtype_np = np.dtype(getattr(pq_ids_d, "dtype", np.uint8))
-        pq_mem, pq_h = self._alloc_pinned_np((int(nnz),), pq_dtype_np)
-        data_dtype_np = np.dtype(getattr(data_d, "dtype", np.float64))
-        data_mem, data_h = self._alloc_pinned_np((int(nnz),), data_dtype_np)
-
-        cp.cuda.runtime.memcpyAsync(
-            int(indptr_h.ctypes.data), int(indptr_d.data.ptr),
-            int(indptr_h.nbytes), int(cp.cuda.runtime.memcpyDeviceToHost), int(stream.ptr),
+        _epq_apply_cache_store_runtime(
+            self,
+            k0=int(k0),
+            indptr_d=indptr_d,
+            indices_d=indices_d,
+            pq_ids_d=pq_ids_d,
+            data_d=data_d,
+            j_count=int(j_count),
+            nnz=int(nnz),
+            stream=stream,
         )
-        cp.cuda.runtime.memcpyAsync(
-            int(indices_h.ctypes.data), int(indices_d.data.ptr),
-            int(indices_h.nbytes), int(cp.cuda.runtime.memcpyDeviceToHost), int(stream.ptr),
-        )
-        cp.cuda.runtime.memcpyAsync(
-            int(pq_h.ctypes.data), int(pq_ids_d.data.ptr),
-            int(pq_h.nbytes), int(cp.cuda.runtime.memcpyDeviceToHost), int(stream.ptr),
-        )
-        cp.cuda.runtime.memcpyAsync(
-            int(data_h.ctypes.data), int(data_d.data.ptr),
-            int(data_h.nbytes), int(cp.cuda.runtime.memcpyDeviceToHost), int(stream.ptr),
-        )
-
-        self._epq_apply_tile_cache[k0_i] = {
-            "indptr_mem": indptr_mem, "indptr": indptr_h,
-            "indices_mem": indices_mem, "indices": indices_h,
-            "pq_mem": pq_mem, "pq_ids": pq_h,
-            "data_mem": data_mem, "data": data_h,
-            "j_count": int(j_count), "nnz": int(nnz), "bytes": int(tile_bytes),
-        }
-        self._epq_apply_cache_bytes += int(tile_bytes)
 
     def _epq_apply_ensure_staging(self, *, j_count: int, nnz: int) -> None:
         """Ensure device staging buffers are large enough for H2D upload."""
-        import cupy as cp
-
-        needed = max(int(nnz), 1)
-        indptr_needed = int(j_count) + 1
-        if int(self._epq_apply_staging_capacity) >= int(needed) and self._epq_apply_staging_indptr is not None:
-            if self._epq_apply_staging_indptr.shape[0] >= indptr_needed:
-                return
-
-        pq_dtype = _epq_pq_dtype_for_norb(cp, int(self.norb))
-        self._epq_apply_staging_indptr = cp.empty((int(indptr_needed),), dtype=cp.int64)
-        self._epq_apply_staging_indices = cp.empty((int(needed),), dtype=cp.int32)
-        self._epq_apply_staging_pq_ids = cp.empty((int(needed),), dtype=pq_dtype)
-        self._epq_apply_staging_data = cp.empty((int(needed),), dtype=self._dtype)
-        self._epq_apply_staging_capacity = int(needed)
+        _epq_apply_ensure_staging_runtime(
+            self,
+            j_count=int(j_count),
+            nnz=int(nnz),
+            epq_pq_dtype_for_norb_fn=_epq_pq_dtype_for_norb,
+        )
 
     def _epq_apply_cache_load(
         self,
@@ -8925,40 +8194,12 @@ class GugaMatvecEriMatWorkspace:
         stream,
     ):
         """Load a cached EPQ tile from host to device.  Returns (indptr, indices, pq_ids, data) or None."""
-        ent = self._epq_apply_tile_cache.get(int(k0))
-        if ent is None:
-            self._epq_apply_cache_misses += 1
-            return None
-
-        import cupy as cp
-
-        j_count = int(ent["j_count"])
-        nnz = int(ent["nnz"])
-        self._epq_apply_ensure_staging(j_count=j_count, nnz=nnz)
-
-        indptr_d = self._epq_apply_staging_indptr[: j_count + 1]
-        indices_d = self._epq_apply_staging_indices[:nnz]
-        pq_ids_d = self._epq_apply_staging_pq_ids[:nnz]
-        data_d = self._epq_apply_staging_data[:nnz]
-
-        cp.cuda.runtime.memcpyAsync(
-            int(indptr_d.data.ptr), int(ent["indptr"].ctypes.data),
-            int(ent["indptr"].nbytes), int(cp.cuda.runtime.memcpyHostToDevice), int(stream.ptr),
+        return _epq_apply_cache_load_runtime(
+            self,
+            k0=int(k0),
+            stream=stream,
+            epq_pq_dtype_for_norb_fn=_epq_pq_dtype_for_norb,
         )
-        cp.cuda.runtime.memcpyAsync(
-            int(indices_d.data.ptr), int(ent["indices"].ctypes.data),
-            int(ent["indices"].nbytes), int(cp.cuda.runtime.memcpyHostToDevice), int(stream.ptr),
-        )
-        cp.cuda.runtime.memcpyAsync(
-            int(pq_ids_d.data.ptr), int(ent["pq_ids"].ctypes.data),
-            int(ent["pq_ids"].nbytes), int(cp.cuda.runtime.memcpyHostToDevice), int(stream.ptr),
-        )
-        cp.cuda.runtime.memcpyAsync(
-            int(data_d.data.ptr), int(ent["data"].ctypes.data),
-            int(ent["data"].nbytes), int(cp.cuda.runtime.memcpyHostToDevice), int(stream.ptr),
-        )
-        self._epq_apply_cache_hits += 1
-        return indptr_d, indices_d, pq_ids_d, data_d
 
     def _diag_g_cache_ready(self) -> bool:
         if not bool(self.include_diagonal_rs):
@@ -9508,94 +8749,51 @@ class GugaMatvecEriMatWorkspace:
 
         # Resolve runtime path mode from constructor policy.
         path_mode = str(getattr(self, "path_mode", "auto"))
-        fused_eligible_runtime = bool(
-            bool(getattr(self, "use_fused_hop", True))
-            and self._fused_hop_kernel_available
-            and int(self.norb) <= 20
-            and (eri_mat is not None or self.eri_mat is not None or self.l_full is not None)
+        _hop_flags = _resolve_hop_runtime_flags_runtime(
+            self,
+            path_mode=str(path_mode),
+            eri_mat=eri_mat,
         )
-        use_fused_hop = bool(path_mode in ("fused_coo", "fused_epq_hybrid") and fused_eligible_runtime)
+        use_fused_hop = bool(_hop_flags["use_fused_hop"])
         # Fused hop already includes one-body + full two-body apply. Keep aggregate-offdiag disabled
         # in this mode to avoid redundant work and double counting.
-        use_aggregate_offdiag = bool(self.aggregate_offdiag_k) and (not use_fused_hop)
+        use_aggregate_offdiag = bool(_hop_flags["use_aggregate_offdiag"])
 
-        # 10.16.10: Combine array operations to reduce overhead.
-        x = cp.ascontiguousarray(cp.asarray(x, dtype=self._dtype).ravel())
-        if x.shape != (int(self.ncsf),):
-            raise ValueError("x must have shape (ncsf,)")
+        x = _normalize_hop_x_runtime(self, cp=cp, x=x)
 
-        # CUDA Graph fast path (optional).
-        if (
-            bool(self.use_cuda_graph)
-            and self._cuda_graph is not None
-            and self._cuda_graph_x is not None
-            and self._cuda_graph_y is not None
-            and eri_mat is None
-            and h_eff is None
-            and profile is None
-            and not bool(check_overflow)
-        ):
-            if stream is None:
-                stream = cp.cuda.get_current_stream()
-            with stream:
-                cp.copyto(self._cuda_graph_x, x)
-                self._cuda_graph.launch(stream=stream)
-                if y is None:
-                    y = self._cuda_graph_y.copy()
-                else:
-                    # 10.16.10: Combine array operations.
-                    y = cp.ascontiguousarray(cp.asarray(y, dtype=self._dtype).ravel())
-                    if y.shape != (int(self.ncsf),):
-                        raise ValueError("y must have shape (ncsf,)")
-                    cp.copyto(y, self._cuda_graph_y)
-            if sync:
-                stream.synchronize()
-            return y
+        _graph = _try_cuda_graph_fast_path_runtime(
+            self,
+            cp=cp,
+            x=x,
+            y=y,
+            eri_mat=eri_mat,
+            h_eff=h_eff,
+            stream=stream,
+            sync=bool(sync),
+            check_overflow=bool(check_overflow),
+            profile=profile,
+        )
+        if bool(_graph["executed"]):
+            return _graph["y"]
+        stream = _graph["stream"]
 
-        if y is None:
-            y = cp.empty((int(self.ncsf),), dtype=self._dtype)
-        else:
-            # 10.16.10: Combine array operations.
-            y = cp.ascontiguousarray(cp.asarray(y, dtype=self._dtype).ravel())
-            if y.shape != (int(self.ncsf),):
-                raise ValueError("y must have shape (ncsf,)")
-
-        eri_mat_use = self.eri_mat if eri_mat is None else cp.ascontiguousarray(cp.asarray(eri_mat, dtype=self._dtype))
-        l_full_use = None
-        use_df = False
-        if eri_mat_use is not None:
-            if eri_mat_use.shape != (int(self.nops), int(self.nops)):
-                raise ValueError("eri_mat must have shape (nops,nops)")
-        else:
-            l_full_use = self.l_full
-            if l_full_use is None:
-                raise ValueError("eri_mat or l_full must be provided (workspace has neither)")
-            l_full_use = cp.ascontiguousarray(cp.asarray(l_full_use, dtype=self._dtype))
-            if l_full_use.ndim != 2 or tuple(l_full_use.shape)[0] != int(self.nops):
-                raise ValueError("l_full must have shape (norb*norb, naux)")
-            use_df = True
-
-        # Materialize dense eri_mat from DF factors for fused hop kernel.
-        # Cost: nops^2 * sizeof(dtype) memory (~150 KB for CAS14) + one GEMM.
-        if use_fused_hop and use_df and eri_mat_use is None:
-            eri_mat_use = cp.ascontiguousarray(
-                cp.dot(l_full_use, l_full_use.T).astype(self._dtype)
-            )
-
-        use_epq_streaming = bool(self.use_epq_table and self.epq_streaming and self._epq_table is None)
-        epq_stream_panic_requested = False
-        epq_stream_panic_active = False
-        if use_epq_streaming:
-            panic_mode = str(getattr(self, "epq_stream_panic_mode", "off")).strip().lower()
-            if panic_mode == "on":
-                epq_stream_panic_requested = True
-            elif panic_mode == "off":
-                epq_stream_panic_requested = False
-            else:
-                # Auto policy stays off by default; this is an explicit "panic button" mode.
-                epq_stream_panic_requested = False
-            epq_stream_panic_active = bool(epq_stream_panic_requested)
-        use_epq_streaming_tiles = bool(use_epq_streaming and (not epq_stream_panic_active))
+        _inputs = _prepare_hop_runtime_inputs_runtime(
+            self,
+            cp=cp,
+            y=y,
+            eri_mat=eri_mat,
+            h_eff=h_eff,
+            use_fused_hop=bool(use_fused_hop),
+        )
+        y = _inputs["y"]
+        eri_mat_use = _inputs["eri_mat_use"]
+        l_full_use = _inputs["l_full_use"]
+        use_df = bool(_inputs["use_df"])
+        h_eff_flat = _inputs["h_eff_flat"]
+        use_epq_streaming = bool(_inputs["use_epq_streaming"])
+        use_epq_streaming_tiles = bool(_inputs["use_epq_streaming_tiles"])
+        epq_stream_panic_requested = bool(_inputs["epq_stream_panic_requested"])
+        epq_stream_panic_active = bool(_inputs["epq_stream_panic_active"])
 
         eri_mat_t = None
         if (not use_df) and self._epq_table is not None:
@@ -9628,13 +8826,6 @@ class GugaMatvecEriMatWorkspace:
                 self._eri_diag_t = cp.ascontiguousarray(cp.dot(l_diag, l_full_use.T))
             else:
                 self._eri_diag_t = eri_mat_use[:, diag_ids].T.copy()
-
-        if h_eff is None:
-            h_eff_flat = self.h_eff_flat
-        else:
-            h_eff_flat = self._as_h_eff_flat(h_eff)
-        if h_eff_flat is None:
-            raise ValueError("h_eff must be provided (workspace h_eff is None)")
 
         if stream is None:
             stream = cp.cuda.get_current_stream()
@@ -9883,36 +9074,20 @@ class GugaMatvecEriMatWorkspace:
             sync_override: bool | None = None,
             check_overflow_override: bool | None = None,
         ):
-            stream_build = stream if stream_override is None else stream_override
-            sync_build = bool(sync) if sync_override is None else bool(sync_override)
-            check_overflow_build = (
-                bool(check_overflow)
-                if check_overflow_override is None
-                else bool(check_overflow_override)
-            )
-            pq_block_build = int(getattr(self, "epq_stream_pq_block", 0))
-            if pq_block_build > 0:
-                # Current pq-block pack path materializes per-block row offsets on host.
-                sync_build = True
-                use_recompute_build = False
-            else:
-                use_recompute_build = self.epq_stream_use_recompute
             t_build0 = time.perf_counter() if profile is not None else None
-            epq_tile = build_epq_action_table_tile_device(
-                self.drt,
-                self.drt_dev,
-                self.state_dev,
+            stream_build = stream if stream_override is None else stream_override
+            epq_tile = _build_epq_stream_tile_runtime(
+                self,
+                build_epq_action_table_tile_device_fn=build_epq_action_table_tile_device,
+                stream=stream,
+                sync=bool(sync),
+                check_overflow=bool(check_overflow),
                 j_start=int(j_start),
                 j_count=int(j_count),
-                threads=int(self.threads_enum),
-                stream=stream_build,
-                sync=bool(sync_build),
-                check_overflow=bool(check_overflow_build),
-                use_recompute=use_recompute_build,
-                recompute_warp_coop=bool(self.epq_recompute_warp_coop),
                 global_indptr=bool(global_indptr),
-                pq_block=int(pq_block_build),
-                dtype=self._dtype,
+                stream_override=stream_override,
+                sync_override=sync_override,
+                check_overflow_override=check_overflow_override,
             )
             if profile is not None and t_build0 is not None:
                 stream_build.synchronize()

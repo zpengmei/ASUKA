@@ -12,7 +12,7 @@ from collections import defaultdict
 import numpy as np
 
 from asuka.cueri.cart import ncart
-from asuka.frontend.periodic_table import atomic_number as _z_from_symbol
+from asuka.chem.periodic_table import atomic_number as _z_from_symbol
 from asuka.integrals.gto_cart import primitive_norm_cart_like_pyscf
 from asuka.integrals.ricd_types import AtomicBasisType, RICDShell
 

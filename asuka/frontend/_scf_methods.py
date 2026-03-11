@@ -15,6 +15,7 @@ from ._scf_build import (
     build_aux_basis_cart,
 )
 from ._scf_config import resolve_cueri_df_config
+from ._scf_df_build import prepare_direct_df_inputs
 from .one_electron import build_ao_basis_cart
 from ._scf_spin import nalpha_nbeta_from_mol as _nalpha_nbeta_from_mol_impl
 
@@ -87,15 +88,41 @@ def _build_df_factors_gpu(
     df_layout_s: str,
     df_profile,
 ):
-    return build_df_B_from_cueri_packed_bases(
-        ao_basis,
-        aux_basis,
-        config=cfg,
-        layout=str(df_layout_s),
-        ao_rep=str(_df_ao_rep(mol)),
-        profile=df_profile,
-        return_L=True,
-    )
+    try:
+        return build_df_B_from_cueri_packed_bases(
+            ao_basis,
+            aux_basis,
+            config=cfg,
+            layout=str(df_layout_s),
+            ao_rep=str(_df_ao_rep(mol)),
+            profile=df_profile,
+            return_L=True,
+        )
+    except Exception as e:
+        msg = str(e).lower()
+        can_fallback = isinstance(e, AttributeError) or (
+            isinstance(e, RuntimeError)
+            and (
+                "cueri cuda extension" in msg
+                or "scatter_df_metric_tiles_inplace_device" in msg
+                or "scatter_df_int3c2e_tiles_inplace_device" in msg
+                or "cuda extension not available" in msg
+            )
+        )
+        if not can_fallback:
+            raise
+        B_cpu, L_cpu = _build_df_factors_cpu(
+            ao_basis=ao_basis,
+            aux_basis=aux_basis,
+            df_threads=0,
+            df_profile=df_profile,
+        )
+        try:
+            import cupy as cp  # noqa: PLC0415
+
+            return cp.asarray(B_cpu, dtype=cp.float64), cp.asarray(L_cpu, dtype=cp.float64)
+        except Exception:
+            return B_cpu, L_cpu
 
 
 def _build_df_factors_cpu(
@@ -678,6 +705,410 @@ def run_rohf_df_cpu_impl(
         profile=profile,
         sph_map=sph_map,
         df_L=L_chol,
+    )
+
+
+def run_rhf_direct_df_impl(
+    mol,
+    *,
+    basis: Any | None = None,
+    auxbasis: Any = "autoaux",
+    df_config: CuERIDFConfig | None = None,
+    expand_contractions: bool = True,
+    max_cycle: int = 50,
+    conv_tol: float = 1e-10,
+    conv_tol_dm: float = 1e-8,
+    diis: bool = True,
+    diis_start_cycle: int | None = None,
+    diis_space: int = 8,
+    damping: float = 0.0,
+    level_shift: float = 0.0,
+    k_q_block: int = 128,
+    cublas_math_mode: str | None = None,
+    df_backend: str | None = None,
+    df_mode: str | None = None,
+    df_threads: int | None = None,
+    df_aux_block_naux: int = 256,
+    L_metric=None,
+    dm0: Any | None = None,
+    mo_coeff0: Any | None = None,
+    init_fock_cycles: int | None = None,
+    profile: dict | None = None,
+    init_fock_cycles_default: int,
+    rhf_guess_key: Callable[..., Any],
+    cache_get: Callable[..., Any],
+    cache_put: Callable[..., None],
+    rhf_guess_cache: Any,
+    hf_guess_cache_max: int,
+    copy_mo_coeff_for_cache: Callable[[Any], Any],
+    make_df_run_config: Callable[..., Any],
+    result_cls: Any,
+):
+    if int(mol.spin) != 0:
+        raise NotImplementedError("run_rhf_direct_df currently supports only closed-shell molecules (spin=0)")
+
+    nelec = int(mol.nelectron)
+    if nelec <= 0 or nelec % 2 != 0:
+        raise ValueError("RHF requires an even, positive electron count")
+
+    basis_in = mol.basis if basis is None else basis
+
+    if mo_coeff0 is None and dm0 is None:
+        guess_key = rhf_guess_key(
+            mol,
+            basis_in=basis_in,
+            auxbasis=auxbasis,
+            expand_contractions=bool(expand_contractions),
+        )
+        guess_hit = cache_get(rhf_guess_cache, guess_key)
+        if guess_hit is not None:
+            mo_coeff0 = copy_mo_coeff_for_cache(guess_hit)
+            if profile is not None:
+                profile.setdefault("scf_guess", {})["cache_hit"] = True
+        elif profile is not None:
+            profile.setdefault("scf_guess", {})["cache_hit"] = False
+
+    (
+        cfg,
+        ao_basis,
+        basis_name,
+        int1e_scf,
+        aux_basis,
+        auxbasis_name,
+        sph_map,
+        df_ao_rep,
+        L_chol,
+    ) = prepare_direct_df_inputs(
+        mol,
+        basis_in=basis_in,
+        auxbasis=auxbasis,
+        expand_contractions=bool(expand_contractions),
+        df_config=df_config,
+        df_backend=df_backend,
+        df_mode=df_mode,
+        df_threads=df_threads,
+        L_metric=L_metric,
+        profile=profile,
+    )
+
+    from asuka.hf.direct_scf import rhf_direct_df as _rhf_direct_df_scf  # noqa: PLC0415
+
+    init_fock_cycles_i = int(init_fock_cycles_default) if init_fock_cycles is None else max(0, int(init_fock_cycles))
+    diis_start_cycle_i = (
+        int(diis_start_cycle) if diis_start_cycle is not None else (1 if int(init_fock_cycles_i) > 0 else 2)
+    )
+    scf = _rhf_direct_df_scf(
+        int1e_scf.S,
+        int1e_scf.hcore,
+        ao_basis=ao_basis,
+        aux_basis=aux_basis,
+        nelec=int(nelec),
+        enuc=float(mol.energy_nuc()),
+        max_cycle=int(max_cycle),
+        conv_tol=float(conv_tol),
+        conv_tol_dm=float(conv_tol_dm),
+        diis=bool(diis),
+        diis_start_cycle=int(diis_start_cycle_i),
+        diis_space=int(diis_space),
+        damping=float(damping),
+        level_shift=float(level_shift),
+        k_q_block=int(k_q_block),
+        cublas_math_mode=cublas_math_mode,
+        df_backend=str(cfg.backend),
+        df_ao_rep=str(df_ao_rep),
+        df_threads=int(cfg.threads),
+        df_mode=str(cfg.mode),
+        df_aux_block_naux=int(df_aux_block_naux),
+        L_metric=L_chol,
+        dm0=dm0,
+        mo_coeff0=mo_coeff0,
+        init_fock_cycles=int(init_fock_cycles_i),
+        profile=profile,
+    )
+
+    if bool(getattr(scf, "converged", False)):
+        guess_key = rhf_guess_key(
+            mol,
+            basis_in=basis_in,
+            auxbasis=auxbasis,
+            expand_contractions=bool(expand_contractions),
+        )
+        cache_put(
+            rhf_guess_cache,
+            guess_key,
+            copy_mo_coeff_for_cache(scf.mo_coeff),
+            max_size=int(hf_guess_cache_max),
+        )
+
+    return result_cls(
+        mol=mol,
+        basis_name=str(basis_name),
+        auxbasis_name=str(auxbasis_name),
+        ao_basis=ao_basis,
+        aux_basis=aux_basis,
+        int1e=int1e_scf,
+        df_B=None,
+        scf=scf,
+        profile=profile,
+        sph_map=sph_map,
+        df_L=L_chol,
+        df_run_config=make_df_run_config(
+            hf_method="rhf",
+            basis=basis_in,
+            auxbasis=auxbasis,
+            df_config=cfg,
+            expand_contractions=bool(expand_contractions),
+            backend="cuda",
+            max_cycle=int(max_cycle),
+            conv_tol=float(conv_tol),
+            conv_tol_dm=float(conv_tol_dm),
+            diis=bool(diis),
+            diis_start_cycle=diis_start_cycle_i,
+            diis_space=int(diis_space),
+            damping=float(damping),
+            level_shift=float(level_shift),
+            k_q_block=int(k_q_block),
+            cublas_math_mode=cublas_math_mode,
+            init_fock_cycles=init_fock_cycles_i,
+        ),
+        two_e_backend="direct_df",
+    )
+
+
+def run_uhf_direct_df_impl(
+    mol,
+    *,
+    basis: Any | None = None,
+    auxbasis: Any = "autoaux",
+    df_config: CuERIDFConfig | None = None,
+    expand_contractions: bool = True,
+    max_cycle: int = 50,
+    conv_tol: float = 1e-10,
+    conv_tol_dm: float = 1e-8,
+    diis: bool = True,
+    diis_start_cycle: int = 2,
+    diis_space: int = 8,
+    damping: float = 0.0,
+    k_q_block: int = 128,
+    cublas_math_mode: str | None = None,
+    df_backend: str | None = None,
+    df_mode: str | None = None,
+    df_threads: int | None = None,
+    df_aux_block_naux: int = 256,
+    L_metric=None,
+    dm0: Any | None = None,
+    mo_coeff0: Any | None = None,
+    profile: dict | None = None,
+    make_df_run_config: Callable[..., Any],
+    result_cls: Any,
+):
+    nalpha, nbeta = _nalpha_nbeta_from_mol(mol)
+    basis_in = mol.basis if basis is None else basis
+
+    (
+        cfg,
+        ao_basis,
+        basis_name,
+        int1e_scf,
+        aux_basis,
+        auxbasis_name,
+        sph_map,
+        df_ao_rep,
+        L_chol,
+    ) = prepare_direct_df_inputs(
+        mol,
+        basis_in=basis_in,
+        auxbasis=auxbasis,
+        expand_contractions=bool(expand_contractions),
+        df_config=df_config,
+        df_backend=df_backend,
+        df_mode=df_mode,
+        df_threads=df_threads,
+        L_metric=L_metric,
+        profile=profile,
+    )
+
+    from asuka.hf.direct_scf import uhf_direct_df as _uhf_direct_df_scf  # noqa: PLC0415
+
+    scf = _uhf_direct_df_scf(
+        int1e_scf.S,
+        int1e_scf.hcore,
+        ao_basis=ao_basis,
+        aux_basis=aux_basis,
+        nalpha=int(nalpha),
+        nbeta=int(nbeta),
+        enuc=float(mol.energy_nuc()),
+        max_cycle=int(max_cycle),
+        conv_tol=float(conv_tol),
+        conv_tol_dm=float(conv_tol_dm),
+        diis=bool(diis),
+        diis_start_cycle=int(diis_start_cycle),
+        diis_space=int(diis_space),
+        damping=float(damping),
+        k_q_block=int(k_q_block),
+        cublas_math_mode=cublas_math_mode,
+        df_backend=str(cfg.backend),
+        df_ao_rep=str(df_ao_rep),
+        df_threads=int(cfg.threads),
+        df_mode=str(cfg.mode),
+        df_aux_block_naux=int(df_aux_block_naux),
+        L_metric=L_chol,
+        dm0=dm0,
+        mo_coeff0=mo_coeff0,
+        profile=profile,
+    )
+
+    return result_cls(
+        mol=mol,
+        basis_name=str(basis_name),
+        auxbasis_name=str(auxbasis_name),
+        ao_basis=ao_basis,
+        aux_basis=aux_basis,
+        int1e=int1e_scf,
+        df_B=None,
+        scf=scf,
+        profile=profile,
+        sph_map=sph_map,
+        df_L=L_chol,
+        df_run_config=make_df_run_config(
+            hf_method="uhf",
+            basis=basis_in,
+            auxbasis=auxbasis,
+            df_config=cfg,
+            expand_contractions=bool(expand_contractions),
+            backend="cuda",
+            max_cycle=int(max_cycle),
+            conv_tol=float(conv_tol),
+            conv_tol_dm=float(conv_tol_dm),
+            diis=bool(diis),
+            diis_start_cycle=int(diis_start_cycle),
+            diis_space=int(diis_space),
+            damping=float(damping),
+            level_shift=0.0,
+            k_q_block=int(k_q_block),
+            cublas_math_mode=cublas_math_mode,
+        ),
+        two_e_backend="direct_df",
+    )
+
+
+def run_rohf_direct_df_impl(
+    mol,
+    *,
+    basis: Any | None = None,
+    auxbasis: Any = "autoaux",
+    df_config: CuERIDFConfig | None = None,
+    expand_contractions: bool = True,
+    max_cycle: int = 50,
+    conv_tol: float = 1e-10,
+    conv_tol_dm: float = 1e-8,
+    diis: bool = True,
+    diis_start_cycle: int = 2,
+    diis_space: int = 8,
+    damping: float = 0.0,
+    k_q_block: int = 128,
+    cublas_math_mode: str | None = None,
+    df_backend: str | None = None,
+    df_mode: str | None = None,
+    df_threads: int | None = None,
+    df_aux_block_naux: int = 256,
+    L_metric=None,
+    dm0: Any | None = None,
+    mo_coeff0: Any | None = None,
+    profile: dict | None = None,
+    make_df_run_config: Callable[..., Any],
+    result_cls: Any,
+):
+    nalpha, nbeta = _nalpha_nbeta_from_mol(mol)
+    if int(nalpha) < int(nbeta):
+        raise ValueError("run_rohf_direct_df requires spin >= 0 (nalpha >= nbeta)")
+
+    basis_in = mol.basis if basis is None else basis
+
+    (
+        cfg,
+        ao_basis,
+        basis_name,
+        int1e_scf,
+        aux_basis,
+        auxbasis_name,
+        sph_map,
+        df_ao_rep,
+        L_chol,
+    ) = prepare_direct_df_inputs(
+        mol,
+        basis_in=basis_in,
+        auxbasis=auxbasis,
+        expand_contractions=bool(expand_contractions),
+        df_config=df_config,
+        df_backend=df_backend,
+        df_mode=df_mode,
+        df_threads=df_threads,
+        L_metric=L_metric,
+        profile=profile,
+    )
+
+    from asuka.hf.direct_scf import rohf_direct_df as _rohf_direct_df_scf  # noqa: PLC0415
+
+    scf = _rohf_direct_df_scf(
+        int1e_scf.S,
+        int1e_scf.hcore,
+        ao_basis=ao_basis,
+        aux_basis=aux_basis,
+        nalpha=int(nalpha),
+        nbeta=int(nbeta),
+        enuc=float(mol.energy_nuc()),
+        max_cycle=int(max_cycle),
+        conv_tol=float(conv_tol),
+        conv_tol_dm=float(conv_tol_dm),
+        diis=bool(diis),
+        diis_start_cycle=int(diis_start_cycle),
+        diis_space=int(diis_space),
+        damping=float(damping),
+        k_q_block=int(k_q_block),
+        cublas_math_mode=cublas_math_mode,
+        df_backend=str(cfg.backend),
+        df_ao_rep=str(df_ao_rep),
+        df_threads=int(cfg.threads),
+        df_mode=str(cfg.mode),
+        df_aux_block_naux=int(df_aux_block_naux),
+        L_metric=L_chol,
+        dm0=dm0,
+        mo_coeff0=mo_coeff0,
+        profile=profile,
+    )
+
+    return result_cls(
+        mol=mol,
+        basis_name=str(basis_name),
+        auxbasis_name=str(auxbasis_name),
+        ao_basis=ao_basis,
+        aux_basis=aux_basis,
+        int1e=int1e_scf,
+        df_B=None,
+        scf=scf,
+        profile=profile,
+        sph_map=sph_map,
+        df_L=L_chol,
+        df_run_config=make_df_run_config(
+            hf_method="rohf",
+            basis=basis_in,
+            auxbasis=auxbasis,
+            df_config=cfg,
+            expand_contractions=bool(expand_contractions),
+            backend="cuda",
+            max_cycle=int(max_cycle),
+            conv_tol=float(conv_tol),
+            conv_tol_dm=float(conv_tol_dm),
+            diis=bool(diis),
+            diis_start_cycle=int(diis_start_cycle),
+            diis_space=int(diis_space),
+            damping=float(damping),
+            level_shift=0.0,
+            k_q_block=int(k_q_block),
+            cublas_math_mode=cublas_math_mode,
+        ),
+        two_e_backend="direct_df",
     )
 
 

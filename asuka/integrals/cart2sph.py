@@ -177,7 +177,9 @@ def transform_df_B_cart_to_sph(
         try:
             import cupy as cp  # noqa: PLC0415
 
-            from asuka.cueri import _cueri_cuda_ext as _ext  # noqa: PLC0415
+            from asuka.kernels import cueri as cueri_kernels  # noqa: PLC0415
+
+            _ext = cueri_kernels.load_ext()
         except Exception:
             _ext = None
         has_mnq = _ext is not None and hasattr(_ext, "df_B_cart_to_sph_sym_device")

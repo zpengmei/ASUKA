@@ -8,6 +8,24 @@ import pytest
 
 from asuka._solver.dump_flags_runtime import dump_flags
 from asuka._solver.init_runtime import configure_solver_runtime_defaults
+from asuka._solver.kernel_runtime import (
+    autotune_cuda_max_g_mib_for_large_cas,
+    build_cuda_hamiltonian_inputs,
+    build_kernel_dry_run_result,
+    maybe_restore_contract_eri,
+    normalize_row_screening,
+    prepare_kernel_precompute_and_state_cache,
+    resolve_kernel_nroots,
+    resolve_kernel_warm_start,
+    run_kernel_dense_eigh_fastpath,
+)
+from asuka._solver.kernel_cuda_runtime import (
+    apply_low_precision_and_workspace_policy,
+    auto_select_use_epq_table,
+    resolve_epq_streaming_controls,
+    resolve_cuda_workspace_policy_common,
+    validate_low_precision_cuda_path,
+)
 from asuka._solver.matvec_cache_runtime import (
     configure_matvec_cuda_ws_cache,
     matvec_cuda_ws_cache_drop,
@@ -20,11 +38,18 @@ from asuka._solver.matvec_cache_runtime import (
 )
 from asuka._solver.cuda_policy import (
     apply_cuda_user_policy,
+    cap_cuda_cublas_workspace_cap_mb_by_hard_cap,
+    cap_cuda_max_g_mib_by_hard_cap,
+    maybe_promote_cuda_apply_mode_scatter,
     normalize_cuda_accuracy_mode,
     normalize_cuda_user_policy_mode,
     normalize_matvec_cuda_path_mode,
     normalize_ws_cache_fraction,
+    resolve_cuda_apply_mode,
+    resolve_cuda_cublas_workspace_cap_mb,
+    resolve_cuda_epq_build_device,
     resolve_cuda_memory_controls,
+    resolve_cuda_max_g_mib,
     resolve_kernel_cuda_policy,
     resolve_epq_overbudget_action,
 )
@@ -44,11 +69,18 @@ from asuka._solver.drt_runtime import drt_key, get_or_build_drt
 from asuka._solver.matvec_runtime import (
     CUDA_MATVEC_BACKENDS,
     estimate_matvec_cuda_workspace_bytes,
+    get_or_create_cuda_matvec_state,
     release_matvec_cuda_workspace,
     resolve_approx_cuda_frontend,
     resolve_approx_kernel_iteration_caps,
+    resolve_cuda_cache_csr_tiles,
+    resolve_cuda_j_tile,
+    resolve_cuda_threads_apply,
+    resolve_cuda_threads_w,
+    resolve_cuda_workspace_controls,
     resolve_matvec_cuda_ws_cache_budget_bytes,
     resolve_kernel_cuda_execution_mode,
+    tune_cuda_threads_for_large_cas_noepq,
     ws_needs_rebuild,
 )
 from asuka._solver.warm_state import (
@@ -223,6 +255,215 @@ def test_matvec_runtime_resolve_approx_kernel_iteration_caps():
     )
     assert out2["max_cycle"] == 2
     assert out2["max_space"] == 4
+
+
+def test_matvec_runtime_resolve_cuda_j_tile_and_csr_cache():
+    auto_j = resolve_cuda_j_tile(
+        requested_j_tile=0,
+        target_ntasks=1_500_000,
+        j_tile_align=256,
+        norb=12,
+        ncsf=5000,
+    )
+    assert auto_j > 0
+    manual_j = resolve_cuda_j_tile(
+        requested_j_tile=777,
+        target_ntasks=1_500_000,
+        j_tile_align=256,
+        norb=12,
+        ncsf=5000,
+    )
+    assert manual_j == 777
+
+    auto_cache_fast = resolve_cuda_cache_csr_tiles(
+        cache_csr_tiles_in=None,
+        aggregate_offdiag=True,
+        use_epq_table=True,
+        ncsf=5000,
+        j_tile=auto_j,
+        norb=12,
+        csr_capacity_mult=2.0,
+    )
+    assert auto_cache_fast is False
+    auto_cache_general = resolve_cuda_cache_csr_tiles(
+        cache_csr_tiles_in=None,
+        aggregate_offdiag=False,
+        use_epq_table=False,
+        ncsf=5000,
+        j_tile=auto_j,
+        norb=12,
+        csr_capacity_mult=2.0,
+    )
+    assert isinstance(auto_cache_general, bool)
+    forced_cache = resolve_cuda_cache_csr_tiles(
+        cache_csr_tiles_in="on",
+        aggregate_offdiag=False,
+        use_epq_table=False,
+        ncsf=5000,
+        j_tile=auto_j,
+        norb=12,
+        csr_capacity_mult=2.0,
+    )
+    assert forced_cache is True
+
+
+def test_matvec_runtime_resolve_cuda_workspace_controls_consume_modes():
+    defaults = SimpleNamespace(
+        matvec_cuda_target_ntasks=10,
+        matvec_cuda_j_tile_align=16,
+        matvec_cuda_j_tile=4,
+        matvec_cuda_csr_capacity_mult=3.0,
+        matvec_cuda_csr_host_cache="off",
+        matvec_cuda_csr_host_cache_budget_gib=2.5,
+        matvec_cuda_csr_host_cache_min_ncsf=12,
+        matvec_cuda_csr_pipeline_streams="auto",
+        matvec_cuda_csr_pipeline_min_ncsf=13,
+        matvec_cuda_prefilter_trivial_tasks="on",
+        matvec_cuda_prefilter_trivial_tasks_min_ncsf=14,
+        matvec_cuda_threads_enum=96,
+        matvec_cuda_threads_g=160,
+        matvec_cuda_threads_w=80,
+        matvec_cuda_threads_apply=0,
+        matvec_cuda_coalesce=True,
+        matvec_cuda_include_diagonal_rs=True,
+        matvec_cuda_cache_csr_tiles=None,
+        matvec_cuda_fuse_count_write=True,
+        matvec_cuda_fp32_coeff_data=False,
+        matvec_cuda_use_epq_table=None,
+        matvec_cuda_aggregate_offdiag=None,
+    )
+    kwargs = {
+        "matvec_cuda_threads_enum": 128,
+        "matvec_cuda_threads_apply": 32,
+        "matvec_cuda_csr_pipeline_streams": 3,
+        "matvec_cuda_aggregate_offdiag": True,
+    }
+    out = resolve_cuda_workspace_controls(
+        kwargs=kwargs,
+        defaults=defaults,
+        consume=True,
+        context="kernel(cuda)",
+    )
+    assert out["threads_enum_forced"] is True
+    assert out["threads_g_forced"] is False
+    assert out["matvec_cuda_threads_enum"] == 128
+    assert out["matvec_cuda_threads_apply"] == 32
+    assert out["threads_apply_auto"] is False
+    assert out["matvec_cuda_csr_pipeline_streams_mode"] == "manual"
+    assert out["matvec_cuda_csr_pipeline_streams_value"] == 3
+    assert out["matvec_cuda_aggregate_offdiag"] is True
+    assert kwargs == {}
+
+    kwargs2 = {"matvec_cuda_aggregate_offdiag": True, "matvec_cuda_threads_apply": 0}
+    out2 = resolve_cuda_workspace_controls(
+        kwargs=kwargs2,
+        defaults=defaults,
+        consume=False,
+        context="approx_kernel(cuda)",
+    )
+    assert out2["threads_apply_auto"] is True
+    assert kwargs2["matvec_cuda_aggregate_offdiag"] is True
+    assert kwargs2["matvec_cuda_threads_apply"] == 0
+
+    with pytest.raises(ValueError, match="forbidden by hard guard"):
+        resolve_cuda_workspace_controls(
+            kwargs={"matvec_cuda_aggregate_offdiag": False},
+            defaults=defaults,
+            consume=False,
+            context="approx_kernel(cuda)",
+        )
+
+
+def test_matvec_runtime_get_or_create_cuda_matvec_state():
+    calls = {"drt": 0, "state": 0}
+
+    def _mk_drt(drt):
+        calls["drt"] += 1
+        return ("drt_dev", drt)
+
+    def _mk_state(drt, drt_dev):
+        calls["state"] += 1
+        return ("state_dev", drt, drt_dev)
+
+    cache = {}
+    s1 = get_or_create_cuda_matvec_state(
+        state_cache=cache,
+        ws_key=("k",),
+        drt="drt_obj",
+        make_device_drt_fn=_mk_drt,
+        make_device_state_cache_fn=_mk_state,
+    )
+    s2 = get_or_create_cuda_matvec_state(
+        state_cache=cache,
+        ws_key=("k",),
+        drt="drt_obj",
+        make_device_drt_fn=_mk_drt,
+        make_device_state_cache_fn=_mk_state,
+    )
+    assert s1 == s2
+    assert calls["drt"] == 1
+    assert calls["state"] == 1
+    assert cache[("k",)] == s1
+
+
+def test_matvec_runtime_thread_tuning_helpers():
+    tuned = tune_cuda_threads_for_large_cas_noepq(
+        threads_enum=128,
+        threads_g=256,
+        threads_enum_forced=False,
+        threads_g_forced=False,
+        eri_mat_present=True,
+        use_epq_table=False,
+        aggregate_offdiag=False,
+        nops=256,
+        ncsf=1_500_000,
+        dtype_mode="float32",
+    )
+    assert tuned["threads_enum"] == 256
+    assert tuned["threads_g"] == 128
+
+    tuned_forced = tune_cuda_threads_for_large_cas_noepq(
+        threads_enum=128,
+        threads_g=192,
+        threads_enum_forced=True,
+        threads_g_forced=True,
+        eri_mat_present=True,
+        use_epq_table=False,
+        aggregate_offdiag=False,
+        nops=256,
+        ncsf=1_500_000,
+        dtype_mode="float64",
+    )
+    assert tuned_forced["threads_enum"] == 128
+    assert tuned_forced["threads_g"] == 192
+
+    assert resolve_cuda_threads_w(threads_w=0, threads_g=160) == 160
+    assert resolve_cuda_threads_w(threads_w=64, threads_g=160) == 64
+
+    assert resolve_cuda_threads_apply(
+        threads_apply=0,
+        use_epq_table=True,
+        dtype_mode="float32",
+        ncsf=2_000_000,
+        nops=100,
+        noepq_large_ncsf_uses_64=True,
+    ) == 64
+    assert resolve_cuda_threads_apply(
+        threads_apply=0,
+        use_epq_table=False,
+        dtype_mode="float64",
+        ncsf=2_000_000,
+        nops=100,
+        noepq_large_ncsf_uses_64=True,
+    ) == 64
+    assert resolve_cuda_threads_apply(
+        threads_apply=0,
+        use_epq_table=False,
+        dtype_mode="float64",
+        ncsf=2_000_000,
+        nops=100,
+        noepq_large_ncsf_uses_64=False,
+    ) == 32
 
 
 def test_matvec_runtime_ws_needs_rebuild_and_budget_helpers():
@@ -476,6 +717,453 @@ def test_dump_flags_runtime_silent_and_verbose_output():
     assert "matvec_cuda_policy = auto" in text
 
 
+def test_kernel_runtime_resolve_nroots_and_warm_start_and_dry_run():
+    assert resolve_kernel_nroots(requested_nroots=None, defaults=SimpleNamespace(nroots=2), ncsf=3) == 2
+    with pytest.raises(ValueError, match="nroots must be >= 1"):
+        resolve_kernel_nroots(requested_nroots=0, defaults=object(), ncsf=3)
+    with pytest.raises(ValueError, match="> ncsf="):
+        resolve_kernel_nroots(requested_nroots=4, defaults=object(), ncsf=3)
+
+    calls = {}
+
+    def _warm_fn(**kwargs):
+        calls["warm"] = kwargs
+        return ([np.asarray([1.0, 0.0])], "applied")
+
+    out = resolve_kernel_warm_start(
+        ci0=None,
+        warm_state_enable=True,
+        warm_state_ci0_if_compatible_fn=_warm_fn,
+        norb=2,
+        nelec_total=2,
+        twos=0,
+        nroots=1,
+        ncsf=2,
+        orbsym=None,
+        wfnsym=None,
+        ne_constraints=None,
+        matvec_backend="cuda",
+        cas_metadata={"ncas": 2, "nelecas": (1, 1)},
+    )
+    assert out["warm_applied"] is True
+    assert out["warm_reason"] == "applied"
+    assert out["ci0"] is not None and len(out["ci0"]) == 1
+    assert calls["warm"]["ncsf"] == 2
+
+    out2 = resolve_kernel_warm_start(
+        ci0=[np.asarray([0.0, 1.0])],
+        warm_state_enable=True,
+        warm_state_ci0_if_compatible_fn=lambda **_kw: (_kw, "unused"),
+        norb=2,
+        nelec_total=2,
+        twos=0,
+        nroots=1,
+        ncsf=2,
+        orbsym=None,
+        wfnsym=None,
+        ne_constraints=None,
+        matvec_backend="contract",
+        cas_metadata={},
+    )
+    assert out2["warm_applied"] is False
+    assert out2["warm_reason"] == "ci0_provided"
+
+    dry = build_kernel_dry_run_result(
+        ci0=None,
+        nroots=2,
+        ncsf=3,
+        ecore=1.25,
+        normalize_ci0_fn=lambda *_args, **_kwargs: None,
+    )
+    assert dry["e"].tolist() == [1.25, 1.25]
+    assert np.allclose(dry["ci"][0], np.asarray([1.0, 0.0, 0.0]))
+    assert np.allclose(dry["ci"][1], np.asarray([0.0, 1.0, 0.0]))
+
+    marker = {"called": False}
+
+    def _norm(ci0, *, nroots, ncsf):
+        marker["called"] = True
+        assert nroots == 1 and ncsf == 2
+        return [np.asarray(ci0[0], dtype=np.float64)]
+
+    dry2 = build_kernel_dry_run_result(
+        ci0=[np.asarray([0.2, 0.8])],
+        nroots=1,
+        ncsf=2,
+        ecore=0.0,
+        normalize_ci0_fn=_norm,
+    )
+    assert marker["called"] is True
+    assert np.allclose(dry2["ci"][0], np.asarray([0.2, 0.8]))
+
+
+def test_kernel_runtime_dense_fastpath_and_precompute_state_cache():
+    calls = {"precompute": 0, "state_cache": 0, "warm": 0}
+
+    class _StubSolver:
+        dense_eigh_ncsf_threshold = 10
+
+        def pspace(self, *_args, **_kwargs):
+            addr = np.asarray([0, 1], dtype=np.int64)
+            h = np.asarray([[1.0, 0.0], [0.0, 2.0]], dtype=np.float64)
+            return addr, h
+
+        def _update_warm_state(self, **_kwargs):
+            calls["warm"] += 1
+
+    solver = _StubSolver()
+    out = run_kernel_dense_eigh_fastpath(
+        solver=solver,
+        h1e=np.zeros((2, 2)),
+        eri=np.zeros((2, 2, 2, 2)),
+        norb=2,
+        nelec=2,
+        ncsf=2,
+        nroots=1,
+        ecore=0.5,
+        max_out=10,
+        orbsym=None,
+        wfnsym=None,
+        ne_constraints=None,
+        drt_key=("k",),
+        warm_state_update=True,
+        nelec_total=2,
+        twos=0,
+        cas_metadata={"ncas": 2},
+        warm_state_mo_coeff=None,
+        warm_state_mo_occ=None,
+        t_kernel0=0.0,
+    )
+    assert out is not None
+    assert out["e"].shape == (1,)
+    assert out["e"][0] == pytest.approx(1.5)
+    assert np.allclose(out["ci"][0], np.asarray([1.0, 0.0]))
+    assert calls["warm"] == 1
+
+    out2 = run_kernel_dense_eigh_fastpath(
+        solver=solver,
+        h1e=np.zeros((2, 2)),
+        eri=np.zeros((2, 2, 2, 2)),
+        norb=2,
+        nelec=2,
+        ncsf=20,
+        nroots=1,
+        ecore=0.0,
+        max_out=10,
+        orbsym=None,
+        wfnsym=None,
+        ne_constraints=None,
+        drt_key=("k",),
+        warm_state_update=False,
+        nelec_total=2,
+        twos=0,
+        cas_metadata={},
+        warm_state_mo_coeff=None,
+        warm_state_mo_occ=None,
+        t_kernel0=0.0,
+    )
+    assert out2 is None
+
+    state_cache = prepare_kernel_precompute_and_state_cache(
+        precompute_epq=True,
+        drt="drt",
+        matvec_backend="row_oracle_df",
+        row_oracle_use_state_cache=True,
+        precompute_epq_actions_fn=lambda _drt: calls.__setitem__("precompute", calls["precompute"] + 1),
+        get_state_cache_fn=lambda _drt: calls.__setitem__("state_cache", calls["state_cache"] + 1) or {"ok": True},
+    )
+    assert state_cache == {"ok": True}
+    assert calls["precompute"] == 1
+    assert calls["state_cache"] == 1
+
+
+def test_kernel_runtime_row_screening_and_contract_eri_restore_helpers():
+    class _RowScreening:
+        pass
+
+    rs = _RowScreening()
+    assert normalize_row_screening(row_screening=rs, row_screening_type=_RowScreening) is rs
+    assert normalize_row_screening(row_screening=None, row_screening_type=_RowScreening) is None
+    with pytest.raises(TypeError, match="row_screening must be a RowScreening or None"):
+        normalize_row_screening(row_screening=object(), row_screening_type=_RowScreening)
+
+    restored = np.zeros((2, 2, 2, 2), dtype=np.float64)
+    calls = {"restore": 0}
+
+    def _restore(_eri, _norb):
+        calls["restore"] += 1
+        return restored
+
+    eri_pair = np.zeros((3, 3), dtype=np.float64)
+    out = maybe_restore_contract_eri(
+        matvec_backend="contract",
+        eri=eri_pair,
+        norb=2,
+        df_types=(),
+        restore_eri1_fn=_restore,
+    )
+    assert calls["restore"] == 1
+    assert out is restored
+
+    calls["restore"] = 0
+    out2 = maybe_restore_contract_eri(
+        matvec_backend="contract",
+        eri=np.zeros((2, 2, 2, 2), dtype=np.float64),
+        norb=2,
+        df_types=(),
+        restore_eri1_fn=_restore,
+    )
+    assert calls["restore"] == 0
+    assert out2.shape == (2, 2, 2, 2)
+
+    calls["restore"] = 0
+    out3 = maybe_restore_contract_eri(
+        matvec_backend="cuda",
+        eri=eri_pair,
+        norb=2,
+        df_types=(),
+        restore_eri1_fn=_restore,
+    )
+    assert calls["restore"] == 0
+    assert out3 is eri_pair
+
+
+def test_kernel_runtime_build_cuda_hamiltonian_inputs_df_path():
+    class _FakeCP:
+        float64 = np.float64
+
+        @staticmethod
+        def asarray(arr, dtype=None):
+            return np.asarray(arr, dtype=dtype)
+
+        @staticmethod
+        def ascontiguousarray(arr):
+            return np.ascontiguousarray(arr)
+
+        @staticmethod
+        def dot(a, b):
+            return np.dot(a, b)
+
+    class _DF:
+        def __init__(self):
+            self.l_full = np.eye(4, dtype=np.float64)
+            self.j_ps = np.ones((2, 2), dtype=np.float64)
+
+    out = build_cuda_hamiltonian_inputs(
+        cp=_FakeCP(),
+        eri=_DF(),
+        h1e=np.eye(2, dtype=np.float64),
+        norb=2,
+        df_eri_mat_max_bytes=1024 * 1024,
+        df_type=_DF,
+        device_df_type=type("_DeviceDF", (), {}),
+        restore_eri_4d_fn=lambda *_a, **_k: None,
+    )
+    assert out["eri_mat_d"] is not None
+    assert out["l_full_d"] is None
+    assert tuple(np.asarray(out["h_eff_d"]).shape) == (2, 2)
+
+
+def test_kernel_runtime_autotune_cuda_max_g_mib_for_large_cas_guards():
+    # Guarded path: forced setting should bypass tuning.
+    out_forced = autotune_cuda_max_g_mib_for_large_cas(
+        max_g_mib=256.0,
+        max_g_forced=True,
+        aggregate_offdiag=True,
+        ncsf=2_000_000,
+        norb=12,
+        matvec_cuda_dtype="float64",
+        eri_mat_present=True,
+        mem_hard_cap_gib=0.0,
+        cuda_budget_free_bytes_fn=lambda *_a, **_k: None,
+    )
+    assert out_forced == 256.0
+
+    # Non-large-CAS path should also bypass tuning.
+    out_small = autotune_cuda_max_g_mib_for_large_cas(
+        max_g_mib=256.0,
+        max_g_forced=False,
+        aggregate_offdiag=True,
+        ncsf=500_000,
+        norb=12,
+        matvec_cuda_dtype="float64",
+        eri_mat_present=True,
+        mem_hard_cap_gib=0.0,
+        cuda_budget_free_bytes_fn=lambda *_a, **_k: None,
+    )
+    assert out_small == 256.0
+
+
+def test_kernel_cuda_runtime_auto_select_use_epq_table():
+    class _Pool:
+        @staticmethod
+        def total_bytes():
+            return 0
+
+        @staticmethod
+        def used_bytes():
+            return 0
+
+    class _Runtime:
+        @staticmethod
+        def memGetInfo():
+            return (6 * 1024 * 1024 * 1024, 12 * 1024 * 1024 * 1024)
+
+    cp_mod = SimpleNamespace(cuda=SimpleNamespace(runtime=_Runtime()), get_default_memory_pool=lambda: _Pool())
+    assert auto_select_use_epq_table(
+        cp=cp_mod,
+        norb=14,
+        ncsf=200_000,
+        aggregate_offdiag=True,
+        has_epq_table_device_build=True,
+        mem_hard_cap_gib=11.5,
+        dtype_mode="float64",
+        eri_mat_present=True,
+    )
+    assert not auto_select_use_epq_table(
+        cp=cp_mod,
+        norb=28,
+        ncsf=200_000,
+        aggregate_offdiag=True,
+        has_epq_table_device_build=True,
+        mem_hard_cap_gib=11.5,
+        dtype_mode="float64",
+        eri_mat_present=True,
+    )
+
+
+def test_kernel_cuda_runtime_common_policy_helpers():
+    out = resolve_cuda_workspace_policy_common(
+        apply_mode="auto",
+        apply_mode_forced=False,
+        use_epq_table=False,
+        dtype_mode="float64",
+        ncsf=1_200_000,
+        nops=196,
+        threads_enum=96,
+        threads_g=128,
+        threads_w=0,
+        threads_apply=0,
+        threads_enum_forced=False,
+        threads_g_forced=False,
+        threads_apply_auto=True,
+        eri_mat_present=True,
+        aggregate_offdiag=True,
+        max_g_mib=4096.0,
+        mem_hard_cap_gib=11.5,
+        cache_csr_tiles_in=None,
+        j_tile=256,
+        norb=14,
+        csr_capacity_mult=2.0,
+        noepq_large_ncsf_uses_64=True,
+    )
+    assert out["threads_enum"] > 0
+    assert out["threads_g"] > 0
+    assert out["threads_w"] > 0
+    assert out["threads_apply"] == 64
+    assert out["max_g_mib"] <= 512.0
+    assert out["cache_csr_tiles"] in (True, False)
+
+
+def test_kernel_cuda_runtime_validate_low_precision_path_guards():
+    out = validate_low_precision_cuda_path(
+        context="test(cuda)",
+        dtype_mode="mixed",
+        use_epq_table=True,
+        aggregate_offdiag=True,
+        ncsf=1_200_000,
+        eri_mat_present=False,
+        enable_fp64_emulation=False,
+        use_graph=True,
+    )
+    assert out["use_graph"] is False
+
+    with pytest.raises(ValueError, match="requires dense eri_mat"):
+        validate_low_precision_cuda_path(
+            context="test(cuda)",
+            dtype_mode="float32",
+            use_epq_table=False,
+            aggregate_offdiag=True,
+            ncsf=100,
+            eri_mat_present=False,
+            enable_fp64_emulation=False,
+            use_graph=False,
+        )
+
+
+def test_kernel_cuda_runtime_resolve_epq_streaming_controls():
+    out = resolve_epq_streaming_controls(
+        epq_streaming_in="on",
+        epq_stream_j_tile_in=-7,
+        epq_stream_use_recompute_in="off",
+    )
+    assert out["streaming_mode"] == "on"
+    assert out["streaming"] is True
+    assert out["stream_j_tile"] == 0
+    assert out["stream_use_recompute"] is False
+
+    out2 = resolve_epq_streaming_controls(
+        epq_streaming_in=None,
+        epq_stream_j_tile_in=64,
+        epq_stream_use_recompute_in=None,
+    )
+    assert out2["streaming_mode"] == "auto"
+    assert out2["streaming"] is False
+    assert out2["stream_j_tile"] == 64
+    assert out2["stream_use_recompute"] == "auto"
+
+    with pytest.raises(ValueError, match="matvec_cuda_epq_streaming"):
+        resolve_epq_streaming_controls(
+            epq_streaming_in="maybe",
+            epq_stream_j_tile_in=0,
+            epq_stream_use_recompute_in="auto",
+        )
+    with pytest.raises(ValueError, match="matvec_cuda_epq_stream_use_recompute"):
+        resolve_epq_streaming_controls(
+            epq_streaming_in="auto",
+            epq_stream_j_tile_in=0,
+            epq_stream_use_recompute_in="sometimes",
+        )
+
+
+def test_kernel_cuda_runtime_apply_low_precision_and_workspace_policy():
+    out = apply_low_precision_and_workspace_policy(
+        context="kernel(cuda)",
+        dtype_mode="mixed",
+        use_epq_table=True,
+        aggregate_offdiag=True,
+        ncsf=1_200_000,
+        eri_mat_present=False,
+        enable_fp64_emulation=False,
+        use_graph=True,
+        apply_mode="auto",
+        apply_mode_forced=False,
+        nops=196,
+        threads_enum=96,
+        threads_g=128,
+        threads_w=0,
+        threads_apply=0,
+        threads_enum_forced=False,
+        threads_g_forced=False,
+        threads_apply_auto=True,
+        max_g_mib=4096.0,
+        mem_hard_cap_gib=11.5,
+        cache_csr_tiles_in=None,
+        j_tile=256,
+        norb=14,
+        csr_capacity_mult=2.0,
+        noepq_large_ncsf_uses_64=True,
+    )
+    assert out["graph_disabled"] is True
+    assert out["use_graph"] is False
+    assert out["threads_enum"] > 0
+    assert out["threads_g"] > 0
+    assert out["threads_w"] > 0
+    assert out["threads_apply"] == 64
+    assert out["max_g_mib"] <= 512.0
+    assert out["cache_csr_tiles"] in (True, False)
+
+
 def test_init_runtime_defaults_env_override_and_normalization():
     seen: dict[str, object] = {}
 
@@ -653,6 +1341,109 @@ def test_resolve_cuda_memory_controls_consume_and_readonly():
     out3 = resolve_cuda_memory_controls(kwargs={}, defaults=defaults, consume=False)
     assert out3["matvec_cuda_mem_hard_cap_gib"] == pytest.approx(9.5)
     assert out3["matvec_cuda_ws_cache_fraction"] == pytest.approx(0.2)
+
+
+def test_resolve_cuda_max_g_and_hard_cap_clamp():
+    defaults = SimpleNamespace(matvec_cuda_max_g_mib=256.0)
+    kwargs = {"matvec_cuda_max_g_mib": "1024"}
+    out = resolve_cuda_max_g_mib(kwargs=kwargs, defaults=defaults, consume=False)
+    assert out["max_g_forced"] is True
+    assert out["matvec_cuda_max_g_mib"] == pytest.approx(1024.0)
+    assert "matvec_cuda_max_g_mib" in kwargs
+
+    out2 = resolve_cuda_max_g_mib(kwargs=kwargs, defaults=defaults, consume=True)
+    assert out2["max_g_forced"] is True
+    assert out2["matvec_cuda_max_g_mib"] == pytest.approx(1024.0)
+    assert kwargs == {}
+
+    out3 = resolve_cuda_max_g_mib(kwargs={}, defaults=SimpleNamespace(matvec_cuda_max_g_mib=-1.0), consume=False)
+    assert out3["max_g_forced"] is False
+    assert out3["matvec_cuda_max_g_mib"] == pytest.approx(256.0)
+
+    assert cap_cuda_max_g_mib_by_hard_cap(max_g_mib=2048.0, hard_cap_gib=12.0) == pytest.approx(512.0)
+    assert cap_cuda_max_g_mib_by_hard_cap(max_g_mib=2048.0, hard_cap_gib=16.0) == pytest.approx(1024.0)
+    assert cap_cuda_max_g_mib_by_hard_cap(max_g_mib=768.0, hard_cap_gib=0.0) == pytest.approx(768.0)
+
+
+def test_resolve_cuda_apply_mode_and_epq_build_device():
+    defaults = SimpleNamespace(matvec_cuda_apply_mode="auto")
+    kwargs = {"matvec_cuda_apply_mode": "scatter"}
+    out = resolve_cuda_apply_mode(kwargs=kwargs, defaults=defaults, consume=False)
+    assert out["apply_mode_forced"] is True
+    assert out["matvec_cuda_apply_mode"] == "scatter"
+    assert "matvec_cuda_apply_mode" in kwargs
+
+    out2 = resolve_cuda_apply_mode(kwargs=kwargs, defaults=defaults, consume=True)
+    assert out2["apply_mode_forced"] is True
+    assert kwargs == {}
+    with pytest.raises(ValueError, match="must be one of"):
+        resolve_cuda_apply_mode(kwargs={"matvec_cuda_apply_mode": "bad"}, defaults=defaults, consume=False)
+
+    assert maybe_promote_cuda_apply_mode_scatter(
+        apply_mode="auto",
+        apply_mode_forced=False,
+        use_epq_table=True,
+        dtype_mode="float32",
+        ncsf=2_000_000,
+    ) == "scatter"
+    assert maybe_promote_cuda_apply_mode_scatter(
+        apply_mode="auto",
+        apply_mode_forced=True,
+        use_epq_table=True,
+        dtype_mode="float32",
+        ncsf=2_000_000,
+    ) == "auto"
+
+    assert resolve_cuda_epq_build_device(
+        epq_build_device=None,
+        use_epq_table=True,
+        has_epq_table_device_build=True,
+    ) is True
+    assert resolve_cuda_epq_build_device(
+        epq_build_device=False,
+        use_epq_table=True,
+        has_epq_table_device_build=True,
+    ) is False
+    with pytest.raises(RuntimeError, match="requires a rebuilt CUDA extension"):
+        resolve_cuda_epq_build_device(
+            epq_build_device=True,
+            use_epq_table=True,
+            has_epq_table_device_build=False,
+        )
+
+
+def test_resolve_cuda_cublas_workspace_cap_mb_and_clamp():
+    defaults = SimpleNamespace(matvec_cuda_cublas_workspace_cap_mb=2048)
+    kwargs = {"matvec_cuda_cublas_workspace_cap_mb": "1024"}
+    out = resolve_cuda_cublas_workspace_cap_mb(
+        kwargs=kwargs,
+        defaults=defaults,
+        hard_cap_gib=16.0,
+        consume=False,
+    )
+    assert out == 512
+    assert "matvec_cuda_cublas_workspace_cap_mb" in kwargs
+
+    out2 = resolve_cuda_cublas_workspace_cap_mb(
+        kwargs=kwargs,
+        defaults=defaults,
+        hard_cap_gib=12.0,
+        consume=True,
+    )
+    assert out2 == 256
+    assert kwargs == {}
+
+    out3 = resolve_cuda_cublas_workspace_cap_mb(
+        kwargs={},
+        defaults=defaults,
+        hard_cap_gib=0.0,
+        consume=False,
+    )
+    assert out3 == 2048
+    assert cap_cuda_cublas_workspace_cap_mb_by_hard_cap(
+        cublas_workspace_cap_mb=4096,
+        hard_cap_gib=12.0,
+    ) == 256
 
 
 def test_ws_fraction_and_epq_overbudget_resolution():

@@ -1,10 +1,10 @@
 from __future__ import annotations
 
 import time
+from typing import Any
 
 import numpy as np
 
-from asuka.integrals.df_integrals import DFMOIntegrals
 from asuka.cuguga.drt import DRT
 from asuka.cuguga.epq.action import epq_apply_g, epq_apply_weighted_many, epq_contribs_one, path_nodes
 from asuka.cuguga.oracle import _STEP_TO_OCC, _restore_eri_4d
@@ -33,6 +33,21 @@ _DENSE_ACC_NCSF_MAX = 10_000_000
 _DENSE_MASK_ACC_CACHE: dict[int, "_DenseRowMaskAccumulator"] = {}
 _H_EFF_STATIC_CACHE: dict[tuple[int, int, int], tuple[np.ndarray, np.ndarray]] = {}
 _H_EFF_STATIC_CACHE_MAX = 8
+
+
+def _is_df_mo_integrals_like(eri: Any) -> bool:
+    """Duck-typed DF integral container check to avoid static package coupling."""
+
+    return all(
+        hasattr(eri, name)
+        for name in (
+            "norb",
+            "j_ps",
+            "rr_slice_h_eff",
+            "contract_cols",
+            "pair_norm",
+        )
+    )
 
 
 def _csf_index_dtype(drt: DRT) -> np.dtype:
@@ -362,7 +377,7 @@ def connected_row_sparse(
 
     # DF/RI dispatch: allow callers (notably QMC) to pass DF integrals through the
     # same API used for dense integrals.
-    if isinstance(eri, DFMOIntegrals):
+    if _is_df_mo_integrals_like(eri):
         return connected_row_sparse_df(
             drt,
             h1e,
@@ -636,7 +651,7 @@ def connected_row_sparse(
 def connected_row_sparse_df(
     drt: DRT,
     h1e: np.ndarray,
-    df_eri: DFMOIntegrals,
+    df_eri: Any,
     j: int,
     *,
     max_out: int = 200_000,

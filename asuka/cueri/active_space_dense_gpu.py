@@ -11,6 +11,7 @@ from .basis_utils import shell_nfunc_cart
 from .cart import ncart
 from .gpu import CUDA_MAX_L, sph_coeff_sph_to_cart_device
 from .mol_basis import SphMapForCartBasis, pack_cart_shells_from_mol_with_sph_map
+from .sph import nsph
 from .shell_pairs import ShellPairs, build_shell_pairs_l_order
 from .stream import stream_ctx
 from .tasks import (
@@ -42,6 +43,19 @@ def _build_ao2shell_and_local_cart(shell_ao_start_cart: np.ndarray, shell_l: np.
         ao2shell[int(a0) : a1] = np.int32(sh)
         ao2local[int(a0) : a1] = np.arange(int(nc), dtype=np.int32)
     return ao2shell, ao2local, nao_cart
+
+
+def _compute_sph_layout_from_cart_basis(basis: BasisCartSoA) -> tuple[np.ndarray, int]:
+    shell_l = np.asarray(basis.shell_l, dtype=np.int32).ravel()
+    nshell = int(shell_l.size)
+    if nshell == 0:
+        return np.zeros((0,), dtype=np.int32), 0
+    shell_ao_start_sph = np.empty((nshell,), dtype=np.int32)
+    cursor = 0
+    for i in range(nshell):
+        shell_ao_start_sph[i] = cursor
+        cursor += int(nsph(int(shell_l[i])))
+    return shell_ao_start_sph, int(cursor)
 
 
 @dataclass
@@ -248,9 +262,7 @@ class CuERIActiveSpaceDenseGPUBuilder:
                     raise RuntimeError("failed to derive spherical AO offsets from mol for ao_rep='sph'") from e
             elif ao_basis is not None:
                 # Derive spherical layout directly from packed Cartesian basis
-                from asuka.integrals.cart2sph import compute_sph_layout_from_cart_basis  # noqa: PLC0415
-
-                _shell_ao_start_sph, _nao_sph = compute_sph_layout_from_cart_basis(ao_basis)
+                _shell_ao_start_sph, _nao_sph = _compute_sph_layout_from_cart_basis(ao_basis)
                 _starts_cart = np.asarray(ao_basis.shell_ao_start, dtype=np.int32).ravel()
                 _ls = np.asarray(ao_basis.shell_l, dtype=np.int32).ravel()
                 _nao_cart = int(max(int(_starts_cart[i]) + ncart(int(_ls[i])) for i in range(int(_ls.size)))) if int(_ls.size) else 0

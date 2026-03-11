@@ -1,12 +1,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from math import gamma, pi
 from typing import Any
 
 import numpy as np
-
-from asuka.integrals.gto_cart import ncart as _ncart
-from asuka.integrals.gto_cart import primitive_norm_cart_like_pyscf as _primitive_norm_cart_like_pyscf
 
 from .basis_cart import BasisCartSoA
 from .sph import nsph
@@ -19,6 +17,37 @@ class SphMapForCartBasis:
     shell_ao_start_sph: np.ndarray  # int32, one entry per expanded shell
     nao_sph: int
     nao_cart: int
+
+
+def _ncart(l: int) -> int:
+    l_i = int(l)
+    if l_i < 0:
+        raise ValueError("l must be >= 0")
+    return (l_i + 1) * (l_i + 2) // 2
+
+
+def _gaussian_int(n: int, alpha: np.ndarray) -> np.ndarray:
+    n_i = int(n)
+    if n_i < 0:
+        raise ValueError("n must be >= 0")
+    alpha_v = np.asarray(alpha, dtype=np.float64)
+    if alpha_v.ndim != 1:
+        raise ValueError("alpha must be 1D")
+    n1 = 0.5 * float(n_i + 1)
+    return (gamma(n1) / 2.0) / np.power(alpha_v, n1)
+
+
+def _primitive_norm_cart_like_pyscf(l: int, exp: np.ndarray) -> np.ndarray:
+    l_i = int(l)
+    if l_i < 0:
+        raise ValueError("l must be >= 0")
+    exp_v = np.asarray(exp, dtype=np.float64)
+    if exp_v.ndim != 1:
+        raise ValueError("exp must be 1D")
+    if l_i <= 1:
+        return (2.0 * exp_v / pi) ** 0.75 * (4.0 * exp_v) ** (0.5 * l_i)
+    # PySCF/libcint-aligned radial normalization for l>=2.
+    return 1.0 / np.sqrt(_gaussian_int(l_i * 2 + 2, 2.0 * exp_v))
 
 
 def _pack_cart_shells_from_mol_core(

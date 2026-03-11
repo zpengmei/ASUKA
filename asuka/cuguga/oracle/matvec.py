@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+from typing import Any
+
 import numpy as np
 
-from asuka.integrals.df_integrals import DFMOIntegrals
 from asuka.cuguga.drt import DRT
 from asuka.cuguga.oracle.sparse import connected_row_sparse_df
 from asuka.cuguga.screening import RowScreening
@@ -12,7 +13,7 @@ from asuka.cuguga.state_cache import DRTStateCache
 def matvec_df_row_oracle(
     drt: DRT,
     h1e: np.ndarray,
-    df_eri: DFMOIntegrals,
+    df_eri: Any,
     xs: list[np.ndarray],
     *,
     max_out: int = 200_000,

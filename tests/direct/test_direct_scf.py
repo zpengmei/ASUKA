@@ -10,6 +10,20 @@ import pytest
 import numpy as np
 
 
+def test_direct_jk_class_policy_parse():
+    from asuka.hf import direct_jk as djk
+
+    parsed = djk._parse_direct_jk_class_policy_env(
+        "psss=warp_eri, ssss=fused, psdp=staged_warp_contract, noop=bogus"
+    )
+
+    assert parsed == {
+        "psss": "staged_warp_eri",
+        "ssss": "fused_jk",
+        "psdp": "staged_warp_contract",
+    }
+
+
 def _cuda_available() -> bool:
     try:
         import cupy as cp

@@ -23,8 +23,9 @@ from .types import GridBatch
 try:  # optional CUDA stack
     import cupy as cp  # type: ignore
 
-    from asuka import _orbitals_cuda_ext as _ext  # type: ignore
+    from asuka.kernels import orbitals as _orbitals_kernels  # noqa: PLC0415
 
+    _ext = _orbitals_kernels.load_ext()
     _CUDA_GRID_OK = True
 except Exception:  # pragma: no cover
     cp = None  # type: ignore
@@ -54,7 +55,7 @@ _GRID_WS_CACHE: dict[int, tuple[int, int, Any]] = {}
 
 def _require_cuda_grid_stack():
     if not _CUDA_GRID_OK:  # pragma: no cover
-        raise RuntimeError("CUDA grid backend unavailable (requires cupy and asuka._orbitals_cuda_ext)")
+        raise RuntimeError("CUDA grid backend unavailable (requires cupy and orbitals CUDA extension)")
     assert cp is not None
     assert _ext is not None
     if int(cp.cuda.runtime.getDeviceCount()) <= 0:  # pragma: no cover

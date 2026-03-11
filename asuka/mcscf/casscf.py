@@ -32,8 +32,10 @@ import numpy as np
 from asuka.hf import df_scf as _df_scf
 from asuka.solver import GUGAFCISolver
 
-from asuka.frontend.molecule import Molecule
-from asuka.frontend.scf import RHFDFRunResult, ROHFDFRunResult, UHFDFRunResult
+Molecule = Any
+RHFDFRunResult = Any
+ROHFDFRunResult = Any
+UHFDFRunResult = Any
 
 from .casci import CASCIResult, run_casci_df, run_casci_thc, eval_casci_energy_df
 from .orbital_grad import (

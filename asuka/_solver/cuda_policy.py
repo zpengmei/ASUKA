@@ -311,6 +311,163 @@ def resolve_cuda_memory_controls(
     }
 
 
+def resolve_cuda_max_g_mib(
+    *,
+    kwargs: dict[str, Any],
+    defaults: Any,
+    consume: bool = False,
+) -> dict[str, Any]:
+    """Resolve `matvec_cuda_max_g_mib` with forcing metadata."""
+
+    if consume:
+        max_g_in = kwargs.pop("matvec_cuda_max_g_mib", None)
+        max_g_forced = max_g_in is not None
+    else:
+        max_g_forced = "matvec_cuda_max_g_mib" in kwargs
+        max_g_in = kwargs.get("matvec_cuda_max_g_mib", getattr(defaults, "matvec_cuda_max_g_mib", 256.0))
+
+    if max_g_in is None:
+        max_g_mib = float(getattr(defaults, "matvec_cuda_max_g_mib", 256.0))
+    else:
+        max_g_mib = float(max_g_in)
+    if float(max_g_mib) <= 0.0:
+        max_g_mib = float(getattr(defaults, "matvec_cuda_max_g_mib", 256.0))
+        if float(max_g_mib) <= 0.0:  # pragma: no cover
+            max_g_mib = 256.0
+    return {
+        "matvec_cuda_max_g_mib": float(max_g_mib),
+        "max_g_forced": bool(max_g_forced),
+    }
+
+
+def cap_cuda_max_g_mib_by_hard_cap(
+    *,
+    max_g_mib: float,
+    hard_cap_gib: float,
+) -> float:
+    """Apply hard-cap-based ceiling for CUDA g-buffer size."""
+
+    out = float(max_g_mib)
+    if float(hard_cap_gib) > 0.0:
+        hard_cap_mb = int(float(hard_cap_gib) * 1024.0)
+        if hard_cap_mb <= 12 * 1024:
+            out = min(float(out), 512.0)
+        elif hard_cap_mb <= 16 * 1024:
+            out = min(float(out), 1024.0)
+    return float(out)
+
+
+def resolve_cuda_apply_mode(
+    *,
+    kwargs: dict[str, Any],
+    defaults: Any,
+    consume: bool = False,
+) -> dict[str, Any]:
+    if consume:
+        apply_mode_forced = "matvec_cuda_apply_mode" in kwargs
+        apply_mode = str(
+            kwargs.pop(
+                "matvec_cuda_apply_mode",
+                getattr(defaults, "matvec_cuda_apply_mode", "auto"),
+            )
+        ).strip().lower()
+    else:
+        apply_mode_forced = "matvec_cuda_apply_mode" in kwargs
+        apply_mode = str(
+            kwargs.get(
+                "matvec_cuda_apply_mode",
+                getattr(defaults, "matvec_cuda_apply_mode", "auto"),
+            )
+        ).strip().lower()
+    if apply_mode not in ("auto", "scatter", "gather"):
+        raise ValueError("matvec_cuda_apply_mode must be one of: 'auto', 'scatter', 'gather'")
+    return {
+        "matvec_cuda_apply_mode": str(apply_mode),
+        "apply_mode_forced": bool(apply_mode_forced),
+    }
+
+
+def maybe_promote_cuda_apply_mode_scatter(
+    *,
+    apply_mode: str,
+    apply_mode_forced: bool,
+    use_epq_table: bool,
+    dtype_mode: str,
+    ncsf: int,
+) -> str:
+    mode = str(apply_mode).strip().lower()
+    if (
+        (not bool(apply_mode_forced))
+        and mode == "auto"
+        and bool(use_epq_table)
+        and str(dtype_mode) in ("float32", "mixed")
+        and int(ncsf) >= 1_000_000
+    ):
+        # Large-CAS FP32/mixed EPQ apply is consistently faster and more stable with scatter.
+        mode = "scatter"
+    return str(mode)
+
+
+def resolve_cuda_epq_build_device(
+    *,
+    epq_build_device: Any,
+    use_epq_table: bool,
+    has_epq_table_device_build: bool,
+) -> bool:
+    if epq_build_device is None:
+        # Auto: build the epq_table on GPU only when the extension supports it.
+        return bool(bool(use_epq_table) and bool(has_epq_table_device_build))
+    out = bool(epq_build_device)
+    if out and (not bool(has_epq_table_device_build)):
+        raise RuntimeError(
+            "matvec_cuda_epq_build_device=True requires a rebuilt CUDA extension "
+            "(missing epq-table device-build entrypoints)"
+        )
+    return bool(out)
+
+
+def cap_cuda_cublas_workspace_cap_mb_by_hard_cap(
+    *,
+    cublas_workspace_cap_mb: int,
+    hard_cap_gib: float,
+) -> int:
+    out = int(cublas_workspace_cap_mb)
+    if float(hard_cap_gib) > 0.0:
+        hard_cap_mb = int(float(hard_cap_gib) * 1024.0)
+        if hard_cap_mb <= 12 * 1024:
+            out = min(int(out), 256)
+        elif hard_cap_mb <= 16 * 1024:
+            out = min(int(out), 512)
+    return int(out)
+
+
+def resolve_cuda_cublas_workspace_cap_mb(
+    *,
+    kwargs: dict[str, Any],
+    defaults: Any,
+    hard_cap_gib: float,
+    consume: bool = False,
+) -> int:
+    if consume:
+        cap_mb = int(
+            kwargs.pop(
+                "matvec_cuda_cublas_workspace_cap_mb",
+                getattr(defaults, "matvec_cuda_cublas_workspace_cap_mb", 2048),
+            )
+        )
+    else:
+        cap_mb = int(
+            kwargs.get(
+                "matvec_cuda_cublas_workspace_cap_mb",
+                getattr(defaults, "matvec_cuda_cublas_workspace_cap_mb", 2048),
+            )
+        )
+    return cap_cuda_cublas_workspace_cap_mb_by_hard_cap(
+        cublas_workspace_cap_mb=int(cap_mb),
+        hard_cap_gib=float(hard_cap_gib),
+    )
+
+
 def enforce_cuda_fp32_large_cas_epq_policy(
     *,
     context: str,

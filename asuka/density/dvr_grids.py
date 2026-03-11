@@ -221,7 +221,7 @@ def _atomic_numbers_or_none(mol_or_coords: Any) -> np.ndarray | None:
     if atoms_bohr is None:
         return None
     try:
-        from asuka.frontend.periodic_table import atomic_number  # noqa: PLC0415
+        from asuka.chem.periodic_table import atomic_number  # noqa: PLC0415
     except Exception:  # pragma: no cover
         return None
     try:

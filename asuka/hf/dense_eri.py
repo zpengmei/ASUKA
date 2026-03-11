@@ -69,7 +69,6 @@ def _build_ao_eri_mat_dense_rys_cuda_direct(
         raise RuntimeError("CuPy is required for CUDA dense ERI build") from e
 
     from asuka.cueri.cart import ncart  # noqa: PLC0415
-    from asuka.cueri import _cueri_cuda_ext as _ext  # noqa: PLC0415
     from asuka.cueri.gpu import (  # noqa: PLC0415
         CUDA_MAX_L,
         CUDA_MAX_NROOTS,
@@ -79,6 +78,7 @@ def _build_ao_eri_mat_dense_rys_cuda_direct(
         to_device_basis_ss,
         to_device_shell_pairs,
     )
+    from asuka.kernels import cueri as cueri_kernels  # noqa: PLC0415
     from asuka.cueri.shell_pairs import build_shell_pairs_l_order  # noqa: PLC0415
     from asuka.cueri.tasks import (  # noqa: PLC0415
         TaskList,
@@ -94,6 +94,7 @@ def _build_ao_eri_mat_dense_rys_cuda_direct(
 
     if not has_cuda_ext():
         raise RuntimeError("cuERI CUDA extension not available; build via `python -m asuka.cueri.build_cuda_ext`")
+    _ext = cueri_kernels.require_ext()
 
     basis = ao_basis
     shell_l = np.asarray(basis.shell_l, dtype=np.int32).ravel()

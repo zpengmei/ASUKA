@@ -6,7 +6,6 @@ from typing import Any
 import numpy as np
 
 from asuka.cueri.cart import cart_comp_str, cartesian_components
-from asuka.frontend.molecule import Molecule
 
 _LSYM = "spdfghijklmn"
 
@@ -34,7 +33,7 @@ class AOInfo:
 
 
 def shell_to_atom_map(
-    mol: Molecule,
+    mol: Any,
     ao_basis: Any,
     *,
     tol: float = 1e-8,
@@ -74,7 +73,7 @@ def shell_to_atom_map(
 
 
 def build_ao_info(
-    mol: Molecule,
+    mol: Any,
     ao_basis: Any,
     *,
     tol: float = 1e-8,
@@ -132,4 +131,3 @@ def build_ao_info(
 
 
 __all__ = ["AOInfo", "build_ao_info", "shell_to_atom_map"]
-

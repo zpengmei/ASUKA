@@ -31,8 +31,10 @@ from asuka.hf import df_scf as _df_scf
 from asuka.hf import df_jk
 from asuka.solver import GUGAFCISolver
 
-from asuka.frontend.molecule import Molecule
-from asuka.frontend.scf import RHFDFRunResult, ROHFDFRunResult, UHFDFRunResult
+Molecule = Any
+RHFDFRunResult = Any
+ROHFDFRunResult = Any
+UHFDFRunResult = Any
 
 from .orbital_grad import orbital_gradient_dense, orbital_gradient_df
 from .state_average import ci_as_list, make_state_averaged_rdms, normalize_weights

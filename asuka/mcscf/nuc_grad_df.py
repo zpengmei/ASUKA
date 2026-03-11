@@ -31,7 +31,7 @@ import time
 import warnings
 import numpy as np
 
-from asuka.frontend.periodic_table import atomic_number
+from asuka.chem.periodic_table import atomic_number
 from asuka.hf import df_jk as _df_jk
 from asuka.hf import df_scf as _df_scf
 from asuka.integrals.cart2sph import coerce_sph_map
@@ -840,7 +840,9 @@ def _pack_qmn_block_to_qp(xp, Qmn_block: Any, *, nao: int, out: Any | None = Non
         return out_arr
 
     import cupy as cp  # noqa: PLC0415
-    from asuka.cueri import _cueri_cuda_ext as _ext  # noqa: PLC0415
+    from asuka.kernels import cueri as cueri_kernels  # noqa: PLC0415
+
+    _ext = cueri_kernels.require_ext()
 
     inp = cp.asarray(arr, dtype=cp.float64)
     if not bool(getattr(inp, "flags", None).c_contiguous):
@@ -946,17 +948,20 @@ def _symmetrize_bar_L_inplace(bar, xp, nchunks: int | None = None) -> None:
                 naux_i, nao0, nao1 = map(int, bar.shape)
                 if nao0 == nao1 and bar.dtype == cp.float64 and bool(getattr(bar, "flags", None).c_contiguous):
                     if _prefer_sym_kernel(arr_nbytes=int(bar.nbytes), nchunks=int(nchunks)):
-                        from asuka.cueri import _cueri_cuda_ext as _ext  # noqa: PLC0415
+                        from asuka.kernels import cueri as cueri_kernels  # noqa: PLC0415
 
-                        _ext.df_symmetrize_qmn_inplace_device(
-                            bar.reshape(-1),
-                            int(naux_i),
-                            int(nao0),
-                            256,
-                            int(cp.cuda.get_current_stream().ptr),
-                            False,
-                        )
-                        return
+                        _ext = cueri_kernels.load_ext()
+
+                        if _ext is not None:
+                            _ext.df_symmetrize_qmn_inplace_device(
+                                bar.reshape(-1),
+                                int(naux_i),
+                                int(nao0),
+                                256,
+                                int(cp.cuda.get_current_stream().ptr),
+                                False,
+                            )
+                            return
         except Exception:
             pass
 

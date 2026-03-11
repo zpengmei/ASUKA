@@ -32,7 +32,6 @@ from typing import Any, Iterator
 
 import numpy as np
 
-from asuka.frontend.molecule import Molecule
 from asuka.orbitals.eval_cart import CubeGrid, make_cube_grid_from_atoms
 
 from .lebedev import LEBEDEV_ORDERS, lebedev_sphere
@@ -62,8 +61,8 @@ class GridSpec:
     padding: float = 4.0
 
 
-def _coords_bohr(mol_or_coords: Molecule | Any) -> np.ndarray:
-    if isinstance(mol_or_coords, Molecule):
+def _coords_bohr(mol_or_coords: Any) -> np.ndarray:
+    if hasattr(mol_or_coords, "coords_bohr"):
         return np.asarray(mol_or_coords.coords_bohr, dtype=np.float64).reshape((-1, 3))
     arr = np.asarray(mol_or_coords, dtype=np.float64)
     return arr.reshape((-1, 3))

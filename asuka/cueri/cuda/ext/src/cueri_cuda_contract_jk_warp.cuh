@@ -39,7 +39,12 @@ __device__ __forceinline__ void cueri_contract_jk_warp_single(
     bool bk_swap,
     double f_ab,
     double f_cd,
-    int64_t N) {
+    int64_t N,
+    int n_bufs = 1,
+    int buf_id = 0) {
+  // Multi-buffer offset: each buffer is N*N doubles contiguous.
+  if (J_mat != nullptr) J_mat = J_mat + static_cast<int64_t>(buf_id) * N * N;
+  if (K_mat != nullptr) K_mat = K_mat + static_cast<int64_t>(buf_id) * N * N;
   if (J_mat != nullptr) {
     for (int iab = 0; iab < nAB; iab++) {
       const int ia = iab / nB;

@@ -286,7 +286,7 @@ void cueri_bind_part4(py::module_& m) {
       py::arg("stream") = 0,
       py::arg("sync") = true);
 
-
+#ifndef CUERI_FAST_DEV_DIRECT_JK
 
 m.def(
     "eri_rys_generic_deriv_contracted_inplace_device",
@@ -673,4 +673,5 @@ m.def(
     py::arg("stream") = 0,
     py::arg("sync") = true);
 
+#endif
 }

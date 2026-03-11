@@ -14,7 +14,9 @@ except Exception:  # pragma: no cover
     cp = None  # type: ignore
 
 try:  # optional CUDA extension
-    from asuka import _guga_cuda_ext as _ext
+    from asuka.kernels import guga as _guga_kernels  # noqa: PLC0415
+
+    _ext = _guga_kernels.load_ext()
 except Exception:  # pragma: no cover
     _ext = None
 
@@ -394,7 +396,7 @@ def apply_contracted_triplet_all_m_cuda(
 
     if not _has_soc_cuda_entrypoints():
         if not bool(fallback_to_cpu):
-            raise RuntimeError("SOC CUDA kernels are unavailable in asuka._guga_cuda_ext")
+            raise RuntimeError("SOC CUDA kernels are unavailable in cuGUGA CUDA extension")
         return _cpu_fallback_result(
             drt_bra,
             drt_ket,
@@ -473,7 +475,7 @@ def build_rho_soc_m_block_cuda(
     if cp is None:
         raise RuntimeError("CuPy is required for SOC CUDA backend")
     if not _has_soc_cuda_rho_entrypoints():
-        raise RuntimeError("SOC CUDA rho kernels are unavailable in asuka._guga_cuda_ext")
+        raise RuntimeError("SOC CUDA rho kernels are unavailable in cuGUGA CUDA extension")
     if int(drt_bra.norb) != int(drt_ket.norb):
         raise ValueError("drt_bra and drt_ket must have the same norb")
 
@@ -618,7 +620,7 @@ def build_gm_soc_m_block_cuda(
     if cp is None:
         raise RuntimeError("CuPy is required for SOC CUDA backend")
     if not _has_soc_cuda_gm_entrypoints():
-        raise RuntimeError("SOC CUDA Gm kernels are unavailable in asuka._guga_cuda_ext")
+        raise RuntimeError("SOC CUDA Gm kernels are unavailable in cuGUGA CUDA extension")
     if int(drt_bra.norb) != int(drt_ket.norb):
         raise ValueError("drt_bra and drt_ket must have the same norb")
 

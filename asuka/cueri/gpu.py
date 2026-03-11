@@ -16,11 +16,9 @@ from .stream import stream_ctx, stream_ptr
 from .native_class_sets import STEP2_NATIVE_CLASS_IDS
 from .tasks import TaskList
 from .tasks import decode_eri_class_id, eri_class_id, group_tasks_by_class, with_task_class_id
+from asuka.kernels import cueri as cueri_kernels
 
-try:  # optional CUDA extension
-    from . import _cueri_cuda_ext as _ext
-except Exception:  # pragma: no cover
-    _ext = None
+_ext = cueri_kernels.load_ext()
 
 
 def has_cuda_ext() -> bool:
@@ -100,6 +98,48 @@ def warmup_cuda(*, gemm_n: int = 256, chol_n: int = 256, stream=None) -> None:
         L = cp.linalg.cholesky(SPD)
         _ = cpx_linalg.solve_triangular(L, B, lower=True, trans="N", unit_diagonal=False, overwrite_b=False)
         s.synchronize()
+
+
+def _scatter_df_int3c2e_tiles_inplace_fallback(
+    *,
+    tile,
+    a0_dev,
+    b0_dev,
+    p0_dev,
+    nao: int,
+    naux: int,
+    nAB: int,
+    nB: int,
+    nP: int,
+    X_out,
+) -> None:
+    import cupy as cp
+
+    ntasks = int(a0_dev.size)
+    if ntasks != int(b0_dev.size) or ntasks != int(p0_dev.size):
+        raise ValueError("a0/b0/p0 task-size mismatch in df_int3c2e scatter fallback")
+    if nB <= 0 or nAB <= 0 or nP < 0 or (int(nAB) % int(nB)) != 0:
+        raise ValueError("invalid nAB/nB/nP in df_int3c2e scatter fallback")
+    nA = int(nAB) // int(nB)
+    if nA <= 0:
+        raise ValueError("invalid nA derived from nAB/nB in df_int3c2e scatter fallback")
+
+    tile_view = cp.asarray(tile, dtype=cp.float64).reshape((ntasks, int(nAB), int(nP)))
+    Xv = cp.asarray(X_out, dtype=cp.float64).reshape((int(nao), int(nao), int(naux)))
+    a0_host = np.asarray(cp.asnumpy(a0_dev), dtype=np.int32).ravel()
+    b0_host = np.asarray(cp.asnumpy(b0_dev), dtype=np.int32).ravel()
+    p0_host = np.asarray(cp.asnumpy(p0_dev), dtype=np.int32).ravel()
+
+    for t_idx, (a0_i, b0_i, p0_i) in enumerate(zip(a0_host, b0_host, p0_host)):
+        a = int(a0_i)
+        b = int(b0_i)
+        p = int(p0_i)
+        block = tile_view[t_idx].reshape((nA, int(nB), int(nP)))
+        if a == b and nA == int(nB):
+            Xv[a : a + nA, a : a + nA, p : p + int(nP)] = 0.5 * (block + block.transpose((1, 0, 2)))
+        else:
+            Xv[a : a + nA, b : b + int(nB), p : p + int(nP)] = block
+            Xv[b : b + int(nB), a : a + nA, p : p + int(nP)] = block.transpose((1, 0, 2))
 
 
 @dataclass(frozen=True)
@@ -2111,18 +2151,37 @@ def df_metric_2c2e_rys_device(
             )
             nP = int(tile.shape[1])
             nQ = int(tile.shape[2])
-            _ext.scatter_df_metric_tiles_inplace_device(
-                tile.ravel(),
-                p0_dev,
-                q0_dev,
-                int(naux),
-                int(nP),
-                int(nQ),
-                V.ravel(),
-                int(threads),
-                int(_stream_ptr(stream)),
-                False,
-            )
+            if hasattr(_ext, "scatter_df_metric_tiles_inplace_device"):
+                _ext.scatter_df_metric_tiles_inplace_device(
+                    tile.ravel(),
+                    p0_dev,
+                    q0_dev,
+                    int(naux),
+                    int(nP),
+                    int(nQ),
+                    V.ravel(),
+                    int(threads),
+                    int(_stream_ptr(stream)),
+                    False,
+                )
+            else:
+                # Backward-compatible fallback for older extensions that do not
+                # expose scatter_df_metric_tiles_inplace_device.
+                ntasks = int(p0_dev.size)
+                if ntasks != int(q0_dev.size):
+                    raise ValueError("p0/q0 task-size mismatch in df_metric_2c2e_rys_device fallback")
+                tile_view = tile.reshape((ntasks, nP, nQ))
+                p0_host = np.asarray(cp.asnumpy(p0_dev), dtype=np.int32).ravel()
+                q0_host = np.asarray(cp.asnumpy(q0_dev), dtype=np.int32).ravel()
+                for t_idx, (p0_i, q0_i) in enumerate(zip(p0_host, q0_host)):
+                    p = int(p0_i)
+                    q = int(q0_i)
+                    block = tile_view[t_idx]
+                    if p == q and nP == nQ:
+                        V[p : p + nP, p : p + nP] = 0.5 * (block + block.T)
+                    else:
+                        V[p : p + nP, q : q + nQ] = block
+                        V[q : q + nQ, p : p + nP] = block.T
 
         return V
 
@@ -2380,21 +2439,35 @@ def df_int3c2e_rys_contracted_ao_device_block(
 
                     nAB = int(tile.shape[1])
                     nP = int(tile.shape[2])
-                    _ext.scatter_df_int3c2e_tiles_inplace_device(
-                        tile.ravel(),
-                        a0_dev,
-                        b0_dev,
-                        p0_dev,
-                        int(plan.nao),
-                        int(plan.naux),
-                        int(nAB),
-                        int(nB),
-                        int(nP),
-                        X.ravel(),
-                        int(threads),
-                        int(_stream_ptr(stream)),
-                        bool(batch.transpose),
-                    )
+                    if hasattr(_ext, "scatter_df_int3c2e_tiles_inplace_device"):
+                        _ext.scatter_df_int3c2e_tiles_inplace_device(
+                            tile.ravel(),
+                            a0_dev,
+                            b0_dev,
+                            p0_dev,
+                            int(plan.nao),
+                            int(plan.naux),
+                            int(nAB),
+                            int(nB),
+                            int(nP),
+                            X.ravel(),
+                            int(threads),
+                            int(_stream_ptr(stream)),
+                            bool(batch.transpose),
+                        )
+                    else:
+                        _scatter_df_int3c2e_tiles_inplace_fallback(
+                            tile=tile,
+                            a0_dev=a0_dev,
+                            b0_dev=b0_dev,
+                            p0_dev=p0_dev,
+                            nao=int(plan.nao),
+                            naux=int(plan.naux),
+                            nAB=int(nAB),
+                            nB=int(nB),
+                            nP=int(nP),
+                            X_out=X,
+                        )
 
                     if start_sc is not None and end_sc is not None:
                         end_sc.record(s0)
@@ -2913,21 +2986,35 @@ def df_int3c2e_rys_device_block(
                 if start_sc is not None and end_sc is not None:
                     start_sc.record(s0)
                 if ao_rep_s == "cart":
-                    _ext.scatter_df_int3c2e_tiles_inplace_device(
-                        tile.ravel(),
-                        a0_dev,
-                        b0_dev,
-                        p0_dev,
-                        int(plan.nao),
-                        int(plan.naux),
-                        int(nAB),
-                        int(nB),
-                        int(nP),
-                        X.ravel(),
-                        int(threads),
-                        int(_stream_ptr(stream)),
-                        False,
-                    )
+                    if hasattr(_ext, "scatter_df_int3c2e_tiles_inplace_device"):
+                        _ext.scatter_df_int3c2e_tiles_inplace_device(
+                            tile.ravel(),
+                            a0_dev,
+                            b0_dev,
+                            p0_dev,
+                            int(plan.nao),
+                            int(plan.naux),
+                            int(nAB),
+                            int(nB),
+                            int(nP),
+                            X.ravel(),
+                            int(threads),
+                            int(_stream_ptr(stream)),
+                            False,
+                        )
+                    else:
+                        _scatter_df_int3c2e_tiles_inplace_fallback(
+                            tile=tile,
+                            a0_dev=a0_dev,
+                            b0_dev=b0_dev,
+                            p0_dev=p0_dev,
+                            nao=int(plan.nao),
+                            naux=int(plan.naux),
+                            nAB=int(nAB),
+                            nB=int(nB),
+                            nP=int(nP),
+                            X_out=X,
+                        )
                 else:
                     _ext.scatter_df_int3c2e_tiles_cart_to_sph_inplace_device(
                         tile.ravel(),
@@ -3103,21 +3190,35 @@ def df_int3c2e_rys_device_block(
                 b0 = np.asarray(ao_basis.shell_ao_start[B], dtype=np.int32).ravel()
                 a0_dev = cp.ascontiguousarray(cp.asarray(a0, dtype=cp.int32))
                 b0_dev = cp.ascontiguousarray(cp.asarray(b0, dtype=cp.int32))
-                _ext.scatter_df_int3c2e_tiles_inplace_device(
-                    tile.ravel(),
-                    a0_dev,
-                    b0_dev,
-                    p0_dev,
-                    int(nao_cart),
-                    int(naux),
-                    int(nAB),
-                    int(nB),
-                    int(nP),
-                    X.ravel(),
-                    int(threads),
-                    int(_stream_ptr(stream)),
-                    False,
-                )
+                if hasattr(_ext, "scatter_df_int3c2e_tiles_inplace_device"):
+                    _ext.scatter_df_int3c2e_tiles_inplace_device(
+                        tile.ravel(),
+                        a0_dev,
+                        b0_dev,
+                        p0_dev,
+                        int(nao_cart),
+                        int(naux),
+                        int(nAB),
+                        int(nB),
+                        int(nP),
+                        X.ravel(),
+                        int(threads),
+                        int(_stream_ptr(stream)),
+                        False,
+                    )
+                else:
+                    _scatter_df_int3c2e_tiles_inplace_fallback(
+                        tile=tile,
+                        a0_dev=a0_dev,
+                        b0_dev=b0_dev,
+                        p0_dev=p0_dev,
+                        nao=int(nao_cart),
+                        naux=int(naux),
+                        nAB=int(nAB),
+                        nB=int(nB),
+                        nP=int(nP),
+                        X_out=X,
+                    )
             else:
                 if shell_ao_start_sph is None:  # pragma: no cover
                     raise RuntimeError("internal error: shell_ao_start_sph is None for ao_rep='sph'")
@@ -4444,6 +4545,7 @@ def _eri_fixed_class_specialized_device(
     work_large_min: int = 200_000,
     blocks_per_task: int = 8,
     tuned_threads: int | None = None,
+    tuned_warp_threads: int | None = None,
     allow_generic_fallback: bool = True,
     fallback_invalid_warp_to_block: bool = True,
 ):
@@ -4465,11 +4567,16 @@ def _eri_fixed_class_specialized_device(
     if tuned_threads is None:
         # Fixed-class kernels default to warp-aligned sizes near ncomp.
         # Keep caller intent as an upper bound.
-        threads_launch = int(min(max(32, ((ncomp + 31) // 32) * 32), min(1024, threads)))
+        threads_launch_block = int(min(max(32, ((ncomp + 31) // 32) * 32), min(1024, threads)))
     else:
-        threads_launch = int(min(1024, max(32, int(tuned_threads))))
-    threads_launch = int(max(32, (threads_launch // 32) * 32))
-    warp_supported = ncomp <= 128 and int(threads_launch) <= 256 and (int(threads_launch) % 32) == 0
+        threads_launch_block = int(min(1024, max(32, int(tuned_threads))))
+    threads_launch_block = int(max(32, (threads_launch_block // 32) * 32))
+    if tuned_warp_threads is None:
+        threads_launch_warp = int(threads_launch_block)
+    else:
+        threads_launch_warp = int(min(1024, max(32, int(tuned_warp_threads))))
+    threads_launch_warp = int(max(32, (threads_launch_warp // 32) * 32))
+    warp_supported = ncomp <= 128 and int(threads_launch_warp) <= 256 and (int(threads_launch_warp) % 32) == 0
 
     mode = mode.lower().strip()
     if mode not in ("block", "warp", "multiblock", "auto"):
@@ -4479,10 +4586,10 @@ def _eri_fixed_class_specialized_device(
         min_warp_threads = int(max(32, min(256, (min_warp_threads // 32) * 32)))
     else:
         min_warp_threads = 32
-    if mode == "warp" and int(threads_launch) < int(min_warp_threads):
+    if mode == "warp" and int(threads_launch_warp) < int(min_warp_threads):
         # Allow raising minimum fixed-class warp launch width from env for
         # device-specific tuning.
-        threads_launch = int(min_warp_threads)
+        threads_launch_warp = int(min_warp_threads)
 
     has_native = all(hasattr(_ext, name) for name in (ext_block_name, ext_warp_name, ext_multiblock_name))
     if not has_native:
@@ -4504,7 +4611,7 @@ def _eri_fixed_class_specialized_device(
                     lc=lc,
                     ld=ld,
                     stream=stream,
-                    threads=int(threads_launch),
+                    threads=int(threads_launch_warp),
                 )
             return eri_rys_generic_device(
                 tasks,
@@ -4516,7 +4623,7 @@ def _eri_fixed_class_specialized_device(
                 lc=lc,
                 ld=ld,
                 stream=stream,
-                threads=int(threads_launch),
+                threads=int(threads_launch_block),
             )
         if mode in ("block", "multiblock"):
             return eri_rys_generic_device(
@@ -4529,7 +4636,7 @@ def _eri_fixed_class_specialized_device(
                 lc=lc,
                 ld=ld,
                 stream=stream,
-                threads=int(threads_launch),
+                threads=int(threads_launch_block),
             )
 
         # mode == "auto"
@@ -4544,7 +4651,7 @@ def _eri_fixed_class_specialized_device(
                 lc=lc,
                 ld=ld,
                 stream=stream,
-                threads=int(threads_launch),
+                threads=int(threads_launch_warp),
             )
         return eri_rys_generic_device(
             tasks,
@@ -4556,7 +4663,7 @@ def _eri_fixed_class_specialized_device(
             lc=lc,
             ld=ld,
             stream=stream,
-            threads=int(threads_launch),
+            threads=int(threads_launch_block),
         )
 
     block_fn = getattr(_ext, ext_block_name)
@@ -4571,7 +4678,7 @@ def _eri_fixed_class_specialized_device(
         if tasks.ntasks == 0:
             return out.ravel()
 
-        def _launch_block(ab_idx, cd_idx, out_buf, *, threads_i: int = threads_launch):
+        def _launch_block(ab_idx, cd_idx, out_buf, *, threads_i: int = threads_launch_block):
             block_fn(
                 ab_idx,
                 cd_idx,
@@ -4593,7 +4700,7 @@ def _eri_fixed_class_specialized_device(
                 False,
             )
 
-        def _launch_warp_or_block(ab_idx, cd_idx, out_buf, *, threads_i: int = threads_launch):
+        def _launch_warp_or_block(ab_idx, cd_idx, out_buf, *, threads_i: int = threads_launch_warp):
             if not warp_supported:
                 _launch_block(ab_idx, cd_idx, out_buf, threads_i=int(threads_i))
                 return
@@ -4651,7 +4758,7 @@ def _eri_fixed_class_specialized_device(
             cd_idx,
             out_buf,
             *,
-            threads_i: int = threads_launch,
+            threads_i: int = threads_launch_block,
             blocks_i: int = blocks_per_task,
         ):
             blocks_i = int(blocks_i)
@@ -4696,7 +4803,13 @@ def _eri_fixed_class_specialized_device(
         # Optional hot fixed-class launch autotune for mode="auto".
         if bool(_env_flag("ASUKA_CUERI_HOTCLASS_AUTOTUNE", True)) and int(cid_u32) in _HOTCLASS_TUNE_CLASS_IDS:
             device_id = int(cp.cuda.runtime.getDevice())
-            cache_key = (int(device_id), int(cid_u32), int(threads), int(threads_launch))
+            cache_key = (
+                int(device_id),
+                int(cid_u32),
+                int(threads),
+                int(threads_launch_block),
+                int(threads_launch_warp),
+            )
             tuned = _ERI_HOTCLASS_TUNE_CACHE.get(cache_key)
             if tuned is None:
                 max_classes = int(_env_int("ASUKA_CUERI_HOTCLASS_AUTOTUNE_MAX_CLASSES", 6, min_value=0))
@@ -4711,10 +4824,10 @@ def _eri_fixed_class_specialized_device(
                         threads_256 = int(min(256, max(32, int(threads))))
                         threads_256 = int(max(32, (threads_256 // 32) * 32))
                         candidates_raw = [
-                            ("block", int(threads_launch), 1),
+                            ("block", int(threads_launch_block), 1),
                             ("block", int(threads_256), 1),
-                            ("multiblock", int(threads_launch), 4),
-                            ("multiblock", int(threads_launch), 8),
+                            ("multiblock", int(threads_launch_block), 4),
+                            ("multiblock", int(threads_launch_block), 8),
                         ]
                         candidates = []
                         seen = set()
@@ -4800,7 +4913,13 @@ def _eri_fixed_class_specialized_device(
             ab_large = cp.ascontiguousarray(task_ab[large_idx])
             cd_large = cp.ascontiguousarray(task_cd[large_idx])
             out_large = cp.empty((int(ab_large.shape[0]), ncomp), dtype=cp.float64)
-            _launch_multiblock(ab_large, cd_large, out_large.ravel(), threads_i=int(threads_launch), blocks_i=int(blocks_per_task))
+            _launch_multiblock(
+                ab_large,
+                cd_large,
+                out_large.ravel(),
+                threads_i=int(threads_launch_block),
+                blocks_i=int(blocks_per_task),
+            )
             out[large_idx] = out_large
         return out.ravel()
 
@@ -4837,6 +4956,7 @@ def eri_ssdp_device(
         work_large_min=work_large_min,
         blocks_per_task=blocks_per_task,
         tuned_threads=128,
+        tuned_warp_threads=64,
         allow_generic_fallback=False,
         fallback_invalid_warp_to_block=False,
     )
@@ -4873,6 +4993,8 @@ def eri_psds_device(
         work_small_max=work_small_max,
         work_large_min=work_large_min,
         blocks_per_task=blocks_per_task,
+        tuned_threads=64,
+        tuned_warp_threads=64,
     )
 
 
@@ -4908,6 +5030,7 @@ def eri_psdp_device(
         work_large_min=work_large_min,
         blocks_per_task=blocks_per_task,
         tuned_threads=128,
+        tuned_warp_threads=64,
         allow_generic_fallback=False,
         fallback_invalid_warp_to_block=False,
     )
@@ -5089,6 +5212,8 @@ def eri_dsds_device(
         work_small_max=work_small_max,
         work_large_min=work_large_min,
         blocks_per_task=blocks_per_task,
+        tuned_threads=64,
+        tuned_warp_threads=64,
     )
 
 

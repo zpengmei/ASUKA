@@ -12,7 +12,9 @@ except Exception:  # pragma: no cover
     cp = None  # type: ignore
 
 try:  # optional CUDA extension
-    from asuka import _guga_cuda_ext  # type: ignore
+    from asuka.kernels import guga as _guga_kernels  # noqa: PLC0415
+
+    _guga_cuda_ext = _guga_kernels.load_ext()
 except Exception:  # pragma: no cover
     _guga_cuda_ext = None  # type: ignore
 
@@ -46,7 +48,7 @@ def qmc_spawn_one_body_events_device(
     """
 
     if cp is None or _guga_cuda_ext is None:  # pragma: no cover
-        raise RuntimeError("CUDA QMC backend unavailable (requires cupy and asuka._guga_cuda_ext)")
+        raise RuntimeError("CUDA QMC backend unavailable (requires cupy and cuGUGA CUDA extension)")
 
     x_idx_dev = cp.asarray(x_idx_dev, dtype=cp.int32)
     x_val_dev = cp.asarray(x_val_dev, dtype=cp.float64)
@@ -112,7 +114,7 @@ def qmc_spawn_hamiltonian_events_device(
     """
 
     if cp is None or _guga_cuda_ext is None:  # pragma: no cover
-        raise RuntimeError("CUDA QMC backend unavailable (requires cupy and asuka._guga_cuda_ext)")
+        raise RuntimeError("CUDA QMC backend unavailable (requires cupy and cuGUGA CUDA extension)")
 
     x_idx_dev = cp.asarray(x_idx_dev, dtype=cp.int32)
     x_val_dev = cp.asarray(x_val_dev, dtype=cp.float64)
@@ -186,7 +188,7 @@ def qmc_spawn_hamiltonian_events_u64_device(
     """
 
     if cp is None or _guga_cuda_ext is None:  # pragma: no cover
-        raise RuntimeError("CUDA QMC backend unavailable (requires cupy and asuka._guga_cuda_ext)")
+        raise RuntimeError("CUDA QMC backend unavailable (requires cupy and cuGUGA CUDA extension)")
 
     x_key_dev = cp.asarray(x_key_dev, dtype=cp.uint64)
     x_val_dev = cp.asarray(x_val_dev, dtype=cp.float64)
@@ -223,7 +225,7 @@ def qmc_spawn_hamiltonian_events_u64_device(
     fn = getattr(_guga_cuda_ext, "qmc_spawn_hamiltonian_u64_inplace_device", None)
     if fn is None:  # pragma: no cover
         raise RuntimeError(
-            "Key64 spawn kernel is unavailable in this build of asuka._guga_cuda_ext "
+            "Key64 spawn kernel is unavailable in this build of the cuGUGA CUDA extension "
             "(missing qmc_spawn_hamiltonian_u64_inplace_device). "
             "Rebuild the CUDA extension with Key64 spawning enabled, or use the index-based spawn backend."
         )
@@ -420,7 +422,7 @@ def qmc_coalesce_coo_i32_f64_device(
     """
 
     if cp is None or _guga_cuda_ext is None:  # pragma: no cover
-        raise RuntimeError("CUDA QMC backend unavailable (requires cupy and asuka._guga_cuda_ext)")
+        raise RuntimeError("CUDA QMC backend unavailable (requires cupy and cuGUGA CUDA extension)")
 
     idx_in_dev = cp.asarray(idx_in_dev, dtype=cp.int32).ravel()
     val_in_dev = cp.asarray(val_in_dev, dtype=cp.float64).ravel()
@@ -478,7 +480,7 @@ def qmc_phi_pivot_resample_i32_f64_device(
     """
 
     if cp is None or _guga_cuda_ext is None:  # pragma: no cover
-        raise RuntimeError("CUDA QMC backend unavailable (requires cupy and asuka._guga_cuda_ext)")
+        raise RuntimeError("CUDA QMC backend unavailable (requires cupy and cuGUGA CUDA extension)")
 
     idx_in_dev = cp.asarray(idx_in_dev, dtype=cp.int32).ravel()
     val_in_dev = cp.asarray(val_in_dev, dtype=cp.float64).ravel()
@@ -543,7 +545,7 @@ def qmc_projector_step_hamiltonian_device(
     """
 
     if cp is None or _guga_cuda_ext is None:  # pragma: no cover
-        raise RuntimeError("CUDA QMC backend unavailable (requires cupy and asuka._guga_cuda_ext)")
+        raise RuntimeError("CUDA QMC backend unavailable (requires cupy and cuGUGA CUDA extension)")
 
     x_idx_dev = cp.asarray(x_idx_dev, dtype=cp.int32).ravel()
     x_val_dev = cp.asarray(x_val_dev, dtype=cp.float64).ravel()
@@ -1188,7 +1190,7 @@ def make_cuda_projector_context(
     """Build a reusable CUDA projector context for dense-ERI Hamiltonians."""
 
     if cp is None or _guga_cuda_ext is None:  # pragma: no cover
-        raise RuntimeError("CUDA QMC backend unavailable (requires cupy and asuka._guga_cuda_ext)")
+        raise RuntimeError("CUDA QMC backend unavailable (requires cupy and cuGUGA CUDA extension)")
 
     from asuka.cuguga.state_cache import get_state_cache  # noqa: PLC0415
     from asuka.cuguga.oracle import _child_prefix_walks  # noqa: PLC0415
@@ -1306,7 +1308,7 @@ def make_cuda_projector_context_key64(
     """
 
     if cp is None or _guga_cuda_ext is None:  # pragma: no cover
-        raise RuntimeError("CUDA QMC backend unavailable (requires cupy and asuka._guga_cuda_ext)")
+        raise RuntimeError("CUDA QMC backend unavailable (requires cupy and cuGUGA CUDA extension)")
     if not hasattr(_guga_cuda_ext, "QmcWorkspaceU64"):
         raise RuntimeError("Key64 QMC workspace is unavailable (missing _guga_cuda_ext.QmcWorkspaceU64); rebuild the CUDA extension")
 
@@ -1493,7 +1495,7 @@ def make_cuda_block_projector_context(
     """Build a reusable CUDA block-projector context for dense-ERI Hamiltonians."""
 
     if cp is None or _guga_cuda_ext is None:  # pragma: no cover
-        raise RuntimeError("CUDA QMC backend unavailable (requires cupy and asuka._guga_cuda_ext)")
+        raise RuntimeError("CUDA QMC backend unavailable (requires cupy and cuGUGA CUDA extension)")
 
     from asuka.cuguga.state_cache import get_state_cache  # noqa: PLC0415
     from asuka.cuguga.oracle import _child_prefix_walks  # noqa: PLC0415
@@ -1659,7 +1661,7 @@ def cuda_projector_step_hamiltonian_ws(
     """
 
     if cp is None or _guga_cuda_ext is None:  # pragma: no cover
-        raise RuntimeError("CUDA QMC backend unavailable (requires cupy and asuka._guga_cuda_ext)")
+        raise RuntimeError("CUDA QMC backend unavailable (requires cupy and cuGUGA CUDA extension)")
     if not bool(sync):
         raise ValueError("cuda_projector_step_hamiltonian_ws currently requires sync=True")
     if ctx.ws is None or ctx.drt_dev is None or ctx.state_dev is None:
@@ -1888,7 +1890,7 @@ def cuda_projector_step_hamiltonian_u64_ws(
     """
 
     if cp is None or _guga_cuda_ext is None:  # pragma: no cover
-        raise RuntimeError("CUDA QMC backend unavailable (requires cupy and asuka._guga_cuda_ext)")
+        raise RuntimeError("CUDA QMC backend unavailable (requires cupy and cuGUGA CUDA extension)")
     if not bool(sync):
         raise ValueError("cuda_projector_step_hamiltonian_u64_ws currently requires sync=True")
     if ctx.ws is None or ctx.drt_dev is None:
@@ -2127,7 +2129,7 @@ def cuda_block_projector_step_hamiltonian_ws(
     """
 
     if cp is None or _guga_cuda_ext is None:  # pragma: no cover
-        raise RuntimeError("CUDA QMC backend unavailable (requires cupy and asuka._guga_cuda_ext)")
+        raise RuntimeError("CUDA QMC backend unavailable (requires cupy and cuGUGA CUDA extension)")
     if not bool(sync):
         raise ValueError("cuda_block_projector_step_hamiltonian_ws currently requires sync=True")
     if ctx.ws is None or ctx.drt_dev is None or ctx.state_dev is None:
@@ -2324,7 +2326,7 @@ def cuda_block_orthonormalize_mgs_ws(
     """
 
     if cp is None or _guga_cuda_ext is None:  # pragma: no cover
-        raise RuntimeError("CUDA QMC backend unavailable (requires cupy and asuka._guga_cuda_ext)")
+        raise RuntimeError("CUDA QMC backend unavailable (requires cupy and cuGUGA CUDA extension)")
     if ctx.ws is None or ctx.drt_dev is None or ctx.state_dev is None:
         raise RuntimeError("CudaBlockProjectorContext is released")
     if ctx.x_idx is None or ctx.x_val is None or ctx.x_idx_next is None or ctx.x_val_next is None:
@@ -2655,7 +2657,7 @@ def cuda_block_build_tmat_hamiltonian_stochastic_ws(
     """
 
     if cp is None or _guga_cuda_ext is None:  # pragma: no cover
-        raise RuntimeError("CUDA QMC backend unavailable (requires cupy and asuka._guga_cuda_ext)")
+        raise RuntimeError("CUDA QMC backend unavailable (requires cupy and cuGUGA CUDA extension)")
     if ctx.ws is None or ctx.drt_dev is None or ctx.state_dev is None:
         raise RuntimeError("CudaBlockProjectorContext is released")
     if ctx.x_idx is None or ctx.x_val is None:
@@ -2776,7 +2778,7 @@ def cuda_block_build_sk_uthx_stochastic_ws(
     """
 
     if cp is None or _guga_cuda_ext is None:  # pragma: no cover
-        raise RuntimeError("CUDA QMC backend unavailable (requires cupy and asuka._guga_cuda_ext)")
+        raise RuntimeError("CUDA QMC backend unavailable (requires cupy and cuGUGA CUDA extension)")
     if ctx.ws is None or ctx.drt_dev is None or ctx.state_dev is None:
         raise RuntimeError("CudaBlockProjectorContext is released")
     if ctx.x_idx is None or ctx.x_val is None:
@@ -2983,7 +2985,7 @@ def cuda_block_apply_right_matrix_phi_ws(
     """
 
     if cp is None or _guga_cuda_ext is None:  # pragma: no cover
-        raise RuntimeError("CUDA QMC backend unavailable (requires cupy and asuka._guga_cuda_ext)")
+        raise RuntimeError("CUDA QMC backend unavailable (requires cupy and cuGUGA CUDA extension)")
     if ctx.ws is None:
         raise RuntimeError("CudaBlockProjectorContext is released")
     if ctx.x_idx is None or ctx.x_val is None or ctx.x_idx_next is None or ctx.x_val_next is None:
@@ -3544,7 +3546,7 @@ def make_cuda_fciqmc_context(
     """Build a reusable CUDA FCIQMC context for dense-ERI Hamiltonians."""
 
     if cp is None or _guga_cuda_ext is None:  # pragma: no cover
-        raise RuntimeError("CUDA QMC backend unavailable (requires cupy and asuka._guga_cuda_ext)")
+        raise RuntimeError("CUDA QMC backend unavailable (requires cupy and cuGUGA CUDA extension)")
 
     from asuka.cuguga.state_cache import get_state_cache  # noqa: PLC0415
     from asuka.cuguga.oracle import _child_prefix_walks  # noqa: PLC0415
@@ -3697,7 +3699,7 @@ def make_cuda_fciqmc_context_key64(
     """
 
     if cp is None or _guga_cuda_ext is None:  # pragma: no cover
-        raise RuntimeError("CUDA QMC backend unavailable (requires cupy and asuka._guga_cuda_ext)")
+        raise RuntimeError("CUDA QMC backend unavailable (requires cupy and cuGUGA CUDA extension)")
     if not hasattr(_guga_cuda_ext, "QmcWorkspaceU64"):
         raise RuntimeError("Key64 QMC workspace is unavailable (missing _guga_cuda_ext.QmcWorkspaceU64); rebuild the CUDA extension")
 
@@ -3931,7 +3933,7 @@ def cuda_fciqmc_step_hamiltonian_ws(
     """
 
     if cp is None or _guga_cuda_ext is None:  # pragma: no cover
-        raise RuntimeError("CUDA QMC backend unavailable (requires cupy and asuka._guga_cuda_ext)")
+        raise RuntimeError("CUDA QMC backend unavailable (requires cupy and cuGUGA CUDA extension)")
     if not bool(sync):
         raise ValueError("cuda_fciqmc_step_hamiltonian_ws currently requires sync=True")
     if ctx.ws is None or ctx.drt_dev is None or ctx.state_dev is None:
@@ -4085,7 +4087,7 @@ def cuda_fciqmc_step_hamiltonian_u64_ws(
     """
 
     if cp is None or _guga_cuda_ext is None:  # pragma: no cover
-        raise RuntimeError("CUDA QMC backend unavailable (requires cupy and asuka._guga_cuda_ext)")
+        raise RuntimeError("CUDA QMC backend unavailable (requires cupy and cuGUGA CUDA extension)")
     if not bool(sync):
         raise ValueError("cuda_fciqmc_step_hamiltonian_u64_ws currently requires sync=True")
     if ctx.ws is None or ctx.drt_dev is None:

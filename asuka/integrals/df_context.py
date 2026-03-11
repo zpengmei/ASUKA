@@ -25,6 +25,7 @@ Notes
 """
 
 import hashlib
+import importlib
 import os
 import re
 from collections import OrderedDict
@@ -51,6 +52,12 @@ def _mol_fingerprint(mol: Any) -> str:
     return hashlib.blake2b(payload.encode("utf-8"), digest_size=16).hexdigest()
 
 
+def _frontend_module(name: str) -> Any:
+    """Load a frontend submodule lazily to avoid hard package-cycle edges."""
+
+    return importlib.import_module(f"asuka.frontend.{name}")
+
+
 def _hash_f64_array(a: Any) -> tuple[bytes, tuple[int, ...]]:
     arr = np.asarray(a, dtype=np.float64)
     if not arr.flags.c_contiguous:
@@ -73,12 +80,8 @@ def _env_int(name: str, default: int) -> int:
 def _atoms_bohr_from_mol_like(mol: Any) -> list[tuple[str, np.ndarray]]:
     """Extract [(sym, xyz_bohr), ...] from a Mole-like object without external imports."""
 
-    try:
-        from asuka.frontend.molecule import Molecule  # noqa: PLC0415
-    except Exception:  # pragma: no cover
-        Molecule = None  # type: ignore[assignment]
-
-    if Molecule is not None and isinstance(mol, Molecule):
+    atoms_bohr = getattr(mol, "atoms_bohr", None)
+    if atoms_bohr is not None:
         return [(str(sym), np.asarray(xyz, dtype=np.float64).reshape((3,))) for sym, xyz in mol.atoms_bohr]
 
     natm = getattr(mol, "natm", None)
@@ -114,7 +117,9 @@ def _build_aux_basis_cart_from_name(
 ) -> tuple[str, dict[str, list[tuple[int, np.ndarray, np.ndarray]]]]:
     """Return (resolved_aux_name, aux_shells_by_element) from a string spec."""
 
-    from asuka.frontend.basis_bse import load_autoaux_shells, load_basis_shells  # noqa: PLC0415
+    basis_bse = _frontend_module("basis_bse")
+    load_autoaux_shells = basis_bse.load_autoaux_shells
+    load_basis_shells = basis_bse.load_basis_shells
 
     name = str(auxbasis_name).strip()
     norm = name.lower()
@@ -165,7 +170,9 @@ def _build_df_bases_cart(mol: Any, *, auxbasis: Any, expand_contractions: bool) 
     """Return (ao_basis, aux_basis, auxbasis_name) as cuERI packed cart bases."""
 
     from asuka.cueri.mol_basis import pack_cart_shells_from_mol  # noqa: PLC0415
-    from asuka.frontend.basis_packer import pack_cart_basis, parse_pyscf_basis_dict  # noqa: PLC0415
+    basis_packer = _frontend_module("basis_packer")
+    pack_cart_basis = basis_packer.pack_cart_basis
+    parse_pyscf_basis_dict = basis_packer.parse_pyscf_basis_dict
 
     atoms_bohr = _atoms_bohr_from_mol_like(mol)
     elements = _unique_elements(atoms_bohr)
@@ -181,8 +188,7 @@ def _build_df_bases_cart(mol: Any, *, auxbasis: Any, expand_contractions: bool) 
         # asuka.frontend.molecule.Molecule path
         orbital_basis_name = getattr(mol, "basis", None)
         if isinstance(orbital_basis_name, str):
-            from asuka.frontend.basis_bse import load_basis_shells  # noqa: PLC0415
-
+            load_basis_shells = _frontend_module("basis_bse").load_basis_shells
             ao_shells = load_basis_shells(str(orbital_basis_name), elements=elements)
         elif isinstance(orbital_basis_name, dict):
             ao_shells = parse_pyscf_basis_dict(orbital_basis_name, elements=elements)

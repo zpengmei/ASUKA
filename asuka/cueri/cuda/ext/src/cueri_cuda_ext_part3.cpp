@@ -258,6 +258,7 @@ void cueri_bind_part3(py::module_& m) {
       py::arg("stream") = 0,
       py::arg("sync") = true);
 
+  #ifndef CUERI_FAST_DEV_STEP2_ONLY
   m.def(
       "eri_ddss_warp_inplace_device",
       [](py::object task_spAB,
@@ -514,6 +515,7 @@ void cueri_bind_part3(py::module_& m) {
       py::arg("threads") = 256,
       py::arg("stream") = 0,
       py::arg("sync") = true);
+#endif
 
   m.def(
       "eri_ssss_warp_inplace_device",

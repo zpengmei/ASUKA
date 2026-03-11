@@ -1,10 +1,15 @@
 from __future__ import annotations
 
+import importlib
 import time
 import numpy as np
 from typing import Any
 
 from asuka.integrals.df_adjoint import chol_lower_adjoint, df_whiten_adjoint, df_whiten_adjoint_Qmn
+
+
+def _frontend_module(name: str) -> Any:
+    return importlib.import_module(f"asuka.frontend.{name}")
 
 def _choose_aux_block_naux(*, nao: int, naux: int, target_bytes: int) -> int:
     """Choose a conservative aux block size for (qblk,nao,nao) float64 chunks."""
@@ -378,7 +383,9 @@ def compute_df_gradient_contributions_analytic_packed_bases(
 
         _ext_sym = None
         try:
-            from asuka.cueri import _cueri_cuda_ext as _ext_sym  # noqa: PLC0415
+            from asuka.kernels import cueri as cueri_kernels  # noqa: PLC0415
+
+            _ext_sym = cueri_kernels.load_ext()
         except Exception:
             _ext_sym = None
 
@@ -457,13 +464,9 @@ def compute_df_gradient_contributions_analytic_packed_bases(
         except Exception as e:  # pragma: no cover
             raise RuntimeError("backend='cuda' requires CuPy") from e
 
-        try:
-            from asuka.cueri import _cueri_cuda_ext as _ext_cuda  # noqa: PLC0415
-        except Exception as e:  # pragma: no cover
-            raise RuntimeError(
-                "cuERI CUDA extension is required for analytic DF gradient contraction; "
-                "build via `python -m asuka.cueri.build_cuda_ext`"
-            ) from e
+        from asuka.kernels import cueri as cueri_kernels  # noqa: PLC0415
+
+        _ext_cuda = cueri_kernels.require_ext()
 
         # Upload static tables once.
         shell_cx_dev = cp.ascontiguousarray(cp.asarray(shell_cxyz_all[:, 0], dtype=cp.float64))
@@ -614,7 +617,9 @@ def compute_df_gradient_contributions_analytic_packed_bases(
                     grad[atomQ] += fac * out_batch[int(t), 1, :]
     else:
         import cupy as cp  # noqa: PLC0415
-        from asuka.cueri import _cueri_cuda_ext as _ext_cuda  # noqa: PLC0415
+        from asuka.kernels import cueri as cueri_kernels  # noqa: PLC0415
+
+        _ext_cuda = cueri_kernels.require_ext()
 
         threads = 256
         stream_ptr = int(cp.cuda.get_current_stream().ptr)
@@ -952,13 +957,8 @@ def compute_df_gradient_contributions_tiled(
     if bar_L_ao.shape != L_ao.shape:
         raise ValueError("bar_L_ao and L_ao shape mismatch")
 
-    # Fast path: native ASUKA molecule container.
-    try:
-        from asuka.frontend.molecule import Molecule  # noqa: PLC0415
-    except Exception:  # pragma: no cover
-        Molecule = None  # type: ignore[assignment]
-
-    if Molecule is not None and isinstance(mol, Molecule):
+    # Fast path: native ASUKA-like molecule container.
+    if hasattr(mol, "atoms_bohr") and hasattr(mol, "natm") and hasattr(mol, "basis"):
         return compute_df_gradient_contributions_fd_molecule(
             mol,
             auxbasis=auxbasis,
@@ -975,8 +975,12 @@ def compute_df_gradient_contributions_tiled(
     # external dependencies.
     from asuka.cueri.mol_basis import pack_cart_shells_from_mol  # noqa: PLC0415
     from asuka.integrals.int1e_cart import nao_cart_from_basis  # noqa: PLC0415
-    from asuka.frontend.basis_bse import load_autoaux_shells, load_basis_shells  # noqa: PLC0415
-    from asuka.frontend.basis_packer import pack_cart_basis, parse_pyscf_basis_dict  # noqa: PLC0415
+    basis_bse = _frontend_module("basis_bse")
+    load_autoaux_shells = basis_bse.load_autoaux_shells
+    load_basis_shells = basis_bse.load_basis_shells
+    basis_packer = _frontend_module("basis_packer")
+    pack_cart_basis = basis_packer.pack_cart_basis
+    parse_pyscf_basis_dict = basis_packer.parse_pyscf_basis_dict
 
     if not bool(getattr(mol, "cart", False)):
         raise NotImplementedError("DF gradient FD path currently requires cart=True")
@@ -1279,12 +1283,10 @@ def compute_df_gradient_contributions_fd_molecule(
 ) -> np.ndarray:
     """DF gradient contraction from a `frontend.Molecule`."""
 
-    from asuka.frontend.molecule import Molecule  # noqa: PLC0415
+    if not hasattr(mol, "atoms_bohr"):
+        raise TypeError("mol must provide an atoms_bohr container for the standalone DF FD path")
 
-    if not isinstance(mol, Molecule):
-        raise TypeError("mol must be asuka.frontend.molecule.Molecule for the standalone DF FD path")
-
-    from asuka.frontend.df import build_df_bases_cart  # noqa: PLC0415
+    build_df_bases_cart = _frontend_module("df").build_df_bases_cart
 
     ao_basis, aux_basis, _aux_name = build_df_bases_cart(
         mol,

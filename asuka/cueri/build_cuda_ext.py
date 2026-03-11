@@ -10,6 +10,23 @@ import sys
 from pathlib import Path
 
 
+def _env_flag(name: str) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return False
+    return value.strip().lower() not in {"", "0", "false", "off", "no"}
+
+
+def _select_build_variant(*, fast_dev_direct_jk: bool, fast_dev_step2_only: bool) -> str:
+    if fast_dev_direct_jk and fast_dev_step2_only:
+        raise SystemExit("build variants --fast-dev-direct-jk and --fast-dev-step2-only are mutually exclusive")
+    if fast_dev_step2_only:
+        return "fastdev_step2"
+    if fast_dev_direct_jk:
+        return "fastdev_direct_jk"
+    return "full"
+
+
 def _cmake_dir_for_pybind11() -> str:
     out = subprocess.check_output([sys.executable, "-m", "pybind11", "--cmakedir"], text=True)
     return out.strip()
@@ -82,10 +99,14 @@ def _detect_cuda_arch() -> str | None:
     return None
 
 
-def _default_build_dir(*, repo_root: Path) -> Path:
+def _default_build_dir(*, repo_root: Path, build_variant: str) -> Path:
     env = os.getenv("CUERI_CUDA_BUILD_DIR")
     if env:
         return Path(env).expanduser().resolve()
+    if build_variant == "fastdev_direct_jk":
+        return (repo_root / "build" / "cueri_cuda_ext_fastdev_direct_jk").resolve()
+    if build_variant == "fastdev_step2":
+        return (repo_root / "build" / "cueri_cuda_ext_fastdev_step2").resolve()
     return (repo_root / "build" / "cueri_cuda_ext").resolve()
 
 
@@ -116,11 +137,27 @@ def main(argv: list[str] | None = None) -> None:
     )
     ap.add_argument("--clean", action="store_true", help="Remove the build directory before configuring")
     ap.add_argument("--fast-boys", action="store_true", help="Enable CUERI_FAST_BOYS (faster Boys moments for NROOTS<=3)")
+    ap.add_argument(
+        "--fast-dev-direct-jk",
+        action="store_true",
+        help="Build a reduced direct-J/K-only CUDA extension that skips derivative and DF-heavy kernels",
+    )
+    ap.add_argument(
+        "--fast-dev-step2-only",
+        action="store_true",
+        help="Build a minimal step2-only CUDA extension for specialized ERI/JK kernel iteration",
+    )
     ap.add_argument("--jobs", type=int, default=0, help="Build parallelism for cmake --build (default: auto)")
     args = ap.parse_args(argv)
 
     cueri_dir = Path(__file__).resolve().parent
     repo_root = cueri_dir.parent
+    fast_dev_direct_jk = bool(args.fast_dev_direct_jk) or _env_flag("CUERI_FAST_DEV_DIRECT_JK")
+    fast_dev_step2_only = bool(args.fast_dev_step2_only) or _env_flag("CUERI_FAST_DEV_STEP2_ONLY")
+    build_variant = _select_build_variant(
+        fast_dev_direct_jk=fast_dev_direct_jk,
+        fast_dev_step2_only=fast_dev_step2_only,
+    )
 
     if shutil.which("cmake") is None:  # pragma: no cover
         raise SystemExit("cmake is required (install with `pip install asuka[build]` or your system package manager)")
@@ -145,7 +182,11 @@ def main(argv: list[str] | None = None) -> None:
     if not src_dir.is_dir():  # pragma: no cover
         raise SystemExit(f"missing CUDA extension sources at {src_dir}")
 
-    build_dir = Path(args.build_dir).expanduser().resolve() if args.build_dir else _default_build_dir(repo_root=repo_root)
+    build_dir = (
+        Path(args.build_dir).expanduser().resolve()
+        if args.build_dir
+        else _default_build_dir(repo_root=repo_root, build_variant=build_variant)
+    )
     build_dir = _ensure_writable_dir(build_dir)
 
     # Auto-clean if CMakeLists.txt is newer than the cached build.ninja.
@@ -168,6 +209,10 @@ def main(argv: list[str] | None = None) -> None:
 
     print(f"Using CUDA root: {cuda_root}", file=sys.stderr)
     print(f"Using nvcc: {nvcc}", file=sys.stderr)
+    if build_variant == "fastdev_direct_jk":
+        print("Using reduced fast-dev direct-J/K build: derivative and DF-heavy CUDA APIs are excluded.", file=sys.stderr)
+    elif build_variant == "fastdev_step2":
+        print("Using reduced fast-dev step2-only build: only specialized ERI/JK kernel TUs are compiled.", file=sys.stderr)
 
     cmake_args = [
         "cmake",
@@ -182,6 +227,10 @@ def main(argv: list[str] | None = None) -> None:
     ]
     if bool(args.fast_boys):
         cmake_args.append("-DCUERI_FAST_BOYS=ON")
+    if build_variant == "fastdev_direct_jk":
+        cmake_args.append("-DCUERI_FAST_DEV_DIRECT_JK=ON")
+    elif build_variant == "fastdev_step2":
+        cmake_args.append("-DCUERI_FAST_DEV_STEP2_ONLY=ON")
 
     cuda_arch_env = str(args.arch).strip() if args.arch is not None else os.getenv("CUERI_CUDA_ARCH")
     if not cuda_arch_env:

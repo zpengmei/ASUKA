@@ -127,6 +127,7 @@ void cueri_bind_part1(py::module_& m) {
       py::arg("stream") = 0,
       py::arg("sync") = true);
 
+#if !defined(CUERI_FAST_DEV_DIRECT_JK) && !defined(CUERI_FAST_DEV_STEP2_ONLY)
   m.def(
       "sph_coeff_sph_to_cart_device",
       [](py::object C_sph,
@@ -199,6 +200,7 @@ void cueri_bind_part1(py::module_& m) {
       py::arg("threads") = 256,
       py::arg("stream") = 0,
       py::arg("sync") = true);
+#endif
 
   m.def(
       "schwarz_ssss_inplace_device",
@@ -1090,6 +1092,7 @@ void cueri_bind_part1(py::module_& m) {
       py::arg("stream") = 0,
       py::arg("sync") = true);
 
+  #ifndef CUERI_FAST_DEV_STEP2_ONLY
   m.def(
       "eri_ddss_inplace_device",
       [](py::object task_spAB,
@@ -1295,5 +1298,6 @@ void cueri_bind_part1(py::module_& m) {
       m, "dpdd", 648, cueri_eri_dpdd_launch_stream, cueri_eri_dpdd_warp_launch_stream, cueri_eri_dpdd_multiblock_launch_stream);
   bind_fixed_class_eri_family(
       m, "dddd", 1296, cueri_eri_dddd_launch_stream, cueri_eri_dddd_warp_launch_stream, cueri_eri_dddd_multiblock_launch_stream);
+#endif
 
 }

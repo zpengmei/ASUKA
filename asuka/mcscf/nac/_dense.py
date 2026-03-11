@@ -30,7 +30,7 @@ from asuka.integrals.int1e_cart import (
     contract_dS_ip_cart,
     contract_dhcore_cart,
 )
-from asuka.frontend.periodic_table import atomic_number
+from asuka.chem.periodic_table import atomic_number
 from asuka.mcscf.dense_eri_cpu import (
     DenseERI4cDerivContractionCPUCache,
     build_dense_eri4c_deriv_contraction_cache_cpu,

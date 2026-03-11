@@ -887,13 +887,9 @@ class DFGradContractionContext:
     def _init_cuda(self) -> None:
         import cupy as cp  # noqa: PLC0415
 
-        try:
-            from asuka.cueri import _cueri_cuda_ext as _ext_cuda  # noqa: PLC0415
-        except Exception as e:  # pragma: no cover
-            raise RuntimeError(
-                "cuERI CUDA extension is required for analytic DF gradient contraction; "
-                "build via `python -m asuka.cueri.build_cuda_ext`"
-            ) from e
+        from asuka.kernels import cueri as cueri_kernels  # noqa: PLC0415
+
+        _ext_cuda = cueri_kernels.require_ext()
 
         spCD_by_l_host = {
             int(lq): np.asarray(spCD_batch, dtype=np.int32).ravel()

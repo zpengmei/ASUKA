@@ -399,7 +399,9 @@ def _benchmark_hf_thc(*, seed: int = 0, warmup: int = 5, iters: int = 20) -> lis
     try:
         cp = _cupy()
         _cuda_init(cp)
-        from asuka import _hf_thc_cuda_ext as ext  # type: ignore[import-not-found]
+        from asuka.kernels import hf_thc as hf_thc_kernels  # noqa: PLC0415
+
+        ext = hf_thc_kernels.require_ext()
     except Exception as exc:
         return [_exception_result("hf_thc", "hf_thc", exc)]
 
@@ -520,7 +522,9 @@ def _benchmark_guga_sparse(*, seed: int = 0, warmup: int = 3, iters: int = 10) -
         cp = _cupy()
         _cuda_init(cp)
         import asuka.cuda.cuda_backend as guga_backend
-        from asuka import _guga_cuda_ext as guga_ext  # type: ignore[import-not-found]
+        from asuka.kernels import guga as guga_kernels  # noqa: PLC0415
+
+        guga_ext = guga_kernels.require_ext()
     except Exception as exc:
         return [_exception_result("guga_sparse", "guga", exc)]
 

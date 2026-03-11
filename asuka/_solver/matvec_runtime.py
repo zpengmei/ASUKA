@@ -5,6 +5,8 @@ from typing import Any
 
 from .cuda_policy import (
     enforce_cuda_aggregate_offdiag_guard,
+    normalize_csr_host_cache_mode,
+    normalize_prefilter_trivial_tasks_mode,
     normalize_ws_cache_fraction as _normalize_ws_cache_fraction,
 )
 
@@ -12,6 +14,153 @@ from .cuda_policy import (
 CUDA_MATVEC_BACKENDS = frozenset(
     ("cuda_eri_mat", "cuda", "cuda_fixed_ell", "cuda_ell", "cuda_fixed_sell", "cuda_sell")
 )
+
+
+def resolve_cuda_workspace_controls(
+    *,
+    kwargs: dict[str, Any],
+    defaults: Any,
+    consume: bool,
+    context: str,
+) -> dict[str, Any]:
+    """Resolve shared CUDA workspace/thread controls used by kernel and approx paths."""
+
+    def _get(key: str, default: Any) -> Any:
+        if bool(consume):
+            return kwargs.pop(key, default)
+        return kwargs.get(key, default)
+
+    matvec_cuda_target_ntasks = int(
+        _get("matvec_cuda_target_ntasks", getattr(defaults, "matvec_cuda_target_ntasks", 1_500_000))
+    )
+    matvec_cuda_j_tile_align = int(
+        _get("matvec_cuda_j_tile_align", getattr(defaults, "matvec_cuda_j_tile_align", 256))
+    )
+    matvec_cuda_j_tile_requested = int(_get("matvec_cuda_j_tile", getattr(defaults, "matvec_cuda_j_tile", 0)))
+    matvec_cuda_csr_capacity_mult = float(
+        _get("matvec_cuda_csr_capacity_mult", getattr(defaults, "matvec_cuda_csr_capacity_mult", 2.0))
+    )
+    matvec_cuda_csr_host_cache_mode = normalize_csr_host_cache_mode(
+        _get("matvec_cuda_csr_host_cache", getattr(defaults, "matvec_cuda_csr_host_cache", "auto"))
+    )
+    matvec_cuda_csr_host_cache_budget_gib = max(
+        0.0,
+        float(
+            _get(
+                "matvec_cuda_csr_host_cache_budget_gib",
+                getattr(defaults, "matvec_cuda_csr_host_cache_budget_gib", 4.0),
+            )
+        ),
+    )
+    matvec_cuda_csr_host_cache_min_ncsf = max(
+        1,
+        int(
+            _get(
+                "matvec_cuda_csr_host_cache_min_ncsf",
+                getattr(defaults, "matvec_cuda_csr_host_cache_min_ncsf", 1_000_000),
+            )
+        ),
+    )
+    matvec_cuda_csr_pipeline_streams = _get(
+        "matvec_cuda_csr_pipeline_streams",
+        getattr(defaults, "matvec_cuda_csr_pipeline_streams", "auto"),
+    )
+    matvec_cuda_csr_pipeline_min_ncsf = max(
+        1,
+        int(
+            _get(
+                "matvec_cuda_csr_pipeline_min_ncsf",
+                getattr(defaults, "matvec_cuda_csr_pipeline_min_ncsf", 1_000_000),
+            )
+        ),
+    )
+    if isinstance(matvec_cuda_csr_pipeline_streams, str):
+        matvec_cuda_csr_pipeline_streams_mode = str(matvec_cuda_csr_pipeline_streams).strip().lower()
+        matvec_cuda_csr_pipeline_streams_value = None
+    else:
+        matvec_cuda_csr_pipeline_streams_mode = "manual"
+        matvec_cuda_csr_pipeline_streams_value = int(matvec_cuda_csr_pipeline_streams)
+
+    matvec_cuda_prefilter_trivial_tasks_mode = normalize_prefilter_trivial_tasks_mode(
+        _get(
+            "matvec_cuda_prefilter_trivial_tasks",
+            getattr(defaults, "matvec_cuda_prefilter_trivial_tasks", "auto"),
+        )
+    )
+    matvec_cuda_prefilter_trivial_tasks_min_ncsf = max(
+        1,
+        int(
+            _get(
+                "matvec_cuda_prefilter_trivial_tasks_min_ncsf",
+                getattr(defaults, "matvec_cuda_prefilter_trivial_tasks_min_ncsf", 1_000_000),
+            )
+        ),
+    )
+
+    threads_enum_forced = "matvec_cuda_threads_enum" in kwargs
+    threads_g_forced = "matvec_cuda_threads_g" in kwargs
+    matvec_cuda_threads_enum = int(_get("matvec_cuda_threads_enum", getattr(defaults, "matvec_cuda_threads_enum", 128)))
+    matvec_cuda_threads_g = int(_get("matvec_cuda_threads_g", getattr(defaults, "matvec_cuda_threads_g", 256)))
+    matvec_cuda_threads_w = int(_get("matvec_cuda_threads_w", getattr(defaults, "matvec_cuda_threads_w", 0)))
+    matvec_cuda_threads_apply = int(
+        _get("matvec_cuda_threads_apply", getattr(defaults, "matvec_cuda_threads_apply", 0))
+    )
+    threads_apply_auto = int(matvec_cuda_threads_apply) <= 0
+
+    matvec_cuda_coalesce = bool(_get("matvec_cuda_coalesce", getattr(defaults, "matvec_cuda_coalesce", True)))
+    matvec_cuda_include_diagonal_rs = bool(
+        _get("matvec_cuda_include_diagonal_rs", getattr(defaults, "matvec_cuda_include_diagonal_rs", True))
+    )
+    matvec_cuda_cache_csr_tiles = _get("matvec_cuda_cache_csr_tiles", getattr(defaults, "matvec_cuda_cache_csr_tiles", None))
+    matvec_cuda_fuse_count_write = bool(
+        _get("matvec_cuda_fuse_count_write", getattr(defaults, "matvec_cuda_fuse_count_write", True))
+    )
+    matvec_cuda_fp32_coeff_data = bool(
+        _get("matvec_cuda_fp32_coeff_data", getattr(defaults, "matvec_cuda_fp32_coeff_data", False))
+    )
+    matvec_cuda_use_epq_table_in = _get("matvec_cuda_use_epq_table", getattr(defaults, "matvec_cuda_use_epq_table", None))
+    matvec_cuda_aggregate_offdiag_in = _get(
+        "matvec_cuda_aggregate_offdiag",
+        getattr(defaults, "matvec_cuda_aggregate_offdiag", None),
+    )
+    if matvec_cuda_aggregate_offdiag_in is None:
+        # Hard guard policy: keep aggregate-offdiag enabled on all CUDA matvec runs.
+        matvec_cuda_aggregate_offdiag = True
+    else:
+        matvec_cuda_aggregate_offdiag = bool(matvec_cuda_aggregate_offdiag_in)
+    matvec_cuda_aggregate_offdiag = enforce_cuda_aggregate_offdiag_guard(
+        bool(matvec_cuda_aggregate_offdiag),
+        context=str(context),
+    )
+
+    return {
+        "matvec_cuda_target_ntasks": int(matvec_cuda_target_ntasks),
+        "matvec_cuda_j_tile_align": int(matvec_cuda_j_tile_align),
+        "matvec_cuda_j_tile_requested": int(matvec_cuda_j_tile_requested),
+        "matvec_cuda_csr_capacity_mult": float(matvec_cuda_csr_capacity_mult),
+        "matvec_cuda_csr_host_cache_mode": str(matvec_cuda_csr_host_cache_mode),
+        "matvec_cuda_csr_host_cache_budget_gib": float(matvec_cuda_csr_host_cache_budget_gib),
+        "matvec_cuda_csr_host_cache_min_ncsf": int(matvec_cuda_csr_host_cache_min_ncsf),
+        "matvec_cuda_csr_pipeline_streams_mode": str(matvec_cuda_csr_pipeline_streams_mode),
+        "matvec_cuda_csr_pipeline_streams_value": matvec_cuda_csr_pipeline_streams_value,
+        "matvec_cuda_csr_pipeline_min_ncsf": int(matvec_cuda_csr_pipeline_min_ncsf),
+        "matvec_cuda_prefilter_trivial_tasks_mode": str(matvec_cuda_prefilter_trivial_tasks_mode),
+        "matvec_cuda_prefilter_trivial_tasks_min_ncsf": int(matvec_cuda_prefilter_trivial_tasks_min_ncsf),
+        "threads_enum_forced": bool(threads_enum_forced),
+        "threads_g_forced": bool(threads_g_forced),
+        "matvec_cuda_threads_enum": int(matvec_cuda_threads_enum),
+        "matvec_cuda_threads_g": int(matvec_cuda_threads_g),
+        "matvec_cuda_threads_w": int(matvec_cuda_threads_w),
+        "matvec_cuda_threads_apply": int(matvec_cuda_threads_apply),
+        "threads_apply_auto": bool(threads_apply_auto),
+        "matvec_cuda_coalesce": bool(matvec_cuda_coalesce),
+        "matvec_cuda_include_diagonal_rs": bool(matvec_cuda_include_diagonal_rs),
+        "matvec_cuda_cache_csr_tiles": matvec_cuda_cache_csr_tiles,
+        "matvec_cuda_fuse_count_write": bool(matvec_cuda_fuse_count_write),
+        "matvec_cuda_fp32_coeff_data": bool(matvec_cuda_fp32_coeff_data),
+        "matvec_cuda_use_epq_table_in": matvec_cuda_use_epq_table_in,
+        "matvec_cuda_aggregate_offdiag": bool(matvec_cuda_aggregate_offdiag),
+    }
 
 
 def ws_needs_rebuild(
@@ -380,3 +529,157 @@ def resolve_approx_kernel_iteration_caps(
         "max_cycle": int(max_cycle),
         "max_space": int(max_space),
     }
+
+
+def resolve_cuda_j_tile(
+    *,
+    requested_j_tile: int,
+    target_ntasks: int,
+    j_tile_align: int,
+    norb: int,
+    ncsf: int,
+) -> int:
+    j_tile = int(requested_j_tile)
+    ncsf_i = int(ncsf)
+    norb_i = int(norb)
+    if j_tile <= 0:
+        # Auto-tune j_tile so that the total number of (j, r, s) tasks per tile is roughly constant.
+        # This reduces overhead from repeated CSR builds and kernel launches on small/moderate problems.
+        rs_pairs = norb_i * norb_i - norb_i  # off-diagonal (r!=s) pairs
+        if rs_pairs <= 0 or int(target_ntasks) <= 0:
+            j_tile = min(ncsf_i, 1024)
+        else:
+            j_tile = (int(target_ntasks) + int(rs_pairs) - 1) // int(rs_pairs)
+            j_tile = max(1, min(ncsf_i, int(j_tile)))
+            if int(j_tile_align) > 1 and j_tile < ncsf_i:
+                j_tile = min(
+                    ncsf_i,
+                    ((j_tile + int(j_tile_align) - 1) // int(j_tile_align)) * int(j_tile_align),
+                )
+        # If we would end up with 2 tiles and a small remainder, prefer a single full tile.
+        # This avoids paying the CSR build + apply overhead twice per hop.
+        if 0 < j_tile < ncsf_i:
+            tiles = (ncsf_i + j_tile - 1) // j_tile
+            if tiles == 2:
+                rem = ncsf_i - j_tile
+                if rem > 0 and rem < max(1, j_tile // 4):
+                    j_tile = ncsf_i
+    return int(j_tile)
+
+
+def resolve_cuda_cache_csr_tiles(
+    *,
+    cache_csr_tiles_in: Any,
+    aggregate_offdiag: bool,
+    use_epq_table: bool,
+    ncsf: int,
+    j_tile: int,
+    norb: int,
+    csr_capacity_mult: float,
+) -> bool:
+    if cache_csr_tiles_in is None:
+        # Auto: cache CSR per j-tile across hops when the tile count is small enough to fit in memory.
+        #
+        # Note: when `aggregate_offdiag` + `epq_table` are enabled, the CUDA hop can build the
+        # off-diagonal W directly from the combined E_pq table and skip per-hop CSR construction.
+        # CSR caching is then unnecessary and can block that fast path (see workspace hop implementations).
+        if bool(aggregate_offdiag) and bool(use_epq_table):
+            return False
+        ncsf_i = int(ncsf)
+        if int(j_tile) >= ncsf_i:
+            return False
+        rs_pairs = int(norb) * int(norb) - int(norb)
+        tiles = (ncsf_i + int(j_tile) - 1) // int(j_tile)
+        cap_full = int(max(1.0, float(csr_capacity_mult)) * float(int(j_tile) * int(rs_pairs)))
+        # Rough device memory estimate for the cached CSR arrays (row_j,row_k,indptr,indices,data).
+        est_bytes_total = int(tiles) * int(cap_full) * 28
+        return bool(tiles <= 32 and est_bytes_total <= 2 * 1024 * 1024 * 1024)
+    return bool(cache_csr_tiles_in)
+
+
+def get_or_create_cuda_matvec_state(
+    *,
+    state_cache: dict[Any, Any],
+    ws_key: Any,
+    drt: Any,
+    make_device_drt_fn: Any,
+    make_device_state_cache_fn: Any,
+) -> tuple[Any, Any]:
+    cuda_state = state_cache.get(ws_key)
+    if cuda_state is None:
+        drt_dev = make_device_drt_fn(drt)
+        state_dev = make_device_state_cache_fn(drt, drt_dev)
+        cuda_state = (drt_dev, state_dev)
+        state_cache[ws_key] = cuda_state
+    return cuda_state
+
+
+def tune_cuda_threads_for_large_cas_noepq(
+    *,
+    threads_enum: int,
+    threads_g: int,
+    threads_enum_forced: bool,
+    threads_g_forced: bool,
+    eri_mat_present: bool,
+    use_epq_table: bool,
+    aggregate_offdiag: bool,
+    nops: int,
+    ncsf: int,
+    dtype_mode: str,
+) -> dict[str, int]:
+    out_threads_enum = int(threads_enum)
+    out_threads_g = int(threads_g)
+
+    cond = bool(
+        eri_mat_present
+        and (not bool(use_epq_table))
+        and (not bool(aggregate_offdiag))
+        and int(nops) <= 256
+        and int(ncsf) >= 1_000_000
+    )
+    if (not bool(threads_g_forced)) and cond:
+        out_threads_g = 128
+    if (not bool(threads_enum_forced)) and int(out_threads_enum) == 128 and cond:
+        if str(dtype_mode) in ("float32", "mixed"):
+            out_threads_enum = 256
+        else:
+            out_threads_enum = 192
+    return {
+        "threads_enum": int(out_threads_enum),
+        "threads_g": int(out_threads_g),
+    }
+
+
+def resolve_cuda_threads_w(
+    *,
+    threads_w: int,
+    threads_g: int,
+) -> int:
+    out = int(threads_w)
+    if out <= 0:
+        out = int(threads_g)
+    return int(out)
+
+
+def resolve_cuda_threads_apply(
+    *,
+    threads_apply: int,
+    use_epq_table: bool,
+    dtype_mode: str,
+    ncsf: int,
+    nops: int,
+    noepq_large_ncsf_uses_64: bool,
+) -> int:
+    out = int(threads_apply)
+    if out <= 0:
+        if bool(use_epq_table):
+            if str(dtype_mode) in ("float32", "mixed"):
+                out = 64 if int(ncsf) >= 1_000_000 else 128
+            else:
+                out = 256 if int(nops) >= 512 else 128
+        else:
+            if bool(noepq_large_ncsf_uses_64):
+                out = 64 if int(ncsf) >= 1_000_000 else 32
+            else:
+                out = 32
+    return int(out)

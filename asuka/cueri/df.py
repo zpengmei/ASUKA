@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import importlib
 import numpy as np
 import weakref
 
@@ -19,6 +20,18 @@ _DF_STREAM_XBLOCK_PLAN_CACHE_MAX = 2
 _df_stream_xblock_plan_cache: dict[tuple, tuple[weakref.ref, weakref.ref, object]] = {}
 _SCATTER_DF_INT3C2E_TO_QP_RAW_KERNEL = None
 _SCATTER_DF_INT3C2E_TO_X_RAW_KERNEL = None
+
+
+def _integrals_df_packed_s2():
+    # Lazy import keeps package boundaries thin while reusing canonical helpers.
+    return importlib.import_module("asuka.integrals.df_packed_s2")
+
+
+def _ntri_from_nao(nao: int) -> int:
+    nao_i = int(nao)
+    if nao_i < 0:
+        raise ValueError("nao must be >= 0")
+    return nao_i * (nao_i + 1) // 2
 
 
 @dataclass(frozen=True)
@@ -1128,8 +1141,7 @@ def active_Lfull_from_B_Qp(B_Qp, C_active, *, aux_block_naux: int = 64):
     except Exception as e:  # pragma: no cover
         raise RuntimeError("CuPy is required for DF active_Lfull_from_B_Qp") from e
 
-    from asuka.integrals.df_packed_s2 import fused_qp_l_act_f64  # noqa: PLC0415
-    from asuka.integrals.tri_packed import ntri_from_nao  # noqa: PLC0415
+    fused_qp_l_act_f64 = _integrals_df_packed_s2().fused_qp_l_act_f64
 
     B_qp = cp.asarray(B_Qp, dtype=cp.float64)
     C_active = cp.asarray(C_active, dtype=cp.float64)
@@ -1142,7 +1154,7 @@ def active_Lfull_from_B_Qp(B_Qp, C_active, *, aux_block_naux: int = 64):
 
     naux, ntri = map(int, B_qp.shape)
     nao, norb = map(int, C_active.shape)
-    ntri_expected = int(ntri_from_nao(int(nao)))
+    ntri_expected = int(_ntri_from_nao(int(nao)))
     if int(ntri) != int(ntri_expected):
         raise ValueError(
             f"B_Qp has ntri={int(ntri)}, expected {int(ntri_expected)} for C_active nao={int(nao)}"
@@ -1229,7 +1241,7 @@ def _active_YT_streamed_rys_basis(
     from .eri_utils import build_pair_coeff_ordered
     from .tasks import TaskList, decode_eri_class_id
     from .basis_utils import shell_nfunc_cart
-    from asuka.integrals.df_packed_s2 import ao_packed_s2_enabled
+    ao_packed_s2_enabled = _integrals_df_packed_s2().ao_packed_s2_enabled
 
     from .gpu import CUDA_MAX_L, has_cuda_ext
     from .eri_dispatch import KernelBatch, plan_kernel_batches_spd, run_kernel_batch_spd
@@ -1259,10 +1271,9 @@ def _active_YT_streamed_rys_basis(
     if not has_cuda_ext():
         raise RuntimeError("cuERI CUDA extension not available; build via `python -m asuka.cueri.build_cuda_ext`")
 
-    try:
-        from . import _cueri_cuda_ext as _ext
-    except Exception as e:  # pragma: no cover
-        raise RuntimeError("cuERI CUDA extension not available") from e
+    from asuka.kernels import cueri as cueri_kernels  # noqa: PLC0415
+
+    _ext = cueri_kernels.require_ext()
     sptr = stream_ptr(stream)
 
     C_active = cp.asarray(C_active, dtype=cp.float64)
@@ -1441,7 +1452,7 @@ def _active_YT_streamed_rys_basis(
                     start2.record(s0)
 
                 if _full_x_use_qp:
-                    from asuka.integrals.df_packed_s2 import pack_B_to_Qp  # noqa: PLC0415
+                    pack_B_to_Qp = _integrals_df_packed_s2().pack_B_to_Qp
 
                     X_qp = pack_B_to_Qp(X, layout="mnQ", nao=int(nao))
                     del X

@@ -12,7 +12,7 @@ import warnings
 
 import numpy as np
 
-from asuka.frontend.periodic_table import atomic_number
+from asuka.chem.periodic_table import atomic_number
 from asuka.integrals.int1e_cart import contract_dS_ip_cart, contract_dhcore_cart
 from asuka.solver import GUGAFCISolver
 

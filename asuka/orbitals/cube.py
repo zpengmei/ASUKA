@@ -4,20 +4,19 @@ from typing import Any
 
 import numpy as np
 
-from asuka.frontend.molecule import Molecule
-from asuka.frontend.periodic_table import atomic_number
+from asuka.chem.periodic_table import atomic_number
 from asuka.integrals.cart2sph import AOSphericalTransform
 
 from .eval_cart import CubeGrid, eval_mos_cart_on_points, make_cube_grid_from_atoms
 
 
-def _atom_coords_bohr(mol: Molecule) -> np.ndarray:
+def _atom_coords_bohr(mol: Any) -> np.ndarray:
     return np.asarray(mol.coords_bohr, dtype=np.float64).reshape((mol.natm, 3))
 
 
 def write_cube_header(
     f,
-    mol: Molecule,
+    mol: Any,
     grid: CubeGrid,
     *,
     comment1: str = "ASUKA cube",
@@ -47,7 +46,7 @@ def write_cube_header(
 
 def write_mo_cube(
     path: str,
-    mol: Molecule,
+    mol: Any,
     ao_basis: Any,
     C: Any,
     mo: int,

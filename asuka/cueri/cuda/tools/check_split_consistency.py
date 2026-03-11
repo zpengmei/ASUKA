@@ -37,6 +37,7 @@ class CheckSpec:
     kind: str
     src: Path
     parts: int
+    split_parts: int | None = None
 
 
 REPO_ROOT = THIS_DIR.parents[3]
@@ -46,19 +47,21 @@ GEN_DIR = SRC_DIR / "generated"
 DEFAULT_CHECKS: tuple[CheckSpec, ...] = (
     CheckSpec("bindings", "bindings", SRC_DIR / "cueri_cuda_ext.cpp", 9),
     CheckSpec("df_deriv", "large", SRC_DIR / "cueri_cuda_kernels_df_deriv.cu", 17),
+    CheckSpec("step2", "large", SRC_DIR / "cueri_cuda_kernels_step2.cu", 2, split_parts=4),
     CheckSpec("rys_generic", "large", SRC_DIR / "cueri_cuda_kernels_rys_generic.cu", 2),
     CheckSpec("rys_generic_deriv", "large", SRC_DIR / "cueri_cuda_kernels_rys_generic_deriv.cu", 2),
-    CheckSpec("wave1", "wave", GEN_DIR / "cueri_cuda_kernels_wave1_generated.cu", 6),
-    CheckSpec("wave2", "wave", GEN_DIR / "cueri_cuda_kernels_wave2_generated.cu", 5),
+    CheckSpec("wave1", "wave", GEN_DIR / "cueri_cuda_kernels_wave1_generated.cu", 12),
+    CheckSpec("wave2", "wave", GEN_DIR / "cueri_cuda_kernels_wave2_generated.cu", 6),
 )
 
 
 def _split_to_temp(spec: CheckSpec, tmp_src: Path) -> list[Path]:
+    split_parts = int(spec.split_parts or spec.parts)
     with contextlib.redirect_stderr(io.StringIO()):
         if spec.kind == "large":
-            return _split_large.split_file(tmp_src, spec.parts, no_cmake=True)
+            return _split_large.split_file(tmp_src, split_parts, no_cmake=True)
         if spec.kind == "wave":
-            return _split_wave.split_file(tmp_src, spec.parts)
+            return _split_wave.split_file(tmp_src, split_parts)
     raise ValueError(f"Unknown check kind: {spec.kind}")
 
 
@@ -127,12 +130,12 @@ def run_bindings_check(spec: CheckSpec) -> bool:
 
     cmake_path = spec.src.parent.parent / "CMakeLists.txt"
     cmake_text = cmake_path.read_text(encoding="utf-8")
-    entry_line = "    src/cueri_cuda_ext.cpp"
-    if entry_line in cmake_text:
+    entry_path = "src/cueri_cuda_ext.cpp"
+    if entry_path in cmake_text:
         print("  OK CMake entrypoint")
     else:
         ok = False
-        print(f"  MISMATCH CMake missing_entry={entry_line!r}")
+        print(f"  MISMATCH CMake missing_entry={entry_path!r}")
     cmake_parts = _extract_part_numbers(r"^\s+src/cueri_cuda_ext_part(\d+)\.cpp$", cmake_text)
     if cmake_parts == expected:
         print(f"  OK CMake part_entries {cmake_parts[0]}..{cmake_parts[-1]}")
@@ -182,7 +185,7 @@ def main(argv: list[str] | None = None) -> int:
         "--only",
         action="append",
         default=[],
-        help="Limit checks to named groups: bindings, df_deriv, rys_generic, rys_generic_deriv, wave1, wave2",
+        help="Limit checks to named groups: bindings, df_deriv, step2, rys_generic, rys_generic_deriv, wave1, wave2",
     )
     parser.add_argument("--show-diff", action="store_true", help="Show unified diffs for mismatches")
     parser.add_argument(
