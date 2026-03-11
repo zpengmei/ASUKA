@@ -15,13 +15,12 @@ Notes
 """
 
 from collections import OrderedDict
-from dataclasses import dataclass, replace as _dc_replace
+from dataclasses import dataclass
 import os
 from typing import Any, TYPE_CHECKING
 
 import numpy as np
 
-from asuka.hf.dense_scf import rhf_dense, rohf_dense, uhf_dense
 from asuka.hf.df_scf import SCFResult, rhf_df, rohf_df, uhf_df
 from asuka.integrals.cueri_df import CuERIDFConfig, build_df_B_from_cueri_packed_bases
 from asuka.integrals.cueri_df_cpu import build_df_B_from_cueri_packed_bases_cpu
@@ -62,6 +61,7 @@ from ._scf_keys import (
     rhf_guess_key as _rhf_guess_key_impl,
     rhf_prep_key as _rhf_prep_key_impl,
 )
+from ._scf_metadata import with_two_e_metadata as _with_two_e_metadata
 from ._scf_methods import (
     run_rhf_direct_df_impl as _run_rhf_direct_df_impl,
     run_rhf_df_impl as _run_rhf_df_impl,
@@ -74,6 +74,21 @@ from ._scf_methods import (
     run_uhf_df_cpu_impl as _run_uhf_df_cpu_impl,
     run_uhf_df_impl as _run_uhf_df_impl,
     run_uks_df_impl as _run_uks_df_impl,
+)
+from ._scf_dense_direct_methods import (
+    run_rhf_dense_impl as _run_rhf_dense_impl,
+    run_uhf_dense_impl as _run_uhf_dense_impl,
+    run_rohf_dense_impl as _run_rohf_dense_impl,
+    run_rhf_direct_impl as _run_rhf_direct_impl,
+    run_uhf_direct_impl as _run_uhf_direct_impl,
+    run_rohf_direct_impl as _run_rohf_direct_impl,
+)
+from ._scf_run_config import (
+    DFRunConfig,
+    THCRunConfig,
+    env_float as _env_float,
+    make_df_run_config as _make_df_run_config,
+    make_thc_run_config as _make_thc_run_config,
 )
 from ._scf_spin import nalpha_nbeta_from_mol as _nalpha_nbeta_from_mol_impl
 from ._scf_thc_common import (
@@ -132,65 +147,6 @@ class _SCFRunResultView:
     @property
     def scf_result(self) -> SCFResult:
         return getattr(self, "scf")
-
-
-@dataclass(frozen=True)
-class THCRunConfig:
-    """Reproducible THC frontend settings for native downstream workflows."""
-
-    hf_method: str
-    basis: Any | None
-    auxbasis: Any
-    df_config: Any | None
-    expand_contractions: bool
-    thc_mode: str
-    thc_local_config: Any | None
-    thc_grid_spec: Any | None
-    thc_grid_kind: str
-    thc_dvr_basis: Any | None
-    thc_grid_options: Any | None
-    thc_npt: int | None
-    thc_solve_method: str
-    use_density_difference: bool
-    df_warmup_cycles: int
-    df_warmup_ediff: float | None = None
-    df_warmup_max_cycles: int | None = None
-    df_aux_block_naux: int = 256
-    df_k_q_block: int = 128
-    max_cycle: int = 50
-    conv_tol: float = 1e-10
-    conv_tol_dm: float = 1e-8
-    diis: bool = True
-    diis_start_cycle: int | None = None
-    diis_space: int = 8
-    damping: float = 0.0
-    level_shift: float = 0.0
-    q_block: int = 256
-    init_guess: str | None = None
-    init_fock_cycles: int | None = None
-
-
-@dataclass(frozen=True)
-class DFRunConfig:
-    """Reproducible DF frontend settings for native downstream workflows."""
-
-    hf_method: str
-    basis: Any | None
-    auxbasis: Any
-    df_config: Any | None
-    expand_contractions: bool
-    backend: str
-    max_cycle: int = 50
-    conv_tol: float = 1e-10
-    conv_tol_dm: float = 1e-8
-    diis: bool = True
-    diis_start_cycle: int | None = None
-    diis_space: int = 8
-    damping: float = 0.0
-    level_shift: float = 0.0
-    k_q_block: int = 128
-    cublas_math_mode: str | None = None
-    init_fock_cycles: int | None = None
 
 
 def _apply_sph_transform(
@@ -280,125 +236,9 @@ _HF_PREP_CACHE_MAX = max(0, int(os.environ.get("ASUKA_HF_PREP_CACHE_MAX", "0")))
 _HF_GUESS_CACHE_MAX = max(0, int(os.environ.get("ASUKA_HF_GUESS_CACHE_MAX", "0")))
 _HF_INIT_FOCK_CYCLES = max(0, int(os.environ.get("ASUKA_HF_INIT_FOCK_CYCLES", "1")))
 
-
-def _env_float(name: str, default: float) -> float:
-    try:
-        return float(os.environ.get(name, str(default)))
-    except Exception:
-        return float(default)
-
-
 _HF_DENSE_MEM_BUDGET_GIB = _env_float("ASUKA_HF_DENSE_MEM_BUDGET_GIB", 8.0)
 _RHF_PREP_CACHE: "OrderedDict[tuple[Any, ...], tuple[Any, str, Int1eResult, Any, str, Any]]" = OrderedDict()
 _RHF_GUESS_CACHE: "OrderedDict[tuple[Any, ...], Any]" = OrderedDict()
-
-
-def _make_thc_run_config(
-    *,
-    hf_method: str,
-    basis: Any | None,
-    auxbasis: Any,
-    df_config: Any | None,
-    expand_contractions: bool,
-    thc_mode: str,
-    thc_local_config: Any | None,
-    thc_grid_spec: Any | None,
-    thc_grid_kind: str,
-    thc_dvr_basis: Any | None,
-    thc_grid_options: Any | None,
-    thc_npt: int | None,
-    thc_solve_method: str,
-    use_density_difference: bool,
-    df_warmup_cycles: int,
-    df_warmup_ediff: float | None = None,
-    df_warmup_max_cycles: int | None = None,
-    df_aux_block_naux: int = 256,
-    df_k_q_block: int = 128,
-    max_cycle: int = 50,
-    conv_tol: float = 1e-10,
-    conv_tol_dm: float = 1e-8,
-    diis: bool = True,
-    diis_start_cycle: int | None = None,
-    diis_space: int = 8,
-    damping: float = 0.0,
-    level_shift: float = 0.0,
-    q_block: int = 256,
-    init_guess: str | None = None,
-    init_fock_cycles: int | None = None,
-) -> THCRunConfig:
-    return THCRunConfig(
-        hf_method=str(hf_method),
-        basis=basis,
-        auxbasis=auxbasis,
-        df_config=df_config,
-        expand_contractions=bool(expand_contractions),
-        thc_mode=str(thc_mode),
-        thc_local_config=thc_local_config,
-        thc_grid_spec=thc_grid_spec,
-        thc_grid_kind=str(thc_grid_kind),
-        thc_dvr_basis=thc_dvr_basis,
-        thc_grid_options=thc_grid_options,
-        thc_npt=None if thc_npt is None else int(thc_npt),
-        thc_solve_method=str(thc_solve_method),
-        use_density_difference=bool(use_density_difference),
-        df_warmup_cycles=int(df_warmup_cycles),
-        df_warmup_ediff=None if df_warmup_ediff is None else float(df_warmup_ediff),
-        df_warmup_max_cycles=None if df_warmup_max_cycles is None else int(df_warmup_max_cycles),
-        df_aux_block_naux=int(df_aux_block_naux),
-        df_k_q_block=int(df_k_q_block),
-        max_cycle=int(max_cycle),
-        conv_tol=float(conv_tol),
-        conv_tol_dm=float(conv_tol_dm),
-        diis=bool(diis),
-        diis_start_cycle=None if diis_start_cycle is None else int(diis_start_cycle),
-        diis_space=int(diis_space),
-        damping=float(damping),
-        level_shift=float(level_shift),
-        q_block=int(q_block),
-        init_guess=None if init_guess is None else str(init_guess),
-        init_fock_cycles=None if init_fock_cycles is None else int(init_fock_cycles),
-    )
-
-
-def _make_df_run_config(
-    *,
-    hf_method: str,
-    basis: Any | None,
-    auxbasis: Any,
-    df_config: Any | None,
-    expand_contractions: bool,
-    backend: str,
-    max_cycle: int,
-    conv_tol: float,
-    conv_tol_dm: float,
-    diis: bool,
-    diis_start_cycle: int | None,
-    diis_space: int,
-    damping: float,
-    level_shift: float,
-    k_q_block: int,
-    cublas_math_mode: str | None = None,
-    init_fock_cycles: int | None = None,
-) -> DFRunConfig:
-    return DFRunConfig(
-        hf_method=str(hf_method),
-        basis=basis,
-        auxbasis=auxbasis,
-        df_config=df_config,
-        expand_contractions=bool(expand_contractions),
-        backend=str(backend),
-        max_cycle=int(max_cycle),
-        conv_tol=float(conv_tol),
-        conv_tol_dm=float(conv_tol_dm),
-        diis=bool(diis),
-        diis_start_cycle=None if diis_start_cycle is None else int(diis_start_cycle),
-        diis_space=int(diis_space),
-        damping=float(damping),
-        level_shift=float(level_shift),
-        k_q_block=int(k_q_block),
-        cublas_math_mode=None if cublas_math_mode is None else str(cublas_math_mode),
-        init_fock_cycles=None if init_fock_cycles is None else int(init_fock_cycles),
-    )
 
 
 def _build_df_metric_cholesky(
@@ -578,75 +418,33 @@ def run_rhf_dense(
     profile: dict | None = None,
 ) -> RHFDFRunResult:
     """Run RHF with dense AO ERIs (non-DF)."""
-
-    if int(mol.spin) != 0:
-        raise NotImplementedError("run_rhf_dense currently supports only closed-shell molecules (spin=0)")
-
-    nelec = int(mol.nelectron)
-    if nelec <= 0 or nelec % 2 != 0:
-        raise ValueError("RHF requires an even, positive electron count")
-
-    basis_in = mol.basis if basis is None else basis
-    ao_basis, basis_name = build_ao_basis_cart(mol, basis=basis_in, expand_contractions=bool(expand_contractions))
-    coords, charges = _atom_coords_charges_bohr(mol)
-    int1e = build_int1e_cart(ao_basis, atom_coords_bohr=coords, atom_charges=charges)
-
-    dense = _build_dense_ao_eri(
-        ao_basis,
-        backend=str(backend),
+    return _run_rhf_dense_impl(
+        mol,
+        basis=basis,
+        backend=backend,
+        expand_contractions=expand_contractions,
         dense_threads=dense_threads,
-        dense_max_tile_bytes=int(dense_max_tile_bytes),
-        dense_eps_ao=float(dense_eps_ao),
+        dense_max_tile_bytes=dense_max_tile_bytes,
+        dense_eps_ao=dense_eps_ao,
         dense_max_l=dense_max_l,
         dense_mem_budget_gib=dense_mem_budget_gib,
-        profile=profile,
-    )
-
-    sph_map: AOSphericalTransform | None = None
-    eri_mat_use = dense.eri_mat
-    if not bool(mol.cart):
-        int1e, _, sph_map = _apply_sph_transform(mol, int1e, None, ao_basis)
-        from asuka.integrals.cart2sph import transform_dense_eri_cart_to_sph  # noqa: PLC0415
-        T, nao_cart, nao_sph = sph_map
-        eri_mat_use = transform_dense_eri_cart_to_sph(dense.eri_mat, T, nao_cart, nao_sph)
-
-    init_fock_cycles_i = int(_HF_INIT_FOCK_CYCLES) if init_fock_cycles is None else max(0, int(init_fock_cycles))
-    diis_start_cycle_i = (
-        int(diis_start_cycle) if diis_start_cycle is not None else (1 if int(init_fock_cycles_i) > 0 else 2)
-    )
-    scf_prof = profile if profile is not None else None
-    scf = rhf_dense(
-        int1e.S,
-        int1e.hcore,
-        eri_mat_use,
-        nelec=int(nelec),
-        enuc=float(mol.energy_nuc()),
-        max_cycle=int(max_cycle),
-        conv_tol=float(conv_tol),
-        conv_tol_dm=float(conv_tol_dm),
-        diis=bool(diis),
-        diis_start_cycle=int(diis_start_cycle_i),
-        diis_space=int(diis_space),
-        damping=float(damping),
-        level_shift=float(level_shift),
+        max_cycle=max_cycle,
+        conv_tol=conv_tol,
+        conv_tol_dm=conv_tol_dm,
+        diis=diis,
+        diis_start_cycle=diis_start_cycle,
+        diis_space=diis_space,
+        damping=damping,
+        level_shift=level_shift,
         dm0=dm0,
         mo_coeff0=mo_coeff0,
-        init_fock_cycles=int(init_fock_cycles_i),
-        profile=scf_prof,
-    )
-
-    return RHFDFRunResult(
-        mol=mol,
-        basis_name=str(basis_name),
-        auxbasis_name="<dense>",
-        ao_basis=ao_basis,
-        aux_basis=None,
-        int1e=int1e,
-        df_B=None,
-        scf=scf,
+        init_fock_cycles=init_fock_cycles,
         profile=profile,
-        ao_eri=eri_mat_use,
-        sph_map=sph_map,
+        init_fock_cycles_default=int(_HF_INIT_FOCK_CYCLES),
+        atom_coords_charges_bohr_fn=_atom_coords_charges_bohr,
+        build_dense_ao_eri_fn=_build_dense_ao_eri,
+        apply_sph_transform_fn=_apply_sph_transform,
+        result_cls=RHFDFRunResult,
     )
 
 
@@ -674,70 +472,30 @@ def run_rhf_direct(
     profile: dict | None = None,
 ) -> RHFDFRunResult:
     """Run RHF with integral-direct 4-center J/K (no DF, no materialized ERI)."""
-
-    if int(mol.spin) != 0:
-        raise NotImplementedError("run_rhf_direct currently supports only closed-shell molecules (spin=0)")
-
-    nelec = int(mol.nelectron)
-    if nelec <= 0 or nelec % 2 != 0:
-        raise ValueError("RHF requires an even, positive electron count")
-
-    basis_in = mol.basis if basis is None else basis
-    ao_basis, basis_name = build_ao_basis_cart(mol, basis=basis_in, expand_contractions=bool(expand_contractions))
-    coords, charges = _atom_coords_charges_bohr(mol)
-    int1e = build_int1e_cart(ao_basis, atom_coords_bohr=coords, atom_charges=charges)
-
-    if not bool(mol.cart):
-        raise NotImplementedError("Integral-direct SCF does not yet support spherical AOs (cart=False)")
-
-    from asuka.hf.direct_jk import make_direct_jk_context  # noqa: PLC0415
-    from asuka.hf.direct_scf import rhf_direct  # noqa: PLC0415
-
-    jk_ctx = make_direct_jk_context(
-        ao_basis,
-        eps_schwarz=float(eps_schwarz),
-        threads=int(direct_threads),
-        max_tile_bytes=int(direct_max_tile_bytes),
-        max_slab_tasks=direct_max_slab_tasks,
-        gpu_task_budget_bytes=direct_gpu_task_budget_bytes,
-    )
-
-    init_fock_cycles_i = int(_HF_INIT_FOCK_CYCLES) if init_fock_cycles is None else max(0, int(init_fock_cycles))
-    diis_start_cycle_i = (
-        int(diis_start_cycle) if diis_start_cycle is not None else (1 if int(init_fock_cycles_i) > 0 else 2)
-    )
-    scf = rhf_direct(
-        int1e.S,
-        int1e.hcore,
-        jk_ctx,
-        nelec=int(nelec),
-        enuc=float(mol.energy_nuc()),
-        max_cycle=int(max_cycle),
-        conv_tol=float(conv_tol),
-        conv_tol_dm=float(conv_tol_dm),
-        diis=bool(diis),
-        diis_start_cycle=int(diis_start_cycle_i),
-        diis_space=int(diis_space),
-        damping=float(damping),
-        level_shift=float(level_shift),
+    return _run_rhf_direct_impl(
+        mol,
+        basis=basis,
+        expand_contractions=expand_contractions,
+        eps_schwarz=eps_schwarz,
+        direct_threads=direct_threads,
+        direct_max_tile_bytes=direct_max_tile_bytes,
+        direct_gpu_task_budget_bytes=direct_gpu_task_budget_bytes,
+        direct_max_slab_tasks=direct_max_slab_tasks,
+        max_cycle=max_cycle,
+        conv_tol=conv_tol,
+        conv_tol_dm=conv_tol_dm,
+        diis=diis,
+        diis_start_cycle=diis_start_cycle,
+        diis_space=diis_space,
+        damping=damping,
+        level_shift=level_shift,
         dm0=dm0,
         mo_coeff0=mo_coeff0,
-        init_fock_cycles=int(init_fock_cycles_i),
+        init_fock_cycles=init_fock_cycles,
         profile=profile,
-    )
-
-    return RHFDFRunResult(
-        mol=mol,
-        basis_name=str(basis_name),
-        auxbasis_name="<direct>",
-        ao_basis=ao_basis,
-        aux_basis=None,
-        int1e=int1e,
-        df_B=None,
-        scf=scf,
-        profile=profile,
-        two_e_backend="direct",
-        direct_jk_ctx=jk_ctx,
+        init_fock_cycles_default=int(_HF_INIT_FOCK_CYCLES),
+        atom_coords_charges_bohr_fn=_atom_coords_charges_bohr,
+        result_cls=RHFDFRunResult,
     )
 
 
@@ -763,59 +521,28 @@ def run_uhf_direct(
     profile: dict | None = None,
 ) -> UHFDFRunResult:
     """Run UHF with integral-direct 4-center J/K."""
-
-    nalpha, nbeta = _nalpha_nbeta_from_mol(mol)
-    basis_in = mol.basis if basis is None else basis
-    ao_basis, basis_name = build_ao_basis_cart(mol, basis=basis_in, expand_contractions=bool(expand_contractions))
-    coords, charges = _atom_coords_charges_bohr(mol)
-    int1e = build_int1e_cart(ao_basis, atom_coords_bohr=coords, atom_charges=charges)
-
-    if not bool(mol.cart):
-        raise NotImplementedError("Integral-direct SCF does not yet support spherical AOs (cart=False)")
-
-    from asuka.hf.direct_jk import make_direct_jk_context  # noqa: PLC0415
-    from asuka.hf.direct_scf import uhf_direct  # noqa: PLC0415
-
-    jk_ctx = make_direct_jk_context(
-        ao_basis,
-        eps_schwarz=float(eps_schwarz),
-        threads=int(direct_threads),
-        max_tile_bytes=int(direct_max_tile_bytes),
-        max_slab_tasks=direct_max_slab_tasks,
-        gpu_task_budget_bytes=direct_gpu_task_budget_bytes,
-    )
-
-    scf = uhf_direct(
-        int1e.S,
-        int1e.hcore,
-        jk_ctx,
-        nalpha=int(nalpha),
-        nbeta=int(nbeta),
-        enuc=float(mol.energy_nuc()),
-        max_cycle=int(max_cycle),
-        conv_tol=float(conv_tol),
-        conv_tol_dm=float(conv_tol_dm),
-        diis=bool(diis),
-        diis_start_cycle=int(diis_start_cycle),
-        diis_space=int(diis_space),
-        damping=float(damping),
+    return _run_uhf_direct_impl(
+        mol,
+        basis=basis,
+        expand_contractions=expand_contractions,
+        eps_schwarz=eps_schwarz,
+        direct_threads=direct_threads,
+        direct_max_tile_bytes=direct_max_tile_bytes,
+        direct_gpu_task_budget_bytes=direct_gpu_task_budget_bytes,
+        direct_max_slab_tasks=direct_max_slab_tasks,
+        max_cycle=max_cycle,
+        conv_tol=conv_tol,
+        conv_tol_dm=conv_tol_dm,
+        diis=diis,
+        diis_start_cycle=diis_start_cycle,
+        diis_space=diis_space,
+        damping=damping,
         dm0=dm0,
         mo_coeff0=mo_coeff0,
         profile=profile,
-    )
-
-    return UHFDFRunResult(
-        mol=mol,
-        basis_name=str(basis_name),
-        auxbasis_name="<direct>",
-        ao_basis=ao_basis,
-        aux_basis=None,
-        int1e=int1e,
-        df_B=None,
-        scf=scf,
-        profile=profile,
-        two_e_backend="direct",
-        direct_jk_ctx=jk_ctx,
+        nalpha_nbeta_from_mol_fn=_nalpha_nbeta_from_mol,
+        atom_coords_charges_bohr_fn=_atom_coords_charges_bohr,
+        result_cls=UHFDFRunResult,
     )
 
 
@@ -841,59 +568,28 @@ def run_rohf_direct(
     profile: dict | None = None,
 ) -> ROHFDFRunResult:
     """Run ROHF with integral-direct 4-center J/K."""
-
-    nalpha, nbeta = _nalpha_nbeta_from_mol(mol)
-    basis_in = mol.basis if basis is None else basis
-    ao_basis, basis_name = build_ao_basis_cart(mol, basis=basis_in, expand_contractions=bool(expand_contractions))
-    coords, charges = _atom_coords_charges_bohr(mol)
-    int1e = build_int1e_cart(ao_basis, atom_coords_bohr=coords, atom_charges=charges)
-
-    if not bool(mol.cart):
-        raise NotImplementedError("Integral-direct SCF does not yet support spherical AOs (cart=False)")
-
-    from asuka.hf.direct_jk import make_direct_jk_context  # noqa: PLC0415
-    from asuka.hf.direct_scf import rohf_direct  # noqa: PLC0415
-
-    jk_ctx = make_direct_jk_context(
-        ao_basis,
-        eps_schwarz=float(eps_schwarz),
-        threads=int(direct_threads),
-        max_tile_bytes=int(direct_max_tile_bytes),
-        max_slab_tasks=direct_max_slab_tasks,
-        gpu_task_budget_bytes=direct_gpu_task_budget_bytes,
-    )
-
-    scf = rohf_direct(
-        int1e.S,
-        int1e.hcore,
-        jk_ctx,
-        nalpha=int(nalpha),
-        nbeta=int(nbeta),
-        enuc=float(mol.energy_nuc()),
-        max_cycle=int(max_cycle),
-        conv_tol=float(conv_tol),
-        conv_tol_dm=float(conv_tol_dm),
-        diis=bool(diis),
-        diis_start_cycle=int(diis_start_cycle),
-        diis_space=int(diis_space),
-        damping=float(damping),
+    return _run_rohf_direct_impl(
+        mol,
+        basis=basis,
+        expand_contractions=expand_contractions,
+        eps_schwarz=eps_schwarz,
+        direct_threads=direct_threads,
+        direct_max_tile_bytes=direct_max_tile_bytes,
+        direct_gpu_task_budget_bytes=direct_gpu_task_budget_bytes,
+        direct_max_slab_tasks=direct_max_slab_tasks,
+        max_cycle=max_cycle,
+        conv_tol=conv_tol,
+        conv_tol_dm=conv_tol_dm,
+        diis=diis,
+        diis_start_cycle=diis_start_cycle,
+        diis_space=diis_space,
+        damping=damping,
         dm0=dm0,
         mo_coeff0=mo_coeff0,
         profile=profile,
-    )
-
-    return ROHFDFRunResult(
-        mol=mol,
-        basis_name=str(basis_name),
-        auxbasis_name="<direct>",
-        ao_basis=ao_basis,
-        aux_basis=None,
-        int1e=int1e,
-        df_B=None,
-        scf=scf,
-        profile=profile,
-        two_e_backend="direct",
-        direct_jk_ctx=jk_ctx,
+        nalpha_nbeta_from_mol_fn=_nalpha_nbeta_from_mol,
+        atom_coords_charges_bohr_fn=_atom_coords_charges_bohr,
+        result_cls=ROHFDFRunResult,
     )
 
 
@@ -1096,65 +792,31 @@ def run_uhf_dense(
     profile: dict | None = None,
 ) -> UHFDFRunResult:
     """Run UHF with dense AO ERIs (non-DF)."""
-
-    nalpha, nbeta = _nalpha_nbeta_from_mol(mol)
-    basis_in = mol.basis if basis is None else basis
-
-    ao_basis, basis_name = build_ao_basis_cart(mol, basis=basis_in, expand_contractions=bool(expand_contractions))
-    coords, charges = _atom_coords_charges_bohr(mol)
-    int1e = build_int1e_cart(ao_basis, atom_coords_bohr=coords, atom_charges=charges)
-
-    dense = _build_dense_ao_eri(
-        ao_basis,
-        backend=str(backend),
+    return _run_uhf_dense_impl(
+        mol,
+        basis=basis,
+        backend=backend,
+        expand_contractions=expand_contractions,
         dense_threads=dense_threads,
-        dense_max_tile_bytes=int(dense_max_tile_bytes),
-        dense_eps_ao=float(dense_eps_ao),
+        dense_max_tile_bytes=dense_max_tile_bytes,
+        dense_eps_ao=dense_eps_ao,
         dense_max_l=dense_max_l,
         dense_mem_budget_gib=dense_mem_budget_gib,
-        profile=profile,
-    )
-
-    sph_map: AOSphericalTransform | None = None
-    eri_mat_use = dense.eri_mat
-    if not bool(mol.cart):
-        int1e, _, sph_map = _apply_sph_transform(mol, int1e, None, ao_basis)
-        from asuka.integrals.cart2sph import transform_dense_eri_cart_to_sph  # noqa: PLC0415
-        T, nao_cart, nao_sph = sph_map
-        eri_mat_use = transform_dense_eri_cart_to_sph(dense.eri_mat, T, nao_cart, nao_sph)
-
-    scf_prof = profile if profile is not None else None
-    scf = uhf_dense(
-        int1e.S,
-        int1e.hcore,
-        eri_mat_use,
-        nalpha=int(nalpha),
-        nbeta=int(nbeta),
-        enuc=float(mol.energy_nuc()),
-        max_cycle=int(max_cycle),
-        conv_tol=float(conv_tol),
-        conv_tol_dm=float(conv_tol_dm),
-        diis=bool(diis),
-        diis_start_cycle=int(diis_start_cycle),
-        diis_space=int(diis_space),
-        damping=float(damping),
+        max_cycle=max_cycle,
+        conv_tol=conv_tol,
+        conv_tol_dm=conv_tol_dm,
+        diis=diis,
+        diis_start_cycle=diis_start_cycle,
+        diis_space=diis_space,
+        damping=damping,
         dm0=dm0,
         mo_coeff0=mo_coeff0,
-        profile=scf_prof,
-    )
-
-    return UHFDFRunResult(
-        mol=mol,
-        basis_name=str(basis_name),
-        auxbasis_name="<dense>",
-        ao_basis=ao_basis,
-        aux_basis=None,
-        int1e=int1e,
-        df_B=None,
-        scf=scf,
         profile=profile,
-        ao_eri=eri_mat_use,
-        sph_map=sph_map,
+        nalpha_nbeta_from_mol_fn=_nalpha_nbeta_from_mol,
+        atom_coords_charges_bohr_fn=_atom_coords_charges_bohr,
+        build_dense_ao_eri_fn=_build_dense_ao_eri,
+        apply_sph_transform_fn=_apply_sph_transform,
+        result_cls=UHFDFRunResult,
     )
 
 
@@ -1181,67 +843,31 @@ def run_rohf_dense(
     profile: dict | None = None,
 ) -> ROHFDFRunResult:
     """Run ROHF with dense AO ERIs (non-DF)."""
-
-    nalpha, nbeta = _nalpha_nbeta_from_mol(mol)
-    if int(nalpha) < int(nbeta):
-        raise ValueError("run_rohf_dense requires spin >= 0 (nalpha >= nbeta)")
-
-    basis_in = mol.basis if basis is None else basis
-    ao_basis, basis_name = build_ao_basis_cart(mol, basis=basis_in, expand_contractions=bool(expand_contractions))
-    coords, charges = _atom_coords_charges_bohr(mol)
-    int1e = build_int1e_cart(ao_basis, atom_coords_bohr=coords, atom_charges=charges)
-
-    dense = _build_dense_ao_eri(
-        ao_basis,
-        backend=str(backend),
+    return _run_rohf_dense_impl(
+        mol,
+        basis=basis,
+        backend=backend,
+        expand_contractions=expand_contractions,
         dense_threads=dense_threads,
-        dense_max_tile_bytes=int(dense_max_tile_bytes),
-        dense_eps_ao=float(dense_eps_ao),
+        dense_max_tile_bytes=dense_max_tile_bytes,
+        dense_eps_ao=dense_eps_ao,
         dense_max_l=dense_max_l,
         dense_mem_budget_gib=dense_mem_budget_gib,
-        profile=profile,
-    )
-
-    sph_map: AOSphericalTransform | None = None
-    eri_mat_use = dense.eri_mat
-    if not bool(mol.cart):
-        int1e, _, sph_map = _apply_sph_transform(mol, int1e, None, ao_basis)
-        from asuka.integrals.cart2sph import transform_dense_eri_cart_to_sph  # noqa: PLC0415
-        T, nao_cart, nao_sph = sph_map
-        eri_mat_use = transform_dense_eri_cart_to_sph(dense.eri_mat, T, nao_cart, nao_sph)
-
-    scf_prof = profile if profile is not None else None
-    scf = rohf_dense(
-        int1e.S,
-        int1e.hcore,
-        eri_mat_use,
-        nalpha=int(nalpha),
-        nbeta=int(nbeta),
-        enuc=float(mol.energy_nuc()),
-        max_cycle=int(max_cycle),
-        conv_tol=float(conv_tol),
-        conv_tol_dm=float(conv_tol_dm),
-        diis=bool(diis),
-        diis_start_cycle=int(diis_start_cycle),
-        diis_space=int(diis_space),
-        damping=float(damping),
+        max_cycle=max_cycle,
+        conv_tol=conv_tol,
+        conv_tol_dm=conv_tol_dm,
+        diis=diis,
+        diis_start_cycle=diis_start_cycle,
+        diis_space=diis_space,
+        damping=damping,
         dm0=dm0,
         mo_coeff0=mo_coeff0,
-        profile=scf_prof,
-    )
-
-    return ROHFDFRunResult(
-        mol=mol,
-        basis_name=str(basis_name),
-        auxbasis_name="<dense>",
-        ao_basis=ao_basis,
-        aux_basis=None,
-        int1e=int1e,
-        df_B=None,
-        scf=scf,
         profile=profile,
-        ao_eri=eri_mat_use,
-        sph_map=sph_map,
+        nalpha_nbeta_from_mol_fn=_nalpha_nbeta_from_mol,
+        atom_coords_charges_bohr_fn=_atom_coords_charges_bohr,
+        build_dense_ao_eri_fn=_build_dense_ao_eri,
+        apply_sph_transform_fn=_apply_sph_transform,
+        result_cls=ROHFDFRunResult,
     )
 
 
@@ -1589,24 +1215,6 @@ def run_rohf_thc(
         mo_coeff0=mo_coeff0,
         profile=profile,
     )
-
-def _with_two_e_metadata(
-    out: RHFDFRunResult | UHFDFRunResult | ROHFDFRunResult,
-    *,
-    two_e_backend: str,
-    direct_jk_ctx: Any | None = None,
-) -> RHFDFRunResult | UHFDFRunResult | ROHFDFRunResult:
-    """Attach normalized two-electron backend metadata to frontend SCF results."""
-
-    try:
-        return _dc_replace(
-            out,
-            two_e_backend=str(two_e_backend),
-            direct_jk_ctx=direct_jk_ctx if direct_jk_ctx is not None else getattr(out, "direct_jk_ctx", None),
-        )
-    except Exception:
-        return out
-
 
 def run_hf_df(
     mol: Molecule,

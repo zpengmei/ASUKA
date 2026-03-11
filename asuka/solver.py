@@ -3223,46 +3223,15 @@ class GUGAFCISolver(_StreamObject):
                             keep_keys=(ws_cache_key,),
                         )
                     else:
-                        ws_dtype_obj = np.dtype(getattr(cuda_ws, "dtype", np.float64))
-                        cuda_ws.eri_mat = None if eri_mat_d is None else cp.ascontiguousarray(cp.asarray(eri_mat_d, dtype=ws_dtype_obj))
-                        h_eff_flat_new = cuda_ws._as_h_eff_flat(h_eff_d)
-                        if getattr(cuda_ws, "h_eff_flat", None) is None or tuple(getattr(cuda_ws.h_eff_flat, "shape", ())) != tuple(
-                            getattr(h_eff_flat_new, "shape", ())
-                        ):
-                            cuda_ws.h_eff_flat = h_eff_flat_new
-                            if getattr(cuda_ws, "_cuda_graph", None) is not None:
-                                # Graph capture pointers depend on stable `h_eff_flat`; fall back to
-                                # re-capturing if the buffer had to be replaced.
-                                cuda_ws._cuda_graph = None
-                                cuda_ws._cuda_graph_x = None
-                                cuda_ws._cuda_graph_y = None
-                        else:
-                            cp.copyto(cuda_ws.h_eff_flat, h_eff_flat_new)
-
-                        # Diagonal-rs contribution depends on `eri_diag_t` extracted from `eri_mat`.
-                        # Invalidate it whenever the Hamiltonian changes.
-                        cuda_ws._eri_diag_t = None
-
-                        # Keep `eri_mat_t` pointer-stable for CUDA Graph reuse.
-                        if getattr(cuda_ws, "_eri_mat_t", None) is not None:
-                            cp.copyto(cuda_ws._eri_mat_t, cuda_ws.eri_mat.T)
-                        else:
-                            cuda_ws._eri_mat_t = cuda_ws.eri_mat.T.copy()
-                            if getattr(cuda_ws, "_cuda_graph", None) is not None:
-                                cuda_ws._cuda_graph = None
-                                cuda_ws._cuda_graph_x = None
-                                cuda_ws._cuda_graph_y = None
-
-                        # If a CUDA Graph was captured, update the diagonal-rs cache in place so the
-                        # captured pointers remain valid and the matvec stays correct.
-                        if (
-                            bool(matvec_cuda_use_graph)
-                            and getattr(cuda_ws, "_cuda_graph", None) is not None
-                            and bool(getattr(cuda_ws, "include_diagonal_rs", False))
-                        ):
-                            cuda_ws._build_diag_g_cache()
-
-                        cuda_ws.use_cuda_graph = bool(matvec_cuda_use_graph)
+                        _refresh_cuda_workspace_hamiltonian_inplace_runtime(
+                            cp=cp,
+                            ws=cuda_ws,
+                            eri_mat_d=eri_mat_d,
+                            l_full_d=l_full_d,
+                            h_eff_d=h_eff_d,
+                            use_cuda_graph=bool(matvec_cuda_use_graph),
+                            refresh_diag_cache_for_graph=True,
+                        )
 
                     if bool(matvec_cuda_use_graph):
                         # Capture once and reuse across many approx_kernel calls (Hamiltonian updates

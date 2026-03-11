@@ -151,7 +151,30 @@ def assign_active_orbitals_by_overlap(
         # score[j] = Σ_i∈active |O[i,j]|²
         overlap_active = O[prev_active_idx, :]  # (ncas, nmo_new)
         scores = np.sum(np.abs(overlap_active) ** 2, axis=0)  # (nmo_new,)
-        return np.argsort(-scores)[:ncas]  # Top ncas by score
+        selected = np.argsort(-scores, kind="stable")[:ncas]  # Top ncas by score
+
+        # Preserve orbital identity/order inside the selected active set.
+        #
+        # Pure score ordering can arbitrarily permute a near-degenerate active pair
+        # (e.g. return [48, 47] instead of [47, 48]), which then seeds the CASSCF
+        # optimizer with swapped active orbitals.  Keep the robust "pick the best
+        # subspace" behavior, but order the chosen orbitals by the best 1:1 match to
+        # the previous active orbitals.
+        overlap_selected = np.abs(O[np.asarray(prev_active_idx, dtype=np.int64)[:, None], selected[None, :]]) ** 2
+        try:
+            from scipy.optimize import linear_sum_assignment
+
+            _row, col = linear_sum_assignment(-overlap_selected)
+            ordered = selected[np.asarray(col, dtype=np.int64)]
+        except Exception:
+            remaining = list(range(int(selected.size)))
+            ordered_idx: list[int] = []
+            for i in range(ncas):
+                best_local = max(remaining, key=lambda j: float(overlap_selected[i, j]))
+                ordered_idx.append(best_local)
+                remaining.remove(best_local)
+            ordered = selected[np.asarray(ordered_idx, dtype=np.int64)]
+        return np.asarray(ordered, dtype=np.int64)
 
     # method == "hungarian"
     # Use 1-to-1 optimal assignment

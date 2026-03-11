@@ -155,8 +155,9 @@ def test_direct_fock_rhf_matches_jk(monkeypatch):
 
 
 @_skip_no_cuda
-def test_direct_fock_rhf_fused_toggle_matches(monkeypatch):
-    """Fused ERI->Fock path must match staged path (env toggle)."""
+@pytest.mark.parametrize("fused_only", ["psss", "ppps", "psds"])
+def test_direct_fock_rhf_fused_toggle_matches(monkeypatch, fused_only):
+    """Fused ERI->Fock specialized paths must match the staged path."""
     import cupy as cp
 
     from asuka.frontend.one_electron import build_ao_basis_cart
@@ -185,19 +186,19 @@ def test_direct_fock_rhf_fused_toggle_matches(monkeypatch):
     F_staged = direct_fock_rhf(ctx, D, h, stats=stats_staged)
     assert int(stats_staged.get("n_fused_calls", 0)) == 0
 
-    # Fused enabled (force only psss so the test checks fused dispatch is actually taken).
+    # Fused enabled for a single class so the test checks that specialized dispatch is taken.
     monkeypatch.setenv("ASUKA_DIRECT_FOCK_FUSED", "1")
-    monkeypatch.setenv("ASUKA_DIRECT_FOCK_FUSED_ONLY", "psss")
+    monkeypatch.setenv("ASUKA_DIRECT_FOCK_FUSED_ONLY", fused_only)
     stats_fused: dict = {}
     F_fused = direct_fock_rhf(ctx, D, h, stats=stats_fused)
     assert int(stats_fused.get("n_fused_calls", 0)) > 0
 
     err = float(cp.max(cp.abs(F_staged - F_fused)).item())
-    assert err < 1e-12, f"Fused vs staged Fock mismatch: max|ΔF|={err:.2e}"
+    assert err < 1e-12, f"Fused vs staged Fock mismatch for {fused_only}: max|ΔF|={err:.2e}"
 
 
 @_skip_no_cuda
-@pytest.mark.parametrize("fused_only", ["psss", "psds"])
+@pytest.mark.parametrize("fused_only", ["psss", "ppps", "psds"])
 def test_direct_jk_fused_toggle_matches(monkeypatch, fused_only):
     """Fused direct-JK specialized paths must match the staged path."""
     import cupy as cp

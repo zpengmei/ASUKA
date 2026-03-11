@@ -16,6 +16,7 @@ from ._scf_build import (
 )
 from ._scf_config import resolve_cueri_df_config
 from ._scf_df_build import prepare_direct_df_inputs
+from ._scf_xc_runtime import resolve_xc_runtime as _resolve_xc_runtime
 from .one_electron import build_ao_basis_cart
 from ._scf_spin import nalpha_nbeta_from_mol as _nalpha_nbeta_from_mol_impl
 
@@ -227,44 +228,6 @@ def _prepare_df_cpu_problem(
     )
     int1e_scf, B_scf, sph_map = apply_sph_transform(mol, int1e, B, ao_basis)
     return ao_basis, basis_name, int1e_scf, aux_basis, auxbasis_name, B_scf, sph_map, L_chol
-
-
-def _coerce_or_build_xc_grid(
-    mol,
-    *,
-    xc_grid_coords,
-    xc_grid_weights,
-    grid_radial_n: int,
-    grid_angular_n: int,
-):
-    from asuka.density.grids_device import make_becke_grid_device
-    import cupy as _cp_grid
-
-    if xc_grid_coords is not None and xc_grid_weights is not None:
-        return (
-            _cp_grid.asarray(xc_grid_coords, dtype=_cp_grid.float64),
-            _cp_grid.asarray(xc_grid_weights, dtype=_cp_grid.float64),
-        )
-    return make_becke_grid_device(
-        mol,
-        radial_n=int(grid_radial_n),
-        angular_n=int(grid_angular_n),
-        radial_scheme="treutler",
-    )
-
-
-def _xc_sph_transform_from_map(mol, sph_map):
-    if bool(mol.cart) or sph_map is None:
-        return None
-    import cupy as _cp_xc
-
-    if hasattr(sph_map, "T_c2s"):
-        return _cp_xc.asarray(sph_map.T_c2s, dtype=_cp_xc.float64)
-    if hasattr(sph_map, "T_matrix"):
-        return _cp_xc.asarray(sph_map.T_matrix, dtype=_cp_xc.float64)
-    if isinstance(sph_map, tuple) and len(sph_map) >= 1:
-        return _cp_xc.asarray(sph_map[0], dtype=_cp_xc.float64)
-    return None
 
 
 def run_rhf_df_cpu_impl(
@@ -1381,12 +1344,9 @@ def run_rks_df_impl(
     init_fock_cycles_default: int,
     result_cls: Any,
 ):
-    from asuka.xc.functional import get_functional
-
     if int(mol.spin) != 0:
         raise NotImplementedError("run_rks_df currently supports only closed-shell molecules (spin=0)")
 
-    xc_spec = get_functional(functional)
     nelec = int(mol.nelectron)
     if nelec <= 0 or nelec % 2 != 0:
         raise ValueError("RKS requires an even, positive electron count")
@@ -1422,14 +1382,15 @@ def run_rks_df_impl(
         profile=profile,
     )
 
-    grid_coords, grid_weights = _coerce_or_build_xc_grid(
-        mol,
-        xc_grid_coords=xc_grid_coords,
-        xc_grid_weights=xc_grid_weights,
+    xc_spec, grid_coords, grid_weights, xc_sph_transform = _resolve_xc_runtime(
+        functional=functional,
+        mol=mol,
+        sph_map=sph_map,
         grid_radial_n=int(grid_radial_n),
         grid_angular_n=int(grid_angular_n),
+        xc_grid_coords=xc_grid_coords,
+        xc_grid_weights=xc_grid_weights,
     )
-    xc_sph_transform = _xc_sph_transform_from_map(mol, sph_map)
 
     init_fock_cycles_i = int(init_fock_cycles_default) if init_fock_cycles is None else max(0, int(init_fock_cycles))
     diis_start_cycle_i = (
@@ -1512,9 +1473,6 @@ def run_uks_df_impl(
     result_cls: Any,
     make_df_run_config: Callable[..., Any],
 ):
-    from asuka.xc.functional import get_functional
-
-    xc_spec = get_functional(functional)
     nalpha, nbeta = _nalpha_nbeta_from_mol(mol)
 
     basis_in = mol.basis if basis is None else basis
@@ -1547,14 +1505,15 @@ def run_uks_df_impl(
         profile=profile,
     )
 
-    grid_coords, grid_weights = _coerce_or_build_xc_grid(
-        mol,
-        xc_grid_coords=xc_grid_coords,
-        xc_grid_weights=xc_grid_weights,
+    xc_spec, grid_coords, grid_weights, xc_sph_transform = _resolve_xc_runtime(
+        functional=functional,
+        mol=mol,
+        sph_map=sph_map,
         grid_radial_n=int(grid_radial_n),
         grid_angular_n=int(grid_angular_n),
+        xc_grid_coords=xc_grid_coords,
+        xc_grid_weights=xc_grid_weights,
     )
-    xc_sph_transform = _xc_sph_transform_from_map(mol, sph_map)
 
     diis_start_cycle_i = int(diis_start_cycle)
     scf = uhf_df(

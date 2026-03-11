@@ -84,9 +84,23 @@ from asuka.cuda._backend_cache_runtime import (
 )
 from asuka.cuda._backend_hop_runtime import (
     build_epq_stream_tile,
+    build_epq_stream_tile_profiled,
+    finalize_one_body_phase,
+    finalize_hop_profile,
+    increment_profile_counter,
     normalize_hop_x,
     prepare_hop_runtime_inputs,
+    resolve_epq_table_for_tile,
+    resolve_epq_streaming_runtime,
     resolve_hop_runtime_flags,
+    resolve_one_body_mode,
+    resolve_tile_runtime_flags,
+    resolve_x_tile_skip_policy,
+    run_one_body_epq_streaming,
+    run_one_body_single_scatter,
+    stamp_csr_prefilter_profile,
+    stamp_csr_prefilter_tile_profile,
+    set_matvec_path_profile,
     try_cuda_graph_fast_path,
 )
 
@@ -1103,3 +1117,637 @@ def test_backend_hop_runtime_build_epq_stream_tile_forwards_args():
     assert calls["kwargs"]["j_start"] == 10
     assert calls["kwargs"]["j_count"] == 5
     assert calls["kwargs"]["stream"] == "s"
+
+
+def test_backend_hop_runtime_build_epq_stream_tile_profiled_updates_profile():
+    calls = {}
+
+    def _build(*args, **kwargs):
+        calls["kwargs"] = kwargs
+        return ("tile",)
+
+    class _Stream:
+        def __init__(self):
+            self.nsync = 0
+
+        def synchronize(self):
+            self.nsync += 1
+
+    stream = _Stream()
+    ws = SimpleNamespace(
+        drt="drt",
+        drt_dev="drt_dev",
+        state_dev="state_dev",
+        threads_enum=64,
+        epq_stream_use_recompute=True,
+        epq_recompute_warp_coop=True,
+        epq_stream_pq_block=0,
+        _dtype=np.float64,
+    )
+    profile = {}
+    out = build_epq_stream_tile_profiled(
+        ws,
+        build_epq_action_table_tile_device_fn=_build,
+        stream=stream,
+        sync=True,
+        check_overflow=False,
+        profile=profile,
+        j_start=0,
+        j_count=8,
+    )
+    assert out == ("tile",)
+    assert calls["kwargs"]["j_start"] == 0
+    assert calls["kwargs"]["j_count"] == 8
+    assert stream.nsync == 1
+    assert profile["epq_stream_build_s"] >= 0.0
+    assert profile["tile_apply_build_s"] >= 0.0
+
+
+def test_backend_hop_runtime_set_matvec_path_profile():
+    profile = {}
+    set_matvec_path_profile(
+        profile=profile,
+        path_mode="fused_epq_hybrid",
+        effective_mode="fused_coo",
+        fallback_reason="",
+    )
+    assert profile["matvec_path_mode"] == "fused_epq_hybrid"
+    assert profile["matvec_path_mode_effective"] == "fused_coo"
+    assert profile["matvec_path_fallback_reason"] == ""
+
+
+def test_backend_hop_runtime_resolve_epq_streaming_runtime_records_profile():
+    ws = SimpleNamespace(
+        ncsf=128,
+        epq_stream_j_tile=32,
+        epq_stream_double_buffer_mode="on",
+        epq_stream_pq_block=16,
+    )
+    profile = {}
+    out = resolve_epq_streaming_runtime(
+        ws,
+        use_epq_streaming=True,
+        check_overflow=False,
+        profile=profile,
+        epq_stream_panic_requested=False,
+        epq_stream_panic_active=False,
+    )
+    assert out["epq_stream_j_tile"] == 32
+    assert out["epq_stream_db_requested"] is True
+    assert out["epq_stream_db_active"] is False  # profiling lane disables overlap
+    assert profile["epq_streaming"] == 1.0
+    assert profile["epq_stream_j_tile"] == 32.0
+    assert profile["epq_stream_pq_block"] == 16.0
+    assert profile["epq_stream_double_buffer_requested"] == 1.0
+
+
+def test_backend_hop_runtime_resolve_one_body_mode():
+    assert resolve_one_body_mode(
+        use_fused_hop=True,
+        use_epq_streaming=True,
+        epq_stream_panic_active=False,
+        epq_stream_db_active=False,
+    ) == "fused_zero"
+    assert resolve_one_body_mode(
+        use_fused_hop=False,
+        use_epq_streaming=True,
+        epq_stream_panic_active=True,
+        epq_stream_db_active=False,
+    ) == "epq_panic"
+    assert resolve_one_body_mode(
+        use_fused_hop=False,
+        use_epq_streaming=True,
+        epq_stream_panic_active=False,
+        epq_stream_db_active=True,
+    ) == "epq_double_buffer"
+    assert resolve_one_body_mode(
+        use_fused_hop=False,
+        use_epq_streaming=True,
+        epq_stream_panic_active=False,
+        epq_stream_db_active=False,
+    ) == "epq_single_buffer"
+    assert resolve_one_body_mode(
+        use_fused_hop=False,
+        use_epq_streaming=False,
+        epq_stream_panic_active=False,
+        epq_stream_db_active=False,
+    ) == "single_scatter"
+
+
+def test_backend_hop_runtime_run_one_body_epq_streaming_panic():
+    class _Stream:
+        def __init__(self):
+            self.nsync = 0
+
+        def synchronize(self):
+            self.nsync += 1
+
+    cp_mod = SimpleNamespace(
+        asarray=lambda arr, dtype=None: np.asarray(arr, dtype=dtype),
+    )
+    ws = SimpleNamespace(
+        ncsf=4,
+        task_csf_all=np.arange(4, dtype=np.int32),
+        drt="drt",
+        drt_dev="drt_dev",
+        state_dev="state_dev",
+        overflow_apply="overflow",
+        threads_apply=64,
+        _dtype=np.float64,
+        kahan_compensation=False,
+    )
+    stream = _Stream()
+    calls = []
+
+    def _apply(*args, **kwargs):
+        _ = args
+        calls.append(kwargs["zero_y"])
+
+    run_one_body_epq_streaming(
+        ws,
+        cp=cp_mod,
+        one_body_mode="epq_panic",
+        x=np.ones(4),
+        y=np.zeros(4),
+        h_eff_flat=np.ones(4),
+        stream=stream,
+        sync=True,
+        check_overflow=False,
+        profile={},
+        epq_stream_j_tile=2,
+        build_epq_action_table_tile_device_fn=lambda *a, **k: None,
+        apply_g_flat_scatter_atomic_inplace_device_fn=_apply,
+        apply_g_flat_scatter_atomic_epq_table_tile_inplace_device_fn=lambda *a, **k: None,
+    )
+    assert calls == [True, False]
+    assert stream.nsync == 2
+
+
+def test_backend_hop_runtime_run_one_body_epq_streaming_single_buffer():
+    class _Stream:
+        def __init__(self):
+            self.nsync = 0
+
+        def synchronize(self):
+            self.nsync += 1
+
+    cp_mod = SimpleNamespace(
+        asarray=lambda arr, dtype=None: np.asarray(arr, dtype=dtype),
+    )
+    ws = SimpleNamespace(
+        ncsf=4,
+        task_csf_all=np.arange(4, dtype=np.int32),
+        drt="drt",
+        drt_dev="drt_dev",
+        state_dev="state_dev",
+        overflow_apply="overflow",
+        threads_apply=64,
+        threads_enum=64,
+        epq_stream_use_recompute=True,
+        epq_recompute_warp_coop=False,
+        epq_stream_pq_block=0,
+        _dtype=np.float64,
+        kahan_compensation=False,
+    )
+    stream = _Stream()
+    calls = []
+
+    def _build(*args, **kwargs):
+        _ = args
+        assert kwargs["j_count"] == 2
+        return (np.asarray([0, 1], dtype=np.int64), np.asarray([0], dtype=np.int32), np.asarray([0], dtype=np.int32), np.asarray([1.0]))
+
+    def _apply(*args, **kwargs):
+        _ = args
+        calls.append((kwargs["j_start"], kwargs["j_count"], kwargs["zero_y"]))
+
+    profile = {}
+    run_one_body_epq_streaming(
+        ws,
+        cp=cp_mod,
+        one_body_mode="epq_single_buffer",
+        x=np.ones(4),
+        y=np.zeros(4),
+        h_eff_flat=np.ones(4),
+        stream=stream,
+        sync=True,
+        check_overflow=False,
+        profile=profile,
+        epq_stream_j_tile=2,
+        build_epq_action_table_tile_device_fn=_build,
+        apply_g_flat_scatter_atomic_inplace_device_fn=lambda *a, **k: None,
+        apply_g_flat_scatter_atomic_epq_table_tile_inplace_device_fn=_apply,
+    )
+    assert calls == [(0, 2, True), (2, 2, False)]
+    assert profile["tile_apply_apply_s"] >= 0.0
+
+
+def test_backend_hop_runtime_run_one_body_epq_streaming_double_buffer():
+    class _Event:
+        def record(self, _stream):
+            return None
+
+    class _Stream:
+        def __init__(self):
+            self.waited = 0
+
+        def wait_event(self, _evt):
+            self.waited += 1
+
+        def synchronize(self):
+            return None
+
+    class _Cuda:
+        @staticmethod
+        def Stream(non_blocking=True):  # noqa: FBT002
+            _ = non_blocking
+            return _Stream()
+
+        @staticmethod
+        def Event(disable_timing=True):  # noqa: FBT002
+            _ = disable_timing
+            return _Event()
+
+    cp_mod = SimpleNamespace(
+        asarray=lambda arr, dtype=None: np.asarray(arr, dtype=dtype),
+        cuda=_Cuda(),
+    )
+    ws = SimpleNamespace(
+        ncsf=4,
+        task_csf_all=np.arange(4, dtype=np.int32),
+        drt="drt",
+        drt_dev="drt_dev",
+        state_dev="state_dev",
+        overflow_apply="overflow",
+        threads_apply=64,
+        threads_enum=64,
+        epq_stream_use_recompute=True,
+        epq_recompute_warp_coop=False,
+        epq_stream_pq_block=0,
+        _dtype=np.float64,
+        kahan_compensation=False,
+    )
+    stream = _Stream()
+    calls = []
+
+    def _build(*args, **kwargs):
+        _ = args
+        return (np.asarray([0, 1], dtype=np.int64), np.asarray([0], dtype=np.int32), np.asarray([0], dtype=np.int32), np.asarray([1.0]))
+
+    def _apply(*args, **kwargs):
+        _ = args
+        calls.append((kwargs["j_start"], kwargs["j_count"], kwargs["zero_y"]))
+
+    run_one_body_epq_streaming(
+        ws,
+        cp=cp_mod,
+        one_body_mode="epq_double_buffer",
+        x=np.ones(4),
+        y=np.zeros(4),
+        h_eff_flat=np.ones(4),
+        stream=stream,
+        sync=False,
+        check_overflow=False,
+        profile=None,
+        epq_stream_j_tile=2,
+        build_epq_action_table_tile_device_fn=_build,
+        apply_g_flat_scatter_atomic_inplace_device_fn=lambda *a, **k: None,
+        apply_g_flat_scatter_atomic_epq_table_tile_inplace_device_fn=_apply,
+    )
+    assert calls == [(0, 2, True), (2, 2, False)]
+    assert stream.waited == 1
+
+
+def test_backend_hop_runtime_run_one_body_single_scatter_overlap_and_direct():
+    class _Stream:
+        def __init__(self):
+            self.tag = "main"
+
+    class _Cuda:
+        @staticmethod
+        def Stream(non_blocking=True):  # noqa: FBT002
+            _ = non_blocking
+            return SimpleNamespace(tag="overlap")
+
+    cp_mod = SimpleNamespace(cuda=_Cuda())
+    ws = SimpleNamespace(
+        drt="drt",
+        drt_dev="drt_dev",
+        state_dev="state_dev",
+        task_csf_all=np.arange(4, dtype=np.int32),
+        apply_mode="scatter",
+        overflow_apply="overflow",
+        threads_apply=32,
+        _dtype=np.float64,
+        kahan_compensation=False,
+        _w_offdiag=None,
+    )
+    calls = []
+
+    def _apply(*args, **kwargs):
+        _ = args
+        calls.append(
+            {
+                "stream_tag": getattr(kwargs["stream"], "tag", "unknown"),
+                "sync": bool(kwargs["sync"]),
+                "check_overflow": bool(kwargs["check_overflow"]),
+                "zero_y": bool(kwargs["zero_y"]),
+            }
+        )
+
+    main_stream = _Stream()
+    out_overlap = run_one_body_single_scatter(
+        ws,
+        cp=cp_mod,
+        x=np.ones(4),
+        y=np.zeros(4),
+        h_eff_flat=np.ones(4),
+        stream=main_stream,
+        sync=True,
+        check_overflow=True,
+        profile=None,
+        use_aggregate_offdiag=True,
+        epq_table=("epq",),
+        apply_g_flat_scatter_atomic_inplace_device_fn=_apply,
+    )
+    assert out_overlap["one_body_overlap"] is True
+    assert getattr(out_overlap["stream_onebody"], "tag") == "overlap"
+    assert calls[-1]["stream_tag"] == "overlap"
+    assert calls[-1]["sync"] is False
+    assert calls[-1]["check_overflow"] is False
+    assert calls[-1]["zero_y"] is True
+
+    out_direct = run_one_body_single_scatter(
+        ws,
+        cp=cp_mod,
+        x=np.ones(4),
+        y=np.zeros(4),
+        h_eff_flat=np.ones(4),
+        stream=main_stream,
+        sync=True,
+        check_overflow=True,
+        profile={"p": 1.0},
+        use_aggregate_offdiag=True,
+        epq_table=("epq",),
+        apply_g_flat_scatter_atomic_inplace_device_fn=_apply,
+    )
+    assert out_direct["one_body_overlap"] is False
+    assert out_direct["stream_onebody"] is None
+    assert calls[-1]["stream_tag"] == "main"
+    assert calls[-1]["sync"] is True
+    assert calls[-1]["check_overflow"] is True
+
+
+def test_backend_hop_runtime_finalize_hop_profile_aggregates_metrics():
+    class _Stream:
+        def __init__(self):
+            self.nsync = 0
+
+        def synchronize(self):
+            self.nsync += 1
+
+    stream = _Stream()
+    profile = {
+        "offdiag_gemm_s": 2.0,
+        "offdiag_gemm_flops": 4.0e12,
+        "offdiag_df_gemm_s": 4.0,
+        "offdiag_df_gemm_flops": 2.0e12,
+    }
+    import time as _time
+
+    t0 = _time.perf_counter() - 0.001
+    finalize_hop_profile(
+        profile=profile,
+        stream=stream,
+        t_total0=t0,
+        csr_host_cache_hits=3,
+        csr_host_cache_misses=1,
+        epq_apply_cache_hits=5,
+        epq_apply_cache_misses=5,
+        epq_apply_cache_bytes=128,
+    )
+    assert profile["offdiag_gemm_tflops"] == 2.0
+    assert profile["offdiag_df_gemm_tflops"] == 0.5
+    assert profile["csr_host_cache_hit_rate"] == 0.75
+    assert profile["epq_apply_cache_hit_rate"] == 0.5
+    assert profile["epq_apply_cache_bytes"] == 128.0
+    assert profile["total_s"] > 0.0
+    assert stream.nsync == 1
+
+
+def test_backend_hop_runtime_resolve_epq_table_for_tile_passthrough():
+    ws = SimpleNamespace(_epq_table=("indptr", "indices", "pq", "data"))
+    out = resolve_epq_table_for_tile(
+        ws,
+        use_epq_streaming_tiles=False,
+        j_start=0,
+        j_count=4,
+        stream=None,
+        sync=True,
+        check_overflow=False,
+        profile=None,
+        build_epq_action_table_tile_device_fn=lambda *a, **k: ("tile",),
+    )
+    assert out == ("indptr", "indices", "pq", "data")
+
+
+def test_backend_hop_runtime_resolve_epq_table_for_tile_streaming_build():
+    class _Stream:
+        def __init__(self):
+            self.nsync = 0
+
+        def synchronize(self):
+            self.nsync += 1
+
+    calls = {}
+
+    def _build(*args, **kwargs):
+        _ = args
+        calls["kwargs"] = kwargs
+        return ("tile",)
+
+    ws = SimpleNamespace(
+        drt="drt",
+        drt_dev="drt_dev",
+        state_dev="state_dev",
+        threads_enum=32,
+        epq_stream_use_recompute=True,
+        epq_recompute_warp_coop=False,
+        epq_stream_pq_block=0,
+        _dtype=np.float64,
+    )
+    out = resolve_epq_table_for_tile(
+        ws,
+        use_epq_streaming_tiles=True,
+        j_start=5,
+        j_count=3,
+        stream=_Stream(),
+        sync=False,
+        check_overflow=False,
+        profile={},
+        build_epq_action_table_tile_device_fn=_build,
+    )
+    assert out == ("tile",)
+    assert calls["kwargs"]["j_start"] == 5
+    assert calls["kwargs"]["j_count"] == 3
+
+
+def test_backend_hop_runtime_finalize_one_body_phase_records_event_and_profile():
+    class _Event:
+        def __init__(self):
+            self.recorded = None
+
+        def record(self, stream):
+            self.recorded = stream
+
+    class _Stream:
+        def __init__(self):
+            self.nsync = 0
+
+        def synchronize(self):
+            self.nsync += 1
+
+    class _Cuda:
+        @staticmethod
+        def Event(disable_timing=True):  # noqa: FBT002
+            _ = disable_timing
+            return _Event()
+
+    cp_mod = SimpleNamespace(cuda=_Cuda())
+    main_stream = _Stream()
+    overlap_stream = _Stream()
+    profile = {}
+    import time as _time
+
+    evt = finalize_one_body_phase(
+        cp=cp_mod,
+        stream=main_stream,
+        one_body_overlap=True,
+        stream_onebody=overlap_stream,
+        profile=profile,
+        t0=_time.perf_counter() - 0.001,
+    )
+    assert evt.recorded is overlap_stream
+    assert main_stream.nsync == 1
+    assert overlap_stream.nsync == 1
+    assert profile["one_body_s"] > 0.0
+
+
+def test_backend_hop_runtime_resolve_tile_runtime_flags():
+    ws = SimpleNamespace(
+        check_overflow_mode=2,
+        check_overflow_first_tile_only=True,
+    )
+    first = resolve_tile_runtime_flags(
+        ws,
+        j0=0,
+        check_overflow=True,
+        sync=True,
+        use_csr_pipeline=True,
+    )
+    assert first["check_overflow_tile"] is True
+    assert first["check_overflow_mode_tile"] == 2
+    assert first["check_overflow_apply_tile"] is True
+    assert first["tile_sync_apply"] is True
+
+    later = resolve_tile_runtime_flags(
+        ws,
+        j0=128,
+        check_overflow=True,
+        sync=True,
+        use_csr_pipeline=True,
+    )
+    assert later["check_overflow_tile"] is False
+    assert later["check_overflow_mode_tile"] == 0
+    assert later["check_overflow_apply_tile"] is False
+    assert later["tile_sync_apply"] is False
+
+
+def test_backend_hop_runtime_stamp_csr_prefilter_profile():
+    profile = {}
+    stamp_csr_prefilter_profile(
+        profile=profile,
+        use_csr_pipeline=True,
+        pipeline_nslots=3,
+        use_prefilter_trivial=False,
+    )
+    assert profile["csr_pipeline_active"] == 1.0
+    assert profile["csr_pipeline_slots"] == 3.0
+    assert profile["csr_prefilter_active"] == 0.0
+
+    # No-op path
+    stamp_csr_prefilter_profile(
+        profile=None,
+        use_csr_pipeline=False,
+        pipeline_nslots=0,
+        use_prefilter_trivial=True,
+    )
+
+
+def test_backend_hop_runtime_increment_profile_counter():
+    profile = {}
+    increment_profile_counter(profile=profile, key="k", delta=2.5)
+    increment_profile_counter(profile=profile, key="k", delta=1.0)
+    assert profile["k"] == 3.5
+    increment_profile_counter(profile=None, key="k", delta=1.0)
+
+
+def test_backend_hop_runtime_stamp_csr_prefilter_tile_profile():
+    profile = {}
+    out = stamp_csr_prefilter_tile_profile(profile=profile, total_tasks=10, kept_tasks=4)
+    assert out["skipped_tasks"] == 6
+    assert out["is_zero_tile"] is False
+    assert profile["csr_prefilter_tiles"] == 1.0
+    assert profile["csr_prefilter_total_tasks"] == 10.0
+    assert profile["csr_prefilter_kept_tasks"] == 4.0
+    assert profile["csr_prefilter_skipped_tasks"] == 6.0
+    assert "csr_prefilter_zero_tiles" not in profile
+
+    out2 = stamp_csr_prefilter_tile_profile(profile=profile, total_tasks=5, kept_tasks=0)
+    assert out2["is_zero_tile"] is True
+    assert profile["csr_prefilter_zero_tiles"] == 1.0
+
+
+def test_backend_hop_runtime_resolve_x_tile_skip_policy_inactive():
+    ws = SimpleNamespace(
+        skip_zero_x_tiles_enabled=True,
+        j_tile=8,
+        ncsf=8,
+    )
+    cp_mod = SimpleNamespace(asnumpy=lambda x: np.asarray(x))
+    profile = {}
+    out = resolve_x_tile_skip_policy(
+        ws,
+        cp=cp_mod,
+        x=np.ones(8),
+        use_fused_hop=False,
+        profile=profile,
+    )
+    assert out["tile_active_mask"] is None
+    assert out["skip_two_body_tiles"] is False
+    assert profile["x_tile_skip_policy_active"] == 0.0
+
+
+def test_backend_hop_runtime_resolve_x_tile_skip_policy_zero_x():
+    ws = SimpleNamespace(
+        skip_zero_x_tiles_enabled=True,
+        j_tile=4,
+        ncsf=8,
+    )
+    cp_mod = SimpleNamespace(asnumpy=lambda x: np.asarray(x))
+    profile = {}
+    out = resolve_x_tile_skip_policy(
+        ws,
+        cp=cp_mod,
+        x=np.zeros(8),
+        use_fused_hop=False,
+        profile=profile,
+    )
+    mask = out["tile_active_mask"]
+    assert out["skip_two_body_tiles"] is True
+    assert mask is not None
+    assert tuple(mask.shape) == (2,)
+    assert int(np.count_nonzero(mask)) == 0
+    assert profile["x_tile_skip_policy_active"] == 1.0
+    assert profile["x_tile_skip_mask_active"] == 1.0
+    assert profile["x_tile_skipped"] == 2.0

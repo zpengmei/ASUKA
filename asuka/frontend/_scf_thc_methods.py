@@ -4,6 +4,8 @@ from __future__ import annotations
 # This module imports `frontend.scf` lazily at module import time and aliases
 # shared helpers/results to avoid behavior changes while shrinking scf.py.
 from . import scf as _scf_mod
+from ._scf_run_config import make_thc_run_config as _make_thc_run_config
+from ._scf_xc_runtime import resolve_xc_runtime as _resolve_xc_runtime
 
 np = _scf_mod.np
 Molecule = _scf_mod.Molecule
@@ -32,7 +34,6 @@ _HF_INIT_FOCK_CYCLES = _scf_mod._HF_INIT_FOCK_CYCLES
 _HF_GUESS_CACHE_MAX = _scf_mod._HF_GUESS_CACHE_MAX
 _RHF_GUESS_CACHE = _scf_mod._RHF_GUESS_CACHE
 
-_make_thc_run_config = _scf_mod._make_thc_run_config
 RHFDFRunResult = _scf_mod.RHFDFRunResult
 UHFDFRunResult = _scf_mod.UHFDFRunResult
 ROHFDFRunResult = _scf_mod.ROHFDFRunResult
@@ -124,27 +125,13 @@ def run_rhf_thc_impl(
     df_ao_rep = "cart" if bool(mol.cart) else "sph"
 
     # DFT setup (optional)
-    xc_spec = None
-    xc_grid_coords = None
-    xc_grid_weights = None
-    xc_sph_transform = None
-    if functional is not None:
-        from asuka.xc.functional import get_functional
-        from asuka.density.grids_device import make_becke_grid_device
-
-        xc_spec = get_functional(functional)
-        xc_grid_coords, xc_grid_weights = make_becke_grid_device(
-            mol, radial_n=int(grid_radial_n), angular_n=int(grid_angular_n),
-            radial_scheme="treutler",
-        )
-        if not bool(mol.cart) and sph_map is not None:
-            import cupy as _cp_xc
-            if hasattr(sph_map, "T_c2s"):
-                xc_sph_transform = _cp_xc.asarray(sph_map.T_c2s, dtype=_cp_xc.float64)
-            elif hasattr(sph_map, "T_matrix"):
-                xc_sph_transform = _cp_xc.asarray(sph_map.T_matrix, dtype=_cp_xc.float64)
-            elif isinstance(sph_map, tuple) and len(sph_map) >= 1:
-                xc_sph_transform = _cp_xc.asarray(sph_map[0], dtype=_cp_xc.float64)
+    xc_spec, xc_grid_coords, xc_grid_weights, xc_sph_transform = _resolve_xc_runtime(
+        functional=functional,
+        mol=mol,
+        sph_map=sph_map,
+        grid_radial_n=int(grid_radial_n),
+        grid_angular_n=int(grid_angular_n),
+    )
 
     # Optional guess reuse (RHF cache)
     init_guess_s = str(init_guess).strip().lower()
@@ -568,27 +555,13 @@ def run_uhf_thc_impl(
     df_ao_rep = "cart" if bool(mol.cart) else "sph"
 
     # DFT setup (optional)
-    xc_spec = None
-    xc_grid_coords = None
-    xc_grid_weights = None
-    xc_sph_transform = None
-    if functional is not None:
-        from asuka.xc.functional import get_functional
-        from asuka.density.grids_device import make_becke_grid_device
-
-        xc_spec = get_functional(functional)
-        xc_grid_coords, xc_grid_weights = make_becke_grid_device(
-            mol, radial_n=int(grid_radial_n), angular_n=int(grid_angular_n),
-            radial_scheme="treutler",
-        )
-        if not bool(mol.cart) and sph_map is not None:
-            import cupy as _cp_xc  # noqa: PLC0415
-            if hasattr(sph_map, "T_c2s"):
-                xc_sph_transform = _cp_xc.asarray(sph_map.T_c2s, dtype=_cp_xc.float64)
-            elif hasattr(sph_map, "T_matrix"):
-                xc_sph_transform = _cp_xc.asarray(sph_map.T_matrix, dtype=_cp_xc.float64)
-            elif isinstance(sph_map, tuple) and len(sph_map) >= 1:
-                xc_sph_transform = _cp_xc.asarray(sph_map[0], dtype=_cp_xc.float64)
+    xc_spec, xc_grid_coords, xc_grid_weights, xc_sph_transform = _resolve_xc_runtime(
+        functional=functional,
+        mol=mol,
+        sph_map=sph_map,
+        grid_radial_n=int(grid_radial_n),
+        grid_angular_n=int(grid_angular_n),
+    )
 
     # Grid kind selection (Becke vs DVR).
     grid_kind_s, dvr_basis_cart = _resolve_thc_grid_and_dvr_basis(

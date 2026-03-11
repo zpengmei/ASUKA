@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections import OrderedDict
+from dataclasses import dataclass
 from types import SimpleNamespace
 
 from asuka.frontend._scf_cache import (
@@ -25,21 +26,25 @@ from asuka.frontend._scf_build import (
 from asuka.frontend._scf_df_build import prepare_direct_df_inputs
 from asuka.frontend._scf_dispatch import run_hf_df_dispatch
 from asuka.frontend._scf_dense import build_dense_ao_eri, dense_default_threads
+from asuka.frontend._scf_metadata import with_two_e_metadata
 import asuka.frontend._scf_keys as scf_keys_mod
 from asuka.frontend._scf_keys import copy_mo_coeff_for_cache, rhf_guess_key, rhf_prep_key
 import asuka.frontend._scf_methods as scf_methods
 from asuka.frontend._scf_methods import _maybe_pack_df_B
+from asuka.frontend._scf_run_config import env_float, make_df_run_config, make_thc_run_config
 from asuka.frontend._scf_spin import nalpha_nbeta_from_mol
 from asuka.frontend._scf_thc_common import (
     coerce_local_thc_config,
     resolve_thc_grid_and_dvr_basis,
     resolve_thc_mp_store_policy,
 )
+from asuka.frontend._scf_xc_runtime import resolve_xc_runtime
 from asuka.frontend.molecule import Molecule
 import asuka.frontend.scf as scf_mod
 from asuka.integrals.cueri_df import CuERIDFConfig
 from asuka.integrals.int1e_cart import Int1eResult
 import numpy as np
+import pytest
 
 
 def test_scf_cache_put_get_lru_behavior():
@@ -140,6 +145,94 @@ def test_scf_config_df_config_key_shape():
     assert len(key) == 8
     assert key[:7] == ("gpu_rys", "warp", 128, 111, 222, 4, "auto")
     assert isinstance(key[7], int)
+
+
+def test_scf_run_config_builders_and_env_float(monkeypatch):
+    monkeypatch.setenv("ASUKA_TEST_FRONTEND_FLOAT", "2.5")
+    assert env_float("ASUKA_TEST_FRONTEND_FLOAT", 1.0) == 2.5
+    monkeypatch.setenv("ASUKA_TEST_FRONTEND_FLOAT", "oops")
+    assert env_float("ASUKA_TEST_FRONTEND_FLOAT", 1.25) == 1.25
+
+    df_cfg = make_df_run_config(
+        hf_method="rhf",
+        basis="sto-3g",
+        auxbasis="autoaux",
+        df_config={"backend": "gpu_rys"},
+        expand_contractions=True,
+        backend="cuda",
+        max_cycle=12,
+        conv_tol=1e-9,
+        conv_tol_dm=2e-8,
+        diis=True,
+        diis_start_cycle=3,
+        diis_space=10,
+        damping=0.1,
+        level_shift=0.2,
+        k_q_block=64,
+        cublas_math_mode="tf32",
+        init_fock_cycles=2,
+    )
+    assert df_cfg.backend == "cuda"
+    assert df_cfg.max_cycle == 12
+    assert df_cfg.diis_start_cycle == 3
+    assert df_cfg.cublas_math_mode == "tf32"
+
+    thc_cfg = make_thc_run_config(
+        hf_method="rhf",
+        basis="sto-3g",
+        auxbasis="autoaux",
+        df_config={"backend": "gpu_rys"},
+        expand_contractions=True,
+        thc_mode="global",
+        thc_local_config=None,
+        thc_grid_spec=None,
+        thc_grid_kind="rdvr",
+        thc_dvr_basis=None,
+        thc_grid_options=None,
+        thc_npt=128,
+        thc_solve_method="fit_metric_qr",
+        use_density_difference=True,
+        df_warmup_cycles=2,
+        max_cycle=30,
+        conv_tol=1e-10,
+        conv_tol_dm=1e-8,
+        diis=True,
+        diis_start_cycle=2,
+        diis_space=8,
+        damping=0.0,
+        level_shift=0.0,
+        q_block=256,
+        init_guess="auto",
+        init_fock_cycles=1,
+    )
+    assert thc_cfg.thc_mode == "global"
+    assert thc_cfg.thc_npt == 128
+    assert thc_cfg.init_guess == "auto"
+
+
+def test_scf_metadata_with_two_e_metadata_for_dataclass_and_fallback():
+    @dataclass(frozen=True)
+    class _R:
+        two_e_backend: str | None = None
+        direct_jk_ctx: object | None = None
+
+    out = with_two_e_metadata(_R(), two_e_backend="direct", direct_jk_ctx="ctx")
+    assert out.two_e_backend == "direct"
+    assert out.direct_jk_ctx == "ctx"
+
+    marker = object()
+    assert with_two_e_metadata(marker, two_e_backend="df") is marker
+
+
+def test_scf_xc_runtime_none_functional_fast_path():
+    out = resolve_xc_runtime(
+        functional=None,
+        mol=SimpleNamespace(cart=True),
+        sph_map=None,
+        grid_radial_n=75,
+        grid_angular_n=590,
+    )
+    assert out == (None, None, None, None)
 
 
 def test_scf_build_atom_and_element_helpers():
@@ -478,6 +571,101 @@ def test_scf_run_rhf_df_delegates_to_methods_impl(monkeypatch):
     assert captured["kwargs"]["init_fock_cycles_default"] == scf_mod._HF_INIT_FOCK_CYCLES
     assert captured["kwargs"]["resolve_cueri_df_config"] is scf_mod._resolve_cueri_df_config
     assert captured["kwargs"]["result_cls"] is scf_mod.RHFDFRunResult
+
+
+@pytest.mark.parametrize(
+    ("runner_name", "impl_attr", "result_cls_attr", "call_kwargs", "expected_attr_keys", "expect_init_default"),
+    [
+        (
+            "run_rhf_dense",
+            "_run_rhf_dense_impl",
+            "RHFDFRunResult",
+            {"basis": "sto-3g", "init_fock_cycles": 3},
+            ("atom_coords_charges_bohr_fn", "build_dense_ao_eri_fn", "apply_sph_transform_fn"),
+            True,
+        ),
+        (
+            "run_uhf_dense",
+            "_run_uhf_dense_impl",
+            "UHFDFRunResult",
+            {"basis": "sto-3g"},
+            (
+                "nalpha_nbeta_from_mol_fn",
+                "atom_coords_charges_bohr_fn",
+                "build_dense_ao_eri_fn",
+                "apply_sph_transform_fn",
+            ),
+            False,
+        ),
+        (
+            "run_rohf_dense",
+            "_run_rohf_dense_impl",
+            "ROHFDFRunResult",
+            {"basis": "sto-3g"},
+            (
+                "nalpha_nbeta_from_mol_fn",
+                "atom_coords_charges_bohr_fn",
+                "build_dense_ao_eri_fn",
+                "apply_sph_transform_fn",
+            ),
+            False,
+        ),
+        (
+            "run_rhf_direct",
+            "_run_rhf_direct_impl",
+            "RHFDFRunResult",
+            {"basis": "sto-3g", "init_fock_cycles": 2},
+            ("atom_coords_charges_bohr_fn",),
+            True,
+        ),
+        (
+            "run_uhf_direct",
+            "_run_uhf_direct_impl",
+            "UHFDFRunResult",
+            {"basis": "sto-3g"},
+            ("nalpha_nbeta_from_mol_fn", "atom_coords_charges_bohr_fn"),
+            False,
+        ),
+        (
+            "run_rohf_direct",
+            "_run_rohf_direct_impl",
+            "ROHFDFRunResult",
+            {"basis": "sto-3g"},
+            ("nalpha_nbeta_from_mol_fn", "atom_coords_charges_bohr_fn"),
+            False,
+        ),
+    ],
+)
+def test_scf_dense_and_direct_wrappers_delegate(
+    monkeypatch,
+    runner_name,
+    impl_attr,
+    result_cls_attr,
+    call_kwargs,
+    expected_attr_keys,
+    expect_init_default,
+):
+    captured = {}
+
+    def _fake_impl(mol, **kwargs):
+        captured["mol"] = mol
+        captured["kwargs"] = kwargs
+        return "ok"
+
+    monkeypatch.setattr(scf_mod, impl_attr, _fake_impl)
+    mol = SimpleNamespace()
+    out = getattr(scf_mod, runner_name)(mol, **call_kwargs)
+
+    assert out == "ok"
+    assert captured["mol"] is mol
+    assert captured["kwargs"]["basis"] == "sto-3g"
+    assert captured["kwargs"]["result_cls"] is getattr(scf_mod, result_cls_attr)
+
+    for key in expected_attr_keys:
+        assert callable(captured["kwargs"][key])
+
+    if expect_init_default:
+        assert captured["kwargs"]["init_fock_cycles_default"] == scf_mod._HF_INIT_FOCK_CYCLES
 
 
 def test_scf_methods_rhf_df_impl_cache_hit_df_config_and_guess_flow(monkeypatch):

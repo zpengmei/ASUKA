@@ -48,6 +48,140 @@ def _clone_molecule_with_coords(mol: Molecule, coords_bohr: np.ndarray) -> Molec
     return Molecule(atoms_bohr=atoms, charge=int(mol.charge), spin=int(mol.spin), basis=mol.basis, cart=bool(mol.cart))
 
 
+def _coerce_bool(value: Any, *, default: bool) -> bool:
+    if value is None:
+        return bool(default)
+    if isinstance(value, bool):
+        return bool(value)
+    sval = str(value).strip().lower()
+    if sval in {"1", "true", "yes", "on", "enable", "enabled"}:
+        return True
+    if sval in {"0", "false", "no", "off", "disable", "disabled"}:
+        return False
+    return bool(default)
+
+
+def _pop_orbital_tracking_controls(casscf_kwargs_use: dict[str, Any]) -> tuple[int, bool, bool]:
+    max_retry_raw = casscf_kwargs_use.pop("orbital_tracking_max_retry", 2)
+    try:
+        max_retry = max(0, int(max_retry_raw))
+    except Exception:
+        max_retry = 2
+    tracking_log = _coerce_bool(casscf_kwargs_use.pop("orbital_tracking_log", True), default=True)
+    raise_on_failure = _coerce_bool(casscf_kwargs_use.pop("orbital_tracking_raise_on_failure", True), default=True)
+    return int(max_retry), bool(tracking_log), bool(raise_on_failure)
+
+
+def _build_tracking_cross_overlap(prev_mol: Molecule, mol_eval: Molecule) -> np.ndarray:
+    from asuka.frontend.one_electron import build_ao_basis_cart  # noqa: PLC0415
+    from asuka.integrals.cross_geometry import build_S_cross  # noqa: PLC0415
+
+    basis_prev, _ = build_ao_basis_cart(prev_mol)
+    basis_new, _ = build_ao_basis_cart(mol_eval)
+
+    T_prev = None
+    T_new = None
+    if not bool(getattr(mol_eval, "cart", True)):
+        from asuka.integrals.cart2sph import build_cart2sph_matrix, compute_sph_layout_from_cart_basis  # noqa: PLC0415
+        from asuka.integrals.int1e_cart import nao_cart_from_basis  # noqa: PLC0415
+
+        sh0_sph_prev, nao_sph_prev = compute_sph_layout_from_cart_basis(basis_prev)
+        T_prev = build_cart2sph_matrix(
+            basis_prev.shell_l,
+            basis_prev.shell_ao_start,
+            sh0_sph_prev,
+            nao_cart_from_basis(basis_prev),
+            nao_sph_prev,
+        )
+        sh0_sph_new, nao_sph_new = compute_sph_layout_from_cart_basis(basis_new)
+        T_new = build_cart2sph_matrix(
+            basis_new.shell_l,
+            basis_new.shell_ao_start,
+            sh0_sph_new,
+            nao_cart_from_basis(basis_new),
+            nao_sph_new,
+        )
+    return build_S_cross(basis_prev, basis_new, T_bra=T_prev, T_ket=T_new)
+
+
+def _analyze_orbital_tracking(
+    *,
+    prev_mol: Molecule,
+    mol_eval: Molecule,
+    prev_casscf_mo_coeff: Any,
+    curr_mo_coeff: Any,
+    ncore: int,
+    ncas: int,
+    tracking_method: str,
+    S_cross: np.ndarray | None = None,
+) -> dict[str, Any]:
+    from asuka.mcscf.orbital_tracking import (  # noqa: PLC0415
+        align_orbital_phases,
+        assign_active_orbitals_by_overlap,
+        compute_mo_overlap,
+        reorder_mo_to_active_space,
+    )
+
+    prev_mo = np.asarray(_to_numpy(prev_casscf_mo_coeff), dtype=np.float64)
+    curr_mo = np.asarray(_to_numpy(curr_mo_coeff), dtype=np.float64)
+    ncore_i = int(ncore)
+    ncas_i = int(ncas)
+    prev_active_idx = list(range(ncore_i, ncore_i + ncas_i))
+    S_cross_use = _build_tracking_cross_overlap(prev_mol, mol_eval) if S_cross is None else np.asarray(S_cross, dtype=np.float64)
+    new_active_idx = np.asarray(
+        assign_active_orbitals_by_overlap(
+            prev_mo,
+            curr_mo,
+            S_cross_use,
+            prev_active_idx,
+            ncas_i,
+            method=str(tracking_method),
+        ),
+        dtype=np.int64,
+    )
+    O = compute_mo_overlap(prev_mo, curr_mo, S_cross_use)
+    current_window = np.asarray(prev_active_idx, dtype=np.int64)
+    match_block = np.asarray(O[np.ix_(current_window, new_active_idx)], dtype=np.float64)
+    current_window_block = np.asarray(O[np.ix_(current_window, current_window)], dtype=np.float64)
+    scores = np.sum(np.abs(O[current_window, :]) ** 2, axis=0)
+    top_count = int(min(scores.shape[0], max(4, ncas_i + 2)))
+    top_idx = np.argsort(-scores, kind="stable")[:top_count]
+    prepared_mo = reorder_mo_to_active_space(curr_mo, new_active_idx, ncore_i)
+    prepared_mo = align_orbital_phases(
+        prev_mo,
+        prepared_mo,
+        S_cross_use,
+        alignment_idx=range(ncore_i, ncore_i + ncas_i),
+    )
+    svals = np.linalg.svd(match_block, compute_uv=False)
+    return {
+        "S_cross": S_cross_use,
+        "prev_active_idx": prev_active_idx,
+        "new_active_idx": [int(x) for x in new_active_idx.tolist()],
+        "match_block": match_block,
+        "current_window_block": current_window_block,
+        "top_candidates": [(int(i), float(scores[i])) for i in top_idx],
+        "outside_count": int(len(set(int(x) for x in new_active_idx.tolist()) - set(prev_active_idx))),
+        "matched_expected": bool(np.array_equal(new_active_idx, current_window)),
+        "match_min_sval": float(np.min(svals)) if svals.size > 0 else 0.0,
+        "prepared_mo_coeff0": np.asarray(prepared_mo, dtype=np.float64),
+    }
+
+
+def _format_orbital_tracking_summary(info: Mapping[str, Any]) -> str:
+    top = ", ".join(f"{idx}:{score:.3f}" for idx, score in info["top_candidates"])
+    return (
+        f"expected={list(info['prev_active_idx'])} matched={list(info['new_active_idx'])} "
+        f"outside={int(info['outside_count'])} smin={float(info['match_min_sval']):.3f} "
+        f"top=[{top}]"
+    )
+
+
+def _print_orbital_tracking(message: str, *, enabled: bool) -> None:
+    if bool(enabled):
+        print(f"[orbital_tracking] {message}", flush=True)
+
+
 def make_df_casscf_energy_grad(
     mol: Molecule,
     *,
@@ -111,6 +245,7 @@ def make_df_casscf_energy_grad(
     hf_kwargs_use = dict(hf_kwargs or {})
     casscf_kwargs_use = dict(casscf_kwargs or {})
     grad_kwargs_use = dict(grad_kwargs or {})
+    tracking_retry_max, tracking_log, tracking_raise_on_failure = _pop_orbital_tracking_controls(casscf_kwargs_use)
 
     # Pick a reasonable HF flavor if not specified.
     if "method" not in hf_kwargs_use:
@@ -243,92 +378,86 @@ def make_df_casscf_energy_grad(
 
         scf_out = run_hf(mol_eval, **hf_call)
         tracked_mo_coeff0: np.ndarray | None = None
+        tracking_seed_info: dict[str, Any] | None = None
 
         # Orbital tracking: reorder SCF orbitals to match previous active space
         if bool(orbital_tracking) and bool(warm_start):
             if prev_mol is not None and prev_casscf_mo_coeff is not None:
                 if prev_ncore is not None and prev_ncas is not None:
-                    from asuka.frontend.one_electron import build_ao_basis_cart  # noqa: PLC0415
-                    from asuka.integrals.cross_geometry import build_S_cross  # noqa: PLC0415
-                    from asuka.mcscf.orbital_tracking import (  # noqa: PLC0415
-                        align_orbital_phases,
-                        assign_active_orbitals_by_overlap,
-                        reorder_mo_to_active_space,
+                    scf_mo_coeff = getattr(getattr(scf_out, "scf", None), "mo_coeff", None)
+                    tracking_seed_info = _analyze_orbital_tracking(
+                        prev_mol=prev_mol,
+                        mol_eval=mol_eval,
+                        prev_casscf_mo_coeff=prev_casscf_mo_coeff,
+                        curr_mo_coeff=scf_mo_coeff,
+                        ncore=int(prev_ncore),
+                        ncas=int(prev_ncas),
+                        tracking_method=str(tracking_method),
+                    )
+                    tracked_mo_coeff0 = np.asarray(tracking_seed_info["prepared_mo_coeff0"], dtype=np.float64)
+                    _print_orbital_tracking(
+                        f"scf guess {_format_orbital_tracking_summary(tracking_seed_info)}",
+                        enabled=tracking_log,
                     )
 
-                    # Build basis for both geometries
-                    basis_prev, _ = build_ao_basis_cart(prev_mol)
-                    basis_new, _ = build_ao_basis_cart(mol_eval)
-
-                    # Compute cross-geometry overlap (project to spherical AO space when cart=False).
-                    T_prev = None
-                    T_new = None
-                    if not bool(getattr(mol_eval, "cart", True)):
-                        from asuka.integrals.cart2sph import build_cart2sph_matrix, compute_sph_layout_from_cart_basis  # noqa: PLC0415
-                        from asuka.integrals.int1e_cart import nao_cart_from_basis  # noqa: PLC0415
-
-                        sh0_sph_prev, nao_sph_prev = compute_sph_layout_from_cart_basis(basis_prev)
-                        T_prev = build_cart2sph_matrix(
-                            basis_prev.shell_l,
-                            basis_prev.shell_ao_start,
-                            sh0_sph_prev,
-                            nao_cart_from_basis(basis_prev),
-                            nao_sph_prev,
-                        )
-                        sh0_sph_new, nao_sph_new = compute_sph_layout_from_cart_basis(basis_new)
-                        T_new = build_cart2sph_matrix(
-                            basis_new.shell_l,
-                            basis_new.shell_ao_start,
-                            sh0_sph_new,
-                            nao_cart_from_basis(basis_new),
-                            nao_sph_new,
-                        )
-                    S_cross = build_S_cross(basis_prev, basis_new, T_bra=T_prev, T_ket=T_new)
-
-                    # Get new SCF orbitals (handle CuPy arrays)
-                    scf_mo_coeff = np.asarray(
-                        _to_numpy(getattr(getattr(scf_out, "scf", None), "mo_coeff", None)),
-                        dtype=np.float64,
-                    )
-
-                    # Identify which new orbitals match previous active space
-                    prev_active_idx = list(range(prev_ncore, prev_ncore + prev_ncas))
-                    new_active_idx = assign_active_orbitals_by_overlap(
-                        prev_casscf_mo_coeff,
-                        scf_mo_coeff,
-                        S_cross,
-                        prev_active_idx,
-                        ncas,
-                        method=tracking_method,
-                    )
-
-                    # Reorder SCF orbitals to place matched orbitals in active space
-                    scf_mo_reordered = reorder_mo_to_active_space(
-                        scf_mo_coeff, new_active_idx, ncore
-                    )
-
-                    # Align phases for continuity
-                    scf_mo_aligned = align_orbital_phases(
-                        prev_casscf_mo_coeff,
-                        scf_mo_reordered,
-                        S_cross,
-                        alignment_idx=range(ncore, ncore + ncas),
-                    )
-
-                    # Use aligned orbitals directly as CASSCF initial guess.
-                    tracked_mo_coeff0 = np.asarray(scf_mo_aligned, dtype=np.float64)
-
-        casscf_call = dict(casscf_kwargs_use)
-        if bool(warm_start):
-            if "mo_coeff0" not in casscf_call:
+        tracking_enabled_now = bool(
+            orbital_tracking
+            and warm_start
+            and prev_mol is not None
+            and prev_casscf_mo_coeff is not None
+            and prev_ncore is not None
+            and prev_ncas is not None
+        )
+        retry_mo_coeff0 = tracked_mo_coeff0
+        mc = None
+        tracking_final_info: dict[str, Any] | None = None
+        max_attempts = 1 + (int(tracking_retry_max) if tracking_enabled_now else 0)
+        for attempt in range(max_attempts):
+            casscf_call = dict(casscf_kwargs_use)
+            if attempt > 0 and retry_mo_coeff0 is not None:
+                casscf_call["mo_coeff0"] = retry_mo_coeff0
+            elif bool(warm_start) and "mo_coeff0" not in casscf_call:
                 if tracked_mo_coeff0 is not None:
                     casscf_call["mo_coeff0"] = tracked_mo_coeff0
                 elif prev_casscf_mo_coeff is not None:
                     casscf_call["mo_coeff0"] = prev_casscf_mo_coeff
-            if "ci0" not in casscf_call and prev_ci is not None:
+            if bool(warm_start) and "ci0" not in casscf_call and prev_ci is not None:
                 casscf_call["ci0"] = prev_ci
 
-        mc = run_casscf(scf_out, **casscf_call)
+            mc = run_casscf(scf_out, **casscf_call)
+            if not tracking_enabled_now:
+                break
+            tracking_final_info = _analyze_orbital_tracking(
+                prev_mol=prev_mol,
+                mol_eval=mol_eval,
+                prev_casscf_mo_coeff=prev_casscf_mo_coeff,
+                curr_mo_coeff=getattr(mc, "mo_coeff", None),
+                ncore=int(prev_ncore),
+                ncas=int(prev_ncas),
+                tracking_method=str(tracking_method),
+                S_cross=tracking_seed_info["S_cross"] if tracking_seed_info is not None else None,
+            )
+            if bool(tracking_final_info["matched_expected"]):
+                _print_orbital_tracking(
+                    f"casscf attempt {attempt + 1} accepted {_format_orbital_tracking_summary(tracking_final_info)}",
+                    enabled=tracking_log,
+                )
+                break
+            retry_mo_coeff0 = np.asarray(tracking_final_info["prepared_mo_coeff0"], dtype=np.float64)
+            summary = _format_orbital_tracking_summary(tracking_final_info)
+            if attempt + 1 >= max_attempts:
+                _print_orbital_tracking(
+                    f"casscf attempt {attempt + 1} drifted after retries {summary}",
+                    enabled=True,
+                )
+                if bool(tracking_raise_on_failure):
+                    raise RuntimeError(f"orbital tracking failed after {attempt + 1} CASSCF attempt(s): {summary}")
+                break
+            _print_orbital_tracking(
+                f"casscf attempt {attempt + 1} drifted {summary}; retrying with reordered active orbitals ({attempt + 1}/{tracking_retry_max})",
+                enabled=True,
+            )
+        assert mc is not None
         g = casscf_nuc_grad_df(scf_out, mc, **grad_kwargs_use)
 
         if bool(save_intermediates):
@@ -501,6 +630,7 @@ def make_df_casscf_multiroot_energy_grad(
     hf_kwargs_use = dict(hf_kwargs or {})
     casscf_kwargs_use = dict(casscf_kwargs or {})
     grad_kwargs_use = dict(grad_kwargs or {})
+    tracking_retry_max, tracking_log, tracking_raise_on_failure = _pop_orbital_tracking_controls(casscf_kwargs_use)
 
     if "method" not in hf_kwargs_use:
         hf_kwargs_use["method"] = "rhf" if int(mol.spin) == 0 else "rohf"
@@ -613,83 +743,85 @@ def make_df_casscf_multiroot_energy_grad(
 
         scf_out = run_hf(mol_eval, **hf_call)
         tracked_mo_coeff0: np.ndarray | None = None
+        tracking_seed_info: dict[str, Any] | None = None
 
         if bool(orbital_tracking) and bool(warm_start):
             if prev_mol is not None and prev_casscf_mo_coeff is not None:
                 if prev_ncore is not None and prev_ncas is not None:
-                    from asuka.frontend.one_electron import build_ao_basis_cart  # noqa: PLC0415
-                    from asuka.integrals.cross_geometry import build_S_cross  # noqa: PLC0415
-                    from asuka.mcscf.orbital_tracking import (  # noqa: PLC0415
-                        align_orbital_phases,
-                        assign_active_orbitals_by_overlap,
-                        reorder_mo_to_active_space,
+                    scf_mo_coeff = getattr(getattr(scf_out, "scf", None), "mo_coeff", None)
+                    tracking_seed_info = _analyze_orbital_tracking(
+                        prev_mol=prev_mol,
+                        mol_eval=mol_eval,
+                        prev_casscf_mo_coeff=prev_casscf_mo_coeff,
+                        curr_mo_coeff=scf_mo_coeff,
+                        ncore=int(prev_ncore),
+                        ncas=int(prev_ncas),
+                        tracking_method=str(tracking_method),
+                    )
+                    tracked_mo_coeff0 = np.asarray(tracking_seed_info["prepared_mo_coeff0"], dtype=np.float64)
+                    _print_orbital_tracking(
+                        f"scf guess {_format_orbital_tracking_summary(tracking_seed_info)}",
+                        enabled=tracking_log,
                     )
 
-                    basis_prev, _ = build_ao_basis_cart(prev_mol)
-                    basis_new, _ = build_ao_basis_cart(mol_eval)
-
-                    # Compute cross-geometry overlap (project to spherical AO space when cart=False).
-                    T_prev = None
-                    T_new = None
-                    if not bool(getattr(mol_eval, "cart", True)):
-                        from asuka.integrals.cart2sph import build_cart2sph_matrix, compute_sph_layout_from_cart_basis  # noqa: PLC0415
-                        from asuka.integrals.int1e_cart import nao_cart_from_basis  # noqa: PLC0415
-
-                        sh0_sph_prev, nao_sph_prev = compute_sph_layout_from_cart_basis(basis_prev)
-                        T_prev = build_cart2sph_matrix(
-                            basis_prev.shell_l,
-                            basis_prev.shell_ao_start,
-                            sh0_sph_prev,
-                            nao_cart_from_basis(basis_prev),
-                            nao_sph_prev,
-                        )
-                        sh0_sph_new, nao_sph_new = compute_sph_layout_from_cart_basis(basis_new)
-                        T_new = build_cart2sph_matrix(
-                            basis_new.shell_l,
-                            basis_new.shell_ao_start,
-                            sh0_sph_new,
-                            nao_cart_from_basis(basis_new),
-                            nao_sph_new,
-                        )
-                    S_cross = build_S_cross(basis_prev, basis_new, T_bra=T_prev, T_ket=T_new)
-
-                    scf_mo_coeff = np.asarray(
-                        _to_numpy(getattr(getattr(scf_out, "scf", None), "mo_coeff", None)),
-                        dtype=np.float64,
-                    )
-
-                    prev_active_idx = list(range(prev_ncore, prev_ncore + prev_ncas))
-                    new_active_idx = assign_active_orbitals_by_overlap(
-                        prev_casscf_mo_coeff,
-                        scf_mo_coeff,
-                        S_cross,
-                        prev_active_idx,
-                        ncas,
-                        method=tracking_method,
-                    )
-
-                    scf_mo_reordered = reorder_mo_to_active_space(
-                        scf_mo_coeff, new_active_idx, ncore
-                    )
-                    scf_mo_aligned = align_orbital_phases(
-                        prev_casscf_mo_coeff,
-                        scf_mo_reordered,
-                        S_cross,
-                        alignment_idx=range(ncore, ncore + ncas),
-                    )
-                    tracked_mo_coeff0 = np.asarray(scf_mo_aligned, dtype=np.float64)
-
-        casscf_call = dict(casscf_kwargs_use)
-        if bool(warm_start):
-            if "mo_coeff0" not in casscf_call:
+        tracking_enabled_now = bool(
+            orbital_tracking
+            and warm_start
+            and prev_mol is not None
+            and prev_casscf_mo_coeff is not None
+            and prev_ncore is not None
+            and prev_ncas is not None
+        )
+        retry_mo_coeff0 = tracked_mo_coeff0
+        mc = None
+        tracking_final_info: dict[str, Any] | None = None
+        max_attempts = 1 + (int(tracking_retry_max) if tracking_enabled_now else 0)
+        for attempt in range(max_attempts):
+            casscf_call = dict(casscf_kwargs_use)
+            if attempt > 0 and retry_mo_coeff0 is not None:
+                casscf_call["mo_coeff0"] = retry_mo_coeff0
+            elif bool(warm_start) and "mo_coeff0" not in casscf_call:
                 if tracked_mo_coeff0 is not None:
                     casscf_call["mo_coeff0"] = tracked_mo_coeff0
                 elif prev_casscf_mo_coeff is not None:
                     casscf_call["mo_coeff0"] = prev_casscf_mo_coeff
-            if "ci0" not in casscf_call and prev_ci is not None:
+            if bool(warm_start) and "ci0" not in casscf_call and prev_ci is not None:
                 casscf_call["ci0"] = prev_ci
 
-        mc = run_casscf(scf_out, **casscf_call)
+            mc = run_casscf(scf_out, **casscf_call)
+            if not tracking_enabled_now:
+                break
+            tracking_final_info = _analyze_orbital_tracking(
+                prev_mol=prev_mol,
+                mol_eval=mol_eval,
+                prev_casscf_mo_coeff=prev_casscf_mo_coeff,
+                curr_mo_coeff=getattr(mc, "mo_coeff", None),
+                ncore=int(prev_ncore),
+                ncas=int(prev_ncas),
+                tracking_method=str(tracking_method),
+                S_cross=tracking_seed_info["S_cross"] if tracking_seed_info is not None else None,
+            )
+            if bool(tracking_final_info["matched_expected"]):
+                _print_orbital_tracking(
+                    f"casscf attempt {attempt + 1} accepted {_format_orbital_tracking_summary(tracking_final_info)}",
+                    enabled=tracking_log,
+                )
+                break
+            retry_mo_coeff0 = np.asarray(tracking_final_info["prepared_mo_coeff0"], dtype=np.float64)
+            summary = _format_orbital_tracking_summary(tracking_final_info)
+            if attempt + 1 >= max_attempts:
+                _print_orbital_tracking(
+                    f"casscf attempt {attempt + 1} drifted after retries {summary}",
+                    enabled=True,
+                )
+                if bool(tracking_raise_on_failure):
+                    raise RuntimeError(f"orbital tracking failed after {attempt + 1} CASSCF attempt(s): {summary}")
+                break
+            _print_orbital_tracking(
+                f"casscf attempt {attempt + 1} drifted {summary}; retrying with reordered active orbitals ({attempt + 1}/{tracking_retry_max})",
+                enabled=True,
+            )
+        assert mc is not None
         g = casscf_nuc_grad_df_per_root(scf_out, mc, **grad_kwargs_use)
 
         if bool(save_intermediates):

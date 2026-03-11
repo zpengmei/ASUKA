@@ -22,6 +22,8 @@ from asuka._solver.kernel_runtime import (
 from asuka._solver.kernel_cuda_runtime import (
     apply_low_precision_and_workspace_policy,
     auto_select_use_epq_table,
+    refresh_cuda_workspace_hamiltonian_inplace,
+    reset_cuda_graph_capture_buffers,
     resolve_epq_streaming_controls,
     resolve_cuda_workspace_policy_common,
     validate_low_precision_cuda_path,
@@ -1162,6 +1164,105 @@ def test_kernel_cuda_runtime_apply_low_precision_and_workspace_policy():
     assert out["threads_apply"] == 64
     assert out["max_g_mib"] <= 512.0
     assert out["cache_csr_tiles"] in (True, False)
+
+
+def test_kernel_cuda_runtime_reset_cuda_graph_capture_buffers():
+    ws = SimpleNamespace(_cuda_graph=object(), _cuda_graph_x=object(), _cuda_graph_y=object())
+    reset_cuda_graph_capture_buffers(ws=ws)
+    assert ws._cuda_graph is None
+    assert ws._cuda_graph_x is None
+    assert ws._cuda_graph_y is None
+
+
+def test_kernel_cuda_runtime_refresh_workspace_replaces_h_eff_and_invalidates_graph():
+    class _FakeCp:
+        @staticmethod
+        def asarray(a, dtype=None):
+            return np.asarray(a, dtype=dtype)
+
+        @staticmethod
+        def ascontiguousarray(a):
+            return np.ascontiguousarray(a)
+
+        @staticmethod
+        def copyto(dst, src):
+            np.copyto(dst, src)
+
+    ws = SimpleNamespace(
+        dtype=np.float64,
+        h_eff_flat=np.zeros((2,), dtype=np.float64),
+        _cuda_graph=object(),
+        _cuda_graph_x=object(),
+        _cuda_graph_y=object(),
+        _eri_mat_t=None,
+        include_diagonal_rs=True,
+        use_cuda_graph=True,
+        _as_h_eff_flat=lambda x: np.asarray(x, dtype=np.float64).ravel(),
+        _build_diag_g_cache=lambda: None,
+    )
+    out = refresh_cuda_workspace_hamiltonian_inplace(
+        cp=_FakeCp(),
+        ws=ws,
+        eri_mat_d=np.eye(3, dtype=np.float64),
+        l_full_d=None,
+        h_eff_d=np.arange(3, dtype=np.float64),
+        use_cuda_graph=True,
+        refresh_diag_cache_for_graph=True,
+    )
+    assert out["h_eff_replaced"] is True
+    assert out["graph_invalidated"] is True
+    assert out["diag_cache_refreshed"] is False
+    assert ws._cuda_graph is None
+    assert ws._cuda_graph_x is None
+    assert ws._cuda_graph_y is None
+    assert ws.use_cuda_graph is True
+
+
+def test_kernel_cuda_runtime_refresh_workspace_updates_in_place_and_rebuilds_diag_cache():
+    class _FakeCp:
+        @staticmethod
+        def asarray(a, dtype=None):
+            return np.asarray(a, dtype=dtype)
+
+        @staticmethod
+        def ascontiguousarray(a):
+            return np.ascontiguousarray(a)
+
+        @staticmethod
+        def copyto(dst, src):
+            np.copyto(dst, src)
+
+    diag_calls = {"n": 0}
+    eri_t = np.zeros((3, 3), dtype=np.float64)
+    ws = SimpleNamespace(
+        dtype=np.float64,
+        h_eff_flat=np.zeros((3,), dtype=np.float64),
+        _cuda_graph=object(),
+        _cuda_graph_x=object(),
+        _cuda_graph_y=object(),
+        _eri_mat_t=eri_t,
+        _eri_diag_t=np.ones((1,), dtype=np.float64),
+        include_diagonal_rs=True,
+        use_cuda_graph=True,
+        _as_h_eff_flat=lambda x: np.asarray(x, dtype=np.float64).ravel(),
+        _build_diag_g_cache=lambda: diag_calls.__setitem__("n", diag_calls["n"] + 1),
+    )
+    out = refresh_cuda_workspace_hamiltonian_inplace(
+        cp=_FakeCp(),
+        ws=ws,
+        eri_mat_d=np.eye(3, dtype=np.float64) * 2.0,
+        l_full_d=np.ones((9, 2), dtype=np.float64),
+        h_eff_d=np.arange(3, dtype=np.float64),
+        use_cuda_graph=True,
+        refresh_diag_cache_for_graph=True,
+    )
+    assert out["h_eff_replaced"] is False
+    assert out["graph_invalidated"] is False
+    assert out["diag_cache_refreshed"] is True
+    assert diag_calls["n"] == 1
+    assert np.allclose(ws._eri_mat_t, ws.eri_mat.T)
+    assert ws._eri_diag_t is None
+    assert ws.use_cuda_graph is True
 
 
 def test_init_runtime_defaults_env_override_and_normalization():

@@ -167,7 +167,6 @@ def _build_sorted_slab(
     cd_out = cp.where(swap, ab, cd)
     del ab, cd, swap
 
-    # --- Sort by class ID on GPU ---
     class_id_dev = sp_class_lo_dev[ab_out] | (sp_class_lo_dev[cd_out] << cp.int32(16))
     perm_dev = cp.argsort(class_id_dev, kind="stable")
     ab_sorted_dev = cp.ascontiguousarray(ab_out[perm_dev])
@@ -621,7 +620,7 @@ def make_direct_jk_context(
         if large_workload and int(max_l) <= 2:
             warp_eri_ncomp_max = 108
         elif large_workload:
-            warp_eri_ncomp_max = 0
+            warp_eri_ncomp_max = 128
         else:
             warp_eri_ncomp_max = 128
     else:
@@ -836,7 +835,7 @@ def direct_JK(
 
     # Density prescreening: compute max|D| per shell pair for CSAM screening
     eps_density_env = os.environ.get("ASUKA_DIRECT_JK_EPS_DENSITY", "")
-    eps_density = float(eps_density_env) if eps_density_env.strip() else ctx.eps_schwarz
+    eps_density = float(eps_density_env) if eps_density_env.strip() else max(ctx.eps_schwarz, 1e-10)
     Q_sp = getattr(ctx, "Q_sp", None)
     shell_l_dev = getattr(ctx, "shell_l_dev", None)
     D_sp_dev = None
@@ -1380,7 +1379,7 @@ def direct_fock_rhf(
 
     # Density prescreening (CSAM) for direct_fock_rhf
     eps_density_env = os.environ.get("ASUKA_DIRECT_JK_EPS_DENSITY", "")
-    eps_density = float(eps_density_env) if eps_density_env.strip() else ctx.eps_schwarz
+    eps_density = float(eps_density_env) if eps_density_env.strip() else max(ctx.eps_schwarz, 1e-10)
     Q_sp = getattr(ctx, "Q_sp", None)
     shell_l_dev = getattr(ctx, "shell_l_dev", None)
     D_sp_dev = None
