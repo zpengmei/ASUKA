@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from typing import Any
 
+import numpy as np
+
 from .cuda_policy import (
     cap_cuda_max_g_mib_by_hard_cap,
     cuda_budget_free_bytes,
@@ -320,4 +322,80 @@ def apply_low_precision_and_workspace_policy(
         "threads_apply": int(policy["threads_apply"]),
         "max_g_mib": float(policy["max_g_mib"]),
         "cache_csr_tiles": policy["cache_csr_tiles"],
+    }
+
+
+def reset_cuda_graph_capture_buffers(*, ws: Any) -> None:
+    """Drop cached CUDA Graph capture handles on a matvec workspace."""
+
+    setattr(ws, "_cuda_graph", None)
+    setattr(ws, "_cuda_graph_x", None)
+    setattr(ws, "_cuda_graph_y", None)
+
+
+def refresh_cuda_workspace_hamiltonian_inplace(
+    *,
+    cp: Any,
+    ws: Any,
+    eri_mat_d: Any,
+    l_full_d: Any,
+    h_eff_d: Any,
+    use_cuda_graph: bool,
+    refresh_diag_cache_for_graph: bool,
+) -> dict[str, bool]:
+    """Refresh a cached CUDA matvec workspace for a new Hamiltonian.
+
+    This keeps pointer-stable buffers where possible for CUDA Graph reuse and
+    invalidates graph capture handles only when buffer replacement is required.
+    """
+
+    graph_invalidated = False
+    h_eff_replaced = False
+    diag_cache_refreshed = False
+
+    ws_dtype_obj = np.dtype(getattr(ws, "dtype", np.float64))
+    ws.eri_mat = None if eri_mat_d is None else cp.ascontiguousarray(cp.asarray(eri_mat_d, dtype=ws_dtype_obj))
+    ws.l_full = None if l_full_d is None else cp.ascontiguousarray(cp.asarray(l_full_d, dtype=ws_dtype_obj))
+
+    h_eff_flat_new = ws._as_h_eff_flat(h_eff_d)
+    if getattr(ws, "h_eff_flat", None) is None or tuple(getattr(ws.h_eff_flat, "shape", ())) != tuple(
+        getattr(h_eff_flat_new, "shape", ())
+    ):
+        ws.h_eff_flat = h_eff_flat_new
+        h_eff_replaced = True
+        if getattr(ws, "_cuda_graph", None) is not None:
+            reset_cuda_graph_capture_buffers(ws=ws)
+            graph_invalidated = True
+    else:
+        cp.copyto(ws.h_eff_flat, h_eff_flat_new)
+
+    # Diagonal-rs contribution depends on `eri_diag_t` extracted from `eri_mat`.
+    ws._eri_diag_t = None
+
+    if eri_mat_d is not None:
+        if getattr(ws, "_eri_mat_t", None) is not None:
+            cp.copyto(ws._eri_mat_t, ws.eri_mat.T)
+        elif getattr(ws, "_cuda_graph", None) is not None:
+            reset_cuda_graph_capture_buffers(ws=ws)
+            graph_invalidated = True
+    else:
+        ws._eri_mat_t = None
+        if getattr(ws, "_cuda_graph", None) is not None:
+            reset_cuda_graph_capture_buffers(ws=ws)
+            graph_invalidated = True
+
+    if (
+        bool(refresh_diag_cache_for_graph)
+        and bool(use_cuda_graph)
+        and getattr(ws, "_cuda_graph", None) is not None
+        and bool(getattr(ws, "include_diagonal_rs", False))
+    ):
+        ws._build_diag_g_cache()
+        diag_cache_refreshed = True
+
+    ws.use_cuda_graph = bool(use_cuda_graph)
+    return {
+        "graph_invalidated": bool(graph_invalidated),
+        "h_eff_replaced": bool(h_eff_replaced),
+        "diag_cache_refreshed": bool(diag_cache_refreshed),
     }

@@ -118,6 +118,9 @@ class DirectJKContext:
     gpu_task_budget_bytes_used: int
     max_slab_tasks_used: int
     max_cpu_slab_ntasks: int
+    # Schwarz bounds and shell geometry for density prescreening
+    Q_sp: Any = None             # cp.ndarray float64 (nsp,) — Schwarz bounds per shell pair
+    shell_l_dev: Any = None      # cp.ndarray int32 (nshell,) — angular momentum per shell
 
 
 def _build_sorted_slab(
@@ -469,9 +472,10 @@ def make_direct_jk_context(
             max_tiles_bytes=int(max_tile_bytes),
         )
         Q_np = cp.asnumpy(Q_dev)
-        del Q_dev
+        Q_sp_dev = Q_dev  # keep for density prescreening
     else:
         Q_np = np.ones((nsp,), dtype=np.float64)
+        Q_sp_dev = None  # populated below when building context
 
     perm = np.argsort(-Q_np, kind="stable")
     Q_sorted = Q_np[perm]
@@ -712,7 +716,66 @@ def make_direct_jk_context(
         gpu_task_budget_bytes_used=int(gpu_task_budget_bytes_i),
         max_slab_tasks_used=int(max_slab_tasks_i),
         max_cpu_slab_ntasks=int(max_cpu_slab_ntasks),
+        Q_sp=Q_sp_dev if eps_f > 0.0 else cp.ones((nsp,), dtype=cp.float64),
+        shell_l_dev=cp.asarray(shell_l, dtype=cp.int32),
     )
+
+
+def _compute_D_sp_max(D_gpu, sp_A_dev, sp_B_dev, shell_ao_start_dev, shell_l_dev, nsp, cp):
+    """Compute max|D[μ,ν]| per shell pair on GPU.
+
+    For each shell pair (A, B), compute the maximum absolute density matrix
+    element over all AO pairs (μ ∈ A, ν ∈ B).  Returns a (nsp,) float64 array.
+    """
+    nao = D_gpu.shape[0]
+    # Build shell-pair → max|D| mapping via CuPy RawKernel
+    D_sp = cp.empty((nsp,), dtype=cp.float64)
+    if nsp == 0:
+        return D_sp
+    _kernel_code = r"""
+extern "C" __global__ void compute_D_sp_max(
+    const double* __restrict__ D,
+    const int* __restrict__ sp_A,
+    const int* __restrict__ sp_B,
+    const int* __restrict__ shell_ao_start,
+    const int* __restrict__ shell_l,
+    int nsp, int nao,
+    double* __restrict__ D_sp) {
+  int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx >= nsp) return;
+  int sA = sp_A[idx];
+  int sB = sp_B[idx];
+  int a0 = shell_ao_start[sA];
+  int b0 = shell_ao_start[sB];
+  int lA = shell_l[sA];
+  int lB = shell_l[sB];
+  int nA = (lA + 1) * (lA + 2) / 2;
+  int nB = (lB + 1) * (lB + 2) / 2;
+  double mx = 0.0;
+  for (int ia = 0; ia < nA; ia++) {
+    for (int ib = 0; ib < nB; ib++) {
+      double val = D[(a0 + ia) * nao + (b0 + ib)];
+      double abs_val = val < 0.0 ? -val : val;
+      if (abs_val > mx) mx = abs_val;
+      // Also check symmetric element for upper-triangle shell pairs
+      if (sA != sB) {
+        double val2 = D[(b0 + ib) * nao + (a0 + ia)];
+        double abs_val2 = val2 < 0.0 ? -val2 : val2;
+        if (abs_val2 > mx) mx = abs_val2;
+      }
+    }
+  }
+  D_sp[idx] = mx;
+}
+"""
+    _kern = cp.RawKernel(_kernel_code, "compute_D_sp_max")
+    threads = 256
+    blocks = (nsp + threads - 1) // threads
+    _kern((blocks,), (threads,), (
+        D_gpu, sp_A_dev, sp_B_dev, shell_ao_start_dev, shell_l_dev,
+        np.int32(nsp), np.int32(nao), D_sp,
+    ))
+    return D_sp
 
 
 def direct_JK(
@@ -770,6 +833,18 @@ def direct_JK(
 
     J_flat = cp.zeros((nao * nao,), dtype=cp.float64) if want_J else None
     K_flat = cp.zeros((nao * nao,), dtype=cp.float64) if want_K else None
+
+    # Density prescreening: compute max|D| per shell pair for CSAM screening
+    eps_density_env = os.environ.get("ASUKA_DIRECT_JK_EPS_DENSITY", "")
+    eps_density = float(eps_density_env) if eps_density_env.strip() else ctx.eps_schwarz
+    Q_sp = getattr(ctx, "Q_sp", None)
+    shell_l_dev = getattr(ctx, "shell_l_dev", None)
+    D_sp_dev = None
+    if Q_sp is not None and shell_l_dev is not None and eps_density > 0:
+        D_sp_dev = _compute_D_sp_max(
+            D_gpu, ctx.sp_A_dev, ctx.sp_B_dev, ctx.shell_ao_start_dev,
+            shell_l_dev, ctx.nsp, cp,
+        )
 
     compute_stream = cp.cuda.get_current_stream()
     stream_ptr = int(compute_stream.ptr)
@@ -1008,6 +1083,25 @@ def direct_JK(
             kernel_spCD_full = ab_dev[j0:j1] if transpose else cd_dev[j0:j1]
 
             class_ntasks = j1 - j0
+
+            # Density prescreening (CSAM): filter tasks where
+            # Q[ab] * Q[cd] * max(D_sp[ab], D_sp[cd]) < eps_density
+            if D_sp_dev is not None and Q_sp is not None and class_ntasks > 0:
+                _q_ab = Q_sp[kernel_spAB_full]
+                _q_cd = Q_sp[kernel_spCD_full]
+                _d_ab = D_sp_dev[kernel_spAB_full]
+                _d_cd = D_sp_dev[kernel_spCD_full]
+                _screen_val = _q_ab * _q_cd * cp.maximum(_d_ab, _d_cd)
+                _mask = _screen_val >= eps_density
+                n_survive = int(_mask.sum())
+                if n_survive < class_ntasks:
+                    if n_survive == 0:
+                        continue
+                    _idx = cp.nonzero(_mask)[0]
+                    kernel_spAB_full = kernel_spAB_full[_idx]
+                    kernel_spCD_full = kernel_spCD_full[_idx]
+                    class_ntasks = n_survive
+
             fused_fn = None
             if klabel in fused_enabled:
                 if klabel == "ssss":
@@ -1284,6 +1378,18 @@ def direct_fock_rhf(
         raise ValueError(f"hcore must be ({nao}, {nao}), got {tuple(h_gpu.shape)}")
     F_flat = cp.ascontiguousarray(h_gpu.ravel()).copy()
 
+    # Density prescreening (CSAM) for direct_fock_rhf
+    eps_density_env = os.environ.get("ASUKA_DIRECT_JK_EPS_DENSITY", "")
+    eps_density = float(eps_density_env) if eps_density_env.strip() else ctx.eps_schwarz
+    Q_sp = getattr(ctx, "Q_sp", None)
+    shell_l_dev = getattr(ctx, "shell_l_dev", None)
+    D_sp_dev = None
+    if Q_sp is not None and shell_l_dev is not None and eps_density > 0:
+        D_sp_dev = _compute_D_sp_max(
+            D_gpu, ctx.sp_A_dev, ctx.sp_B_dev, ctx.shell_ao_start_dev,
+            shell_l_dev, ctx.nsp, cp,
+        )
+
     compute_stream = cp.cuda.get_current_stream()
     stream_ptr = int(compute_stream.ptr)
     ws = _get_direct_jk_workspace(cp, ctx)
@@ -1460,10 +1566,47 @@ def direct_fock_rhf(
                 cd_dev = ws.upload_cd[int(cur_buf)][:nt]
                 used_buf = int(cur_buf)
 
+        # --- Bulk density prescreening for direct_fock_rhf ---
+        slab_offsets_adj = None
+        slab_ntasks_eff = int(slab.ntasks)
+        if D_sp_dev is not None and Q_sp is not None and slab_ntasks_eff > 0:
+            _ab_slab = ab_dev[:slab_ntasks_eff]
+            _cd_slab = cd_dev[:slab_ntasks_eff]
+            _screen_all = Q_sp[_ab_slab] * Q_sp[_cd_slab] * cp.maximum(D_sp_dev[_ab_slab], D_sp_dev[_cd_slab])
+            _mask_all = _screen_all >= eps_density
+            n_survive_total = int(_mask_all.sum())
+            if n_survive_total < slab_ntasks_eff:
+                if n_survive_total == 0:
+                    if used_buf is not None and ws is not None:
+                        ws.compute_done[int(used_buf)].record(compute_stream)
+                        buf_slab[int(used_buf)] = None
+                    continue
+                _idx_all = cp.nonzero(_mask_all)[0]
+                ab_dev = ab_dev[_idx_all]
+                cd_dev = cd_dev[_idx_all]
+                # Recompute per-group offsets on GPU (only transfer ~N_groups values).
+                old_offsets = slab.offsets
+                _cumsum_dev = cp.cumsum(_mask_all)
+                _odev = cp.asarray(old_offsets, dtype=cp.int64)
+                # cumsum[end-1] gives count of surviving tasks up to group boundary.
+                # Clamp indices to 0 to handle empty leading groups (offset==0).
+                _boundary_idx = cp.maximum(_odev[1:] - 1, 0)  # (n_groups-1,)
+                _boundary_vals = _cumsum_dev[_boundary_idx]
+                # Where original offset was 0, the new offset must also be 0.
+                _boundary_vals[_odev[1:] == 0] = 0
+                slab_offsets_adj = np.empty(len(old_offsets), dtype=np.int64)
+                slab_offsets_adj[0] = 0
+                slab_offsets_adj[1:] = cp.asnumpy(_boundary_vals)
+                del _cumsum_dev, _odev, _boundary_idx, _boundary_vals
+
         slab_plan = ctx.plans[slab_i]
-        for gp in slab_plan:
+        for gpi, gp in enumerate(slab_plan):
             orig_cid = int(gp.orig_cid)
-            j0, j1 = int(gp.j0), int(gp.j1)
+            if slab_offsets_adj is not None:
+                j0 = int(slab_offsets_adj[gpi])
+                j1 = int(slab_offsets_adj[gpi + 1])
+            else:
+                j0, j1 = int(gp.j0), int(gp.j1)
             if j1 <= j0:
                 continue
 
@@ -1481,6 +1624,7 @@ def direct_fock_rhf(
             kernel_spCD_full = ab_dev[j0:j1] if transpose else cd_dev[j0:j1]
 
             class_ntasks = j1 - j0
+
             klabel = _class_label(kernel_cid).lower()
             fused_fn = None
             use_fused = False

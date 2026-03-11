@@ -95,6 +95,12 @@ asuka = [
   "cuda/linalg_ext/CMakeLists.txt",
   "cuda/linalg_ext/src/*.cu",
   "cuda/linalg_ext/src/*.cpp",
+  # Orbitals CUDA extension sources
+  "orbitals/cuda_ext/CMakeLists.txt",
+  "orbitals/cuda_ext/src/*.cu",
+  "orbitals/cuda_ext/src/*.cpp",
+  "orbitals/cuda_ext/src/*.h",
+  "orbitals/cuda_ext/src/*.cuh",
   # cuERI CUDA extension sources (vendored under asuka.cueri)
   "cueri/cuda/ext/CMakeLists.txt",
   "cueri/cuda/ext/src/*.cu",

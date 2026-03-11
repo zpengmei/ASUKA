@@ -59,7 +59,7 @@ python -m asuka.build.guga_cuda_linalg_ext
 | `hf_df_jk_cuda_ext.py` | CMake/pybind11 build helper for `asuka.hf.cuda._hf_df_jk_cuda_ext` |
 | `hf_thc_cuda_ext.py` | CMake/pybind11 build helper for `asuka.hf.thc.cuda._hf_thc_cuda_ext` |
 | `caspt2_cuda_ext.py` | CMake/pybind11 build helper for `asuka.caspt2.cuda._caspt2_cuda_ext` |
-| `orbitals_cuda_ext.py` | CMake/pybind11 build helper for `asuka.orbitals._orbitals_cuda_ext` |
+| `orbitals_cuda_ext.py` | CMake/pybind11 build helper for `asuka._orbitals_cuda_ext` |
 
 ## Notes
 

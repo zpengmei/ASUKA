@@ -8415,7 +8415,10 @@ class GugaMatvecEriMatWorkspace:
 
     def _initial_csr_capacity(self) -> int:
         ntasks = int(self.j_tile) * int(self._rs_n_pairs)
-        return int(max(1.0, float(self.csr_capacity_mult)) * float(ntasks))
+        # Tiny active spaces can yield zero implicit (r,s) tasks. Keep capacity
+        # at least 1 so workspace allocation remains valid and downstream kernels
+        # can operate on empty views.
+        return max(1, int(max(1.0, float(self.csr_capacity_mult)) * float(ntasks)))
 
     def _ensure_kernel25_workspace(self, *, max_nnz_in: int | None = None) -> None:
         if _ext is None or not hasattr(_ext, "Kernel25Workspace"):

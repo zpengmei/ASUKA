@@ -581,7 +581,8 @@ __global__ void KernelFused_psss_warp(
     int nao,
     const double* D_mat,
     double* out0_mat,
-    double* out1_mat) {
+    double* out1_mat,
+    int n_bufs) {
   constexpr int nA = 3, nB = 1, nC = 1, nD = 1;
   constexpr int nAB = nA * nB;
   constexpr int nCD = nC * nD;
@@ -593,6 +594,7 @@ __global__ void KernelFused_psss_warp(
   const int warps_per_block = static_cast<int>(blockDim.x) >> 5;
   const int t = static_cast<int>(blockIdx.x) * warps_per_block + warp_id;
   if (t >= ntasks) return;
+  const int buf_id = static_cast<int>(blockIdx.x) % n_bufs;
 
   double* tile = sh_tile + static_cast<int64_t>(warp_id) * static_cast<int64_t>(kNComp);
 
@@ -678,13 +680,13 @@ __global__ void KernelFused_psss_warp(
         tile, D_mat, out0_mat, lane,
         nAB, nCD, nA, nB, nC, nD,
         a0, b0, c0, d0,
-        ab_neq, cd_neq, bk_swap, f_ab, f_cd, N);
+        ab_neq, cd_neq, bk_swap, f_ab, f_cd, N, n_bufs, buf_id);
   } else {
     cueri_contract_jk_warp_single(
         tile, D_mat, out0_mat, out1_mat, lane,
         nAB, nCD, nA, nB, nC, nD,
         a0, b0, c0, d0,
-        ab_neq, cd_neq, bk_swap, f_ab, f_cd, N);
+        ab_neq, cd_neq, bk_swap, f_ab, f_cd, N, n_bufs, buf_id);
   }
 }
 
@@ -708,7 +710,8 @@ __global__ void KernelFusedJK_psss_warp(
     int nao,
     const double* D_mat,
     double* J_mat,
-    double* K_mat) {
+    double* K_mat,
+    int n_bufs) {
   constexpr int nA = 3, nB = 1, nC = 1, nD = 1;
   constexpr int nAB = nA * nB;
   constexpr int nCD = nC * nD;
@@ -720,6 +723,7 @@ __global__ void KernelFusedJK_psss_warp(
   const int warps_per_block = static_cast<int>(blockDim.x) >> 5;
   const int t = static_cast<int>(blockIdx.x) * warps_per_block + warp_id;
   if (t >= ntasks) return;
+  const int buf_id = static_cast<int>(blockIdx.x) % n_bufs;
 
   double* tile = sh_tile + static_cast<int64_t>(warp_id) * static_cast<int64_t>(kNComp);
 
@@ -804,7 +808,7 @@ __global__ void KernelFusedJK_psss_warp(
       tile, D_mat, J_mat, K_mat, lane,
       nAB, nCD, nA, nB, nC, nD,
       a0, b0, c0, d0,
-      ab_neq, cd_neq, bk_swap, f_ab, f_cd, N);
+      ab_neq, cd_neq, bk_swap, f_ab, f_cd, N, n_bufs, buf_id);
 }
 
 template <bool kToFock>
@@ -828,7 +832,8 @@ __global__ void KernelFused_dsss_warp(
     int nao,
     const double* D_mat,
     double* out0_mat,
-    double* out1_mat) {
+    double* out1_mat,
+    int n_bufs) {
   constexpr int nA = 6, nB = 1, nC = 1, nD = 1;
   constexpr int nAB = nA * nB;
   constexpr int nCD = nC * nD;
@@ -840,6 +845,7 @@ __global__ void KernelFused_dsss_warp(
   const int warps_per_block = static_cast<int>(blockDim.x) >> 5;
   const int t = static_cast<int>(blockIdx.x) * warps_per_block + warp_id;
   if (t >= ntasks) return;
+  const int buf_id = static_cast<int>(blockIdx.x) % n_bufs;
 
   double* tile = sh_tile + static_cast<int64_t>(warp_id) * static_cast<int64_t>(kNComp);
 
@@ -960,13 +966,13 @@ __global__ void KernelFused_dsss_warp(
         tile, D_mat, out0_mat, lane,
         nAB, nCD, nA, nB, nC, nD,
         a0, b0, c0, d0,
-        ab_neq, cd_neq, bk_swap, f_ab, f_cd, N);
+        ab_neq, cd_neq, bk_swap, f_ab, f_cd, N, n_bufs, buf_id);
   } else {
     cueri_contract_jk_warp_single(
         tile, D_mat, out0_mat, out1_mat, lane,
         nAB, nCD, nA, nB, nC, nD,
         a0, b0, c0, d0,
-        ab_neq, cd_neq, bk_swap, f_ab, f_cd, N);
+        ab_neq, cd_neq, bk_swap, f_ab, f_cd, N, n_bufs, buf_id);
   }
   (void)sp_B;
 }
@@ -991,7 +997,8 @@ __global__ void KernelFusedJK_dsss_warp(
     int nao,
     const double* D_mat,
     double* J_mat,
-    double* K_mat) {
+    double* K_mat,
+    int n_bufs) {
   constexpr int nA = 6, nB = 1, nC = 1, nD = 1;
   constexpr int nAB = nA * nB;
   constexpr int nCD = nC * nD;
@@ -1003,6 +1010,7 @@ __global__ void KernelFusedJK_dsss_warp(
   const int warps_per_block = static_cast<int>(blockDim.x) >> 5;
   const int t = static_cast<int>(blockIdx.x) * warps_per_block + warp_id;
   if (t >= ntasks) return;
+  const int buf_id = static_cast<int>(blockIdx.x) % n_bufs;
 
   double* tile = sh_tile + static_cast<int64_t>(warp_id) * static_cast<int64_t>(kNComp);
 
@@ -1122,7 +1130,7 @@ __global__ void KernelFusedJK_dsss_warp(
       tile, D_mat, J_mat, K_mat, lane,
       nAB, nCD, nA, nB, nC, nD,
       a0, b0, c0, d0,
-      ab_neq, cd_neq, bk_swap, f_ab, f_cd, N);
+      ab_neq, cd_neq, bk_swap, f_ab, f_cd, N, n_bufs, buf_id);
   (void)sp_B;
 }
 
@@ -1147,7 +1155,8 @@ __global__ void KernelFused_ppss_warp(
     int nao,
     const double* D_mat,
     double* out0_mat,
-    double* out1_mat) {
+    double* out1_mat,
+    int n_bufs) {
   constexpr int nA = 3, nB = 3, nC = 1, nD = 1;
   constexpr int nAB = nA * nB;
   constexpr int nCD = nC * nD;
@@ -1159,6 +1168,7 @@ __global__ void KernelFused_ppss_warp(
   const int warps_per_block = static_cast<int>(blockDim.x) >> 5;
   const int t = static_cast<int>(blockIdx.x) * warps_per_block + warp_id;
   if (t >= ntasks) return;
+  const int buf_id = static_cast<int>(blockIdx.x) % n_bufs;
 
   double* tile = sh_tile + static_cast<int64_t>(warp_id) * static_cast<int64_t>(kNComp);
 
@@ -1307,13 +1317,13 @@ __global__ void KernelFused_ppss_warp(
         tile, D_mat, out0_mat, lane,
         nAB, nCD, nA, nB, nC, nD,
         a0, b0, c0, d0,
-        ab_neq, cd_neq, bk_swap, f_ab, f_cd, N);
+        ab_neq, cd_neq, bk_swap, f_ab, f_cd, N, n_bufs, buf_id);
   } else {
     cueri_contract_jk_warp_single(
         tile, D_mat, out0_mat, out1_mat, lane,
         nAB, nCD, nA, nB, nC, nD,
         a0, b0, c0, d0,
-        ab_neq, cd_neq, bk_swap, f_ab, f_cd, N);
+        ab_neq, cd_neq, bk_swap, f_ab, f_cd, N, n_bufs, buf_id);
   }
 }
 
@@ -1337,7 +1347,8 @@ __global__ void KernelFusedJK_ppss_warp(
     int nao,
     const double* D_mat,
     double* J_mat,
-    double* K_mat) {
+    double* K_mat,
+    int n_bufs) {
   constexpr int nA = 3, nB = 3, nC = 1, nD = 1;
   constexpr int nAB = nA * nB;
   constexpr int nCD = nC * nD;
@@ -1349,6 +1360,7 @@ __global__ void KernelFusedJK_ppss_warp(
   const int warps_per_block = static_cast<int>(blockDim.x) >> 5;
   const int t = static_cast<int>(blockIdx.x) * warps_per_block + warp_id;
   if (t >= ntasks) return;
+  const int buf_id = static_cast<int>(blockIdx.x) % n_bufs;
 
   double* tile = sh_tile + static_cast<int64_t>(warp_id) * static_cast<int64_t>(kNComp);
 
@@ -1496,7 +1508,7 @@ __global__ void KernelFusedJK_ppss_warp(
       tile, D_mat, J_mat, K_mat, lane,
       nAB, nCD, nA, nB, nC, nD,
       a0, b0, c0, d0,
-      ab_neq, cd_neq, bk_swap, f_ab, f_cd, N);
+      ab_neq, cd_neq, bk_swap, f_ab, f_cd, N, n_bufs, buf_id);
 }
 
 }  // namespace
@@ -1536,7 +1548,7 @@ extern "C" cudaError_t cueri_fused_fock_psss_launch_stream(
       sp_A, sp_B, sp_pair_start, sp_npair,
       shell_cx, shell_cy, shell_cz,
       pair_eta, pair_Px, pair_Py, pair_Pz, pair_cK,
-      shell_ao_start, nao, D_mat, F_mat, nullptr);
+      shell_ao_start, nao, D_mat, F_mat, nullptr, n_bufs);
   return cudaGetLastError();
 }
 
@@ -1576,7 +1588,7 @@ extern "C" cudaError_t cueri_fused_jk_psss_launch_stream(
       sp_A, sp_B, sp_pair_start, sp_npair,
       shell_cx, shell_cy, shell_cz,
       pair_eta, pair_Px, pair_Py, pair_Pz, pair_cK,
-      shell_ao_start, nao, D_mat, J_mat, K_mat);
+      shell_ao_start, nao, D_mat, J_mat, K_mat, n_bufs);
   return cudaGetLastError();
 }
 
@@ -1615,7 +1627,7 @@ extern "C" cudaError_t cueri_fused_fock_dsss_launch_stream(
       sp_A, sp_B, sp_pair_start, sp_npair,
       shell_cx, shell_cy, shell_cz,
       pair_eta, pair_Px, pair_Py, pair_Pz, pair_cK,
-      shell_ao_start, nao, D_mat, F_mat, nullptr);
+      shell_ao_start, nao, D_mat, F_mat, nullptr, n_bufs);
   return cudaGetLastError();
 }
 
@@ -1655,7 +1667,7 @@ extern "C" cudaError_t cueri_fused_jk_dsss_launch_stream(
       sp_A, sp_B, sp_pair_start, sp_npair,
       shell_cx, shell_cy, shell_cz,
       pair_eta, pair_Px, pair_Py, pair_Pz, pair_cK,
-      shell_ao_start, nao, D_mat, J_mat, K_mat);
+      shell_ao_start, nao, D_mat, J_mat, K_mat, n_bufs);
   return cudaGetLastError();
 }
 
@@ -1694,7 +1706,7 @@ extern "C" cudaError_t cueri_fused_fock_ppss_launch_stream(
       sp_A, sp_B, sp_pair_start, sp_npair,
       shell_cx, shell_cy, shell_cz,
       pair_eta, pair_Px, pair_Py, pair_Pz, pair_cK,
-      shell_ao_start, nao, D_mat, F_mat, nullptr);
+      shell_ao_start, nao, D_mat, F_mat, nullptr, n_bufs);
   return cudaGetLastError();
 }
 
@@ -1734,7 +1746,7 @@ extern "C" cudaError_t cueri_fused_jk_ppss_launch_stream(
       sp_A, sp_B, sp_pair_start, sp_npair,
       shell_cx, shell_cy, shell_cz,
       pair_eta, pair_Px, pair_Py, pair_Pz, pair_cK,
-      shell_ao_start, nao, D_mat, J_mat, K_mat);
+      shell_ao_start, nao, D_mat, J_mat, K_mat, n_bufs);
   return cudaGetLastError();
 }
 

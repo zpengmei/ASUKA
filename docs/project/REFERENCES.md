@@ -38,6 +38,17 @@ theory references used in ASUKA.
 
 ## Theory References Used in ASUKA Modules
 
+- Becke, A. D. A multicenter numerical integration scheme for polyatomic molecules.
+  *J. Chem. Phys.* **88** (1988) 2547–2553. DOI: `10.1063/1.454033`.
+- Lebedev, V. I. Quadratures on a sphere.
+  *USSR Comput. Math. Math. Phys.* **16** (1976) 10–24.
+
+- Grimme, S.; Antony, J.; Ehrlich, S.; Krieg, H. A consistent and accurate *ab initio*
+  parametrization of density functional dispersion correction (DFT-D) for the 94 elements H–Pu.
+  *J. Chem. Phys.* **132** (2010) 154104. DOI: `10.1063/1.3382344`.
+- Grimme, S.; Ehrlich, S.; Goerigk, L. Effect of the damping function in dispersion corrected density functional theory.
+  *J. Comput. Chem.* **32** (2011) 1456–1465. DOI: `10.1002/jcc.21759`.
+
 - Dobrautz, W.; Smart, S. D.; Alavi, A. GUGA-FCIQMC spin-eigenbasis formulation.
   *J. Chem. Phys.* **151** (2019) 094104. DOI: `10.1063/1.5108908`.
 - Dobrautz, W. *Development of Full Configuration Interaction Quantum Monte Carlo in a Spin Eigenbasis*.

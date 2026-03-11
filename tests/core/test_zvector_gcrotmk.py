@@ -89,6 +89,10 @@ def test_gcrotmk_xp_cupy_converges_and_recycles():
         _ = cp.zeros((1,), dtype=cp.float64)
     except Exception:
         pytest.skip("CuPy is present but a CUDA device is unavailable")
+    try:
+        _ = cp.asarray([[1.0]], dtype=cp.float64) @ cp.asarray([[1.0]], dtype=cp.float64)
+    except Exception:
+        pytest.skip("CuPy CUDA BLAS is unavailable (missing cuBLAS runtime)")
 
     a_np, b_np = _random_system(34, seed=31)
     a_cp = cp.asarray(a_np, dtype=cp.float64)
@@ -129,6 +133,10 @@ def test_solve_mcscf_zvector_gcrotmk_gpu_dispatch():
         _ = cp.zeros((1,), dtype=cp.float64)
     except Exception:
         pytest.skip("CuPy is present but a CUDA device is unavailable")
+    try:
+        _ = cp.asarray([[1.0]], dtype=cp.float64) @ cp.asarray([[1.0]], dtype=cp.float64)
+    except Exception:
+        pytest.skip("CuPy CUDA BLAS is unavailable (missing cuBLAS runtime)")
 
     from asuka.mcscf.zvector import MCSCFHessianOp, solve_mcscf_zvector
 

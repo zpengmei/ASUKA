@@ -68,6 +68,8 @@ from .kernel_runtime import (
 from .kernel_cuda_runtime import (
     apply_low_precision_and_workspace_policy,
     auto_select_use_epq_table,
+    refresh_cuda_workspace_hamiltonian_inplace,
+    reset_cuda_graph_capture_buffers,
     resolve_epq_streaming_controls,
     resolve_cuda_workspace_policy_common,
     validate_low_precision_cuda_path,
@@ -160,6 +162,8 @@ __all__ = [
     "run_kernel_dense_eigh_fastpath",
     "apply_low_precision_and_workspace_policy",
     "auto_select_use_epq_table",
+    "refresh_cuda_workspace_hamiltonian_inplace",
+    "reset_cuda_graph_capture_buffers",
     "resolve_epq_streaming_controls",
     "resolve_cuda_workspace_policy_common",
     "validate_low_precision_cuda_path",

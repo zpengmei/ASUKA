@@ -108,6 +108,7 @@ from asuka._solver.kernel_runtime import (
 from asuka._solver.kernel_cuda_runtime import (
     apply_low_precision_and_workspace_policy as _apply_low_precision_and_workspace_policy_runtime,
     auto_select_use_epq_table as _auto_select_use_epq_table_runtime,
+    refresh_cuda_workspace_hamiltonian_inplace as _refresh_cuda_workspace_hamiltonian_inplace_runtime,
     resolve_epq_streaming_controls as _resolve_epq_streaming_controls_runtime,
 )
 from asuka._solver.matvec_cache_runtime import (
@@ -1792,52 +1793,21 @@ class GUGAFCISolver(_StreamObject):
             else:
                 if kprof is not None:
                     kprof["matvec_cuda_ws_reused"] = True
-                ws_dtype_obj = np.dtype(getattr(cuda_ws, "dtype", np.float64))
-                cuda_ws.eri_mat = None if eri_mat_d is None else cp.ascontiguousarray(cp.asarray(eri_mat_d, dtype=ws_dtype_obj))
-                cuda_ws.l_full = None if l_full_d is None else cp.ascontiguousarray(cp.asarray(l_full_d, dtype=ws_dtype_obj))
-                h_eff_flat_new = cuda_ws._as_h_eff_flat(h_eff_d)
-                if getattr(cuda_ws, "h_eff_flat", None) is None or tuple(getattr(cuda_ws.h_eff_flat, "shape", ())) != tuple(
-                    getattr(h_eff_flat_new, "shape", ())
-                ):
-                    cuda_ws.h_eff_flat = h_eff_flat_new
-                    if getattr(cuda_ws, "_cuda_graph", None) is not None:
-                        # Graph capture pointers depend on stable `h_eff_flat`; fall back to
-                        # re-capturing if the buffer had to be replaced.
-                        cuda_ws._cuda_graph = None
-                        cuda_ws._cuda_graph_x = None
-                        cuda_ws._cuda_graph_y = None
-                else:
-                    cp.copyto(cuda_ws.h_eff_flat, h_eff_flat_new)
-
-                # Diagonal-rs contribution depends on `eri_diag_t` extracted from `eri_mat`.
-                # Invalidate it whenever the Hamiltonian changes.
-                cuda_ws._eri_diag_t = None
-
-                # Keep `eri_mat_t` pointer-stable for CUDA Graph reuse.
-                if eri_mat_d is not None:
-                    if getattr(cuda_ws, "_eri_mat_t", None) is not None:
-                        cp.copyto(cuda_ws._eri_mat_t, cuda_ws.eri_mat.T)
-                    elif getattr(cuda_ws, "_cuda_graph", None) is not None:
-                        cuda_ws._cuda_graph = None
-                        cuda_ws._cuda_graph_x = None
-                        cuda_ws._cuda_graph_y = None
-                else:
-                    cuda_ws._eri_mat_t = None
-                    if getattr(cuda_ws, "_cuda_graph", None) is not None:
-                        cuda_ws._cuda_graph = None
-                        cuda_ws._cuda_graph_x = None
-                        cuda_ws._cuda_graph_y = None
-
-                # If a CUDA Graph exists, its diagonal-rs contribution uses cached g_diag buffers.
-                # Refresh them in place when the Hamiltonian changes.
-                if (
-                    bool(matvec_cuda_use_graph)
-                    and getattr(cuda_ws, "_cuda_graph", None) is not None
-                    and bool(getattr(cuda_ws, "include_diagonal_rs", False))
-                ):
-                    cuda_ws._build_diag_g_cache()
-
-                cuda_ws.use_cuda_graph = bool(matvec_cuda_use_graph)
+                _refresh_main = _refresh_cuda_workspace_hamiltonian_inplace_runtime(
+                    cp=cp,
+                    ws=cuda_ws,
+                    eri_mat_d=eri_mat_d,
+                    l_full_d=l_full_d,
+                    h_eff_d=h_eff_d,
+                    use_cuda_graph=bool(matvec_cuda_use_graph),
+                    refresh_diag_cache_for_graph=True,
+                )
+                if kprof is not None:
+                    kprof["matvec_cuda_ws_refresh_h_eff_replaced"] = bool(_refresh_main["h_eff_replaced"])
+                    kprof["matvec_cuda_ws_refresh_graph_invalidated"] = bool(_refresh_main["graph_invalidated"])
+                    kprof["matvec_cuda_ws_refresh_diag_cache_refreshed"] = bool(
+                        _refresh_main["diag_cache_refreshed"]
+                    )
             if kprof is not None:
                 kprof["matvec_cuda_use_epq_table_effective"] = bool(getattr(cuda_ws, "use_epq_table", False))
                 kprof["matvec_cuda_epq_streaming_effective"] = bool(getattr(cuda_ws, "epq_streaming", False))
@@ -2006,22 +1976,17 @@ class GUGAFCISolver(_StreamObject):
                 else:
                     if kprof is not None:
                         kprof["matvec_cuda_ws_low_reused"] = True
-                    ws_dtype_obj_low = np.dtype(getattr(cuda_ws_low, "dtype", np.float32))
-                    cuda_ws_low.eri_mat = None if eri_mat_d is None else cp.ascontiguousarray(cp.asarray(eri_mat_d, dtype=ws_dtype_obj_low))
-                    cuda_ws_low.l_full = None if l_full_d is None else cp.ascontiguousarray(cp.asarray(l_full_d, dtype=ws_dtype_obj_low))
-                    h_eff_flat_new_low = cuda_ws_low._as_h_eff_flat(h_eff_d)
-                    if getattr(cuda_ws_low, "h_eff_flat", None) is None or tuple(getattr(cuda_ws_low.h_eff_flat, "shape", ())) != tuple(
-                        getattr(h_eff_flat_new_low, "shape", ())
-                    ):
-                        cuda_ws_low.h_eff_flat = h_eff_flat_new_low
-                    else:
-                        cp.copyto(cuda_ws_low.h_eff_flat, h_eff_flat_new_low)
-                    cuda_ws_low._eri_diag_t = None
-                    if eri_mat_d is not None and getattr(cuda_ws_low, "_eri_mat_t", None) is not None:
-                        cp.copyto(cuda_ws_low._eri_mat_t, cuda_ws_low.eri_mat.T)
-                    elif eri_mat_d is None:
-                        cuda_ws_low._eri_mat_t = None
-                    cuda_ws_low.use_cuda_graph = False
+                    _refresh_low = _refresh_cuda_workspace_hamiltonian_inplace_runtime(
+                        cp=cp,
+                        ws=cuda_ws_low,
+                        eri_mat_d=eri_mat_d,
+                        l_full_d=l_full_d,
+                        h_eff_d=h_eff_d,
+                        use_cuda_graph=False,
+                        refresh_diag_cache_for_graph=False,
+                    )
+                    if kprof is not None:
+                        kprof["matvec_cuda_ws_low_refresh_h_eff_replaced"] = bool(_refresh_low["h_eff_replaced"])
                 if kprof is not None:
                     kprof["matvec_cuda_mixed_low_use_epq_table_effective"] = bool(
                         getattr(cuda_ws_low, "use_epq_table", False)
