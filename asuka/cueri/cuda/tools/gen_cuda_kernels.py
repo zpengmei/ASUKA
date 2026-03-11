@@ -168,9 +168,10 @@ LAUNCH_THREADS_OVERRIDES: dict[str, int] = {
 # Maximum ncomp for which a warp-parallel-pair kernel is generated.
 # For ncomp > this limit, the warp launcher falls back to the block kernel.
 # Constraint: ncomp * NROOTS register accumulators per lane must fit in
-# the SM register file.  128 comps × 5 roots = 640 doubles is still fine
-# on SM89 (RTX 4090).
-WARP_PAIR_NCOMP_MAX = 128
+# the SM register file.  162 comps × 3 roots = 486 doubles is still fine
+# on SM89 (RTX 4090).  This enables warp kernels for ppdp (ncomp=162)
+# and dppp (ncomp=135, via transpose).
+WARP_PAIR_NCOMP_MAX = 162
 
 
 FUSED_FOCK_CLASSES: set[str] = {
@@ -241,6 +242,26 @@ def axis_expr(terms: list[tuple[int, int, int, int, int]], *, stride: int, gsym:
     if not parts:
         return "0.0"
     return " + ".join(parts)
+
+
+@dataclass(frozen=True)
+class AxisDedup:
+    uniq: list[str]
+    map_idx: list[int]
+
+
+def dedup_axis_exprs(exprs: list[str]) -> AxisDedup:
+    uniq: list[str] = []
+    map_idx: list[int] = []
+    seen: dict[str, int] = {}
+    for expr in exprs:
+        idx = seen.get(expr)
+        if idx is None:
+            idx = len(uniq)
+            uniq.append(expr)
+            seen[expr] = idx
+        map_idx.append(idx)
+    return AxisDedup(uniq=uniq, map_idx=map_idx)
 
 
 def emit_eval_fn(q: QuartetClass, axis: str, exprs: list[str]) -> str:
@@ -348,6 +369,8 @@ def emit_kernel(q: QuartetClass, stride: int) -> str:
     # cross-kernel shared dependencies (KernelMultiblockReduceFixed)
     # that prevent the splitter from splitting wave files into multiple parts.
     out.append(emit_flat_kernel(q, stride))
+    if q.ncomp <= WARP_PAIR_NCOMP_MAX:
+        out.append(emit_warp_kernel(q, stride))
     if q.name in FUSED_FOCK_CLASSES:
         out.append(emit_fused_fock_kernel(q, stride))
     if q.name in FUSED_JK_CLASSES:
@@ -951,6 +974,10 @@ def emit_flat_kernel(q: QuartetClass, stride: int) -> str:
             comp_exprs_y.append(axis_expr(ty, stride=flat_stride, gsym="Gy", dij="yij", dkl="ykl"))
             comp_exprs_z.append(axis_expr(tz, stride=flat_stride, gsym="Gz", dij="zij", dkl="zkl"))
 
+    dedup_x = dedup_axis_exprs(comp_exprs_x)
+    dedup_y = dedup_axis_exprs(comp_exprs_y)
+    dedup_z = dedup_axis_exprs(comp_exprs_z)
+
     fn: list[str] = []
     fn.extend([
         f"template <int NROOTS>",
@@ -1021,6 +1048,9 @@ def emit_flat_kernel(q: QuartetClass, stride: int) -> str:
         f"  double Gx[{flat_gsize}];",
         f"  double Gy[{flat_gsize}];",
         f"  double Gz[{flat_gsize}];",
+        f"  double Ux[{len(dedup_x.uniq)}];",
+        f"  double Uy[{len(dedup_y.uniq)}];",
+        f"  double Uz[{len(dedup_z.uniq)}];",
         f"  double tile[{ncomp}];",
     ])
     for i in range(ncomp):
@@ -1070,12 +1100,16 @@ def emit_flat_kernel(q: QuartetClass, stride: int) -> str:
         "        compute_G_stride_fixed<kFlatStride, kNMax, kMMax>(Gz, Cz_, Cpz_, B0, B1, B1p);",
         "        const double sc = base * w;",
     ])
-    # Inline all component accumulations directly (no eval function calls).
+    for i, expr in enumerate(dedup_x.uniq):
+        fn.append(f"        Ux[{i}] = {expr};")
+    for i, expr in enumerate(dedup_y.uniq):
+        fn.append(f"        Uy[{i}] = {expr};")
+    for i, expr in enumerate(dedup_z.uniq):
+        fn.append(f"        Uz[{i}] = {expr};")
     for i in range(ncomp):
-        ex = comp_exprs_x[i]
-        ey = comp_exprs_y[i]
-        ez = comp_exprs_z[i]
-        fn.append(f"        tile[{i}] += sc * ({ex}) * ({ey}) * ({ez});")
+        fn.append(
+            f"        tile[{i}] += sc * Ux[{dedup_x.map_idx[i]}] * Uy[{dedup_y.map_idx[i]}] * Uz[{dedup_z.map_idx[i]}];"
+        )
     fn.extend([
         "      }",
         "    }",
@@ -1638,7 +1672,12 @@ def emit_launchers(q: QuartetClass, stride: int) -> str:
             "    cudaStream_t stream,",
             "    int threads) {",]
     )
-    # Warp launcher also uses the flat kernel (100% thread utilization).
+    # Warp launcher delegates to the flat kernel.  The generated Rys-based
+    # warp kernels (KernelERI_*_warp_true) are available but benchmarking
+    # shows they are slower than flat for Rys-quadrature classes because each
+    # lane independently computes expensive Rys roots/weights.  The true warp
+    # kernels remain compiled and can be dispatched by setting an env var or
+    # by a future auto-tuner.
     fn.extend([
         f"  return cueri_eri_{q.name}_launch_stream(",
         "      task_spAB, task_spCD, ntasks, sp_A, sp_B, sp_pair_start, sp_npair, shell_cx, shell_cy, shell_cz,",

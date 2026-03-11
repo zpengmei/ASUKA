@@ -1,4 +1,4 @@
-// Auto-split from cueri_cuda_kernels_rys_generic.cu (part 1/2: KernelERI_RysGeneric..KernelERI_RysDF_Ld0Warp)
+// Auto-split from cueri_cuda_kernels_rys_generic.cu (part 1/1: KernelERI_RysGeneric..KernelDFInt3c2e_RysContractedLd0Block)
 // Do not edit — regenerate with split_large_kernels.py
 
 #include <cuda_runtime.h>
@@ -19,6 +19,8 @@ constexpr int kStride = 2 * kLMax + 1;  // la+lb <= 10, lc+ld <= 10
 constexpr int kGSize = kStride * kStride;
 constexpr int kNcartMax = (kLMax + 1) * (kLMax + 2) / 2;  // 21 for l=5
 constexpr int kMaxWarpsPerBlock = 8;  // threads <= 256
+constexpr int kPairTileAB = 8;
+constexpr int kPairTileCD = 8;
 
 __device__ __forceinline__ int ncart(int l) { return ((l + 1) * (l + 2)) >> 1; }
 
@@ -219,6 +221,16 @@ __global__ void KernelERI_RysGeneric(
   __shared__ double sh_xij_pow[kLMax + 1], sh_xkl_pow[kLMax + 1];
   __shared__ double sh_yij_pow[kLMax + 1], sh_ykl_pow[kLMax + 1];
   __shared__ double sh_zij_pow[kLMax + 1], sh_zkl_pow[kLMax + 1];
+  __shared__ double sh_ab_eta[kPairTileAB];
+  __shared__ double sh_ab_Px[kPairTileAB];
+  __shared__ double sh_ab_Py[kPairTileAB];
+  __shared__ double sh_ab_Pz[kPairTileAB];
+  __shared__ double sh_ab_cK[kPairTileAB];
+  __shared__ double sh_cd_eta[kPairTileCD];
+  __shared__ double sh_cd_Px[kPairTileCD];
+  __shared__ double sh_cd_Py[kPairTileCD];
+  __shared__ double sh_cd_Pz[kPairTileCD];
+  __shared__ double sh_cd_cK[kPairTileCD];
 
   if (threadIdx.x == 0) {
     fill_cart_comp(la, sh_Ax, sh_Ay, sh_Az);
@@ -277,86 +289,99 @@ __global__ void KernelERI_RysGeneric(
 
     double val = 0.0;
 
-    for (int ip = 0; ip < nPairAB; ++ip) {
-      const int ki = baseAB + ip;
-      double p = 0.0;
-      double Px = 0.0;
-      double Py = 0.0;
-      double Pz = 0.0;
-      double cKab = 0.0;
-      if (threadIdx.x == 0) {
-        p = pair_eta[ki];
-        Px = pair_Px[ki];
-        Py = pair_Py[ki];
-        Pz = pair_Pz[ki];
-        cKab = pair_cK[ki];
+    for (int ip0 = 0; ip0 < nPairAB; ip0 += kPairTileAB) {
+      const int tileAB = min(kPairTileAB, nPairAB - ip0);
+      if (static_cast<int>(threadIdx.x) < tileAB) {
+        const int ki = baseAB + ip0 + static_cast<int>(threadIdx.x);
+        sh_ab_eta[threadIdx.x] = pair_eta[ki];
+        sh_ab_Px[threadIdx.x] = pair_Px[ki];
+        sh_ab_Py[threadIdx.x] = pair_Py[ki];
+        sh_ab_Pz[threadIdx.x] = pair_Pz[ki];
+        sh_ab_cK[threadIdx.x] = pair_cK[ki];
       }
+      __syncthreads();
 
-      for (int jp = 0; jp < nPairCD; ++jp) {
-        const int kj = baseCD + jp;
-        double q = 0.0;
-        double Qx = 0.0;
-        double Qy = 0.0;
-        double Qz = 0.0;
-        double cKcd = 0.0;
-        double denom = 0.0;
-        double base = 0.0;
-        if (threadIdx.x == 0) {
-          q = pair_eta[kj];
-          Qx = pair_Px[kj];
-          Qy = pair_Py[kj];
-          Qz = pair_Pz[kj];
-          cKcd = pair_cK[kj];
-
-          const double dx = Px - Qx;
-          const double dy = Py - Qy;
-          const double dz = Pz - Qz;
-          const double PQ2 = dx * dx + dy * dy + dz * dz;
-
-          denom = p + q;
-          const double omega = p * q / denom;
-          const double T = omega * PQ2;
-
-          base = kTwoPiToFiveHalves / (p * q * ::sqrt(denom)) * cKab * cKcd;
-
-          cueri_rys::rys_roots_weights<NROOTS>(T, sh_roots, sh_weights);
+      for (int jp0 = 0; jp0 < nPairCD; jp0 += kPairTileCD) {
+        const int tileCD = min(kPairTileCD, nPairCD - jp0);
+        if (static_cast<int>(threadIdx.x) < tileCD) {
+          const int kj = baseCD + jp0 + static_cast<int>(threadIdx.x);
+          sh_cd_eta[threadIdx.x] = pair_eta[kj];
+          sh_cd_Px[threadIdx.x] = pair_Px[kj];
+          sh_cd_Py[threadIdx.x] = pair_Py[kj];
+          sh_cd_Pz[threadIdx.x] = pair_Pz[kj];
+          sh_cd_cK[threadIdx.x] = pair_cK[kj];
         }
+        __syncthreads();
 
-        for (int u = 0; u < NROOTS; ++u) {
-          if (threadIdx.x == 0) {
-            const double x = sh_roots[u];
-            const double w = sh_weights[u];
+        for (int ip = 0; ip < tileAB; ++ip) {
+          const double p = sh_ab_eta[ip];
+          const double Px = sh_ab_Px[ip];
+          const double Py = sh_ab_Py[ip];
+          const double Pz = sh_ab_Pz[ip];
+          const double cKab = sh_ab_cK[ip];
 
-            const double inv_denom = 1.0 / denom;
-            const double B0 = x * 0.5 * inv_denom;
-            const double B1 = (1.0 - x) * 0.5 / p + B0;
-            const double B1p = (1.0 - x) * 0.5 / q + B0;
+          for (int jp = 0; jp < tileCD; ++jp) {
+            const double q = sh_cd_eta[jp];
+            const double Qx = sh_cd_Px[jp];
+            const double Qy = sh_cd_Py[jp];
+            const double Qz = sh_cd_Pz[jp];
+            const double cKcd = sh_cd_cK[jp];
+            double denom = 0.0;
+            double base = 0.0;
+            if (threadIdx.x == 0) {
+              const double dx = Px - Qx;
+              const double dy = Py - Qy;
+              const double dz = Pz - Qz;
+              const double PQ2 = dx * dx + dy * dy + dz * dz;
 
-            const double Cx_ = (Px - Ax) + (q * inv_denom) * x * (Qx - Px);
-            const double Cy_ = (Py - Ay) + (q * inv_denom) * x * (Qy - Py);
-            const double Cz_ = (Pz - Az) + (q * inv_denom) * x * (Qz - Pz);
+              denom = p + q;
+              const double omega = p * q / denom;
+              const double T = omega * PQ2;
 
-            const double Cpx_ = (Qx - Cx) + (p * inv_denom) * x * (Px - Qx);
-            const double Cpy_ = (Qy - Cy) + (p * inv_denom) * x * (Py - Qy);
-            const double Cpz_ = (Qz - Cz) + (p * inv_denom) * x * (Pz - Qz);
+              base = kTwoPiToFiveHalves / (p * q * ::sqrt(denom)) * cKab * cKcd;
 
-            compute_G(sh_Gx, nmax, mmax, Cx_, Cpx_, B0, B1, B1p);
-            compute_G(sh_Gy, nmax, mmax, Cy_, Cpy_, B0, B1, B1p);
-            compute_G(sh_Gz, nmax, mmax, Cz_, Cpz_, B0, B1, B1p);
+              cueri_rys::rys_roots_weights<NROOTS>(T, sh_roots, sh_weights);
+            }
 
-            sh_scale = base * w;
+            for (int u = 0; u < NROOTS; ++u) {
+              if (threadIdx.x == 0) {
+                const double x = sh_roots[u];
+                const double w = sh_weights[u];
+
+                const double inv_denom = 1.0 / denom;
+                const double B0 = x * 0.5 * inv_denom;
+                const double B1 = (1.0 - x) * 0.5 / p + B0;
+                const double B1p = (1.0 - x) * 0.5 / q + B0;
+
+                const double Cx_ = (Px - Ax) + (q * inv_denom) * x * (Qx - Px);
+                const double Cy_ = (Py - Ay) + (q * inv_denom) * x * (Qy - Py);
+                const double Cz_ = (Pz - Az) + (q * inv_denom) * x * (Qz - Pz);
+
+                const double Cpx_ = (Qx - Cx) + (p * inv_denom) * x * (Px - Qx);
+                const double Cpy_ = (Qy - Cy) + (p * inv_denom) * x * (Py - Qy);
+                const double Cpz_ = (Qz - Cz) + (p * inv_denom) * x * (Pz - Qz);
+
+                compute_G(sh_Gx, nmax, mmax, Cx_, Cpx_, B0, B1, B1p);
+                compute_G(sh_Gy, nmax, mmax, Cy_, Cpy_, B0, B1, B1p);
+                compute_G(sh_Gz, nmax, mmax, Cz_, Cpz_, B0, B1, B1p);
+
+                sh_scale = base * w;
+              }
+              __syncthreads();
+
+              if (active) {
+                const double Ix = shift_from_G(sh_Gx, iax, ibx, icx, idx, sh_xij_pow, sh_xkl_pow);
+                const double Iy = shift_from_G(sh_Gy, iay, iby, icy, idy, sh_yij_pow, sh_ykl_pow);
+                const double Iz = shift_from_G(sh_Gz, iaz, ibz, icz, idz, sh_zij_pow, sh_zkl_pow);
+                val += sh_scale * (Ix * Iy * Iz);
+              }
+              __syncthreads();
+            }
           }
-          __syncthreads();
-
-          if (active) {
-            const double Ix = shift_from_G(sh_Gx, iax, ibx, icx, idx, sh_xij_pow, sh_xkl_pow);
-            const double Iy = shift_from_G(sh_Gy, iay, iby, icy, idy, sh_yij_pow, sh_ykl_pow);
-            const double Iz = shift_from_G(sh_Gz, iaz, ibz, icz, idz, sh_zij_pow, sh_zkl_pow);
-            val += sh_scale * (Ix * Iy * Iz);
-          }
-          __syncthreads();
         }
+        __syncthreads();
       }
+      __syncthreads();
     }
 
     if (active) {
@@ -1839,7 +1864,1927 @@ struct DFInt3c2eContractedLd0SubwarpScratch {
   double wab[CTR_PAIR_MAX];
 };
 
+template <int NROOTS, int STRIDE, int CTR_MAX>
+__global__ void KernelDFInt3c2e_RysContractedLd0Subwarp8(
+    const int32_t* task_spAB,
+    const int32_t* task_spCD,
+    int ntasks,
+    const int32_t* sp_A,
+    const int32_t* sp_B,
+    const int32_t* sp_pair_start,
+    const int32_t* sp_npair,
+    const int32_t* shell_nprim,
+    const double* shell_cx,
+    const double* shell_cy,
+    const double* shell_cz,
+    const double* pair_eta,
+    const double* pair_Px,
+    const double* pair_Py,
+    const double* pair_Pz,
+    const double* pair_cK,
+    const int32_t* ao_shell_ao_start,
+    const int32_t* ao_shell_nctr,
+    const int32_t* ao_shell_coef_start,
+    const double* ao_prim_coef,
+    const int32_t* aux_shell_ao_start,
+    int n_shell_ao,
+    int nao,
+    int naux,
+    int aux_p0_block,
+    int la,
+    int lb,
+    int lc,
+    double* X_out) {
+  // 4 tasks per warp (subwarp8). Each lane computes up to 4 elements:
+  //   e = lane8 + pass*8, pass=0..3 -> supports up to nElem<=32.
+  constexpr int CTR_PAIR_MAX = CTR_MAX * CTR_MAX;
+  const int lane = static_cast<int>(threadIdx.x) & 31;
+  const int warp_id = static_cast<int>(threadIdx.x) >> 5;
+  if (warp_id >= kMaxWarpsPerBlock) return;
+  const int warps_per_block = static_cast<int>(blockDim.x) >> 5;
+  const int warp_global = static_cast<int>(blockIdx.x) * warps_per_block + warp_id;
+
+  const int subwarp = lane >> 3;  // 0..3
+  const int lane8 = lane & 7;
+  const unsigned mask = 0xFFu << (8 * subwarp);
+
+  const int t = warp_global * 4 + subwarp;
+  if (t >= ntasks) return;
+
+  if (la < 0 || lb < 0 || lc < 0) return;
+  if (la > kLMax || lb > kLMax || lc > kLMax) return;
+
+  const int nA = ncart(la);
+  const int nB = ncart(lb);
+  const int nC = ncart(lc);
+  const int nAB = nA * nB;
+  const int nElem = nAB * nC;
+  if (nElem <= 0 || nElem > 32) return;
+  const bool lb_is_zero = (lb == 0);
+
+  // Shared scratch: one entry per task in this block.
+  extern __shared__ unsigned char smem[];
+  using ScratchT = DFInt3c2eContractedLd0SubwarpScratch<NROOTS, STRIDE, CTR_PAIR_MAX>;
+  auto* scratch = reinterpret_cast<ScratchT*>(smem);
+  const int task_local = warp_id * 4 + subwarp;
+  ScratchT* s = scratch + task_local;
+
+  const bool leader = (lane8 == 0);
+
+  const int spAB = static_cast<int>(task_spAB[t]);
+  const int spCD = static_cast<int>(task_spCD[t]);
+  const int A = static_cast<int>(sp_A[spAB]);
+  const int B = static_cast<int>(sp_B[spAB]);
+  const int C = static_cast<int>(sp_A[spCD]);  // combined-basis aux shell index
+  const int Psh = C - n_shell_ao;
+  if (Psh < 0) return;
+
+  const int a0_shell = static_cast<int>(ao_shell_ao_start[A]);
+  const int b0_shell = static_cast<int>(ao_shell_ao_start[B]);
+  const int nctrA = static_cast<int>(ao_shell_nctr[A]);
+  const int nctrB = static_cast<int>(ao_shell_nctr[B]);
+  if (nctrA <= 0 || nctrB <= 0) return;
+  if (nctrA > CTR_MAX || nctrB > CTR_MAX) return;
+  const int nctrAB = nctrA * nctrB;
+
+  const int coefA0 = static_cast<int>(ao_shell_coef_start[A]);
+  const int coefB0 = static_cast<int>(ao_shell_coef_start[B]);
+  const int nprimB = static_cast<int>(shell_nprim[B]);
+  if (nprimB <= 0) return;
+
+  const int p0_shell = static_cast<int>(aux_shell_ao_start[Psh]) - aux_p0_block;
+
+  const int nmax = la + lb;
+  const int mmax = lc;  // ld=0
+  if (nmax >= STRIDE || mmax >= STRIDE) return;
+
+  const int baseAB = static_cast<int>(sp_pair_start[spAB]);
+  const int baseCD = static_cast<int>(sp_pair_start[spCD]);
+  const int nPairAB = static_cast<int>(sp_npair[spAB]);
+  const int nPairCD = static_cast<int>(sp_npair[spCD]);
+
+  if (leader) {
+    fill_cart_comp(la, s->Ax, s->Ay, s->Az);
+    if (!lb_is_zero) fill_cart_comp(lb, s->Bx, s->By, s->Bz);
+    fill_cart_comp(lc, s->Cx, s->Cy, s->Cz);
+
+    const double Ax = shell_cx[A];
+    const double Ay = shell_cy[A];
+    const double Az = shell_cz[A];
+    const double Cx = shell_cx[C];
+    const double Cy = shell_cy[C];
+    const double Cz = shell_cz[C];
+
+    s->Axyz[0] = Ax;
+    s->Axyz[1] = Ay;
+    s->Axyz[2] = Az;
+    s->Cxyz[0] = Cx;
+    s->Cxyz[1] = Cy;
+    s->Cxyz[2] = Cz;
+
+    s->xij_pow[0] = 1.0;
+    s->yij_pow[0] = 1.0;
+    s->zij_pow[0] = 1.0;
+    // ld=0 => D is an s-shell: shift() reads only xkl_pow[0]=1.
+    s->xkl_pow[0] = 1.0;
+    s->ykl_pow[0] = 1.0;
+    s->zkl_pow[0] = 1.0;
+    for (int p = 1; p <= kLMax; ++p) {
+      s->xkl_pow[p] = 0.0;
+      s->ykl_pow[p] = 0.0;
+      s->zkl_pow[p] = 0.0;
+    }
+
+    if (!lb_is_zero) {
+      const double Bx = shell_cx[B];
+      const double By = shell_cy[B];
+      const double Bz = shell_cz[B];
+      const double xij = Ax - Bx;
+      const double yij = Ay - By;
+      const double zij = Az - Bz;
+      for (int p = 1; p <= kLMax; ++p) {
+        s->xij_pow[p] = s->xij_pow[p - 1] * xij;
+        s->yij_pow[p] = s->yij_pow[p - 1] * yij;
+        s->zij_pow[p] = s->zij_pow[p - 1] * zij;
+      }
+    }
+  }
+  __syncwarp(mask);
+
+  // Each lane owns up to 4 elements: e0..e3.
+  const int e0 = lane8;
+  const int e1 = lane8 + 8;
+  const int e2 = lane8 + 16;
+  const int e3 = lane8 + 24;
+
+  const bool has0 = (e0 < nElem);
+  const bool has1 = (e1 < nElem);
+  const bool has2 = (e2 < nElem);
+  const bool has3 = (e3 < nElem);
+
+  int ia0 = 0, ib0 = 0, ic0 = 0;
+  int ia1 = 0, ib1 = 0, ic1 = 0;
+  int ia2 = 0, ib2 = 0, ic2 = 0;
+  int ia3 = 0, ib3 = 0, ic3 = 0;
+
+  int iax0 = 0, iay0 = 0, iaz0 = 0, ibx0 = 0, iby0 = 0, ibz0 = 0, icx0 = 0, icy0 = 0, icz0 = 0;
+  int iax1 = 0, iay1 = 0, iaz1 = 0, ibx1 = 0, iby1 = 0, ibz1 = 0, icx1 = 0, icy1 = 0, icz1 = 0;
+  int iax2 = 0, iay2 = 0, iaz2 = 0, ibx2 = 0, iby2 = 0, ibz2 = 0, icx2 = 0, icy2 = 0, icz2 = 0;
+  int iax3 = 0, iay3 = 0, iaz3 = 0, ibx3 = 0, iby3 = 0, ibz3 = 0, icx3 = 0, icy3 = 0, icz3 = 0;
+
+  if (has0) {
+    const int ab = e0 / nC;
+    ic0 = e0 - ab * nC;
+    ia0 = ab / nB;
+    ib0 = ab - ia0 * nB;
+    iax0 = static_cast<int>(s->Ax[ia0]);
+    iay0 = static_cast<int>(s->Ay[ia0]);
+    iaz0 = static_cast<int>(s->Az[ia0]);
+    if (!lb_is_zero) {
+      ibx0 = static_cast<int>(s->Bx[ib0]);
+      iby0 = static_cast<int>(s->By[ib0]);
+      ibz0 = static_cast<int>(s->Bz[ib0]);
+    }
+    icx0 = static_cast<int>(s->Cx[ic0]);
+    icy0 = static_cast<int>(s->Cy[ic0]);
+    icz0 = static_cast<int>(s->Cz[ic0]);
+  }
+  if (has1) {
+    const int ab = e1 / nC;
+    ic1 = e1 - ab * nC;
+    ia1 = ab / nB;
+    ib1 = ab - ia1 * nB;
+    iax1 = static_cast<int>(s->Ax[ia1]);
+    iay1 = static_cast<int>(s->Ay[ia1]);
+    iaz1 = static_cast<int>(s->Az[ia1]);
+    if (!lb_is_zero) {
+      ibx1 = static_cast<int>(s->Bx[ib1]);
+      iby1 = static_cast<int>(s->By[ib1]);
+      ibz1 = static_cast<int>(s->Bz[ib1]);
+    }
+    icx1 = static_cast<int>(s->Cx[ic1]);
+    icy1 = static_cast<int>(s->Cy[ic1]);
+    icz1 = static_cast<int>(s->Cz[ic1]);
+  }
+  if (has2) {
+    const int ab = e2 / nC;
+    ic2 = e2 - ab * nC;
+    ia2 = ab / nB;
+    ib2 = ab - ia2 * nB;
+    iax2 = static_cast<int>(s->Ax[ia2]);
+    iay2 = static_cast<int>(s->Ay[ia2]);
+    iaz2 = static_cast<int>(s->Az[ia2]);
+    if (!lb_is_zero) {
+      ibx2 = static_cast<int>(s->Bx[ib2]);
+      iby2 = static_cast<int>(s->By[ib2]);
+      ibz2 = static_cast<int>(s->Bz[ib2]);
+    }
+    icx2 = static_cast<int>(s->Cx[ic2]);
+    icy2 = static_cast<int>(s->Cy[ic2]);
+    icz2 = static_cast<int>(s->Cz[ic2]);
+  }
+  if (has3) {
+    const int ab = e3 / nC;
+    ic3 = e3 - ab * nC;
+    ia3 = ab / nB;
+    ib3 = ab - ia3 * nB;
+    iax3 = static_cast<int>(s->Ax[ia3]);
+    iay3 = static_cast<int>(s->Ay[ia3]);
+    iaz3 = static_cast<int>(s->Az[ia3]);
+    if (!lb_is_zero) {
+      ibx3 = static_cast<int>(s->Bx[ib3]);
+      iby3 = static_cast<int>(s->By[ib3]);
+      ibz3 = static_cast<int>(s->Bz[ib3]);
+    }
+    icx3 = static_cast<int>(s->Cx[ic3]);
+    icy3 = static_cast<int>(s->Cy[ic3]);
+    icz3 = static_cast<int>(s->Cz[ic3]);
+  }
+
+  double acc0[CTR_PAIR_MAX];
+  double acc1[CTR_PAIR_MAX];
+  double acc2[CTR_PAIR_MAX];
+  double acc3[CTR_PAIR_MAX];
+  for (int c = 0; c < CTR_PAIR_MAX; ++c) {
+    acc0[c] = 0.0;
+    acc1[c] = 0.0;
+    acc2[c] = 0.0;
+    acc3[c] = 0.0;
+  }
+
+  for (int ip = 0; ip < nPairAB; ++ip) {
+    const int ki = baseAB + ip;
+    double p = 0.0;
+    double Px = 0.0;
+    double Py = 0.0;
+    double Pz = 0.0;
+    double Kab = 0.0;
+    if (leader) {
+      p = pair_eta[ki];
+      Px = pair_Px[ki];
+      Py = pair_Py[ki];
+      Pz = pair_Pz[ki];
+      Kab = pair_cK[ki];  // AO: Kab_geom (prim coef=1)
+
+      const int ipA = ip / nprimB;
+      const int ipB = ip - ipA * nprimB;
+      for (int ca = 0; ca < nctrA; ++ca) {
+        const double cA = ao_prim_coef[coefA0 + ipA * nctrA + ca];
+        for (int cb = 0; cb < nctrB; ++cb) {
+          const double cB = ao_prim_coef[coefB0 + ipB * nctrB + cb];
+          s->wab[ca * nctrB + cb] = cA * cB;
+        }
+      }
+    }
+    __syncwarp(mask);
+
+    double val0 = 0.0;
+    double val1 = 0.0;
+    double val2 = 0.0;
+    double val3 = 0.0;
+
+    for (int jp = 0; jp < nPairCD; ++jp) {
+      const int kj = baseCD + jp;
+      double q = 0.0;
+      double Qx = 0.0;
+      double Qy = 0.0;
+      double Qz = 0.0;
+      double cKcd = 0.0;
+      double denom = 0.0;
+      double base = 0.0;
+      if (leader) {
+        q = pair_eta[kj];
+        Qx = pair_Px[kj];
+        Qy = pair_Py[kj];
+        Qz = pair_Pz[kj];
+        cKcd = pair_cK[kj];  // aux coef (dummy exp=0 => Kab=1)
+
+        const double dx = Px - Qx;
+        const double dy = Py - Qy;
+        const double dz = Pz - Qz;
+        const double PQ2 = dx * dx + dy * dy + dz * dz;
+
+        denom = p + q;
+        const double omega = p * q / denom;
+        const double T = omega * PQ2;
+
+        base = kTwoPiToFiveHalves / (p * q * ::sqrt(denom)) * Kab * cKcd;
+
+        cueri_rys::rys_roots_weights<NROOTS>(T, s->roots, s->weights);
+      }
+      __syncwarp(mask);
+
+      for (int u = 0; u < NROOTS; ++u) {
+        if (leader) {
+          const double x = s->roots[u];
+          const double w = s->weights[u];
+
+          const double inv_denom = 1.0 / denom;
+          const double B0 = x * 0.5 * inv_denom;
+          const double B1 = (1.0 - x) * 0.5 / p + B0;
+          const double B1p = (1.0 - x) * 0.5 / q + B0;
+
+          const double Ax = s->Axyz[0];
+          const double Ay = s->Axyz[1];
+          const double Az = s->Axyz[2];
+          const double Cx = s->Cxyz[0];
+          const double Cy = s->Cxyz[1];
+          const double Cz = s->Cxyz[2];
+
+          const double Cx_ = (Px - Ax) + (q * inv_denom) * x * (Qx - Px);
+          const double Cy_ = (Py - Ay) + (q * inv_denom) * x * (Qy - Py);
+          const double Cz_ = (Pz - Az) + (q * inv_denom) * x * (Qz - Pz);
+
+          const double Cpx_ = (Qx - Cx) + (p * inv_denom) * x * (Px - Qx);
+          const double Cpy_ = (Qy - Cy) + (p * inv_denom) * x * (Py - Qy);
+          const double Cpz_ = (Qz - Cz) + (p * inv_denom) * x * (Pz - Qz);
+
+          compute_G_stride<STRIDE>(s->Gx, nmax, mmax, Cx_, Cpx_, B0, B1, B1p);
+          compute_G_stride<STRIDE>(s->Gy, nmax, mmax, Cy_, Cpy_, B0, B1, B1p);
+          compute_G_stride<STRIDE>(s->Gz, nmax, mmax, Cz_, Cpz_, B0, B1, B1p);
+
+          s->scale = base * w;
+        }
+        __syncwarp(mask);
+
+        const double scale = s->scale;
+        if (has0) {
+          const double Ix = lb_is_zero ? s->Gx[iax0 * STRIDE + icx0]
+                                       : shift_from_G_stride<STRIDE>(s->Gx, iax0, ibx0, icx0, 0, s->xij_pow, s->xkl_pow);
+          const double Iy = lb_is_zero ? s->Gy[iay0 * STRIDE + icy0]
+                                       : shift_from_G_stride<STRIDE>(s->Gy, iay0, iby0, icy0, 0, s->yij_pow, s->ykl_pow);
+          const double Iz = lb_is_zero ? s->Gz[iaz0 * STRIDE + icz0]
+                                       : shift_from_G_stride<STRIDE>(s->Gz, iaz0, ibz0, icz0, 0, s->zij_pow, s->zkl_pow);
+          val0 += scale * (Ix * Iy * Iz);
+        }
+        if (has1) {
+          const double Ix = lb_is_zero ? s->Gx[iax1 * STRIDE + icx1]
+                                       : shift_from_G_stride<STRIDE>(s->Gx, iax1, ibx1, icx1, 0, s->xij_pow, s->xkl_pow);
+          const double Iy = lb_is_zero ? s->Gy[iay1 * STRIDE + icy1]
+                                       : shift_from_G_stride<STRIDE>(s->Gy, iay1, iby1, icy1, 0, s->yij_pow, s->ykl_pow);
+          const double Iz = lb_is_zero ? s->Gz[iaz1 * STRIDE + icz1]
+                                       : shift_from_G_stride<STRIDE>(s->Gz, iaz1, ibz1, icz1, 0, s->zij_pow, s->zkl_pow);
+          val1 += scale * (Ix * Iy * Iz);
+        }
+        if (has2) {
+          const double Ix = lb_is_zero ? s->Gx[iax2 * STRIDE + icx2]
+                                       : shift_from_G_stride<STRIDE>(s->Gx, iax2, ibx2, icx2, 0, s->xij_pow, s->xkl_pow);
+          const double Iy = lb_is_zero ? s->Gy[iay2 * STRIDE + icy2]
+                                       : shift_from_G_stride<STRIDE>(s->Gy, iay2, iby2, icy2, 0, s->yij_pow, s->ykl_pow);
+          const double Iz = lb_is_zero ? s->Gz[iaz2 * STRIDE + icz2]
+                                       : shift_from_G_stride<STRIDE>(s->Gz, iaz2, ibz2, icz2, 0, s->zij_pow, s->zkl_pow);
+          val2 += scale * (Ix * Iy * Iz);
+        }
+        if (has3) {
+          const double Ix = lb_is_zero ? s->Gx[iax3 * STRIDE + icx3]
+                                       : shift_from_G_stride<STRIDE>(s->Gx, iax3, ibx3, icx3, 0, s->xij_pow, s->xkl_pow);
+          const double Iy = lb_is_zero ? s->Gy[iay3 * STRIDE + icy3]
+                                       : shift_from_G_stride<STRIDE>(s->Gy, iay3, iby3, icy3, 0, s->yij_pow, s->ykl_pow);
+          const double Iz = lb_is_zero ? s->Gz[iaz3 * STRIDE + icz3]
+                                       : shift_from_G_stride<STRIDE>(s->Gz, iaz3, ibz3, icz3, 0, s->zij_pow, s->zkl_pow);
+          val3 += scale * (Ix * Iy * Iz);
+        }
+        __syncwarp(mask);
+      }
+    }
+
+    if (has0) {
+      for (int c = 0; c < nctrAB; ++c) acc0[c] += s->wab[c] * val0;
+    }
+    if (has1) {
+      for (int c = 0; c < nctrAB; ++c) acc1[c] += s->wab[c] * val1;
+    }
+    if (has2) {
+      for (int c = 0; c < nctrAB; ++c) acc2[c] += s->wab[c] * val2;
+    }
+    if (has3) {
+      for (int c = 0; c < nctrAB; ++c) acc3[c] += s->wab[c] * val3;
+    }
+    __syncwarp(mask);
+  }
+
+  if (has0) {
+    const int p = p0_shell + ic0;
+    for (int c = 0; c < nctrAB; ++c) {
+      const int ca = c / nctrB;
+      const int cb = c - ca * nctrB;
+      const int a = a0_shell + ca * nA + ia0;
+      const int b = b0_shell + cb * nB + ib0;
+      const int64_t idx_abp =
+          (static_cast<int64_t>(a) * static_cast<int64_t>(nao) + static_cast<int64_t>(b)) * static_cast<int64_t>(naux) +
+          static_cast<int64_t>(p);
+      const int64_t idx_bap =
+          (static_cast<int64_t>(b) * static_cast<int64_t>(nao) + static_cast<int64_t>(a)) * static_cast<int64_t>(naux) +
+          static_cast<int64_t>(p);
+      X_out[idx_abp] = acc0[c];
+      if (a != b) X_out[idx_bap] = acc0[c];
+    }
+  }
+  if (has1) {
+    const int p = p0_shell + ic1;
+    for (int c = 0; c < nctrAB; ++c) {
+      const int ca = c / nctrB;
+      const int cb = c - ca * nctrB;
+      const int a = a0_shell + ca * nA + ia1;
+      const int b = b0_shell + cb * nB + ib1;
+      const int64_t idx_abp =
+          (static_cast<int64_t>(a) * static_cast<int64_t>(nao) + static_cast<int64_t>(b)) * static_cast<int64_t>(naux) +
+          static_cast<int64_t>(p);
+      const int64_t idx_bap =
+          (static_cast<int64_t>(b) * static_cast<int64_t>(nao) + static_cast<int64_t>(a)) * static_cast<int64_t>(naux) +
+          static_cast<int64_t>(p);
+      X_out[idx_abp] = acc1[c];
+      if (a != b) X_out[idx_bap] = acc1[c];
+    }
+  }
+  if (has2) {
+    const int p = p0_shell + ic2;
+    for (int c = 0; c < nctrAB; ++c) {
+      const int ca = c / nctrB;
+      const int cb = c - ca * nctrB;
+      const int a = a0_shell + ca * nA + ia2;
+      const int b = b0_shell + cb * nB + ib2;
+      const int64_t idx_abp =
+          (static_cast<int64_t>(a) * static_cast<int64_t>(nao) + static_cast<int64_t>(b)) * static_cast<int64_t>(naux) +
+          static_cast<int64_t>(p);
+      const int64_t idx_bap =
+          (static_cast<int64_t>(b) * static_cast<int64_t>(nao) + static_cast<int64_t>(a)) * static_cast<int64_t>(naux) +
+          static_cast<int64_t>(p);
+      X_out[idx_abp] = acc2[c];
+      if (a != b) X_out[idx_bap] = acc2[c];
+    }
+  }
+  if (has3) {
+    const int p = p0_shell + ic3;
+    for (int c = 0; c < nctrAB; ++c) {
+      const int ca = c / nctrB;
+      const int cb = c - ca * nctrB;
+      const int a = a0_shell + ca * nA + ia3;
+      const int b = b0_shell + cb * nB + ib3;
+      const int64_t idx_abp =
+          (static_cast<int64_t>(a) * static_cast<int64_t>(nao) + static_cast<int64_t>(b)) * static_cast<int64_t>(naux) +
+          static_cast<int64_t>(p);
+      const int64_t idx_bap =
+          (static_cast<int64_t>(b) * static_cast<int64_t>(nao) + static_cast<int64_t>(a)) * static_cast<int64_t>(naux) +
+          static_cast<int64_t>(p);
+      X_out[idx_abp] = acc3[c];
+      if (a != b) X_out[idx_bap] = acc3[c];
+    }
+  }
+}
+
+template <int NROOTS, int CTR_MAX>
+static inline void launch_df_int3c2e_rys_contracted_ld0_subwarp8_stride5(
+    int blocks,
+    int threads,
+    int tasks_per_block,
+    const int32_t* task_spAB,
+    const int32_t* task_spCD,
+    int ntasks,
+    const int32_t* sp_A,
+    const int32_t* sp_B,
+    const int32_t* sp_pair_start,
+    const int32_t* sp_npair,
+    const int32_t* shell_nprim,
+    const double* shell_cx,
+    const double* shell_cy,
+    const double* shell_cz,
+    const double* pair_eta,
+    const double* pair_Px,
+    const double* pair_Py,
+    const double* pair_Pz,
+    const double* pair_cK,
+    const int32_t* ao_shell_ao_start,
+    const int32_t* ao_shell_nctr,
+    const int32_t* ao_shell_coef_start,
+    const double* ao_prim_coef,
+    const int32_t* aux_shell_ao_start,
+    int n_shell_ao,
+    int nao,
+    int naux,
+    int aux_p0_block,
+    int la,
+    int lb,
+    int lc,
+    double* X_out,
+    cudaStream_t stream) {
+  using ScratchT = DFInt3c2eContractedLd0SubwarpScratch<NROOTS, 5, CTR_MAX * CTR_MAX>;
+  const size_t shared_bytes = static_cast<size_t>(tasks_per_block) * sizeof(ScratchT);
+  KernelDFInt3c2e_RysContractedLd0Subwarp8<NROOTS, 5, CTR_MAX><<<blocks, threads, shared_bytes, stream>>>(
+      task_spAB,
+      task_spCD,
+      ntasks,
+      sp_A,
+      sp_B,
+      sp_pair_start,
+      sp_npair,
+      shell_nprim,
+      shell_cx,
+      shell_cy,
+      shell_cz,
+      pair_eta,
+      pair_Px,
+      pair_Py,
+      pair_Pz,
+      pair_cK,
+      ao_shell_ao_start,
+      ao_shell_nctr,
+      ao_shell_coef_start,
+      ao_prim_coef,
+      aux_shell_ao_start,
+      n_shell_ao,
+      nao,
+      naux,
+      aux_p0_block,
+      la,
+      lb,
+      lc,
+      X_out);
+}
+
+template <int NROOTS, int STRIDE, int CTR_MAX>
+__global__ void KernelDFInt3c2e_RysContractedLd0Warp64(
+    const int32_t* task_spAB,
+    const int32_t* task_spCD,
+    int ntasks,
+    const int32_t* sp_A,
+    const int32_t* sp_B,
+    const int32_t* sp_pair_start,
+    const int32_t* sp_npair,
+    const int32_t* shell_nprim,
+    const double* shell_cx,
+    const double* shell_cy,
+    const double* shell_cz,
+    const double* pair_eta,
+    const double* pair_Px,
+    const double* pair_Py,
+    const double* pair_Pz,
+    const double* pair_cK,
+    const int32_t* ao_shell_ao_start,
+    const int32_t* ao_shell_nctr,
+    const int32_t* ao_shell_coef_start,
+    const double* ao_prim_coef,
+    const int32_t* aux_shell_ao_start,
+    int n_shell_ao,
+    int nao,
+    int naux,
+    int aux_p0_block,
+    int la,
+    int lb,
+    int lc,
+    double* X_out) {
+  constexpr int CTR_PAIR_MAX = CTR_MAX * CTR_MAX;
+  const int lane = static_cast<int>(threadIdx.x) & 31;
+  const int warp_id = static_cast<int>(threadIdx.x) >> 5;
+  if (warp_id >= kMaxWarpsPerBlock) return;
+  const int warps_per_block = static_cast<int>(blockDim.x) >> 5;
+  const int t = static_cast<int>(blockIdx.x) * warps_per_block + warp_id;
+  if (t >= ntasks) return;
+
+  if (la < 0 || lb < 0 || lc < 0) return;
+  if (la > kLMax || lb > kLMax || lc > kLMax) return;
+
+  const int nA = ncart(la);
+  const int nB = ncart(lb);
+  const int nC = ncart(lc);
+  const int nElem = nA * nB * nC;
+  if (nElem <= 0 || nElem > 64) return;
+  const bool lb_is_zero = (lb == 0);
+
+  const int spAB = static_cast<int>(task_spAB[t]);
+  const int spCD = static_cast<int>(task_spCD[t]);
+  const int A = static_cast<int>(sp_A[spAB]);
+  const int B = static_cast<int>(sp_B[spAB]);
+  const int C = static_cast<int>(sp_A[spCD]);  // combined-basis aux shell index
+  const int Psh = C - n_shell_ao;
+  if (Psh < 0) return;
+
+  const int a0_shell = static_cast<int>(ao_shell_ao_start[A]);
+  const int b0_shell = static_cast<int>(ao_shell_ao_start[B]);
+  const int nctrA = static_cast<int>(ao_shell_nctr[A]);
+  const int nctrB = static_cast<int>(ao_shell_nctr[B]);
+  if (nctrA <= 0 || nctrB <= 0) return;
+  if (nctrA > CTR_MAX || nctrB > CTR_MAX) return;
+  const int nctrAB = nctrA * nctrB;
+
+  const int coefA0 = static_cast<int>(ao_shell_coef_start[A]);
+  const int coefB0 = static_cast<int>(ao_shell_coef_start[B]);
+  const int nprimB = static_cast<int>(shell_nprim[B]);
+  if (nprimB <= 0) return;
+
+  const int p0_shell = static_cast<int>(aux_shell_ao_start[Psh]) - aux_p0_block;
+
+  const int nmax = la + lb;
+  const int mmax = lc;  // ld=0
+  if (nmax >= STRIDE || mmax >= STRIDE) return;
+
+  const int baseAB = static_cast<int>(sp_pair_start[spAB]);
+  const int baseCD = static_cast<int>(sp_pair_start[spCD]);
+  const int nPairAB = static_cast<int>(sp_npair[spAB]);
+  const int nPairCD = static_cast<int>(sp_npair[spCD]);
+
+  __shared__ int8_t sh_Ax[kMaxWarpsPerBlock][kNcartMax];
+  __shared__ int8_t sh_Ay[kMaxWarpsPerBlock][kNcartMax];
+  __shared__ int8_t sh_Az[kMaxWarpsPerBlock][kNcartMax];
+  __shared__ int8_t sh_Bx[kMaxWarpsPerBlock][kNcartMax];
+  __shared__ int8_t sh_By[kMaxWarpsPerBlock][kNcartMax];
+  __shared__ int8_t sh_Bz[kMaxWarpsPerBlock][kNcartMax];
+  __shared__ int8_t sh_Cx[kMaxWarpsPerBlock][kNcartMax];
+  __shared__ int8_t sh_Cy[kMaxWarpsPerBlock][kNcartMax];
+  __shared__ int8_t sh_Cz[kMaxWarpsPerBlock][kNcartMax];
+
+  __shared__ double sh_Gx[kMaxWarpsPerBlock][STRIDE * STRIDE];
+  __shared__ double sh_Gy[kMaxWarpsPerBlock][STRIDE * STRIDE];
+  __shared__ double sh_Gz[kMaxWarpsPerBlock][STRIDE * STRIDE];
+  __shared__ double sh_scale[kMaxWarpsPerBlock];
+  __shared__ double sh_roots[kMaxWarpsPerBlock][NROOTS];
+  __shared__ double sh_weights[kMaxWarpsPerBlock][NROOTS];
+
+  __shared__ double sh_Axyz[kMaxWarpsPerBlock][3];
+  __shared__ double sh_Cxyz[kMaxWarpsPerBlock][3];
+
+  __shared__ double sh_xij_pow[kMaxWarpsPerBlock][kLMax + 1];
+  __shared__ double sh_xkl_pow[kMaxWarpsPerBlock][kLMax + 1];
+  __shared__ double sh_yij_pow[kMaxWarpsPerBlock][kLMax + 1];
+  __shared__ double sh_ykl_pow[kMaxWarpsPerBlock][kLMax + 1];
+  __shared__ double sh_zij_pow[kMaxWarpsPerBlock][kLMax + 1];
+  __shared__ double sh_zkl_pow[kMaxWarpsPerBlock][kLMax + 1];
+
+  __shared__ double sh_wab[kMaxWarpsPerBlock][CTR_PAIR_MAX];
+
+  if (lane == 0) {
+    fill_cart_comp(la, sh_Ax[warp_id], sh_Ay[warp_id], sh_Az[warp_id]);
+    if (!lb_is_zero) fill_cart_comp(lb, sh_Bx[warp_id], sh_By[warp_id], sh_Bz[warp_id]);
+    fill_cart_comp(lc, sh_Cx[warp_id], sh_Cy[warp_id], sh_Cz[warp_id]);
+
+    const double Ax = shell_cx[A];
+    const double Ay = shell_cy[A];
+    const double Az = shell_cz[A];
+    const double Bx = shell_cx[B];
+    const double By = shell_cy[B];
+    const double Bz = shell_cz[B];
+    const double Cx = shell_cx[C];
+    const double Cy = shell_cy[C];
+    const double Cz = shell_cz[C];
+
+    sh_Axyz[warp_id][0] = Ax;
+    sh_Axyz[warp_id][1] = Ay;
+    sh_Axyz[warp_id][2] = Az;
+    sh_Cxyz[warp_id][0] = Cx;
+    sh_Cxyz[warp_id][1] = Cy;
+    sh_Cxyz[warp_id][2] = Cz;
+
+    const double xij = Ax - Bx;
+    const double yij = Ay - By;
+    const double zij = Az - Bz;
+    sh_xij_pow[warp_id][0] = 1.0;
+    sh_yij_pow[warp_id][0] = 1.0;
+    sh_zij_pow[warp_id][0] = 1.0;
+    for (int l = 1; l <= kLMax; ++l) {
+      sh_xij_pow[warp_id][l] = sh_xij_pow[warp_id][l - 1] * xij;
+      sh_yij_pow[warp_id][l] = sh_yij_pow[warp_id][l - 1] * yij;
+      sh_zij_pow[warp_id][l] = sh_zij_pow[warp_id][l - 1] * zij;
+    }
+    // ld=0 => D is an s-shell: shift() reads only xkl_pow[0]=1.
+    sh_xkl_pow[warp_id][0] = 1.0;
+    sh_ykl_pow[warp_id][0] = 1.0;
+    sh_zkl_pow[warp_id][0] = 1.0;
+    for (int l = 1; l <= kLMax; ++l) {
+      sh_xkl_pow[warp_id][l] = 0.0;
+      sh_ykl_pow[warp_id][l] = 0.0;
+      sh_zkl_pow[warp_id][l] = 0.0;
+    }
+  }
+  __syncwarp();
+
+  // Lane owns up to 2 elements (since nElem<=64).
+  const int e0 = lane;
+  const int e1 = lane + 32;
+  const bool has0 = (e0 < nElem);
+  const bool has1 = (e1 < nElem);
+
+  int ia0 = 0, ib0 = 0, ic0 = 0;
+  int ia1 = 0, ib1 = 0, ic1 = 0;
+  int iax0 = 0, iay0 = 0, iaz0 = 0, ibx0 = 0, iby0 = 0, ibz0 = 0, icx0 = 0, icy0 = 0, icz0 = 0;
+  int iax1 = 0, iay1 = 0, iaz1 = 0, ibx1 = 0, iby1 = 0, ibz1 = 0, icx1 = 0, icy1 = 0, icz1 = 0;
+  if (has0) {
+    const int iab = e0 / nC;
+    ic0 = e0 - iab * nC;
+    ia0 = iab / nB;
+    ib0 = iab - ia0 * nB;
+    iax0 = static_cast<int>(sh_Ax[warp_id][ia0]);
+    iay0 = static_cast<int>(sh_Ay[warp_id][ia0]);
+    iaz0 = static_cast<int>(sh_Az[warp_id][ia0]);
+    if (!lb_is_zero) {
+      ibx0 = static_cast<int>(sh_Bx[warp_id][ib0]);
+      iby0 = static_cast<int>(sh_By[warp_id][ib0]);
+      ibz0 = static_cast<int>(sh_Bz[warp_id][ib0]);
+    }
+    icx0 = static_cast<int>(sh_Cx[warp_id][ic0]);
+    icy0 = static_cast<int>(sh_Cy[warp_id][ic0]);
+    icz0 = static_cast<int>(sh_Cz[warp_id][ic0]);
+  }
+  if (has1) {
+    const int iab = e1 / nC;
+    ic1 = e1 - iab * nC;
+    ia1 = iab / nB;
+    ib1 = iab - ia1 * nB;
+    iax1 = static_cast<int>(sh_Ax[warp_id][ia1]);
+    iay1 = static_cast<int>(sh_Ay[warp_id][ia1]);
+    iaz1 = static_cast<int>(sh_Az[warp_id][ia1]);
+    if (!lb_is_zero) {
+      ibx1 = static_cast<int>(sh_Bx[warp_id][ib1]);
+      iby1 = static_cast<int>(sh_By[warp_id][ib1]);
+      ibz1 = static_cast<int>(sh_Bz[warp_id][ib1]);
+    }
+    icx1 = static_cast<int>(sh_Cx[warp_id][ic1]);
+    icy1 = static_cast<int>(sh_Cy[warp_id][ic1]);
+    icz1 = static_cast<int>(sh_Cz[warp_id][ic1]);
+  }
+
+  double acc0[CTR_PAIR_MAX];
+  double acc1[CTR_PAIR_MAX];
+  for (int c = 0; c < CTR_PAIR_MAX; ++c) {
+    acc0[c] = 0.0;
+    acc1[c] = 0.0;
+  }
+
+  for (int ip = 0; ip < nPairAB; ++ip) {
+    const int ki = baseAB + ip;
+    double p = 0.0;
+    double Px = 0.0;
+    double Py = 0.0;
+    double Pz = 0.0;
+    double Kab = 0.0;
+    if (lane == 0) {
+      p = pair_eta[ki];
+      Px = pair_Px[ki];
+      Py = pair_Py[ki];
+      Pz = pair_Pz[ki];
+      Kab = pair_cK[ki];  // AO: Kab_geom (prim coef=1)
+
+      const int ipA = ip / nprimB;
+      const int ipB = ip - ipA * nprimB;
+      for (int ca = 0; ca < nctrA; ++ca) {
+        const double cA = ao_prim_coef[coefA0 + ipA * nctrA + ca];
+        for (int cb = 0; cb < nctrB; ++cb) {
+          const double cB = ao_prim_coef[coefB0 + ipB * nctrB + cb];
+          sh_wab[warp_id][ca * nctrB + cb] = cA * cB;
+        }
+      }
+    }
+    __syncwarp();
+
+    double val0 = 0.0;
+    double val1 = 0.0;
+
+    for (int jp = 0; jp < nPairCD; ++jp) {
+      const int kj = baseCD + jp;
+      double q = 0.0;
+      double Qx = 0.0;
+      double Qy = 0.0;
+      double Qz = 0.0;
+      double cKcd = 0.0;
+      double denom = 0.0;
+      double base = 0.0;
+      if (lane == 0) {
+        q = pair_eta[kj];
+        Qx = pair_Px[kj];
+        Qy = pair_Py[kj];
+        Qz = pair_Pz[kj];
+        cKcd = pair_cK[kj];  // aux coef (dummy exp=0 => Kab=1)
+
+        const double dx = Px - Qx;
+        const double dy = Py - Qy;
+        const double dz = Pz - Qz;
+        const double PQ2 = dx * dx + dy * dy + dz * dz;
+
+        denom = p + q;
+        const double omega = p * q / denom;
+        const double T = omega * PQ2;
+
+        base = kTwoPiToFiveHalves / (p * q * ::sqrt(denom)) * Kab * cKcd;
+
+        cueri_rys::rys_roots_weights<NROOTS>(T, sh_roots[warp_id], sh_weights[warp_id]);
+      }
+      __syncwarp();
+
+      for (int u = 0; u < NROOTS; ++u) {
+        if (lane == 0) {
+          const double x = sh_roots[warp_id][u];
+          const double w = sh_weights[warp_id][u];
+
+          const double inv_denom = 1.0 / denom;
+          const double B0 = x * 0.5 * inv_denom;
+          const double B1 = (1.0 - x) * 0.5 / p + B0;
+          const double B1p = (1.0 - x) * 0.5 / q + B0;
+
+          const double Ax = sh_Axyz[warp_id][0];
+          const double Ay = sh_Axyz[warp_id][1];
+          const double Az = sh_Axyz[warp_id][2];
+          const double Cx = sh_Cxyz[warp_id][0];
+          const double Cy = sh_Cxyz[warp_id][1];
+          const double Cz = sh_Cxyz[warp_id][2];
+
+          const double Cx_ = (Px - Ax) + (q * inv_denom) * x * (Qx - Px);
+          const double Cy_ = (Py - Ay) + (q * inv_denom) * x * (Qy - Py);
+          const double Cz_ = (Pz - Az) + (q * inv_denom) * x * (Qz - Pz);
+
+          const double Cpx_ = (Qx - Cx) + (p * inv_denom) * x * (Px - Qx);
+          const double Cpy_ = (Qy - Cy) + (p * inv_denom) * x * (Py - Qy);
+          const double Cpz_ = (Qz - Cz) + (p * inv_denom) * x * (Pz - Qz);
+
+          compute_G_stride<STRIDE>(sh_Gx[warp_id], nmax, mmax, Cx_, Cpx_, B0, B1, B1p);
+          compute_G_stride<STRIDE>(sh_Gy[warp_id], nmax, mmax, Cy_, Cpy_, B0, B1, B1p);
+          compute_G_stride<STRIDE>(sh_Gz[warp_id], nmax, mmax, Cz_, Cpz_, B0, B1, B1p);
+
+          sh_scale[warp_id] = base * w;
+        }
+        __syncwarp();
+
+        const double scale = sh_scale[warp_id];
+
+        if (has0) {
+          const double Ix = lb_is_zero ? sh_Gx[warp_id][iax0 * STRIDE + icx0]
+                                       : shift_from_G_stride<STRIDE>(
+                                             sh_Gx[warp_id], iax0, ibx0, icx0, 0, sh_xij_pow[warp_id], sh_xkl_pow[warp_id]);
+          const double Iy = lb_is_zero ? sh_Gy[warp_id][iay0 * STRIDE + icy0]
+                                       : shift_from_G_stride<STRIDE>(
+                                             sh_Gy[warp_id], iay0, iby0, icy0, 0, sh_yij_pow[warp_id], sh_ykl_pow[warp_id]);
+          const double Iz = lb_is_zero ? sh_Gz[warp_id][iaz0 * STRIDE + icz0]
+                                       : shift_from_G_stride<STRIDE>(
+                                             sh_Gz[warp_id], iaz0, ibz0, icz0, 0, sh_zij_pow[warp_id], sh_zkl_pow[warp_id]);
+          val0 += scale * (Ix * Iy * Iz);
+        }
+        if (has1) {
+          const double Ix = lb_is_zero ? sh_Gx[warp_id][iax1 * STRIDE + icx1]
+                                       : shift_from_G_stride<STRIDE>(
+                                             sh_Gx[warp_id], iax1, ibx1, icx1, 0, sh_xij_pow[warp_id], sh_xkl_pow[warp_id]);
+          const double Iy = lb_is_zero ? sh_Gy[warp_id][iay1 * STRIDE + icy1]
+                                       : shift_from_G_stride<STRIDE>(
+                                             sh_Gy[warp_id], iay1, iby1, icy1, 0, sh_yij_pow[warp_id], sh_ykl_pow[warp_id]);
+          const double Iz = lb_is_zero ? sh_Gz[warp_id][iaz1 * STRIDE + icz1]
+                                       : shift_from_G_stride<STRIDE>(
+                                             sh_Gz[warp_id], iaz1, ibz1, icz1, 0, sh_zij_pow[warp_id], sh_zkl_pow[warp_id]);
+          val1 += scale * (Ix * Iy * Iz);
+        }
+        __syncwarp();
+      }
+    }
+
+    if (has0) {
+      for (int c = 0; c < nctrAB; ++c) {
+        acc0[c] += sh_wab[warp_id][c] * val0;
+      }
+    }
+    if (has1) {
+      for (int c = 0; c < nctrAB; ++c) {
+        acc1[c] += sh_wab[warp_id][c] * val1;
+      }
+    }
+    __syncwarp();
+  }
+
+  if (has0) {
+    const int p = p0_shell + ic0;
+    for (int c = 0; c < nctrAB; ++c) {
+      const int ca = c / nctrB;
+      const int cb = c - ca * nctrB;
+      const int a = a0_shell + ca * nA + ia0;
+      const int b = b0_shell + cb * nB + ib0;
+      const int64_t idx_abp =
+          (static_cast<int64_t>(a) * static_cast<int64_t>(nao) + static_cast<int64_t>(b)) * static_cast<int64_t>(naux) +
+          static_cast<int64_t>(p);
+      const int64_t idx_bap =
+          (static_cast<int64_t>(b) * static_cast<int64_t>(nao) + static_cast<int64_t>(a)) * static_cast<int64_t>(naux) +
+          static_cast<int64_t>(p);
+      X_out[idx_abp] = acc0[c];
+      if (a != b) X_out[idx_bap] = acc0[c];
+    }
+  }
+  if (has1) {
+    const int p = p0_shell + ic1;
+    for (int c = 0; c < nctrAB; ++c) {
+      const int ca = c / nctrB;
+      const int cb = c - ca * nctrB;
+      const int a = a0_shell + ca * nA + ia1;
+      const int b = b0_shell + cb * nB + ib1;
+      const int64_t idx_abp =
+          (static_cast<int64_t>(a) * static_cast<int64_t>(nao) + static_cast<int64_t>(b)) * static_cast<int64_t>(naux) +
+          static_cast<int64_t>(p);
+      const int64_t idx_bap =
+          (static_cast<int64_t>(b) * static_cast<int64_t>(nao) + static_cast<int64_t>(a)) * static_cast<int64_t>(naux) +
+          static_cast<int64_t>(p);
+      X_out[idx_abp] = acc1[c];
+      if (a != b) X_out[idx_bap] = acc1[c];
+    }
+  }
+}
+
+template <int NROOTS, int STRIDE, int CTR_MAX>
+__global__ void KernelDFInt3c2e_RysContractedLd0Block(
+    const int32_t* task_spAB,
+    const int32_t* task_spCD,
+    int ntasks,
+    const int32_t* sp_A,
+    const int32_t* sp_B,
+    const int32_t* sp_pair_start,
+    const int32_t* sp_npair,
+    const int32_t* shell_nprim,
+    const double* shell_cx,
+    const double* shell_cy,
+    const double* shell_cz,
+    const double* pair_eta,
+    const double* pair_Px,
+    const double* pair_Py,
+    const double* pair_Pz,
+    const double* pair_cK,
+    const int32_t* ao_shell_ao_start,
+    const int32_t* ao_shell_nctr,
+    const int32_t* ao_shell_coef_start,
+    const double* ao_prim_coef,
+    const int32_t* aux_shell_ao_start,
+    int n_shell_ao,
+    int nao,
+    int naux,
+    int aux_p0_block,
+    int la,
+    int lb,
+    int lc,
+    double* X_out) {
+  constexpr int CTR_PAIR_MAX = CTR_MAX * CTR_MAX;
+  const int t = static_cast<int>(blockIdx.x);
+  if (t >= ntasks) return;
+
+  if (la < 0 || lb < 0 || lc < 0) return;
+  if (la > kLMax || lb > kLMax || lc > kLMax) return;
+
+  const int nA = ncart(la);
+  const int nB = ncart(lb);
+  const int nC = ncart(lc);
+  const int nElem = nA * nB * nC;
+  const bool lb_is_zero = (lb == 0);
+
+  const int spAB = static_cast<int>(task_spAB[t]);
+  const int spCD = static_cast<int>(task_spCD[t]);
+  const int A = static_cast<int>(sp_A[spAB]);
+  const int B = static_cast<int>(sp_B[spAB]);
+  const int C = static_cast<int>(sp_A[spCD]);  // combined-basis aux shell index
+  const int Psh = C - n_shell_ao;
+  if (Psh < 0) return;
+
+  const int a0_shell = static_cast<int>(ao_shell_ao_start[A]);
+  const int b0_shell = static_cast<int>(ao_shell_ao_start[B]);
+  const int nctrA = static_cast<int>(ao_shell_nctr[A]);
+  const int nctrB = static_cast<int>(ao_shell_nctr[B]);
+  if (nctrA <= 0 || nctrB <= 0) return;
+  if (nctrA > CTR_MAX || nctrB > CTR_MAX) return;
+  const int nctrAB = nctrA * nctrB;
+
+  const int coefA0 = static_cast<int>(ao_shell_coef_start[A]);
+  const int coefB0 = static_cast<int>(ao_shell_coef_start[B]);
+  const int nprimB = static_cast<int>(shell_nprim[B]);
+  if (nprimB <= 0) return;
+
+  const int p0_shell = static_cast<int>(aux_shell_ao_start[Psh]) - aux_p0_block;
+
+  const int nmax = la + lb;
+  const int mmax = lc;  // ld=0
+  if (nmax >= STRIDE || mmax >= STRIDE) return;
+
+  const int baseAB = static_cast<int>(sp_pair_start[spAB]);
+  const int baseCD = static_cast<int>(sp_pair_start[spCD]);
+  const int nPairAB = static_cast<int>(sp_npair[spAB]);
+  const int nPairCD = static_cast<int>(sp_npair[spCD]);
+
+  __shared__ int8_t sh_Ax[kNcartMax];
+  __shared__ int8_t sh_Ay[kNcartMax];
+  __shared__ int8_t sh_Az[kNcartMax];
+  __shared__ int8_t sh_Bx[kNcartMax];
+  __shared__ int8_t sh_By[kNcartMax];
+  __shared__ int8_t sh_Bz[kNcartMax];
+  __shared__ int8_t sh_Cx[kNcartMax];
+  __shared__ int8_t sh_Cy[kNcartMax];
+  __shared__ int8_t sh_Cz[kNcartMax];
+
+  __shared__ double sh_Gx[STRIDE * STRIDE];
+  __shared__ double sh_Gy[STRIDE * STRIDE];
+  __shared__ double sh_Gz[STRIDE * STRIDE];
+  __shared__ double sh_scale;
+  __shared__ double sh_roots[NROOTS];
+  __shared__ double sh_weights[NROOTS];
+
+  __shared__ double sh_xij_pow[kLMax + 1];
+  __shared__ double sh_xkl_pow[kLMax + 1];
+  __shared__ double sh_yij_pow[kLMax + 1];
+  __shared__ double sh_ykl_pow[kLMax + 1];
+  __shared__ double sh_zij_pow[kLMax + 1];
+  __shared__ double sh_zkl_pow[kLMax + 1];
+
+  __shared__ double sh_Axyz[3];
+  __shared__ double sh_Cxyz[3];
+
+  __shared__ double sh_wab[CTR_PAIR_MAX];
+
+  if (threadIdx.x == 0) {
+    fill_cart_comp(la, sh_Ax, sh_Ay, sh_Az);
+    if (!lb_is_zero) fill_cart_comp(lb, sh_Bx, sh_By, sh_Bz);
+    fill_cart_comp(lc, sh_Cx, sh_Cy, sh_Cz);
+
+    const double Ax = shell_cx[A];
+    const double Ay = shell_cy[A];
+    const double Az = shell_cz[A];
+    const double Bx = shell_cx[B];
+    const double By = shell_cy[B];
+    const double Bz = shell_cz[B];
+    const double Cx = shell_cx[C];
+    const double Cy = shell_cy[C];
+    const double Cz = shell_cz[C];
+
+    sh_Axyz[0] = Ax;
+    sh_Axyz[1] = Ay;
+    sh_Axyz[2] = Az;
+    sh_Cxyz[0] = Cx;
+    sh_Cxyz[1] = Cy;
+    sh_Cxyz[2] = Cz;
+
+    const double xij = Ax - Bx;
+    const double yij = Ay - By;
+    const double zij = Az - Bz;
+    sh_xij_pow[0] = 1.0;
+    sh_yij_pow[0] = 1.0;
+    sh_zij_pow[0] = 1.0;
+    for (int l = 1; l <= kLMax; ++l) {
+      sh_xij_pow[l] = sh_xij_pow[l - 1] * xij;
+      sh_yij_pow[l] = sh_yij_pow[l - 1] * yij;
+      sh_zij_pow[l] = sh_zij_pow[l - 1] * zij;
+    }
+    sh_xkl_pow[0] = 1.0;
+    sh_ykl_pow[0] = 1.0;
+    sh_zkl_pow[0] = 1.0;
+    for (int l = 1; l <= kLMax; ++l) {
+      sh_xkl_pow[l] = 0.0;
+      sh_ykl_pow[l] = 0.0;
+      sh_zkl_pow[l] = 0.0;
+    }
+  }
+  __syncthreads();
+
+  for (int e_base = 0; e_base < nElem; e_base += static_cast<int>(blockDim.x)) {
+    const int e = e_base + static_cast<int>(threadIdx.x);
+    const bool active = (e < nElem);
+
+    int ia = 0, ib = 0, ic = 0;
+    int iax = 0, iay = 0, iaz = 0, ibx = 0, iby = 0, ibz = 0, icx = 0, icy = 0, icz = 0;
+    if (active) {
+      const int iab = e / nC;
+      ic = e - iab * nC;
+      ia = iab / nB;
+      ib = iab - ia * nB;
+      iax = static_cast<int>(sh_Ax[ia]);
+      iay = static_cast<int>(sh_Ay[ia]);
+      iaz = static_cast<int>(sh_Az[ia]);
+      if (!lb_is_zero) {
+        ibx = static_cast<int>(sh_Bx[ib]);
+        iby = static_cast<int>(sh_By[ib]);
+        ibz = static_cast<int>(sh_Bz[ib]);
+      }
+      icx = static_cast<int>(sh_Cx[ic]);
+      icy = static_cast<int>(sh_Cy[ic]);
+      icz = static_cast<int>(sh_Cz[ic]);
+    }
+
+    double acc[CTR_PAIR_MAX];
+    for (int c = 0; c < CTR_PAIR_MAX; ++c) acc[c] = 0.0;
+
+    for (int ip = 0; ip < nPairAB; ++ip) {
+      const int ki = baseAB + ip;
+      double p = 0.0;
+      double Px = 0.0;
+      double Py = 0.0;
+      double Pz = 0.0;
+      double Kab = 0.0;
+      if (threadIdx.x == 0) {
+        p = pair_eta[ki];
+        Px = pair_Px[ki];
+        Py = pair_Py[ki];
+        Pz = pair_Pz[ki];
+        Kab = pair_cK[ki];
+
+        const int ipA = ip / nprimB;
+        const int ipB = ip - ipA * nprimB;
+        for (int ca = 0; ca < nctrA; ++ca) {
+          const double cA = ao_prim_coef[coefA0 + ipA * nctrA + ca];
+          for (int cb = 0; cb < nctrB; ++cb) {
+            const double cB = ao_prim_coef[coefB0 + ipB * nctrB + cb];
+            sh_wab[ca * nctrB + cb] = cA * cB;
+          }
+        }
+      }
+      __syncthreads();
+
+      double val = 0.0;
+      for (int jp = 0; jp < nPairCD; ++jp) {
+        const int kj = baseCD + jp;
+        double q = 0.0;
+        double Qx = 0.0;
+        double Qy = 0.0;
+        double Qz = 0.0;
+        double cKcd = 0.0;
+        double denom = 0.0;
+        double base = 0.0;
+        if (threadIdx.x == 0) {
+          q = pair_eta[kj];
+          Qx = pair_Px[kj];
+          Qy = pair_Py[kj];
+          Qz = pair_Pz[kj];
+          cKcd = pair_cK[kj];
+
+          const double dx = Px - Qx;
+          const double dy = Py - Qy;
+          const double dz = Pz - Qz;
+          const double PQ2 = dx * dx + dy * dy + dz * dz;
+
+          denom = p + q;
+          const double omega = p * q / denom;
+          const double T = omega * PQ2;
+
+          base = kTwoPiToFiveHalves / (p * q * ::sqrt(denom)) * Kab * cKcd;
+
+          cueri_rys::rys_roots_weights<NROOTS>(T, sh_roots, sh_weights);
+        }
+        __syncthreads();
+
+        for (int u = 0; u < NROOTS; ++u) {
+          if (threadIdx.x == 0) {
+            const double x = sh_roots[u];
+            const double w = sh_weights[u];
+
+            const double inv_denom = 1.0 / denom;
+            const double B0 = x * 0.5 * inv_denom;
+            const double B1 = (1.0 - x) * 0.5 / p + B0;
+            const double B1p = (1.0 - x) * 0.5 / q + B0;
+
+            const double Ax = sh_Axyz[0];
+            const double Ay = sh_Axyz[1];
+            const double Az = sh_Axyz[2];
+            const double Cx = sh_Cxyz[0];
+            const double Cy = sh_Cxyz[1];
+            const double Cz = sh_Cxyz[2];
+
+            const double Cx_ = (Px - Ax) + (q * inv_denom) * x * (Qx - Px);
+            const double Cy_ = (Py - Ay) + (q * inv_denom) * x * (Qy - Py);
+            const double Cz_ = (Pz - Az) + (q * inv_denom) * x * (Qz - Pz);
+
+            const double Cpx_ = (Qx - Cx) + (p * inv_denom) * x * (Px - Qx);
+            const double Cpy_ = (Qy - Cy) + (p * inv_denom) * x * (Py - Qy);
+            const double Cpz_ = (Qz - Cz) + (p * inv_denom) * x * (Pz - Qz);
+
+            compute_G_stride<STRIDE>(sh_Gx, nmax, mmax, Cx_, Cpx_, B0, B1, B1p);
+            compute_G_stride<STRIDE>(sh_Gy, nmax, mmax, Cy_, Cpy_, B0, B1, B1p);
+            compute_G_stride<STRIDE>(sh_Gz, nmax, mmax, Cz_, Cpz_, B0, B1, B1p);
+
+            sh_scale = base * w;
+          }
+          __syncthreads();
+
+          if (active) {
+            const double Ix = lb_is_zero ? sh_Gx[iax * STRIDE + icx]
+                                         : shift_from_G_stride<STRIDE>(sh_Gx, iax, ibx, icx, 0, sh_xij_pow, sh_xkl_pow);
+            const double Iy = lb_is_zero ? sh_Gy[iay * STRIDE + icy]
+                                         : shift_from_G_stride<STRIDE>(sh_Gy, iay, iby, icy, 0, sh_yij_pow, sh_ykl_pow);
+            const double Iz = lb_is_zero ? sh_Gz[iaz * STRIDE + icz]
+                                         : shift_from_G_stride<STRIDE>(sh_Gz, iaz, ibz, icz, 0, sh_zij_pow, sh_zkl_pow);
+            val += sh_scale * (Ix * Iy * Iz);
+          }
+          __syncthreads();
+        }
+      }
+
+      if (active) {
+        for (int c = 0; c < nctrAB; ++c) {
+          acc[c] += sh_wab[c] * val;
+        }
+      }
+      __syncthreads();
+    }
+
+    if (active) {
+      const int p = p0_shell + ic;
+      for (int c = 0; c < nctrAB; ++c) {
+        const int ca = c / nctrB;
+        const int cb = c - ca * nctrB;
+        const int a = a0_shell + ca * nA + ia;
+        const int b = b0_shell + cb * nB + ib;
+        const int64_t idx_abp =
+            (static_cast<int64_t>(a) * static_cast<int64_t>(nao) + static_cast<int64_t>(b)) * static_cast<int64_t>(naux) +
+            static_cast<int64_t>(p);
+        const int64_t idx_bap =
+            (static_cast<int64_t>(b) * static_cast<int64_t>(nao) + static_cast<int64_t>(a)) * static_cast<int64_t>(naux) +
+            static_cast<int64_t>(p);
+        X_out[idx_abp] = acc[c];
+        if (a != b) X_out[idx_bap] = acc[c];
+      }
+    }
+  }
+}
+
 }  // namespace
+
+template <int CTR_MAX>
+static cudaError_t cueri_df_int3c2e_rys_contracted_launch_stream_impl(
+    const int32_t* task_spAB,
+    const int32_t* task_spCD,
+    int ntasks,
+    const int32_t* sp_A,
+    const int32_t* sp_B,
+    const int32_t* sp_pair_start,
+    const int32_t* sp_npair,
+    const int32_t* shell_nprim,
+    const double* shell_cx,
+    const double* shell_cy,
+    const double* shell_cz,
+    const double* pair_eta,
+    const double* pair_Px,
+    const double* pair_Py,
+    const double* pair_Pz,
+    const double* pair_cK,
+    const int32_t* ao_shell_ao_start,
+    const int32_t* ao_shell_nctr,
+    const int32_t* ao_shell_coef_start,
+    const double* ao_prim_coef,
+    const int32_t* aux_shell_ao_start,
+    int n_shell_ao,
+    int nao,
+    int naux,
+    int aux_p0_block,
+    int la,
+    int lb,
+    int lc,
+    double* X_out,
+    cudaStream_t stream,
+    int threads) {
+  if (ntasks < 0) return cudaErrorInvalidValue;
+  if (n_shell_ao < 0) return cudaErrorInvalidValue;
+  if (nao < 0 || naux < 0) return cudaErrorInvalidValue;
+  if (aux_p0_block < 0) return cudaErrorInvalidValue;
+  if (la < 0 || lb < 0 || lc < 0) return cudaErrorInvalidValue;
+  if (la > kLMax || lb > kLMax || lc > kLMax) return cudaErrorInvalidValue;
+  if (threads <= 0) return cudaErrorInvalidValue;
+  if ((threads & 31) != 0) return cudaErrorInvalidValue;
+  if (threads > 256) return cudaErrorInvalidValue;
+
+  const int nA = ((la + 1) * (la + 2)) >> 1;
+  const int nB = ((lb + 1) * (lb + 2)) >> 1;
+  const int nC = ((lc + 1) * (lc + 2)) >> 1;
+  const int nElem = nA * nB * nC;
+  if (nElem <= 0) return cudaErrorInvalidValue;
+
+  const int lsum = la + lb + lc;  // ld=0
+  const int nroots = (lsum >> 1) + 1;
+  if (nroots < 1 || nroots > 11) return cudaErrorInvalidValue;
+
+  const int nmax = la + lb;
+  const int mmax = lc;  // ld=0
+  const bool use_stride5 = (nmax <= 4 && mmax <= 4);
+
+  const bool use_warp = (nElem <= 64);
+
+  // Subwarp packing for common contracted AO cases (CTR_MAX=2) in the STRIDE=5 bucket.
+  //
+  // Targets small DF tiles (nElem<=32) where the warp-per-task kernel suffers from
+  // poor lane utilization and setup-heavy leader work.
+  if constexpr (CTR_MAX == 2) {
+    if (use_stride5 && use_warp && nElem <= 32) {
+      const int threads_eff = threads;
+      const int warps_per_block = threads_eff >> 5;
+      if (warps_per_block <= 0 || warps_per_block > kMaxWarpsPerBlock) return cudaErrorInvalidValue;
+      const int tasks_per_block = warps_per_block * 4;
+      const int blocks = (ntasks + tasks_per_block - 1) / tasks_per_block;
+
+#define CUERI_LAUNCH_DF_INT3C2E_CONTRACTED_SUBWARP8(NR)                                                                         \
+  launch_df_int3c2e_rys_contracted_ld0_subwarp8_stride5<NR, CTR_MAX>(                                                           \
+      blocks,                                                                                                                  \
+      threads_eff,                                                                                                             \
+      tasks_per_block,                                                                                                         \
+      task_spAB,                                                                                                               \
+      task_spCD,                                                                                                               \
+      ntasks,                                                                                                                  \
+      sp_A,                                                                                                                    \
+      sp_B,                                                                                                                    \
+      sp_pair_start,                                                                                                           \
+      sp_npair,                                                                                                                \
+      shell_nprim,                                                                                                             \
+      shell_cx,                                                                                                                \
+      shell_cy,                                                                                                                \
+      shell_cz,                                                                                                                \
+      pair_eta,                                                                                                                \
+      pair_Px,                                                                                                                 \
+      pair_Py,                                                                                                                 \
+      pair_Pz,                                                                                                                 \
+      pair_cK,                                                                                                                 \
+      ao_shell_ao_start,                                                                                                       \
+      ao_shell_nctr,                                                                                                           \
+      ao_shell_coef_start,                                                                                                     \
+      ao_prim_coef,                                                                                                            \
+      aux_shell_ao_start,                                                                                                      \
+      n_shell_ao,                                                                                                              \
+      nao,                                                                                                                     \
+      naux,                                                                                                                    \
+      aux_p0_block,                                                                                                            \
+      la,                                                                                                                      \
+      lb,                                                                                                                      \
+      lc,                                                                                                                      \
+      X_out,                                                                                                                   \
+      stream)
+
+      switch (nroots) {
+        case 1:
+          CUERI_LAUNCH_DF_INT3C2E_CONTRACTED_SUBWARP8(1);
+          break;
+        case 2:
+          CUERI_LAUNCH_DF_INT3C2E_CONTRACTED_SUBWARP8(2);
+          break;
+        case 3:
+          CUERI_LAUNCH_DF_INT3C2E_CONTRACTED_SUBWARP8(3);
+          break;
+        case 4:
+          CUERI_LAUNCH_DF_INT3C2E_CONTRACTED_SUBWARP8(4);
+          break;
+        case 5:
+          CUERI_LAUNCH_DF_INT3C2E_CONTRACTED_SUBWARP8(5);
+          break;
+        case 6:
+          CUERI_LAUNCH_DF_INT3C2E_CONTRACTED_SUBWARP8(6);
+          break;
+        case 7:
+          CUERI_LAUNCH_DF_INT3C2E_CONTRACTED_SUBWARP8(7);
+          break;
+        case 8:
+          CUERI_LAUNCH_DF_INT3C2E_CONTRACTED_SUBWARP8(8);
+          break;
+        case 9:
+          CUERI_LAUNCH_DF_INT3C2E_CONTRACTED_SUBWARP8(9);
+          break;
+        case 10:
+          CUERI_LAUNCH_DF_INT3C2E_CONTRACTED_SUBWARP8(10);
+          break;
+        case 11:
+          CUERI_LAUNCH_DF_INT3C2E_CONTRACTED_SUBWARP8(11);
+          break;
+        default:
+#undef CUERI_LAUNCH_DF_INT3C2E_CONTRACTED_SUBWARP8
+          return cudaErrorInvalidValue;
+      }
+#undef CUERI_LAUNCH_DF_INT3C2E_CONTRACTED_SUBWARP8
+      return cudaGetLastError();
+    }
+  }
+
+  int threads_eff = threads;
+  int blocks = 0;
+  if (use_warp) {
+    const int warps_per_block = threads_eff >> 5;
+    if (warps_per_block <= 0 || warps_per_block > kMaxWarpsPerBlock) return cudaErrorInvalidValue;
+    blocks = (ntasks + warps_per_block - 1) / warps_per_block;
+  } else {
+    // For block-per-task, avoid launching many idle threads.
+    const int want = ((nElem + 31) >> 5) << 5;  // round up to warp multiple
+    threads_eff = (threads_eff > want) ? want : threads_eff;
+    if (threads_eff < 32) threads_eff = 32;
+    blocks = ntasks;
+  }
+
+  if (use_stride5) {
+    switch (nroots) {
+      case 1:
+        if (use_warp) {
+          KernelDFInt3c2e_RysContractedLd0Warp64<1, 5, CTR_MAX><<<blocks, threads_eff, 0, stream>>>(
+              task_spAB,
+              task_spCD,
+              ntasks,
+              sp_A,
+              sp_B,
+              sp_pair_start,
+              sp_npair,
+              shell_nprim,
+              shell_cx,
+              shell_cy,
+              shell_cz,
+              pair_eta,
+              pair_Px,
+              pair_Py,
+              pair_Pz,
+              pair_cK,
+              ao_shell_ao_start,
+              ao_shell_nctr,
+              ao_shell_coef_start,
+              ao_prim_coef,
+              aux_shell_ao_start,
+              n_shell_ao,
+              nao,
+              naux,
+              aux_p0_block,
+              la,
+              lb,
+              lc,
+              X_out);
+        } else {
+          KernelDFInt3c2e_RysContractedLd0Block<1, 5, CTR_MAX><<<blocks, threads_eff, 0, stream>>>(
+              task_spAB,
+              task_spCD,
+              ntasks,
+              sp_A,
+              sp_B,
+              sp_pair_start,
+              sp_npair,
+              shell_nprim,
+              shell_cx,
+              shell_cy,
+              shell_cz,
+              pair_eta,
+              pair_Px,
+              pair_Py,
+              pair_Pz,
+              pair_cK,
+              ao_shell_ao_start,
+              ao_shell_nctr,
+              ao_shell_coef_start,
+              ao_prim_coef,
+              aux_shell_ao_start,
+              n_shell_ao,
+              nao,
+              naux,
+              aux_p0_block,
+              la,
+              lb,
+              lc,
+              X_out);
+        }
+        break;
+      case 2:
+        if (use_warp) {
+          KernelDFInt3c2e_RysContractedLd0Warp64<2, 5, CTR_MAX><<<blocks, threads_eff, 0, stream>>>(task_spAB, task_spCD, ntasks, sp_A,
+                                                                                           sp_B, sp_pair_start, sp_npair,
+                                                                                           shell_nprim, shell_cx, shell_cy,
+                                                                                           shell_cz, pair_eta, pair_Px, pair_Py,
+                                                                                           pair_Pz, pair_cK, ao_shell_ao_start,
+                                                                                           ao_shell_nctr, ao_shell_coef_start,
+                                                                                           ao_prim_coef, aux_shell_ao_start,
+                                                                                           n_shell_ao, nao, naux, aux_p0_block,
+                                                                                           la, lb, lc, X_out);
+        } else {
+          KernelDFInt3c2e_RysContractedLd0Block<2, 5, CTR_MAX><<<blocks, threads_eff, 0, stream>>>(task_spAB, task_spCD, ntasks, sp_A,
+                                                                                          sp_B, sp_pair_start, sp_npair,
+                                                                                          shell_nprim, shell_cx, shell_cy, shell_cz,
+                                                                                          pair_eta, pair_Px, pair_Py, pair_Pz, pair_cK,
+                                                                                          ao_shell_ao_start, ao_shell_nctr,
+                                                                                          ao_shell_coef_start, ao_prim_coef,
+                                                                                          aux_shell_ao_start, n_shell_ao, nao, naux,
+                                                                                          aux_p0_block, la, lb, lc, X_out);
+        }
+        break;
+      case 3:
+        if (use_warp) {
+          KernelDFInt3c2e_RysContractedLd0Warp64<3, 5, CTR_MAX><<<blocks, threads_eff, 0, stream>>>(task_spAB, task_spCD, ntasks, sp_A,
+                                                                                           sp_B, sp_pair_start, sp_npair,
+                                                                                           shell_nprim, shell_cx, shell_cy,
+                                                                                           shell_cz, pair_eta, pair_Px, pair_Py,
+                                                                                           pair_Pz, pair_cK, ao_shell_ao_start,
+                                                                                           ao_shell_nctr, ao_shell_coef_start,
+                                                                                           ao_prim_coef, aux_shell_ao_start,
+                                                                                           n_shell_ao, nao, naux, aux_p0_block,
+                                                                                           la, lb, lc, X_out);
+        } else {
+          KernelDFInt3c2e_RysContractedLd0Block<3, 5, CTR_MAX><<<blocks, threads_eff, 0, stream>>>(task_spAB, task_spCD, ntasks, sp_A,
+                                                                                          sp_B, sp_pair_start, sp_npair,
+                                                                                          shell_nprim, shell_cx, shell_cy, shell_cz,
+                                                                                          pair_eta, pair_Px, pair_Py, pair_Pz, pair_cK,
+                                                                                          ao_shell_ao_start, ao_shell_nctr,
+                                                                                          ao_shell_coef_start, ao_prim_coef,
+                                                                                          aux_shell_ao_start, n_shell_ao, nao, naux,
+                                                                                          aux_p0_block, la, lb, lc, X_out);
+        }
+        break;
+      case 4:
+        if (use_warp) {
+          KernelDFInt3c2e_RysContractedLd0Warp64<4, 5, CTR_MAX><<<blocks, threads_eff, 0, stream>>>(task_spAB, task_spCD, ntasks, sp_A,
+                                                                                           sp_B, sp_pair_start, sp_npair,
+                                                                                           shell_nprim, shell_cx, shell_cy,
+                                                                                           shell_cz, pair_eta, pair_Px, pair_Py,
+                                                                                           pair_Pz, pair_cK, ao_shell_ao_start,
+                                                                                           ao_shell_nctr, ao_shell_coef_start,
+                                                                                           ao_prim_coef, aux_shell_ao_start,
+                                                                                           n_shell_ao, nao, naux, aux_p0_block,
+                                                                                           la, lb, lc, X_out);
+        } else {
+          KernelDFInt3c2e_RysContractedLd0Block<4, 5, CTR_MAX><<<blocks, threads_eff, 0, stream>>>(task_spAB, task_spCD, ntasks, sp_A,
+                                                                                          sp_B, sp_pair_start, sp_npair,
+                                                                                          shell_nprim, shell_cx, shell_cy, shell_cz,
+                                                                                          pair_eta, pair_Px, pair_Py, pair_Pz, pair_cK,
+                                                                                          ao_shell_ao_start, ao_shell_nctr,
+                                                                                          ao_shell_coef_start, ao_prim_coef,
+                                                                                          aux_shell_ao_start, n_shell_ao, nao, naux,
+                                                                                          aux_p0_block, la, lb, lc, X_out);
+        }
+        break;
+      case 5:
+        if (use_warp) {
+          KernelDFInt3c2e_RysContractedLd0Warp64<5, 5, CTR_MAX><<<blocks, threads_eff, 0, stream>>>(task_spAB, task_spCD, ntasks, sp_A,
+                                                                                           sp_B, sp_pair_start, sp_npair,
+                                                                                           shell_nprim, shell_cx, shell_cy,
+                                                                                           shell_cz, pair_eta, pair_Px, pair_Py,
+                                                                                           pair_Pz, pair_cK, ao_shell_ao_start,
+                                                                                           ao_shell_nctr, ao_shell_coef_start,
+                                                                                           ao_prim_coef, aux_shell_ao_start,
+                                                                                           n_shell_ao, nao, naux, aux_p0_block,
+                                                                                           la, lb, lc, X_out);
+        } else {
+          KernelDFInt3c2e_RysContractedLd0Block<5, 5, CTR_MAX><<<blocks, threads_eff, 0, stream>>>(task_spAB, task_spCD, ntasks, sp_A,
+                                                                                          sp_B, sp_pair_start, sp_npair,
+                                                                                          shell_nprim, shell_cx, shell_cy, shell_cz,
+                                                                                          pair_eta, pair_Px, pair_Py, pair_Pz, pair_cK,
+                                                                                          ao_shell_ao_start, ao_shell_nctr,
+                                                                                          ao_shell_coef_start, ao_prim_coef,
+                                                                                          aux_shell_ao_start, n_shell_ao, nao, naux,
+                                                                                          aux_p0_block, la, lb, lc, X_out);
+        }
+        break;
+      case 6:
+        if (use_warp) {
+          KernelDFInt3c2e_RysContractedLd0Warp64<6, 5, CTR_MAX><<<blocks, threads_eff, 0, stream>>>(task_spAB, task_spCD, ntasks, sp_A,
+                                                                                           sp_B, sp_pair_start, sp_npair,
+                                                                                           shell_nprim, shell_cx, shell_cy,
+                                                                                           shell_cz, pair_eta, pair_Px, pair_Py,
+                                                                                           pair_Pz, pair_cK, ao_shell_ao_start,
+                                                                                           ao_shell_nctr, ao_shell_coef_start,
+                                                                                           ao_prim_coef, aux_shell_ao_start,
+                                                                                           n_shell_ao, nao, naux, aux_p0_block,
+                                                                                           la, lb, lc, X_out);
+        } else {
+          KernelDFInt3c2e_RysContractedLd0Block<6, 5, CTR_MAX><<<blocks, threads_eff, 0, stream>>>(task_spAB, task_spCD, ntasks, sp_A,
+                                                                                          sp_B, sp_pair_start, sp_npair,
+                                                                                          shell_nprim, shell_cx, shell_cy, shell_cz,
+                                                                                          pair_eta, pair_Px, pair_Py, pair_Pz, pair_cK,
+                                                                                          ao_shell_ao_start, ao_shell_nctr,
+                                                                                          ao_shell_coef_start, ao_prim_coef,
+                                                                                          aux_shell_ao_start, n_shell_ao, nao, naux,
+                                                                                          aux_p0_block, la, lb, lc, X_out);
+        }
+        break;
+      case 7:
+        if (use_warp) {
+          KernelDFInt3c2e_RysContractedLd0Warp64<7, 5, CTR_MAX><<<blocks, threads_eff, 0, stream>>>(task_spAB, task_spCD, ntasks, sp_A,
+                                                                                           sp_B, sp_pair_start, sp_npair,
+                                                                                           shell_nprim, shell_cx, shell_cy,
+                                                                                           shell_cz, pair_eta, pair_Px, pair_Py,
+                                                                                           pair_Pz, pair_cK, ao_shell_ao_start,
+                                                                                           ao_shell_nctr, ao_shell_coef_start,
+                                                                                           ao_prim_coef, aux_shell_ao_start,
+                                                                                           n_shell_ao, nao, naux, aux_p0_block,
+                                                                                           la, lb, lc, X_out);
+        } else {
+          KernelDFInt3c2e_RysContractedLd0Block<7, 5, CTR_MAX><<<blocks, threads_eff, 0, stream>>>(task_spAB, task_spCD, ntasks, sp_A,
+                                                                                          sp_B, sp_pair_start, sp_npair,
+                                                                                          shell_nprim, shell_cx, shell_cy, shell_cz,
+                                                                                          pair_eta, pair_Px, pair_Py, pair_Pz, pair_cK,
+                                                                                          ao_shell_ao_start, ao_shell_nctr,
+                                                                                          ao_shell_coef_start, ao_prim_coef,
+                                                                                          aux_shell_ao_start, n_shell_ao, nao, naux,
+                                                                                          aux_p0_block, la, lb, lc, X_out);
+        }
+        break;
+      case 8:
+        if (use_warp) {
+          KernelDFInt3c2e_RysContractedLd0Warp64<8, 5, CTR_MAX><<<blocks, threads_eff, 0, stream>>>(task_spAB, task_spCD, ntasks, sp_A,
+                                                                                           sp_B, sp_pair_start, sp_npair,
+                                                                                           shell_nprim, shell_cx, shell_cy,
+                                                                                           shell_cz, pair_eta, pair_Px, pair_Py,
+                                                                                           pair_Pz, pair_cK, ao_shell_ao_start,
+                                                                                           ao_shell_nctr, ao_shell_coef_start,
+                                                                                           ao_prim_coef, aux_shell_ao_start,
+                                                                                           n_shell_ao, nao, naux, aux_p0_block,
+                                                                                           la, lb, lc, X_out);
+        } else {
+          KernelDFInt3c2e_RysContractedLd0Block<8, 5, CTR_MAX><<<blocks, threads_eff, 0, stream>>>(task_spAB, task_spCD, ntasks, sp_A,
+                                                                                          sp_B, sp_pair_start, sp_npair,
+                                                                                          shell_nprim, shell_cx, shell_cy, shell_cz,
+                                                                                          pair_eta, pair_Px, pair_Py, pair_Pz, pair_cK,
+                                                                                          ao_shell_ao_start, ao_shell_nctr,
+                                                                                          ao_shell_coef_start, ao_prim_coef,
+                                                                                          aux_shell_ao_start, n_shell_ao, nao, naux,
+                                                                                          aux_p0_block, la, lb, lc, X_out);
+        }
+        break;
+      case 9:
+        if (use_warp) {
+          KernelDFInt3c2e_RysContractedLd0Warp64<9, 5, CTR_MAX><<<blocks, threads_eff, 0, stream>>>(task_spAB, task_spCD, ntasks, sp_A,
+                                                                                           sp_B, sp_pair_start, sp_npair,
+                                                                                           shell_nprim, shell_cx, shell_cy,
+                                                                                           shell_cz, pair_eta, pair_Px, pair_Py,
+                                                                                           pair_Pz, pair_cK, ao_shell_ao_start,
+                                                                                           ao_shell_nctr, ao_shell_coef_start,
+                                                                                           ao_prim_coef, aux_shell_ao_start,
+                                                                                           n_shell_ao, nao, naux, aux_p0_block,
+                                                                                           la, lb, lc, X_out);
+        } else {
+          KernelDFInt3c2e_RysContractedLd0Block<9, 5, CTR_MAX><<<blocks, threads_eff, 0, stream>>>(task_spAB, task_spCD, ntasks, sp_A,
+                                                                                          sp_B, sp_pair_start, sp_npair,
+                                                                                          shell_nprim, shell_cx, shell_cy, shell_cz,
+                                                                                          pair_eta, pair_Px, pair_Py, pair_Pz, pair_cK,
+                                                                                          ao_shell_ao_start, ao_shell_nctr,
+                                                                                          ao_shell_coef_start, ao_prim_coef,
+                                                                                          aux_shell_ao_start, n_shell_ao, nao, naux,
+                                                                                          aux_p0_block, la, lb, lc, X_out);
+        }
+        break;
+      case 10:
+        if (use_warp) {
+          KernelDFInt3c2e_RysContractedLd0Warp64<10, 5, CTR_MAX><<<blocks, threads_eff, 0, stream>>>(task_spAB, task_spCD, ntasks, sp_A,
+                                                                                            sp_B, sp_pair_start, sp_npair,
+                                                                                            shell_nprim, shell_cx, shell_cy,
+                                                                                            shell_cz, pair_eta, pair_Px, pair_Py,
+                                                                                            pair_Pz, pair_cK, ao_shell_ao_start,
+                                                                                            ao_shell_nctr, ao_shell_coef_start,
+                                                                                            ao_prim_coef, aux_shell_ao_start,
+                                                                                            n_shell_ao, nao, naux, aux_p0_block,
+                                                                                            la, lb, lc, X_out);
+        } else {
+          KernelDFInt3c2e_RysContractedLd0Block<10, 5, CTR_MAX><<<blocks, threads_eff, 0, stream>>>(task_spAB, task_spCD, ntasks, sp_A,
+                                                                                           sp_B, sp_pair_start, sp_npair,
+                                                                                           shell_nprim, shell_cx, shell_cy, shell_cz,
+                                                                                           pair_eta, pair_Px, pair_Py, pair_Pz, pair_cK,
+                                                                                           ao_shell_ao_start, ao_shell_nctr,
+                                                                                           ao_shell_coef_start, ao_prim_coef,
+                                                                                           aux_shell_ao_start, n_shell_ao, nao, naux,
+                                                                                           aux_p0_block, la, lb, lc, X_out);
+        }
+        break;
+      case 11:
+        if (use_warp) {
+          KernelDFInt3c2e_RysContractedLd0Warp64<11, 5, CTR_MAX><<<blocks, threads_eff, 0, stream>>>(task_spAB, task_spCD, ntasks, sp_A,
+                                                                                            sp_B, sp_pair_start, sp_npair,
+                                                                                            shell_nprim, shell_cx, shell_cy,
+                                                                                            shell_cz, pair_eta, pair_Px, pair_Py,
+                                                                                            pair_Pz, pair_cK, ao_shell_ao_start,
+                                                                                            ao_shell_nctr, ao_shell_coef_start,
+                                                                                            ao_prim_coef, aux_shell_ao_start,
+                                                                                            n_shell_ao, nao, naux, aux_p0_block,
+                                                                                            la, lb, lc, X_out);
+        } else {
+          KernelDFInt3c2e_RysContractedLd0Block<11, 5, CTR_MAX><<<blocks, threads_eff, 0, stream>>>(task_spAB, task_spCD, ntasks, sp_A,
+                                                                                           sp_B, sp_pair_start, sp_npair,
+                                                                                           shell_nprim, shell_cx, shell_cy, shell_cz,
+                                                                                           pair_eta, pair_Px, pair_Py, pair_Pz, pair_cK,
+                                                                                           ao_shell_ao_start, ao_shell_nctr,
+                                                                                           ao_shell_coef_start, ao_prim_coef,
+                                                                                           aux_shell_ao_start, n_shell_ao, nao, naux,
+                                                                                           aux_p0_block, la, lb, lc, X_out);
+        }
+        break;
+      default:
+        return cudaErrorInvalidValue;
+    }
+  } else {
+    switch (nroots) {
+      case 1:
+        if (use_warp) {
+          KernelDFInt3c2e_RysContractedLd0Warp64<1, kStride, CTR_MAX><<<blocks, threads_eff, 0, stream>>>(task_spAB, task_spCD, ntasks, sp_A,
+                                                                                                sp_B, sp_pair_start, sp_npair,
+                                                                                                shell_nprim, shell_cx, shell_cy, shell_cz,
+                                                                                                pair_eta, pair_Px, pair_Py, pair_Pz, pair_cK,
+                                                                                                ao_shell_ao_start, ao_shell_nctr,
+                                                                                                ao_shell_coef_start, ao_prim_coef,
+                                                                                                aux_shell_ao_start, n_shell_ao, nao, naux,
+                                                                                                aux_p0_block, la, lb, lc, X_out);
+        } else {
+          KernelDFInt3c2e_RysContractedLd0Block<1, kStride, CTR_MAX><<<blocks, threads_eff, 0, stream>>>(task_spAB, task_spCD, ntasks, sp_A,
+                                                                                               sp_B, sp_pair_start, sp_npair,
+                                                                                               shell_nprim, shell_cx, shell_cy, shell_cz,
+                                                                                               pair_eta, pair_Px, pair_Py, pair_Pz, pair_cK,
+                                                                                               ao_shell_ao_start, ao_shell_nctr,
+                                                                                               ao_shell_coef_start, ao_prim_coef,
+                                                                                               aux_shell_ao_start, n_shell_ao, nao, naux,
+                                                                                               aux_p0_block, la, lb, lc, X_out);
+        }
+        break;
+      case 2:
+        if (use_warp) {
+          KernelDFInt3c2e_RysContractedLd0Warp64<2, kStride, CTR_MAX><<<blocks, threads_eff, 0, stream>>>(task_spAB, task_spCD, ntasks, sp_A,
+                                                                                                sp_B, sp_pair_start, sp_npair,
+                                                                                                shell_nprim, shell_cx, shell_cy, shell_cz,
+                                                                                                pair_eta, pair_Px, pair_Py, pair_Pz, pair_cK,
+                                                                                                ao_shell_ao_start, ao_shell_nctr,
+                                                                                                ao_shell_coef_start, ao_prim_coef,
+                                                                                                aux_shell_ao_start, n_shell_ao, nao, naux,
+                                                                                                aux_p0_block, la, lb, lc, X_out);
+        } else {
+          KernelDFInt3c2e_RysContractedLd0Block<2, kStride, CTR_MAX><<<blocks, threads_eff, 0, stream>>>(task_spAB, task_spCD, ntasks, sp_A,
+                                                                                               sp_B, sp_pair_start, sp_npair,
+                                                                                               shell_nprim, shell_cx, shell_cy, shell_cz,
+                                                                                               pair_eta, pair_Px, pair_Py, pair_Pz, pair_cK,
+                                                                                               ao_shell_ao_start, ao_shell_nctr,
+                                                                                               ao_shell_coef_start, ao_prim_coef,
+                                                                                               aux_shell_ao_start, n_shell_ao, nao, naux,
+                                                                                               aux_p0_block, la, lb, lc, X_out);
+        }
+        break;
+      case 3:
+        if (use_warp) {
+          KernelDFInt3c2e_RysContractedLd0Warp64<3, kStride, CTR_MAX><<<blocks, threads_eff, 0, stream>>>(task_spAB, task_spCD, ntasks, sp_A,
+                                                                                                sp_B, sp_pair_start, sp_npair,
+                                                                                                shell_nprim, shell_cx, shell_cy, shell_cz,
+                                                                                                pair_eta, pair_Px, pair_Py, pair_Pz, pair_cK,
+                                                                                                ao_shell_ao_start, ao_shell_nctr,
+                                                                                                ao_shell_coef_start, ao_prim_coef,
+                                                                                                aux_shell_ao_start, n_shell_ao, nao, naux,
+                                                                                                aux_p0_block, la, lb, lc, X_out);
+        } else {
+          KernelDFInt3c2e_RysContractedLd0Block<3, kStride, CTR_MAX><<<blocks, threads_eff, 0, stream>>>(task_spAB, task_spCD, ntasks, sp_A,
+                                                                                               sp_B, sp_pair_start, sp_npair,
+                                                                                               shell_nprim, shell_cx, shell_cy, shell_cz,
+                                                                                               pair_eta, pair_Px, pair_Py, pair_Pz, pair_cK,
+                                                                                               ao_shell_ao_start, ao_shell_nctr,
+                                                                                               ao_shell_coef_start, ao_prim_coef,
+                                                                                               aux_shell_ao_start, n_shell_ao, nao, naux,
+                                                                                               aux_p0_block, la, lb, lc, X_out);
+        }
+        break;
+      case 4:
+        if (use_warp) {
+          KernelDFInt3c2e_RysContractedLd0Warp64<4, kStride, CTR_MAX><<<blocks, threads_eff, 0, stream>>>(task_spAB, task_spCD, ntasks, sp_A,
+                                                                                                sp_B, sp_pair_start, sp_npair,
+                                                                                                shell_nprim, shell_cx, shell_cy, shell_cz,
+                                                                                                pair_eta, pair_Px, pair_Py, pair_Pz, pair_cK,
+                                                                                                ao_shell_ao_start, ao_shell_nctr,
+                                                                                                ao_shell_coef_start, ao_prim_coef,
+                                                                                                aux_shell_ao_start, n_shell_ao, nao, naux,
+                                                                                                aux_p0_block, la, lb, lc, X_out);
+        } else {
+          KernelDFInt3c2e_RysContractedLd0Block<4, kStride, CTR_MAX><<<blocks, threads_eff, 0, stream>>>(task_spAB, task_spCD, ntasks, sp_A,
+                                                                                               sp_B, sp_pair_start, sp_npair,
+                                                                                               shell_nprim, shell_cx, shell_cy, shell_cz,
+                                                                                               pair_eta, pair_Px, pair_Py, pair_Pz, pair_cK,
+                                                                                               ao_shell_ao_start, ao_shell_nctr,
+                                                                                               ao_shell_coef_start, ao_prim_coef,
+                                                                                               aux_shell_ao_start, n_shell_ao, nao, naux,
+                                                                                               aux_p0_block, la, lb, lc, X_out);
+        }
+        break;
+      case 5:
+        if (use_warp) {
+          KernelDFInt3c2e_RysContractedLd0Warp64<5, kStride, CTR_MAX><<<blocks, threads_eff, 0, stream>>>(task_spAB, task_spCD, ntasks, sp_A,
+                                                                                                sp_B, sp_pair_start, sp_npair,
+                                                                                                shell_nprim, shell_cx, shell_cy, shell_cz,
+                                                                                                pair_eta, pair_Px, pair_Py, pair_Pz, pair_cK,
+                                                                                                ao_shell_ao_start, ao_shell_nctr,
+                                                                                                ao_shell_coef_start, ao_prim_coef,
+                                                                                                aux_shell_ao_start, n_shell_ao, nao, naux,
+                                                                                                aux_p0_block, la, lb, lc, X_out);
+        } else {
+          KernelDFInt3c2e_RysContractedLd0Block<5, kStride, CTR_MAX><<<blocks, threads_eff, 0, stream>>>(task_spAB, task_spCD, ntasks, sp_A,
+                                                                                               sp_B, sp_pair_start, sp_npair,
+                                                                                               shell_nprim, shell_cx, shell_cy, shell_cz,
+                                                                                               pair_eta, pair_Px, pair_Py, pair_Pz, pair_cK,
+                                                                                               ao_shell_ao_start, ao_shell_nctr,
+                                                                                               ao_shell_coef_start, ao_prim_coef,
+                                                                                               aux_shell_ao_start, n_shell_ao, nao, naux,
+                                                                                               aux_p0_block, la, lb, lc, X_out);
+        }
+        break;
+      case 6:
+        if (use_warp) {
+          KernelDFInt3c2e_RysContractedLd0Warp64<6, kStride, CTR_MAX><<<blocks, threads_eff, 0, stream>>>(task_spAB, task_spCD, ntasks, sp_A,
+                                                                                                sp_B, sp_pair_start, sp_npair,
+                                                                                                shell_nprim, shell_cx, shell_cy, shell_cz,
+                                                                                                pair_eta, pair_Px, pair_Py, pair_Pz, pair_cK,
+                                                                                                ao_shell_ao_start, ao_shell_nctr,
+                                                                                                ao_shell_coef_start, ao_prim_coef,
+                                                                                                aux_shell_ao_start, n_shell_ao, nao, naux,
+                                                                                                aux_p0_block, la, lb, lc, X_out);
+        } else {
+          KernelDFInt3c2e_RysContractedLd0Block<6, kStride, CTR_MAX><<<blocks, threads_eff, 0, stream>>>(task_spAB, task_spCD, ntasks, sp_A,
+                                                                                               sp_B, sp_pair_start, sp_npair,
+                                                                                               shell_nprim, shell_cx, shell_cy, shell_cz,
+                                                                                               pair_eta, pair_Px, pair_Py, pair_Pz, pair_cK,
+                                                                                               ao_shell_ao_start, ao_shell_nctr,
+                                                                                               ao_shell_coef_start, ao_prim_coef,
+                                                                                               aux_shell_ao_start, n_shell_ao, nao, naux,
+                                                                                               aux_p0_block, la, lb, lc, X_out);
+        }
+        break;
+      case 7:
+        if (use_warp) {
+          KernelDFInt3c2e_RysContractedLd0Warp64<7, kStride, CTR_MAX><<<blocks, threads_eff, 0, stream>>>(task_spAB, task_spCD, ntasks, sp_A,
+                                                                                                sp_B, sp_pair_start, sp_npair,
+                                                                                                shell_nprim, shell_cx, shell_cy, shell_cz,
+                                                                                                pair_eta, pair_Px, pair_Py, pair_Pz, pair_cK,
+                                                                                                ao_shell_ao_start, ao_shell_nctr,
+                                                                                                ao_shell_coef_start, ao_prim_coef,
+                                                                                                aux_shell_ao_start, n_shell_ao, nao, naux,
+                                                                                                aux_p0_block, la, lb, lc, X_out);
+        } else {
+          KernelDFInt3c2e_RysContractedLd0Block<7, kStride, CTR_MAX><<<blocks, threads_eff, 0, stream>>>(task_spAB, task_spCD, ntasks, sp_A,
+                                                                                               sp_B, sp_pair_start, sp_npair,
+                                                                                               shell_nprim, shell_cx, shell_cy, shell_cz,
+                                                                                               pair_eta, pair_Px, pair_Py, pair_Pz, pair_cK,
+                                                                                               ao_shell_ao_start, ao_shell_nctr,
+                                                                                               ao_shell_coef_start, ao_prim_coef,
+                                                                                               aux_shell_ao_start, n_shell_ao, nao, naux,
+                                                                                               aux_p0_block, la, lb, lc, X_out);
+        }
+        break;
+      case 8:
+        if (use_warp) {
+          KernelDFInt3c2e_RysContractedLd0Warp64<8, kStride, CTR_MAX><<<blocks, threads_eff, 0, stream>>>(task_spAB, task_spCD, ntasks, sp_A,
+                                                                                                sp_B, sp_pair_start, sp_npair,
+                                                                                                shell_nprim, shell_cx, shell_cy, shell_cz,
+                                                                                                pair_eta, pair_Px, pair_Py, pair_Pz, pair_cK,
+                                                                                                ao_shell_ao_start, ao_shell_nctr,
+                                                                                                ao_shell_coef_start, ao_prim_coef,
+                                                                                                aux_shell_ao_start, n_shell_ao, nao, naux,
+                                                                                                aux_p0_block, la, lb, lc, X_out);
+        } else {
+          KernelDFInt3c2e_RysContractedLd0Block<8, kStride, CTR_MAX><<<blocks, threads_eff, 0, stream>>>(task_spAB, task_spCD, ntasks, sp_A,
+                                                                                               sp_B, sp_pair_start, sp_npair,
+                                                                                               shell_nprim, shell_cx, shell_cy, shell_cz,
+                                                                                               pair_eta, pair_Px, pair_Py, pair_Pz, pair_cK,
+                                                                                               ao_shell_ao_start, ao_shell_nctr,
+                                                                                               ao_shell_coef_start, ao_prim_coef,
+                                                                                               aux_shell_ao_start, n_shell_ao, nao, naux,
+                                                                                               aux_p0_block, la, lb, lc, X_out);
+        }
+        break;
+      case 9:
+        if (use_warp) {
+          KernelDFInt3c2e_RysContractedLd0Warp64<9, kStride, CTR_MAX><<<blocks, threads_eff, 0, stream>>>(task_spAB, task_spCD, ntasks, sp_A,
+                                                                                                sp_B, sp_pair_start, sp_npair,
+                                                                                                shell_nprim, shell_cx, shell_cy, shell_cz,
+                                                                                                pair_eta, pair_Px, pair_Py, pair_Pz, pair_cK,
+                                                                                                ao_shell_ao_start, ao_shell_nctr,
+                                                                                                ao_shell_coef_start, ao_prim_coef,
+                                                                                                aux_shell_ao_start, n_shell_ao, nao, naux,
+                                                                                                aux_p0_block, la, lb, lc, X_out);
+        } else {
+          KernelDFInt3c2e_RysContractedLd0Block<9, kStride, CTR_MAX><<<blocks, threads_eff, 0, stream>>>(task_spAB, task_spCD, ntasks, sp_A,
+                                                                                               sp_B, sp_pair_start, sp_npair,
+                                                                                               shell_nprim, shell_cx, shell_cy, shell_cz,
+                                                                                               pair_eta, pair_Px, pair_Py, pair_Pz, pair_cK,
+                                                                                               ao_shell_ao_start, ao_shell_nctr,
+                                                                                               ao_shell_coef_start, ao_prim_coef,
+                                                                                               aux_shell_ao_start, n_shell_ao, nao, naux,
+                                                                                               aux_p0_block, la, lb, lc, X_out);
+        }
+        break;
+      case 10:
+        if (use_warp) {
+          KernelDFInt3c2e_RysContractedLd0Warp64<10, kStride, CTR_MAX><<<blocks, threads_eff, 0, stream>>>(task_spAB, task_spCD, ntasks, sp_A,
+                                                                                                 sp_B, sp_pair_start, sp_npair,
+                                                                                                 shell_nprim, shell_cx, shell_cy, shell_cz,
+                                                                                                 pair_eta, pair_Px, pair_Py, pair_Pz, pair_cK,
+                                                                                                 ao_shell_ao_start, ao_shell_nctr,
+                                                                                                 ao_shell_coef_start, ao_prim_coef,
+                                                                                                 aux_shell_ao_start, n_shell_ao, nao, naux,
+                                                                                                 aux_p0_block, la, lb, lc, X_out);
+        } else {
+          KernelDFInt3c2e_RysContractedLd0Block<10, kStride, CTR_MAX><<<blocks, threads_eff, 0, stream>>>(task_spAB, task_spCD, ntasks, sp_A,
+                                                                                                sp_B, sp_pair_start, sp_npair,
+                                                                                                shell_nprim, shell_cx, shell_cy, shell_cz,
+                                                                                                pair_eta, pair_Px, pair_Py, pair_Pz, pair_cK,
+                                                                                                ao_shell_ao_start, ao_shell_nctr,
+                                                                                                ao_shell_coef_start, ao_prim_coef,
+                                                                                                aux_shell_ao_start, n_shell_ao, nao, naux,
+                                                                                                aux_p0_block, la, lb, lc, X_out);
+        }
+        break;
+      case 11:
+        if (use_warp) {
+          KernelDFInt3c2e_RysContractedLd0Warp64<11, kStride, CTR_MAX><<<blocks, threads_eff, 0, stream>>>(task_spAB, task_spCD, ntasks, sp_A,
+                                                                                                 sp_B, sp_pair_start, sp_npair,
+                                                                                                 shell_nprim, shell_cx, shell_cy, shell_cz,
+                                                                                                 pair_eta, pair_Px, pair_Py, pair_Pz, pair_cK,
+                                                                                                 ao_shell_ao_start, ao_shell_nctr,
+                                                                                                 ao_shell_coef_start, ao_prim_coef,
+                                                                                                 aux_shell_ao_start, n_shell_ao, nao, naux,
+                                                                                                 aux_p0_block, la, lb, lc, X_out);
+        } else {
+          KernelDFInt3c2e_RysContractedLd0Block<11, kStride, CTR_MAX><<<blocks, threads_eff, 0, stream>>>(task_spAB, task_spCD, ntasks, sp_A,
+                                                                                                sp_B, sp_pair_start, sp_npair,
+                                                                                                shell_nprim, shell_cx, shell_cy, shell_cz,
+                                                                                                pair_eta, pair_Px, pair_Py, pair_Pz, pair_cK,
+                                                                                                ao_shell_ao_start, ao_shell_nctr,
+                                                                                                ao_shell_coef_start, ao_prim_coef,
+                                                                                                aux_shell_ao_start, n_shell_ao, nao, naux,
+                                                                                                aux_p0_block, la, lb, lc, X_out);
+        }
+        break;
+      default:
+        return cudaErrorInvalidValue;
+    }
+  }
+
+  return cudaGetLastError();
+}
 
 extern "C" cudaError_t cueri_eri_rys_generic_launch_stream(
     const int32_t* task_spAB,
@@ -2865,5 +4810,139 @@ extern "C" cudaError_t cueri_eri_rys_df_ld0_warp_launch_stream(
   }
 
   return cudaGetLastError();
+}
+
+extern "C" cudaError_t cueri_df_int3c2e_rys_contracted_launch_stream(
+    const int32_t* task_spAB,
+    const int32_t* task_spCD,
+    int ntasks,
+    const int32_t* sp_A,
+    const int32_t* sp_B,
+    const int32_t* sp_pair_start,
+    const int32_t* sp_npair,
+    const int32_t* shell_nprim,
+    const double* shell_cx,
+    const double* shell_cy,
+    const double* shell_cz,
+    const double* pair_eta,
+    const double* pair_Px,
+    const double* pair_Py,
+    const double* pair_Pz,
+    const double* pair_cK,
+    const int32_t* ao_shell_ao_start,
+    const int32_t* ao_shell_nctr,
+    const int32_t* ao_shell_coef_start,
+    const double* ao_prim_coef,
+    const int32_t* aux_shell_ao_start,
+    int n_shell_ao,
+    int nao,
+    int naux,
+    int aux_p0_block,
+    int la,
+    int lb,
+    int lc,
+    double* X_out,
+    cudaStream_t stream,
+    int threads) {
+  return cueri_df_int3c2e_rys_contracted_launch_stream_impl<kCtrMax>(
+      task_spAB,
+      task_spCD,
+      ntasks,
+      sp_A,
+      sp_B,
+      sp_pair_start,
+      sp_npair,
+      shell_nprim,
+      shell_cx,
+      shell_cy,
+      shell_cz,
+      pair_eta,
+      pair_Px,
+      pair_Py,
+      pair_Pz,
+      pair_cK,
+      ao_shell_ao_start,
+      ao_shell_nctr,
+      ao_shell_coef_start,
+      ao_prim_coef,
+      aux_shell_ao_start,
+      n_shell_ao,
+      nao,
+      naux,
+      aux_p0_block,
+      la,
+      lb,
+      lc,
+      X_out,
+      stream,
+      threads);
+}
+
+extern "C" cudaError_t cueri_df_int3c2e_rys_contracted_ctr2_launch_stream(
+    const int32_t* task_spAB,
+    const int32_t* task_spCD,
+    int ntasks,
+    const int32_t* sp_A,
+    const int32_t* sp_B,
+    const int32_t* sp_pair_start,
+    const int32_t* sp_npair,
+    const int32_t* shell_nprim,
+    const double* shell_cx,
+    const double* shell_cy,
+    const double* shell_cz,
+    const double* pair_eta,
+    const double* pair_Px,
+    const double* pair_Py,
+    const double* pair_Pz,
+    const double* pair_cK,
+    const int32_t* ao_shell_ao_start,
+    const int32_t* ao_shell_nctr,
+    const int32_t* ao_shell_coef_start,
+    const double* ao_prim_coef,
+    const int32_t* aux_shell_ao_start,
+    int n_shell_ao,
+    int nao,
+    int naux,
+    int aux_p0_block,
+    int la,
+    int lb,
+    int lc,
+    double* X_out,
+    cudaStream_t stream,
+    int threads) {
+  // CTR_MAX=2 specialization: significantly reduces register pressure for the
+  // common case nctrA,nctrB<=2 (e.g., cc-pVXZ).
+  return cueri_df_int3c2e_rys_contracted_launch_stream_impl<2>(
+      task_spAB,
+      task_spCD,
+      ntasks,
+      sp_A,
+      sp_B,
+      sp_pair_start,
+      sp_npair,
+      shell_nprim,
+      shell_cx,
+      shell_cy,
+      shell_cz,
+      pair_eta,
+      pair_Px,
+      pair_Py,
+      pair_Pz,
+      pair_cK,
+      ao_shell_ao_start,
+      ao_shell_nctr,
+      ao_shell_coef_start,
+      ao_prim_coef,
+      aux_shell_ao_start,
+      n_shell_ao,
+      nao,
+      naux,
+      aux_p0_block,
+      la,
+      lb,
+      lc,
+      X_out,
+      stream,
+      threads);
 }
 

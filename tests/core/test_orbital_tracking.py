@@ -119,6 +119,30 @@ def test_assign_active_orbitals_subspace_no_shift():
     assert set(new_active) == {3, 4, 5}
 
 
+def test_assign_active_orbitals_subspace_preserves_prev_order_on_near_tie():
+    """Subspace selection should not reverse a nearly degenerate active pair."""
+    from asuka.mcscf.orbital_tracking import assign_active_orbitals_by_overlap
+
+    nmo = 60
+    C_prev = np.eye(nmo)
+    C_new = np.eye(nmo)
+    S = np.eye(nmo)
+
+    # Mimic a real tracked pair where the active set is still {47,48}, but the
+    # total subspace score of column 48 is slightly larger than column 47.
+    S[47, 47] = 0.98758147
+    S[47, 48] = 0.05712902
+    S[48, 47] = -0.05201094
+    S[48, 48] = 0.98964269
+
+    prev_active = [47, 48]
+    new_active = assign_active_orbitals_by_overlap(
+        C_prev, C_new, S, prev_active, ncas=2, method="subspace"
+    )
+
+    assert new_active.tolist() == [47, 48]
+
+
 def test_assign_active_orbitals_hungarian():
     """Hungarian method should give optimal 1-to-1 assignment."""
     pytest.importorskip("scipy")  # Skip if scipy not available
@@ -384,6 +408,91 @@ def test_orbital_tracking_with_tuple_ref():
     )
 
     assert callable(energy_grad)
+
+
+def test_orbital_tracking_retries_drifted_casscf(monkeypatch, capsys):
+    """A drifted converged CASSCF should be reordered and retried."""
+    from dataclasses import dataclass
+    from types import SimpleNamespace
+
+    from asuka.frontend import Molecule, make_df_casscf_energy_grad
+    from asuka.frontend.one_electron import build_int1e_from_mol
+
+    mol = Molecule.from_atoms(
+        atoms=[
+            ("O", (0.0, 0.0, 0.0)),
+            ("H", (0.0, 0.757, 0.586)),
+            ("H", (0.0, -0.757, 0.586)),
+        ],
+        basis="sto-3g",
+    )
+    int1e, _ao_basis, _basis_name, _T = build_int1e_from_mol(mol)
+    nmo = int(int1e.S.shape[0])
+    mo_ref = np.eye(nmo, dtype=np.float64)
+    drift_perm = [0, 3, 4, 1, 2] + list(range(5, nmo))
+    mo_drift = mo_ref[:, drift_perm]
+
+    @dataclass
+    class MockCASSCF:
+        mol: Molecule
+        mo_coeff: np.ndarray
+        ci: np.ndarray
+        ncore: int
+        ncas: int
+
+    ref_result = MockCASSCF(
+        mol=mol,
+        mo_coeff=mo_ref.copy(),
+        ci=np.array([1.0, 0.0], dtype=np.float64),
+        ncore=1,
+        ncas=2,
+    )
+
+    calls: list[np.ndarray] = []
+
+    def fake_run_hf(mol_eval, **kwargs):
+        return SimpleNamespace(
+            scf=SimpleNamespace(mo_coeff=mo_ref.copy(), converged=True),
+            e_tot=-74.0,
+            mol=mol_eval,
+        )
+
+    def fake_run_casscf(scf_out, **kwargs):
+        mo_coeff0 = np.asarray(kwargs.get("mo_coeff0"), dtype=np.float64)
+        calls.append(mo_coeff0.copy())
+        if len(calls) == 1:
+            return SimpleNamespace(mo_coeff=mo_drift.copy(), ci=np.array([1.0, 0.0]), converged=True)
+        np.testing.assert_allclose(mo_coeff0, mo_ref, atol=1e-12)
+        return SimpleNamespace(mo_coeff=mo_ref.copy(), ci=np.array([1.0, 0.0]), converged=True)
+
+    def fake_grad(scf_out, mc, **kwargs):
+        return SimpleNamespace(e_tot=-75.0, grad=np.zeros((int(mol.natm), 3), dtype=np.float64))
+
+    monkeypatch.setattr("asuka.frontend.run_hf", fake_run_hf)
+    monkeypatch.setattr("asuka.mcscf.run_casscf", fake_run_casscf)
+    monkeypatch.setattr("asuka.mcscf.nuc_grad_df.casscf_nuc_grad_df", fake_grad)
+
+    energy_grad = make_df_casscf_energy_grad(
+        mol,
+        casscf_kwargs={
+            "ncore": 1,
+            "ncas": 2,
+            "nelecas": 2,
+            "orbital_tracking_max_retry": 1,
+        },
+        orbital_tracking=True,
+        tracking_ref=(mol, ref_result),
+    )
+
+    E, grad = energy_grad(mol.coords_bohr.reshape(-1))
+    out = capsys.readouterr().out
+
+    assert len(calls) == 2
+    assert float(E) == pytest.approx(-75.0)
+    assert grad.shape == (int(mol.natm), 3)
+    assert "casscf attempt 1 drifted" in out
+    assert "retrying with reordered active orbitals" in out
+    assert "casscf attempt 2 accepted" in out
 
 
 def test_cross_geometry_overlap_water():

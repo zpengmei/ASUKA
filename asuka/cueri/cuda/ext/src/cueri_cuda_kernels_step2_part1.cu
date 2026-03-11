@@ -1,4 +1,4 @@
-// Auto-split from cueri_cuda_kernels_step2.cu (part 1/4: KernelERI_multiblock_reduce_fixed..KernelERI_psps_warp)
+// Auto-split from cueri_cuda_kernels_step2.cu (part 1/4: KernelERI_multiblock_reduce_fixed..KernelERI_ppss_warp)
 // Do not edit — regenerate with split_large_kernels.py
 
 #include <cuda_runtime.h>
@@ -1524,6 +1524,151 @@ __global__ void KernelERI_psps_warp(
     eri_out[out + 8] = s22;
   }
   (void)sp_B;
+}
+
+__global__ void KernelERI_ppss_warp(
+    const int32_t* task_spAB,
+    const int32_t* task_spCD,
+    int ntasks,
+    const int32_t* sp_A,
+    const int32_t* sp_B,
+    const int32_t* sp_pair_start,
+    const int32_t* sp_npair,
+    const double* shell_cx,
+    const double* shell_cy,
+    const double* shell_cz,
+    const double* pair_eta,
+    const double* pair_Px,
+    const double* pair_Py,
+    const double* pair_Pz,
+    const double* pair_cK,
+    double* eri_out) {
+  const int lane = static_cast<int>(threadIdx.x) & 31;
+  const int warp_id = static_cast<int>(threadIdx.x) >> 5;
+  const int warps_per_block = static_cast<int>(blockDim.x) >> 5;
+  const int t = static_cast<int>(blockIdx.x) * warps_per_block + warp_id;
+  if (t >= ntasks) return;
+
+  const int spAB = static_cast<int>(task_spAB[t]);
+  const int spCD = static_cast<int>(task_spCD[t]);
+  const int A = static_cast<int>(sp_A[spAB]);
+  const int B = static_cast<int>(sp_B[spAB]);
+
+  const double Ax = shell_cx[A];
+  const double Ay = shell_cy[A];
+  const double Az = shell_cz[A];
+  const double Bx = shell_cx[B];
+  const double By = shell_cy[B];
+  const double Bz = shell_cz[B];
+
+  const int baseAB = static_cast<int>(sp_pair_start[spAB]);
+  const int baseCD = static_cast<int>(sp_pair_start[spCD]);
+  const int nAB = static_cast<int>(sp_npair[spAB]);
+  const int nCD = static_cast<int>(sp_npair[spCD]);
+  const int64_t nTot = static_cast<int64_t>(nAB) * static_cast<int64_t>(nCD);
+
+  double s00 = 0.0, s01 = 0.0, s02 = 0.0;
+  double s10 = 0.0, s11 = 0.0, s12 = 0.0;
+  double s20 = 0.0, s21 = 0.0, s22 = 0.0;
+
+  for (int64_t u = static_cast<int64_t>(lane); u < nTot; u += 32) {
+    const int i = static_cast<int>(u / nCD);
+    const int j = static_cast<int>(u - static_cast<int64_t>(i) * nCD);
+    const int ki = baseAB + i;
+    const int kj = baseCD + j;
+
+    const double p = pair_eta[ki];
+    const double q = pair_eta[kj];
+    const double Px = pair_Px[ki];
+    const double Py = pair_Py[ki];
+    const double Pz = pair_Pz[ki];
+    const double Qx = pair_Px[kj];
+    const double Qy = pair_Py[kj];
+    const double Qz = pair_Pz[kj];
+
+    const double dx = Px - Qx;
+    const double dy = Py - Qy;
+    const double dz = Pz - Qz;
+    const double PQ2 = dx * dx + dy * dy + dz * dz;
+
+    const double denom = p + q;
+    const double omega = p * q / denom;
+    const double T = omega * PQ2;
+
+    const double pref = kTwoPiToFiveHalves / (p * q * ::sqrt(denom));
+    const double base = pref * pair_cK[ki] * pair_cK[kj];
+
+    double F0, F1, F2;
+    boys_f0_f1_f2(T, F0, F1, F2);
+
+    const double I = base * F0;
+    const double omega_over_p = omega / p;
+    const double Jx = -omega_over_p * base * F1 * dx;
+    const double Jy = -omega_over_p * base * F1 * dy;
+    const double Jz = -omega_over_p * base * F1 * dz;
+
+    const double inv4p2 = 1.0 / (4.0 * p * p);
+    const double w2 = omega * omega;
+    const double t4 = 4.0 * w2 * F2;
+    const double t2 = 2.0 * omega * F1;
+
+    const double Kxx = (base * (t4 * dx * dx - t2) + 2.0 * p * I) * inv4p2;
+    const double Kyy = (base * (t4 * dy * dy - t2) + 2.0 * p * I) * inv4p2;
+    const double Kzz = (base * (t4 * dz * dz - t2) + 2.0 * p * I) * inv4p2;
+    const double Kxy = (base * (t4 * dx * dy)) * inv4p2;
+    const double Kxz = (base * (t4 * dx * dz)) * inv4p2;
+    const double Kyz = (base * (t4 * dy * dz)) * inv4p2;
+
+    const double PAx = Px - Ax;
+    const double PAy = Py - Ay;
+    const double PAz = Pz - Az;
+    const double PBx = Px - Bx;
+    const double PBy = Py - By;
+    const double PBz = Pz - Bz;
+
+    s00 += Kxx + PAx * Jx + PBx * Jx + (PAx * PBx) * I;
+    s01 += Kxy + PAx * Jy + PBy * Jx + (PAx * PBy) * I;
+    s02 += Kxz + PAx * Jz + PBz * Jx + (PAx * PBz) * I;
+
+    s10 += Kxy + PAy * Jx + PBx * Jy + (PAy * PBx) * I;
+    s11 += Kyy + PAy * Jy + PBy * Jy + (PAy * PBy) * I;
+    s12 += Kyz + PAy * Jz + PBz * Jy + (PAy * PBz) * I;
+
+    s20 += Kxz + PAz * Jx + PBx * Jz + (PAz * PBx) * I;
+    s21 += Kyz + PAz * Jy + PBy * Jz + (PAz * PBy) * I;
+    s22 += Kzz + PAz * Jz + PBz * Jz + (PAz * PBz) * I;
+  }
+
+  s00 = warp_reduce_sum(s00);
+  s01 = warp_reduce_sum(s01);
+  s02 = warp_reduce_sum(s02);
+  s10 = warp_reduce_sum(s10);
+  s11 = warp_reduce_sum(s11);
+  s12 = warp_reduce_sum(s12);
+  s20 = warp_reduce_sum(s20);
+  s21 = warp_reduce_sum(s21);
+  s22 = warp_reduce_sum(s22);
+
+  if (lane == 0) {
+    const int out = t * 9;
+    eri_out[out + 0] = s00;
+    eri_out[out + 1] = s01;
+    eri_out[out + 2] = s02;
+    eri_out[out + 3] = s10;
+    eri_out[out + 4] = s11;
+    eri_out[out + 5] = s12;
+    eri_out[out + 6] = s20;
+    eri_out[out + 7] = s21;
+    eri_out[out + 8] = s22;
+  }
+}
+
+inline int sanitize_component_warp_threads(int threads) {
+  int t = threads;
+  if (t <= 0) t = 32;
+  if (t > 256) t = 256;
+  t = (t / 32) * 32;
+  return t < 32 ? 32 : t;
 }
 
 }  // namespace

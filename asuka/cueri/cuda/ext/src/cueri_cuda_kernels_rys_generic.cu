@@ -16,6 +16,8 @@ constexpr int kStride = 2 * kLMax + 1;  // la+lb <= 10, lc+ld <= 10
 constexpr int kGSize = kStride * kStride;
 constexpr int kNcartMax = (kLMax + 1) * (kLMax + 2) / 2;  // 21 for l=5
 constexpr int kMaxWarpsPerBlock = 8;  // threads <= 256
+constexpr int kPairTileAB = 8;
+constexpr int kPairTileCD = 8;
 
 __device__ __forceinline__ int ncart(int l) { return ((l + 1) * (l + 2)) >> 1; }
 
@@ -216,6 +218,16 @@ __global__ void KernelERI_RysGeneric(
   __shared__ double sh_xij_pow[kLMax + 1], sh_xkl_pow[kLMax + 1];
   __shared__ double sh_yij_pow[kLMax + 1], sh_ykl_pow[kLMax + 1];
   __shared__ double sh_zij_pow[kLMax + 1], sh_zkl_pow[kLMax + 1];
+  __shared__ double sh_ab_eta[kPairTileAB];
+  __shared__ double sh_ab_Px[kPairTileAB];
+  __shared__ double sh_ab_Py[kPairTileAB];
+  __shared__ double sh_ab_Pz[kPairTileAB];
+  __shared__ double sh_ab_cK[kPairTileAB];
+  __shared__ double sh_cd_eta[kPairTileCD];
+  __shared__ double sh_cd_Px[kPairTileCD];
+  __shared__ double sh_cd_Py[kPairTileCD];
+  __shared__ double sh_cd_Pz[kPairTileCD];
+  __shared__ double sh_cd_cK[kPairTileCD];
 
   if (threadIdx.x == 0) {
     fill_cart_comp(la, sh_Ax, sh_Ay, sh_Az);
@@ -274,86 +286,99 @@ __global__ void KernelERI_RysGeneric(
 
     double val = 0.0;
 
-    for (int ip = 0; ip < nPairAB; ++ip) {
-      const int ki = baseAB + ip;
-      double p = 0.0;
-      double Px = 0.0;
-      double Py = 0.0;
-      double Pz = 0.0;
-      double cKab = 0.0;
-      if (threadIdx.x == 0) {
-        p = pair_eta[ki];
-        Px = pair_Px[ki];
-        Py = pair_Py[ki];
-        Pz = pair_Pz[ki];
-        cKab = pair_cK[ki];
+    for (int ip0 = 0; ip0 < nPairAB; ip0 += kPairTileAB) {
+      const int tileAB = min(kPairTileAB, nPairAB - ip0);
+      if (static_cast<int>(threadIdx.x) < tileAB) {
+        const int ki = baseAB + ip0 + static_cast<int>(threadIdx.x);
+        sh_ab_eta[threadIdx.x] = pair_eta[ki];
+        sh_ab_Px[threadIdx.x] = pair_Px[ki];
+        sh_ab_Py[threadIdx.x] = pair_Py[ki];
+        sh_ab_Pz[threadIdx.x] = pair_Pz[ki];
+        sh_ab_cK[threadIdx.x] = pair_cK[ki];
       }
+      __syncthreads();
 
-      for (int jp = 0; jp < nPairCD; ++jp) {
-        const int kj = baseCD + jp;
-        double q = 0.0;
-        double Qx = 0.0;
-        double Qy = 0.0;
-        double Qz = 0.0;
-        double cKcd = 0.0;
-        double denom = 0.0;
-        double base = 0.0;
-        if (threadIdx.x == 0) {
-          q = pair_eta[kj];
-          Qx = pair_Px[kj];
-          Qy = pair_Py[kj];
-          Qz = pair_Pz[kj];
-          cKcd = pair_cK[kj];
-
-          const double dx = Px - Qx;
-          const double dy = Py - Qy;
-          const double dz = Pz - Qz;
-          const double PQ2 = dx * dx + dy * dy + dz * dz;
-
-          denom = p + q;
-          const double omega = p * q / denom;
-          const double T = omega * PQ2;
-
-          base = kTwoPiToFiveHalves / (p * q * ::sqrt(denom)) * cKab * cKcd;
-
-          cueri_rys::rys_roots_weights<NROOTS>(T, sh_roots, sh_weights);
+      for (int jp0 = 0; jp0 < nPairCD; jp0 += kPairTileCD) {
+        const int tileCD = min(kPairTileCD, nPairCD - jp0);
+        if (static_cast<int>(threadIdx.x) < tileCD) {
+          const int kj = baseCD + jp0 + static_cast<int>(threadIdx.x);
+          sh_cd_eta[threadIdx.x] = pair_eta[kj];
+          sh_cd_Px[threadIdx.x] = pair_Px[kj];
+          sh_cd_Py[threadIdx.x] = pair_Py[kj];
+          sh_cd_Pz[threadIdx.x] = pair_Pz[kj];
+          sh_cd_cK[threadIdx.x] = pair_cK[kj];
         }
+        __syncthreads();
 
-        for (int u = 0; u < NROOTS; ++u) {
-          if (threadIdx.x == 0) {
-            const double x = sh_roots[u];
-            const double w = sh_weights[u];
+        for (int ip = 0; ip < tileAB; ++ip) {
+          const double p = sh_ab_eta[ip];
+          const double Px = sh_ab_Px[ip];
+          const double Py = sh_ab_Py[ip];
+          const double Pz = sh_ab_Pz[ip];
+          const double cKab = sh_ab_cK[ip];
 
-            const double inv_denom = 1.0 / denom;
-            const double B0 = x * 0.5 * inv_denom;
-            const double B1 = (1.0 - x) * 0.5 / p + B0;
-            const double B1p = (1.0 - x) * 0.5 / q + B0;
+          for (int jp = 0; jp < tileCD; ++jp) {
+            const double q = sh_cd_eta[jp];
+            const double Qx = sh_cd_Px[jp];
+            const double Qy = sh_cd_Py[jp];
+            const double Qz = sh_cd_Pz[jp];
+            const double cKcd = sh_cd_cK[jp];
+            double denom = 0.0;
+            double base = 0.0;
+            if (threadIdx.x == 0) {
+              const double dx = Px - Qx;
+              const double dy = Py - Qy;
+              const double dz = Pz - Qz;
+              const double PQ2 = dx * dx + dy * dy + dz * dz;
 
-            const double Cx_ = (Px - Ax) + (q * inv_denom) * x * (Qx - Px);
-            const double Cy_ = (Py - Ay) + (q * inv_denom) * x * (Qy - Py);
-            const double Cz_ = (Pz - Az) + (q * inv_denom) * x * (Qz - Pz);
+              denom = p + q;
+              const double omega = p * q / denom;
+              const double T = omega * PQ2;
 
-            const double Cpx_ = (Qx - Cx) + (p * inv_denom) * x * (Px - Qx);
-            const double Cpy_ = (Qy - Cy) + (p * inv_denom) * x * (Py - Qy);
-            const double Cpz_ = (Qz - Cz) + (p * inv_denom) * x * (Pz - Qz);
+              base = kTwoPiToFiveHalves / (p * q * ::sqrt(denom)) * cKab * cKcd;
 
-            compute_G(sh_Gx, nmax, mmax, Cx_, Cpx_, B0, B1, B1p);
-            compute_G(sh_Gy, nmax, mmax, Cy_, Cpy_, B0, B1, B1p);
-            compute_G(sh_Gz, nmax, mmax, Cz_, Cpz_, B0, B1, B1p);
+              cueri_rys::rys_roots_weights<NROOTS>(T, sh_roots, sh_weights);
+            }
 
-            sh_scale = base * w;
+            for (int u = 0; u < NROOTS; ++u) {
+              if (threadIdx.x == 0) {
+                const double x = sh_roots[u];
+                const double w = sh_weights[u];
+
+                const double inv_denom = 1.0 / denom;
+                const double B0 = x * 0.5 * inv_denom;
+                const double B1 = (1.0 - x) * 0.5 / p + B0;
+                const double B1p = (1.0 - x) * 0.5 / q + B0;
+
+                const double Cx_ = (Px - Ax) + (q * inv_denom) * x * (Qx - Px);
+                const double Cy_ = (Py - Ay) + (q * inv_denom) * x * (Qy - Py);
+                const double Cz_ = (Pz - Az) + (q * inv_denom) * x * (Qz - Pz);
+
+                const double Cpx_ = (Qx - Cx) + (p * inv_denom) * x * (Px - Qx);
+                const double Cpy_ = (Qy - Cy) + (p * inv_denom) * x * (Py - Qy);
+                const double Cpz_ = (Qz - Cz) + (p * inv_denom) * x * (Pz - Qz);
+
+                compute_G(sh_Gx, nmax, mmax, Cx_, Cpx_, B0, B1, B1p);
+                compute_G(sh_Gy, nmax, mmax, Cy_, Cpy_, B0, B1, B1p);
+                compute_G(sh_Gz, nmax, mmax, Cz_, Cpz_, B0, B1, B1p);
+
+                sh_scale = base * w;
+              }
+              __syncthreads();
+
+              if (active) {
+                const double Ix = shift_from_G(sh_Gx, iax, ibx, icx, idx, sh_xij_pow, sh_xkl_pow);
+                const double Iy = shift_from_G(sh_Gy, iay, iby, icy, idy, sh_yij_pow, sh_ykl_pow);
+                const double Iz = shift_from_G(sh_Gz, iaz, ibz, icz, idz, sh_zij_pow, sh_zkl_pow);
+                val += sh_scale * (Ix * Iy * Iz);
+              }
+              __syncthreads();
+            }
           }
-          __syncthreads();
-
-          if (active) {
-            const double Ix = shift_from_G(sh_Gx, iax, ibx, icx, idx, sh_xij_pow, sh_xkl_pow);
-            const double Iy = shift_from_G(sh_Gy, iay, iby, icy, idy, sh_yij_pow, sh_ykl_pow);
-            const double Iz = shift_from_G(sh_Gz, iaz, ibz, icz, idz, sh_zij_pow, sh_zkl_pow);
-            val += sh_scale * (Ix * Iy * Iz);
-          }
-          __syncthreads();
         }
+        __syncthreads();
       }
+      __syncthreads();
     }
 
     if (active) {

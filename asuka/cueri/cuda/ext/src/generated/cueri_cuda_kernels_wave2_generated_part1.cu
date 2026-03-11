@@ -9361,6 +9361,9 @@ __global__ void KernelERI_ssdp_flat(
   double Gx[4];
   double Gy[4];
   double Gz[4];
+  double Ux[6];
+  double Uy[6];
+  double Uz[6];
   double tile[18];
   tile[0] = 0.0;
   tile[1] = 0.0;
@@ -9423,24 +9426,42 @@ __global__ void KernelERI_ssdp_flat(
         compute_G_stride_fixed<kFlatStride, kNMax, kMMax>(Gy, Cy_, Cpy_, B0, B1, B1p);
         compute_G_stride_fixed<kFlatStride, kNMax, kMMax>(Gz, Cz_, Cpz_, B0, B1, B1p);
         const double sc = base * w;
-        tile[0] += sc * (Gx[2] * xkl + Gx[3]) * (Gy[0]) * (Gz[0]);
-        tile[1] += sc * (Gx[2]) * (Gy[0] * ykl + Gy[1]) * (Gz[0]);
-        tile[2] += sc * (Gx[2]) * (Gy[0]) * (Gz[0] * zkl + Gz[1]);
-        tile[3] += sc * (Gx[1] * xkl + Gx[2]) * (Gy[1]) * (Gz[0]);
-        tile[4] += sc * (Gx[1]) * (Gy[1] * ykl + Gy[2]) * (Gz[0]);
-        tile[5] += sc * (Gx[1]) * (Gy[1]) * (Gz[0] * zkl + Gz[1]);
-        tile[6] += sc * (Gx[1] * xkl + Gx[2]) * (Gy[0]) * (Gz[1]);
-        tile[7] += sc * (Gx[1]) * (Gy[0] * ykl + Gy[1]) * (Gz[1]);
-        tile[8] += sc * (Gx[1]) * (Gy[0]) * (Gz[1] * zkl + Gz[2]);
-        tile[9] += sc * (Gx[0] * xkl + Gx[1]) * (Gy[2]) * (Gz[0]);
-        tile[10] += sc * (Gx[0]) * (Gy[2] * ykl + Gy[3]) * (Gz[0]);
-        tile[11] += sc * (Gx[0]) * (Gy[2]) * (Gz[0] * zkl + Gz[1]);
-        tile[12] += sc * (Gx[0] * xkl + Gx[1]) * (Gy[1]) * (Gz[1]);
-        tile[13] += sc * (Gx[0]) * (Gy[1] * ykl + Gy[2]) * (Gz[1]);
-        tile[14] += sc * (Gx[0]) * (Gy[1]) * (Gz[1] * zkl + Gz[2]);
-        tile[15] += sc * (Gx[0] * xkl + Gx[1]) * (Gy[0]) * (Gz[2]);
-        tile[16] += sc * (Gx[0]) * (Gy[0] * ykl + Gy[1]) * (Gz[2]);
-        tile[17] += sc * (Gx[0]) * (Gy[0]) * (Gz[2] * zkl + Gz[3]);
+        Ux[0] = Gx[2] * xkl + Gx[3];
+        Ux[1] = Gx[2];
+        Ux[2] = Gx[1] * xkl + Gx[2];
+        Ux[3] = Gx[1];
+        Ux[4] = Gx[0] * xkl + Gx[1];
+        Ux[5] = Gx[0];
+        Uy[0] = Gy[0];
+        Uy[1] = Gy[0] * ykl + Gy[1];
+        Uy[2] = Gy[1];
+        Uy[3] = Gy[1] * ykl + Gy[2];
+        Uy[4] = Gy[2];
+        Uy[5] = Gy[2] * ykl + Gy[3];
+        Uz[0] = Gz[0];
+        Uz[1] = Gz[0] * zkl + Gz[1];
+        Uz[2] = Gz[1];
+        Uz[3] = Gz[1] * zkl + Gz[2];
+        Uz[4] = Gz[2];
+        Uz[5] = Gz[2] * zkl + Gz[3];
+        tile[0] += sc * Ux[0] * Uy[0] * Uz[0];
+        tile[1] += sc * Ux[1] * Uy[1] * Uz[0];
+        tile[2] += sc * Ux[1] * Uy[0] * Uz[1];
+        tile[3] += sc * Ux[2] * Uy[2] * Uz[0];
+        tile[4] += sc * Ux[3] * Uy[3] * Uz[0];
+        tile[5] += sc * Ux[3] * Uy[2] * Uz[1];
+        tile[6] += sc * Ux[2] * Uy[0] * Uz[2];
+        tile[7] += sc * Ux[3] * Uy[1] * Uz[2];
+        tile[8] += sc * Ux[3] * Uy[0] * Uz[3];
+        tile[9] += sc * Ux[4] * Uy[4] * Uz[0];
+        tile[10] += sc * Ux[5] * Uy[5] * Uz[0];
+        tile[11] += sc * Ux[5] * Uy[4] * Uz[1];
+        tile[12] += sc * Ux[4] * Uy[2] * Uz[2];
+        tile[13] += sc * Ux[5] * Uy[3] * Uz[2];
+        tile[14] += sc * Ux[5] * Uy[2] * Uz[3];
+        tile[15] += sc * Ux[4] * Uy[0] * Uz[4];
+        tile[16] += sc * Ux[5] * Uy[1] * Uz[4];
+        tile[17] += sc * Ux[5] * Uy[0] * Uz[5];
       }
     }
   }
@@ -9465,6 +9486,175 @@ __global__ void KernelERI_ssdp_flat(
   out[15] = tile[15];
   out[16] = tile[16];
   out[17] = tile[17];
+}
+
+template <int NROOTS>
+__global__ void KernelERI_ssdp_warp_true(
+    const int32_t* __restrict__ task_spAB,
+    const int32_t* __restrict__ task_spCD,
+    int ntasks,
+    const int32_t* __restrict__ sp_A,
+    const int32_t* __restrict__ sp_B,
+    const int32_t* __restrict__ sp_pair_start,
+    const int32_t* __restrict__ sp_npair,
+    const double* __restrict__ shell_cx,
+    const double* __restrict__ shell_cy,
+    const double* __restrict__ shell_cz,
+    const double* __restrict__ pair_eta,
+    const double* __restrict__ pair_Px,
+    const double* __restrict__ pair_Py,
+    const double* __restrict__ pair_Pz,
+    const double* __restrict__ pair_cK,
+    double* __restrict__ eri_out) {
+  const int lane = static_cast<int>(threadIdx.x) & 31;
+  const int warp_id = static_cast<int>(threadIdx.x) >> 5;
+  const int warps_per_block = static_cast<int>(blockDim.x) >> 5;
+  const int t = static_cast<int>(blockIdx.x) * warps_per_block + warp_id;
+  if (t >= ntasks) return;
+
+  const int spAB = static_cast<int>(task_spAB[t]);
+  const int spCD = static_cast<int>(task_spCD[t]);
+  const int iA = static_cast<int>(sp_A[spAB]);
+  const int iB = static_cast<int>(sp_B[spAB]);
+  const int iC = static_cast<int>(sp_A[spCD]);
+  const int iD = static_cast<int>(sp_B[spCD]);
+
+  const double Ax = shell_cx[iA];
+  const double Ay = shell_cy[iA];
+  const double Az = shell_cz[iA];
+  const double Bx = shell_cx[iB];
+  const double By = shell_cy[iB];
+  const double Bz = shell_cz[iB];
+  const double Cx = shell_cx[iC];
+  const double Cy = shell_cy[iC];
+  const double Cz = shell_cz[iC];
+  const double Dx = shell_cx[iD];
+  const double Dy = shell_cy[iD];
+  const double Dz = shell_cz[iD];
+
+  const double xij = Ax - Bx;
+  const double yij = Ay - By;
+  const double zij = Az - Bz;
+  const double xkl = Cx - Dx;
+  const double ykl = Cy - Dy;
+  const double zkl = Cz - Dz;
+  const double xij2 = xij * xij;
+  const double yij2 = yij * yij;
+  const double zij2 = zij * zij;
+  const double xkl2 = xkl * xkl;
+  const double ykl2 = ykl * ykl;
+  const double zkl2 = zkl * zkl;
+
+  const int baseAB = static_cast<int>(sp_pair_start[spAB]);
+  const int baseCD = static_cast<int>(sp_pair_start[spCD]);
+  const int nPairAB = static_cast<int>(sp_npair[spAB]);
+  const int nPairCD = static_cast<int>(sp_npair[spCD]);
+  const int totalPairs = nPairAB * nPairCD;
+
+  constexpr int kStride = 5;
+  constexpr int kNComp = 18;
+  constexpr int kNMax = 0;
+  constexpr int kMMax = 3;
+  constexpr int kGSize = 25;
+
+  // Per-lane accumulators in registers.
+  double acc[kNComp];
+  #pragma unroll
+  for (int i = 0; i < kNComp; ++i) acc[i] = 0.0;
+
+  // Lane-parallel primitive pair loop.
+  for (int pair = lane; pair < totalPairs; pair += 32) {
+    const int ip = pair / nPairCD;
+    const int jp = pair - ip * nPairCD;
+    const int ki = baseAB + ip;
+    const int kj = baseCD + jp;
+
+    const double p = pair_eta[ki];
+    const double q = pair_eta[kj];
+    const double Px = pair_Px[ki];
+    const double Py = pair_Py[ki];
+    const double Pz = pair_Pz[ki];
+    const double Qx = pair_Px[kj];
+    const double Qy = pair_Py[kj];
+    const double Qz = pair_Pz[kj];
+
+    const double dxPQ = Px - Qx;
+    const double dyPQ = Py - Qy;
+    const double dzPQ = Pz - Qz;
+    const double PQ2 = dxPQ * dxPQ + dyPQ * dyPQ + dzPQ * dzPQ;
+
+    const double denom = p + q;
+    const double omega = p * q / denom;
+    const double T = omega * PQ2;
+    const double base = kTwoPiToFiveHalves / (p * q * ::sqrt(denom)) * pair_cK[ki] * pair_cK[kj];
+
+    // Rys roots/weights in registers — each lane computes independently.
+    double roots[NROOTS];
+    double weights[NROOTS];
+    cueri_rys::rys_roots_weights<NROOTS>(T, roots, weights);
+
+    for (int u = 0; u < NROOTS; ++u) {
+      const double x = roots[u];
+      const double w = weights[u];
+      const double inv_denom = 1.0 / denom;
+      const double B0 = x * 0.5 * inv_denom;
+      const double B1 = (1.0 - x) * 0.5 / p + B0;
+      const double B1p = (1.0 - x) * 0.5 / q + B0;
+
+      const double Cx_ = (Px - Ax) + (q * inv_denom) * x * (Qx - Px);
+      const double Cy_ = (Py - Ay) + (q * inv_denom) * x * (Qy - Py);
+      const double Cz_ = (Pz - Az) + (q * inv_denom) * x * (Qz - Pz);
+      const double Cpx_ = (Qx - Cx) + (p * inv_denom) * x * (Px - Qx);
+      const double Cpy_ = (Qy - Cy) + (p * inv_denom) * x * (Py - Qy);
+      const double Cpz_ = (Qz - Cz) + (p * inv_denom) * x * (Pz - Qz);
+
+      // G arrays in local memory (registers/L1).
+      double Gx[kGSize];
+      double Gy[kGSize];
+      double Gz[kGSize];
+      compute_G_stride_fixed<kStride, kNMax, kMMax>(Gx, Cx_, Cpx_, B0, B1, B1p);
+      compute_G_stride_fixed<kStride, kNMax, kMMax>(Gy, Cy_, Cpy_, B0, B1, B1p);
+      compute_G_stride_fixed<kStride, kNMax, kMMax>(Gz, Cz_, Cpz_, B0, B1, B1p);
+
+      const double scale = base * w;
+
+      // Accumulate all components.
+            acc[0] += scale * (Gx[2] * xkl + Gx[3]) * (Gy[0]) * (Gz[0]);
+            acc[1] += scale * (Gx[2]) * (Gy[0] * ykl + Gy[1]) * (Gz[0]);
+            acc[2] += scale * (Gx[2]) * (Gy[0]) * (Gz[0] * zkl + Gz[1]);
+            acc[3] += scale * (Gx[1] * xkl + Gx[2]) * (Gy[1]) * (Gz[0]);
+            acc[4] += scale * (Gx[1]) * (Gy[1] * ykl + Gy[2]) * (Gz[0]);
+            acc[5] += scale * (Gx[1]) * (Gy[1]) * (Gz[0] * zkl + Gz[1]);
+            acc[6] += scale * (Gx[1] * xkl + Gx[2]) * (Gy[0]) * (Gz[1]);
+            acc[7] += scale * (Gx[1]) * (Gy[0] * ykl + Gy[1]) * (Gz[1]);
+            acc[8] += scale * (Gx[1]) * (Gy[0]) * (Gz[1] * zkl + Gz[2]);
+            acc[9] += scale * (Gx[0] * xkl + Gx[1]) * (Gy[2]) * (Gz[0]);
+            acc[10] += scale * (Gx[0]) * (Gy[2] * ykl + Gy[3]) * (Gz[0]);
+            acc[11] += scale * (Gx[0]) * (Gy[2]) * (Gz[0] * zkl + Gz[1]);
+            acc[12] += scale * (Gx[0] * xkl + Gx[1]) * (Gy[1]) * (Gz[1]);
+            acc[13] += scale * (Gx[0]) * (Gy[1] * ykl + Gy[2]) * (Gz[1]);
+            acc[14] += scale * (Gx[0]) * (Gy[1]) * (Gz[1] * zkl + Gz[2]);
+            acc[15] += scale * (Gx[0] * xkl + Gx[1]) * (Gy[0]) * (Gz[2]);
+            acc[16] += scale * (Gx[0]) * (Gy[0] * ykl + Gy[1]) * (Gz[2]);
+            acc[17] += scale * (Gx[0]) * (Gy[0]) * (Gz[2] * zkl + Gz[3]);
+    }  // for u (Rys roots)
+  }  // for pair
+
+  // Warp reduction: sum across lanes.
+  #pragma unroll
+  for (int i = 0; i < kNComp; ++i) {
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+      acc[i] += __shfl_down_sync(0xFFFFFFFF, acc[i], offset);
+    }
+  }
+
+  // Lane 0 writes output.
+  if (lane == 0) {
+    double* out = eri_out + static_cast<int64_t>(t) * static_cast<int64_t>(kNComp);
+    #pragma unroll
+    for (int i = 0; i < kNComp; ++i) out[i] = acc[i];
+  }
 }
 
 template <int NROOTS>

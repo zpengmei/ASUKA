@@ -283,6 +283,8 @@ def plan_kernel_batches_spd(tasks: TaskList, *, shell_pairs, shell_l: np.ndarray
     changes = np.nonzero(tag_sorted[1:] != tag_sorted[:-1])[0] + 1
     offsets = np.concatenate(([0], changes, [nt])).astype(np.int32)
 
+    sp_npair = np.asarray(shell_pairs.sp_npair, dtype=np.int64).ravel()
+
     batches: list[KernelBatch] = []
     for g in range(int(offsets.shape[0] - 1)):
         i0 = int(offsets[g])
@@ -290,6 +292,9 @@ def plan_kernel_batches_spd(tasks: TaskList, *, shell_pairs, shell_l: np.ndarray
         if i1 <= i0:
             continue
         idx = perm[i0:i1]
+        if idx.shape[0] > 1:
+            work = sp_npair[tasks.task_spAB[idx].astype(np.int64, copy=False)] * sp_npair[tasks.task_spCD[idx].astype(np.int64, copy=False)]
+            idx = idx[np.argsort(work, kind="stable")]
         kcid = int(kernel_cid[int(idx[0])])
         transpose = bool(tr[int(idx[0])])
         if not transpose:

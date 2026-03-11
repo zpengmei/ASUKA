@@ -9363,6 +9363,9 @@ __global__ void KernelERI_psdd_flat(
   double Gx[10];
   double Gy[10];
   double Gz[10];
+  double Ux[18];
+  double Uy[18];
+  double Uz[18];
   double tile[108];
   tile[0] = 0.0;
   tile[1] = 0.0;
@@ -9515,114 +9518,168 @@ __global__ void KernelERI_psdd_flat(
         compute_G_stride_fixed<kFlatStride, kNMax, kMMax>(Gy, Cy_, Cpy_, B0, B1, B1p);
         compute_G_stride_fixed<kFlatStride, kNMax, kMMax>(Gz, Cz_, Cpz_, B0, B1, B1p);
         const double sc = base * w;
-        tile[0] += sc * (Gx[7] * xkl2 + 2.0 * (Gx[8] * xkl) + Gx[9]) * (Gy[0]) * (Gz[0]);
-        tile[1] += sc * (Gx[7] * xkl + Gx[8]) * (Gy[0] * ykl + Gy[1]) * (Gz[0]);
-        tile[2] += sc * (Gx[7] * xkl + Gx[8]) * (Gy[0]) * (Gz[0] * zkl + Gz[1]);
-        tile[3] += sc * (Gx[7]) * (Gy[0] * ykl2 + 2.0 * (Gy[1] * ykl) + Gy[2]) * (Gz[0]);
-        tile[4] += sc * (Gx[7]) * (Gy[0] * ykl + Gy[1]) * (Gz[0] * zkl + Gz[1]);
-        tile[5] += sc * (Gx[7]) * (Gy[0]) * (Gz[0] * zkl2 + 2.0 * (Gz[1] * zkl) + Gz[2]);
-        tile[6] += sc * (Gx[6] * xkl2 + 2.0 * (Gx[7] * xkl) + Gx[8]) * (Gy[1]) * (Gz[0]);
-        tile[7] += sc * (Gx[6] * xkl + Gx[7]) * (Gy[1] * ykl + Gy[2]) * (Gz[0]);
-        tile[8] += sc * (Gx[6] * xkl + Gx[7]) * (Gy[1]) * (Gz[0] * zkl + Gz[1]);
-        tile[9] += sc * (Gx[6]) * (Gy[1] * ykl2 + 2.0 * (Gy[2] * ykl) + Gy[3]) * (Gz[0]);
-        tile[10] += sc * (Gx[6]) * (Gy[1] * ykl + Gy[2]) * (Gz[0] * zkl + Gz[1]);
-        tile[11] += sc * (Gx[6]) * (Gy[1]) * (Gz[0] * zkl2 + 2.0 * (Gz[1] * zkl) + Gz[2]);
-        tile[12] += sc * (Gx[6] * xkl2 + 2.0 * (Gx[7] * xkl) + Gx[8]) * (Gy[0]) * (Gz[1]);
-        tile[13] += sc * (Gx[6] * xkl + Gx[7]) * (Gy[0] * ykl + Gy[1]) * (Gz[1]);
-        tile[14] += sc * (Gx[6] * xkl + Gx[7]) * (Gy[0]) * (Gz[1] * zkl + Gz[2]);
-        tile[15] += sc * (Gx[6]) * (Gy[0] * ykl2 + 2.0 * (Gy[1] * ykl) + Gy[2]) * (Gz[1]);
-        tile[16] += sc * (Gx[6]) * (Gy[0] * ykl + Gy[1]) * (Gz[1] * zkl + Gz[2]);
-        tile[17] += sc * (Gx[6]) * (Gy[0]) * (Gz[1] * zkl2 + 2.0 * (Gz[2] * zkl) + Gz[3]);
-        tile[18] += sc * (Gx[5] * xkl2 + 2.0 * (Gx[6] * xkl) + Gx[7]) * (Gy[2]) * (Gz[0]);
-        tile[19] += sc * (Gx[5] * xkl + Gx[6]) * (Gy[2] * ykl + Gy[3]) * (Gz[0]);
-        tile[20] += sc * (Gx[5] * xkl + Gx[6]) * (Gy[2]) * (Gz[0] * zkl + Gz[1]);
-        tile[21] += sc * (Gx[5]) * (Gy[2] * ykl2 + 2.0 * (Gy[3] * ykl) + Gy[4]) * (Gz[0]);
-        tile[22] += sc * (Gx[5]) * (Gy[2] * ykl + Gy[3]) * (Gz[0] * zkl + Gz[1]);
-        tile[23] += sc * (Gx[5]) * (Gy[2]) * (Gz[0] * zkl2 + 2.0 * (Gz[1] * zkl) + Gz[2]);
-        tile[24] += sc * (Gx[5] * xkl2 + 2.0 * (Gx[6] * xkl) + Gx[7]) * (Gy[1]) * (Gz[1]);
-        tile[25] += sc * (Gx[5] * xkl + Gx[6]) * (Gy[1] * ykl + Gy[2]) * (Gz[1]);
-        tile[26] += sc * (Gx[5] * xkl + Gx[6]) * (Gy[1]) * (Gz[1] * zkl + Gz[2]);
-        tile[27] += sc * (Gx[5]) * (Gy[1] * ykl2 + 2.0 * (Gy[2] * ykl) + Gy[3]) * (Gz[1]);
-        tile[28] += sc * (Gx[5]) * (Gy[1] * ykl + Gy[2]) * (Gz[1] * zkl + Gz[2]);
-        tile[29] += sc * (Gx[5]) * (Gy[1]) * (Gz[1] * zkl2 + 2.0 * (Gz[2] * zkl) + Gz[3]);
-        tile[30] += sc * (Gx[5] * xkl2 + 2.0 * (Gx[6] * xkl) + Gx[7]) * (Gy[0]) * (Gz[2]);
-        tile[31] += sc * (Gx[5] * xkl + Gx[6]) * (Gy[0] * ykl + Gy[1]) * (Gz[2]);
-        tile[32] += sc * (Gx[5] * xkl + Gx[6]) * (Gy[0]) * (Gz[2] * zkl + Gz[3]);
-        tile[33] += sc * (Gx[5]) * (Gy[0] * ykl2 + 2.0 * (Gy[1] * ykl) + Gy[2]) * (Gz[2]);
-        tile[34] += sc * (Gx[5]) * (Gy[0] * ykl + Gy[1]) * (Gz[2] * zkl + Gz[3]);
-        tile[35] += sc * (Gx[5]) * (Gy[0]) * (Gz[2] * zkl2 + 2.0 * (Gz[3] * zkl) + Gz[4]);
-        tile[36] += sc * (Gx[2] * xkl2 + 2.0 * (Gx[3] * xkl) + Gx[4]) * (Gy[5]) * (Gz[0]);
-        tile[37] += sc * (Gx[2] * xkl + Gx[3]) * (Gy[5] * ykl + Gy[6]) * (Gz[0]);
-        tile[38] += sc * (Gx[2] * xkl + Gx[3]) * (Gy[5]) * (Gz[0] * zkl + Gz[1]);
-        tile[39] += sc * (Gx[2]) * (Gy[5] * ykl2 + 2.0 * (Gy[6] * ykl) + Gy[7]) * (Gz[0]);
-        tile[40] += sc * (Gx[2]) * (Gy[5] * ykl + Gy[6]) * (Gz[0] * zkl + Gz[1]);
-        tile[41] += sc * (Gx[2]) * (Gy[5]) * (Gz[0] * zkl2 + 2.0 * (Gz[1] * zkl) + Gz[2]);
-        tile[42] += sc * (Gx[1] * xkl2 + 2.0 * (Gx[2] * xkl) + Gx[3]) * (Gy[6]) * (Gz[0]);
-        tile[43] += sc * (Gx[1] * xkl + Gx[2]) * (Gy[6] * ykl + Gy[7]) * (Gz[0]);
-        tile[44] += sc * (Gx[1] * xkl + Gx[2]) * (Gy[6]) * (Gz[0] * zkl + Gz[1]);
-        tile[45] += sc * (Gx[1]) * (Gy[6] * ykl2 + 2.0 * (Gy[7] * ykl) + Gy[8]) * (Gz[0]);
-        tile[46] += sc * (Gx[1]) * (Gy[6] * ykl + Gy[7]) * (Gz[0] * zkl + Gz[1]);
-        tile[47] += sc * (Gx[1]) * (Gy[6]) * (Gz[0] * zkl2 + 2.0 * (Gz[1] * zkl) + Gz[2]);
-        tile[48] += sc * (Gx[1] * xkl2 + 2.0 * (Gx[2] * xkl) + Gx[3]) * (Gy[5]) * (Gz[1]);
-        tile[49] += sc * (Gx[1] * xkl + Gx[2]) * (Gy[5] * ykl + Gy[6]) * (Gz[1]);
-        tile[50] += sc * (Gx[1] * xkl + Gx[2]) * (Gy[5]) * (Gz[1] * zkl + Gz[2]);
-        tile[51] += sc * (Gx[1]) * (Gy[5] * ykl2 + 2.0 * (Gy[6] * ykl) + Gy[7]) * (Gz[1]);
-        tile[52] += sc * (Gx[1]) * (Gy[5] * ykl + Gy[6]) * (Gz[1] * zkl + Gz[2]);
-        tile[53] += sc * (Gx[1]) * (Gy[5]) * (Gz[1] * zkl2 + 2.0 * (Gz[2] * zkl) + Gz[3]);
-        tile[54] += sc * (Gx[0] * xkl2 + 2.0 * (Gx[1] * xkl) + Gx[2]) * (Gy[7]) * (Gz[0]);
-        tile[55] += sc * (Gx[0] * xkl + Gx[1]) * (Gy[7] * ykl + Gy[8]) * (Gz[0]);
-        tile[56] += sc * (Gx[0] * xkl + Gx[1]) * (Gy[7]) * (Gz[0] * zkl + Gz[1]);
-        tile[57] += sc * (Gx[0]) * (Gy[7] * ykl2 + 2.0 * (Gy[8] * ykl) + Gy[9]) * (Gz[0]);
-        tile[58] += sc * (Gx[0]) * (Gy[7] * ykl + Gy[8]) * (Gz[0] * zkl + Gz[1]);
-        tile[59] += sc * (Gx[0]) * (Gy[7]) * (Gz[0] * zkl2 + 2.0 * (Gz[1] * zkl) + Gz[2]);
-        tile[60] += sc * (Gx[0] * xkl2 + 2.0 * (Gx[1] * xkl) + Gx[2]) * (Gy[6]) * (Gz[1]);
-        tile[61] += sc * (Gx[0] * xkl + Gx[1]) * (Gy[6] * ykl + Gy[7]) * (Gz[1]);
-        tile[62] += sc * (Gx[0] * xkl + Gx[1]) * (Gy[6]) * (Gz[1] * zkl + Gz[2]);
-        tile[63] += sc * (Gx[0]) * (Gy[6] * ykl2 + 2.0 * (Gy[7] * ykl) + Gy[8]) * (Gz[1]);
-        tile[64] += sc * (Gx[0]) * (Gy[6] * ykl + Gy[7]) * (Gz[1] * zkl + Gz[2]);
-        tile[65] += sc * (Gx[0]) * (Gy[6]) * (Gz[1] * zkl2 + 2.0 * (Gz[2] * zkl) + Gz[3]);
-        tile[66] += sc * (Gx[0] * xkl2 + 2.0 * (Gx[1] * xkl) + Gx[2]) * (Gy[5]) * (Gz[2]);
-        tile[67] += sc * (Gx[0] * xkl + Gx[1]) * (Gy[5] * ykl + Gy[6]) * (Gz[2]);
-        tile[68] += sc * (Gx[0] * xkl + Gx[1]) * (Gy[5]) * (Gz[2] * zkl + Gz[3]);
-        tile[69] += sc * (Gx[0]) * (Gy[5] * ykl2 + 2.0 * (Gy[6] * ykl) + Gy[7]) * (Gz[2]);
-        tile[70] += sc * (Gx[0]) * (Gy[5] * ykl + Gy[6]) * (Gz[2] * zkl + Gz[3]);
-        tile[71] += sc * (Gx[0]) * (Gy[5]) * (Gz[2] * zkl2 + 2.0 * (Gz[3] * zkl) + Gz[4]);
-        tile[72] += sc * (Gx[2] * xkl2 + 2.0 * (Gx[3] * xkl) + Gx[4]) * (Gy[0]) * (Gz[5]);
-        tile[73] += sc * (Gx[2] * xkl + Gx[3]) * (Gy[0] * ykl + Gy[1]) * (Gz[5]);
-        tile[74] += sc * (Gx[2] * xkl + Gx[3]) * (Gy[0]) * (Gz[5] * zkl + Gz[6]);
-        tile[75] += sc * (Gx[2]) * (Gy[0] * ykl2 + 2.0 * (Gy[1] * ykl) + Gy[2]) * (Gz[5]);
-        tile[76] += sc * (Gx[2]) * (Gy[0] * ykl + Gy[1]) * (Gz[5] * zkl + Gz[6]);
-        tile[77] += sc * (Gx[2]) * (Gy[0]) * (Gz[5] * zkl2 + 2.0 * (Gz[6] * zkl) + Gz[7]);
-        tile[78] += sc * (Gx[1] * xkl2 + 2.0 * (Gx[2] * xkl) + Gx[3]) * (Gy[1]) * (Gz[5]);
-        tile[79] += sc * (Gx[1] * xkl + Gx[2]) * (Gy[1] * ykl + Gy[2]) * (Gz[5]);
-        tile[80] += sc * (Gx[1] * xkl + Gx[2]) * (Gy[1]) * (Gz[5] * zkl + Gz[6]);
-        tile[81] += sc * (Gx[1]) * (Gy[1] * ykl2 + 2.0 * (Gy[2] * ykl) + Gy[3]) * (Gz[5]);
-        tile[82] += sc * (Gx[1]) * (Gy[1] * ykl + Gy[2]) * (Gz[5] * zkl + Gz[6]);
-        tile[83] += sc * (Gx[1]) * (Gy[1]) * (Gz[5] * zkl2 + 2.0 * (Gz[6] * zkl) + Gz[7]);
-        tile[84] += sc * (Gx[1] * xkl2 + 2.0 * (Gx[2] * xkl) + Gx[3]) * (Gy[0]) * (Gz[6]);
-        tile[85] += sc * (Gx[1] * xkl + Gx[2]) * (Gy[0] * ykl + Gy[1]) * (Gz[6]);
-        tile[86] += sc * (Gx[1] * xkl + Gx[2]) * (Gy[0]) * (Gz[6] * zkl + Gz[7]);
-        tile[87] += sc * (Gx[1]) * (Gy[0] * ykl2 + 2.0 * (Gy[1] * ykl) + Gy[2]) * (Gz[6]);
-        tile[88] += sc * (Gx[1]) * (Gy[0] * ykl + Gy[1]) * (Gz[6] * zkl + Gz[7]);
-        tile[89] += sc * (Gx[1]) * (Gy[0]) * (Gz[6] * zkl2 + 2.0 * (Gz[7] * zkl) + Gz[8]);
-        tile[90] += sc * (Gx[0] * xkl2 + 2.0 * (Gx[1] * xkl) + Gx[2]) * (Gy[2]) * (Gz[5]);
-        tile[91] += sc * (Gx[0] * xkl + Gx[1]) * (Gy[2] * ykl + Gy[3]) * (Gz[5]);
-        tile[92] += sc * (Gx[0] * xkl + Gx[1]) * (Gy[2]) * (Gz[5] * zkl + Gz[6]);
-        tile[93] += sc * (Gx[0]) * (Gy[2] * ykl2 + 2.0 * (Gy[3] * ykl) + Gy[4]) * (Gz[5]);
-        tile[94] += sc * (Gx[0]) * (Gy[2] * ykl + Gy[3]) * (Gz[5] * zkl + Gz[6]);
-        tile[95] += sc * (Gx[0]) * (Gy[2]) * (Gz[5] * zkl2 + 2.0 * (Gz[6] * zkl) + Gz[7]);
-        tile[96] += sc * (Gx[0] * xkl2 + 2.0 * (Gx[1] * xkl) + Gx[2]) * (Gy[1]) * (Gz[6]);
-        tile[97] += sc * (Gx[0] * xkl + Gx[1]) * (Gy[1] * ykl + Gy[2]) * (Gz[6]);
-        tile[98] += sc * (Gx[0] * xkl + Gx[1]) * (Gy[1]) * (Gz[6] * zkl + Gz[7]);
-        tile[99] += sc * (Gx[0]) * (Gy[1] * ykl2 + 2.0 * (Gy[2] * ykl) + Gy[3]) * (Gz[6]);
-        tile[100] += sc * (Gx[0]) * (Gy[1] * ykl + Gy[2]) * (Gz[6] * zkl + Gz[7]);
-        tile[101] += sc * (Gx[0]) * (Gy[1]) * (Gz[6] * zkl2 + 2.0 * (Gz[7] * zkl) + Gz[8]);
-        tile[102] += sc * (Gx[0] * xkl2 + 2.0 * (Gx[1] * xkl) + Gx[2]) * (Gy[0]) * (Gz[7]);
-        tile[103] += sc * (Gx[0] * xkl + Gx[1]) * (Gy[0] * ykl + Gy[1]) * (Gz[7]);
-        tile[104] += sc * (Gx[0] * xkl + Gx[1]) * (Gy[0]) * (Gz[7] * zkl + Gz[8]);
-        tile[105] += sc * (Gx[0]) * (Gy[0] * ykl2 + 2.0 * (Gy[1] * ykl) + Gy[2]) * (Gz[7]);
-        tile[106] += sc * (Gx[0]) * (Gy[0] * ykl + Gy[1]) * (Gz[7] * zkl + Gz[8]);
-        tile[107] += sc * (Gx[0]) * (Gy[0]) * (Gz[7] * zkl2 + 2.0 * (Gz[8] * zkl) + Gz[9]);
+        Ux[0] = Gx[7] * xkl2 + 2.0 * (Gx[8] * xkl) + Gx[9];
+        Ux[1] = Gx[7] * xkl + Gx[8];
+        Ux[2] = Gx[7];
+        Ux[3] = Gx[6] * xkl2 + 2.0 * (Gx[7] * xkl) + Gx[8];
+        Ux[4] = Gx[6] * xkl + Gx[7];
+        Ux[5] = Gx[6];
+        Ux[6] = Gx[5] * xkl2 + 2.0 * (Gx[6] * xkl) + Gx[7];
+        Ux[7] = Gx[5] * xkl + Gx[6];
+        Ux[8] = Gx[5];
+        Ux[9] = Gx[2] * xkl2 + 2.0 * (Gx[3] * xkl) + Gx[4];
+        Ux[10] = Gx[2] * xkl + Gx[3];
+        Ux[11] = Gx[2];
+        Ux[12] = Gx[1] * xkl2 + 2.0 * (Gx[2] * xkl) + Gx[3];
+        Ux[13] = Gx[1] * xkl + Gx[2];
+        Ux[14] = Gx[1];
+        Ux[15] = Gx[0] * xkl2 + 2.0 * (Gx[1] * xkl) + Gx[2];
+        Ux[16] = Gx[0] * xkl + Gx[1];
+        Ux[17] = Gx[0];
+        Uy[0] = Gy[0];
+        Uy[1] = Gy[0] * ykl + Gy[1];
+        Uy[2] = Gy[0] * ykl2 + 2.0 * (Gy[1] * ykl) + Gy[2];
+        Uy[3] = Gy[1];
+        Uy[4] = Gy[1] * ykl + Gy[2];
+        Uy[5] = Gy[1] * ykl2 + 2.0 * (Gy[2] * ykl) + Gy[3];
+        Uy[6] = Gy[2];
+        Uy[7] = Gy[2] * ykl + Gy[3];
+        Uy[8] = Gy[2] * ykl2 + 2.0 * (Gy[3] * ykl) + Gy[4];
+        Uy[9] = Gy[5];
+        Uy[10] = Gy[5] * ykl + Gy[6];
+        Uy[11] = Gy[5] * ykl2 + 2.0 * (Gy[6] * ykl) + Gy[7];
+        Uy[12] = Gy[6];
+        Uy[13] = Gy[6] * ykl + Gy[7];
+        Uy[14] = Gy[6] * ykl2 + 2.0 * (Gy[7] * ykl) + Gy[8];
+        Uy[15] = Gy[7];
+        Uy[16] = Gy[7] * ykl + Gy[8];
+        Uy[17] = Gy[7] * ykl2 + 2.0 * (Gy[8] * ykl) + Gy[9];
+        Uz[0] = Gz[0];
+        Uz[1] = Gz[0] * zkl + Gz[1];
+        Uz[2] = Gz[0] * zkl2 + 2.0 * (Gz[1] * zkl) + Gz[2];
+        Uz[3] = Gz[1];
+        Uz[4] = Gz[1] * zkl + Gz[2];
+        Uz[5] = Gz[1] * zkl2 + 2.0 * (Gz[2] * zkl) + Gz[3];
+        Uz[6] = Gz[2];
+        Uz[7] = Gz[2] * zkl + Gz[3];
+        Uz[8] = Gz[2] * zkl2 + 2.0 * (Gz[3] * zkl) + Gz[4];
+        Uz[9] = Gz[5];
+        Uz[10] = Gz[5] * zkl + Gz[6];
+        Uz[11] = Gz[5] * zkl2 + 2.0 * (Gz[6] * zkl) + Gz[7];
+        Uz[12] = Gz[6];
+        Uz[13] = Gz[6] * zkl + Gz[7];
+        Uz[14] = Gz[6] * zkl2 + 2.0 * (Gz[7] * zkl) + Gz[8];
+        Uz[15] = Gz[7];
+        Uz[16] = Gz[7] * zkl + Gz[8];
+        Uz[17] = Gz[7] * zkl2 + 2.0 * (Gz[8] * zkl) + Gz[9];
+        tile[0] += sc * Ux[0] * Uy[0] * Uz[0];
+        tile[1] += sc * Ux[1] * Uy[1] * Uz[0];
+        tile[2] += sc * Ux[1] * Uy[0] * Uz[1];
+        tile[3] += sc * Ux[2] * Uy[2] * Uz[0];
+        tile[4] += sc * Ux[2] * Uy[1] * Uz[1];
+        tile[5] += sc * Ux[2] * Uy[0] * Uz[2];
+        tile[6] += sc * Ux[3] * Uy[3] * Uz[0];
+        tile[7] += sc * Ux[4] * Uy[4] * Uz[0];
+        tile[8] += sc * Ux[4] * Uy[3] * Uz[1];
+        tile[9] += sc * Ux[5] * Uy[5] * Uz[0];
+        tile[10] += sc * Ux[5] * Uy[4] * Uz[1];
+        tile[11] += sc * Ux[5] * Uy[3] * Uz[2];
+        tile[12] += sc * Ux[3] * Uy[0] * Uz[3];
+        tile[13] += sc * Ux[4] * Uy[1] * Uz[3];
+        tile[14] += sc * Ux[4] * Uy[0] * Uz[4];
+        tile[15] += sc * Ux[5] * Uy[2] * Uz[3];
+        tile[16] += sc * Ux[5] * Uy[1] * Uz[4];
+        tile[17] += sc * Ux[5] * Uy[0] * Uz[5];
+        tile[18] += sc * Ux[6] * Uy[6] * Uz[0];
+        tile[19] += sc * Ux[7] * Uy[7] * Uz[0];
+        tile[20] += sc * Ux[7] * Uy[6] * Uz[1];
+        tile[21] += sc * Ux[8] * Uy[8] * Uz[0];
+        tile[22] += sc * Ux[8] * Uy[7] * Uz[1];
+        tile[23] += sc * Ux[8] * Uy[6] * Uz[2];
+        tile[24] += sc * Ux[6] * Uy[3] * Uz[3];
+        tile[25] += sc * Ux[7] * Uy[4] * Uz[3];
+        tile[26] += sc * Ux[7] * Uy[3] * Uz[4];
+        tile[27] += sc * Ux[8] * Uy[5] * Uz[3];
+        tile[28] += sc * Ux[8] * Uy[4] * Uz[4];
+        tile[29] += sc * Ux[8] * Uy[3] * Uz[5];
+        tile[30] += sc * Ux[6] * Uy[0] * Uz[6];
+        tile[31] += sc * Ux[7] * Uy[1] * Uz[6];
+        tile[32] += sc * Ux[7] * Uy[0] * Uz[7];
+        tile[33] += sc * Ux[8] * Uy[2] * Uz[6];
+        tile[34] += sc * Ux[8] * Uy[1] * Uz[7];
+        tile[35] += sc * Ux[8] * Uy[0] * Uz[8];
+        tile[36] += sc * Ux[9] * Uy[9] * Uz[0];
+        tile[37] += sc * Ux[10] * Uy[10] * Uz[0];
+        tile[38] += sc * Ux[10] * Uy[9] * Uz[1];
+        tile[39] += sc * Ux[11] * Uy[11] * Uz[0];
+        tile[40] += sc * Ux[11] * Uy[10] * Uz[1];
+        tile[41] += sc * Ux[11] * Uy[9] * Uz[2];
+        tile[42] += sc * Ux[12] * Uy[12] * Uz[0];
+        tile[43] += sc * Ux[13] * Uy[13] * Uz[0];
+        tile[44] += sc * Ux[13] * Uy[12] * Uz[1];
+        tile[45] += sc * Ux[14] * Uy[14] * Uz[0];
+        tile[46] += sc * Ux[14] * Uy[13] * Uz[1];
+        tile[47] += sc * Ux[14] * Uy[12] * Uz[2];
+        tile[48] += sc * Ux[12] * Uy[9] * Uz[3];
+        tile[49] += sc * Ux[13] * Uy[10] * Uz[3];
+        tile[50] += sc * Ux[13] * Uy[9] * Uz[4];
+        tile[51] += sc * Ux[14] * Uy[11] * Uz[3];
+        tile[52] += sc * Ux[14] * Uy[10] * Uz[4];
+        tile[53] += sc * Ux[14] * Uy[9] * Uz[5];
+        tile[54] += sc * Ux[15] * Uy[15] * Uz[0];
+        tile[55] += sc * Ux[16] * Uy[16] * Uz[0];
+        tile[56] += sc * Ux[16] * Uy[15] * Uz[1];
+        tile[57] += sc * Ux[17] * Uy[17] * Uz[0];
+        tile[58] += sc * Ux[17] * Uy[16] * Uz[1];
+        tile[59] += sc * Ux[17] * Uy[15] * Uz[2];
+        tile[60] += sc * Ux[15] * Uy[12] * Uz[3];
+        tile[61] += sc * Ux[16] * Uy[13] * Uz[3];
+        tile[62] += sc * Ux[16] * Uy[12] * Uz[4];
+        tile[63] += sc * Ux[17] * Uy[14] * Uz[3];
+        tile[64] += sc * Ux[17] * Uy[13] * Uz[4];
+        tile[65] += sc * Ux[17] * Uy[12] * Uz[5];
+        tile[66] += sc * Ux[15] * Uy[9] * Uz[6];
+        tile[67] += sc * Ux[16] * Uy[10] * Uz[6];
+        tile[68] += sc * Ux[16] * Uy[9] * Uz[7];
+        tile[69] += sc * Ux[17] * Uy[11] * Uz[6];
+        tile[70] += sc * Ux[17] * Uy[10] * Uz[7];
+        tile[71] += sc * Ux[17] * Uy[9] * Uz[8];
+        tile[72] += sc * Ux[9] * Uy[0] * Uz[9];
+        tile[73] += sc * Ux[10] * Uy[1] * Uz[9];
+        tile[74] += sc * Ux[10] * Uy[0] * Uz[10];
+        tile[75] += sc * Ux[11] * Uy[2] * Uz[9];
+        tile[76] += sc * Ux[11] * Uy[1] * Uz[10];
+        tile[77] += sc * Ux[11] * Uy[0] * Uz[11];
+        tile[78] += sc * Ux[12] * Uy[3] * Uz[9];
+        tile[79] += sc * Ux[13] * Uy[4] * Uz[9];
+        tile[80] += sc * Ux[13] * Uy[3] * Uz[10];
+        tile[81] += sc * Ux[14] * Uy[5] * Uz[9];
+        tile[82] += sc * Ux[14] * Uy[4] * Uz[10];
+        tile[83] += sc * Ux[14] * Uy[3] * Uz[11];
+        tile[84] += sc * Ux[12] * Uy[0] * Uz[12];
+        tile[85] += sc * Ux[13] * Uy[1] * Uz[12];
+        tile[86] += sc * Ux[13] * Uy[0] * Uz[13];
+        tile[87] += sc * Ux[14] * Uy[2] * Uz[12];
+        tile[88] += sc * Ux[14] * Uy[1] * Uz[13];
+        tile[89] += sc * Ux[14] * Uy[0] * Uz[14];
+        tile[90] += sc * Ux[15] * Uy[6] * Uz[9];
+        tile[91] += sc * Ux[16] * Uy[7] * Uz[9];
+        tile[92] += sc * Ux[16] * Uy[6] * Uz[10];
+        tile[93] += sc * Ux[17] * Uy[8] * Uz[9];
+        tile[94] += sc * Ux[17] * Uy[7] * Uz[10];
+        tile[95] += sc * Ux[17] * Uy[6] * Uz[11];
+        tile[96] += sc * Ux[15] * Uy[3] * Uz[12];
+        tile[97] += sc * Ux[16] * Uy[4] * Uz[12];
+        tile[98] += sc * Ux[16] * Uy[3] * Uz[13];
+        tile[99] += sc * Ux[17] * Uy[5] * Uz[12];
+        tile[100] += sc * Ux[17] * Uy[4] * Uz[13];
+        tile[101] += sc * Ux[17] * Uy[3] * Uz[14];
+        tile[102] += sc * Ux[15] * Uy[0] * Uz[15];
+        tile[103] += sc * Ux[16] * Uy[1] * Uz[15];
+        tile[104] += sc * Ux[16] * Uy[0] * Uz[16];
+        tile[105] += sc * Ux[17] * Uy[2] * Uz[15];
+        tile[106] += sc * Ux[17] * Uy[1] * Uz[16];
+        tile[107] += sc * Ux[17] * Uy[0] * Uz[17];
       }
     }
   }
@@ -9737,6 +9794,265 @@ __global__ void KernelERI_psdd_flat(
   out[105] = tile[105];
   out[106] = tile[106];
   out[107] = tile[107];
+}
+
+template <int NROOTS>
+__global__ void KernelERI_psdd_warp_true(
+    const int32_t* __restrict__ task_spAB,
+    const int32_t* __restrict__ task_spCD,
+    int ntasks,
+    const int32_t* __restrict__ sp_A,
+    const int32_t* __restrict__ sp_B,
+    const int32_t* __restrict__ sp_pair_start,
+    const int32_t* __restrict__ sp_npair,
+    const double* __restrict__ shell_cx,
+    const double* __restrict__ shell_cy,
+    const double* __restrict__ shell_cz,
+    const double* __restrict__ pair_eta,
+    const double* __restrict__ pair_Px,
+    const double* __restrict__ pair_Py,
+    const double* __restrict__ pair_Pz,
+    const double* __restrict__ pair_cK,
+    double* __restrict__ eri_out) {
+  const int lane = static_cast<int>(threadIdx.x) & 31;
+  const int warp_id = static_cast<int>(threadIdx.x) >> 5;
+  const int warps_per_block = static_cast<int>(blockDim.x) >> 5;
+  const int t = static_cast<int>(blockIdx.x) * warps_per_block + warp_id;
+  if (t >= ntasks) return;
+
+  const int spAB = static_cast<int>(task_spAB[t]);
+  const int spCD = static_cast<int>(task_spCD[t]);
+  const int iA = static_cast<int>(sp_A[spAB]);
+  const int iB = static_cast<int>(sp_B[spAB]);
+  const int iC = static_cast<int>(sp_A[spCD]);
+  const int iD = static_cast<int>(sp_B[spCD]);
+
+  const double Ax = shell_cx[iA];
+  const double Ay = shell_cy[iA];
+  const double Az = shell_cz[iA];
+  const double Bx = shell_cx[iB];
+  const double By = shell_cy[iB];
+  const double Bz = shell_cz[iB];
+  const double Cx = shell_cx[iC];
+  const double Cy = shell_cy[iC];
+  const double Cz = shell_cz[iC];
+  const double Dx = shell_cx[iD];
+  const double Dy = shell_cy[iD];
+  const double Dz = shell_cz[iD];
+
+  const double xij = Ax - Bx;
+  const double yij = Ay - By;
+  const double zij = Az - Bz;
+  const double xkl = Cx - Dx;
+  const double ykl = Cy - Dy;
+  const double zkl = Cz - Dz;
+  const double xij2 = xij * xij;
+  const double yij2 = yij * yij;
+  const double zij2 = zij * zij;
+  const double xkl2 = xkl * xkl;
+  const double ykl2 = ykl * ykl;
+  const double zkl2 = zkl * zkl;
+
+  const int baseAB = static_cast<int>(sp_pair_start[spAB]);
+  const int baseCD = static_cast<int>(sp_pair_start[spCD]);
+  const int nPairAB = static_cast<int>(sp_npair[spAB]);
+  const int nPairCD = static_cast<int>(sp_npair[spCD]);
+  const int totalPairs = nPairAB * nPairCD;
+
+  constexpr int kStride = 5;
+  constexpr int kNComp = 108;
+  constexpr int kNMax = 1;
+  constexpr int kMMax = 4;
+  constexpr int kGSize = 25;
+
+  // Per-lane accumulators in registers.
+  double acc[kNComp];
+  #pragma unroll
+  for (int i = 0; i < kNComp; ++i) acc[i] = 0.0;
+
+  // Lane-parallel primitive pair loop.
+  for (int pair = lane; pair < totalPairs; pair += 32) {
+    const int ip = pair / nPairCD;
+    const int jp = pair - ip * nPairCD;
+    const int ki = baseAB + ip;
+    const int kj = baseCD + jp;
+
+    const double p = pair_eta[ki];
+    const double q = pair_eta[kj];
+    const double Px = pair_Px[ki];
+    const double Py = pair_Py[ki];
+    const double Pz = pair_Pz[ki];
+    const double Qx = pair_Px[kj];
+    const double Qy = pair_Py[kj];
+    const double Qz = pair_Pz[kj];
+
+    const double dxPQ = Px - Qx;
+    const double dyPQ = Py - Qy;
+    const double dzPQ = Pz - Qz;
+    const double PQ2 = dxPQ * dxPQ + dyPQ * dyPQ + dzPQ * dzPQ;
+
+    const double denom = p + q;
+    const double omega = p * q / denom;
+    const double T = omega * PQ2;
+    const double base = kTwoPiToFiveHalves / (p * q * ::sqrt(denom)) * pair_cK[ki] * pair_cK[kj];
+
+    // Rys roots/weights in registers — each lane computes independently.
+    double roots[NROOTS];
+    double weights[NROOTS];
+    cueri_rys::rys_roots_weights<NROOTS>(T, roots, weights);
+
+    for (int u = 0; u < NROOTS; ++u) {
+      const double x = roots[u];
+      const double w = weights[u];
+      const double inv_denom = 1.0 / denom;
+      const double B0 = x * 0.5 * inv_denom;
+      const double B1 = (1.0 - x) * 0.5 / p + B0;
+      const double B1p = (1.0 - x) * 0.5 / q + B0;
+
+      const double Cx_ = (Px - Ax) + (q * inv_denom) * x * (Qx - Px);
+      const double Cy_ = (Py - Ay) + (q * inv_denom) * x * (Qy - Py);
+      const double Cz_ = (Pz - Az) + (q * inv_denom) * x * (Qz - Pz);
+      const double Cpx_ = (Qx - Cx) + (p * inv_denom) * x * (Px - Qx);
+      const double Cpy_ = (Qy - Cy) + (p * inv_denom) * x * (Py - Qy);
+      const double Cpz_ = (Qz - Cz) + (p * inv_denom) * x * (Pz - Qz);
+
+      // G arrays in local memory (registers/L1).
+      double Gx[kGSize];
+      double Gy[kGSize];
+      double Gz[kGSize];
+      compute_G_stride_fixed<kStride, kNMax, kMMax>(Gx, Cx_, Cpx_, B0, B1, B1p);
+      compute_G_stride_fixed<kStride, kNMax, kMMax>(Gy, Cy_, Cpy_, B0, B1, B1p);
+      compute_G_stride_fixed<kStride, kNMax, kMMax>(Gz, Cz_, Cpz_, B0, B1, B1p);
+
+      const double scale = base * w;
+
+      // Accumulate all components.
+            acc[0] += scale * (Gx[7] * xkl2 + 2.0 * (Gx[8] * xkl) + Gx[9]) * (Gy[0]) * (Gz[0]);
+            acc[1] += scale * (Gx[7] * xkl + Gx[8]) * (Gy[0] * ykl + Gy[1]) * (Gz[0]);
+            acc[2] += scale * (Gx[7] * xkl + Gx[8]) * (Gy[0]) * (Gz[0] * zkl + Gz[1]);
+            acc[3] += scale * (Gx[7]) * (Gy[0] * ykl2 + 2.0 * (Gy[1] * ykl) + Gy[2]) * (Gz[0]);
+            acc[4] += scale * (Gx[7]) * (Gy[0] * ykl + Gy[1]) * (Gz[0] * zkl + Gz[1]);
+            acc[5] += scale * (Gx[7]) * (Gy[0]) * (Gz[0] * zkl2 + 2.0 * (Gz[1] * zkl) + Gz[2]);
+            acc[6] += scale * (Gx[6] * xkl2 + 2.0 * (Gx[7] * xkl) + Gx[8]) * (Gy[1]) * (Gz[0]);
+            acc[7] += scale * (Gx[6] * xkl + Gx[7]) * (Gy[1] * ykl + Gy[2]) * (Gz[0]);
+            acc[8] += scale * (Gx[6] * xkl + Gx[7]) * (Gy[1]) * (Gz[0] * zkl + Gz[1]);
+            acc[9] += scale * (Gx[6]) * (Gy[1] * ykl2 + 2.0 * (Gy[2] * ykl) + Gy[3]) * (Gz[0]);
+            acc[10] += scale * (Gx[6]) * (Gy[1] * ykl + Gy[2]) * (Gz[0] * zkl + Gz[1]);
+            acc[11] += scale * (Gx[6]) * (Gy[1]) * (Gz[0] * zkl2 + 2.0 * (Gz[1] * zkl) + Gz[2]);
+            acc[12] += scale * (Gx[6] * xkl2 + 2.0 * (Gx[7] * xkl) + Gx[8]) * (Gy[0]) * (Gz[1]);
+            acc[13] += scale * (Gx[6] * xkl + Gx[7]) * (Gy[0] * ykl + Gy[1]) * (Gz[1]);
+            acc[14] += scale * (Gx[6] * xkl + Gx[7]) * (Gy[0]) * (Gz[1] * zkl + Gz[2]);
+            acc[15] += scale * (Gx[6]) * (Gy[0] * ykl2 + 2.0 * (Gy[1] * ykl) + Gy[2]) * (Gz[1]);
+            acc[16] += scale * (Gx[6]) * (Gy[0] * ykl + Gy[1]) * (Gz[1] * zkl + Gz[2]);
+            acc[17] += scale * (Gx[6]) * (Gy[0]) * (Gz[1] * zkl2 + 2.0 * (Gz[2] * zkl) + Gz[3]);
+            acc[18] += scale * (Gx[5] * xkl2 + 2.0 * (Gx[6] * xkl) + Gx[7]) * (Gy[2]) * (Gz[0]);
+            acc[19] += scale * (Gx[5] * xkl + Gx[6]) * (Gy[2] * ykl + Gy[3]) * (Gz[0]);
+            acc[20] += scale * (Gx[5] * xkl + Gx[6]) * (Gy[2]) * (Gz[0] * zkl + Gz[1]);
+            acc[21] += scale * (Gx[5]) * (Gy[2] * ykl2 + 2.0 * (Gy[3] * ykl) + Gy[4]) * (Gz[0]);
+            acc[22] += scale * (Gx[5]) * (Gy[2] * ykl + Gy[3]) * (Gz[0] * zkl + Gz[1]);
+            acc[23] += scale * (Gx[5]) * (Gy[2]) * (Gz[0] * zkl2 + 2.0 * (Gz[1] * zkl) + Gz[2]);
+            acc[24] += scale * (Gx[5] * xkl2 + 2.0 * (Gx[6] * xkl) + Gx[7]) * (Gy[1]) * (Gz[1]);
+            acc[25] += scale * (Gx[5] * xkl + Gx[6]) * (Gy[1] * ykl + Gy[2]) * (Gz[1]);
+            acc[26] += scale * (Gx[5] * xkl + Gx[6]) * (Gy[1]) * (Gz[1] * zkl + Gz[2]);
+            acc[27] += scale * (Gx[5]) * (Gy[1] * ykl2 + 2.0 * (Gy[2] * ykl) + Gy[3]) * (Gz[1]);
+            acc[28] += scale * (Gx[5]) * (Gy[1] * ykl + Gy[2]) * (Gz[1] * zkl + Gz[2]);
+            acc[29] += scale * (Gx[5]) * (Gy[1]) * (Gz[1] * zkl2 + 2.0 * (Gz[2] * zkl) + Gz[3]);
+            acc[30] += scale * (Gx[5] * xkl2 + 2.0 * (Gx[6] * xkl) + Gx[7]) * (Gy[0]) * (Gz[2]);
+            acc[31] += scale * (Gx[5] * xkl + Gx[6]) * (Gy[0] * ykl + Gy[1]) * (Gz[2]);
+            acc[32] += scale * (Gx[5] * xkl + Gx[6]) * (Gy[0]) * (Gz[2] * zkl + Gz[3]);
+            acc[33] += scale * (Gx[5]) * (Gy[0] * ykl2 + 2.0 * (Gy[1] * ykl) + Gy[2]) * (Gz[2]);
+            acc[34] += scale * (Gx[5]) * (Gy[0] * ykl + Gy[1]) * (Gz[2] * zkl + Gz[3]);
+            acc[35] += scale * (Gx[5]) * (Gy[0]) * (Gz[2] * zkl2 + 2.0 * (Gz[3] * zkl) + Gz[4]);
+            acc[36] += scale * (Gx[2] * xkl2 + 2.0 * (Gx[3] * xkl) + Gx[4]) * (Gy[5]) * (Gz[0]);
+            acc[37] += scale * (Gx[2] * xkl + Gx[3]) * (Gy[5] * ykl + Gy[6]) * (Gz[0]);
+            acc[38] += scale * (Gx[2] * xkl + Gx[3]) * (Gy[5]) * (Gz[0] * zkl + Gz[1]);
+            acc[39] += scale * (Gx[2]) * (Gy[5] * ykl2 + 2.0 * (Gy[6] * ykl) + Gy[7]) * (Gz[0]);
+            acc[40] += scale * (Gx[2]) * (Gy[5] * ykl + Gy[6]) * (Gz[0] * zkl + Gz[1]);
+            acc[41] += scale * (Gx[2]) * (Gy[5]) * (Gz[0] * zkl2 + 2.0 * (Gz[1] * zkl) + Gz[2]);
+            acc[42] += scale * (Gx[1] * xkl2 + 2.0 * (Gx[2] * xkl) + Gx[3]) * (Gy[6]) * (Gz[0]);
+            acc[43] += scale * (Gx[1] * xkl + Gx[2]) * (Gy[6] * ykl + Gy[7]) * (Gz[0]);
+            acc[44] += scale * (Gx[1] * xkl + Gx[2]) * (Gy[6]) * (Gz[0] * zkl + Gz[1]);
+            acc[45] += scale * (Gx[1]) * (Gy[6] * ykl2 + 2.0 * (Gy[7] * ykl) + Gy[8]) * (Gz[0]);
+            acc[46] += scale * (Gx[1]) * (Gy[6] * ykl + Gy[7]) * (Gz[0] * zkl + Gz[1]);
+            acc[47] += scale * (Gx[1]) * (Gy[6]) * (Gz[0] * zkl2 + 2.0 * (Gz[1] * zkl) + Gz[2]);
+            acc[48] += scale * (Gx[1] * xkl2 + 2.0 * (Gx[2] * xkl) + Gx[3]) * (Gy[5]) * (Gz[1]);
+            acc[49] += scale * (Gx[1] * xkl + Gx[2]) * (Gy[5] * ykl + Gy[6]) * (Gz[1]);
+            acc[50] += scale * (Gx[1] * xkl + Gx[2]) * (Gy[5]) * (Gz[1] * zkl + Gz[2]);
+            acc[51] += scale * (Gx[1]) * (Gy[5] * ykl2 + 2.0 * (Gy[6] * ykl) + Gy[7]) * (Gz[1]);
+            acc[52] += scale * (Gx[1]) * (Gy[5] * ykl + Gy[6]) * (Gz[1] * zkl + Gz[2]);
+            acc[53] += scale * (Gx[1]) * (Gy[5]) * (Gz[1] * zkl2 + 2.0 * (Gz[2] * zkl) + Gz[3]);
+            acc[54] += scale * (Gx[0] * xkl2 + 2.0 * (Gx[1] * xkl) + Gx[2]) * (Gy[7]) * (Gz[0]);
+            acc[55] += scale * (Gx[0] * xkl + Gx[1]) * (Gy[7] * ykl + Gy[8]) * (Gz[0]);
+            acc[56] += scale * (Gx[0] * xkl + Gx[1]) * (Gy[7]) * (Gz[0] * zkl + Gz[1]);
+            acc[57] += scale * (Gx[0]) * (Gy[7] * ykl2 + 2.0 * (Gy[8] * ykl) + Gy[9]) * (Gz[0]);
+            acc[58] += scale * (Gx[0]) * (Gy[7] * ykl + Gy[8]) * (Gz[0] * zkl + Gz[1]);
+            acc[59] += scale * (Gx[0]) * (Gy[7]) * (Gz[0] * zkl2 + 2.0 * (Gz[1] * zkl) + Gz[2]);
+            acc[60] += scale * (Gx[0] * xkl2 + 2.0 * (Gx[1] * xkl) + Gx[2]) * (Gy[6]) * (Gz[1]);
+            acc[61] += scale * (Gx[0] * xkl + Gx[1]) * (Gy[6] * ykl + Gy[7]) * (Gz[1]);
+            acc[62] += scale * (Gx[0] * xkl + Gx[1]) * (Gy[6]) * (Gz[1] * zkl + Gz[2]);
+            acc[63] += scale * (Gx[0]) * (Gy[6] * ykl2 + 2.0 * (Gy[7] * ykl) + Gy[8]) * (Gz[1]);
+            acc[64] += scale * (Gx[0]) * (Gy[6] * ykl + Gy[7]) * (Gz[1] * zkl + Gz[2]);
+            acc[65] += scale * (Gx[0]) * (Gy[6]) * (Gz[1] * zkl2 + 2.0 * (Gz[2] * zkl) + Gz[3]);
+            acc[66] += scale * (Gx[0] * xkl2 + 2.0 * (Gx[1] * xkl) + Gx[2]) * (Gy[5]) * (Gz[2]);
+            acc[67] += scale * (Gx[0] * xkl + Gx[1]) * (Gy[5] * ykl + Gy[6]) * (Gz[2]);
+            acc[68] += scale * (Gx[0] * xkl + Gx[1]) * (Gy[5]) * (Gz[2] * zkl + Gz[3]);
+            acc[69] += scale * (Gx[0]) * (Gy[5] * ykl2 + 2.0 * (Gy[6] * ykl) + Gy[7]) * (Gz[2]);
+            acc[70] += scale * (Gx[0]) * (Gy[5] * ykl + Gy[6]) * (Gz[2] * zkl + Gz[3]);
+            acc[71] += scale * (Gx[0]) * (Gy[5]) * (Gz[2] * zkl2 + 2.0 * (Gz[3] * zkl) + Gz[4]);
+            acc[72] += scale * (Gx[2] * xkl2 + 2.0 * (Gx[3] * xkl) + Gx[4]) * (Gy[0]) * (Gz[5]);
+            acc[73] += scale * (Gx[2] * xkl + Gx[3]) * (Gy[0] * ykl + Gy[1]) * (Gz[5]);
+            acc[74] += scale * (Gx[2] * xkl + Gx[3]) * (Gy[0]) * (Gz[5] * zkl + Gz[6]);
+            acc[75] += scale * (Gx[2]) * (Gy[0] * ykl2 + 2.0 * (Gy[1] * ykl) + Gy[2]) * (Gz[5]);
+            acc[76] += scale * (Gx[2]) * (Gy[0] * ykl + Gy[1]) * (Gz[5] * zkl + Gz[6]);
+            acc[77] += scale * (Gx[2]) * (Gy[0]) * (Gz[5] * zkl2 + 2.0 * (Gz[6] * zkl) + Gz[7]);
+            acc[78] += scale * (Gx[1] * xkl2 + 2.0 * (Gx[2] * xkl) + Gx[3]) * (Gy[1]) * (Gz[5]);
+            acc[79] += scale * (Gx[1] * xkl + Gx[2]) * (Gy[1] * ykl + Gy[2]) * (Gz[5]);
+            acc[80] += scale * (Gx[1] * xkl + Gx[2]) * (Gy[1]) * (Gz[5] * zkl + Gz[6]);
+            acc[81] += scale * (Gx[1]) * (Gy[1] * ykl2 + 2.0 * (Gy[2] * ykl) + Gy[3]) * (Gz[5]);
+            acc[82] += scale * (Gx[1]) * (Gy[1] * ykl + Gy[2]) * (Gz[5] * zkl + Gz[6]);
+            acc[83] += scale * (Gx[1]) * (Gy[1]) * (Gz[5] * zkl2 + 2.0 * (Gz[6] * zkl) + Gz[7]);
+            acc[84] += scale * (Gx[1] * xkl2 + 2.0 * (Gx[2] * xkl) + Gx[3]) * (Gy[0]) * (Gz[6]);
+            acc[85] += scale * (Gx[1] * xkl + Gx[2]) * (Gy[0] * ykl + Gy[1]) * (Gz[6]);
+            acc[86] += scale * (Gx[1] * xkl + Gx[2]) * (Gy[0]) * (Gz[6] * zkl + Gz[7]);
+            acc[87] += scale * (Gx[1]) * (Gy[0] * ykl2 + 2.0 * (Gy[1] * ykl) + Gy[2]) * (Gz[6]);
+            acc[88] += scale * (Gx[1]) * (Gy[0] * ykl + Gy[1]) * (Gz[6] * zkl + Gz[7]);
+            acc[89] += scale * (Gx[1]) * (Gy[0]) * (Gz[6] * zkl2 + 2.0 * (Gz[7] * zkl) + Gz[8]);
+            acc[90] += scale * (Gx[0] * xkl2 + 2.0 * (Gx[1] * xkl) + Gx[2]) * (Gy[2]) * (Gz[5]);
+            acc[91] += scale * (Gx[0] * xkl + Gx[1]) * (Gy[2] * ykl + Gy[3]) * (Gz[5]);
+            acc[92] += scale * (Gx[0] * xkl + Gx[1]) * (Gy[2]) * (Gz[5] * zkl + Gz[6]);
+            acc[93] += scale * (Gx[0]) * (Gy[2] * ykl2 + 2.0 * (Gy[3] * ykl) + Gy[4]) * (Gz[5]);
+            acc[94] += scale * (Gx[0]) * (Gy[2] * ykl + Gy[3]) * (Gz[5] * zkl + Gz[6]);
+            acc[95] += scale * (Gx[0]) * (Gy[2]) * (Gz[5] * zkl2 + 2.0 * (Gz[6] * zkl) + Gz[7]);
+            acc[96] += scale * (Gx[0] * xkl2 + 2.0 * (Gx[1] * xkl) + Gx[2]) * (Gy[1]) * (Gz[6]);
+            acc[97] += scale * (Gx[0] * xkl + Gx[1]) * (Gy[1] * ykl + Gy[2]) * (Gz[6]);
+            acc[98] += scale * (Gx[0] * xkl + Gx[1]) * (Gy[1]) * (Gz[6] * zkl + Gz[7]);
+            acc[99] += scale * (Gx[0]) * (Gy[1] * ykl2 + 2.0 * (Gy[2] * ykl) + Gy[3]) * (Gz[6]);
+            acc[100] += scale * (Gx[0]) * (Gy[1] * ykl + Gy[2]) * (Gz[6] * zkl + Gz[7]);
+            acc[101] += scale * (Gx[0]) * (Gy[1]) * (Gz[6] * zkl2 + 2.0 * (Gz[7] * zkl) + Gz[8]);
+            acc[102] += scale * (Gx[0] * xkl2 + 2.0 * (Gx[1] * xkl) + Gx[2]) * (Gy[0]) * (Gz[7]);
+            acc[103] += scale * (Gx[0] * xkl + Gx[1]) * (Gy[0] * ykl + Gy[1]) * (Gz[7]);
+            acc[104] += scale * (Gx[0] * xkl + Gx[1]) * (Gy[0]) * (Gz[7] * zkl + Gz[8]);
+            acc[105] += scale * (Gx[0]) * (Gy[0] * ykl2 + 2.0 * (Gy[1] * ykl) + Gy[2]) * (Gz[7]);
+            acc[106] += scale * (Gx[0]) * (Gy[0] * ykl + Gy[1]) * (Gz[7] * zkl + Gz[8]);
+            acc[107] += scale * (Gx[0]) * (Gy[0]) * (Gz[7] * zkl2 + 2.0 * (Gz[8] * zkl) + Gz[9]);
+    }  // for u (Rys roots)
+  }  // for pair
+
+  // Warp reduction: sum across lanes.
+  #pragma unroll
+  for (int i = 0; i < kNComp; ++i) {
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+      acc[i] += __shfl_down_sync(0xFFFFFFFF, acc[i], offset);
+    }
+  }
+
+  // Lane 0 writes output.
+  if (lane == 0) {
+    double* out = eri_out + static_cast<int64_t>(t) * static_cast<int64_t>(kNComp);
+    #pragma unroll
+    for (int i = 0; i < kNComp; ++i) out[i] = acc[i];
+  }
 }
 
 template <int NROOTS>

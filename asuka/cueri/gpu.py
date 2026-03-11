@@ -6398,7 +6398,8 @@ def eri_rys_generic_device(
     """Evaluate contracted Cartesian shell-quartet tiles using the generic Rys microkernel.
 
     Notes
-    - This is a reference-oriented generic implementation (not yet optimized).
+    - This is the shared-memory tiled generic fallback path for quartet classes
+      that do not have a native Step-2 kernel.
     - Current CUDA implementation supports l<=CUDA_MAX_L on each shell and nroots<=CUDA_MAX_NROOTS.
     - Output layout: flat device array of length `ntasks * nAB * nCD`, where:
       - nAB = ncart(la) * ncart(lb)

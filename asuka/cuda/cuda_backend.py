@@ -85,10 +85,23 @@ from asuka.cuda._backend_offdiag_workspace import (
     configure_offdiag_gemm_workspace as _configure_offdiag_gemm_workspace,
 )
 from asuka.cuda._backend_hop_runtime import (
-    build_epq_stream_tile as _build_epq_stream_tile_runtime,
+    build_epq_stream_tile_profiled as _build_epq_stream_tile_profiled_runtime,
+    finalize_one_body_phase as _finalize_one_body_phase_runtime,
+    finalize_hop_profile as _finalize_hop_profile_runtime,
+    increment_profile_counter as _increment_profile_counter_runtime,
     normalize_hop_x as _normalize_hop_x_runtime,
     prepare_hop_runtime_inputs as _prepare_hop_runtime_inputs_runtime,
+    resolve_epq_table_for_tile as _resolve_epq_table_for_tile_runtime,
+    resolve_epq_streaming_runtime as _resolve_epq_streaming_runtime,
     resolve_hop_runtime_flags as _resolve_hop_runtime_flags_runtime,
+    resolve_one_body_mode as _resolve_one_body_mode_runtime,
+    resolve_tile_runtime_flags as _resolve_tile_runtime_flags_runtime,
+    run_one_body_epq_streaming as _run_one_body_epq_streaming_runtime,
+    run_one_body_single_scatter as _run_one_body_single_scatter_runtime,
+    stamp_csr_prefilter_profile as _stamp_csr_prefilter_profile_runtime,
+    stamp_csr_prefilter_tile_profile as _stamp_csr_prefilter_tile_profile_runtime,
+    resolve_x_tile_skip_policy as _resolve_x_tile_skip_policy_runtime,
+    set_matvec_path_profile as _set_matvec_path_profile_runtime,
     try_cuda_graph_fast_path as _try_cuda_graph_fast_path_runtime,
 )
 from asuka.cuguga.drt import DRT
@@ -8870,16 +8883,18 @@ class GugaMatvecEriMatWorkspace:
             if path_mode == "fused_coo":
                 _has_phase1 = False
             g_tile = self._g_buf if (_has_phase1_coo or _has_phase1) else None
-            if profile is not None:
-                profile["matvec_path_mode"] = path_mode
-                profile["matvec_path_mode_effective"] = (
+            _set_matvec_path_profile_runtime(
+                profile=profile,
+                path_mode=path_mode,
+                effective_mode=(
                     "fused_coo" if _has_phase1_coo else ("fused_epq_hybrid" if _has_phase1 else "fused_hop_fallback")
-                )
-                profile["matvec_path_fallback_reason"] = (
+                ),
+                fallback_reason=(
                     ""
                     if (_has_phase1_coo or _has_phase1)
                     else str(getattr(self, "path_mode_fallback_reason", "fused_phase1_unavailable"))
-                )
+                ),
+            )
 
             # Allocate COO buffers once (lazy) for the COO path.
             if _has_phase1_coo and g_tile is not None:
@@ -9063,270 +9078,88 @@ class GugaMatvecEriMatWorkspace:
                 profile["total_s"] = profile.get("total_s", 0.0) + (time.perf_counter() - t_total0)
             return y
 
-        if profile is not None:
-            profile["matvec_path_mode"] = path_mode
-            profile["matvec_path_mode_effective"] = "epq_blocked"
-            profile["matvec_path_fallback_reason"] = str(getattr(self, "path_mode_fallback_reason", "") or "")
+        _set_matvec_path_profile_runtime(
+            profile=profile,
+            path_mode=path_mode,
+            effective_mode="epq_blocked",
+            fallback_reason=str(getattr(self, "path_mode_fallback_reason", "") or ""),
+        )
 
-        def _build_epq_stream_tile(
-            j_start: int,
-            j_count: int,
-            *,
-            global_indptr: bool = False,
-            stream_override=None,
-            sync_override: bool | None = None,
-            check_overflow_override: bool | None = None,
-        ):
-            t_build0 = time.perf_counter() if profile is not None else None
-            stream_build = stream if stream_override is None else stream_override
-            epq_tile = _build_epq_stream_tile_runtime(
-                self,
-                build_epq_action_table_tile_device_fn=build_epq_action_table_tile_device,
-                stream=stream,
-                sync=bool(sync),
-                check_overflow=bool(check_overflow),
-                j_start=int(j_start),
-                j_count=int(j_count),
-                global_indptr=bool(global_indptr),
-                stream_override=stream_override,
-                sync_override=sync_override,
-                check_overflow_override=check_overflow_override,
-            )
-            if profile is not None and t_build0 is not None:
-                stream_build.synchronize()
-                dt = time.perf_counter() - t_build0
-                profile["epq_stream_build_s"] = profile.get("epq_stream_build_s", 0.0) + dt
-                profile["tile_apply_build_s"] = profile.get("tile_apply_build_s", 0.0) + dt
-            return epq_tile
-
-        epq_stream_db_requested = False
-        epq_stream_db_active = False
-        epq_stream_j_tile = int(self.epq_stream_j_tile)
-        if use_epq_streaming:
-            db_mode = str(getattr(self, "epq_stream_double_buffer_mode", "off")).strip().lower()
-            if db_mode == "on":
-                epq_stream_db_requested = True
-            elif db_mode == "off":
-                epq_stream_db_requested = False
-            else:
-                epq_stream_db_requested = bool(int(self.ncsf) > int(epq_stream_j_tile))
-            # Phase 6.1 (safe policy): overlap build/apply only when overflow checks are disabled.
-            epq_stream_db_active = bool(
-                epq_stream_db_requested
-                and int(epq_stream_j_tile) < int(self.ncsf)
-                and profile is None
-                and (not bool(check_overflow))
-                and (not bool(epq_stream_panic_active))
-            )
-
-        if profile is not None:
-            profile["epq_streaming"] = float(1.0 if use_epq_streaming else 0.0)
-            if use_epq_streaming:
-                profile["epq_stream_j_tile"] = float(int(self.epq_stream_j_tile))
-                profile["epq_stream_pq_block"] = float(int(getattr(self, "epq_stream_pq_block", 0)))
-                profile["epq_stream_panic_requested"] = float(1.0 if epq_stream_panic_requested else 0.0)
-                profile["epq_stream_panic"] = float(1.0 if epq_stream_panic_active else 0.0)
-                profile["epq_stream_double_buffer_requested"] = float(1.0 if epq_stream_db_requested else 0.0)
-                profile["epq_stream_double_buffer"] = float(1.0 if epq_stream_db_active else 0.0)
+        _stream_runtime = _resolve_epq_streaming_runtime(
+            self,
+            use_epq_streaming=bool(use_epq_streaming),
+            check_overflow=bool(check_overflow),
+            profile=profile,
+            epq_stream_panic_requested=bool(epq_stream_panic_requested),
+            epq_stream_panic_active=bool(epq_stream_panic_active),
+        )
+        epq_stream_j_tile = int(_stream_runtime["epq_stream_j_tile"])
+        epq_stream_db_requested = bool(_stream_runtime["epq_stream_db_requested"])
+        epq_stream_db_active = bool(_stream_runtime["epq_stream_db_active"])
 
         # One-body contribution: y = sum_pq h_eff[pq] E_pq |x>.
         # In fused-hop mode, one-body is computed inside the fused kernel, so we only zero y here.
         _one_body_overlap = False
         _stream_onebody = None
+        one_body_mode = _resolve_one_body_mode_runtime(
+            use_fused_hop=bool(use_fused_hop),
+            use_epq_streaming=bool(use_epq_streaming),
+            epq_stream_panic_active=bool(epq_stream_panic_active),
+            epq_stream_db_active=bool(epq_stream_db_active),
+        )
+        if profile is not None:
+            profile["one_body_mode"] = str(one_body_mode)
         t0 = time.perf_counter() if profile is not None else None
-        if use_fused_hop:
+        if one_body_mode == "fused_zero":
             cp.cuda.runtime.memsetAsync(
                 int(y.data.ptr),
                 0,
                 int(y.size) * int(y.itemsize),
                 int(stream.ptr),
             )
-        elif use_epq_streaming:
-            if epq_stream_panic_active:
-                zero_y = True
-                for j0 in range(0, int(self.ncsf), epq_stream_j_tile):
-                    j1 = min(int(self.ncsf), int(j0 + epq_stream_j_tile))
-                    j_d = self.task_csf_all[int(j0) : int(j1)]
-                    t_apply0 = time.perf_counter() if profile is not None else None
-                    apply_g_flat_scatter_atomic_inplace_device(
-                        self.drt,
-                        self.drt_dev,
-                        self.state_dev,
-                        j_d,
-                        h_eff_flat,
-                        task_scale=cp.asarray(x[int(j0) : int(j1)], dtype=self._dtype),
-                        epq_table=None,
-                        apply_mode="scatter",
-                        y=y,
-                        overflow=self.overflow_apply,
-                        threads=int(self.threads_apply),
-                        zero_y=bool(zero_y),
-                        stream=stream,
-                        sync=bool(sync),
-                        check_overflow=bool(check_overflow),
-                        dtype=self._dtype,
-                        use_kahan=bool(self.kahan_compensation),
-                    )
-                    if profile is not None and t_apply0 is not None:
-                        stream.synchronize()
-                        dt = time.perf_counter() - t_apply0
-                        profile["epq_stream_panic_apply_s"] = profile.get("epq_stream_panic_apply_s", 0.0) + dt
-                    zero_y = False
-            elif epq_stream_db_active:
-                stream_build = cp.cuda.Stream(non_blocking=True)
-                stream_apply = cp.cuda.Stream(non_blocking=True)
-                evt_build_done = [cp.cuda.Event(disable_timing=True), cp.cuda.Event(disable_timing=True)]
-                evt_apply_done = [cp.cuda.Event(disable_timing=True), cp.cuda.Event(disable_timing=True)]
-
-                last_slot = 0
-                nt = 0
-                for tile_idx, j0 in enumerate(range(0, int(self.ncsf), int(epq_stream_j_tile))):
-                    slot = int(tile_idx & 1)
-                    if tile_idx >= 2:
-                        stream_build.wait_event(evt_apply_done[slot])
-
-                    j1 = min(int(self.ncsf), int(j0 + int(epq_stream_j_tile)))
-                    jc = int(j1 - j0)
-                    local_indptr, tile_indices, tile_pq, tile_data = _build_epq_stream_tile(
-                        int(j0),
-                        int(jc),
-                        global_indptr=False,
-                        stream_override=stream_build,
-                        sync_override=True,
-                        check_overflow_override=False,
-                    )
-                    evt_build_done[slot].record(stream_build)
-
-                    stream_apply.wait_event(evt_build_done[slot])
-                    apply_g_flat_scatter_atomic_epq_table_tile_inplace_device(
-                        self.drt,
-                        self.drt_dev,
-                        self.state_dev,
-                        local_indptr,
-                        tile_indices,
-                        tile_pq,
-                        tile_data,
-                        h_eff_flat,
-                        task_scale=cp.asarray(x[int(j0) : int(j1)], dtype=self._dtype),
-                        j_start=int(j0),
-                        j_count=int(jc),
-                        y=y,
-                        overflow=self.overflow_apply,
-                        threads=int(self.threads_apply),
-                        zero_y=bool(tile_idx == 0),
-                        stream=stream_apply,
-                        sync=False,
-                        check_overflow=False,
-                        dtype=self._dtype,
-                        use_kahan=bool(self.kahan_compensation),
-                    )
-                    evt_apply_done[slot].record(stream_apply)
-                    last_slot = int(slot)
-                    nt += 1
-
-                if nt > 0:
-                    stream.wait_event(evt_apply_done[last_slot])
-            else:
-                zero_y = True
-                for j0 in range(0, int(self.ncsf), epq_stream_j_tile):
-                    j1 = min(int(self.ncsf), int(j0 + epq_stream_j_tile))
-                    jc = int(j1 - j0)
-                    local_indptr, tile_indices, tile_pq, tile_data = _build_epq_stream_tile(
-                        int(j0),
-                        int(jc),
-                        global_indptr=False,
-                    )
-                    t_apply0 = time.perf_counter() if profile is not None else None
-                    apply_g_flat_scatter_atomic_epq_table_tile_inplace_device(
-                        self.drt,
-                        self.drt_dev,
-                        self.state_dev,
-                        local_indptr,
-                        tile_indices,
-                        tile_pq,
-                        tile_data,
-                        h_eff_flat,
-                        task_scale=cp.asarray(x[int(j0) : int(j1)], dtype=self._dtype),
-                        j_start=int(j0),
-                        j_count=int(jc),
-                        y=y,
-                        overflow=self.overflow_apply,
-                        threads=int(self.threads_apply),
-                        zero_y=bool(zero_y),
-                        stream=stream,
-                        sync=bool(sync),
-                        check_overflow=bool(check_overflow),
-                        dtype=self._dtype,
-                        use_kahan=bool(self.kahan_compensation),
-                    )
-                    if profile is not None and t_apply0 is not None:
-                        stream.synchronize()
-                        dt = time.perf_counter() - t_apply0
-                        profile["tile_apply_apply_s"] = profile.get("tile_apply_apply_s", 0.0) + dt
-                    zero_y = False
-        else:
-            # When the blocked offdiag path will be used and profiling is not active,
-            # launch one_body on a separate stream so W-build+GEMM can overlap with it.
-            _one_body_overlap = (
-                bool(use_aggregate_offdiag)
-                and self._epq_table is not None
-                and self._w_offdiag is None
-                and profile is None
+        elif one_body_mode in {"epq_panic", "epq_double_buffer", "epq_single_buffer"}:
+            _run_one_body_epq_streaming_runtime(
+                self,
+                cp=cp,
+                one_body_mode=str(one_body_mode),
+                x=x,
+                y=y,
+                h_eff_flat=h_eff_flat,
+                stream=stream,
+                sync=bool(sync),
+                check_overflow=bool(check_overflow),
+                profile=profile,
+                epq_stream_j_tile=int(epq_stream_j_tile),
+                build_epq_action_table_tile_device_fn=build_epq_action_table_tile_device,
+                apply_g_flat_scatter_atomic_inplace_device_fn=apply_g_flat_scatter_atomic_inplace_device,
+                apply_g_flat_scatter_atomic_epq_table_tile_inplace_device_fn=apply_g_flat_scatter_atomic_epq_table_tile_inplace_device,
             )
-            if _one_body_overlap:
-                _stream_onebody = getattr(self, "_stream_onebody", None)
-                if _stream_onebody is None:
-                    _stream_onebody = cp.cuda.Stream(non_blocking=True)
-                    self._stream_onebody = _stream_onebody
-                # one_body on separate stream (overlaps with W-build+GEMM on main stream).
-                apply_g_flat_scatter_atomic_inplace_device(
-                    self.drt,
-                    self.drt_dev,
-                    self.state_dev,
-                    self.task_csf_all,
-                    h_eff_flat,
-                    task_scale=x,
-                    epq_table=self._epq_table,
-                    apply_mode=str(self.apply_mode),
-                    y=y,
-                    overflow=self.overflow_apply,
-                    threads=int(self.threads_apply),
-                    zero_y=True,
-                    stream=_stream_onebody,
-                    sync=False,
-                    check_overflow=False,
-                    dtype=self._dtype,
-                    use_kahan=bool(self.kahan_compensation),
-                )
-            else:
-                _stream_onebody = None
-                apply_g_flat_scatter_atomic_inplace_device(
-                    self.drt,
-                    self.drt_dev,
-                    self.state_dev,
-                    self.task_csf_all,
-                    h_eff_flat,
-                    task_scale=x,
-                    epq_table=self._epq_table,
-                    apply_mode=str(self.apply_mode),
-                    y=y,
-                    overflow=self.overflow_apply,
-                    threads=int(self.threads_apply),
-                    zero_y=True,
-                    stream=stream,
-                    sync=bool(sync),
-                    check_overflow=bool(check_overflow),
-                    dtype=self._dtype,
-                    use_kahan=bool(self.kahan_compensation),
-                )
+        else:
+            _single = _run_one_body_single_scatter_runtime(
+                self,
+                cp=cp,
+                x=x,
+                y=y,
+                h_eff_flat=h_eff_flat,
+                stream=stream,
+                sync=bool(sync),
+                check_overflow=bool(check_overflow),
+                profile=profile,
+                use_aggregate_offdiag=bool(use_aggregate_offdiag),
+                epq_table=self._epq_table,
+                apply_g_flat_scatter_atomic_inplace_device_fn=apply_g_flat_scatter_atomic_inplace_device,
+            )
+            _one_body_overlap = bool(_single["one_body_overlap"])
+            _stream_onebody = _single["stream_onebody"]
         # Record event for one_body completion (used by offdiag Apply to wait on y).
-        _one_body_event = cp.cuda.Event(disable_timing=True)
-        _one_body_event.record(_stream_onebody if _one_body_overlap else stream)
-        if profile is not None and t0 is not None:
-            stream.synchronize()
-            if _stream_onebody is not None:
-                _stream_onebody.synchronize()
-            profile["one_body_s"] = profile.get("one_body_s", 0.0) + (time.perf_counter() - t0)
+        _one_body_event = _finalize_one_body_phase_runtime(
+            cp=cp,
+            stream=stream,
+            one_body_overlap=bool(_one_body_overlap),
+            stream_onebody=_stream_onebody,
+            profile=profile,
+            t0=t0,
+        )
 
         # Blocked epq-table aggregate path:
         # Avoid allocating the full W buffer (O(ncsf*nops)) by processing W in blocks over ket index k.
@@ -9911,10 +9744,16 @@ class GugaMatvecEriMatWorkspace:
                 stream_j_tile = int(self.epq_stream_j_tile)
                 for j0 in range(0, int(self.ncsf), stream_j_tile):
                     j1 = min(int(self.ncsf), int(j0 + stream_j_tile))
-                    epq_table_tile = _build_epq_stream_tile(
-                        int(j0),
-                        int(j1 - j0),
-                        global_indptr=True,
+                    epq_table_tile = _resolve_epq_table_for_tile_runtime(
+                        self,
+                        use_epq_streaming_tiles=bool(use_epq_streaming_tiles),
+                        j_start=int(j0),
+                        j_count=int(j1 - j0),
+                        stream=stream,
+                        sync=bool(sync),
+                        check_overflow=bool(check_overflow),
+                        profile=profile,
+                        build_epq_action_table_tile_device_fn=build_epq_action_table_tile_device,
                     )
                     build_w_from_epq_table_inplace_device(
                         self.drt,
@@ -9968,9 +9807,6 @@ class GugaMatvecEriMatWorkspace:
             y_ready_evt = cp.cuda.Event(disable_timing=True)
             y_ready_evt.record(stream)
             pipeline_apply_stream.wait_event(y_ready_evt)
-        if profile is not None:
-            profile["csr_pipeline_active"] = float(1.0 if use_csr_pipeline else 0.0)
-            profile["csr_pipeline_slots"] = float(pipeline_nslots)
 
         use_prefilter_trivial = bool(
             bool(getattr(self, "prefilter_trivial_tasks_enabled", False))
@@ -9978,8 +9814,12 @@ class GugaMatvecEriMatWorkspace:
             and int(self._rs_n_pairs) > 0
             and not bool(use_epq_streaming_tiles)
         )
-        if profile is not None:
-            profile["csr_prefilter_active"] = float(1.0 if use_prefilter_trivial else 0.0)
+        _stamp_csr_prefilter_profile_runtime(
+            profile=profile,
+            use_csr_pipeline=bool(use_csr_pipeline),
+            pipeline_nslots=int(pipeline_nslots),
+            use_prefilter_trivial=bool(use_prefilter_trivial),
+        )
 
         # Optional x-sparsity tile skip:
         # If x[j] is exactly zero for all j in a tile, all two-body terms from that tile are zero
@@ -9989,42 +9829,16 @@ class GugaMatvecEriMatWorkspace:
         #   W[j,*] = (E_* x)[j]
         # via an adjoint walk, so a row j depends on all x[k], not only x[j].
         # Skipping a j-tile solely from x[j]==0 would drop valid contributions.
-        tile_active_mask = None
-        if (
-            (not bool(use_fused_hop))
-            and bool(getattr(self, "skip_zero_x_tiles_enabled", False))
-            and int(self.j_tile) < int(self.ncsf)
-        ):
-            t_scan0 = time.perf_counter() if profile is not None else None
-            ntiles = (int(self.ncsf) + int(self.j_tile) - 1) // int(self.j_tile)
-            # Host-side scan avoids CuPy reduction JIT warmup costs in short-lived processes.
-            x_h = np.asarray(cp.asnumpy(x))
-            nnz_x = int(np.count_nonzero(x_h))
-            if profile is not None:
-                profile["x_tile_skip_policy_active"] = 1.0
-                profile["x_nnz"] = float(nnz_x)
-                profile["x_tile_total"] = float(ntiles)
-            if nnz_x <= 0:
-                tile_active_mask = np.zeros((int(ntiles),), dtype=np.bool_)
-                skip_two_body_tiles = True
-            elif nnz_x < int(self.ncsf):
-                nz_tiles_h = np.unique(np.flatnonzero(x_h) // int(self.j_tile)).astype(np.int64, copy=False)
-                tile_active_mask = np.zeros((int(ntiles),), dtype=np.bool_)
-                if int(nz_tiles_h.size) > 0:
-                    tile_active_mask[nz_tiles_h] = True
-            if profile is not None:
-                if tile_active_mask is None:
-                    profile["x_tile_skip_mask_active"] = 0.0
-                    profile["x_tile_skipped"] = 0.0
-                else:
-                    skipped = int(int(ntiles) - int(np.count_nonzero(tile_active_mask)))
-                    profile["x_tile_skip_mask_active"] = 1.0
-                    profile["x_tile_skipped"] = float(skipped)
-                    profile["x_tile_active"] = float(int(ntiles) - int(skipped))
-                if t_scan0 is not None:
-                    profile["x_tile_scan_s"] = profile.get("x_tile_scan_s", 0.0) + (time.perf_counter() - t_scan0)
-        elif profile is not None:
-            profile["x_tile_skip_policy_active"] = 0.0
+        _x_tile_skip = _resolve_x_tile_skip_policy_runtime(
+            self,
+            cp=cp,
+            x=x,
+            use_fused_hop=bool(use_fused_hop),
+            profile=profile,
+        )
+        tile_active_mask = _x_tile_skip["tile_active_mask"]
+        if bool(_x_tile_skip["skip_two_body_tiles"]):
+            skip_two_body_tiles = True
 
         # Two-body product term: process ket columns j in tiles.
         for tile_idx, j0 in enumerate(range(0, int(self.ncsf), int(self.j_tile))):
@@ -10035,18 +9849,17 @@ class GugaMatvecEriMatWorkspace:
             j1 = min(int(self.ncsf), int(j0 + int(self.j_tile)))
             j_d = self.task_csf_all[int(j0) : int(j1)]
             j_count = int(j1 - j0)
-            check_overflow_tile = bool(check_overflow)
-            check_overflow_mode_tile = int(self.check_overflow_mode)
-            if check_overflow_tile and bool(self.check_overflow_first_tile_only) and int(j0) != 0:
-                check_overflow_tile = False
-            if not check_overflow_tile:
-                check_overflow_mode_tile = 0
-            check_overflow_apply_tile = bool(check_overflow)
-            if check_overflow_apply_tile and bool(self.check_overflow_first_tile_only) and int(j0) != 0:
-                check_overflow_apply_tile = False
-            tile_sync_apply = bool(sync)
-            if use_csr_pipeline and (not check_overflow_apply_tile):
-                tile_sync_apply = False
+            _tile_runtime_flags = _resolve_tile_runtime_flags_runtime(
+                self,
+                j0=int(j0),
+                check_overflow=bool(check_overflow),
+                sync=bool(sync),
+                use_csr_pipeline=bool(use_csr_pipeline),
+            )
+            check_overflow_tile = bool(_tile_runtime_flags["check_overflow_tile"])
+            check_overflow_mode_tile = int(_tile_runtime_flags["check_overflow_mode_tile"])
+            check_overflow_apply_tile = bool(_tile_runtime_flags["check_overflow_apply_tile"])
+            tile_sync_apply = bool(_tile_runtime_flags["tile_sync_apply"])
 
             tile_slot = None
             stream_build = stream
@@ -10077,9 +9890,17 @@ class GugaMatvecEriMatWorkspace:
                 # so the ERI contraction includes diagonal two-body terms.
                 continue
 
-            epq_table_j = self._epq_table
-            if use_epq_streaming_tiles:
-                epq_table_j = _build_epq_stream_tile(int(j0), int(j_count), global_indptr=True)
+            epq_table_j = _resolve_epq_table_for_tile_runtime(
+                self,
+                use_epq_streaming_tiles=bool(use_epq_streaming_tiles),
+                j_start=int(j0),
+                j_count=int(j_count),
+                stream=stream,
+                sync=bool(sync),
+                check_overflow=bool(check_overflow),
+                profile=profile,
+                build_epq_action_table_tile_device_fn=build_epq_action_table_tile_device,
+            )
 
             # Diagonal rs terms: r==s, where E_rr is a diagonal number operator.
             if self.include_diagonal_rs and not diag_in_w:
@@ -10220,8 +10041,7 @@ class GugaMatvecEriMatWorkspace:
             cached_tile = self._csr_tile_cache.get(int(j0)) if self.cache_csr_tiles else None
             if cached_tile is not None:
                 row_j_d, row_k_d, indptr_d, indices_d, data_d, nrows, nnz = cached_tile
-                if profile is not None:
-                    profile["csr_dev_cache_hits"] = profile.get("csr_dev_cache_hits", 0.0) + 1.0
+                _increment_profile_counter_runtime(profile=profile, key="csr_dev_cache_hits", delta=1.0)
             else:
                 cached_single = self._csr_single_tile_cache
                 if (
@@ -10231,8 +10051,7 @@ class GugaMatvecEriMatWorkspace:
                     and int(j_count) == int(self.ncsf)
                 ):
                     row_j_d, row_k_d, indptr_d, indices_d, data_d, nrows, nnz = cached_single
-                    if profile is not None:
-                        profile["csr_dev_cache_hits"] = profile.get("csr_dev_cache_hits", 0.0) + 1.0
+                    _increment_profile_counter_runtime(profile=profile, key="csr_dev_cache_hits", delta=1.0)
                 else:
                     host_cached = None
                     if bool(getattr(self, "csr_host_cache_enabled", False)):
@@ -10253,33 +10072,23 @@ class GugaMatvecEriMatWorkspace:
                                 )
                             if pref_host is not None:
                                 task_csf_h, task_p_h, task_q_h, total_tasks_h, kept_tasks_h = pref_host
-                                skipped_tasks_h = int(total_tasks_h) - int(kept_tasks_h)
-                                if profile is not None:
-                                    profile["csr_prefilter_tiles"] = profile.get("csr_prefilter_tiles", 0.0) + 1.0
-                                    profile["csr_prefilter_total_tasks"] = profile.get(
-                                        "csr_prefilter_total_tasks", 0.0
-                                    ) + float(total_tasks_h)
-                                    profile["csr_prefilter_kept_tasks"] = profile.get(
-                                        "csr_prefilter_kept_tasks", 0.0
-                                    ) + float(kept_tasks_h)
-                                    profile["csr_prefilter_skipped_tasks"] = profile.get(
-                                        "csr_prefilter_skipped_tasks", 0.0
-                                    ) + float(skipped_tasks_h)
-                                if int(kept_tasks_h) <= 0:
-                                    if profile is not None:
-                                        profile["csr_prefilter_zero_tiles"] = profile.get(
-                                            "csr_prefilter_zero_tiles", 0.0
-                                        ) + 1.0
+                                _pref_stats = _stamp_csr_prefilter_tile_profile_runtime(
+                                    profile=profile,
+                                    total_tasks=int(total_tasks_h),
+                                    kept_tasks=int(kept_tasks_h),
+                                )
+                                if bool(_pref_stats["is_zero_tile"]):
                                     continue
                                 with stream_build:
                                     pref_task_csf_d = cp.asarray(task_csf_h, dtype=cp.int32)
                                     pref_task_p_d = cp.asarray(task_p_h, dtype=cp.int32)
                                     pref_task_q_d = cp.asarray(task_q_h, dtype=cp.int32)
                                 build_from_prefiltered_tasks = True
-                                if profile is not None:
-                                    profile["csr_prefilter_dispatch_tiles"] = profile.get(
-                                        "csr_prefilter_dispatch_tiles", 0.0
-                                    ) + 1.0
+                                _increment_profile_counter_runtime(
+                                    profile=profile,
+                                    key="csr_prefilter_dispatch_tiles",
+                                    delta=1.0,
+                                )
 
                         if self.cache_csr_tiles and int(self.j_tile) < int(self.ncsf):
                             # 10.16.1: Use pre-allocated tile CSR buffers to avoid hot-loop allocations.
@@ -10975,25 +10784,16 @@ class GugaMatvecEriMatWorkspace:
         if use_csr_pipeline and pipeline_apply_stream is not None and bool(sync):
             pipeline_apply_stream.synchronize()
 
-        if profile is not None:
-            offdiag_gemm_s = float(profile.get("offdiag_gemm_s", 0.0))
-            offdiag_gemm_flops = float(profile.get("offdiag_gemm_flops", 0.0))
-            if offdiag_gemm_s > 0.0 and offdiag_gemm_flops > 0.0:
-                profile["offdiag_gemm_tflops"] = float(offdiag_gemm_flops / offdiag_gemm_s / 1.0e12)
-            offdiag_df_gemm_s = float(profile.get("offdiag_df_gemm_s", 0.0))
-            offdiag_df_gemm_flops = float(profile.get("offdiag_df_gemm_flops", 0.0))
-            if offdiag_df_gemm_s > 0.0 and offdiag_df_gemm_flops > 0.0:
-                profile["offdiag_df_gemm_tflops"] = float(offdiag_df_gemm_flops / offdiag_df_gemm_s / 1.0e12)
-            # CSR host cache hit rate.
-            _csr_total = max(1, int(self._csr_host_cache_hits) + int(self._csr_host_cache_misses))
-            profile["csr_host_cache_hit_rate"] = float(int(self._csr_host_cache_hits)) / float(_csr_total)
-            # EPQ apply tile cache hit rate.
-            _epq_total = max(1, int(self._epq_apply_cache_hits) + int(self._epq_apply_cache_misses))
-            profile["epq_apply_cache_hit_rate"] = float(int(self._epq_apply_cache_hits)) / float(_epq_total)
-            profile["epq_apply_cache_bytes"] = float(int(self._epq_apply_cache_bytes))
-        if profile is not None and t_total0 is not None:
-            stream.synchronize()
-            profile["total_s"] = profile.get("total_s", 0.0) + (time.perf_counter() - t_total0)
+        _finalize_hop_profile_runtime(
+            profile=profile,
+            stream=stream,
+            t_total0=t_total0,
+            csr_host_cache_hits=int(self._csr_host_cache_hits),
+            csr_host_cache_misses=int(self._csr_host_cache_misses),
+            epq_apply_cache_hits=int(self._epq_apply_cache_hits),
+            epq_apply_cache_misses=int(self._epq_apply_cache_misses),
+            epq_apply_cache_bytes=int(self._epq_apply_cache_bytes),
+        )
         return y
 
 
