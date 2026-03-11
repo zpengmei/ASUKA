@@ -361,7 +361,7 @@ __device__ __forceinline__ void warp_reduce_sum_arr(double* v) {
   }
 }
 
-// Bridge: gap code from previous part (types needed here).
+// Bridge: gap code from previous part(s) (types/helpers needed here).
 
 // Spherical bar_X + float32 variant: reads bar_X in spherical AO basis in Qmn layout as float32
 // (reduced global memory bandwidth), while keeping accumulation in FP64.

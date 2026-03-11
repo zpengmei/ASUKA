@@ -361,7 +361,7 @@ __device__ __forceinline__ void warp_reduce_sum_arr(double* v) {
   }
 }
 
-// Bridge: gap code from previous part (types needed here).
+// Bridge: gap code from previous part(s) (types/helpers needed here).
 
 // Float32 bar_X variant: reduces global memory bandwidth for the dominant DF 3c2e derivative contraction.
 // Accumulation is still in FP64 for stability.

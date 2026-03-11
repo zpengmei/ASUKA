@@ -74,7 +74,7 @@ def _find_line_exact(lines: list[str], text: str, start: int = 0) -> int:
 
 def _kernel_names_in_order(lines: list[str], ns_start: int, ns_end: int) -> list[str]:
     """Return kernel names in source order (e.g. 'psds', 'ppds', ...)."""
-    rx = re.compile(r"^__global__ void KernelERI_(\w+?)_fixed\s*\(")
+    rx = re.compile(r"^__global__ void KernelERI_(\w+?)_flat\s*\(")
     names: list[str] = []
     for line in lines[ns_start:ns_end]:
         m = rx.match(line)
@@ -94,7 +94,7 @@ def _kernel_block_bounds(
     # Find where the shared helpers end: right after the closing } of
     # compute_G_stride_fixed (the only template helper in the shared area).
     # Strategy: find each kernel's first device helper (eval_<name>_x).
-    rx_global = re.compile(r"^__global__ void KernelERI_(\w+?)_fixed\s*\(")
+    rx_global = re.compile(r"^__global__ void KernelERI_(\w+?)_flat\s*\(")
 
     # Collect the line index of each __global__ marker (absolute in file)
     global_lines: dict[str, int] = {}

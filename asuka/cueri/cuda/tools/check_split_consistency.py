@@ -47,11 +47,11 @@ GEN_DIR = SRC_DIR / "generated"
 DEFAULT_CHECKS: tuple[CheckSpec, ...] = (
     CheckSpec("bindings", "bindings", SRC_DIR / "cueri_cuda_ext.cpp", 9),
     CheckSpec("df_deriv", "large", SRC_DIR / "cueri_cuda_kernels_df_deriv.cu", 17),
-    CheckSpec("step2", "large", SRC_DIR / "cueri_cuda_kernels_step2.cu", 2, split_parts=4),
+    CheckSpec("step2", "large", SRC_DIR / "cueri_cuda_kernels_step2.cu", 4),
     CheckSpec("rys_generic", "large", SRC_DIR / "cueri_cuda_kernels_rys_generic.cu", 2),
     CheckSpec("rys_generic_deriv", "large", SRC_DIR / "cueri_cuda_kernels_rys_generic_deriv.cu", 2),
     CheckSpec("wave1", "wave", GEN_DIR / "cueri_cuda_kernels_wave1_generated.cu", 12),
-    CheckSpec("wave2", "wave", GEN_DIR / "cueri_cuda_kernels_wave2_generated.cu", 6),
+    CheckSpec("wave2", "wave", GEN_DIR / "cueri_cuda_kernels_wave2_generated.cu", 9, split_parts=12),
 )
 
 

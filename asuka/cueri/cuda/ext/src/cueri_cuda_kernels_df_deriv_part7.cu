@@ -361,7 +361,7 @@ __device__ __forceinline__ void warp_reduce_sum_arr(double* v) {
   }
 }
 
-// Bridge: gap code from previous part (types needed here).
+// Bridge: gap code from previous part(s) (types/helpers needed here).
 
 // AB-tiled variant: each block processes one spAB and up to `cd_tile` spCD tasks.
 // A/B-center derivatives are accumulated across tile tasks and atomically flushed once,

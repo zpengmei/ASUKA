@@ -1,4 +1,4 @@
-// Auto-split from cueri_cuda_kernels_df_deriv.cu (part 4/4: KernelDFInt3c2eDerivContractedCartAllSPAtomGradSphBarQmnF32Bar..KernelDFMetric2c2eDerivContractedCartAllSPAtomGradTril)
+// Auto-split from cueri_cuda_kernels_df_deriv.cu (part 4/17: KernelDFInt3c2eDerivContractedCartAllSPAtomGradSphBarQmn..KernelDFInt3c2eDerivContractedCartAllSPAtomGradSphBarQmn)
 // Do not edit — regenerate with split_large_kernels.py
 
 #include <cuda_runtime.h>
@@ -363,10 +363,11 @@ __device__ __forceinline__ void warp_reduce_sum_arr(double* v) {
 
 // Bridge: gap code from previous part(s) (types/helpers needed here).
 
-// Spherical bar_X + float32 variant: reads bar_X in spherical AO basis in Qmn layout as float32
-// (reduced global memory bandwidth), while keeping accumulation in FP64.
+// Spherical bar_X variant: consumes bar_X in spherical AO basis in Qmn layout and applies the
+// cart<-sph transforms inside the contraction kernel to avoid materializing the full
+// Cartesian bar_X tensor (nao_cart^2 * naux).
 template <int NROOTS>
-__global__ void KernelDFInt3c2eDerivContractedCartAllSPAtomGradSphBarQmnF32Bar(
+__global__ void KernelDFInt3c2eDerivContractedCartAllSPAtomGradSphBarQmn(
     const int32_t* spAB_arr,   // [n_spAB] AO shell-pair indices in this (la,lb) class
     int n_spAB,
     const int32_t* spCD,       // [ntasks] aux shell-pair indices
@@ -393,9 +394,11 @@ __global__ void KernelDFInt3c2eDerivContractedCartAllSPAtomGradSphBarQmnF32Bar(
     int la,
     int lb,
     int lc,
-    const float* bar_X_sph_Qmn,        // [naux*nao_sph*nao_sph] (Q,m,n) C-order
+    const double* bar_X_sph_Qmn,       // [naux*nao_sph*nao_sph] (Q,m,n) C-order
     const int32_t* shell_ao_start_sph, // spherical AO start offset per AO shell
     const int32_t* shell_atom,         // combined AO+aux shell->atom map (length: nAOshells+nAuxShells)
+    int q_offset,                      // absolute aux AO start index for streamed bar_X
+    int q_count,                       // number of aux AO rows in streamed bar_X
     double* grad_dev) {                // [natm*3] gradient accumulator (atomicAdd target)
   const int t   = static_cast<int>(blockIdx.x);  // CD task index
   const int iAB = static_cast<int>(blockIdx.y);  // AB class index
@@ -415,7 +418,7 @@ __global__ void KernelDFInt3c2eDerivContractedCartAllSPAtomGradSphBarQmnF32Bar(
   __shared__ double sh_Gz[kMaxWarpsPerBlock][kGSizeD];
 
   __shared__ double sh_warp_sum[kMaxWarpsPerBlock][9];
-  __shared__ float sh_bar[kBarCacheMax];
+  __shared__ double sh_bar[kBarCacheMax];
 
   const int shellA = static_cast<int>(sp_A[spAB]);
   const int shellB = static_cast<int>(sp_B[spAB]);
@@ -477,7 +480,18 @@ __global__ void KernelDFInt3c2eDerivContractedCartAllSPAtomGradSphBarQmnF32Bar(
       const int ib = rem / nC;
       const int ic = rem - ib * nC;
       const int q = c0 + ic;
-      sh_bar[idx] = static_cast<float>(df_bar_cart_from_sph_qmn_f32(bar_X_sph_Qmn, q, ia, ib, la, lb, a0_sph, b0_sph, nao_sph));
+      sh_bar[idx] = df_bar_cart_from_sph_qmn_stream(
+          bar_X_sph_Qmn,
+          q,
+          q_offset,
+          q_count,
+          ia,
+          ib,
+          la,
+          lb,
+          a0_sph,
+          b0_sph,
+          nao_sph);
     }
   }
 
@@ -596,14 +610,25 @@ __global__ void KernelDFInt3c2eDerivContractedCartAllSPAtomGradSphBarQmnF32Bar(
         const int ib = rem / nC;
         const int ic = rem - ib * nC;
 
-        float bar_f = 0.0f;
+        double bar = 0.0;
         if (cache_bar) {
-          bar_f = sh_bar[idx];
+          bar = sh_bar[idx];
         } else {
           const int q_idx = c0 + ic;
-          bar_f = static_cast<float>(df_bar_cart_from_sph_qmn_f32(bar_X_sph_Qmn, q_idx, ia, ib, la, lb, a0_sph, b0_sph, nao_sph));
+          bar = df_bar_cart_from_sph_qmn_stream(
+              bar_X_sph_Qmn,
+              q_idx,
+              q_offset,
+              q_count,
+              ia,
+              ib,
+              la,
+              lb,
+              a0_sph,
+              b0_sph,
+              nao_sph);
         }
-        if (bar_f == 0.0f) continue;
+        if (bar == 0.0) continue;
 
         const int iax = static_cast<int>(shA_lx[ia]);
         const int iay = static_cast<int>(shA_ly[ia]);
@@ -619,7 +644,7 @@ __global__ void KernelDFInt3c2eDerivContractedCartAllSPAtomGradSphBarQmnF32Bar(
         const double Iy = shift_from_G_ld0_d(sh_Gy[warp_id], iay, iby, icy, sh_yij_pow);
         const double Iz = shift_from_G_ld0_d(sh_Gz[warp_id], iaz, ibz, icz, sh_zij_pow);
 
-        const double bar_scale = static_cast<double>(bar_f) * scale;
+        const double bar_scale = bar * scale;
 
         // Center A derivatives.
         const double Ix_m_A = (iax > 0) ? shift_from_G_ld0_d(sh_Gx[warp_id], iax - 1, ibx, icx, sh_xij_pow) : 0.0;
@@ -706,1247 +731,13 @@ __global__ void KernelDFInt3c2eDerivContractedCartAllSPAtomGradSphBarQmnF32Bar(
   }
 }
 
-template <int NROOTS>
-__global__ void KernelDFMetric2c2eDerivContractedCartBatch(
-    int32_t spAB,
-    const int32_t* spCD,
-    int ntasks,
-    const int32_t* sp_A,
-    const int32_t* sp_B,
-    const int32_t* sp_pair_start,
-    const int32_t* sp_npair,
-    const double* shell_cx,
-    const double* shell_cy,
-    const double* shell_cz,
-    const int32_t* shell_prim_start,
-    const int32_t* shell_nprim,
-    const int32_t* shell_ao_start,
-    const double* prim_exp,
-    const double* pair_eta,
-    const double* pair_Px,
-    const double* pair_Py,
-    const double* pair_Pz,
-    const double* pair_cK,
-    int nao,
-    int naux,
-    int la,
-    int lc,
-    const double* bar_V,
-    double* out) {
-  const int t = static_cast<int>(blockIdx.x);
-  if (t >= ntasks) return;
-
-  __shared__ int8_t shA_lx[kNcartMax], shA_ly[kNcartMax], shA_lz[kNcartMax];
-  __shared__ int8_t shC_lx[kNcartMax], shC_ly[kNcartMax], shC_lz[kNcartMax];
-  __shared__ double sh_xij_pow[kLMaxD + 1], sh_yij_pow[kLMaxD + 1], sh_zij_pow[kLMaxD + 1];
-
-  __shared__ double sh_Gx[kMaxWarpsPerBlock][kGSizeD];
-  __shared__ double sh_Gy[kMaxWarpsPerBlock][kGSizeD];
-  __shared__ double sh_Gz[kMaxWarpsPerBlock][kGSizeD];
-
-  __shared__ double sh_warp_sum[kMaxWarpsPerBlock][6];
-  __shared__ double sh_bar[kBarCacheMax];
-
-  const int spCD_i = static_cast<int>(spCD[t]);
-
-  const int shellA = static_cast<int>(sp_A[spAB]);
-  const int shellB = static_cast<int>(sp_B[spAB]);  // dummy s at origin
-  const int shellC = static_cast<int>(sp_A[spCD_i]);
-
-  (void)shellB;
-
-  const int nA = ncart(la);
-  const int nC = ncart(lc);
-  const int nElem = nA * nC;
-
-  const int a0 = static_cast<int>(shell_ao_start[shellA]) - nao;
-  const int c0 = static_cast<int>(shell_ao_start[shellC]) - nao;
-
-  const int baseAB = static_cast<int>(sp_pair_start[spAB]);
-  const int baseCD = static_cast<int>(sp_pair_start[spCD_i]);
-  const int nprimAB = static_cast<int>(sp_npair[spAB]);  // == nprimA (nprimB=1)
-  const int nprimCD = static_cast<int>(sp_npair[spCD_i]);  // == nprimC (nprimD=1)
-
-  const int sA = static_cast<int>(shell_prim_start[shellA]);
-  const int sC = static_cast<int>(shell_prim_start[shellC]);
-
-  const double Ax = shell_cx[shellA];
-  const double Ay = shell_cy[shellA];
-  const double Az = shell_cz[shellA];
-  const double Cx = shell_cx[shellC];
-  const double Cy = shell_cy[shellC];
-  const double Cz = shell_cz[shellC];
-
-  if (threadIdx.x == 0) {
-    fill_cart_comp(la, shA_lx, shA_ly, shA_lz);
-    fill_cart_comp(lc, shC_lx, shC_ly, shC_lz);
-
-    // Dummy shell at origin => AB vector == A.
-    sh_xij_pow[0] = 1.0;
-    sh_yij_pow[0] = 1.0;
-    sh_zij_pow[0] = 1.0;
-    for (int p = 1; p <= kLMaxD; ++p) {
-      sh_xij_pow[p] = sh_xij_pow[p - 1] * Ax;
-      sh_yij_pow[p] = sh_yij_pow[p - 1] * Ay;
-      sh_zij_pow[p] = sh_zij_pow[p - 1] * Az;
-    }
-  }
-
-  const bool cache_bar = (nElem > 0 && nElem <= kBarCacheMax);
-  if (cache_bar) {
-    for (int idx = static_cast<int>(threadIdx.x); idx < nElem; idx += static_cast<int>(blockDim.x)) {
-      const int ia = idx / nC;
-      const int ic = idx - ia * nC;
-      const int row_idx = a0 + ia;
-      const int col_idx = c0 + ic;
-      sh_bar[idx] = bar_V[static_cast<int64_t>(row_idx) * static_cast<int64_t>(naux) + static_cast<int64_t>(col_idx)];
-    }
-  }
-
-  __syncthreads();
-
-  // Block-level bar_X early-exit: skip block if max|sh_bar| < threshold.
-  if (cache_bar) {
-    double tmax = 0.0;
-    for (int idx = static_cast<int>(threadIdx.x); idx < nElem; idx += static_cast<int>(blockDim.x)) {
-      double v = static_cast<double>(sh_bar[idx]);
-      if (v < 0.0) v = -v;
-      if (v > tmax) tmax = v;
-    }
-    for (int offset = 16; offset > 0; offset >>= 1) {
-      double other = __shfl_down_sync(0xffffffff, tmax, offset);
-      if (other > tmax) tmax = other;
-    }
-    {
-      const int lane_ = static_cast<int>(threadIdx.x) & 31;
-      const int warp_ = static_cast<int>(threadIdx.x) >> 5;
-      if (lane_ == 0) sh_warp_sum[warp_][0] = tmax;
-    }
-    __syncthreads();
-    if (threadIdx.x == 0) {
-      double bmax = sh_warp_sum[0][0];
-      const int nw = static_cast<int>(blockDim.x) >> 5;
-      for (int w = 1; w < nw; ++w) {
-        if (sh_warp_sum[w][0] > bmax) bmax = sh_warp_sum[w][0];
-      }
-      sh_warp_sum[0][0] = bmax;
-    }
-    __syncthreads();
-    if (sh_warp_sum[0][0] < 1e-14) return;
-  }
-
-  const int lane = static_cast<int>(threadIdx.x) & 31;
-  const int warp_id = static_cast<int>(threadIdx.x) >> 5;
-  const int warps = static_cast<int>(blockDim.x) >> 5;
-
-  double acc[6];
-#pragma unroll
-  for (int i = 0; i < 6; ++i) acc[i] = 0.0;
-
-  const int nmax = la + 1;
-  const int mmax = lc + 1;
-  const int64_t nTot = static_cast<int64_t>(nprimAB) * static_cast<int64_t>(nprimCD);
-
-  for (int64_t u = static_cast<int64_t>(warp_id); u < nTot; u += static_cast<int64_t>(warps)) {
-    const int iAB = static_cast<int>(u / static_cast<int64_t>(nprimCD));  // primitive index for A
-    const int iCD = static_cast<int>(u - static_cast<int64_t>(iAB) * static_cast<int64_t>(nprimCD));  // primitive index for C
-    const int ki = baseAB + iAB;
-    const int kj = baseCD + iCD;
-
-    const double p = pair_eta[ki];
-    const double q = pair_eta[kj];
-    const double Px = pair_Px[ki];
-    const double Py = pair_Py[ki];
-    const double Pz = pair_Pz[ki];
-    const double Qx = pair_Px[kj];
-    const double Qy = pair_Py[kj];
-    const double Qz = pair_Pz[kj];
-    const double cKab = pair_cK[ki];
-    const double cKcd = pair_cK[kj];
-
-    const double aexp = prim_exp[sA + iAB];
-    const double cexp = prim_exp[sC + iCD];
-
-    const double denom = p + q;
-    const double inv_denom = 1.0 / denom;
-    const double dx = Px - Qx;
-    const double dy = Py - Qy;
-    const double dz = Pz - Qz;
-    const double PQ2 = dx * dx + dy * dy + dz * dz;
-    const double omega = p * q * inv_denom;
-    const double T = omega * PQ2;
-
-    const double base = kTwoPiToFiveHalves / (p * q * ::sqrt(denom)) * cKab * cKcd;
-
-    double roots[NROOTS];
-    double weights[NROOTS];
-    if (lane == 0) {
-      cueri_rys::rys_roots_weights<NROOTS>(T, roots, weights);
-    }
-
-    for (int r = 0; r < NROOTS; ++r) {
-      double x = (lane == 0) ? roots[r] : 0.0;
-      double w = (lane == 0) ? weights[r] : 0.0;
-      x = __shfl_sync(0xffffffff, x, 0);
-      w = __shfl_sync(0xffffffff, w, 0);
-
-      {
-        const double B0 = x * 0.5 * inv_denom;
-        const double B1 = (1.0 - x) * 0.5 / p + B0;
-        const double B1p = (1.0 - x) * 0.5 / q + B0;
-        const double q_over = q * inv_denom;
-        const double p_over = p * inv_denom;
-        if (lane < 3) {
-          double PA, QC, PQd;
-          double* G_target;
-          if (lane == 0) { PA = Px - Ax; QC = Qx - Cx; PQd = Qx - Px; G_target = sh_Gx[warp_id]; }
-          else if (lane == 1) { PA = Py - Ay; QC = Qy - Cy; PQd = Qy - Py; G_target = sh_Gy[warp_id]; }
-          else { PA = Pz - Az; QC = Qz - Cz; PQd = Qz - Pz; G_target = sh_Gz[warp_id]; }
-          compute_G_d(G_target, nmax, mmax, PA + q_over * x * PQd, QC - p_over * x * PQd, B0, B1, B1p);
-        }
-      }
-
-      const double scale = base * w;
-      __syncwarp();
-
-      for (int idx = lane; idx < nElem; idx += 32) {
-        double bar = 0.0;
-        if (cache_bar) {
-          bar = sh_bar[idx];
-        } else {
-          const int ia = idx / nC;
-          const int ic = idx - ia * nC;
-          const int row_idx = a0 + ia;
-          const int col_idx = c0 + ic;
-          bar = bar_V[static_cast<int64_t>(row_idx) * static_cast<int64_t>(naux) + static_cast<int64_t>(col_idx)];
-        }
-        if (bar == 0.0) continue;
-
-        const int ia = idx / nC;
-        const int ic = idx - ia * nC;
-
-        const int iax = static_cast<int>(shA_lx[ia]);
-        const int iay = static_cast<int>(shA_ly[ia]);
-        const int iaz = static_cast<int>(shA_lz[ia]);
-        const int icx = static_cast<int>(shC_lx[ic]);
-        const int icy = static_cast<int>(shC_ly[ic]);
-        const int icz = static_cast<int>(shC_lz[ic]);
-
-        const double Ix = shift_from_G_ld0_d(sh_Gx[warp_id], iax, 0, icx, sh_xij_pow);
-        const double Iy = shift_from_G_ld0_d(sh_Gy[warp_id], iay, 0, icy, sh_yij_pow);
-        const double Iz = shift_from_G_ld0_d(sh_Gz[warp_id], iaz, 0, icz, sh_zij_pow);
-
-        const double bar_scale = bar * scale;
-
-        // Center A (P) derivatives.
-        const double Ix_m_A = (iax > 0) ? shift_from_G_ld0_d(sh_Gx[warp_id], iax - 1, 0, icx, sh_xij_pow) : 0.0;
-        const double Ix_p_A = shift_from_G_ld0_d(sh_Gx[warp_id], iax + 1, 0, icx, sh_xij_pow);
-        const double dIx_A = (-static_cast<double>(iax)) * Ix_m_A + (2.0 * aexp) * Ix_p_A;
-        acc[0] += bar_scale * (dIx_A * Iy * Iz);
-
-        const double Iy_m_A = (iay > 0) ? shift_from_G_ld0_d(sh_Gy[warp_id], iay - 1, 0, icy, sh_yij_pow) : 0.0;
-        const double Iy_p_A = shift_from_G_ld0_d(sh_Gy[warp_id], iay + 1, 0, icy, sh_yij_pow);
-        const double dIy_A = (-static_cast<double>(iay)) * Iy_m_A + (2.0 * aexp) * Iy_p_A;
-        acc[1] += bar_scale * (Ix * dIy_A * Iz);
-
-        const double Iz_m_A = (iaz > 0) ? shift_from_G_ld0_d(sh_Gz[warp_id], iaz - 1, 0, icz, sh_zij_pow) : 0.0;
-        const double Iz_p_A = shift_from_G_ld0_d(sh_Gz[warp_id], iaz + 1, 0, icz, sh_zij_pow);
-        const double dIz_A = (-static_cast<double>(iaz)) * Iz_m_A + (2.0 * aexp) * Iz_p_A;
-        acc[2] += bar_scale * (Ix * Iy * dIz_A);
-
-        // Center C (Q) derivatives.
-        const double Ix_m_C = (icx > 0) ? shift_from_G_ld0_d(sh_Gx[warp_id], iax, 0, icx - 1, sh_xij_pow) : 0.0;
-        const double Ix_p_C = shift_from_G_ld0_d(sh_Gx[warp_id], iax, 0, icx + 1, sh_xij_pow);
-        const double dIx_C = (-static_cast<double>(icx)) * Ix_m_C + (2.0 * cexp) * Ix_p_C;
-        acc[3] += bar_scale * (dIx_C * Iy * Iz);
-
-        const double Iy_m_C = (icy > 0) ? shift_from_G_ld0_d(sh_Gy[warp_id], iay, 0, icy - 1, sh_yij_pow) : 0.0;
-        const double Iy_p_C = shift_from_G_ld0_d(sh_Gy[warp_id], iay, 0, icy + 1, sh_yij_pow);
-        const double dIy_C = (-static_cast<double>(icy)) * Iy_m_C + (2.0 * cexp) * Iy_p_C;
-        acc[4] += bar_scale * (Ix * dIy_C * Iz);
-
-        const double Iz_m_C = (icz > 0) ? shift_from_G_ld0_d(sh_Gz[warp_id], iaz, 0, icz - 1, sh_zij_pow) : 0.0;
-        const double Iz_p_C = shift_from_G_ld0_d(sh_Gz[warp_id], iaz, 0, icz + 1, sh_zij_pow);
-        const double dIz_C = (-static_cast<double>(icz)) * Iz_m_C + (2.0 * cexp) * Iz_p_C;
-        acc[5] += bar_scale * (Ix * Iy * dIz_C);
-      }
-
-      __syncwarp();
-    }
-  }
-
-  warp_reduce_sum_arr(acc);
-  if (lane == 0) {
-#pragma unroll
-    for (int i = 0; i < 6; ++i) sh_warp_sum[warp_id][i] = acc[i];
-  }
-  __syncthreads();
-
-  if (threadIdx.x == 0) {
-    double sum[6];
-#pragma unroll
-    for (int i = 0; i < 6; ++i) sum[i] = 0.0;
-    for (int w = 0; w < warps; ++w) {
-#pragma unroll
-      for (int i = 0; i < 6; ++i) sum[i] += sh_warp_sum[w][i];
-    }
-    const int out0 = t * 6;
-#pragma unroll
-    for (int i = 0; i < 6; ++i) out[out0 + i] = sum[i];
-  }
-}
-
-// ──────────────────────────────────────────────────────────────────────
-// KernelDFMetric2c2eDerivContractedCartAllSPAtomGrad
-//
-// Like KernelDFMetric2c2eDerivContractedCartBatch but:
-//   • takes an array spAB_arr[n_spAB] instead of a single spAB
-//   • uses a 2D grid: blockIdx.x = CD task,  blockIdx.y = AB index
-//   • writes results directly to grad_dev[natm*3] via atomicAdd
-//   • processes the FULL matrix (no upper-triangle restriction);
-//     the caller is responsible for supplying the correct adjoint bar_V
-//     that already accounts for symmetry (or passing the full matrix).
-// ──────────────────────────────────────────────────────────────────────
-template <int NROOTS>
-__global__ void KernelDFMetric2c2eDerivContractedCartAllSPAtomGrad(
-    const int32_t* spAB_arr,
-    int n_spAB,
-    const int32_t* spCD,
-    int ntasks,
-    const int32_t* sp_A,
-    const int32_t* sp_B,
-    const int32_t* sp_pair_start,
-    const int32_t* sp_npair,
-    const double* shell_cx,
-    const double* shell_cy,
-    const double* shell_cz,
-    const int32_t* shell_prim_start,
-    const int32_t* shell_nprim,
-    const int32_t* shell_ao_start,
-    const double* prim_exp,
-    const double* pair_eta,
-    const double* pair_Px,
-    const double* pair_Py,
-    const double* pair_Pz,
-    const double* pair_cK,
-    int nao,
-    int naux,
-    int la,
-    int lc,
-    const double* bar_V,
-    const int32_t* shell_atom,
-    double* grad_dev) {
-  const int t   = static_cast<int>(blockIdx.x);   // CD task index
-  const int iAB = static_cast<int>(blockIdx.y);   // AB class index
-  if (t >= ntasks || iAB >= n_spAB) return;
-
-  const int spAB   = static_cast<int>(spAB_arr[iAB]);
-  const int spCD_i = static_cast<int>(spCD[t]);
-
-  __shared__ int8_t shA_lx[kNcartMax], shA_ly[kNcartMax], shA_lz[kNcartMax];
-  __shared__ int8_t shC_lx[kNcartMax], shC_ly[kNcartMax], shC_lz[kNcartMax];
-  __shared__ double sh_xij_pow[kLMaxD + 1], sh_yij_pow[kLMaxD + 1], sh_zij_pow[kLMaxD + 1];
-
-  __shared__ double sh_Gx[kMaxWarpsPerBlock][kGSizeD];
-  __shared__ double sh_Gy[kMaxWarpsPerBlock][kGSizeD];
-  __shared__ double sh_Gz[kMaxWarpsPerBlock][kGSizeD];
-
-  __shared__ double sh_warp_sum[kMaxWarpsPerBlock][6];
-  __shared__ double sh_bar[kBarCacheMax];
-
-  const int shellA = static_cast<int>(sp_A[spAB]);
-  const int shellC = static_cast<int>(sp_A[spCD_i]);
-
-  const int nA = ncart(la);
-  const int nC = ncart(lc);
-  const int nElem = nA * nC;
-
-  const int a0 = static_cast<int>(shell_ao_start[shellA]) - nao;
-  const int c0 = static_cast<int>(shell_ao_start[shellC]) - nao;
-
-  const int baseAB = static_cast<int>(sp_pair_start[spAB]);
-  const int baseCD = static_cast<int>(sp_pair_start[spCD_i]);
-  const int nprimAB = static_cast<int>(sp_npair[spAB]);
-  const int nprimCD = static_cast<int>(sp_npair[spCD_i]);
-
-  const int sA = static_cast<int>(shell_prim_start[shellA]);
-  const int sC = static_cast<int>(shell_prim_start[shellC]);
-
-  const double Ax = shell_cx[shellA];
-  const double Ay = shell_cy[shellA];
-  const double Az = shell_cz[shellA];
-  const double Cx = shell_cx[shellC];
-  const double Cy = shell_cy[shellC];
-  const double Cz = shell_cz[shellC];
-
-  if (threadIdx.x == 0) {
-    fill_cart_comp(la, shA_lx, shA_ly, shA_lz);
-    fill_cart_comp(lc, shC_lx, shC_ly, shC_lz);
-
-    sh_xij_pow[0] = 1.0;
-    sh_yij_pow[0] = 1.0;
-    sh_zij_pow[0] = 1.0;
-    for (int p = 1; p <= kLMaxD; ++p) {
-      sh_xij_pow[p] = sh_xij_pow[p - 1] * Ax;
-      sh_yij_pow[p] = sh_yij_pow[p - 1] * Ay;
-      sh_zij_pow[p] = sh_zij_pow[p - 1] * Az;
-    }
-  }
-
-  const bool cache_bar = (nElem > 0 && nElem <= kBarCacheMax);
-  if (cache_bar) {
-    for (int idx = static_cast<int>(threadIdx.x); idx < nElem; idx += static_cast<int>(blockDim.x)) {
-      const int ia = idx / nC;
-      const int ic = idx - ia * nC;
-      const int row_idx = a0 + ia;
-      const int col_idx = c0 + ic;
-      sh_bar[idx] = bar_V[static_cast<int64_t>(row_idx) * static_cast<int64_t>(naux) + static_cast<int64_t>(col_idx)];
-    }
-  }
-
-  __syncthreads();
-
-  // Block-level bar_X early-exit: skip block if max|sh_bar| < threshold.
-  if (cache_bar) {
-    double tmax = 0.0;
-    for (int idx = static_cast<int>(threadIdx.x); idx < nElem; idx += static_cast<int>(blockDim.x)) {
-      double v = static_cast<double>(sh_bar[idx]);
-      if (v < 0.0) v = -v;
-      if (v > tmax) tmax = v;
-    }
-    for (int offset = 16; offset > 0; offset >>= 1) {
-      double other = __shfl_down_sync(0xffffffff, tmax, offset);
-      if (other > tmax) tmax = other;
-    }
-    {
-      const int lane_ = static_cast<int>(threadIdx.x) & 31;
-      const int warp_ = static_cast<int>(threadIdx.x) >> 5;
-      if (lane_ == 0) sh_warp_sum[warp_][0] = tmax;
-    }
-    __syncthreads();
-    if (threadIdx.x == 0) {
-      double bmax = sh_warp_sum[0][0];
-      const int nw = static_cast<int>(blockDim.x) >> 5;
-      for (int w = 1; w < nw; ++w) {
-        if (sh_warp_sum[w][0] > bmax) bmax = sh_warp_sum[w][0];
-      }
-      sh_warp_sum[0][0] = bmax;
-    }
-    __syncthreads();
-    if (sh_warp_sum[0][0] < 1e-14) return;
-  }
-
-  const int lane = static_cast<int>(threadIdx.x) & 31;
-  const int warp_id = static_cast<int>(threadIdx.x) >> 5;
-  const int warps = static_cast<int>(blockDim.x) >> 5;
-
-  double acc[6];
-#pragma unroll
-  for (int i = 0; i < 6; ++i) acc[i] = 0.0;
-
-  const int nmax = la + 1;
-  const int mmax = lc + 1;
-  const int64_t nTot = static_cast<int64_t>(nprimAB) * static_cast<int64_t>(nprimCD);
-
-  for (int64_t u = static_cast<int64_t>(warp_id); u < nTot; u += static_cast<int64_t>(warps)) {
-    const int iAB_prim = static_cast<int>(u / static_cast<int64_t>(nprimCD));
-    const int iCD = static_cast<int>(u - static_cast<int64_t>(iAB_prim) * static_cast<int64_t>(nprimCD));
-    const int ki = baseAB + iAB_prim;
-    const int kj = baseCD + iCD;
-
-    const double p = pair_eta[ki];
-    const double q = pair_eta[kj];
-    const double Px_ = pair_Px[ki];
-    const double Py_ = pair_Py[ki];
-    const double Pz_ = pair_Pz[ki];
-    const double Qx = pair_Px[kj];
-    const double Qy = pair_Py[kj];
-    const double Qz = pair_Pz[kj];
-    const double cKab = pair_cK[ki];
-    const double cKcd = pair_cK[kj];
-
-    const double aexp = prim_exp[sA + iAB_prim];
-    const double cexp = prim_exp[sC + iCD];
-
-    const double denom = p + q;
-    const double inv_denom = 1.0 / denom;
-    const double dx = Px_ - Qx;
-    const double dy = Py_ - Qy;
-    const double dz = Pz_ - Qz;
-    const double PQ2 = dx * dx + dy * dy + dz * dz;
-    const double omega = p * q * inv_denom;
-    const double T = omega * PQ2;
-
-    const double base = kTwoPiToFiveHalves / (p * q * ::sqrt(denom)) * cKab * cKcd;
-
-    double roots[NROOTS];
-    double weights[NROOTS];
-    if (lane == 0) {
-      cueri_rys::rys_roots_weights<NROOTS>(T, roots, weights);
-    }
-
-    for (int r = 0; r < NROOTS; ++r) {
-      double x = (lane == 0) ? roots[r] : 0.0;
-      double w = (lane == 0) ? weights[r] : 0.0;
-      x = __shfl_sync(0xffffffff, x, 0);
-      w = __shfl_sync(0xffffffff, w, 0);
-
-      {
-        const double B0 = x * 0.5 * inv_denom;
-        const double B1 = (1.0 - x) * 0.5 / p + B0;
-        const double B1p = (1.0 - x) * 0.5 / q + B0;
-        const double q_over = q * inv_denom;
-        const double p_over = p * inv_denom;
-        if (lane < 3) {
-          double PA, QC, PQd;
-          double* G_target;
-          if (lane == 0) { PA = Px_ - Ax; QC = Qx - Cx; PQd = Qx - Px_; G_target = sh_Gx[warp_id]; }
-          else if (lane == 1) { PA = Py_ - Ay; QC = Qy - Cy; PQd = Qy - Py_; G_target = sh_Gy[warp_id]; }
-          else { PA = Pz_ - Az; QC = Qz - Cz; PQd = Qz - Pz_; G_target = sh_Gz[warp_id]; }
-          compute_G_d(G_target, nmax, mmax, PA + q_over * x * PQd, QC - p_over * x * PQd, B0, B1, B1p);
-        }
-      }
-
-      const double scale = base * w;
-      __syncwarp();
-
-      for (int idx = lane; idx < nElem; idx += 32) {
-        double bar = 0.0;
-        if (cache_bar) {
-          bar = sh_bar[idx];
-        } else {
-          const int ia = idx / nC;
-          const int ic = idx - ia * nC;
-          const int row_idx = a0 + ia;
-          const int col_idx = c0 + ic;
-          bar = bar_V[static_cast<int64_t>(row_idx) * static_cast<int64_t>(naux) + static_cast<int64_t>(col_idx)];
-        }
-        if (bar == 0.0) continue;
-
-        const int ia = idx / nC;
-        const int ic = idx - ia * nC;
-
-        const int iax = static_cast<int>(shA_lx[ia]);
-        const int iay = static_cast<int>(shA_ly[ia]);
-        const int iaz = static_cast<int>(shA_lz[ia]);
-        const int icx = static_cast<int>(shC_lx[ic]);
-        const int icy = static_cast<int>(shC_ly[ic]);
-        const int icz = static_cast<int>(shC_lz[ic]);
-
-        const double Ix = shift_from_G_ld0_d(sh_Gx[warp_id], iax, 0, icx, sh_xij_pow);
-        const double Iy = shift_from_G_ld0_d(sh_Gy[warp_id], iay, 0, icy, sh_yij_pow);
-        const double Iz = shift_from_G_ld0_d(sh_Gz[warp_id], iaz, 0, icz, sh_zij_pow);
-
-        const double bar_scale = bar * scale;
-
-        // Center A (P) derivatives.
-        const double Ix_m_A = (iax > 0) ? shift_from_G_ld0_d(sh_Gx[warp_id], iax - 1, 0, icx, sh_xij_pow) : 0.0;
-        const double Ix_p_A = shift_from_G_ld0_d(sh_Gx[warp_id], iax + 1, 0, icx, sh_xij_pow);
-        const double dIx_A = (-static_cast<double>(iax)) * Ix_m_A + (2.0 * aexp) * Ix_p_A;
-        acc[0] += bar_scale * (dIx_A * Iy * Iz);
-
-        const double Iy_m_A = (iay > 0) ? shift_from_G_ld0_d(sh_Gy[warp_id], iay - 1, 0, icy, sh_yij_pow) : 0.0;
-        const double Iy_p_A = shift_from_G_ld0_d(sh_Gy[warp_id], iay + 1, 0, icy, sh_yij_pow);
-        const double dIy_A = (-static_cast<double>(iay)) * Iy_m_A + (2.0 * aexp) * Iy_p_A;
-        acc[1] += bar_scale * (Ix * dIy_A * Iz);
-
-        const double Iz_m_A = (iaz > 0) ? shift_from_G_ld0_d(sh_Gz[warp_id], iaz - 1, 0, icz, sh_zij_pow) : 0.0;
-        const double Iz_p_A = shift_from_G_ld0_d(sh_Gz[warp_id], iaz + 1, 0, icz, sh_zij_pow);
-        const double dIz_A = (-static_cast<double>(iaz)) * Iz_m_A + (2.0 * aexp) * Iz_p_A;
-        acc[2] += bar_scale * (Ix * Iy * dIz_A);
-
-        // Center C (Q) derivatives.
-        const double Ix_m_C = (icx > 0) ? shift_from_G_ld0_d(sh_Gx[warp_id], iax, 0, icx - 1, sh_xij_pow) : 0.0;
-        const double Ix_p_C = shift_from_G_ld0_d(sh_Gx[warp_id], iax, 0, icx + 1, sh_xij_pow);
-        const double dIx_C = (-static_cast<double>(icx)) * Ix_m_C + (2.0 * cexp) * Ix_p_C;
-        acc[3] += bar_scale * (dIx_C * Iy * Iz);
-
-        const double Iy_m_C = (icy > 0) ? shift_from_G_ld0_d(sh_Gy[warp_id], iay, 0, icy - 1, sh_yij_pow) : 0.0;
-        const double Iy_p_C = shift_from_G_ld0_d(sh_Gy[warp_id], iay, 0, icy + 1, sh_yij_pow);
-        const double dIy_C = (-static_cast<double>(icy)) * Iy_m_C + (2.0 * cexp) * Iy_p_C;
-        acc[4] += bar_scale * (Ix * dIy_C * Iz);
-
-        const double Iz_m_C = (icz > 0) ? shift_from_G_ld0_d(sh_Gz[warp_id], iaz, 0, icz - 1, sh_zij_pow) : 0.0;
-        const double Iz_p_C = shift_from_G_ld0_d(sh_Gz[warp_id], iaz, 0, icz + 1, sh_zij_pow);
-        const double dIz_C = (-static_cast<double>(icz)) * Iz_m_C + (2.0 * cexp) * Iz_p_C;
-        acc[5] += bar_scale * (Ix * Iy * dIz_C);
-      }
-
-      __syncwarp();
-    }
-  }
-
-  warp_reduce_sum_arr(acc);
-  if (lane == 0) {
-#pragma unroll
-    for (int i = 0; i < 6; ++i) sh_warp_sum[warp_id][i] = acc[i];
-  }
-  __syncthreads();
-
-  if (threadIdx.x == 0) {
-    double sum[6];
-#pragma unroll
-    for (int i = 0; i < 6; ++i) sum[i] = 0.0;
-    for (int w = 0; w < warps; ++w) {
-#pragma unroll
-      for (int i = 0; i < 6; ++i) sum[i] += sh_warp_sum[w][i];
-    }
-    const int atomA = static_cast<int>(shell_atom[shellA]);
-    const int atomC = static_cast<int>(shell_atom[shellC]);
-    atomicAdd(&grad_dev[atomA * 3 + 0], sum[0]);
-    atomicAdd(&grad_dev[atomA * 3 + 1], sum[1]);
-    atomicAdd(&grad_dev[atomA * 3 + 2], sum[2]);
-    atomicAdd(&grad_dev[atomC * 3 + 0], sum[3]);
-    atomicAdd(&grad_dev[atomC * 3 + 1], sum[4]);
-    atomicAdd(&grad_dev[atomC * 3 + 2], sum[5]);
-  }
-}
-
-// ──────────────────────────────────────────────────────────────────────
-// KernelDFMetric2c2eDerivContractedCartAllSPAtomGradTril
-//
-// Variant of KernelDFMetric2c2eDerivContractedCartAllSPAtomGrad that:
-// - skips upper-triangle shell pairs (shellC > shellA)
-// - scales off-diagonal shell pairs by 2.0 to account for symmetry
-//
-// This matches the common "compute lower triangle + factor 2" contraction
-// pattern without requiring per-shell task lists on the host.
-// ──────────────────────────────────────────────────────────────────────
-template <int NROOTS>
-__global__ void KernelDFMetric2c2eDerivContractedCartAllSPAtomGradTril(
-    const int32_t* spAB_arr,
-    int n_spAB,
-    const int32_t* spCD,
-    int ntasks,
-    const int32_t* sp_A,
-    const int32_t* sp_B,
-    const int32_t* sp_pair_start,
-    const int32_t* sp_npair,
-    const double* shell_cx,
-    const double* shell_cy,
-    const double* shell_cz,
-    const int32_t* shell_prim_start,
-    const int32_t* shell_nprim,
-    const int32_t* shell_ao_start,
-    const double* prim_exp,
-    const double* pair_eta,
-    const double* pair_Px,
-    const double* pair_Py,
-    const double* pair_Pz,
-    const double* pair_cK,
-    int nao,
-    int naux,
-    int la,
-    int lc,
-    const double* bar_V,
-    const int32_t* shell_atom,
-    double* grad_dev) {
-  const int t   = static_cast<int>(blockIdx.x);   // CD task index
-  const int iAB = static_cast<int>(blockIdx.y);   // AB class index
-  if (t >= ntasks || iAB >= n_spAB) return;
-
-  const int spAB   = static_cast<int>(spAB_arr[iAB]);
-  const int spCD_i = static_cast<int>(spCD[t]);
-
-  __shared__ int8_t shA_lx[kNcartMax], shA_ly[kNcartMax], shA_lz[kNcartMax];
-  __shared__ int8_t shC_lx[kNcartMax], shC_ly[kNcartMax], shC_lz[kNcartMax];
-  __shared__ double sh_xij_pow[kLMaxD + 1], sh_yij_pow[kLMaxD + 1], sh_zij_pow[kLMaxD + 1];
-
-  __shared__ double sh_Gx[kMaxWarpsPerBlock][kGSizeD];
-  __shared__ double sh_Gy[kMaxWarpsPerBlock][kGSizeD];
-  __shared__ double sh_Gz[kMaxWarpsPerBlock][kGSizeD];
-
-  __shared__ double sh_warp_sum[kMaxWarpsPerBlock][6];
-  __shared__ double sh_bar[kBarCacheMax];
-
-  const int shellA = static_cast<int>(sp_A[spAB]);
-  const int shellC = static_cast<int>(sp_A[spCD_i]);
-  if (shellC > shellA) return;
-  const double fac = (shellC == shellA) ? 1.0 : 2.0;
-
-  const int nA = ncart(la);
-  const int nC = ncart(lc);
-  const int nElem = nA * nC;
-
-  const int a0 = static_cast<int>(shell_ao_start[shellA]) - nao;
-  const int c0 = static_cast<int>(shell_ao_start[shellC]) - nao;
-
-  const int baseAB = static_cast<int>(sp_pair_start[spAB]);
-  const int baseCD = static_cast<int>(sp_pair_start[spCD_i]);
-  const int nprimAB = static_cast<int>(sp_npair[spAB]);
-  const int nprimCD = static_cast<int>(sp_npair[spCD_i]);
-
-  const int sA = static_cast<int>(shell_prim_start[shellA]);
-  const int sC = static_cast<int>(shell_prim_start[shellC]);
-
-  const double Ax = shell_cx[shellA];
-  const double Ay = shell_cy[shellA];
-  const double Az = shell_cz[shellA];
-  const double Cx = shell_cx[shellC];
-  const double Cy = shell_cy[shellC];
-  const double Cz = shell_cz[shellC];
-
-  if (threadIdx.x == 0) {
-    fill_cart_comp(la, shA_lx, shA_ly, shA_lz);
-    fill_cart_comp(lc, shC_lx, shC_ly, shC_lz);
-
-    sh_xij_pow[0] = 1.0;
-    sh_yij_pow[0] = 1.0;
-    sh_zij_pow[0] = 1.0;
-    for (int p = 1; p <= kLMaxD; ++p) {
-      sh_xij_pow[p] = sh_xij_pow[p - 1] * Ax;
-      sh_yij_pow[p] = sh_yij_pow[p - 1] * Ay;
-      sh_zij_pow[p] = sh_zij_pow[p - 1] * Az;
-    }
-  }
-
-  const bool cache_bar = (nElem > 0 && nElem <= kBarCacheMax);
-  if (cache_bar) {
-    for (int idx = static_cast<int>(threadIdx.x); idx < nElem; idx += static_cast<int>(blockDim.x)) {
-      const int ia = idx / nC;
-      const int ic = idx - ia * nC;
-      const int row_idx = a0 + ia;
-      const int col_idx = c0 + ic;
-      sh_bar[idx] = fac * bar_V[static_cast<int64_t>(row_idx) * static_cast<int64_t>(naux) + static_cast<int64_t>(col_idx)];
-    }
-  }
-
-  __syncthreads();
-
-  // Block-level bar_X early-exit: skip block if max|sh_bar| < threshold.
-  if (cache_bar) {
-    double tmax = 0.0;
-    for (int idx = static_cast<int>(threadIdx.x); idx < nElem; idx += static_cast<int>(blockDim.x)) {
-      double v = static_cast<double>(sh_bar[idx]);
-      if (v < 0.0) v = -v;
-      if (v > tmax) tmax = v;
-    }
-    for (int offset = 16; offset > 0; offset >>= 1) {
-      double other = __shfl_down_sync(0xffffffff, tmax, offset);
-      if (other > tmax) tmax = other;
-    }
-    {
-      const int lane_ = static_cast<int>(threadIdx.x) & 31;
-      const int warp_ = static_cast<int>(threadIdx.x) >> 5;
-      if (lane_ == 0) sh_warp_sum[warp_][0] = tmax;
-    }
-    __syncthreads();
-    if (threadIdx.x == 0) {
-      double bmax = sh_warp_sum[0][0];
-      const int nw = static_cast<int>(blockDim.x) >> 5;
-      for (int w = 1; w < nw; ++w) {
-        if (sh_warp_sum[w][0] > bmax) bmax = sh_warp_sum[w][0];
-      }
-      sh_warp_sum[0][0] = bmax;
-    }
-    __syncthreads();
-    if (sh_warp_sum[0][0] < 1e-14) return;
-  }
-
-  const int lane = static_cast<int>(threadIdx.x) & 31;
-  const int warp_id = static_cast<int>(threadIdx.x) >> 5;
-  const int warps = static_cast<int>(blockDim.x) >> 5;
-
-  double acc[6];
-#pragma unroll
-  for (int i = 0; i < 6; ++i) acc[i] = 0.0;
-
-  const int nmax = la + 1;
-  const int mmax = lc + 1;
-  const int64_t nTot = static_cast<int64_t>(nprimAB) * static_cast<int64_t>(nprimCD);
-
-  for (int64_t u = static_cast<int64_t>(warp_id); u < nTot; u += static_cast<int64_t>(warps)) {
-    const int iAB_prim = static_cast<int>(u / static_cast<int64_t>(nprimCD));
-    const int iCD = static_cast<int>(u - static_cast<int64_t>(iAB_prim) * static_cast<int64_t>(nprimCD));
-    const int ki = baseAB + iAB_prim;
-    const int kj = baseCD + iCD;
-
-    const double p = pair_eta[ki];
-    const double q = pair_eta[kj];
-    const double Px_ = pair_Px[ki];
-    const double Py_ = pair_Py[ki];
-    const double Pz_ = pair_Pz[ki];
-    const double Qx = pair_Px[kj];
-    const double Qy = pair_Py[kj];
-    const double Qz = pair_Pz[kj];
-    const double cKab = pair_cK[ki];
-    const double cKcd = pair_cK[kj];
-
-    const double aexp = prim_exp[sA + iAB_prim];
-    const double cexp = prim_exp[sC + iCD];
-
-    const double denom = p + q;
-    const double inv_denom = 1.0 / denom;
-    const double dx = Px_ - Qx;
-    const double dy = Py_ - Qy;
-    const double dz = Pz_ - Qz;
-    const double PQ2 = dx * dx + dy * dy + dz * dz;
-    const double omega = p * q * inv_denom;
-    const double T = omega * PQ2;
-
-	    const double base = kTwoPiToFiveHalves / (p * q * ::sqrt(denom)) * cKab * cKcd;
-
-	    double roots[NROOTS];
-	    double weights[NROOTS];
-	    if (lane == 0) {
-	      cueri_rys::rys_roots_weights<NROOTS>(T, roots, weights);
-	    }
-	    for (int r = 0; r < NROOTS; ++r) {
-	      double x = (lane == 0) ? roots[r] : 0.0;
-	      double w = (lane == 0) ? weights[r] : 0.0;
-	      x = __shfl_sync(0xffffffff, x, 0);
-	      w = __shfl_sync(0xffffffff, w, 0);
-
-	      {
-	        const double B0 = x * 0.5 * inv_denom;
-	        const double B1 = (1.0 - x) * 0.5 / p + B0;
-	        const double B1p = (1.0 - x) * 0.5 / q + B0;
-	        const double q_over = q * inv_denom;
-	        const double p_over = p * inv_denom;
-	        if (lane < 3) {
-	          double PA, QC, PQd;
-	          double* G_target;
-	          if (lane == 0) { PA = Px_ - Ax; QC = Qx - Cx; PQd = Qx - Px_; G_target = sh_Gx[warp_id]; }
-	          else if (lane == 1) { PA = Py_ - Ay; QC = Qy - Cy; PQd = Qy - Py_; G_target = sh_Gy[warp_id]; }
-	          else { PA = Pz_ - Az; QC = Qz - Cz; PQd = Qz - Pz_; G_target = sh_Gz[warp_id]; }
-	          compute_G_d(G_target, nmax, mmax, PA + q_over * x * PQd, QC - p_over * x * PQd, B0, B1, B1p);
-	        }
-	      }
-
-	      const double scale = base * w;
-	      __syncwarp();
-
-	      for (int idx = lane; idx < nElem; idx += 32) {
-	        double bar = 0.0;
-	        if (cache_bar) {
-	          bar = sh_bar[idx];
-	        } else {
-	          const int ia = idx / nC;
-	          const int ic = idx - ia * nC;
-	          const int row_idx = a0 + ia;
-	          const int col_idx = c0 + ic;
-	          bar = fac * bar_V[static_cast<int64_t>(row_idx) * static_cast<int64_t>(naux) + static_cast<int64_t>(col_idx)];
-	        }
-	        if (bar == 0.0) continue;
-
-	        const int ia = idx / nC;
-	        const int ic = idx - ia * nC;
-
-	        const int iax = static_cast<int>(shA_lx[ia]);
-	        const int iay = static_cast<int>(shA_ly[ia]);
-	        const int iaz = static_cast<int>(shA_lz[ia]);
-	        const int icx = static_cast<int>(shC_lx[ic]);
-	        const int icy = static_cast<int>(shC_ly[ic]);
-	        const int icz = static_cast<int>(shC_lz[ic]);
-
-	        const double Ix = shift_from_G_ld0_d(sh_Gx[warp_id], iax, 0, icx, sh_xij_pow);
-	        const double Iy = shift_from_G_ld0_d(sh_Gy[warp_id], iay, 0, icy, sh_yij_pow);
-	        const double Iz = shift_from_G_ld0_d(sh_Gz[warp_id], iaz, 0, icz, sh_zij_pow);
-
-	        const double bar_scale = bar * scale;
-
-	        // Center A (P) derivatives.
-	        const double Ix_m_A = (iax > 0) ? shift_from_G_ld0_d(sh_Gx[warp_id], iax - 1, 0, icx, sh_xij_pow) : 0.0;
-	        const double Ix_p_A = shift_from_G_ld0_d(sh_Gx[warp_id], iax + 1, 0, icx, sh_xij_pow);
-	        const double dIx_A = (-static_cast<double>(iax)) * Ix_m_A + (2.0 * aexp) * Ix_p_A;
-	        acc[0] += bar_scale * (dIx_A * Iy * Iz);
-
-	        const double Iy_m_A = (iay > 0) ? shift_from_G_ld0_d(sh_Gy[warp_id], iay - 1, 0, icy, sh_yij_pow) : 0.0;
-	        const double Iy_p_A = shift_from_G_ld0_d(sh_Gy[warp_id], iay + 1, 0, icy, sh_yij_pow);
-	        const double dIy_A = (-static_cast<double>(iay)) * Iy_m_A + (2.0 * aexp) * Iy_p_A;
-	        acc[1] += bar_scale * (Ix * dIy_A * Iz);
-
-	        const double Iz_m_A = (iaz > 0) ? shift_from_G_ld0_d(sh_Gz[warp_id], iaz - 1, 0, icz, sh_zij_pow) : 0.0;
-	        const double Iz_p_A = shift_from_G_ld0_d(sh_Gz[warp_id], iaz + 1, 0, icz, sh_zij_pow);
-	        const double dIz_A = (-static_cast<double>(iaz)) * Iz_m_A + (2.0 * aexp) * Iz_p_A;
-	        acc[2] += bar_scale * (Ix * Iy * dIz_A);
-
-	        // Center C (Q) derivatives.
-	        const double Ix_m_C = (icx > 0) ? shift_from_G_ld0_d(sh_Gx[warp_id], iax, 0, icx - 1, sh_xij_pow) : 0.0;
-	        const double Ix_p_C = shift_from_G_ld0_d(sh_Gx[warp_id], iax, 0, icx + 1, sh_xij_pow);
-	        const double dIx_C = (-static_cast<double>(icx)) * Ix_m_C + (2.0 * cexp) * Ix_p_C;
-	        acc[3] += bar_scale * (dIx_C * Iy * Iz);
-
-	        const double Iy_m_C = (icy > 0) ? shift_from_G_ld0_d(sh_Gy[warp_id], iay, 0, icy - 1, sh_yij_pow) : 0.0;
-	        const double Iy_p_C = shift_from_G_ld0_d(sh_Gy[warp_id], iay, 0, icy + 1, sh_yij_pow);
-	        const double dIy_C = (-static_cast<double>(icy)) * Iy_m_C + (2.0 * cexp) * Iy_p_C;
-	        acc[4] += bar_scale * (Ix * dIy_C * Iz);
-
-	        const double Iz_m_C = (icz > 0) ? shift_from_G_ld0_d(sh_Gz[warp_id], iaz, 0, icz - 1, sh_zij_pow) : 0.0;
-	        const double Iz_p_C = shift_from_G_ld0_d(sh_Gz[warp_id], iaz, 0, icz + 1, sh_zij_pow);
-	        const double dIz_C = (-static_cast<double>(icz)) * Iz_m_C + (2.0 * cexp) * Iz_p_C;
-	        acc[5] += bar_scale * (Ix * Iy * dIz_C);
-	      }
-
-	      __syncwarp();
-	    }
-	  }
-
-  warp_reduce_sum_arr(acc);
-  if (lane == 0) {
-#pragma unroll
-    for (int i = 0; i < 6; ++i) sh_warp_sum[warp_id][i] = acc[i];
-  }
-  __syncthreads();
-
-  if (threadIdx.x == 0) {
-    double sum[6];
-#pragma unroll
-    for (int i = 0; i < 6; ++i) sum[i] = 0.0;
-    for (int w = 0; w < warps; ++w) {
-#pragma unroll
-      for (int i = 0; i < 6; ++i) sum[i] += sh_warp_sum[w][i];
-    }
-    const int atomA = static_cast<int>(shell_atom[shellA]);
-    const int atomC = static_cast<int>(shell_atom[shellC]);
-    atomicAdd(&grad_dev[atomA * 3 + 0], sum[0]);
-    atomicAdd(&grad_dev[atomA * 3 + 1], sum[1]);
-    atomicAdd(&grad_dev[atomA * 3 + 2], sum[2]);
-    atomicAdd(&grad_dev[atomC * 3 + 0], sum[3]);
-    atomicAdd(&grad_dev[atomC * 3 + 1], sum[4]);
-    atomicAdd(&grad_dev[atomC * 3 + 2], sum[5]);
-  }
-}
-
+// Packed-Qp spherical bar_X variant: consumes bar_X in packed Qp layout (s2 packed AO pairs) in spherical AO basis
+// and applies the cart<-sph transforms inside the contraction kernel.
 static inline int df_nroots_from_L(int L_total) {
   return ((L_total + 1) / 2) + 1;
 }
 
-static inline cudaError_t launch_df_metric_2c2e_deriv_cart(
-    int32_t spAB,
-    const int32_t* spCD,
-    int ntasks,
-    const int32_t* sp_A,
-    const int32_t* sp_B,
-    const int32_t* sp_pair_start,
-    const int32_t* sp_npair,
-    const double* shell_cx,
-    const double* shell_cy,
-    const double* shell_cz,
-    const int32_t* shell_prim_start,
-    const int32_t* shell_nprim,
-    const int32_t* shell_ao_start,
-    const double* prim_exp,
-    const double* pair_eta,
-    const double* pair_Px,
-    const double* pair_Py,
-    const double* pair_Pz,
-    const double* pair_cK,
-    int nao,
-    int naux,
-    int la,
-    int lc,
-    const double* bar_V,
-    double* out,
-    cudaStream_t stream,
-    int threads) {
-  const int nroots = df_nroots_from_L(la + lc);
-  switch (nroots) {
-    case 1:
-      KernelDFMetric2c2eDerivContractedCartBatch<1><<<static_cast<unsigned int>(ntasks), threads, 0, stream>>>(
-          spAB,
-          spCD,
-          ntasks,
-          sp_A,
-          sp_B,
-          sp_pair_start,
-          sp_npair,
-          shell_cx,
-          shell_cy,
-          shell_cz,
-          shell_prim_start,
-          shell_nprim,
-          shell_ao_start,
-          prim_exp,
-          pair_eta,
-          pair_Px,
-          pair_Py,
-          pair_Pz,
-          pair_cK,
-          nao,
-          naux,
-          la,
-          lc,
-          bar_V,
-          out);
-      break;
-    case 2:
-      KernelDFMetric2c2eDerivContractedCartBatch<2><<<static_cast<unsigned int>(ntasks), threads, 0, stream>>>(spAB,
-                                                                                                              spCD,
-                                                                                                              ntasks,
-                                                                                                              sp_A,
-                                                                                                              sp_B,
-                                                                                                              sp_pair_start,
-                                                                                                              sp_npair,
-                                                                                                              shell_cx,
-                                                                                                              shell_cy,
-                                                                                                              shell_cz,
-                                                                                                              shell_prim_start,
-                                                                                                              shell_nprim,
-                                                                                                              shell_ao_start,
-                                                                                                              prim_exp,
-                                                                                                              pair_eta,
-                                                                                                              pair_Px,
-                                                                                                              pair_Py,
-                                                                                                              pair_Pz,
-                                                                                                              pair_cK,
-                                                                                                              nao,
-                                                                                                              naux,
-                                                                                                              la,
-                                                                                                              lc,
-                                                                                                              bar_V,
-                                                                                                              out);
-      break;
-    case 3:
-      KernelDFMetric2c2eDerivContractedCartBatch<3><<<static_cast<unsigned int>(ntasks), threads, 0, stream>>>(spAB,
-                                                                                                              spCD,
-                                                                                                              ntasks,
-                                                                                                              sp_A,
-                                                                                                              sp_B,
-                                                                                                              sp_pair_start,
-                                                                                                              sp_npair,
-                                                                                                              shell_cx,
-                                                                                                              shell_cy,
-                                                                                                              shell_cz,
-                                                                                                              shell_prim_start,
-                                                                                                              shell_nprim,
-                                                                                                              shell_ao_start,
-                                                                                                              prim_exp,
-                                                                                                              pair_eta,
-                                                                                                              pair_Px,
-                                                                                                              pair_Py,
-                                                                                                              pair_Pz,
-                                                                                                              pair_cK,
-                                                                                                              nao,
-                                                                                                              naux,
-                                                                                                              la,
-                                                                                                              lc,
-                                                                                                              bar_V,
-                                                                                                              out);
-      break;
-    case 4:
-      KernelDFMetric2c2eDerivContractedCartBatch<4><<<static_cast<unsigned int>(ntasks), threads, 0, stream>>>(spAB,
-                                                                                                              spCD,
-                                                                                                              ntasks,
-                                                                                                              sp_A,
-                                                                                                              sp_B,
-                                                                                                              sp_pair_start,
-                                                                                                              sp_npair,
-                                                                                                              shell_cx,
-                                                                                                              shell_cy,
-                                                                                                              shell_cz,
-                                                                                                              shell_prim_start,
-                                                                                                              shell_nprim,
-                                                                                                              shell_ao_start,
-                                                                                                              prim_exp,
-                                                                                                              pair_eta,
-                                                                                                              pair_Px,
-                                                                                                              pair_Py,
-                                                                                                              pair_Pz,
-                                                                                                              pair_cK,
-                                                                                                              nao,
-                                                                                                              naux,
-                                                                                                              la,
-                                                                                                              lc,
-                                                                                                              bar_V,
-                                                                                                              out);
-      break;
-    case 5:
-      KernelDFMetric2c2eDerivContractedCartBatch<5><<<static_cast<unsigned int>(ntasks), threads, 0, stream>>>(spAB,
-                                                                                                              spCD,
-                                                                                                              ntasks,
-                                                                                                              sp_A,
-                                                                                                              sp_B,
-                                                                                                              sp_pair_start,
-                                                                                                              sp_npair,
-                                                                                                              shell_cx,
-                                                                                                              shell_cy,
-                                                                                                              shell_cz,
-                                                                                                              shell_prim_start,
-                                                                                                              shell_nprim,
-                                                                                                              shell_ao_start,
-                                                                                                              prim_exp,
-                                                                                                              pair_eta,
-                                                                                                              pair_Px,
-                                                                                                              pair_Py,
-                                                                                                              pair_Pz,
-                                                                                                              pair_cK,
-                                                                                                              nao,
-                                                                                                              naux,
-                                                                                                              la,
-                                                                                                              lc,
-                                                                                                              bar_V,
-                                                                                                              out);
-      break;
-    case 6:
-      KernelDFMetric2c2eDerivContractedCartBatch<6><<<static_cast<unsigned int>(ntasks), threads, 0, stream>>>(spAB,
-                                                                                                              spCD,
-                                                                                                              ntasks,
-                                                                                                              sp_A,
-                                                                                                              sp_B,
-                                                                                                              sp_pair_start,
-                                                                                                              sp_npair,
-                                                                                                              shell_cx,
-                                                                                                              shell_cy,
-                                                                                                              shell_cz,
-                                                                                                              shell_prim_start,
-                                                                                                              shell_nprim,
-                                                                                                              shell_ao_start,
-                                                                                                              prim_exp,
-                                                                                                              pair_eta,
-                                                                                                              pair_Px,
-                                                                                                              pair_Py,
-                                                                                                              pair_Pz,
-                                                                                                              pair_cK,
-                                                                                                              nao,
-                                                                                                              naux,
-                                                                                                              la,
-                                                                                                              lc,
-                                                                                                              bar_V,
-                                                                                                              out);
-      break;
-    case 7:
-      KernelDFMetric2c2eDerivContractedCartBatch<7><<<static_cast<unsigned int>(ntasks), threads, 0, stream>>>(spAB,
-                                                                                                              spCD,
-                                                                                                              ntasks,
-                                                                                                              sp_A,
-                                                                                                              sp_B,
-                                                                                                              sp_pair_start,
-                                                                                                              sp_npair,
-                                                                                                              shell_cx,
-                                                                                                              shell_cy,
-                                                                                                              shell_cz,
-                                                                                                              shell_prim_start,
-                                                                                                              shell_nprim,
-                                                                                                              shell_ao_start,
-                                                                                                              prim_exp,
-                                                                                                              pair_eta,
-                                                                                                              pair_Px,
-                                                                                                              pair_Py,
-                                                                                                              pair_Pz,
-                                                                                                              pair_cK,
-                                                                                                              nao,
-                                                                                                              naux,
-                                                                                                              la,
-                                                                                                              lc,
-                                                                                                              bar_V,
-                                                                                                              out);
-      break;
-    case 8:
-      KernelDFMetric2c2eDerivContractedCartBatch<8><<<static_cast<unsigned int>(ntasks), threads, 0, stream>>>(spAB,
-                                                                                                              spCD,
-                                                                                                              ntasks,
-                                                                                                              sp_A,
-                                                                                                              sp_B,
-                                                                                                              sp_pair_start,
-                                                                                                              sp_npair,
-                                                                                                              shell_cx,
-                                                                                                              shell_cy,
-                                                                                                              shell_cz,
-                                                                                                              shell_prim_start,
-                                                                                                              shell_nprim,
-                                                                                                              shell_ao_start,
-                                                                                                              prim_exp,
-                                                                                                              pair_eta,
-                                                                                                              pair_Px,
-                                                                                                              pair_Py,
-                                                                                                              pair_Pz,
-                                                                                                              pair_cK,
-                                                                                                              nao,
-                                                                                                              naux,
-                                                                                                              la,
-                                                                                                              lc,
-                                                                                                              bar_V,
-                                                                                                              out);
-      break;
-    case 9:
-      KernelDFMetric2c2eDerivContractedCartBatch<9><<<static_cast<unsigned int>(ntasks), threads, 0, stream>>>(spAB,
-                                                                                                              spCD,
-                                                                                                              ntasks,
-                                                                                                              sp_A,
-                                                                                                              sp_B,
-                                                                                                              sp_pair_start,
-                                                                                                              sp_npair,
-                                                                                                              shell_cx,
-                                                                                                              shell_cy,
-                                                                                                              shell_cz,
-                                                                                                              shell_prim_start,
-                                                                                                              shell_nprim,
-                                                                                                              shell_ao_start,
-                                                                                                              prim_exp,
-                                                                                                              pair_eta,
-                                                                                                              pair_Px,
-                                                                                                              pair_Py,
-                                                                                                              pair_Pz,
-                                                                                                              pair_cK,
-                                                                                                              nao,
-                                                                                                              naux,
-                                                                                                              la,
-                                                                                                              lc,
-                                                                                                              bar_V,
-                                                                                                              out);
-      break;
-    case 10:
-      KernelDFMetric2c2eDerivContractedCartBatch<10><<<static_cast<unsigned int>(ntasks), threads, 0, stream>>>(spAB,
-                                                                                                               spCD,
-                                                                                                               ntasks,
-                                                                                                               sp_A,
-                                                                                                               sp_B,
-                                                                                                               sp_pair_start,
-                                                                                                               sp_npair,
-                                                                                                               shell_cx,
-                                                                                                               shell_cy,
-                                                                                                               shell_cz,
-                                                                                                               shell_prim_start,
-                                                                                                               shell_nprim,
-                                                                                                               shell_ao_start,
-                                                                                                               prim_exp,
-                                                                                                               pair_eta,
-                                                                                                               pair_Px,
-                                                                                                               pair_Py,
-                                                                                                               pair_Pz,
-                                                                                                               pair_cK,
-                                                                                                               nao,
-                                                                                                               naux,
-                                                                                                               la,
-                                                                                                               lc,
-                                                                                                               bar_V,
-                                                                                                               out);
-      break;
-    case 11:
-      KernelDFMetric2c2eDerivContractedCartBatch<11><<<static_cast<unsigned int>(ntasks), threads, 0, stream>>>(spAB,
-                                                                                                               spCD,
-                                                                                                               ntasks,
-                                                                                                               sp_A,
-                                                                                                               sp_B,
-                                                                                                               sp_pair_start,
-                                                                                                               sp_npair,
-                                                                                                               shell_cx,
-                                                                                                               shell_cy,
-                                                                                                               shell_cz,
-                                                                                                               shell_prim_start,
-                                                                                                               shell_nprim,
-                                                                                                               shell_ao_start,
-                                                                                                               prim_exp,
-                                                                                                               pair_eta,
-                                                                                                               pair_Px,
-                                                                                                               pair_Py,
-                                                                                                               pair_Pz,
-                                                                                                               pair_cK,
-                                                                                                               nao,
-                                                                                                               naux,
-                                                                                                               la,
-                                                                                                               lc,
-                                                                                                               bar_V,
-                                                                                                               out);
-      break;
-    default:
-      return cudaErrorInvalidValue;
-  }
-  return cudaGetLastError();
-}
-
-static inline cudaError_t launch_df_int3c2e_deriv_cart_allsp_atomgrad_sphbar_qmn_f32bar(
+static inline cudaError_t launch_df_int3c2e_deriv_cart_allsp_atomgrad_sphbar_qmn(
     const int32_t* spAB_arr,
     int n_spAB,
     const int32_t* spCD,
@@ -1973,145 +764,39 @@ static inline cudaError_t launch_df_int3c2e_deriv_cart_allsp_atomgrad_sphbar_qmn
     int la,
     int lb,
     int lc,
-    const float* bar_X_sph_Qmn,
+    const double* bar_X_sph_Qmn,
     const int32_t* shell_ao_start_sph,
     const int32_t* shell_atom,
+    int q_offset,
+    int q_count,
     double* grad_dev,
     cudaStream_t stream,
     int threads) {
+  if (q_count <= 0) return cudaSuccess;
   const int nroots = df_nroots_from_L(la + lb + lc);
   const dim3 grid(static_cast<unsigned int>(ntasks), static_cast<unsigned int>(n_spAB));
   switch (nroots) {
-#define LAUNCH_3C_SPH_F32(NR) \
+#define LAUNCH_3C_SPH_STREAM(NR) \
     case NR: \
-      KernelDFInt3c2eDerivContractedCartAllSPAtomGradSphBarQmnF32Bar<NR><<<grid, threads, 0, stream>>>( \
+      KernelDFInt3c2eDerivContractedCartAllSPAtomGradSphBarQmn<NR><<<grid, threads, 0, stream>>>( \
           spAB_arr, n_spAB, spCD, ntasks, sp_A, sp_B, sp_pair_start, sp_npair, \
           shell_cx, shell_cy, shell_cz, shell_prim_start, shell_nprim, shell_ao_start, \
           prim_exp, pair_eta, pair_Px, pair_Py, pair_Pz, pair_cK, \
-          nao, naux, nao_sph, la, lb, lc, bar_X_sph_Qmn, shell_ao_start_sph, shell_atom, grad_dev); \
+          nao, naux, nao_sph, la, lb, lc, bar_X_sph_Qmn, shell_ao_start_sph, shell_atom, \
+          q_offset, q_count, grad_dev); \
       break;
-    LAUNCH_3C_SPH_F32(1)
-    LAUNCH_3C_SPH_F32(2)
-    LAUNCH_3C_SPH_F32(3)
-    LAUNCH_3C_SPH_F32(4)
-    LAUNCH_3C_SPH_F32(5)
-    LAUNCH_3C_SPH_F32(6)
-    LAUNCH_3C_SPH_F32(7)
-    LAUNCH_3C_SPH_F32(8)
-    LAUNCH_3C_SPH_F32(9)
-    LAUNCH_3C_SPH_F32(10)
-    LAUNCH_3C_SPH_F32(11)
-#undef LAUNCH_3C_SPH_F32
-    default:
-      return cudaErrorInvalidValue;
-  }
-  return cudaGetLastError();
-}
-
-static inline cudaError_t launch_df_metric_2c2e_deriv_cart_allsp_atomgrad(
-    const int32_t* spAB_arr,
-    int n_spAB,
-    const int32_t* spCD,
-    int ntasks,
-    const int32_t* sp_A,
-    const int32_t* sp_B,
-    const int32_t* sp_pair_start,
-    const int32_t* sp_npair,
-    const double* shell_cx,
-    const double* shell_cy,
-    const double* shell_cz,
-    const int32_t* shell_prim_start,
-    const int32_t* shell_nprim,
-    const int32_t* shell_ao_start,
-    const double* prim_exp,
-    const double* pair_eta,
-    const double* pair_Px,
-    const double* pair_Py,
-    const double* pair_Pz,
-    const double* pair_cK,
-    int nao,
-    int naux,
-    int la,
-    int lc,
-    const double* bar_V,
-    const int32_t* shell_atom,
-    double* grad_dev,
-    cudaStream_t stream,
-    int threads) {
-  const int nroots = df_nroots_from_L(la + lc);
-  const dim3 grid(static_cast<unsigned int>(ntasks), static_cast<unsigned int>(n_spAB));
-  switch (nroots) {
-    // Aux basis angular momentum ≤ 5 → la+lc ≤ 10 → nroots ≤ 6.
-    // Instantiate only 1–6 to keep compile time manageable.
-#define LAUNCH_2C_ALLSP(NR) \
-    case NR: \
-      KernelDFMetric2c2eDerivContractedCartAllSPAtomGrad<NR><<<grid, threads, 0, stream>>>( \
-          spAB_arr, n_spAB, spCD, ntasks, sp_A, sp_B, sp_pair_start, sp_npair, \
-          shell_cx, shell_cy, shell_cz, shell_prim_start, shell_nprim, shell_ao_start, \
-          prim_exp, pair_eta, pair_Px, pair_Py, pair_Pz, pair_cK, \
-          nao, naux, la, lc, bar_V, shell_atom, grad_dev); \
-      break;
-    LAUNCH_2C_ALLSP(1)
-    LAUNCH_2C_ALLSP(2)
-    LAUNCH_2C_ALLSP(3)
-    LAUNCH_2C_ALLSP(4)
-    LAUNCH_2C_ALLSP(5)
-    LAUNCH_2C_ALLSP(6)
-#undef LAUNCH_2C_ALLSP
-    default:
-      return cudaErrorInvalidValue;
-  }
-  return cudaGetLastError();
-}
-
-static inline cudaError_t launch_df_metric_2c2e_deriv_cart_allsp_atomgrad_tril(
-    const int32_t* spAB_arr,
-    int n_spAB,
-    const int32_t* spCD,
-    int ntasks,
-    const int32_t* sp_A,
-    const int32_t* sp_B,
-    const int32_t* sp_pair_start,
-    const int32_t* sp_npair,
-    const double* shell_cx,
-    const double* shell_cy,
-    const double* shell_cz,
-    const int32_t* shell_prim_start,
-    const int32_t* shell_nprim,
-    const int32_t* shell_ao_start,
-    const double* prim_exp,
-    const double* pair_eta,
-    const double* pair_Px,
-    const double* pair_Py,
-    const double* pair_Pz,
-    const double* pair_cK,
-    int nao,
-    int naux,
-    int la,
-    int lc,
-    const double* bar_V,
-    const int32_t* shell_atom,
-    double* grad_dev,
-    cudaStream_t stream,
-    int threads) {
-  const int nroots = df_nroots_from_L(la + lc);
-  const dim3 grid(static_cast<unsigned int>(ntasks), static_cast<unsigned int>(n_spAB));
-  switch (nroots) {
-#define LAUNCH_2C_ALLSP_TRIL(NR) \
-    case NR: \
-      KernelDFMetric2c2eDerivContractedCartAllSPAtomGradTril<NR><<<grid, threads, 0, stream>>>( \
-          spAB_arr, n_spAB, spCD, ntasks, sp_A, sp_B, sp_pair_start, sp_npair, \
-          shell_cx, shell_cy, shell_cz, shell_prim_start, shell_nprim, shell_ao_start, \
-          prim_exp, pair_eta, pair_Px, pair_Py, pair_Pz, pair_cK, \
-          nao, naux, la, lc, bar_V, shell_atom, grad_dev); \
-      break;
-    LAUNCH_2C_ALLSP_TRIL(1)
-    LAUNCH_2C_ALLSP_TRIL(2)
-    LAUNCH_2C_ALLSP_TRIL(3)
-    LAUNCH_2C_ALLSP_TRIL(4)
-    LAUNCH_2C_ALLSP_TRIL(5)
-    LAUNCH_2C_ALLSP_TRIL(6)
-#undef LAUNCH_2C_ALLSP_TRIL
+    LAUNCH_3C_SPH_STREAM(1)
+    LAUNCH_3C_SPH_STREAM(2)
+    LAUNCH_3C_SPH_STREAM(3)
+    LAUNCH_3C_SPH_STREAM(4)
+    LAUNCH_3C_SPH_STREAM(5)
+    LAUNCH_3C_SPH_STREAM(6)
+    LAUNCH_3C_SPH_STREAM(7)
+    LAUNCH_3C_SPH_STREAM(8)
+    LAUNCH_3C_SPH_STREAM(9)
+    LAUNCH_3C_SPH_STREAM(10)
+    LAUNCH_3C_SPH_STREAM(11)
+#undef LAUNCH_3C_SPH_STREAM
     default:
       return cudaErrorInvalidValue;
   }
@@ -2120,7 +805,7 @@ static inline cudaError_t launch_df_metric_2c2e_deriv_cart_allsp_atomgrad_tril(
 
 }  // namespace
 
-extern "C" cudaError_t cueri_df_int3c2e_deriv_contracted_cart_allsp_atomgrad_sphbar_qmn_f32bar_launch_stream(
+extern "C" cudaError_t cueri_df_int3c2e_deriv_contracted_cart_allsp_atomgrad_sphbar_qmn_launch_stream(
     const int32_t* spAB_arr,
     int n_spAB,
     const int32_t* spCD,
@@ -2147,82 +832,24 @@ extern "C" cudaError_t cueri_df_int3c2e_deriv_contracted_cart_allsp_atomgrad_sph
     int la,
     int lb,
     int lc,
-    const float* bar_X_sph_Qmn,
+    const double* bar_X_sph_Qmn,
     const int32_t* shell_ao_start_sph,
     const int32_t* shell_atom,
     double* grad_dev,
     cudaStream_t stream,
     int threads) {
-  return launch_df_int3c2e_deriv_cart_allsp_atomgrad_sphbar_qmn_f32bar(
+  return launch_df_int3c2e_deriv_cart_allsp_atomgrad_sphbar_qmn(
       spAB_arr, n_spAB, spCD, ntasks,
       sp_A, sp_B, sp_pair_start, sp_npair,
       shell_cx, shell_cy, shell_cz,
       shell_prim_start, shell_nprim, shell_ao_start,
       prim_exp, pair_eta, pair_Px, pair_Py, pair_Pz, pair_cK,
       nao, naux, nao_sph, la, lb, lc,
-      bar_X_sph_Qmn, shell_ao_start_sph, shell_atom, grad_dev,
+      bar_X_sph_Qmn, shell_ao_start_sph, shell_atom, 0, naux, grad_dev,
       stream, threads);
 }
 
-extern "C" cudaError_t cueri_df_metric_2c2e_deriv_contracted_cart_launch_stream(
-    int32_t spAB,
-    const int32_t* spCD,
-    int ntasks,
-    const int32_t* sp_A,
-    const int32_t* sp_B,
-    const int32_t* sp_pair_start,
-    const int32_t* sp_npair,
-    const double* shell_cx,
-    const double* shell_cy,
-    const double* shell_cz,
-    const int32_t* shell_prim_start,
-    const int32_t* shell_nprim,
-    const int32_t* shell_ao_start,
-    const double* prim_exp,
-    const double* pair_eta,
-    const double* pair_Px,
-    const double* pair_Py,
-    const double* pair_Pz,
-    const double* pair_cK,
-    int nao,
-    int naux,
-    int la,
-    int lc,
-    const double* bar_V,
-    double* out,
-    cudaStream_t stream,
-    int threads) {
-  return launch_df_metric_2c2e_deriv_cart(
-      spAB,
-      spCD,
-      ntasks,
-      sp_A,
-      sp_B,
-      sp_pair_start,
-      sp_npair,
-      shell_cx,
-      shell_cy,
-      shell_cz,
-      shell_prim_start,
-      shell_nprim,
-      shell_ao_start,
-      prim_exp,
-      pair_eta,
-      pair_Px,
-      pair_Py,
-      pair_Pz,
-      pair_cK,
-      nao,
-      naux,
-      la,
-      lc,
-      bar_V,
-      out,
-      stream,
-      threads);
-}
-
-extern "C" cudaError_t cueri_df_metric_2c2e_deriv_contracted_cart_allsp_atomgrad_launch_stream(
+extern "C" cudaError_t cueri_df_int3c2e_deriv_contracted_cart_allsp_atomgrad_sphbar_qmn_streamed_launch_stream(
     const int32_t* spAB_arr,
     int n_spAB,
     const int32_t* spCD,
@@ -2245,60 +872,27 @@ extern "C" cudaError_t cueri_df_metric_2c2e_deriv_contracted_cart_allsp_atomgrad
     const double* pair_cK,
     int nao,
     int naux,
+    int nao_sph,
     int la,
+    int lb,
     int lc,
-    const double* bar_V,
+    const double* bar_X_sph_Qmn_chunk,
+    const int32_t* shell_ao_start_sph,
     const int32_t* shell_atom,
+    int q_offset,
+    int q_count,
     double* grad_dev,
     cudaStream_t stream,
     int threads) {
-  return launch_df_metric_2c2e_deriv_cart_allsp_atomgrad(
+  return launch_df_int3c2e_deriv_cart_allsp_atomgrad_sphbar_qmn(
       spAB_arr, n_spAB, spCD, ntasks,
       sp_A, sp_B, sp_pair_start, sp_npair,
       shell_cx, shell_cy, shell_cz,
       shell_prim_start, shell_nprim, shell_ao_start,
       prim_exp, pair_eta, pair_Px, pair_Py, pair_Pz, pair_cK,
-      nao, naux, la, lc, bar_V, shell_atom, grad_dev,
-      stream, threads);
-}
-
-extern "C" cudaError_t cueri_df_metric_2c2e_deriv_contracted_cart_allsp_atomgrad_tril_launch_stream(
-    const int32_t* spAB_arr,
-    int n_spAB,
-    const int32_t* spCD,
-    int ntasks,
-    const int32_t* sp_A,
-    const int32_t* sp_B,
-    const int32_t* sp_pair_start,
-    const int32_t* sp_npair,
-    const double* shell_cx,
-    const double* shell_cy,
-    const double* shell_cz,
-    const int32_t* shell_prim_start,
-    const int32_t* shell_nprim,
-    const int32_t* shell_ao_start,
-    const double* prim_exp,
-    const double* pair_eta,
-    const double* pair_Px,
-    const double* pair_Py,
-    const double* pair_Pz,
-    const double* pair_cK,
-    int nao,
-    int naux,
-    int la,
-    int lc,
-    const double* bar_V,
-    const int32_t* shell_atom,
-    double* grad_dev,
-    cudaStream_t stream,
-    int threads) {
-  return launch_df_metric_2c2e_deriv_cart_allsp_atomgrad_tril(
-      spAB_arr, n_spAB, spCD, ntasks,
-      sp_A, sp_B, sp_pair_start, sp_npair,
-      shell_cx, shell_cy, shell_cz,
-      shell_prim_start, shell_nprim, shell_ao_start,
-      prim_exp, pair_eta, pair_Px, pair_Py, pair_Pz, pair_cK,
-      nao, naux, la, lc, bar_V, shell_atom, grad_dev,
+      nao, naux, nao_sph, la, lb, lc,
+      bar_X_sph_Qmn_chunk, shell_ao_start_sph, shell_atom,
+      q_offset, q_count, grad_dev,
       stream, threads);
 }
 

@@ -361,7 +361,7 @@ __device__ __forceinline__ void warp_reduce_sum_arr(double* v) {
   }
 }
 
-// Bridge: gap code from previous part (types needed here).
+// Bridge: gap code from previous part(s) (types/helpers needed here).
 
 // Packed-Qp spherical bar_X variant: consumes bar_X in packed Qp layout (s2 packed AO pairs) in spherical AO basis
 // and applies the cart<-sph transforms inside the contraction kernel.

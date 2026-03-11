@@ -63,9 +63,6 @@ if (NOT CUERI_FAST_DEV_STEP2_ONLY)
     src/generated/cueri_cuda_kernels_wave2_generated_part7.cu
     src/generated/cueri_cuda_kernels_wave2_generated_part8.cu
     src/generated/cueri_cuda_kernels_wave2_generated_part9.cu
-    src/generated/cueri_cuda_kernels_wave2_generated_part10.cu
-    src/generated/cueri_cuda_kernels_wave2_generated_part11.cu
-    src/generated/cueri_cuda_kernels_wave2_generated_part12.cu
     src/cueri_cuda_kernels_rys_generic_part1.cu
     src/cueri_cuda_kernels_rys_generic_part2.cu
   )

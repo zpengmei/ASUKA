@@ -361,7 +361,7 @@ __device__ __forceinline__ void warp_reduce_sum_arr(double* v) {
   }
 }
 
-// Bridge: gap code from previous part (types needed here).
+// Bridge: gap code from previous part(s) (types/helpers needed here).
 
 template <int NROOTS>
 __global__ void KernelDFInt3c2eDerivContractedCartAllSPAtomGradSphBarQmnABTile(
