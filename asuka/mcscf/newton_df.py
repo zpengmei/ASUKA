@@ -21,6 +21,7 @@ import numpy as np
 
 from asuka.hf import df_jk as _df_jk
 from asuka.hf import df_scf as _df_scf
+from asuka.mcscf.newton_mc1step_adapter import NewtonMC1StepAdapterMixin
 from asuka.mcscf.orbital_grad import cayley_update
 from asuka.utils.einsum_cache import cached_einsum
 
@@ -116,8 +117,8 @@ class DFNewtonERIs:
     Arrays may be NumPy or CuPy depending on the build path.
     """
 
-    ppaa: Any
-    papa: Any
+    ppaa: Any | None
+    papa: Any | None
     vhf_c: Any
     j_pc: Any
     k_pc: Any
@@ -125,6 +126,9 @@ class DFNewtonERIs:
     L_pi: Any = None
     L_uv: Any = None
     L_pq: Any = None
+    eri_provider: Any = None
+    mo_coeff: Any = None
+    C_act: Any = None
 
 
 def build_df_newton_eris(
@@ -691,8 +695,14 @@ def build_provider_newton_eris(
     *,
     ncore: int,
     ncas: int,
+    materialize_ppaa_papa: bool = True,
 ) -> DFNewtonERIs:
-    """Build Newton ERIs through a generic provider."""
+    """Build Newton ERIs through a generic provider.
+
+    For provider-backed GPU paths, keep the mixed-index provider lazy and avoid
+    materializing full ``ppaa/papa`` unless a legacy consumer explicitly
+    requests them.
+    """
 
     probe = None
     probe_fn = getattr(eri_provider, "probe_array", None)
@@ -711,10 +721,15 @@ def build_provider_newton_eris(
         raise ValueError("ncore+ncas exceeds nmo")
 
     C_act = xp.ascontiguousarray(mo[:, ncore:nocc])
-    ppaa_flat = eri_provider.build_pq_uv(mo, C_act)
-    papa_flat = eri_provider.build_pu_qv(mo, C_act)
-    ppaa = xp.ascontiguousarray(xp.asarray(ppaa_flat, dtype=xp.float64)).reshape(nmo, nmo, ncas, ncas)
-    papa = xp.ascontiguousarray(xp.asarray(papa_flat, dtype=xp.float64)).reshape(nmo, ncas, nmo, ncas)
+
+    if materialize_ppaa_papa:
+        ppaa_flat = eri_provider.build_pq_uv(mo, C_act)
+        papa_flat = eri_provider.build_pu_qv(mo, C_act)
+        ppaa = xp.ascontiguousarray(xp.asarray(ppaa_flat, dtype=xp.float64)).reshape(nmo, nmo, ncas, ncas)
+        papa = xp.ascontiguousarray(xp.asarray(papa_flat, dtype=xp.float64)).reshape(nmo, ncas, nmo, ncas)
+    else:
+        ppaa = None
+        papa = None
 
     if ncore:
         mo_core = mo[:, :ncore]
@@ -755,7 +770,16 @@ def build_provider_newton_eris(
         j_pc = xp.zeros((nmo, 0), dtype=xp.float64)
         k_pc = xp.zeros((nmo, 0), dtype=xp.float64)
 
-    return DFNewtonERIs(ppaa=ppaa, papa=papa, vhf_c=vhf_c, j_pc=j_pc, k_pc=k_pc)
+    return DFNewtonERIs(
+        ppaa=ppaa,
+        papa=papa,
+        vhf_c=vhf_c,
+        j_pc=j_pc,
+        k_pc=k_pc,
+        eri_provider=eri_provider,
+        mo_coeff=xp.ascontiguousarray(mo),
+        C_act=xp.ascontiguousarray(C_act),
+    )
 
 
 class THCERIProvider:
@@ -857,7 +881,7 @@ class THCERIProvider:
 
 
 @dataclass
-class DFNewtonCASSCFAdapter:
+class DFNewtonCASSCFAdapter(NewtonMC1StepAdapterMixin):
     """Minimal CASSCF-like adapter for `newton_casscf.gen_g_hop_internal`.
 
     This is intentionally small: it only implements what the internal operator
@@ -910,6 +934,7 @@ class DFNewtonCASSCFAdapter:
     ao_eri: Any = None  # (nao*nao, nao*nao) — for dense J/K when df_B is None
     jk_provider: Any = None
     eri_provider: Any = None
+    stream_provider_eris: bool = False
 
     # Optional knobs (PySCF-compatible names)
     weights: list[float] | None = None
@@ -963,6 +988,7 @@ class DFNewtonCASSCFAdapter:
                 mo_coeff,
                 ncore=int(self.ncore),
                 ncas=int(self.ncas),
+                materialize_ppaa_papa=not bool(self.stream_provider_eris),
             )
         if self.dense_gpu_builder is not None:
             return build_dense_newton_eris(
@@ -1063,7 +1089,7 @@ class DFNewtonCASSCFAdapter:
         mat[idx] = v
         return mat - mat.T
 
-    def update_rotate_matrix(self, dx: Any, u0: Any = 1) -> np.ndarray:
+    def update_rotate_matrix(self, dx: Any, u0: Any = 1) -> Any:
         """Apply orbital rotation `dx` to `u0`.
 
         Parameters
@@ -1079,8 +1105,14 @@ class DFNewtonCASSCFAdapter:
             Updated rotation matrix.
         """
         dr = self.unpack_uniq_var(dx)
-        u = cayley_update(np, dr)
-        return np.dot(u0, np.asarray(u, dtype=np.float64))
+        xp, _ = _get_xp(dr, u0)
+        dr = xp.asarray(dr, dtype=xp.float64)
+        u = cayley_update(xp, dr)
+        if np.isscalar(u0):
+            if float(u0) == 1.0:
+                return u
+            raise ValueError("scalar orbital rotation is only supported for u0=1")
+        return xp.asarray(u0, dtype=xp.float64) @ xp.asarray(u, dtype=xp.float64)
 
     def update_jk_in_ah(
         self,

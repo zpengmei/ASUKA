@@ -1,8 +1,7 @@
 """Selected/Selective CI utilities built on the native GUGA/DRT CSF stack.
 
-Top-level exports favor the scalable sparse-row-oracle workflows. Small-space
-reference helpers remain available from their defining modules but are not
-re-exported here when they are no longer part of the supported production path.
+Top-level exports are limited to the scalable sparse-row-oracle workflows that
+remain supported in production.
 """
 
 from asuka.sci.gpu_cipsi import CIPSITrialSpaceResult, build_cipsi_trials_from_scf, run_cipsi_trials

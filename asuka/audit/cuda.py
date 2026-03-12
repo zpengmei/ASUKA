@@ -838,7 +838,7 @@ def _benchmark_sci_cipsi_frontier_hash(name: str, *, diagnostic: bool) -> dict[s
     try:
         from asuka.cuguga.drt import build_drt
         from asuka.sci.frontier_hash import SparseFrontierSelector
-        from asuka.sci.selected_ci import DiagonalGuessLookup
+        from asuka.sci.sparse_support import DiagonalGuessLookup
     except Exception as exc:
         return _exception_result(str(name), "sci", exc)
 

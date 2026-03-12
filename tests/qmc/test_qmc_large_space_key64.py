@@ -20,28 +20,12 @@ def test_key64_roundtrip_preserves_large_csf_indices():
     assert np.array_equal(idx_rt, idx)
 
 
-def test_selected_ci_rejects_large_space_dense_path():
-    from asuka.cuguga.drt import build_drt
-    from asuka.sci.selected_ci import selected_ci
+def test_selected_ci_symbol_is_absent():
+    import importlib
+    import asuka.sci as sci
 
-    drt = build_drt(norb=28, nelec=12, twos_target=0)
-    assert int(drt.ncsf) > np.iinfo(np.int32).max
-
-    norb = int(drt.norb)
-    h1e = np.zeros((norb, norb), dtype=np.float64)
-    eri = np.zeros((norb, norb, norb, norb), dtype=np.float64)
-
-    with pytest.raises(NotImplementedError, match="selected_ci does not yet support|2\\^31-1"):
-        selected_ci(
-            drt,
-            h1e,
-            eri,
-            nroots=1,
-            init_ncsf=1,
-            max_ncsf=1,
-            add_ncsf=1,
-            max_iter=1,
-        )
+    assert not hasattr(sci, "selected_ci")
+    assert importlib.util.find_spec("asuka.sci.selected_ci") is None
 
 
 def test_fciqmc_large_space_rejects_rayleigh_estimator_and_diagnostics():
@@ -93,8 +77,8 @@ def test_fciqmc_large_space_rejects_rayleigh_estimator_and_diagnostics():
 
 def test_fcifri_large_space_rejects_rayleigh_and_removes_legacy_subspace():
     from asuka.cuguga.drt import build_drt
-    from asuka.qmc.fcifri import run_fcifri_block, run_fcifri_ground, run_fcifri_subspace
-    from asuka.qmc.rsi import run_fcifri_rsi
+    from asuka.qmc.fcifri import run_fcifri_block, run_fcifri_ground
+    import asuka.qmc.fcifri as qmc_fcifri
 
     drt = build_drt(norb=28, nelec=12, twos_target=0)
     assert int(drt.ncsf) > np.iinfo(np.int32).max
@@ -104,6 +88,10 @@ def test_fcifri_large_space_rejects_rayleigh_and_removes_legacy_subspace():
     eri = np.zeros((norb, norb, norb, norb), dtype=np.float64)
     x_idx = np.asarray([0], dtype=np.int64)
     x_val = np.asarray([1.0], dtype=np.float64)
+    x0_block = [
+        (np.asarray([0], dtype=np.int64), np.asarray([1.0], dtype=np.float64)),
+        (np.asarray([1], dtype=np.int64), np.asarray([1.0], dtype=np.float64)),
+    ]
 
     with pytest.raises(ValueError, match="projected|rayleigh"):
         run_fcifri_ground(
@@ -126,7 +114,7 @@ def test_fcifri_large_space_rejects_rayleigh_and_removes_legacy_subspace():
         drt,
         h1e,
         eri,
-        nroots=1,
+        nroots=2,
         m=1,
         eps=0.01,
         niter=0,
@@ -134,123 +122,35 @@ def test_fcifri_large_space_rejects_rayleigh_and_removes_legacy_subspace():
         nspawn_two=1,
         seed=31,
         backend="auto",
-        x0=[(x_idx, x_val)],
+        x0=x0_block,
     )
-    assert block.energies.shape == (1, 1)
-    assert block.idx and block.idx[0].dtype == np.int64
-    assert block.val and block.val[0].dtype == np.float64
+    assert block.energies.shape == (1, 2)
+    assert len(block.idx) == 2
+    assert len(block.val) == 2
+    assert all(col.dtype == np.int64 for col in block.idx)
+    assert all(col.dtype == np.float64 for col in block.val)
 
-    with pytest.raises(NotImplementedError, match="removed from the scalable production path"):
-        run_fcifri_subspace(
-            drt,
-            h1e,
-            eri,
-            nroots=1,
-            m=1,
-            eps=0.01,
-            niter=0,
-            nspawn_one=1,
-            nspawn_two=1,
-            seed=23,
-            method="rsi",
-            x0=[(x_idx, x_val)],
-        )
+    import importlib
 
-    with pytest.raises(NotImplementedError, match="removed from the scalable production path"):
-        run_fcifri_rsi(
-            drt,
-            h1e,
-            eri,
-            U0=[(x_idx, x_val)],
-            m=1,
-            eps=0.01,
-            niter=0,
-            nspawn_one=1,
-            nspawn_two=1,
-            seed=29,
-        )
+    assert not hasattr(qmc_fcifri, "run_fcifri_subspace")
+    assert importlib.util.find_spec("asuka.qmc.rsi") is None
 
 
-def test_low_level_cpu_qmc_helpers_reject_large_space_labels():
-    from asuka.cuguga.drt import build_drt
-    from asuka.qmc.compress import compress_phi_pivot_resample, compress_phi_pivotal
-    from asuka.qmc.compress_guided import compress_phi_pivot_resample_guided
-    from asuka.qmc.epq_sample import sample_epq_from_arrays, sample_epq_one
-    from asuka.qmc.projector import projector_step
-    from asuka.qmc.spawn_guided import spawn_hamiltonian_events_guided_row
-    from asuka.qmc.spawn import spawn_hamiltonian_events
+def test_low_level_cpu_qmc_helper_modules_are_absent():
+    import importlib
 
-    drt = build_drt(norb=28, nelec=12, twos_target=0)
-    assert int(drt.ncsf) > np.iinfo(np.int32).max
+    removed_modules = [
+        "asuka.qmc.compress",
+        "asuka.qmc.compress_guided",
+        "asuka.qmc.epq_sample",
+        "asuka.qmc.projector",
+        "asuka.qmc.spawn",
+        "asuka.qmc.spawn_guided",
+        "asuka.qmc.subspace",
+    ]
 
-    norb = int(drt.norb)
-    h1e = np.zeros((norb, norb), dtype=np.float64)
-    eri = np.zeros((norb, norb, norb, norb), dtype=np.float64)
-    x_idx = np.asarray([0], dtype=np.int64)
-    x_val = np.asarray([1.0], dtype=np.float64)
-    x_idx_big = np.asarray([np.iinfo(np.int32).max + 5], dtype=np.int64)
-    rng = np.random.default_rng(31)
-
-    with pytest.raises(NotImplementedError, match="large-space / key64 labels"):
-        spawn_hamiltonian_events(
-            drt,
-            h1e,
-            eri,
-            x_idx,
-            x_val,
-            eps=0.01,
-            nspawn_one=1,
-            nspawn_two=1,
-            rng=rng,
-        )
-
-    with pytest.raises(NotImplementedError, match="large-space / key64 labels"):
-        projector_step(
-            drt,
-            h1e,
-            eri,
-            x_idx,
-            x_val,
-            eps=0.01,
-            nspawn_one=1,
-            nspawn_two=1,
-            rng=rng,
-        )
-
-    with pytest.raises(NotImplementedError, match="int32-addressable labels"):
-        compress_phi_pivot_resample(x_idx_big, x_val, m=1, rng=rng)
-
-    with pytest.raises(NotImplementedError, match="int32-addressable labels"):
-        compress_phi_pivotal(x_idx_big, x_val, m=1, rng=rng)
-
-    with pytest.raises(NotImplementedError, match="int32-addressable labels"):
-        compress_phi_pivot_resample_guided(
-            x_idx_big,
-            x_val,
-            m=1,
-            rng=rng,
-            logq_fn=lambda idx: np.zeros_like(np.asarray(idx, dtype=np.float64)),
-            alpha=0.5,
-        )
-
-    with pytest.raises(NotImplementedError, match="large-space / key64 labels"):
-        spawn_hamiltonian_events_guided_row(
-            drt,
-            h1e,
-            eri,
-            x_idx,
-            x_val,
-            eps=0.01,
-            nspawn_one=1,
-            nspawn_two=1,
-            rng=rng,
-        )
-
-    with pytest.raises(NotImplementedError, match="int32-addressable labels"):
-        sample_epq_from_arrays(x_idx_big, np.asarray([1.0], dtype=np.float64), rng)
-
-    with pytest.raises(NotImplementedError, match="large-space / key64 labels"):
-        sample_epq_one(drt, int(x_idx[0]), 0, 0, rng)
+    for module_name in removed_modules:
+        assert importlib.util.find_spec(module_name) is None, module_name
 
 
 def test_root_package_surfaces_prefer_scalable_entrypoints():
@@ -323,3 +223,52 @@ def test_fciqmc_cuda_key64_large_space_zero_iter_smoke():
     assert res.key_u64 is not None and res.key_u64.dtype == np.uint64
     assert res.ref_idx.dtype == np.int64
     assert np.array_equal(res.idx, x_idx)
+
+
+@pytest.mark.cuda
+def test_fcifri_block_cuda_key64_large_space_multi_root_smoke():
+    cp = pytest.importorskip("cupy")
+    try:
+        ndev = int(cp.cuda.runtime.getDeviceCount())
+    except Exception as e:  # pragma: no cover
+        pytest.skip(f"CUDA runtime unavailable ({type(e).__name__}: {e})")
+    if ndev <= 0:
+        pytest.skip("no CUDA device")
+
+    from asuka.cuguga.drt import build_drt
+    from asuka.qmc.fcifri import run_fcifri_block
+
+    norb = 28
+    drt = build_drt(norb=norb, nelec=12, twos_target=0)
+    assert int(drt.ncsf) > np.iinfo(np.int32).max
+
+    h1e = np.zeros((norb, norb), dtype=np.float64)
+    eri = np.zeros((norb, norb, norb, norb), dtype=np.float64)
+    x0 = [
+        (np.asarray([0], dtype=np.int64), np.asarray([1.0], dtype=np.float64)),
+        (np.asarray([1], dtype=np.int64), np.asarray([1.0], dtype=np.float64)),
+    ]
+
+    res = run_fcifri_block(
+        drt,
+        h1e,
+        eri,
+        nroots=2,
+        m=2,
+        eps=1e-4,
+        niter=1,
+        nspawn_one=1,
+        nspawn_two=1,
+        seed=23,
+        backend="cuda_key64",
+        x0=x0,
+        ortho_stride=1,
+        ritz_stride=1,
+    )
+
+    assert res.backend == "cuda_key64"
+    assert res.energies.shape == (2, 2)
+    assert res.iters.tolist() == [0, 1]
+    assert len(res.idx) == 2
+    assert all(col.dtype == np.int64 for col in res.idx)
+    assert all(col.size >= 1 for col in res.idx)

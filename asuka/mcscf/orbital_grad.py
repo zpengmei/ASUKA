@@ -537,15 +537,15 @@ def orbital_gradient_df(
     if nocc > nmo:
         raise ValueError("ncore+ncas exceeds number of MOs")
 
-    dm1_act = np.asarray(dm1_act, dtype=np.float64)
-    if dm1_act.shape != (ncas, ncas):
-        raise ValueError(f"dm1_act must have shape {(ncas, ncas)}, got {tuple(dm1_act.shape)}")
-    dm1_act = 0.5 * (dm1_act + dm1_act.T)
-    dm1_act = 0.5 * (dm1_act + dm1_act.T)
-    dm1_act = 0.5 * (dm1_act + dm1_act.T)
-    dm1_act = 0.5 * (dm1_act + dm1_act.T)
+    dm1_act_xp = _as_xp_f64(xp, dm1_act)
+    if dm1_act_xp.shape != (ncas, ncas):
+        raise ValueError(f"dm1_act must have shape {(ncas, ncas)}, got {tuple(dm1_act_xp.shape)}")
+    dm1_act_xp = 0.5 * (dm1_act_xp + dm1_act_xp.T)
+    dm1_act_xp = 0.5 * (dm1_act_xp + dm1_act_xp.T)
+    dm1_act_xp = 0.5 * (dm1_act_xp + dm1_act_xp.T)
+    dm1_act_xp = 0.5 * (dm1_act_xp + dm1_act_xp.T)
 
-    dm2_arr = np.asarray(dm2_act, dtype=np.float64)
+    dm2_arr = _as_xp_f64(xp, dm2_act)
     if dm2_arr.shape == (ncas, ncas, ncas, ncas):
         dm2_flat = dm2_arr.reshape(ncas * ncas, ncas * ncas)
     elif dm2_arr.shape == (ncas * ncas, ncas * ncas):
@@ -556,7 +556,6 @@ def orbital_gradient_df(
             f"got {tuple(dm2_arr.shape)}"
         )
 
-    dm1_act_xp = _as_xp_f64(xp, dm1_act)
     dm2_act_xp = _as_xp_f64(xp, dm2_flat)
 
     # Core + active AO densities
@@ -604,15 +603,14 @@ def orbital_gradient_df(
             Kc = xp.zeros((nao, nao), dtype=xp.float64)
 
         Ja, _ = _df_scf._df_JK(B, D_act_ao, want_J=True, want_K=False)  # noqa: SLF001
-        w_h, U_h = np.linalg.eigh(dm1_act)
-        if float(np.min(w_h)) < -1e-8:
+        w_xp, U_xp = xp.linalg.eigh(dm1_act_xp)
+        if _scalar_float(xp.min(w_xp)) < -1e-8:
             # Active 1-RDM must be PSD for occupied-driven K (sqrt(occ)).
             # Fall back to dense-D K if numerical noise is unexpectedly large.
             _, Ka = _df_scf._df_JK(B, D_act_ao, want_J=False, want_K=True)  # noqa: SLF001
         else:
-            w_h = np.clip(w_h, 0.0, None)
-            w = _as_xp_f64(xp, w_h)
-            U = _as_xp_f64(xp, U_h)
+            w = xp.clip(w_xp, 0.0, None)
+            U = xp.asarray(U_xp, dtype=xp.float64)
             C_no = C_act @ U
             Ka = _df_jk.df_K_from_BmnQ_Cocc(B, C_no, w, q_block=int(q_block))
     else:
@@ -630,13 +628,12 @@ def orbital_gradient_df(
                 Kc = xp.zeros((nao, nao), dtype=xp.float64)
 
             Ja, _ = _df_scf._df_JK(B, D_act_ao, want_J=True, want_K=False)  # noqa: SLF001
-            w_h, U_h = np.linalg.eigh(dm1_act)
-            if float(np.min(w_h)) < -1e-8:
+            w_xp, U_xp = xp.linalg.eigh(dm1_act_xp)
+            if _scalar_float(xp.min(w_xp)) < -1e-8:
                 _, Ka = _df_scf._df_JK(B, D_act_ao, want_J=False, want_K=True)  # noqa: SLF001
             else:
-                w_h = np.clip(w_h, 0.0, None)
-                w = _as_xp_f64(xp, w_h)
-                U = _as_xp_f64(xp, U_h)
+                w = xp.clip(w_xp, 0.0, None)
+                U = xp.asarray(U_xp, dtype=xp.float64)
                 C_no = C_act @ U
                 Ka = _df_jk.df_K_from_BmnQ_Cocc(B, C_no, w, q_block=int(q_block))
         else:
@@ -871,12 +868,12 @@ def orbital_gradient_thc(
     if nocc > nmo:
         raise ValueError("ncore+ncas exceeds number of MOs")
 
-    dm1_act = np.asarray(dm1_act, dtype=np.float64)
-    if dm1_act.shape != (ncas, ncas):
-        raise ValueError(f"dm1_act must have shape {(ncas, ncas)}, got {tuple(dm1_act.shape)}")
-    dm1_act = 0.5 * (dm1_act + dm1_act.T)
+    dm1_act_xp = _as_xp_f64(xp, dm1_act)
+    if dm1_act_xp.shape != (ncas, ncas):
+        raise ValueError(f"dm1_act must have shape {(ncas, ncas)}, got {tuple(dm1_act_xp.shape)}")
+    dm1_act_xp = 0.5 * (dm1_act_xp + dm1_act_xp.T)
 
-    dm2_arr = np.asarray(dm2_act, dtype=np.float64)
+    dm2_arr = _as_xp_f64(xp, dm2_act)
     if dm2_arr.shape == (ncas, ncas, ncas, ncas):
         dm2_flat = dm2_arr.reshape(ncas * ncas, ncas * ncas)
     elif dm2_arr.shape == (ncas * ncas, ncas * ncas):
@@ -887,7 +884,6 @@ def orbital_gradient_thc(
             f"got {tuple(dm2_arr.shape)}"
         )
 
-    dm1_act_xp = _as_xp_f64(xp, dm1_act)
     dm2_act_xp = _as_xp_f64(xp, dm2_flat)
 
     # Core + active MO blocks
@@ -1483,7 +1479,7 @@ def orbital_gradient_dense(
     ao_eri = getattr(scf_out, "ao_eri", None)
     direct_mode = bool(
         getattr(scf_out, "direct_jk_ctx", None) is not None
-        or str(getattr(scf_out, "two_e_backend", "") or "").strip().lower() == "direct"
+        or str(getattr(scf_out, "two_e_backend", "") or "").strip().lower() in {"direct", "direct_df"}
     )
     provider = two_e_provider
     if provider is None and direct_mode:
@@ -1534,11 +1530,11 @@ def orbital_gradient_dense(
     if nocc > nmo:
         raise ValueError("ncore+ncas exceeds number of MOs")
 
-    dm1_act = np.asarray(dm1_act, dtype=np.float64)
-    if dm1_act.shape != (ncas, ncas):
-        raise ValueError(f"dm1_act must have shape {(ncas, ncas)}, got {tuple(dm1_act.shape)}")
+    dm1_act_xp = _as_xp_f64(xp, dm1_act)
+    if dm1_act_xp.shape != (ncas, ncas):
+        raise ValueError(f"dm1_act must have shape {(ncas, ncas)}, got {tuple(dm1_act_xp.shape)}")
 
-    dm2_arr = np.asarray(dm2_act, dtype=np.float64)
+    dm2_arr = _as_xp_f64(xp, dm2_act)
     if dm2_arr.shape == (ncas, ncas, ncas, ncas):
         dm2_uvwx = dm2_arr
     elif dm2_arr.shape == (ncas * ncas, ncas * ncas):
@@ -1549,7 +1545,6 @@ def orbital_gradient_dense(
             f"got {tuple(dm2_arr.shape)}"
         )
 
-    dm1_act_xp = _as_xp_f64(xp, dm1_act)
     dm2_wxuv_flat = dm2_uvwx.transpose(2, 3, 0, 1).reshape(ncas * ncas, ncas * ncas)
     dm2_wxuv_flat = 0.5 * (dm2_wxuv_flat + dm2_wxuv_flat.T)
     dm2_wxuv_xp = _as_xp_f64(xp, dm2_wxuv_flat)
@@ -1612,13 +1607,12 @@ def orbital_gradient_dense(
                 Kc = xp.zeros((nao, nao), dtype=xp.float64)
 
             Ja, _ = _df_scf._df_JK(B, D_act_ao, want_J=True, want_K=False)  # noqa: SLF001
-            w_h, U_h = np.linalg.eigh(dm1_act)
-            if float(np.min(w_h)) < -1e-8:
+            w_xp, U_xp = xp.linalg.eigh(dm1_act_xp)
+            if _scalar_float(xp.min(w_xp)) < -1e-8:
                 _, Ka = _df_scf._df_JK(B, D_act_ao, want_J=False, want_K=True)  # noqa: SLF001
             else:
-                w_h = np.clip(w_h, 0.0, None)
-                w = _as_xp_f64(xp, w_h)
-                U = _as_xp_f64(xp, U_h)
+                w = xp.clip(w_xp, 0.0, None)
+                U = xp.asarray(U_xp, dtype=xp.float64)
                 C_no = C_act @ U
                 Ka = _df_jk.df_K_from_BmnQ_Cocc(B, C_no, w, q_block=int(q_block))
         else:

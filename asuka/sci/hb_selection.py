@@ -15,7 +15,7 @@ from asuka.cuguga.drt import DRT
 from asuka.cuguga.screening import RowScreening
 from asuka.cuguga.state_cache import DRTStateCache
 from asuka.sci.hb_integrals import HeatBathIntegralIndex
-from asuka.sci.selected_ci import ConnectedRowCache, DiagonalGuessLookup, _select_external_sparse
+from asuka.sci.sparse_support import ConnectedRowCache, DiagonalGuessLookup, _select_external_sparse
 
 
 def heat_bath_select_and_pt2_sparse(
@@ -34,6 +34,8 @@ def heat_bath_select_and_pt2_sparse(
     screening: RowScreening | None,
     state_cache: DRTStateCache | None,
     row_cache: ConnectedRowCache | None = None,
+    stats_out: dict[str, Any] | None = None,
+    seeds_out: dict[str, Any] | None = None,
 ) -> tuple[list[int], np.ndarray]:
     """Scalable heat-bath-style selection using exact matrix-element screening."""
 
@@ -57,6 +59,8 @@ def heat_bath_select_and_pt2_sparse(
         state_cache=state_cache,
         select_screen_contrib=float(eps),
         row_cache=row_cache,
+        stats_out=stats_out,
+        seeds_out=seeds_out,
     )
 
 
@@ -99,17 +103,6 @@ def _python_build_screened_g_flat(
 
     return g_flat
 
-
-def heat_bath_select_and_pt2(*args, **kwargs) -> tuple[list[int], np.ndarray]:
-    """Legacy HB selector entrypoint removed from the supported path."""
-
-    _ = (args, kwargs)
-    raise NotImplementedError(
-        "heat_bath_select_and_pt2 has been removed from the supported path; use "
-        "heat_bath_select_and_pt2_sparse or run_cipsi_trials(..., selection_mode='heat_bath') instead"
-    )
-
-
 def adaptive_epsilon(
     iteration: int,
     nsel: int,
@@ -126,13 +119,3 @@ def adaptive_epsilon(
     if eps_init <= 0 or eps_final <= 0 or eps_init <= eps_final:
         return float(eps_final)
     return float(eps_init) * (float(eps_final) / float(eps_init)) ** frac
-
-
-def semistochastic_pt2(*args, **kwargs):
-    """Placeholder for the removed legacy semistochastic PT2 helper."""
-
-    _ = (args, kwargs)
-    raise NotImplementedError(
-        "semistochastic_pt2 is not implemented; use heat_bath_select_and_pt2_sparse(..., max_add=0) "
-        "or run_cipsi_trials(..., selection_mode='heat_bath') for deterministic PT2 evaluation"
-    )

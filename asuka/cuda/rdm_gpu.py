@@ -239,7 +239,7 @@ def make_rdm12_cuda_workspace(
 
 def make_rdm12_cuda(
     drt: DRT,
-    civec: np.ndarray,
+    civec: Any,
     *,
     block_nops: int = 8,
     build_threads: int = 256,
@@ -254,7 +254,8 @@ def make_rdm12_cuda(
     fixed_point_mantissa_bit_offset: int | None = None,
     symmetrize_gram: bool = True,
     streaming_ncsf_cutoff: int | None = None,
-) -> tuple[np.ndarray, np.ndarray]:
+    return_cupy: bool = False,
+) -> tuple[Any, Any]:
     """Compute (dm1, dm2) on GPU using (segment-walk or epq_table -> T) then cuBLAS (dm1, Gram).
 
     Notes
@@ -281,8 +282,16 @@ def make_rdm12_cuda(
     except Exception as e:  # pragma: no cover
         raise RuntimeError("CuPy is required for the CUDA RDM backend") from e
 
-    c = np.asarray(civec, dtype=np.float64).ravel()
-    if c.size != ncsf:
+    if isinstance(civec, cp.ndarray):
+        c_gpu = cp.ascontiguousarray(civec.astype(cp.float64, copy=False).ravel())
+        _civec_on_device = True
+        c_size = int(c_gpu.size)
+    else:
+        c = np.asarray(civec, dtype=np.float64).ravel()
+        c_gpu = cp.asarray(c, dtype=cp.float64)
+        _civec_on_device = False
+        c_size = int(c.size)
+    if c_size != ncsf:
         raise ValueError("civec has wrong length")
 
     cache_workspace = bool(_env_int("CUGUGA_RDM_CUDA_CACHE_WORKSPACE", 1))
@@ -334,7 +343,6 @@ def make_rdm12_cuda(
             fixed_point_mantissa_bit_offset=fixed_point_mantissa_bit_offset,
         )
 
-    c_gpu = cp.asarray(c, dtype=cp.float64)
     drt_dev = workspace.drt_dev
     state_dev = workspace.state_dev
     p_gpu = workspace.p_gpu
@@ -565,6 +573,8 @@ def make_rdm12_cuda(
         dm1, dm2 = rdm12_reorder_delta_inplace_device(
             dm1_pq_gpu, gram0_t, norb=norb, sync=True,
         )
+        if bool(return_cupy):
+            return dm1, dm2
         return cp.asnumpy(dm1).astype(np.float64), cp.asnumpy(dm2).astype(np.float64)
 
     dm1_pq = cp.asnumpy(dm1_pq_gpu)
@@ -580,6 +590,8 @@ def make_rdm12_cuda(
         for q in range(norb):
             dm2[p, q, q, :] -= dm1[:, p]
 
+    if bool(return_cupy):
+        return cp.asarray(dm1, dtype=cp.float64), cp.asarray(dm2, dtype=cp.float64)
     return np.asarray(dm1, dtype=np.float64), np.asarray(dm2, dtype=np.float64)
 
 

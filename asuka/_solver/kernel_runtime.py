@@ -116,6 +116,20 @@ def run_kernel_dense_eigh_fastpath(
     warm_state_mo_occ: Any,
     t_kernel0: float,
 ) -> dict[str, Any] | None:
+    try:
+        from asuka.integrals.df_integrals import DeviceDFMOIntegrals  # noqa: PLC0415
+    except Exception:  # pragma: no cover
+        DeviceDFMOIntegrals = ()  # type: ignore[assignment]
+    try:
+        from asuka.integrals.direct_integrals import DeviceDirectMOIntegrals  # noqa: PLC0415
+    except Exception:  # pragma: no cover
+        DeviceDirectMOIntegrals = ()  # type: ignore[assignment]
+
+    if isinstance(eri, DeviceDFMOIntegrals) and getattr(eri, "eri_mat", None) is None:
+        return None
+    if isinstance(eri, DeviceDirectMOIntegrals):
+        return None
+
     dense_thresh = int(getattr(solver, "dense_eigh_ncsf_threshold", 0))
     if dense_thresh <= 0 or int(ncsf) > dense_thresh:
         return None
@@ -240,6 +254,7 @@ def build_cuda_hamiltonian_inputs(
     df_eri_mat_max_bytes: int,
     df_type: type,
     device_df_type: type,
+    direct_device_type: type | tuple[type, ...] = (),
     restore_eri_4d_fn: Any,
 ) -> dict[str, Any]:
     """Build CUDA-side Hamiltonian inputs for matvec backends."""
@@ -249,6 +264,7 @@ def build_cuda_hamiltonian_inputs(
 
     eri_mat_d = None
     l_full_d = None
+    direct_op_d = None
     if isinstance(eri, device_df_type):
         j_ps_d = cp.asarray(eri.j_ps, dtype=cp.float64)
         j_ps_d = cp.ascontiguousarray(j_ps_d)
@@ -267,6 +283,15 @@ def build_cuda_hamiltonian_inputs(
         else:
             raise RuntimeError("DeviceDFMOIntegrals requires eri_mat or l_full for CUDA matvec")
         h_eff_d = h1e_d - 0.5 * j_ps_d
+    elif isinstance(eri, direct_device_type):
+        j_ps_src = getattr(eri, "j_ps_device", None)
+        if j_ps_src is None:
+            j_ps_src = eri.j_ps
+        j_ps_d = cp.asarray(j_ps_src, dtype=cp.float64)
+        j_ps_d = cp.ascontiguousarray(j_ps_d)
+        h1e_d = cp.asarray(np.asarray(h1e, dtype=np.float64), dtype=cp.float64)
+        h_eff_d = h1e_d - 0.5 * j_ps_d
+        direct_op_d = eri
     else:
         if isinstance(eri, df_type):
             l_full_d = cp.asarray(eri.l_full, dtype=cp.float64)
@@ -290,6 +315,7 @@ def build_cuda_hamiltonian_inputs(
     return {
         "eri_mat_d": eri_mat_d,
         "l_full_d": l_full_d,
+        "direct_op_d": direct_op_d,
         "h_eff_d": h_eff_d,
     }
 

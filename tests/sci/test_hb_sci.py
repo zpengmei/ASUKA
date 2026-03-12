@@ -15,7 +15,7 @@ import pytest
 
 from asuka.cuguga.drt import build_drt
 from asuka.sci.hb_integrals import HeatBathIntegralIndex, build_g_base, build_hb_index, build_hb_index_from_df
-from asuka.sci.hb_selection import adaptive_epsilon, heat_bath_select_and_pt2, semistochastic_pt2
+from asuka.sci.hb_selection import adaptive_epsilon
 
 
 # ---------------------------------------------------------------------------
@@ -275,26 +275,12 @@ class TestAdaptiveEpsilon:
             assert epsilons[i] >= epsilons[i + 1]
 
 
-class TestSemistochasticPT2:
-    def test_not_implemented(self):
-        with pytest.raises(NotImplementedError):
-            semistochastic_pt2(
-                None,
-                np.zeros((0,), dtype=np.int32),
-                np.zeros((0, 1), dtype=np.float64),
-                np.zeros((1,), dtype=np.float64),
-                None,
-                None,
-                {},
-                1,
-                0,
-                1e-12,
-                np.zeros((0,), dtype=np.float64),
-            )
+class TestLegacyHBShims:
+    def test_removed_symbols_are_absent(self):
+        import asuka.sci.hb_selection as hb_selection
 
-    def test_legacy_heat_bath_selector_removed(self):
-        with pytest.raises(NotImplementedError):
-            heat_bath_select_and_pt2()
+        assert not hasattr(hb_selection, "heat_bath_select_and_pt2")
+        assert not hasattr(hb_selection, "semistochastic_pt2")
 
 
 # ---------------------------------------------------------------------------
@@ -476,3 +462,33 @@ class TestHBSCIGPU:
         np.testing.assert_allclose(res_cuda.e_var, res_fused.e_var, atol=1e-10)
         np.testing.assert_allclose(res_cuda.e_pt2, res_fused.e_pt2, atol=1e-10)
         np.testing.assert_allclose(res_cuda.e_tot, res_fused.e_tot, atol=1e-10)
+
+    def test_hb_bucketed_selector_parity(self, monkeypatch):
+        """Forced bucketed HB-SCI must match the one-pass exact selector."""
+        import asuka.sci.sparse_support as sparse_support
+        from asuka.sci.gpu_cipsi import run_cipsi_trials
+
+        norb, h1e, eri = _be_integrals()
+        drt = build_drt(norb=norb, nelec=2, twos_target=0)
+        kwargs = dict(
+            nroots=1,
+            init_ncsf=2,
+            max_ncsf=6,
+            grow_by=2,
+            max_iter=2,
+            epq_mode="no_epq_support_aware",
+            selection_mode="heat_bath",
+            hb_epsilon=1e-4,
+            verbose=0,
+            backend="cpu_sparse",
+        )
+
+        res_base = run_cipsi_trials(drt, h1e, eri, **kwargs)
+        monkeypatch.setattr(sparse_support, "SELECTOR_BUCKET_EDGE_THRESHOLD", 1)
+        res_bucketed = run_cipsi_trials(drt, h1e, eri, **kwargs)
+
+        assert np.array_equal(np.sort(res_bucketed.sel_idx), np.sort(res_base.sel_idx))
+        np.testing.assert_allclose(res_bucketed.e_var, res_base.e_var, atol=1e-10)
+        np.testing.assert_allclose(res_bucketed.e_pt2, res_base.e_pt2, atol=1e-10)
+        np.testing.assert_allclose(res_bucketed.e_tot, res_base.e_tot, atol=1e-10)
+        assert bool(res_bucketed.profile.get("selector_bucketed_any", False))

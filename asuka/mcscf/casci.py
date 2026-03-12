@@ -30,6 +30,7 @@ from asuka.cuda.active_space_thc.active_space_integrals import (
 from asuka.hf import df_scf as _df_scf
 from asuka.hf import df_jk
 from asuka.solver import GUGAFCISolver
+from asuka.integrals.direct_integrals import DeviceDirectMOIntegrals, DirectRowOracleIntegrals
 
 Molecule = Any
 RHFDFRunResult = Any
@@ -307,6 +308,7 @@ def _build_casci_df_integrals(
     profile: dict | None = None,
     cached_b_whitened: Any | None = None,
     cache_out: dict | None = None,
+    two_e_provider: Any | None = None,
 ) -> _CASCIDFIntegrals:
     """Build effective 1-electron, 2-electron integrals, and core energy for DF-CASCI.
 
@@ -371,36 +373,50 @@ def _build_casci_df_integrals(
     C_cas = C[:, ncore : ncore + ncas]
 
     B = scf_out.df_B
-    if B is None:
-        raise ValueError("scf_out.df_B is missing (DF CASCI/CASSCF requires cached DF factors)")
-    B_shape = getattr(B, "shape", None)
-    if B_shape is None:
-        raise ValueError("scf_out.df_B must have a valid shape")
+    two_e_backend_s = str(getattr(scf_out, "two_e_backend", "") or "").strip().lower()
+    direct_df_mode = bool(two_e_backend_s == "direct_df")
     is_qp = False
-    if len(B_shape) == 3:
-        if int(B_shape[0]) != int(nao) or int(B_shape[1]) != int(nao):
-            raise ValueError(
-                "DF CASCI/CASSCF requires df_B in mnQ (nao,nao,naux) or packed Qp (naux,ntri) layout. "
-                f"Got df_B.shape={tuple(map(int, B_shape))} for nao={int(nao)}."
-            )
-    elif len(B_shape) == 2:
-        from asuka.integrals.tri_packed import ntri_from_nao  # noqa: PLC0415
+    if B is not None:
+        B_shape = getattr(B, "shape", None)
+        if B_shape is None:
+            raise ValueError("scf_out.df_B must have a valid shape")
+        if len(B_shape) == 3:
+            if int(B_shape[0]) != int(nao) or int(B_shape[1]) != int(nao):
+                raise ValueError(
+                    "DF CASCI/CASSCF requires df_B in mnQ (nao,nao,naux) or packed Qp (naux,ntri) layout. "
+                    f"Got df_B.shape={tuple(map(int, B_shape))} for nao={int(nao)}."
+                )
+        elif len(B_shape) == 2:
+            from asuka.integrals.tri_packed import ntri_from_nao  # noqa: PLC0415
 
-        is_qp = True
-        ntri_expected = int(ntri_from_nao(int(nao)))
-        if int(B_shape[1]) != int(ntri_expected):
+            is_qp = True
+            ntri_expected = int(ntri_from_nao(int(nao)))
+            if int(B_shape[1]) != int(ntri_expected):
+                raise ValueError(
+                    "Packed df_B must have shape (naux, nao*(nao+1)//2). "
+                    f"Got df_B.shape={tuple(map(int, B_shape))} but expected ntri={int(ntri_expected)} for nao={int(nao)}."
+                )
+        else:
             raise ValueError(
-                "Packed df_B must have shape (naux, nao*(nao+1)//2). "
-                f"Got df_B.shape={tuple(map(int, B_shape))} but expected ntri={int(ntri_expected)} for nao={int(nao)}."
+                "scf_out.df_B must be mnQ (nao,nao,naux) or packed Qp (naux,ntri). "
+                f"Got df_B.shape={tuple(map(int, B_shape))}."
             )
-    else:
-        raise ValueError(
-            "scf_out.df_B must be mnQ (nao,nao,naux) or packed Qp (naux,ntri). "
-            f"Got df_B.shape={tuple(map(int, B_shape))}."
-        )
+    elif not direct_df_mode:
+        raise ValueError("scf_out.df_B is missing (DF CASCI/CASSCF requires cached DF factors)")
 
     _t_core_start = time.perf_counter() if profile is not None else 0.0
-    xp, _is_gpu = _df_scf._get_xp(B, C_cas)  # noqa: SLF001
+    provider = two_e_provider
+    if provider is None and direct_df_mode:
+        from asuka.mcscf.two_e_provider import resolve_two_e_provider  # noqa: PLC0415
+
+        provider = resolve_two_e_provider(scf_out)
+    _probe = None
+    if provider is not None:
+        _probe_fn = getattr(provider, "probe_array", None)
+        if callable(_probe_fn):
+            _probe = _probe_fn()
+    xp_probe = B if B is not None else (_probe if _probe is not None else C_cas)
+    xp, _is_gpu = _df_scf._get_xp(xp_probe, C_cas)  # noqa: SLF001
     h_ao = xp.asarray(scf_out.int1e.hcore, dtype=xp.float64)
 
     cached_b_whitened_use = cached_b_whitened
@@ -427,7 +443,11 @@ def _build_casci_df_integrals(
         ecore = float(scf_out.mol.energy_nuc())
     else:
         D_core = 2.0 * (C_core @ C_core.T)
-        if bool(_is_gpu):
+        if provider is not None:
+            Jc, Kc = provider.jk(D_core, want_J=True, want_K=True, profile=profile)
+            if Jc is None or Kc is None:  # pragma: no cover
+                raise RuntimeError("provider.jk returned None while J/K were requested")
+        elif bool(_is_gpu):
             import cupy as cp  # type: ignore
 
             B_dev = cp.asarray(B, dtype=cp.float64)
@@ -702,6 +722,7 @@ def run_casci_df(
     profile: dict | None = None,
     cached_b_whitened: Any | None = None,
     cache_out: dict | None = None,
+    two_e_provider: Any | None = None,
     **solver_kwargs,
 ) -> CASCIResult:
     """Run DF-CASCI using `cuERI`-built GPU active-space DF integrals.
@@ -771,6 +792,7 @@ def run_casci_df(
         profile=profile,
         cached_b_whitened=cached_b_whitened,
         cache_out=cache_out,
+        two_e_provider=two_e_provider,
     )
     h1eff = integrals.h1eff
     eri = integrals.eri
@@ -1638,7 +1660,7 @@ def run_casci_dense_gpu(
     ao_eri = getattr(scf_out, "ao_eri", None)
     direct_mode = bool(
         getattr(scf_out, "direct_jk_ctx", None) is not None
-        or str(getattr(scf_out, "two_e_backend", "") or "").strip().lower() == "direct"
+        or str(getattr(scf_out, "two_e_backend", "") or "").strip().lower() in {"direct", "direct_df"}
     )
     provider = two_e_provider
     if provider is None and direct_mode:
@@ -1810,6 +1832,171 @@ def run_casci_dense_gpu(
         scf_out=scf_out,
     )
 
+
+def run_casci_direct_exact(
+    scf_out: RHFDFRunResult | ROHFDFRunResult | UHFDFRunResult,
+    *,
+    ncore: int,
+    ncas: int,
+    nelecas: int | tuple[int, int],
+    mo_coeff: Any | None = None,
+    ci0: Any | None = None,
+    fcisolver: GUGAFCISolver | None = None,
+    twos: int | None = None,
+    nroots: int = 1,
+    matvec_backend: str = "cuda_direct",
+    dense_gpu_ao_rep: str = "auto",
+    dense_gpu_builder_mol: Any | None = None,
+    dense_gpu_builder: Any | None = None,
+    two_e_provider: Any | None = None,
+    dense_exact_jk: bool = False,
+    threads: int = 256,
+    eps_ao: float = 0.0,
+    max_tile_bytes: int = 256 * 1024 * 1024,
+    profile: dict | None = None,
+    **solver_kwargs,
+) -> CASCIResult:
+    matvec_backend_s = str(matvec_backend).strip().lower()
+    if matvec_backend_s not in {"cuda_direct", "contract", "row_oracle_df"}:
+        raise ValueError(
+            "run_casci_direct_exact requires matvec_backend in {'cuda_direct','contract','row_oracle_df'}"
+        )
+    validate_active_space_configuration(
+        scf_out,
+        ncore=int(ncore),
+        ncas=int(ncas),
+        nelecas=nelecas,
+        mo_coeff=mo_coeff,
+        context="run_casci_direct_exact",
+    )
+    if not bool(getattr(scf_out.scf, "converged", False)):
+        raise RuntimeError("SCF must be converged before CASCI")
+
+    ncore = int(ncore)
+    ncas = int(ncas)
+    C = mo_coeff if mo_coeff is not None else getattr(scf_out.scf, "mo_coeff", None)
+    if C is None:
+        raise ValueError("scf_out.scf.mo_coeff is missing")
+    if isinstance(C, tuple):
+        mo_occ = getattr(scf_out.scf, "mo_occ", None)
+        if not isinstance(mo_occ, tuple) or len(mo_occ) != 2:
+            raise ValueError("UHF mo_coeff=(Ca,Cb) requires scf_out.scf.mo_occ=(occ_a,occ_b)")
+        C, _occ_no = spatialize_uhf_mo_coeff(S_ao=scf_out.int1e.S, mo_coeff=C, mo_occ=mo_occ)
+    C = C.astype(C.dtype, copy=False)
+    nao, nmo = map(int, C.shape)
+    if ncore + ncas > nmo:
+        raise ValueError("ncore+ncas exceeds number of MOs")
+    C_core = C[:, :ncore]
+    C_cas = C[:, ncore : ncore + ncas]
+
+    provider = two_e_provider
+    if provider is None:
+        from asuka.mcscf.two_e_provider import resolve_two_e_provider  # noqa: PLC0415
+
+        provider = resolve_two_e_provider(
+            scf_out,
+            dense_gpu_builder=dense_gpu_builder,
+            dense_gpu_builder_mol=dense_gpu_builder_mol,
+            dense_gpu_threads=int(threads),
+            dense_max_tile_bytes=int(max_tile_bytes),
+            dense_eps_ao=float(eps_ao),
+            dense_gpu_ao_rep=str(dense_gpu_ao_rep),
+        )
+    _probe = getattr(provider, "probe_array", lambda: None)()
+    _xp_probe = _probe if _probe is not None else C_cas
+    xp, _is_gpu = _df_scf._get_xp(_xp_probe, C_cas)  # noqa: SLF001
+    h_ao = xp.asarray(scf_out.int1e.hcore, dtype=xp.float64)
+
+    def _jk_for_density(D_in):
+        if dense_exact_jk:
+            mol_exact = getattr(scf_out, "mol", None)
+            scf_exact = getattr(scf_out, "scf", None)
+            get_jk = getattr(scf_exact, "get_jk", None)
+            if mol_exact is None or not callable(get_jk):
+                raise ValueError("dense_exact_jk=True requires scf_out.scf.get_jk")
+            d_h = np.asarray(_asnumpy_f64(D_in), dtype=np.float64, order="C")
+            try:
+                J_h, K_h = get_jk(mol_exact, d_h, hermi=1)
+            except TypeError:
+                J_h, K_h = get_jk(d_h, hermi=1)
+            return xp.asarray(J_h, dtype=xp.float64), xp.asarray(K_h, dtype=xp.float64)
+        J_p, K_p = provider.jk(D_in, want_J=True, want_K=True, profile=profile)
+        if J_p is None or K_p is None:  # pragma: no cover
+            raise RuntimeError("provider.jk returned None while J/K were requested")
+        return J_p, K_p
+
+    if ncore == 0:
+        vhf_core = xp.zeros((nao, nao), dtype=xp.float64)
+        ecore = float(scf_out.mol.energy_nuc())
+    else:
+        D_core = 2.0 * (C_core @ C_core.T)
+        Jc, Kc = _jk_for_density(D_core)
+        vhf_core = Jc - 0.5 * Kc
+        e_one = xp.sum(D_core * h_ao)
+        e_two = 0.5 * xp.sum(D_core * vhf_core)
+        ecore = float(float(scf_out.mol.energy_nuc()) + float(e_one.item()) + float(e_two.item()))
+    h1eff = _asnumpy_f64(C_cas.T @ (h_ao + vhf_core) @ C_cas)
+    eri_cls = DeviceDirectMOIntegrals if matvec_backend_s == "cuda_direct" else DirectRowOracleIntegrals
+    eri = eri_cls(
+        norb=int(ncas),
+        provider=provider,
+        C_act=C_cas,
+        backend=str(getattr(provider, "backend", "cuda")),
+    )
+
+    if fcisolver is None:
+        if twos is None:
+            twos = int(getattr(scf_out.mol, "spin", 0))
+        fcisolver = GUGAFCISolver(twos=int(twos), nroots=int(nroots))
+    else:
+        if getattr(fcisolver, "nroots", None) != int(nroots):
+            try:
+                fcisolver.nroots = int(nroots)
+            except Exception:
+                pass
+
+    solver_kwargs = dict(solver_kwargs)
+    solver_kwargs.setdefault("pspace_size", 0)
+    t0_ci = time.perf_counter() if profile is not None else 0.0
+    e_tot, ci = fcisolver.kernel(
+        h1eff,
+        eri,
+        int(ncas),
+        nelecas,
+        ci0=ci0,
+        ecore=float(ecore),
+        nroots=int(nroots),
+        matvec_backend=str(matvec_backend_s),
+        **solver_kwargs,
+    )
+    if profile is not None:
+        profile["t_ci_solve_s"] = profile.get("t_ci_solve_s", 0.0) + float(time.perf_counter() - float(t0_ci))
+
+    e_tot_val: float | np.ndarray
+    if int(nroots) == 1:
+        e_tot_val = float(e_tot)
+    else:
+        e_tot_val = np.asarray(e_tot, dtype=np.float64).ravel()
+
+    return CASCIResult(
+        mol=scf_out.mol,
+        basis_name=str(scf_out.basis_name),
+        auxbasis_name=str(scf_out.auxbasis_name),
+        ncore=int(ncore),
+        ncas=int(ncas),
+        nelecas=nelecas,
+        nroots=int(nroots),
+        ecore=float(ecore),
+        e_tot=e_tot_val,
+        ci=ci,
+        mo_coeff=C,
+        h1eff=h1eff,
+        eri=eri,
+        scf=scf_out.scf,
+        profile=profile,
+        scf_out=scf_out,
+    )
+
 def run_casci(
     scf_out: RHFDFRunResult | ROHFDFRunResult | UHFDFRunResult,
     *,
@@ -1875,19 +2062,52 @@ def run_casci(
     if backend_s == "cuda" and not bool(is_gpu):
         raise ValueError("backend='cuda' requires scf_out with GPU arrays")
 
+    two_e_backend_s = str(getattr(scf_out, "two_e_backend", "") or "").strip().lower()
+    two_e_provider = None
+    if backend_s == "cuda":
+        from asuka.mcscf.two_e_provider import resolve_two_e_provider  # noqa: PLC0415
+
+        two_e_provider = resolve_two_e_provider(scf_out)
     direct_mode = bool(
         getattr(scf_out, "direct_jk_ctx", None) is not None
-        or str(getattr(scf_out, "two_e_backend", "") or "").strip().lower() == "direct"
+        or two_e_backend_s in {"direct", "direct_df"}
     )
     if direct_mode:
         if backend_s != "cuda":
             raise NotImplementedError("direct two-electron backend currently requires backend='cuda' for CASCI")
+        if two_e_backend_s == "direct":
+            matvec_backend_s = str(kwargs.get("matvec_backend", "cuda_direct")).strip().lower()
+            kwargs["matvec_backend"] = str(matvec_backend_s)
+            if matvec_backend_s in {"cuda_direct", "contract", "row_oracle_df"}:
+                return run_casci_direct_exact(
+                    scf_out,
+                    ncore=int(ncore),
+                    ncas=int(ncas),
+                    nelecas=nelecas,
+                    mo_coeff=mo_coeff,
+                    two_e_provider=two_e_provider,
+                    **kwargs,
+                )
+        if two_e_backend_s == "direct_df":
+            matvec_backend_s = str(kwargs.get("matvec_backend", "cuda")).strip().lower()
+            kwargs["matvec_backend"] = str(matvec_backend_s)
+            return run_casci_df(
+                scf_out,
+                ncore=int(ncore),
+                ncas=int(ncas),
+                nelecas=nelecas,
+                mo_coeff=mo_coeff,
+                want_eri_mat=bool(matvec_backend_s == "cuda_eri_mat"),
+                two_e_provider=two_e_provider,
+                **kwargs,
+            )
         return run_casci_dense_gpu(
             scf_out,
             ncore=int(ncore),
             ncas=int(ncas),
             nelecas=nelecas,
             mo_coeff=mo_coeff,
+            two_e_provider=two_e_provider,
             **kwargs,
         )
 
@@ -1896,11 +2116,27 @@ def run_casci(
             return run_casci_thc(
                 scf_out, ncore=int(ncore), ncas=int(ncas), nelecas=nelecas, mo_coeff=mo_coeff, **kwargs
             )
-        return run_casci_df(scf_out, ncore=int(ncore), ncas=int(ncas), nelecas=nelecas, mo_coeff=mo_coeff, **kwargs)
+        return run_casci_df(
+            scf_out,
+            ncore=int(ncore),
+            ncas=int(ncas),
+            nelecas=nelecas,
+            mo_coeff=mo_coeff,
+            two_e_provider=two_e_provider,
+            **kwargs,
+        )
     if backend_s == "cpu" and df_b:
         return run_casci_df_cpu(scf_out, ncore=int(ncore), ncas=int(ncas), nelecas=nelecas, mo_coeff=mo_coeff, **kwargs)
     if backend_s == "cuda" and not df_b:
-        return run_casci_dense_gpu(scf_out, ncore=int(ncore), ncas=int(ncas), nelecas=nelecas, mo_coeff=mo_coeff, **kwargs)
+        return run_casci_dense_gpu(
+            scf_out,
+            ncore=int(ncore),
+            ncas=int(ncas),
+            nelecas=nelecas,
+            mo_coeff=mo_coeff,
+            two_e_provider=two_e_provider,
+            **kwargs,
+        )
     return run_casci_dense_cpu(scf_out, ncore=int(ncore), ncas=int(ncas), nelecas=nelecas, mo_coeff=mo_coeff, **kwargs)
 
 
@@ -2089,4 +2325,5 @@ __all__ = [
     "run_casci_df_cpu",
     "run_casci_dense_cpu",
     "run_casci_dense_gpu",
+    "run_casci_direct_exact",
 ]

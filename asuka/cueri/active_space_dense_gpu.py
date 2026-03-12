@@ -255,13 +255,11 @@ class CuERIActiveSpaceDenseGPUBuilder:
                 ao_rep_eff = "cart" if bool(getattr(mol, "cart", False)) else "sph"
 
         if ao_rep_eff == "sph" and sph_map is None:
-            if mol is not None:
-                try:
-                    _basis_ref, sph_map = pack_cart_shells_from_mol_with_sph_map(mol, expand_contractions=True)
-                except Exception as e:  # pragma: no cover
-                    raise RuntimeError("failed to derive spherical AO offsets from mol for ao_rep='sph'") from e
-            elif ao_basis is not None:
-                # Derive spherical layout directly from packed Cartesian basis
+            if ao_basis is not None:
+                # Prefer the already-packed Cartesian basis when available. The
+                # frontend `Molecule` wrapper does not expose the full PySCF mol
+                # AO-introspection surface, but we can derive the spherical
+                # layout directly from the packed basis without needing it.
                 _shell_ao_start_sph, _nao_sph = _compute_sph_layout_from_cart_basis(ao_basis)
                 _starts_cart = np.asarray(ao_basis.shell_ao_start, dtype=np.int32).ravel()
                 _ls = np.asarray(ao_basis.shell_l, dtype=np.int32).ravel()
@@ -271,6 +269,11 @@ class CuERIActiveSpaceDenseGPUBuilder:
                     nao_sph=_nao_sph,
                     nao_cart=_nao_cart,
                 )
+            elif mol is not None:
+                try:
+                    _basis_ref, sph_map = pack_cart_shells_from_mol_with_sph_map(mol, expand_contractions=True)
+                except Exception as e:  # pragma: no cover
+                    raise RuntimeError("failed to derive spherical AO offsets from mol for ao_rep='sph'") from e
             else:
                 raise ValueError("ao_rep='sph' requires mol or ao_basis so spherical AO offsets can be derived")
         object.__setattr__(self, "ao_rep", ao_rep_eff)

@@ -24,6 +24,101 @@ def test_direct_jk_class_policy_parse():
     }
 
 
+def test_accumulate_ppps_shape_census():
+    from asuka.hf import direct_jk as djk
+
+    census = {}
+    djk._accumulate_ppps_shape_census(
+        census,
+        cls="ppps",
+        transpose=False,
+        nAB=np.asarray([9, 9, 18, 18], dtype=np.int64),
+        nCD=np.asarray([3, 3, 9, 3], dtype=np.int64),
+    )
+    djk._accumulate_ppps_shape_census(
+        census,
+        cls="pspp",
+        transpose=True,
+        nAB=np.asarray([9, 18], dtype=np.int64),
+        nCD=np.asarray([9, 9], dtype=np.int64),
+    )
+
+    assert census["family_ntasks"] == 6
+    assert census["by_class"] == {"ppps": 4, "pspp": 2}
+    assert census["by_transpose"] == {"native": 4, "transpose": 2}
+    assert census["shape_counts"] == {"9x3": 2, "18x3": 1, "18x9": 2, "9x9": 1}
+    assert census["work_counts"] == {"27": 2, "54": 1, "81": 1, "162": 2}
+    assert census["work_bin_counts"] == {"9..32": 2, "33..128": 2, ">128": 2}
+    assert census["nAB_counts"] == {"9": 3, "18": 3}
+    assert census["nCD_counts"] == {"3": 3, "9": 3}
+    assert census["total_work"] == (27 * 2 + 54 + 81 + 162 * 2)
+    assert census["work_min"] == 27
+    assert census["work_max"] == 162
+
+
+def test_build_ppps_packed_slab_plan_roundtrip():
+    from asuka.hf import direct_jk as djk
+
+    sp_npair = np.asarray([1, 3, 6, 9], dtype=np.int32)
+    task_spAB = np.asarray([1, 0, 3, 2, 1, 3, 0], dtype=np.int32)
+    task_spCD = np.asarray([1, 1, 1, 0, 3, 0, 2], dtype=np.int32)
+
+    plan = djk._build_ppps_packed_slab_plan(
+        task_spAB=task_spAB,
+        task_spCD=task_spCD,
+        sp_npair=sp_npair,
+        transpose=False,
+        target_shape_keys=("3x3", "1x3", "9x3", "1x1"),
+        max_tasks_per_group=2,
+    )
+
+    assert int(plan.packed_to_original.size) == int(task_spAB.size)
+    assert sorted(plan.packed_to_original.tolist()) == list(range(int(task_spAB.size)))
+
+    roundtrip_ab = np.empty_like(task_spAB)
+    roundtrip_cd = np.empty_like(task_spCD)
+    roundtrip_ab[plan.packed_to_original] = plan.packed_task_spAB
+    roundtrip_cd[plan.packed_to_original] = plan.packed_task_spCD
+    np.testing.assert_array_equal(roundtrip_ab, task_spAB)
+    np.testing.assert_array_equal(roundtrip_cd, task_spCD)
+
+    restored_packed_ab = plan.packed_task_spAB[plan.original_to_packed]
+    restored_packed_cd = plan.packed_task_spCD[plan.original_to_packed]
+    np.testing.assert_array_equal(restored_packed_ab, task_spAB)
+    np.testing.assert_array_equal(restored_packed_cd, task_spCD)
+
+    assert plan.eligible_ntasks == 3
+    assert plan.fallback_ntasks == 4
+    assert [g.shape_key for g in plan.groups] == ["3x3", "1x3", "9x3", "6x1", "3x9", "9x1", "1x6"]
+    assert [g.work_bucket for g in plan.groups] == ["9..32", "1..8", "9..32", "1..8", "9..32", "9..32", "1..8"]
+    assert [int(g.packed_stop) - int(g.packed_start) for g in plan.groups] == [1, 1, 1, 1, 1, 1, 1]
+
+
+def test_accumulate_ppps_packed_plan_stats():
+    from asuka.hf import direct_jk as djk
+
+    sp_npair = np.asarray([1, 3, 6, 9], dtype=np.int32)
+    plan = djk._build_ppps_packed_slab_plan(
+        task_spAB=np.asarray([1, 0, 3, 2], dtype=np.int32),
+        task_spCD=np.asarray([1, 1, 1, 0], dtype=np.int32),
+        sp_npair=sp_npair,
+        transpose=True,
+        target_shape_keys=("3x3", "1x3", "9x3"),
+        max_tasks_per_group=8,
+    )
+
+    stats = {}
+    djk._accumulate_ppps_packed_plan_stats(stats, plan)
+
+    assert stats["family_ntasks"] == 4
+    assert stats["eligible_ntasks"] == 3
+    assert stats["fallback_ntasks"] == 1
+    assert stats["group_count"] == 4
+    assert stats["shape_counts"] == {"3x3": 1, "1x3": 1, "9x3": 1, "6x1": 1}
+    assert stats["work_bin_counts"] == {"9..32": 2, "1..8": 2}
+    assert stats["group_counts"] == {"3x3|9..32": 1, "1x3|1..8": 1, "9x3|9..32": 1, "6x1|1..8": 1}
+
+
 def _cuda_available() -> bool:
     try:
         import cupy as cp
@@ -76,6 +171,57 @@ def _skip_no_cuda(test_func):
 
 
 @_skip_no_cuda
+@pytest.mark.parametrize(
+    ("policy", "expected_mode"),
+    [
+        ("", "auto"),
+        ("ppps=staged_warp_eri", "warp"),
+        ("ppps=staged_block", "block"),
+    ],
+)
+def test_direct_jk_ppps_routing_mode(monkeypatch, policy, expected_mode):
+    import cupy as cp
+
+    import asuka.cueri.eri_dispatch as eri_dispatch
+    from asuka.cueri.tasks import eri_class_id
+    from asuka.frontend.one_electron import build_ao_basis_cart
+    from asuka.hf.direct_jk import direct_JK, make_direct_jk_context
+    from asuka.integrals.int1e_cart import nao_cart_from_basis
+
+    monkeypatch.setenv("ASUKA_DIRECT_JK_FUSED", "0")
+    monkeypatch.delenv("ASUKA_DIRECT_JK_FUSED_ONLY", raising=False)
+    monkeypatch.delenv("ASUKA_DIRECT_JK_FUSED_ENABLE", raising=False)
+    monkeypatch.delenv("ASUKA_DIRECT_JK_FUSED_DISABLE", raising=False)
+    if policy:
+        monkeypatch.setenv("ASUKA_DIRECT_JK_CLASS_POLICY", policy)
+    else:
+        monkeypatch.delenv("ASUKA_DIRECT_JK_CLASS_POLICY", raising=False)
+
+    mol = _make_h2o(basis="6-31g*")
+    ao_basis, _ = build_ao_basis_cart(mol, basis=mol.basis, expand_contractions=True)
+    nao = int(nao_cart_from_basis(ao_basis))
+    rng = np.random.default_rng(1234)
+    D_np = rng.standard_normal((nao, nao))
+    D_np = 0.5 * (D_np + D_np.T)
+    D = cp.asarray(D_np, dtype=cp.float64)
+    ctx = make_direct_jk_context(ao_basis, eps_schwarz=0.0)
+
+    calls: list[str] = []
+    ppps_cid = int(eri_class_id(1, 1, 1, 0))
+    orig_run_kernel_batch_spd = eri_dispatch.run_kernel_batch_spd
+
+    def _wrapped_run_kernel_batch_spd(batch, *args, **kwargs):
+        if int(batch.kernel_class_id) == ppps_cid:
+            calls.append(str(kwargs.get("mode")))
+        return orig_run_kernel_batch_spd(batch, *args, **kwargs)
+
+    monkeypatch.setattr(eri_dispatch, "run_kernel_batch_spd", _wrapped_run_kernel_batch_spd)
+    direct_JK(ctx, D, want_J=True, want_K=True)
+
+    assert calls, "expected ppps/pspp staged ERI calls to be observed"
+    assert all(mode == expected_mode for mode in calls), calls
+
+
 def test_direct_jk_single_iteration():
     """Verify single-iteration J/K values match dense (random D)."""
     import cupy as cp
@@ -469,11 +615,12 @@ def test_shape_rejection():
 
 
 @_skip_no_cuda
-def test_direct_scf_to_casci_dense_gpu_smoke():
+@pytest.mark.parametrize("two_e_backend", ["direct", "direct_df"])
+def test_direct_scf_to_casci_dense_gpu_smoke(two_e_backend: str):
     from asuka.frontend.scf import run_hf_df
     from asuka.mcscf.casci import run_casci
 
-    scf_out = run_hf_df(_make_h2(), method="rhf", backend="cuda", two_e_backend="direct", eps_schwarz=0.0)
+    scf_out = run_hf_df(_make_h2(), method="rhf", backend="cuda", two_e_backend=str(two_e_backend), eps_schwarz=0.0)
     cas = run_casci(
         scf_out,
         ncore=0,
@@ -487,22 +634,541 @@ def test_direct_scf_to_casci_dense_gpu_smoke():
 
 
 @_skip_no_cuda
-def test_direct_scf_to_casci_cpu_rejected():
+def test_direct_df_casci_cuda_path_skips_eri_mat_materialization():
+    from asuka.frontend.scf import run_hf_df
+    from asuka.integrals.df_integrals import DeviceDFMOIntegrals
+    from asuka.mcscf.casci import run_casci
+
+    scf_out = run_hf_df(_make_h2(), method="rhf", backend="cuda", two_e_backend="direct_df", eps_schwarz=0.0)
+    cas = run_casci(
+        scf_out,
+        ncore=0,
+        ncas=2,
+        nelecas=2,
+        backend="cuda",
+        df=False,
+        matvec_backend="cuda",
+    )
+    assert float(cas.e_tot) < 0.0
+    assert isinstance(cas.eri, DeviceDFMOIntegrals)
+    assert cas.eri.l_full is not None
+    assert cas.eri.eri_mat is None
+
+
+@_skip_no_cuda
+def test_direct_exact_casci_row_oracle_skips_eri_mat_materialization():
+    from asuka.frontend.scf import run_hf_df
+    from asuka.integrals.direct_integrals import DirectRowOracleIntegrals
+    from asuka.mcscf.casci import run_casci
+
+    scf_out = run_hf_df(_make_h2(), method="rhf", backend="cuda", two_e_backend="direct", eps_schwarz=0.0)
+    cas = run_casci(
+        scf_out,
+        ncore=0,
+        ncas=2,
+        nelecas=2,
+        backend="cuda",
+        df=False,
+        matvec_backend="row_oracle_df",
+    )
+    assert float(cas.e_tot) < 0.0
+    assert isinstance(cas.eri, DirectRowOracleIntegrals)
+    assert cas.eri._maybe_build_eri_mat(1 << 20) is None
+
+
+@_skip_no_cuda
+def test_direct_exact_casci_contract_skips_eri_mat_materialization():
+    from asuka.frontend.scf import run_hf_df
+    from asuka.integrals.direct_integrals import DirectRowOracleIntegrals
+    from asuka.mcscf.casci import run_casci
+
+    scf_out = run_hf_df(_make_h2(), method="rhf", backend="cuda", two_e_backend="direct", eps_schwarz=0.0)
+    cas = run_casci(
+        scf_out,
+        ncore=0,
+        ncas=2,
+        nelecas=2,
+        backend="cuda",
+        df=False,
+        matvec_backend="contract",
+    )
+    assert float(cas.e_tot) < 0.0
+    assert isinstance(cas.eri, DirectRowOracleIntegrals)
+    assert cas.eri._maybe_build_eri_mat(1 << 20) is None
+
+
+@_skip_no_cuda
+def test_direct_exact_casci_cuda_direct_skips_eri_mat_materialization():
+    from asuka.frontend.scf import run_hf_df
+    from asuka.integrals.direct_integrals import DeviceDirectMOIntegrals
+    from asuka.mcscf.casci import run_casci
+
+    scf_out = run_hf_df(_make_h2(), method="rhf", backend="cuda", two_e_backend="direct", eps_schwarz=0.0)
+    cas = run_casci(
+        scf_out,
+        ncore=0,
+        ncas=2,
+        nelecas=2,
+        backend="cuda",
+        df=False,
+        matvec_backend="cuda_direct",
+    )
+    assert float(cas.e_tot) < 0.0
+    assert isinstance(cas.eri, DeviceDirectMOIntegrals)
+    assert cas.eri._maybe_build_eri_mat(1 << 20) is None
+
+
+@_skip_no_cuda
+def test_direct_exact_casci_row_oracle_matches_dense_path():
     from asuka.frontend.scf import run_hf_df
     from asuka.mcscf.casci import run_casci
 
     scf_out = run_hf_df(_make_h2(), method="rhf", backend="cuda", two_e_backend="direct", eps_schwarz=0.0)
+    cas_dense = run_casci(
+        scf_out,
+        ncore=0,
+        ncas=2,
+        nelecas=2,
+        backend="cuda",
+        df=False,
+        matvec_backend="cuda_eri_mat",
+    )
+    cas_row = run_casci(
+        scf_out,
+        ncore=0,
+        ncas=2,
+        nelecas=2,
+        backend="cuda",
+        df=False,
+        matvec_backend="row_oracle_df",
+    )
+    np.testing.assert_allclose(float(cas_row.e_tot), float(cas_dense.e_tot), atol=1e-8, rtol=1e-8)
+
+
+@_skip_no_cuda
+def test_direct_exact_casci_contract_matches_dense_path():
+    from asuka.frontend.scf import run_hf_df
+    from asuka.mcscf.casci import run_casci
+
+    scf_out = run_hf_df(_make_h2(), method="rhf", backend="cuda", two_e_backend="direct", eps_schwarz=0.0)
+    cas_dense = run_casci(
+        scf_out,
+        ncore=0,
+        ncas=2,
+        nelecas=2,
+        backend="cuda",
+        df=False,
+        matvec_backend="cuda_eri_mat",
+    )
+    cas_contract = run_casci(
+        scf_out,
+        ncore=0,
+        ncas=2,
+        nelecas=2,
+        backend="cuda",
+        df=False,
+        matvec_backend="contract",
+    )
+    np.testing.assert_allclose(float(cas_contract.e_tot), float(cas_dense.e_tot), atol=1e-8, rtol=1e-8)
+
+
+@_skip_no_cuda
+def test_direct_exact_casci_cuda_direct_matches_dense_path():
+    from asuka.frontend.scf import run_hf_df
+    from asuka.mcscf.casci import run_casci
+
+    scf_out = run_hf_df(_make_h2(), method="rhf", backend="cuda", two_e_backend="direct", eps_schwarz=0.0)
+    cas_dense = run_casci(
+        scf_out,
+        ncore=0,
+        ncas=2,
+        nelecas=2,
+        backend="cuda",
+        df=False,
+        matvec_backend="cuda_eri_mat",
+    )
+    cas_cuda_direct = run_casci(
+        scf_out,
+        ncore=0,
+        ncas=2,
+        nelecas=2,
+        backend="cuda",
+        df=False,
+        matvec_backend="cuda_direct",
+    )
+    np.testing.assert_allclose(float(cas_cuda_direct.e_tot), float(cas_dense.e_tot), atol=1e-8, rtol=1e-8)
+
+
+@_skip_no_cuda
+def test_direct_exact_casci_cuda_direct_never_uses_row_oracle_reference_backend(monkeypatch):
+    from asuka.frontend.scf import run_hf_df
+    from asuka.integrals.direct_integrals import DirectRowOracleIntegrals
+    from asuka.mcscf.casci import run_casci
+
+    def _fail_row_oracle(*args, **kwargs):
+        raise AssertionError("cuda_direct CASCI fell back to row-oracle contract_cols")
+
+    monkeypatch.setattr(DirectRowOracleIntegrals, "contract_cols", _fail_row_oracle)
+    scf_out = run_hf_df(_make_h2(), method="rhf", backend="cuda", two_e_backend="direct", eps_schwarz=0.0)
+    cas = run_casci(
+        scf_out,
+        ncore=0,
+        ncas=2,
+        nelecas=2,
+        backend="cuda",
+        df=False,
+        matvec_backend="cuda_direct",
+    )
+    assert float(cas.e_tot) < 0.0
+
+
+@_skip_no_cuda
+def test_direct_exact_casci_cuda_direct_uses_fused_direct_apply_path(monkeypatch):
+    from asuka.frontend.scf import run_hf_df
+    from asuka.integrals.direct_integrals import DeviceDirectMOIntegrals
+    from asuka.mcscf.casci import run_casci
+
+    calls = {"fused": 0}
+    orig_fused = DeviceDirectMOIntegrals.contract_apply_w_block_device
+
+    def _wrapped_fused(self, *args, **kwargs):
+        calls["fused"] += 1
+        return orig_fused(self, *args, **kwargs)
+
+    def _fail_split(*args, **kwargs):
+        raise AssertionError("cuda_direct CASCI fell back to split contract_w_block_device path")
+
+    monkeypatch.setattr(DeviceDirectMOIntegrals, "contract_apply_w_block_device", _wrapped_fused)
+    monkeypatch.setattr(DeviceDirectMOIntegrals, "contract_w_block_device", _fail_split)
+    scf_out = run_hf_df(_make_h2(), method="rhf", backend="cuda", two_e_backend="direct", eps_schwarz=0.0)
+    cas = run_casci(
+        scf_out,
+        ncore=0,
+        ncas=2,
+        nelecas=2,
+        backend="cuda",
+        df=False,
+        matvec_backend="cuda_direct",
+    )
+    assert float(cas.e_tot) < 0.0
+    assert calls["fused"] > 0
+
+
+@_skip_no_cuda
+def test_direct_exact_casci_cuda_direct_ignores_pspace_row_oracle_startup(monkeypatch):
+    from asuka.frontend.scf import run_hf_df
+    from asuka.mcscf.casci import run_casci
+    import asuka.integrals.oracle_df as oracle_df_mod
+
+    def _fail_connected_row_df(*args, **kwargs):
+        raise AssertionError("cuda_direct CASCI fell back to row-oracle pspace startup")
+
+    monkeypatch.setattr(oracle_df_mod, "connected_row_df", _fail_connected_row_df)
+    scf_out = run_hf_df(_make_h2(), method="rhf", backend="cuda", two_e_backend="direct", eps_schwarz=0.0)
+    cas = run_casci(
+        scf_out,
+        ncore=0,
+        ncas=2,
+        nelecas=2,
+        backend="cuda",
+        df=False,
+        matvec_backend="cuda_direct",
+        pspace_size=8,
+    )
+    assert float(cas.e_tot) < 0.0
+
+
+@_skip_no_cuda
+def test_direct_exact_casci_cuda_direct_make_hdiag_returns_cupy():
+    import cupy as cp
+
+    from asuka.frontend.scf import run_hf_df
+    from asuka.mcscf.casci import run_casci
+    from asuka.solver import GUGAFCISolver
+
+    solver = GUGAFCISolver(twos=0, nroots=1)
+    scf_out = run_hf_df(_make_h2(), method="rhf", backend="cuda", two_e_backend="direct", eps_schwarz=0.0)
+    cas = run_casci(
+        scf_out,
+        ncore=0,
+        ncas=2,
+        nelecas=2,
+        backend="cuda",
+        df=False,
+        matvec_backend="cuda_direct",
+        fcisolver=solver,
+    )
+    hdiag = solver.make_hdiag(cas.h1eff, cas.eri, 2, 2, return_cupy=True)
+    assert isinstance(hdiag, cp.ndarray)
+    assert hdiag.ndim == 1
+    assert int(hdiag.size) > 0
+    assert bool(cp.isfinite(hdiag).all())
+
+
+@_skip_no_cuda
+def test_direct_df_casscf_defaults_to_cuda_l_full_path():
+    cp = pytest.importorskip("cupy")
+    from asuka.frontend.scf import run_hf_df
+    from asuka.integrals.df_integrals import DeviceDFMOIntegrals
+    from asuka.mcscf import run_casscf
+
+    scf_out = run_hf_df(_make_h2(), method="rhf", backend="cuda", two_e_backend="direct_df", eps_schwarz=0.0)
+    mc = run_casscf(
+        scf_out,
+        ncore=0,
+        ncas=2,
+        nelecas=2,
+        backend="cuda",
+        df=False,
+        orbital_optimizer="jacobi",
+        max_cycle_macro=1,
+        tol=1e-9,
+        conv_tol_grad=1e-5,
+    )
+    assert str(mc.run_config.matvec_backend) == "cuda"
+    assert isinstance(mc.casci.eri, DeviceDFMOIntegrals)
+    assert mc.casci.eri.eri_mat is None
+    assert isinstance(mc.casci.ci, cp.ndarray)
+
+
+@_skip_no_cuda
+def test_direct_exact_casscf_row_oracle_skips_eri_mat_materialization():
+    from asuka.frontend.scf import run_hf_df
+    from asuka.integrals.direct_integrals import DirectRowOracleIntegrals
+    from asuka.mcscf import run_casscf
+
+    scf_out = run_hf_df(_make_h2(), method="rhf", backend="cuda", two_e_backend="direct", eps_schwarz=0.0)
+    mc = run_casscf(
+        scf_out,
+        ncore=0,
+        ncas=2,
+        nelecas=2,
+        backend="cuda",
+        df=False,
+        orbital_optimizer="jacobi",
+        max_cycle_macro=1,
+        tol=1e-9,
+        conv_tol_grad=1e-5,
+        matvec_backend="row_oracle_df",
+    )
+    assert isinstance(mc.casci.eri, DirectRowOracleIntegrals)
+    assert np.isfinite(float(mc.e_tot))
+
+
+@_skip_no_cuda
+def test_direct_exact_casscf_cuda_direct_is_default_non_materializing():
+    cp = pytest.importorskip("cupy")
+    from asuka.frontend.scf import run_hf_df
+    from asuka.integrals.direct_integrals import DeviceDirectMOIntegrals
+    from asuka.mcscf import run_casscf
+
+    scf_out = run_hf_df(_make_h2(), method="rhf", backend="cuda", two_e_backend="direct", eps_schwarz=0.0)
+    mc = run_casscf(
+        scf_out,
+        ncore=0,
+        ncas=2,
+        nelecas=2,
+        backend="cuda",
+        df=False,
+        orbital_optimizer="jacobi",
+        max_cycle_macro=1,
+        tol=1e-9,
+        conv_tol_grad=1e-5,
+    )
+    assert str(mc.run_config.matvec_backend).strip().lower() == "cuda_direct"
+    assert isinstance(mc.casci.eri, DeviceDirectMOIntegrals)
+    assert mc.casci.eri._maybe_build_eri_mat(1 << 20) is None
+    assert isinstance(mc.casci.ci, cp.ndarray)
+    assert np.isfinite(float(mc.e_tot))
+
+
+@_skip_no_cuda
+def test_direct_exact_casci_cuda_direct_can_return_cupy_ci():
+    cp = pytest.importorskip("cupy")
+
+    from asuka.frontend.scf import run_hf_df
+    from asuka.mcscf.casci import run_casci
+    from asuka.solver import GUGAFCISolver
+
+    scf_out = run_hf_df(_make_h2(), method="rhf", backend="cuda", two_e_backend="direct", eps_schwarz=0.0)
+    solver = GUGAFCISolver(twos=0, nroots=1)
+    cas = run_casci(
+        scf_out,
+        ncore=0,
+        ncas=2,
+        nelecas=2,
+        backend="cuda",
+        df=False,
+        matvec_backend="cuda_direct",
+        fcisolver=solver,
+        return_cupy=True,
+    )
+    assert isinstance(cas.ci, cp.ndarray)
+    assert bool(cp.isfinite(cas.ci).all())
+
+
+@_skip_no_cuda
+def test_direct_exact_contract_2e_row_oracle_matches_dense_path():
+    from asuka.frontend.scf import run_hf_df
+    from asuka.mcscf.casci import run_casci
+    from asuka.solver import GUGAFCISolver, H1E2EContractOp
+
+    scf_out = run_hf_df(_make_h2(), method="rhf", backend="cuda", two_e_backend="direct", eps_schwarz=0.0)
+    solver_dense = GUGAFCISolver(twos=0, nroots=1)
+    solver_row = GUGAFCISolver(twos=0, nroots=1)
+    cas_dense = run_casci(
+        scf_out,
+        ncore=0,
+        ncas=2,
+        nelecas=2,
+        backend="cuda",
+        df=False,
+        matvec_backend="cuda_eri_mat",
+        fcisolver=solver_dense,
+    )
+    cas_row = run_casci(
+        scf_out,
+        ncore=0,
+        ncas=2,
+        nelecas=2,
+        backend="cuda",
+        df=False,
+        matvec_backend="row_oracle_df",
+        fcisolver=solver_row,
+    )
+    ci0 = np.asarray(cas_dense.ci, dtype=np.float64).ravel()
+    op_dense = H1E2EContractOp(h1e=np.asarray(cas_dense.h1eff, dtype=np.float64), eri=cas_dense.eri, fac=0.5)
+    op_row = H1E2EContractOp(h1e=np.asarray(cas_row.h1eff, dtype=np.float64), eri=cas_row.eri, fac=0.5)
+    hc_dense = np.asarray(solver_dense.contract_2e(op_dense, ci0, 2, 2, contract_2e_backend="cuda_eri_mat"), dtype=np.float64)
+    hc_row = np.asarray(solver_row.contract_2e(op_row, ci0, 2, 2, contract_2e_backend="row_oracle_df"), dtype=np.float64)
+    np.testing.assert_allclose(hc_row, hc_dense, atol=1e-8, rtol=1e-8)
+
+
+@_skip_no_cuda
+def test_direct_exact_contract_2e_contract_matches_dense_path():
+    from asuka.frontend.scf import run_hf_df
+    from asuka.mcscf.casci import run_casci
+    from asuka.solver import GUGAFCISolver, H1E2EContractOp
+
+    scf_out = run_hf_df(_make_h2(), method="rhf", backend="cuda", two_e_backend="direct", eps_schwarz=0.0)
+    solver_dense = GUGAFCISolver(twos=0, nroots=1)
+    solver_contract = GUGAFCISolver(twos=0, nroots=1)
+    cas_dense = run_casci(
+        scf_out,
+        ncore=0,
+        ncas=2,
+        nelecas=2,
+        backend="cuda",
+        df=False,
+        matvec_backend="cuda_eri_mat",
+        fcisolver=solver_dense,
+    )
+    cas_contract = run_casci(
+        scf_out,
+        ncore=0,
+        ncas=2,
+        nelecas=2,
+        backend="cuda",
+        df=False,
+        matvec_backend="contract",
+        fcisolver=solver_contract,
+    )
+    ci0 = np.asarray(cas_dense.ci, dtype=np.float64).ravel()
+    op_dense = H1E2EContractOp(h1e=np.asarray(cas_dense.h1eff, dtype=np.float64), eri=cas_dense.eri, fac=0.5)
+    op_contract = H1E2EContractOp(h1e=np.asarray(cas_contract.h1eff, dtype=np.float64), eri=cas_contract.eri, fac=0.5)
+    hc_dense = np.asarray(solver_dense.contract_2e(op_dense, ci0, 2, 2, contract_2e_backend="cuda_eri_mat"), dtype=np.float64)
+    hc_contract = np.asarray(solver_contract.contract_2e(op_contract, ci0, 2, 2, contract_2e_backend="contract"), dtype=np.float64)
+    np.testing.assert_allclose(hc_contract, hc_dense, atol=1e-8, rtol=1e-8)
+
+
+@_skip_no_cuda
+def test_direct_exact_contract_2e_cuda_direct_matches_dense_path():
+    from asuka.frontend.scf import run_hf_df
+    from asuka.mcscf.casci import run_casci
+    from asuka.solver import GUGAFCISolver, H1E2EContractOp
+
+    scf_out = run_hf_df(_make_h2(), method="rhf", backend="cuda", two_e_backend="direct", eps_schwarz=0.0)
+    solver_dense = GUGAFCISolver(twos=0, nroots=1)
+    solver_direct = GUGAFCISolver(twos=0, nroots=1)
+    cas_dense = run_casci(
+        scf_out,
+        ncore=0,
+        ncas=2,
+        nelecas=2,
+        backend="cuda",
+        df=False,
+        matvec_backend="cuda_eri_mat",
+        fcisolver=solver_dense,
+    )
+    cas_direct = run_casci(
+        scf_out,
+        ncore=0,
+        ncas=2,
+        nelecas=2,
+        backend="cuda",
+        df=False,
+        matvec_backend="cuda_direct",
+        fcisolver=solver_direct,
+    )
+    ci0 = np.asarray(cas_dense.ci, dtype=np.float64).ravel()
+    op_dense = H1E2EContractOp(h1e=np.asarray(cas_dense.h1eff, dtype=np.float64), eri=cas_dense.eri, fac=0.5)
+    op_direct = H1E2EContractOp(h1e=np.asarray(cas_direct.h1eff, dtype=np.float64), eri=cas_direct.eri, fac=0.5)
+    hc_dense = np.asarray(solver_dense.contract_2e(op_dense, ci0, 2, 2, contract_2e_backend="cuda_eri_mat"), dtype=np.float64)
+    hc_direct = np.asarray(
+        solver_direct.contract_2e(op_direct, ci0, 2, 2, contract_2e_backend="cuda_direct"),
+        dtype=np.float64,
+    )
+    np.testing.assert_allclose(hc_direct, hc_dense, atol=1e-8, rtol=1e-8)
+
+
+@_skip_no_cuda
+def test_direct_exact_contract_2e_cuda_direct_never_uses_row_oracle_reference_backend(monkeypatch):
+    from asuka.frontend.scf import run_hf_df
+    from asuka.integrals.direct_integrals import DirectRowOracleIntegrals
+    from asuka.mcscf.casci import run_casci
+    from asuka.solver import GUGAFCISolver, H1E2EContractOp
+
+    def _fail_row_oracle(*args, **kwargs):
+        raise AssertionError("cuda_direct contract_2e fell back to row-oracle contract_cols")
+
+    monkeypatch.setattr(DirectRowOracleIntegrals, "contract_cols", _fail_row_oracle)
+    scf_out = run_hf_df(_make_h2(), method="rhf", backend="cuda", two_e_backend="direct", eps_schwarz=0.0)
+    solver_direct = GUGAFCISolver(twos=0, nroots=1)
+    cas_direct = run_casci(
+        scf_out,
+        ncore=0,
+        ncas=2,
+        nelecas=2,
+        backend="cuda",
+        df=False,
+        matvec_backend="cuda_direct",
+        fcisolver=solver_direct,
+    )
+    ci0 = np.asarray(cas_direct.ci, dtype=np.float64).ravel()
+    op_direct = H1E2EContractOp(h1e=np.asarray(cas_direct.h1eff, dtype=np.float64), eri=cas_direct.eri, fac=0.5)
+    hc_direct = np.asarray(solver_direct.contract_2e(op_direct, ci0, 2, 2, contract_2e_backend="cuda_direct"))
+    assert hc_direct.shape == ci0.shape
+
+
+@_skip_no_cuda
+@pytest.mark.parametrize("two_e_backend", ["direct", "direct_df"])
+def test_direct_scf_to_casci_cpu_rejected(two_e_backend: str):
+    from asuka.frontend.scf import run_hf_df
+    from asuka.mcscf.casci import run_casci
+
+    scf_out = run_hf_df(_make_h2(), method="rhf", backend="cuda", two_e_backend=str(two_e_backend), eps_schwarz=0.0)
     with pytest.raises(NotImplementedError):
         run_casci(scf_out, ncore=0, ncas=2, nelecas=2, backend="cpu", df=False)
 
 
 @_skip_no_cuda
 @pytest.mark.parametrize("optimizer", ["jacobi", "lbfgs", "ah", "1step"])
-def test_direct_scf_to_casscf_smoke(optimizer: str):
+@pytest.mark.parametrize("two_e_backend", ["direct", "direct_df"])
+def test_direct_scf_to_casscf_smoke(optimizer: str, two_e_backend: str):
     from asuka.frontend.scf import run_hf_df
     from asuka.mcscf import run_casscf
 
-    scf_out = run_hf_df(_make_h2(), method="rhf", backend="cuda", two_e_backend="direct", eps_schwarz=0.0)
+    scf_out = run_hf_df(_make_h2(), method="rhf", backend="cuda", two_e_backend=str(two_e_backend), eps_schwarz=0.0)
     mc = run_casscf(
         scf_out,
         ncore=0,
@@ -517,6 +1183,10 @@ def test_direct_scf_to_casscf_smoke(optimizer: str):
         matvec_backend="cuda_eri_mat",
     )
     assert float(mc.e_tot) < 0.0
+    assert np.isfinite(float(mc.e_tot))
+    assert np.isfinite(np.asarray(mc.e_roots, dtype=np.float64)).all()
+    assert np.isfinite(float(mc.grad_norm))
+    assert int(mc.niter) >= 1
 
 
 def test_build_provider_newton_eris_projects_jpc_kpc_in_mo_basis():
@@ -563,6 +1233,114 @@ def test_build_provider_newton_eris_projects_jpc_kpc_in_mo_basis():
 
     assert np.allclose(eris.j_pc[:, 0], j_expected, atol=1e-12, rtol=1e-12)
     assert np.allclose(eris.k_pc[:, 0], k_expected, atol=1e-12, rtol=1e-12)
+
+
+def test_build_provider_newton_eris_can_skip_ppaa_papa_materialization():
+    from asuka.mcscf.newton_df import build_provider_newton_eris
+
+    class _FakeProvider:
+        def probe_array(self):
+            return np.zeros((2, 2), dtype=np.float64)
+
+        def build_pq_uv(self, C_mo, C_act):
+            nmo = int(C_mo.shape[1])
+            ncas = int(C_act.shape[1])
+            return np.zeros((nmo * nmo, ncas * ncas), dtype=np.float64)
+
+        def build_pu_qv(self, C_mo, C_act):
+            nmo = int(C_mo.shape[1])
+            ncas = int(C_act.shape[1])
+            return np.zeros((nmo * ncas, nmo * ncas), dtype=np.float64)
+
+        def jk(self, D, *, want_J=True, want_K=True):
+            _ = D
+            J = np.eye(2, dtype=np.float64)
+            K = np.eye(2, dtype=np.float64) * 0.5
+            return (J if want_J else None), (K if want_K else None)
+
+        def jk_multi2(self, Da, Db, *, want_J=True, want_K=True):
+            _ = Da, Db
+            J = np.eye(2, dtype=np.float64)
+            K = np.eye(2, dtype=np.float64) * 0.5
+            return (J if want_J else None), (K if want_K else None), (J if want_J else None), (K if want_K else None)
+
+    mo = np.eye(2, dtype=np.float64)
+    eris = build_provider_newton_eris(
+        _FakeProvider(),
+        mo,
+        ncore=1,
+        ncas=1,
+        materialize_ppaa_papa=False,
+    )
+    assert eris.ppaa is None
+    assert eris.papa is None
+    assert eris.eri_provider is not None
+    assert eris.mo_coeff is not None
+    assert eris.C_act is not None
+
+
+@_skip_no_cuda
+def test_direct_df_casscf_uses_lazy_provider_newton_eris(monkeypatch):
+    from asuka.frontend.scf import run_hf_df
+    from asuka.mcscf import run_casscf
+    import asuka.mcscf.newton_df as newton_df_mod
+
+    calls: list[bool] = []
+    orig = newton_df_mod.build_provider_newton_eris
+
+    def _wrapped(provider, mo_coeff, *args, **kwargs):
+        calls.append(bool(kwargs.get("materialize_ppaa_papa", True)))
+        return orig(provider, mo_coeff, *args, **kwargs)
+
+    monkeypatch.setattr(newton_df_mod, "build_provider_newton_eris", _wrapped)
+    scf_out = run_hf_df(_make_h2(), method="rhf", backend="cuda", two_e_backend="direct_df", eps_schwarz=0.0)
+    mc = run_casscf(
+        scf_out,
+        ncore=0,
+        ncas=2,
+        nelecas=2,
+        backend="cuda",
+        df=False,
+        orbital_optimizer="1step",
+        max_cycle_macro=1,
+        tol=1e-9,
+        conv_tol_grad=1e-5,
+    )
+    assert np.isfinite(float(mc.e_tot))
+    assert calls
+    assert all(flag is False for flag in calls)
+
+
+@_skip_no_cuda
+def test_direct_exact_casscf_uses_lazy_provider_newton_eris(monkeypatch):
+    from asuka.frontend.scf import run_hf_df
+    from asuka.mcscf import run_casscf
+    import asuka.mcscf.newton_df as newton_df_mod
+
+    calls: list[bool] = []
+    orig = newton_df_mod.build_provider_newton_eris
+
+    def _wrapped(provider, mo_coeff, *args, **kwargs):
+        calls.append(bool(kwargs.get("materialize_ppaa_papa", True)))
+        return orig(provider, mo_coeff, *args, **kwargs)
+
+    monkeypatch.setattr(newton_df_mod, "build_provider_newton_eris", _wrapped)
+    scf_out = run_hf_df(_make_h2(), method="rhf", backend="cuda", two_e_backend="direct", eps_schwarz=0.0)
+    mc = run_casscf(
+        scf_out,
+        ncore=0,
+        ncas=2,
+        nelecas=2,
+        backend="cuda",
+        df=False,
+        orbital_optimizer="1step",
+        max_cycle_macro=1,
+        tol=1e-9,
+        conv_tol_grad=1e-5,
+    )
+    assert np.isfinite(float(mc.e_tot))
+    assert calls
+    assert all(flag is False for flag in calls)
 
 
 @_skip_no_cuda

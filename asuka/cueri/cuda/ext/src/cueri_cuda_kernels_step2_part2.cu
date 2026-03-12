@@ -1,4 +1,4 @@
-// Auto-split from cueri_cuda_kernels_step2.cu (part 2/4: KernelERI_ppss_subwarp8..KernelFused_psss_warp)
+// Auto-split from cueri_cuda_kernels_step2.cu (part 2/4: KernelERI_ppss_subwarp8..KernelFused_dsss_warp)
 // Do not edit — regenerate with split_large_kernels.py
 
 #include <cuda_runtime.h>
@@ -24,6 +24,13 @@ __device__ __forceinline__ double warp_reduce_sum(double x) {
   return x;
 }
 
+__device__ __forceinline__ double subwarp8_reduce_sum(double x) {
+  x += __shfl_down_sync(0xffffffff, x, 4, 8);
+  x += __shfl_down_sync(0xffffffff, x, 2, 8);
+  x += __shfl_down_sync(0xffffffff, x, 1, 8);
+  return x;
+}
+
 __device__ __forceinline__ double block_reduce_sum(double x) {
   __shared__ double shared[32];  // up to 1024 threads
   const int lane = threadIdx.x & 31;
@@ -36,6 +43,83 @@ __device__ __forceinline__ double block_reduce_sum(double x) {
   x = (threadIdx.x < (blockDim.x >> 5)) ? shared[lane] : 0.0;
   if (wid == 0) x = warp_reduce_sum(x);
   return x;
+}
+
+__device__ __forceinline__ void accumulate_jk_single_value(
+    double val,
+    const double* D_mat,
+    double* J_mat,
+    double* K_mat,
+    int a,
+    int b,
+    int c,
+    int d,
+    bool ab_neq,
+    bool cd_neq,
+    bool bk_swap,
+    double f_ab,
+    double f_cd,
+    int64_t N) {
+  if (val == 0.0) return;
+  if (J_mat != nullptr) {
+    const double Dcd = D_mat[c * N + d];
+    atomicAdd(&J_mat[a * N + b], f_cd * val * Dcd);
+    if (ab_neq) atomicAdd(&J_mat[b * N + a], f_cd * val * Dcd);
+    if (bk_swap) {
+      const double Dab = D_mat[a * N + b];
+      atomicAdd(&J_mat[c * N + d], f_ab * val * Dab);
+      if (cd_neq) atomicAdd(&J_mat[d * N + c], f_ab * val * Dab);
+    }
+  }
+  if (K_mat != nullptr) {
+    atomicAdd(&K_mat[a * N + c], val * D_mat[b * N + d]);
+    if (cd_neq) atomicAdd(&K_mat[a * N + d], val * D_mat[b * N + c]);
+    if (ab_neq) atomicAdd(&K_mat[b * N + c], val * D_mat[a * N + d]);
+    if (ab_neq && cd_neq) atomicAdd(&K_mat[b * N + d], val * D_mat[a * N + c]);
+    if (bk_swap) {
+      atomicAdd(&K_mat[c * N + a], val * D_mat[d * N + b]);
+      if (cd_neq) atomicAdd(&K_mat[d * N + a], val * D_mat[c * N + b]);
+      if (ab_neq) atomicAdd(&K_mat[c * N + b], val * D_mat[d * N + a]);
+      if (ab_neq && cd_neq) atomicAdd(&K_mat[d * N + b], val * D_mat[c * N + a]);
+    }
+  }
+}
+
+__device__ __forceinline__ void accumulate_fock_single_value(
+    double val,
+    const double* D_mat,
+    double* F_mat,
+    int a,
+    int b,
+    int c,
+    int d,
+    bool ab_neq,
+    bool cd_neq,
+    bool bk_swap,
+    double f_ab,
+    double f_cd,
+    int64_t N) {
+  if (val == 0.0 || F_mat == nullptr) return;
+  const double Dcd = D_mat[c * N + d];
+  atomicAdd(&F_mat[a * N + b], f_cd * val * Dcd);
+  if (ab_neq) atomicAdd(&F_mat[b * N + a], f_cd * val * Dcd);
+  if (bk_swap) {
+    const double Dab = D_mat[a * N + b];
+    atomicAdd(&F_mat[c * N + d], f_ab * val * Dab);
+    if (cd_neq) atomicAdd(&F_mat[d * N + c], f_ab * val * Dab);
+  }
+
+  constexpr double alpha = -0.5;
+  atomicAdd(&F_mat[a * N + c], alpha * val * D_mat[b * N + d]);
+  if (cd_neq) atomicAdd(&F_mat[a * N + d], alpha * val * D_mat[b * N + c]);
+  if (ab_neq) atomicAdd(&F_mat[b * N + c], alpha * val * D_mat[a * N + d]);
+  if (ab_neq && cd_neq) atomicAdd(&F_mat[b * N + d], alpha * val * D_mat[a * N + c]);
+  if (bk_swap) {
+    atomicAdd(&F_mat[c * N + a], alpha * val * D_mat[d * N + b]);
+    if (cd_neq) atomicAdd(&F_mat[d * N + a], alpha * val * D_mat[c * N + b]);
+    if (ab_neq) atomicAdd(&F_mat[c * N + b], alpha * val * D_mat[d * N + a]);
+    if (ab_neq && cd_neq) atomicAdd(&F_mat[d * N + b], alpha * val * D_mat[c * N + a]);
+  }
 }
 
 __device__ __forceinline__ void boys_f0_f1_f2(double T, double& F0, double& F1, double& F2) {
@@ -1598,7 +1682,7 @@ __global__ void KernelERI_pppp_multiblock_reduce(const double* partial_sums, int
 // ---------------------------------------------------------------------------
 
 template <bool kToFock>
-__global__ void KernelFused_psss_warp(
+__global__ void KernelFused_psss_subwarp8(
     const int32_t* task_spAB,
     const int32_t* task_spCD,
     int ntasks,
@@ -1620,20 +1704,14 @@ __global__ void KernelFused_psss_warp(
     double* out0_mat,
     double* out1_mat,
     int n_bufs) {
-  constexpr int nA = 3, nB = 1, nC = 1, nD = 1;
-  constexpr int nAB = nA * nB;
-  constexpr int nCD = nC * nD;
-  constexpr int kNComp = nAB * nCD;  // 3
-
-  extern __shared__ double sh_tile[];
   const int lane = static_cast<int>(threadIdx.x) & 31;
   const int warp_id = static_cast<int>(threadIdx.x) >> 5;
   const int warps_per_block = static_cast<int>(blockDim.x) >> 5;
-  const int t = static_cast<int>(blockIdx.x) * warps_per_block + warp_id;
+  const int warp_global = static_cast<int>(blockIdx.x) * warps_per_block + warp_id;
+  const int subwarp = lane >> 3;
+  const int lane8 = lane & 7;
+  const int t = warp_global * 4 + subwarp;
   if (t >= ntasks) return;
-  const int buf_id = static_cast<int>(blockIdx.x) % n_bufs;
-
-  double* tile = sh_tile + static_cast<int64_t>(warp_id) * static_cast<int64_t>(kNComp);
 
   const int spAB = static_cast<int>(task_spAB[t]);
   const int spCD = static_cast<int>(task_spCD[t]);
@@ -1645,14 +1723,16 @@ __global__ void KernelFused_psss_warp(
 
   const int baseAB = static_cast<int>(sp_pair_start[spAB]);
   const int baseCD = static_cast<int>(sp_pair_start[spCD]);
-  const int nPairAB = static_cast<int>(sp_npair[spAB]);
-  const int nPairCD = static_cast<int>(sp_npair[spCD]);
-  const int64_t nTot = static_cast<int64_t>(nPairAB) * static_cast<int64_t>(nPairCD);
+  const int nAB = static_cast<int>(sp_npair[spAB]);
+  const int nCD = static_cast<int>(sp_npair[spCD]);
+  const int64_t nTot = static_cast<int64_t>(nAB) * static_cast<int64_t>(nCD);
 
-  double sx = 0.0, sy = 0.0, sz = 0.0;
-  for (int64_t u = static_cast<int64_t>(lane); u < nTot; u += 32) {
-    const int i = static_cast<int>(u / nPairCD);
-    const int j = static_cast<int>(u - static_cast<int64_t>(i) * nPairCD);
+  double sx = 0.0;
+  double sy = 0.0;
+  double sz = 0.0;
+  for (int64_t u = static_cast<int64_t>(lane8); u < nTot; u += 8) {
+    const int i = static_cast<int>(u / nCD);
+    const int j = static_cast<int>(u - static_cast<int64_t>(i) * nCD);
     const int ki = baseAB + i;
     const int kj = baseCD + j;
 
@@ -1680,20 +1760,179 @@ __global__ void KernelFused_psss_warp(
     double F0, F1;
     boys_f0_f1(T, F0, F1);
 
-    const double q_over = q / denom;  // omega/p
+    const double q_over = q / denom;
     sx += base * (-(Ax - Px) * F0 - q_over * dx * F1);
     sy += base * (-(Ay - Py) * F0 - q_over * dy * F1);
     sz += base * (-(Az - Pz) * F0 - q_over * dz * F1);
   }
 
-  sx = warp_reduce_sum(sx);
-  sy = warp_reduce_sum(sy);
-  sz = warp_reduce_sum(sz);
+  sx = subwarp8_reduce_sum(sx);
+  sy = subwarp8_reduce_sum(sy);
+  sz = subwarp8_reduce_sum(sz);
+  if (lane8 != 0) return;
+
+  const int A_sh = static_cast<int>(sp_A[spAB]);
+  const int B_sh = static_cast<int>(sp_B[spAB]);
+  const int C_sh = static_cast<int>(sp_A[spCD]);
+  const int D_sh = static_cast<int>(sp_B[spCD]);
+  const int a0 = static_cast<int>(shell_ao_start[A_sh]);
+  const int b0 = static_cast<int>(shell_ao_start[B_sh]);
+  const int c0 = static_cast<int>(shell_ao_start[C_sh]);
+  const int d0 = static_cast<int>(shell_ao_start[D_sh]);
+  const bool ab_neq = (A_sh != B_sh);
+  const bool cd_neq = (C_sh != D_sh);
+  const bool bk_swap = (spAB != spCD);
+  const double f_ab = ab_neq ? 2.0 : 1.0;
+  const double f_cd = cd_neq ? 2.0 : 1.0;
+  const int64_t N = static_cast<int64_t>(nao);
+  const int64_t buf_off = static_cast<int64_t>(t % n_bufs) * N * N;
+
+  if constexpr (kToFock) {
+    double* F_mat = out0_mat + buf_off;
+    accumulate_fock_single_value(sx, D_mat, F_mat, a0 + 0, b0, c0, d0, ab_neq, cd_neq, bk_swap, f_ab, f_cd, N);
+    accumulate_fock_single_value(sy, D_mat, F_mat, a0 + 1, b0, c0, d0, ab_neq, cd_neq, bk_swap, f_ab, f_cd, N);
+    accumulate_fock_single_value(sz, D_mat, F_mat, a0 + 2, b0, c0, d0, ab_neq, cd_neq, bk_swap, f_ab, f_cd, N);
+  } else {
+    double* J_mat = out0_mat + buf_off;
+    double* K_mat = out1_mat + buf_off;
+    accumulate_jk_single_value(sx, D_mat, J_mat, K_mat, a0 + 0, b0, c0, d0, ab_neq, cd_neq, bk_swap, f_ab, f_cd, N);
+    accumulate_jk_single_value(sy, D_mat, J_mat, K_mat, a0 + 1, b0, c0, d0, ab_neq, cd_neq, bk_swap, f_ab, f_cd, N);
+    accumulate_jk_single_value(sz, D_mat, J_mat, K_mat, a0 + 2, b0, c0, d0, ab_neq, cd_neq, bk_swap, f_ab, f_cd, N);
+  }
+}
+
+template <bool kToFock>
+__global__ void KernelFused_dsss_warp(
+    const int32_t* task_spAB,
+    const int32_t* task_spCD,
+    int ntasks,
+    const int32_t* sp_A,
+    const int32_t* sp_B,
+    const int32_t* sp_pair_start,
+    const int32_t* sp_npair,
+    const double* shell_cx,
+    const double* shell_cy,
+    const double* shell_cz,
+    const double* pair_eta,
+    const double* pair_Px,
+    const double* pair_Py,
+    const double* pair_Pz,
+    const double* pair_cK,
+    const int32_t* shell_ao_start,
+    int nao,
+    const double* D_mat,
+    double* out0_mat,
+    double* out1_mat,
+    int n_bufs) {
+  constexpr int nA = 6, nB = 1, nC = 1, nD = 1;
+  constexpr int nAB = nA * nB;
+  constexpr int nCD = nC * nD;
+  constexpr int kNComp = nAB * nCD;  // 6
+
+  extern __shared__ double sh_tile[];
+  const int lane = static_cast<int>(threadIdx.x) & 31;
+  const int warp_id = static_cast<int>(threadIdx.x) >> 5;
+  const int warps_per_block = static_cast<int>(blockDim.x) >> 5;
+  const int t = static_cast<int>(blockIdx.x) * warps_per_block + warp_id;
+  if (t >= ntasks) return;
+  const int buf_id = static_cast<int>(blockIdx.x) % n_bufs;
+
+  double* tile = sh_tile + static_cast<int64_t>(warp_id) * static_cast<int64_t>(kNComp);
+
+  const int spAB = static_cast<int>(task_spAB[t]);
+  const int spCD = static_cast<int>(task_spCD[t]);
+  const int A = static_cast<int>(sp_A[spAB]);
+
+  const double Ax = shell_cx[A];
+  const double Ay = shell_cy[A];
+  const double Az = shell_cz[A];
+
+  const int baseAB = static_cast<int>(sp_pair_start[spAB]);
+  const int baseCD = static_cast<int>(sp_pair_start[spCD]);
+  const int nPairAB = static_cast<int>(sp_npair[spAB]);
+  const int nPairCD = static_cast<int>(sp_npair[spCD]);
+  const int64_t nTot = static_cast<int64_t>(nPairAB) * static_cast<int64_t>(nPairCD);
+
+  // Match KernelERI_dsss_warp exactly: outputs are (xx,xy,xz,yy,yz,zz).
+  double s_xx = 0.0;
+  double s_xy = 0.0;
+  double s_xz = 0.0;
+  double s_yy = 0.0;
+  double s_yz = 0.0;
+  double s_zz = 0.0;
+  for (int64_t u = static_cast<int64_t>(lane); u < nTot; u += 32) {
+    const int i = static_cast<int>(u / nPairCD);
+    const int j = static_cast<int>(u - static_cast<int64_t>(i) * nPairCD);
+    const int ki = baseAB + i;
+    const int kj = baseCD + j;
+
+    const double p = pair_eta[ki];
+    const double q = pair_eta[kj];
+    const double Px = pair_Px[ki];
+    const double Py = pair_Py[ki];
+    const double Pz = pair_Pz[ki];
+    const double Qx = pair_Px[kj];
+    const double Qy = pair_Py[kj];
+    const double Qz = pair_Pz[kj];
+
+    const double dx = Px - Qx;
+    const double dy = Py - Qy;
+    const double dz = Pz - Qz;
+    const double PQ2 = dx * dx + dy * dy + dz * dz;
+
+    const double denom = p + q;
+    const double omega = p * q / denom;
+    const double T = omega * PQ2;
+
+    const double pref = kTwoPiToFiveHalves / (p * q * ::sqrt(denom));
+    const double base = pref * pair_cK[ki] * pair_cK[kj];
+
+    double F0, F1, F2;
+    boys_f0_f1_f2(T, F0, F1, F2);
+
+    const double I = base * F0;
+    const double omega_over_p = omega / p;
+    const double Jx = -omega_over_p * base * F1 * dx;
+    const double Jy = -omega_over_p * base * F1 * dy;
+    const double Jz = -omega_over_p * base * F1 * dz;
+
+    const double inv4p2 = 1.0 / (4.0 * p * p);
+    const double w2 = omega * omega;
+    const double t4 = 4.0 * w2 * F2;
+    const double t2 = 2.0 * omega * F1;
+    const double Kxx = (base * (t4 * dx * dx - t2) + 2.0 * p * I) * inv4p2;
+    const double Kyy = (base * (t4 * dy * dy - t2) + 2.0 * p * I) * inv4p2;
+    const double Kzz = (base * (t4 * dz * dz - t2) + 2.0 * p * I) * inv4p2;
+    const double Kxy = (base * (t4 * dx * dy)) * inv4p2;
+    const double Kxz = (base * (t4 * dx * dz)) * inv4p2;
+    const double Kyz = (base * (t4 * dy * dz)) * inv4p2;
+
+    const double PAx = Px - Ax;
+    const double PAy = Py - Ay;
+    const double PAz = Pz - Az;
+
+    s_xx += Kxx + 2.0 * PAx * Jx + (PAx * PAx) * I;
+    s_xy += Kxy + PAx * Jy + PAy * Jx + (PAx * PAy) * I;
+    s_xz += Kxz + PAx * Jz + PAz * Jx + (PAx * PAz) * I;
+    s_yy += Kyy + 2.0 * PAy * Jy + (PAy * PAy) * I;
+    s_yz += Kyz + PAy * Jz + PAz * Jy + (PAy * PAz) * I;
+    s_zz += Kzz + 2.0 * PAz * Jz + (PAz * PAz) * I;
+  }
+
+  s_xx = warp_reduce_sum(s_xx);
+  s_xy = warp_reduce_sum(s_xy);
+  s_xz = warp_reduce_sum(s_xz);
+  s_yy = warp_reduce_sum(s_yy);
+  s_yz = warp_reduce_sum(s_yz);
+  s_zz = warp_reduce_sum(s_zz);
 
   if (lane == 0) {
-    tile[0] = sx;
-    tile[1] = sy;
-    tile[2] = sz;
+    tile[0] = s_xx;
+    tile[1] = s_xy;
+    tile[2] = s_xz;
+    tile[3] = s_yy;
+    tile[4] = s_yz;
+    tile[5] = s_zz;
   }
   __syncwarp();
 
@@ -1725,6 +1964,7 @@ __global__ void KernelFused_psss_warp(
         a0, b0, c0, d0,
         ab_neq, cd_neq, bk_swap, f_ab, f_cd, N, n_bufs, buf_id);
   }
+  (void)sp_B;
 }
 
 inline int sanitize_component_warp_threads(int threads) {
@@ -1735,9 +1975,166 @@ inline int sanitize_component_warp_threads(int threads) {
   return t < 32 ? 32 : t;
 }
 
+inline int sanitize_halfwarp_launch_threads(int threads) {
+  int t = threads;
+  if (t <= 0) t = 128;
+  if (t > 256) t = 256;
+  t = (t / 32) * 32;
+  return t < 32 ? 32 : t;
+}
+
+inline int sanitize_subwarp8_launch_threads(int threads) {
+  int t = threads;
+  if (t <= 0) t = 128;
+  if (t > 256) t = 256;
+  t = (t / 32) * 32;
+  return t < 32 ? 32 : t;
+}
+
 }  // namespace
 
+extern "C" cudaError_t cueri_eri_ppss_warp_launch_stream(
+    const int32_t* task_spAB,
+    const int32_t* task_spCD,
+    int ntasks,
+    const int32_t* sp_A,
+    const int32_t* sp_B,
+    const int32_t* sp_pair_start,
+    const int32_t* sp_npair,
+    const double* shell_cx,
+    const double* shell_cy,
+    const double* shell_cz,
+    const double* pair_eta,
+    const double* pair_Px,
+    const double* pair_Py,
+    const double* pair_Pz,
+    const double* pair_cK,
+    double* eri_out,
+    cudaStream_t stream,
+    int threads) {
+  if (ntasks <= 0) return ntasks == 0 ? cudaSuccess : cudaErrorInvalidValue;
+  const int launch_threads = sanitize_subwarp8_launch_threads(threads);
+  const int warps_per_block = launch_threads >> 5;
+  const int tasks_per_block = warps_per_block << 2;
+  const int blocks = (ntasks + tasks_per_block - 1) / tasks_per_block;
+  KernelERI_ppss_subwarp8<<<static_cast<unsigned int>(blocks), launch_threads, 0, stream>>>(
+      task_spAB, task_spCD, ntasks, sp_A, sp_B, sp_pair_start, sp_npair,
+      shell_cx, shell_cy, shell_cz, pair_eta, pair_Px, pair_Py, pair_Pz, pair_cK, eri_out);
+  return cudaGetLastError();
+}
+
+extern "C" cudaError_t cueri_eri_dsss_warp_launch_stream(
+    const int32_t* task_spAB,
+    const int32_t* task_spCD,
+    int ntasks,
+    const int32_t* sp_A,
+    const int32_t* sp_B,
+    const int32_t* sp_pair_start,
+    const int32_t* sp_npair,
+    const double* shell_cx,
+    const double* shell_cy,
+    const double* shell_cz,
+    const double* pair_eta,
+    const double* pair_Px,
+    const double* pair_Py,
+    const double* pair_Pz,
+    const double* pair_cK,
+    double* eri_out,
+    cudaStream_t stream,
+    int threads) {
+  if (ntasks <= 0) return ntasks == 0 ? cudaSuccess : cudaErrorInvalidValue;
+  const int launch_threads = sanitize_subwarp8_launch_threads(threads);
+  const int warps_per_block = launch_threads >> 5;
+  const int tasks_per_block = warps_per_block << 2;
+  const int blocks = (ntasks + tasks_per_block - 1) / tasks_per_block;
+  KernelERI_dsss_subwarp8<<<static_cast<unsigned int>(blocks), launch_threads, 0, stream>>>(
+      task_spAB, task_spCD, ntasks, sp_A, sp_B, sp_pair_start, sp_npair,
+      shell_cx, shell_cy, shell_cz, pair_eta, pair_Px, pair_Py, pair_Pz, pair_cK, eri_out);
+  return cudaGetLastError();
+}
+
 extern "C" cudaError_t cueri_fused_fock_psss_launch_stream(
+    const int32_t* task_spAB,
+    const int32_t* task_spCD,
+    int ntasks,
+    const int32_t* sp_A,
+    const int32_t* sp_B,
+    const int32_t* sp_pair_start,
+    const int32_t* sp_npair,
+    const double* shell_cx,
+    const double* shell_cy,
+    const double* shell_cz,
+    const double* pair_eta,
+    const double* pair_Px,
+    const double* pair_Py,
+    const double* pair_Pz,
+    const double* pair_cK,
+    const int32_t* shell_ao_start,
+    int nao,
+    const double* D_mat,
+    double* F_mat,
+    cudaStream_t stream,
+    int threads,
+    int n_bufs) {
+  if (ntasks < 0 || nao <= 0) return cudaErrorInvalidValue;
+  if (ntasks == 0) return cudaSuccess;
+  if (threads < 32 || (threads & 31) != 0) return cudaErrorInvalidValue;
+  const int launch_threads = sanitize_subwarp8_launch_threads(threads);
+  const int warps_per_block = launch_threads >> 5;
+  if (warps_per_block <= 0) return cudaErrorInvalidValue;
+  const int tasks_per_block = warps_per_block << 2;
+  const int blocks = (ntasks + tasks_per_block - 1) / tasks_per_block;
+  KernelFused_psss_subwarp8<true><<<static_cast<unsigned int>(blocks), launch_threads, 0, stream>>>(
+      task_spAB, task_spCD, ntasks,
+      sp_A, sp_B, sp_pair_start, sp_npair,
+      shell_cx, shell_cy, shell_cz,
+      pair_eta, pair_Px, pair_Py, pair_Pz, pair_cK,
+      shell_ao_start, nao, D_mat, F_mat, nullptr, n_bufs);
+  return cudaGetLastError();
+}
+
+extern "C" cudaError_t cueri_fused_jk_psss_launch_stream(
+    const int32_t* task_spAB,
+    const int32_t* task_spCD,
+    int ntasks,
+    const int32_t* sp_A,
+    const int32_t* sp_B,
+    const int32_t* sp_pair_start,
+    const int32_t* sp_npair,
+    const double* shell_cx,
+    const double* shell_cy,
+    const double* shell_cz,
+    const double* pair_eta,
+    const double* pair_Px,
+    const double* pair_Py,
+    const double* pair_Pz,
+    const double* pair_cK,
+    const int32_t* shell_ao_start,
+    int nao,
+    const double* D_mat,
+    double* J_mat,
+    double* K_mat,
+    cudaStream_t stream,
+    int threads,
+    int n_bufs) {
+  if (ntasks < 0 || nao <= 0) return cudaErrorInvalidValue;
+  if (ntasks == 0) return cudaSuccess;
+  if (threads < 32 || (threads & 31) != 0) return cudaErrorInvalidValue;
+  const int launch_threads = sanitize_subwarp8_launch_threads(threads);
+  const int warps_per_block = launch_threads >> 5;
+  if (warps_per_block <= 0) return cudaErrorInvalidValue;
+  const int tasks_per_block = warps_per_block << 2;
+  const int blocks = (ntasks + tasks_per_block - 1) / tasks_per_block;
+  KernelFused_psss_subwarp8<false><<<static_cast<unsigned int>(blocks), launch_threads, 0, stream>>>(
+      task_spAB, task_spCD, ntasks,
+      sp_A, sp_B, sp_pair_start, sp_npair,
+      shell_cx, shell_cy, shell_cz,
+      pair_eta, pair_Px, pair_Py, pair_Pz, pair_cK,
+      shell_ao_start, nao, D_mat, J_mat, K_mat, n_bufs);
+  return cudaGetLastError();
+}
+
+extern "C" cudaError_t cueri_fused_fock_dsss_launch_stream(
     const int32_t* task_spAB,
     const int32_t* task_spCD,
     int ntasks,
@@ -1766,8 +2163,8 @@ extern "C" cudaError_t cueri_fused_fock_psss_launch_stream(
   const int warps_per_block = threads >> 5;
   if (warps_per_block <= 0) return cudaErrorInvalidValue;
   const int blocks = (ntasks + warps_per_block - 1) / warps_per_block;
-  const size_t shmem = static_cast<size_t>(warps_per_block) * 3u * sizeof(double);
-  KernelFused_psss_warp<true><<<static_cast<unsigned int>(blocks), threads, shmem, stream>>>(
+  const size_t shmem = static_cast<size_t>(warps_per_block) * 6u * sizeof(double);
+  KernelFused_dsss_warp<true><<<static_cast<unsigned int>(blocks), threads, shmem, stream>>>(
       task_spAB, task_spCD, ntasks,
       sp_A, sp_B, sp_pair_start, sp_npair,
       shell_cx, shell_cy, shell_cz,

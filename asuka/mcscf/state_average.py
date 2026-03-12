@@ -16,6 +16,11 @@ from typing import Any, Sequence
 
 import numpy as np
 
+try:
+    import cupy as cp  # type: ignore
+except Exception:
+    cp = None  # type: ignore
+
 
 def normalize_weights(weights: Sequence[float] | None, *, nroots: int) -> np.ndarray:
     """Return normalized non-negative weights of shape (nroots,).
@@ -51,7 +56,7 @@ def normalize_weights(weights: Sequence[float] | None, *, nroots: int) -> np.nda
     return np.asarray(w / s, dtype=np.float64)
 
 
-def ci_as_list(ci: Any, *, nroots: int) -> list[np.ndarray]:
+def ci_as_list(ci: Any, *, nroots: int) -> list[Any]:
     """Canonicalize a multiroot CI container to a list of 1D float64 arrays.
 
     Parameters
@@ -71,17 +76,28 @@ def ci_as_list(ci: Any, *, nroots: int) -> list[np.ndarray]:
     if nroots < 1:
         raise ValueError("nroots must be >= 1")
 
+    def _xp_for(obj: Any):
+        if cp is not None and isinstance(obj, cp.ndarray):  # type: ignore[attr-defined]
+            return cp
+        return np
+
     if nroots == 1:
-        return [np.asarray(ci, dtype=np.float64).ravel()]
+        xp = _xp_for(ci)
+        return [xp.asarray(ci, dtype=xp.float64).ravel()]
 
     if isinstance(ci, (list, tuple)):
         if len(ci) != nroots:
             raise ValueError("CI list length mismatch")
-        return [np.asarray(x, dtype=np.float64).ravel() for x in ci]
+        out: list[Any] = []
+        for x in ci:
+            xp = _xp_for(x)
+            out.append(xp.asarray(x, dtype=xp.float64).ravel())
+        return out
 
-    arr = np.asarray(ci, dtype=np.float64)
+    xp = _xp_for(ci)
+    arr = xp.asarray(ci, dtype=xp.float64)
     if arr.ndim == 2 and int(arr.shape[0]) == nroots:
-        return [np.asarray(arr[i], dtype=np.float64).ravel().copy() for i in range(nroots)]
+        return [xp.asarray(arr[i], dtype=xp.float64).ravel().copy() for i in range(nroots)]
 
     raise TypeError("Unsupported CI format for multiroot")
 
@@ -206,8 +222,19 @@ def make_state_averaged_rdms(
     if int(w.size) != int(len(ci_list)):
         raise ValueError("weights/ci_list length mismatch")
 
-    dm1 = np.zeros((ncas, ncas), dtype=np.float64)
-    dm2 = np.zeros((ncas, ncas, ncas, ncas), dtype=np.float64)
+    want_cupy = bool(solver_kwargs.get("return_cupy", False))
+
+    def _xp_for(obj: Any):
+        if cp is not None and isinstance(obj, cp.ndarray):  # type: ignore[attr-defined]
+            return cp
+        return np
+
+    xp = _xp_for(ci_list[0]) if len(ci_list) else np
+    if want_cupy and cp is not None:
+        xp = cp
+
+    dm1 = xp.zeros((ncas, ncas), dtype=xp.float64)
+    dm2 = xp.zeros((ncas, ncas, ncas, ncas), dtype=xp.float64)
     base_cls = getattr(fcisolver, "_base_class", None)
     if base_cls is not None and hasattr(base_cls, "make_rdm12"):
         # PySCF's state-average wrappers implement make_rdm12 with list semantics.
@@ -215,13 +242,13 @@ def make_state_averaged_rdms(
         make_rdm12 = getattr(base_cls, "make_rdm12")
         for wi, civec in zip(w.tolist(), ci_list):
             dm1_i, dm2_i = make_rdm12(fcisolver, civec, ncas, nelecas, **solver_kwargs)
-            dm1 += float(wi) * np.asarray(dm1_i, dtype=np.float64)
-            dm2 += float(wi) * np.asarray(dm2_i, dtype=np.float64)
+            dm1 += float(wi) * xp.asarray(dm1_i, dtype=xp.float64)
+            dm2 += float(wi) * xp.asarray(dm2_i, dtype=xp.float64)
     else:
         for wi, civec in zip(w.tolist(), ci_list):
             dm1_i, dm2_i = fcisolver.make_rdm12(civec, ncas, nelecas, **solver_kwargs)
-            dm1 += float(wi) * np.asarray(dm1_i, dtype=np.float64)
-            dm2 += float(wi) * np.asarray(dm2_i, dtype=np.float64)
+            dm1 += float(wi) * xp.asarray(dm1_i, dtype=xp.float64)
+            dm2 += float(wi) * xp.asarray(dm2_i, dtype=xp.float64)
     return dm1, dm2
 
 

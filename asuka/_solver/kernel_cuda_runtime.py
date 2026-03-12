@@ -339,6 +339,7 @@ def refresh_cuda_workspace_hamiltonian_inplace(
     ws: Any,
     eri_mat_d: Any,
     l_full_d: Any,
+    direct_op_d: Any,
     h_eff_d: Any,
     use_cuda_graph: bool,
     refresh_diag_cache_for_graph: bool,
@@ -356,6 +357,7 @@ def refresh_cuda_workspace_hamiltonian_inplace(
     ws_dtype_obj = np.dtype(getattr(ws, "dtype", np.float64))
     ws.eri_mat = None if eri_mat_d is None else cp.ascontiguousarray(cp.asarray(eri_mat_d, dtype=ws_dtype_obj))
     ws.l_full = None if l_full_d is None else cp.ascontiguousarray(cp.asarray(l_full_d, dtype=ws_dtype_obj))
+    ws.direct_op = direct_op_d
 
     h_eff_flat_new = ws._as_h_eff_flat(h_eff_d)
     if getattr(ws, "h_eff_flat", None) is None or tuple(getattr(ws.h_eff_flat, "shape", ())) != tuple(

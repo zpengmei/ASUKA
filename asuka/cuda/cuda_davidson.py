@@ -9,9 +9,9 @@ import numpy as np
 
 @dataclass
 class DavidsonResult:
-    converged: np.ndarray  # (nroots,) bool
-    e: np.ndarray  # (nroots,) float64
-    x: list[np.ndarray]  # list of (n,) float64
+    converged: Any  # (nroots,) bool
+    e: Any  # (nroots,) float64
+    x: list[Any]  # list of (n,) float64
     niter: int
     stats: dict[str, Any] | None = None
 
@@ -39,6 +39,7 @@ def davidson_sym_gpu(
     subspace_eigh_cpu: bool | None = None,
     subspace_eigh_cpu_max_m: int = 64,
     batch_convergence_transfer: bool = True,
+    return_cupy: bool = False,
 ) -> DavidsonResult:
     """Matrix-free symmetric Davidson on GPU (CuPy).
 
@@ -124,8 +125,11 @@ def davidson_sym_gpu(
     if n <= 0:
         raise ValueError("invalid hdiag size")
 
-    def _as_vec_d(x: np.ndarray):
-        v = cp.asarray(np.asarray(x, dtype=np.float64).ravel(), dtype=cp.float64)
+    def _as_vec_d(x):
+        if isinstance(x, cp.ndarray):
+            v = cp.asarray(x, dtype=cp.float64).ravel()
+        else:
+            v = cp.asarray(np.asarray(x, dtype=np.float64).ravel(), dtype=cp.float64)
         if v.size != n:
             raise ValueError("x0 vectors must have shape (ncsf,)")
         return v
@@ -225,7 +229,7 @@ def davidson_sym_gpu(
             c = basis.T @ v
             v = v - basis @ c
         nrm = _norm(v)
-        nrm_h = float(np.asarray(cp.asnumpy(nrm), dtype=np.float64))
+        nrm_h = float(nrm.item())
         if nrm_h <= lindep:
             if t0 is not None:
                 orth_time_s += time.perf_counter() - t0
@@ -263,10 +267,8 @@ def davidson_sym_gpu(
         e_prev_d = None
         X = None
 
-        # For tiny subspace matrices, calling cuSOLVER is often dominated by launch/dispatch overhead.
-        # Prefer NumPy eigh on host (matrix is <= ~O(10^2) and transfer is negligible) unless explicitly disabled.
         if subspace_eigh_cpu is None:
-            subspace_eigh_cpu = True
+            subspace_eigh_cpu = False
 
         for it in range(1, max_cycle + 1):
             m = int(V.shape[1])
@@ -439,15 +441,20 @@ def davidson_sym_gpu(
     # Export to host.
     if X is None:  # pragma: no cover
         raise RuntimeError("internal error: missing X")
-    if batch_convergence_transfer:
-        final_metrics_h = np.asarray(cp.asnumpy(cp.stack((e, conv.astype(cp.float64)), axis=0)), dtype=np.float64)
-        e_h = final_metrics_h[0]
-        conv_h = np.asarray(final_metrics_h[1] > 0.0, dtype=np.bool_)
+    if bool(return_cupy):
+        conv_out = cp.asarray(conv, dtype=cp.bool_)
+        e_out = cp.asarray(e, dtype=cp.float64)
+        x_out = [cp.ascontiguousarray(X[:, i]) for i in range(int(nroots))]
     else:
-        conv_h = np.asarray(cp.asnumpy(conv), dtype=np.bool_)
-        e_h = np.asarray(cp.asnumpy(e), dtype=np.float64)
-    x_h_arr = np.asarray(cp.asnumpy(X), dtype=np.float64)
-    x_h = [np.asarray(x_h_arr[:, i], dtype=np.float64).copy() for i in range(int(nroots))]
+        if batch_convergence_transfer:
+            final_metrics_h = np.asarray(cp.asnumpy(cp.stack((e, conv.astype(cp.float64)), axis=0)), dtype=np.float64)
+            e_out = final_metrics_h[0]
+            conv_out = np.asarray(final_metrics_h[1] > 0.0, dtype=np.bool_)
+        else:
+            conv_out = np.asarray(cp.asnumpy(conv), dtype=np.bool_)
+            e_out = np.asarray(cp.asnumpy(e), dtype=np.float64)
+        x_h_arr = np.asarray(cp.asnumpy(X), dtype=np.float64)
+        x_out = [np.asarray(x_h_arr[:, i], dtype=np.float64).copy() for i in range(int(nroots))]
     if stats is not None:
         stats["hop_calls"] = float(hop_calls)
         stats["hop_time_s"] = float(hop_time_s)
@@ -484,4 +491,4 @@ def davidson_sym_gpu(
             if final_full_precision_correction_rnorm_max is None
             else final_full_precision_correction_rnorm_max
         )
-    return DavidsonResult(converged=conv_h, e=e_h, x=x_h, niter=int(it), stats=stats)
+    return DavidsonResult(converged=conv_out, e=e_out, x=x_out, niter=int(it), stats=stats)

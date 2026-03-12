@@ -12,7 +12,7 @@ from .cuda_policy import (
 
 
 CUDA_MATVEC_BACKENDS = frozenset(
-    ("cuda_eri_mat", "cuda", "cuda_fixed_ell", "cuda_ell", "cuda_fixed_sell", "cuda_sell")
+    ("cuda_eri_mat", "cuda", "cuda_direct", "cuda_fixed_ell", "cuda_ell", "cuda_fixed_sell", "cuda_sell")
 )
 
 
@@ -183,6 +183,7 @@ def ws_needs_rebuild(
     use_epq_table: bool,
     aggregate_offdiag_k: bool,
     l_full_d: Any,
+    direct_op_d: Any,
     enable_fp64_emulation: bool,
     gemm_backend: str,
     emulation_strategy: str,
@@ -231,6 +232,7 @@ def ws_needs_rebuild(
             and bool(getattr(ws, "aggregate_offdiag_k", False)) != bool(aggregate_offdiag_k)
         )
         or bool(getattr(ws, "l_full", None) is not None) != bool(l_full_d is not None)
+        or bool(getattr(ws, "direct_op", None) is not None) != bool(direct_op_d is not None)
         or bool(getattr(ws, "offdiag_enable_fp64_emulation", False)) != bool(enable_fp64_emulation)
         or str(getattr(ws, "gemm_backend", "")) != str(gemm_backend)
         or str(getattr(ws, "offdiag_emulation_strategy", "")) != str(emulation_strategy)
@@ -467,7 +469,7 @@ def resolve_approx_cuda_frontend(
     defaults: Any,
     matvec_backend: str,
 ) -> dict[str, Any]:
-    if str(matvec_backend) in ("cuda_eri_mat", "cuda"):
+    if str(matvec_backend) in ("cuda_eri_mat", "cuda", "cuda_direct"):
         aggregate_preview_in = kwargs.get(
             "matvec_cuda_aggregate_offdiag",
             getattr(defaults, "matvec_cuda_aggregate_offdiag", None),
@@ -505,7 +507,7 @@ def resolve_approx_kernel_iteration_caps(
     matvec_backend: str,
 ) -> dict[str, int]:
     nroots_i = int(nroots)
-    if str(matvec_backend) in ("cuda_eri_mat", "cuda"):
+    if str(matvec_backend) in ("cuda_eri_mat", "cuda", "cuda_direct"):
         default_cap_cycle = 2
         default_cap_space = max(4, 2 * nroots_i)
     else:

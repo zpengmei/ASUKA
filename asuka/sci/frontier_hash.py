@@ -8,7 +8,7 @@ import numpy as np
 from asuka.cuguga.drt import DRT
 from asuka.cuguga.state_cache import DRTStateCache
 from asuka.cuguga.screening import RowScreening
-from asuka.sci.selected_ci import ConnectedRowCache, DiagonalGuessLookup, _select_external_sparse
+from asuka.sci.sparse_support import ConnectedRowCache, DiagonalGuessLookup, _select_external_sparse
 
 
 @dataclass
@@ -67,6 +67,8 @@ class SparseFrontierSelector:
         select_threshold: float | None = None,
         profile: bool = False,
         row_cache: ConnectedRowCache | None = None,
+        stats_out: dict[str, Any] | None = None,
+        seeds_out: dict[str, Any] | None = None,
     ) -> tuple[list[int], np.ndarray, FrontierHashStats]:
         _ = bool(profile)
         new_idx, e_pt2 = _select_external_sparse(
@@ -74,7 +76,7 @@ class SparseFrontierSelector:
             self.h1e,
             self.eri,
             sel=np.asarray(sel_idx, dtype=np.int64).ravel().tolist(),
-            selected_set=set(self._selected),
+            selected_set=self._selected,
             c_sel=np.asarray(c_sel, dtype=np.float64),
             e_var=np.asarray(e_var, dtype=np.float64),
             hdiag_lookup=self.hdiag_lookup,
@@ -86,6 +88,8 @@ class SparseFrontierSelector:
             state_cache=self.state_cache,
             select_screen_contrib=float(self.select_screen_contrib),
             row_cache=row_cache,
+            stats_out=stats_out,
+            seeds_out=seeds_out,
         )
         stats = FrontierHashStats(
             hash_cap=0,
@@ -95,14 +99,3 @@ class SparseFrontierSelector:
             memory={},
         )
         return new_idx, np.asarray(e_pt2, dtype=np.float64), stats
-
-
-class FrontierHashSelector:
-    """Legacy CUDA frontier-hash selector removed from the supported path."""
-
-    def __init__(self, *args, **kwargs) -> None:
-        _ = (args, kwargs)
-        raise NotImplementedError(
-            "FrontierHashSelector has been removed from the supported path; use SparseFrontierSelector "
-            "or run_cipsi_trials(..., selection_mode='frontier_hash') instead"
-        )

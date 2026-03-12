@@ -12,6 +12,7 @@ Policy
 from __future__ import annotations
 
 from .cross_geometry import build_S_cross_cart
+from .direct_integrals import DirectRowOracleIntegrals
 from .cueri_df import CuERIDFConfig, build_df_B_from_cueri_packed_bases
 from .int1e_cart import (
     Int1eDerivResult,
@@ -30,6 +31,7 @@ from .int1e_cart import (
 
 __all__ = [
     "CuERIDFConfig",
+    "DirectRowOracleIntegrals",
     "Int1eDerivResult",
     "Int1eResult",
     "build_df_B_from_cueri_packed_bases",

@@ -5223,6 +5223,21 @@ def has_cas36_hb_screen_and_apply_u64_device() -> bool:
     return _ext is not None and hasattr(_ext, "cas36_hb_screen_and_apply_u64_inplace_device")
 
 
+def has_cas36_hb_emit_tuples_u64_device() -> bool:
+    """Return True if the CUDA extension exposes CAS(36,36)-style u64 tuple emitters."""
+    return _ext is not None and hasattr(_ext, "cas36_hb_emit_tuples_u64_inplace_device")
+
+
+def has_cas36_exact_selected_emit_tuples_u64_device() -> bool:
+    """Return True if the CUDA extension exposes the dedicated exact-selected u64 tuple emitter."""
+    return _ext is not None and hasattr(_ext, "cas36_exact_selected_emit_tuples_u64_inplace_device")
+
+
+def has_cas36_exact_selected_emit_tuples_dense_u64_device() -> bool:
+    """Return True if the CUDA extension exposes the dense exact-selected u64 tuple emitter."""
+    return _ext is not None and hasattr(_ext, "cas36_exact_selected_emit_tuples_dense_u64_inplace_device")
+
+
 def has_cas36_diag_guess_candidates_u64_dense_device() -> bool:
     """Return True if compact candidate diagonal-guess u64 kernel is available."""
     return _ext is not None and hasattr(_ext, "cas36_diag_guess_candidates_u64_dense_inplace_device")
@@ -5253,7 +5268,10 @@ def cas36_hb_screen_and_apply_u64_inplace_device(
     eps: float,
     hash_keys_u64,
     hash_vals,
+    label_lo: int = 0,
+    label_hi: int | None = None,
     selected_idx_sorted_u64=None,
+    target_mode: str | int = "external_only",
     overflow=None,
     threads: int = 256,
     stream=None,
@@ -5286,6 +5304,22 @@ def cas36_hb_screen_and_apply_u64_inplace_device(
         raise ValueError("hash_vals must have shape (nroots, cap)")
     if int(hash_vals.shape[1]) != int(hash_keys_u64.size):
         raise ValueError("hash_vals must have shape (nroots, cap) with cap matching hash_keys_u64")
+    label_lo = int(label_lo)
+    label_hi = int(drt.ncsf) if label_hi is None else int(label_hi)
+    if label_lo < 0 or label_hi < label_lo or label_hi > int(drt.ncsf):
+        raise ValueError("label window must satisfy 0 <= label_lo <= label_hi <= drt.ncsf")
+    if isinstance(target_mode, str):
+        target_mode_s = str(target_mode).strip().lower()
+        if target_mode_s in ("external", "external_only", "exclude_selected"):
+            target_mode_i = 0
+        elif target_mode_s in ("selected", "selected_only", "keep_selected"):
+            target_mode_i = 1
+        else:
+            raise ValueError("target_mode must be 'external_only' or 'selected_only'")
+    else:
+        target_mode_i = int(target_mode)
+        if target_mode_i not in (0, 1):
+            raise ValueError("target_mode must be 0 or 1")
 
     if selected_idx_sorted_u64 is not None:
         selected_idx_sorted_u64 = cp.ascontiguousarray(cp.asarray(selected_idx_sorted_u64, dtype=cp.uint64).ravel())
@@ -5320,13 +5354,331 @@ def cas36_hb_screen_and_apply_u64_inplace_device(
         float(eps),
         hash_keys_u64,
         hash_vals,
+        int(label_lo),
+        int(label_hi),
         selected_idx_sorted_u64 if selected_idx_sorted_u64 is not None else None,
+        int(target_mode_i),
         overflow,
         int(threads),
         int(stream_ptr),
         bool(sync),
     )
     return hash_keys_u64, hash_vals, overflow
+
+
+def cas36_hb_emit_tuples_u64_inplace_device(
+    drt: DRT,
+    drt_dev,
+    sel_idx_u64,
+    c_bound,
+    *,
+    nsel: int,
+    h1_pq,
+    h1_abs,
+    h1_signed,
+    n_h1: int,
+    pq_ptr,
+    rs_idx,
+    v_abs,
+    v_signed,
+    pq_max_v,
+    eps: float,
+    out_keys_u64,
+    out_src,
+    out_hij,
+    cap: int,
+    label_lo: int = 0,
+    label_hi: int | None = None,
+    selected_idx_sorted_u64=None,
+    target_mode: str | int = "external_only",
+    out_n=None,
+    overflow=None,
+    threads: int = 256,
+    stream=None,
+    sync: bool = True,
+):
+    """Launch the u64 heat-bath SCI tuple-emission kernel (large-space CUDA SCI path)."""
+    if _ext is None or not hasattr(_ext, "cas36_hb_emit_tuples_u64_inplace_device"):
+        raise RuntimeError(
+            "CUDA extension is missing CAS36 HB-SCI u64 tuple emitters; rebuild with python -m asuka.build.guga_cuda_ext"
+        )
+
+    try:
+        import cupy as cp
+    except Exception as e:  # pragma: no cover
+        raise RuntimeError("CuPy is required") from e
+
+    sel_idx_u64 = cp.ascontiguousarray(cp.asarray(sel_idx_u64, dtype=cp.uint64).ravel())
+    c_bound = cp.ascontiguousarray(cp.asarray(c_bound, dtype=cp.float64).ravel())
+    h1_pq = cp.ascontiguousarray(cp.asarray(h1_pq, dtype=cp.int32))
+    h1_abs = cp.ascontiguousarray(cp.asarray(h1_abs, dtype=cp.float64).ravel())
+    h1_signed = cp.ascontiguousarray(cp.asarray(h1_signed, dtype=cp.float64).ravel())
+    pq_ptr = cp.ascontiguousarray(cp.asarray(pq_ptr, dtype=cp.int64).ravel())
+    rs_idx = cp.ascontiguousarray(cp.asarray(rs_idx, dtype=cp.int32).ravel())
+    v_abs = cp.ascontiguousarray(cp.asarray(v_abs, dtype=cp.float64).ravel())
+    v_signed = cp.ascontiguousarray(cp.asarray(v_signed, dtype=cp.float64).ravel())
+    pq_max_v = cp.ascontiguousarray(cp.asarray(pq_max_v, dtype=cp.float64).ravel())
+    out_keys_u64 = cp.ascontiguousarray(cp.asarray(out_keys_u64, dtype=cp.uint64).ravel())
+    out_src = cp.ascontiguousarray(cp.asarray(out_src, dtype=cp.int32).ravel())
+    out_hij = cp.ascontiguousarray(cp.asarray(out_hij, dtype=cp.float64).ravel())
+    if int(out_keys_u64.size) < int(cap) or int(out_src.size) < int(cap) or int(out_hij.size) < int(cap):
+        raise ValueError("out_keys_u64, out_src, and out_hij must have length >= cap")
+    label_lo = int(label_lo)
+    label_hi = int(drt.ncsf) if label_hi is None else int(label_hi)
+    if label_lo < 0 or label_hi < label_lo or label_hi > int(drt.ncsf):
+        raise ValueError("label window must satisfy 0 <= label_lo <= label_hi <= drt.ncsf")
+    if isinstance(target_mode, str):
+        target_mode_s = str(target_mode).strip().lower()
+        if target_mode_s in ("external", "external_only", "exclude_selected"):
+            target_mode_i = 0
+        elif target_mode_s in ("selected", "selected_only", "keep_selected"):
+            target_mode_i = 1
+        else:
+            raise ValueError("target_mode must be 'external_only' or 'selected_only'")
+    else:
+        target_mode_i = int(target_mode)
+        if target_mode_i not in (0, 1):
+            raise ValueError("target_mode must be 0 or 1")
+
+    if selected_idx_sorted_u64 is not None:
+        selected_idx_sorted_u64 = cp.ascontiguousarray(cp.asarray(selected_idx_sorted_u64, dtype=cp.uint64).ravel())
+    if out_n is None:
+        out_n = cp.zeros((1,), dtype=cp.int32)
+    else:
+        out_n = cp.ascontiguousarray(cp.asarray(out_n, dtype=cp.int32).ravel())
+        if out_n.shape != (1,):
+            raise ValueError("out_n must have shape (1,)")
+    if overflow is None:
+        overflow = cp.zeros((1,), dtype=cp.int32)
+    else:
+        overflow = cp.ascontiguousarray(cp.asarray(overflow, dtype=cp.int32).ravel())
+        if overflow.shape != (1,):
+            raise ValueError("overflow must have shape (1,)")
+
+    if stream is None:
+        stream_ptr = int(cp.cuda.get_current_stream().ptr)
+    else:
+        stream_ptr = int(getattr(stream, "ptr", stream))
+
+    _ext.cas36_hb_emit_tuples_u64_inplace_device(
+        drt_dev,
+        int(drt.ncsf),
+        sel_idx_u64,
+        c_bound,
+        int(nsel),
+        h1_pq,
+        h1_abs,
+        h1_signed,
+        int(n_h1),
+        pq_ptr,
+        rs_idx,
+        v_abs,
+        v_signed,
+        pq_max_v,
+        float(eps),
+        out_keys_u64,
+        out_src,
+        out_hij,
+        int(cap),
+        int(label_lo),
+        int(label_hi),
+        selected_idx_sorted_u64 if selected_idx_sorted_u64 is not None else None,
+        int(target_mode_i),
+        out_n,
+        overflow,
+        int(threads),
+        int(stream_ptr),
+        bool(sync),
+    )
+    return out_keys_u64, out_src, out_hij, out_n, overflow
+
+
+def cas36_exact_selected_emit_tuples_u64_inplace_device(
+    drt: DRT,
+    drt_dev,
+    sel_idx_u64,
+    c_bound,
+    *,
+    nsel: int,
+    h1_pq,
+    h1_abs,
+    h1_signed,
+    n_h1: int,
+    pq_ptr,
+    rs_idx,
+    v_abs,
+    v_signed,
+    pq_max_v,
+    out_keys_u64,
+    out_src,
+    out_hij,
+    cap: int,
+    selected_idx_sorted_u64,
+    out_n=None,
+    overflow=None,
+    threads: int = 256,
+    stream=None,
+    sync: bool = True,
+):
+    """Launch the dedicated exact-selected u64 tuple-emission surface."""
+    if _ext is None or not hasattr(_ext, "cas36_exact_selected_emit_tuples_u64_inplace_device"):
+        raise RuntimeError(
+            "CUDA extension is missing the exact-selected CAS36 u64 tuple emitter; rebuild with python -m asuka.build.guga_cuda_ext"
+        )
+
+    try:
+        import cupy as cp
+    except Exception as e:  # pragma: no cover
+        raise RuntimeError("CuPy is required") from e
+
+    sel_idx_u64 = cp.ascontiguousarray(cp.asarray(sel_idx_u64, dtype=cp.uint64).ravel())
+    c_bound = cp.ascontiguousarray(cp.asarray(c_bound, dtype=cp.float64).ravel())
+    h1_pq = cp.ascontiguousarray(cp.asarray(h1_pq, dtype=cp.int32))
+    h1_abs = cp.ascontiguousarray(cp.asarray(h1_abs, dtype=cp.float64).ravel())
+    h1_signed = cp.ascontiguousarray(cp.asarray(h1_signed, dtype=cp.float64).ravel())
+    pq_ptr = cp.ascontiguousarray(cp.asarray(pq_ptr, dtype=cp.int64).ravel())
+    rs_idx = cp.ascontiguousarray(cp.asarray(rs_idx, dtype=cp.int32).ravel())
+    v_abs = cp.ascontiguousarray(cp.asarray(v_abs, dtype=cp.float64).ravel())
+    v_signed = cp.ascontiguousarray(cp.asarray(v_signed, dtype=cp.float64).ravel())
+    pq_max_v = cp.ascontiguousarray(cp.asarray(pq_max_v, dtype=cp.float64).ravel())
+    out_keys_u64 = cp.ascontiguousarray(cp.asarray(out_keys_u64, dtype=cp.uint64).ravel())
+    out_src = cp.ascontiguousarray(cp.asarray(out_src, dtype=cp.int32).ravel())
+    out_hij = cp.ascontiguousarray(cp.asarray(out_hij, dtype=cp.float64).ravel())
+    selected_idx_sorted_u64 = cp.ascontiguousarray(cp.asarray(selected_idx_sorted_u64, dtype=cp.uint64).ravel())
+    if int(out_keys_u64.size) < int(cap) or int(out_src.size) < int(cap) or int(out_hij.size) < int(cap):
+        raise ValueError("out_keys_u64, out_src, and out_hij must have length >= cap")
+    if out_n is None:
+        out_n = cp.zeros((1,), dtype=cp.int32)
+    else:
+        out_n = cp.ascontiguousarray(cp.asarray(out_n, dtype=cp.int32).ravel())
+        if out_n.shape != (1,):
+            raise ValueError("out_n must have shape (1,)")
+    if overflow is None:
+        overflow = cp.zeros((1,), dtype=cp.int32)
+    else:
+        overflow = cp.ascontiguousarray(cp.asarray(overflow, dtype=cp.int32).ravel())
+        if overflow.shape != (1,):
+            raise ValueError("overflow must have shape (1,)")
+
+    if stream is None:
+        stream_ptr = int(cp.cuda.get_current_stream().ptr)
+    else:
+        stream_ptr = int(getattr(stream, "ptr", stream))
+
+    _ext.cas36_exact_selected_emit_tuples_u64_inplace_device(
+        drt_dev,
+        int(drt.ncsf),
+        sel_idx_u64,
+        c_bound,
+        int(nsel),
+        h1_pq,
+        h1_abs,
+        h1_signed,
+        int(n_h1),
+        pq_ptr,
+        rs_idx,
+        v_abs,
+        v_signed,
+        pq_max_v,
+        out_keys_u64,
+        out_src,
+        out_hij,
+        int(cap),
+        selected_idx_sorted_u64,
+        out_n,
+        overflow,
+        int(threads),
+        int(stream_ptr),
+        bool(sync),
+    )
+    return out_keys_u64, out_src, out_hij, out_n, overflow
+
+
+def cas36_exact_selected_emit_tuples_dense_u64_inplace_device(
+    drt: DRT,
+    drt_dev,
+    sel_idx_u64,
+    c_bound,
+    *,
+    nsel: int,
+    h_base,
+    eri4,
+    out_keys_u64,
+    out_src,
+    out_hij,
+    cap: int,
+    selected_idx_sorted_u64,
+    out_diag=None,
+    out_n=None,
+    overflow=None,
+    threads: int = 128,
+    stream=None,
+    sync: bool = True,
+):
+    """Launch the dense exact-selected u64 tuple-emission surface."""
+    if _ext is None or not hasattr(_ext, "cas36_exact_selected_emit_tuples_dense_u64_inplace_device"):
+        raise RuntimeError(
+            "CUDA extension is missing the dense exact-selected CAS36 u64 tuple emitter; rebuild with python -m asuka.build.guga_cuda_ext"
+        )
+
+    try:
+        import cupy as cp
+    except Exception as e:  # pragma: no cover
+        raise RuntimeError("CuPy is required") from e
+
+    sel_idx_u64 = cp.ascontiguousarray(cp.asarray(sel_idx_u64, dtype=cp.uint64).ravel())
+    c_bound = cp.ascontiguousarray(cp.asarray(c_bound, dtype=cp.float64).ravel())
+    h_base = cp.ascontiguousarray(cp.asarray(h_base, dtype=cp.float64).ravel())
+    eri4 = cp.ascontiguousarray(cp.asarray(eri4, dtype=cp.float64).ravel())
+    out_keys_u64 = cp.ascontiguousarray(cp.asarray(out_keys_u64, dtype=cp.uint64).ravel())
+    out_src = cp.ascontiguousarray(cp.asarray(out_src, dtype=cp.int32).ravel())
+    out_hij = cp.ascontiguousarray(cp.asarray(out_hij, dtype=cp.float64).ravel())
+    selected_idx_sorted_u64 = cp.ascontiguousarray(cp.asarray(selected_idx_sorted_u64, dtype=cp.uint64).ravel())
+    if out_diag is not None:
+        out_diag = cp.ascontiguousarray(cp.asarray(out_diag, dtype=cp.float64).ravel())
+        if int(out_diag.size) < int(nsel):
+            raise ValueError("out_diag must have length >= nsel")
+    if int(out_keys_u64.size) < int(cap) or int(out_src.size) < int(cap) or int(out_hij.size) < int(cap):
+        raise ValueError("out_keys_u64, out_src, and out_hij must have length >= cap")
+    if out_n is None:
+        out_n = cp.zeros((1,), dtype=cp.int32)
+    else:
+        out_n = cp.ascontiguousarray(cp.asarray(out_n, dtype=cp.int32).ravel())
+        if out_n.shape != (1,):
+            raise ValueError("out_n must have shape (1,)")
+    if overflow is None:
+        overflow = cp.zeros((1,), dtype=cp.int32)
+    else:
+        overflow = cp.ascontiguousarray(cp.asarray(overflow, dtype=cp.int32).ravel())
+        if overflow.shape != (1,):
+            raise ValueError("overflow must have shape (1,)")
+
+    if stream is None:
+        stream_ptr = int(cp.cuda.get_current_stream().ptr)
+    else:
+        stream_ptr = int(getattr(stream, "ptr", stream))
+
+    _ext.cas36_exact_selected_emit_tuples_dense_u64_inplace_device(
+        drt_dev,
+        int(drt.ncsf),
+        sel_idx_u64,
+        c_bound,
+        int(nsel),
+        h_base,
+        eri4,
+        out_keys_u64,
+        out_src,
+        out_hij,
+        int(cap),
+        selected_idx_sorted_u64,
+        out_diag,
+        out_n,
+        overflow,
+        int(threads),
+        int(stream_ptr),
+        bool(sync),
+    )
+    return out_keys_u64, out_src, out_hij, out_diag, out_n, overflow
 
 
 def cas36_diag_guess_candidates_u64_dense_inplace_device(
@@ -7116,6 +7468,7 @@ class GugaMatvecEriMatWorkspace:
         state_cache: DRTStateCache | None = None,
         eri_mat=None,
         l_full=None,
+        direct_op=None,
         h_eff=None,
         j_tile: int = 1024,
         csr_capacity_mult: float = 2.0,
@@ -7221,7 +7574,7 @@ class GugaMatvecEriMatWorkspace:
             self.coalesce = bool(coalesce)
         self.include_diagonal_rs = bool(include_diagonal_rs)
         self.path_mode_requested = _normalize_matvec_cuda_path_mode(path_mode)
-        self.use_fused_hop = bool(use_fused_hop)
+        self.use_fused_hop = bool(use_fused_hop and direct_op is None)
         self.use_epq_table = bool(use_epq_table)
         self.aggregate_offdiag_k = bool(aggregate_offdiag_k)
         self._fused_hop_kernel_available = bool(_ext is not None and hasattr(_ext, "fused_hop_device"))
@@ -7231,6 +7584,8 @@ class GugaMatvecEriMatWorkspace:
             and int(self.norb) <= 20
             and (eri_mat is not None or l_full is not None)
         )
+        if direct_op is not None:
+            self._fused_hop_workspace_eligible = False
         # Slow-path policy: fused_coo is marked no-go for production runs.
         self.path_mode_fallback_reason: str | None = None
         mode_eff = str(self.path_mode_requested)
@@ -7448,6 +7803,8 @@ class GugaMatvecEriMatWorkspace:
             and int(self.norb) <= 20
             and (eri_mat is not None or l_full is not None)
         )
+        if direct_op is not None:
+            fused_hop_eligible = False
         if (
             int(requested_j_tile) == 1024
             and int(self.ncsf) >= 1_000_000
@@ -7640,15 +7997,18 @@ class GugaMatvecEriMatWorkspace:
 
         self.eri_mat = None if eri_mat is None else cp.ascontiguousarray(cp.asarray(eri_mat, dtype=self._dtype))
         self.l_full = None if l_full is None else cp.ascontiguousarray(cp.asarray(l_full, dtype=self._dtype))
+        self.direct_op = direct_op
         if self.l_full is not None:
             if self.l_full.ndim != 2 or tuple(self.l_full.shape)[0] != int(self.nops):
                 raise ValueError("l_full must have shape (norb*norb, naux)")
         self.naux = 0 if self.l_full is None else int(self.l_full.shape[1])
+        if self.direct_op is not None and self._dtype != cp.float64:
+            raise ValueError("direct_op currently requires dtype=float64")
         if self._dtype == cp.float32:
-            if self.eri_mat is None and self.l_full is None:
-                raise ValueError("dtype=float32 requires eri_mat or l_full")
+            if self.eri_mat is None and self.l_full is None and self.direct_op is None:
+                raise ValueError("dtype=float32 requires eri_mat, l_full, or direct_op")
             if (not bool(self.use_epq_table)) and self.eri_mat is None:
-                raise ValueError("dtype=float32 no-EPQ path currently requires dense eri_mat (DF/l_full no-EPQ unsupported)")
+                raise ValueError("dtype=float32 no-EPQ path currently requires dense eri_mat (DF/direct no-EPQ unsupported)")
         self._gdf_ws: Kernel3BuildGDFWorkspace | None = None
         self.h_eff_flat = None if h_eff is None else self._as_h_eff_flat(h_eff)
         self._eri_diag_t = None
@@ -8804,15 +9164,19 @@ class GugaMatvecEriMatWorkspace:
         y = _inputs["y"]
         eri_mat_use = _inputs["eri_mat_use"]
         l_full_use = _inputs["l_full_use"]
+        direct_op_use = _inputs["direct_op_use"]
         use_df = bool(_inputs["use_df"])
+        use_direct = bool(_inputs["use_direct"])
         h_eff_flat = _inputs["h_eff_flat"]
         use_epq_streaming = bool(_inputs["use_epq_streaming"])
         use_epq_streaming_tiles = bool(_inputs["use_epq_streaming_tiles"])
         epq_stream_panic_requested = bool(_inputs["epq_stream_panic_requested"])
         epq_stream_panic_active = bool(_inputs["epq_stream_panic_active"])
+        if use_direct:
+            use_fused_hop = False
 
         eri_mat_t = None
-        if (not use_df) and self._epq_table is not None:
+        if (not use_df) and (not use_direct) and self._epq_table is not None:
             if eri_mat is None:
                 if self._eri_mat_t is None:
                     self._eri_mat_t = eri_mat_use.T.copy()
@@ -8831,7 +9195,7 @@ class GugaMatvecEriMatWorkspace:
                         del self._eri_mat_t_cache[oldest]
                     self._eri_mat_t_cache[eri_ptr] = eri_mat_t
 
-        if self.include_diagonal_rs and not bool(use_aggregate_offdiag) and self._eri_diag_t is None:
+        if self.include_diagonal_rs and (not use_direct) and not bool(use_aggregate_offdiag) and self._eri_diag_t is None:
             # Cache the transpose of the diagonal rs columns:
             #   eri_diag_t[r,pq] = eri_mat[pq, rr]  with rr = r*norb+r
             diag_ids = cp.asarray([int(r) * int(self.norb) + int(r) for r in range(int(self.norb))], dtype=cp.int32)
@@ -9264,7 +9628,7 @@ class GugaMatvecEriMatWorkspace:
             l_pair = None
             l_pair_t = None
             npair = self._sym_pair_npair
-            if npair > 0 and self._sym_pair_pair_pq is not None:
+            if (not use_direct) and npair > 0 and self._sym_pair_pair_pq is not None:
                 if use_df:
                     # DF path: sym-pair compression only reduces one GEMM dimension
                     # (npair vs nops) while adding pack/unpack overhead — not beneficial.
@@ -9480,6 +9844,53 @@ class GugaMatvecEriMatWorkspace:
                         profile[gemm_key] = profile.get(gemm_key, 0.0) + dt
                         profile["blocked_w_gemm_s"] = profile.get("blocked_w_gemm_s", 0.0) + dt
                         profile[flops_key] = profile.get(flops_key, 0.0) + gemm_flops
+                elif use_direct:
+                    if direct_op_use is None:  # pragma: no cover
+                        raise RuntimeError("internal error: direct_op is not initialized")
+                    direct_applied = False
+                    if callable(getattr(direct_op_use, "contract_apply_w_block_device", None)):
+                        if _one_body_event is not None:
+                            stream.wait_event(_one_body_event)
+                            _one_body_event = None
+                        t0 = time.perf_counter() if profile is not None else None
+                        direct_op_use.contract_apply_w_block_device(
+                            self.drt,
+                            self.drt_dev,
+                            self.state_dev,
+                            epq_table_t,
+                            w_block,
+                            k_start=int(k0),
+                            y=y,
+                            half=0.5,
+                            overflow=self.overflow_apply,
+                            threads_apply=int(self.threads_apply),
+                            add=True,
+                            stream=stream,
+                            sync=bool(sync),
+                            check_overflow=bool(check_overflow),
+                            use_kahan=bool(self.kahan_compensation),
+                            profile=profile,
+                        )
+                        if profile is not None and t0 is not None:
+                            stream.synchronize()
+                            dt = time.perf_counter() - t0
+                            profile["blocked_w_gemm_s"] = profile.get("blocked_w_gemm_s", 0.0) + dt
+                            profile["blocked_w_apply_s"] = profile.get("blocked_w_apply_s", 0.0) + dt
+                            profile["offdiag_apply_s"] = profile.get("offdiag_apply_s", 0.0) + dt
+                        direct_applied = True
+                    else:
+                        g_block = self._g_buf[:k_count]
+                        t0 = time.perf_counter() if profile is not None else None
+                        direct_op_use.contract_w_block_device(
+                            w_block,
+                            half=0.5,
+                            out=g_block,
+                        )
+                        if profile is not None and t0 is not None:
+                            stream.synchronize()
+                            dt = time.perf_counter() - t0
+                            profile["offdiag_direct_cuda_s"] = profile.get("offdiag_direct_cuda_s", 0.0) + dt
+                            profile["blocked_w_gemm_s"] = profile.get("blocked_w_gemm_s", 0.0) + dt
                 elif use_df:
                     t0 = time.perf_counter() if profile is not None else None
                     naux = int(l_full_use.shape[1])
@@ -9575,58 +9986,59 @@ class GugaMatvecEriMatWorkspace:
                             2.0 * float(int(gemm_rows)) * float(int(self.nops)) * float(int(self.nops))
                         )
 
-                # Wait for one_body to finish writing y before Apply accumulates into it.
-                if _one_body_event is not None:
-                    stream.wait_event(_one_body_event)
-                    _one_body_event = None  # only need to wait once
+                if not (use_direct and 'direct_applied' in locals() and direct_applied):
+                    # Wait for one_body to finish writing y before Apply accumulates into it.
+                    if _one_body_event is not None:
+                        stream.wait_event(_one_body_event)
+                        _one_body_event = None  # only need to wait once
 
-                # Apply g_block to y via destination-major EPQ transpose gather.
-                t0 = time.perf_counter() if profile is not None else None
-                if use_pair_fused:
-                    t_indptr, t_source, t_pq, t_data = epq_table_t
-                    _ext.apply_g_pair_gather_epq_transpose_range_inplace_device(
-                        self.drt_dev,
-                        self.state_dev,
-                        t_indptr,
-                        t_source,
-                        t_pq,
-                        t_data,
-                        g_block,  # g_pair_buf (pair-indexed)
-                        int(k0),
-                        int(k_count),
-                        _ftp_dev,
-                        y,
-                        self.overflow_apply,
-                        int(self.threads_apply),
-                        True,  # add
-                        int(stream.ptr),
-                        bool(sync),
-                        bool(check_overflow),
-                    )
-                else:
-                    apply_g_flat_gather_epq_transpose_range_inplace_device(
-                        self.drt,
-                        self.drt_dev,
-                        self.state_dev,
-                        epq_table_t,
-                        g_block,
-                        k_start=int(k0),
-                        k_count=int(k_count),
-                        y=y,
-                        overflow=self.overflow_apply,
-                        threads=int(self.threads_apply),
-                        add=True,
-                        stream=stream,
-                        sync=bool(sync),
-                        check_overflow=bool(check_overflow),
-                        dtype=self._dtype,
-                        use_kahan=bool(self.kahan_compensation),
-                    )
-                if profile is not None and t0 is not None:
-                    stream.synchronize()
-                    dt = time.perf_counter() - t0
-                    profile["offdiag_apply_s"] = profile.get("offdiag_apply_s", 0.0) + dt
-                    profile["blocked_w_apply_s"] = profile.get("blocked_w_apply_s", 0.0) + dt
+                    # Apply g_block to y via destination-major EPQ transpose gather.
+                    t0 = time.perf_counter() if profile is not None else None
+                    if use_pair_fused:
+                        t_indptr, t_source, t_pq, t_data = epq_table_t
+                        _ext.apply_g_pair_gather_epq_transpose_range_inplace_device(
+                            self.drt_dev,
+                            self.state_dev,
+                            t_indptr,
+                            t_source,
+                            t_pq,
+                            t_data,
+                            g_block,  # g_pair_buf (pair-indexed)
+                            int(k0),
+                            int(k_count),
+                            _ftp_dev,
+                            y,
+                            self.overflow_apply,
+                            int(self.threads_apply),
+                            True,  # add
+                            int(stream.ptr),
+                            bool(sync),
+                            bool(check_overflow),
+                        )
+                    else:
+                        apply_g_flat_gather_epq_transpose_range_inplace_device(
+                            self.drt,
+                            self.drt_dev,
+                            self.state_dev,
+                            epq_table_t,
+                            g_block,
+                            k_start=int(k0),
+                            k_count=int(k_count),
+                            y=y,
+                            overflow=self.overflow_apply,
+                            threads=int(self.threads_apply),
+                            add=True,
+                            stream=stream,
+                            sync=bool(sync),
+                            check_overflow=bool(check_overflow),
+                            dtype=self._dtype,
+                            use_kahan=bool(self.kahan_compensation),
+                        )
+                    if profile is not None and t0 is not None:
+                        stream.synchronize()
+                        dt = time.perf_counter() - t0
+                        profile["offdiag_apply_s"] = profile.get("offdiag_apply_s", 0.0) + dt
+                        profile["blocked_w_apply_s"] = profile.get("blocked_w_apply_s", 0.0) + dt
 
             if profile is not None:
                 offdiag_gemm_s = float(profile.get("offdiag_gemm_s", 0.0))

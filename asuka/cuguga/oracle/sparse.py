@@ -50,6 +50,10 @@ def _is_df_mo_integrals_like(eri: Any) -> bool:
     )
 
 
+def _has_row_oracle_contract(eri: Any) -> bool:
+    return hasattr(eri, "contract_cols") and callable(getattr(eri, "contract_cols", None))
+
+
 def _csf_index_dtype(drt: DRT) -> np.dtype:
     return np.dtype(np.int32 if int(drt.ncsf) <= np.iinfo(np.int32).max else np.int64)
 
@@ -850,7 +854,7 @@ def connected_row_sparse_df(
                 #   g_mat = 0.5 * C @ ERI_mat
                 def build_g_block(C_block: sparse.csr_matrix) -> np.ndarray:
                     return 0.5 * (C_block @ eri_mat)
-            else:
+            elif getattr(df_eri, "l_full", None) is not None:
                 # Two-step DF contraction, but batched over all k:
                 #   W = C @ L_full   (W[k,L] = sum_rs c_rs(k)*d[L,rs])
                 #   g = 0.5 * W @ L_full.T
@@ -861,6 +865,32 @@ def connected_row_sparse_df(
                     # Avoid materializing a full transpose copy of `l_full` per row;
                     # NumPy can call BLAS GEMM with `transB='T'` for this transpose-view.
                     return 0.5 * (w_block @ l_full.T)
+            elif _has_row_oracle_contract(df_eri):
+                def build_g_block(C_block: sparse.csr_matrix) -> np.ndarray:
+                    indptr = np.asarray(C_block.indptr, dtype=np.int32)
+                    indices = np.asarray(C_block.indices, dtype=np.int32)
+                    data = np.asarray(C_block.data, dtype=np.float64)
+                    g_rows: list[np.ndarray] = []
+                    for row in range(int(C_block.shape[0])):
+                        start_i = int(indptr[row])
+                        stop_i = int(indptr[row + 1])
+                        g_rows.append(
+                            np.asarray(
+                                df_eri.contract_cols(
+                                    indices[start_i:stop_i],
+                                    data[start_i:stop_i],
+                                    half=0.5,
+                                    eri_mat_max_bytes=int(screen.df_eri_mat_max_bytes),
+                                ),
+                                dtype=np.float64,
+                                order="C",
+                            )
+                        )
+                    if not g_rows:
+                        return np.zeros((0, nops), dtype=np.float64)
+                    return np.asarray(np.stack(g_rows, axis=0), dtype=np.float64, order="C")
+            else:  # pragma: no cover
+                raise TypeError("row-oracle integral object must provide l_full or contract_cols")
 
             # Process k in blocks to cap peak memory for g_block (nk_block * nops).
             g_block_max_bytes = 256 * 1024 * 1024  # 256 MiB

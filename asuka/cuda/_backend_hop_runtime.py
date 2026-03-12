@@ -81,6 +81,7 @@ def prepare_hop_runtime_inputs(
     cp: Any,
     y: Any,
     eri_mat: Any,
+    direct_op: Any = None,
     h_eff: Any,
     use_fused_hop: bool,
 ) -> dict[str, Any]:
@@ -93,18 +94,23 @@ def prepare_hop_runtime_inputs(
 
     eri_mat_use = workspace.eri_mat if eri_mat is None else cp.ascontiguousarray(cp.asarray(eri_mat, dtype=workspace._dtype))
     l_full_use = None
+    direct_op_use = getattr(workspace, "direct_op", None) if direct_op is None else direct_op
     use_df = False
+    use_direct = False
     if eri_mat_use is not None:
         if eri_mat_use.shape != (int(workspace.nops), int(workspace.nops)):
             raise ValueError("eri_mat must have shape (nops,nops)")
     else:
         l_full_use = workspace.l_full
-        if l_full_use is None:
-            raise ValueError("eri_mat or l_full must be provided (workspace has neither)")
-        l_full_use = cp.ascontiguousarray(cp.asarray(l_full_use, dtype=workspace._dtype))
-        if l_full_use.ndim != 2 or tuple(l_full_use.shape)[0] != int(workspace.nops):
-            raise ValueError("l_full must have shape (norb*norb, naux)")
-        use_df = True
+        if l_full_use is not None:
+            l_full_use = cp.ascontiguousarray(cp.asarray(l_full_use, dtype=workspace._dtype))
+            if l_full_use.ndim != 2 or tuple(l_full_use.shape)[0] != int(workspace.nops):
+                raise ValueError("l_full must have shape (norb*norb, naux)")
+            use_df = True
+        elif direct_op_use is None:
+            raise ValueError("eri_mat, l_full, or direct_op must be provided (workspace has none)")
+        else:
+            use_direct = True
 
     if bool(use_fused_hop) and bool(use_df) and eri_mat_use is None:
         eri_mat_use = cp.ascontiguousarray(cp.dot(l_full_use, l_full_use.T).astype(workspace._dtype))
@@ -134,7 +140,9 @@ def prepare_hop_runtime_inputs(
         "y": y_out,
         "eri_mat_use": eri_mat_use,
         "l_full_use": l_full_use,
+        "direct_op_use": direct_op_use,
         "use_df": bool(use_df),
+        "use_direct": bool(use_direct),
         "h_eff_flat": h_eff_flat,
         "use_epq_streaming": bool(use_epq_streaming),
         "use_epq_streaming_tiles": bool(use_epq_streaming_tiles),

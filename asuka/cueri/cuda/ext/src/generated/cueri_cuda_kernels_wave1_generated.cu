@@ -1748,7 +1748,10 @@ __global__ void KernelERI_psds_warp_true(
   const int lane = static_cast<int>(threadIdx.x) & 31;
   const int warp_id = static_cast<int>(threadIdx.x) >> 5;
   const int warps_per_block = static_cast<int>(blockDim.x) >> 5;
-  const int t = static_cast<int>(blockIdx.x) * warps_per_block + warp_id;
+  const int warp_global = static_cast<int>(blockIdx.x) * warps_per_block + warp_id;
+  const int subwarp = lane >> 3;
+  const int lane8 = lane & 7;
+  const int t = warp_global * 4 + subwarp;
   if (t >= ntasks) return;
 
   const int spAB = static_cast<int>(task_spAB[t]);
@@ -1771,19 +1774,6 @@ __global__ void KernelERI_psds_warp_true(
   const double Dy = shell_cy[iD];
   const double Dz = shell_cz[iD];
 
-  const double xij = Ax - Bx;
-  const double yij = Ay - By;
-  const double zij = Az - Bz;
-  const double xkl = Cx - Dx;
-  const double ykl = Cy - Dy;
-  const double zkl = Cz - Dz;
-  const double xij2 = xij * xij;
-  const double yij2 = yij * yij;
-  const double zij2 = zij * zij;
-  const double xkl2 = xkl * xkl;
-  const double ykl2 = ykl * ykl;
-  const double zkl2 = zkl * zkl;
-
   const int baseAB = static_cast<int>(sp_pair_start[spAB]);
   const int baseCD = static_cast<int>(sp_pair_start[spCD]);
   const int nPairAB = static_cast<int>(sp_npair[spAB]);
@@ -1801,8 +1791,8 @@ __global__ void KernelERI_psds_warp_true(
   #pragma unroll
   for (int i = 0; i < kNComp; ++i) acc[i] = 0.0;
 
-  // Lane-parallel primitive pair loop.
-  for (int pair = lane; pair < totalPairs; pair += 32) {
+  // Subwarp-parallel primitive pair loop.
+  for (int pair = lane8; pair < totalPairs; pair += 8) {
     const int ip = pair / nPairCD;
     const int jp = pair - ip * nPairCD;
     const int ki = baseAB + ip;
@@ -1879,17 +1869,15 @@ __global__ void KernelERI_psds_warp_true(
     }  // for u (Rys roots)
   }  // for pair
 
-  // Warp reduction: sum across lanes.
+  // Subwarp reduction: sum across 8 lanes for this task.
   #pragma unroll
   for (int i = 0; i < kNComp; ++i) {
-    #pragma unroll
-    for (int offset = 16; offset > 0; offset >>= 1) {
-      acc[i] += __shfl_down_sync(0xFFFFFFFF, acc[i], offset);
-    }
+    acc[i] += __shfl_down_sync(0xFFFFFFFF, acc[i], 4, 8);
+    acc[i] += __shfl_down_sync(0xFFFFFFFF, acc[i], 2, 8);
+    acc[i] += __shfl_down_sync(0xFFFFFFFF, acc[i], 1, 8);
   }
 
-  // Lane 0 writes output.
-  if (lane == 0) {
+  if (lane8 == 0) {
     double* out = eri_out + static_cast<int64_t>(t) * static_cast<int64_t>(kNComp);
     #pragma unroll
     for (int i = 0; i < kNComp; ++i) out[i] = acc[i];
@@ -41498,9 +41486,17 @@ extern "C" cudaError_t cueri_eri_psds_warp_launch_stream(
     double* eri_out,
     cudaStream_t stream,
     int threads) {
-  return cueri_eri_psds_launch_stream(
+  if (ntasks <= 0) return (ntasks == 0) ? cudaSuccess : cudaErrorInvalidValue;
+  int launch_threads = threads > 0 ? threads : 32;
+  launch_threads = (launch_threads / 32) * 32;
+  if (launch_threads < 32) launch_threads = 32;
+  const int warps_per_block = launch_threads >> 5;
+  const int tasks_per_block = warps_per_block << 2;
+  const int blocks = (ntasks + tasks_per_block - 1) / tasks_per_block;
+  KernelERI_psds_warp_true<2><<<blocks, launch_threads, 0, stream>>>(
       task_spAB, task_spCD, ntasks, sp_A, sp_B, sp_pair_start, sp_npair, shell_cx, shell_cy, shell_cz,
-      pair_eta, pair_Px, pair_Py, pair_Pz, pair_cK, eri_out, stream, threads);
+      pair_eta, pair_Px, pair_Py, pair_Pz, pair_cK, eri_out);
+  return cudaGetLastError();
 }
 
 extern "C" cudaError_t cueri_eri_psds_multiblock_launch_stream(

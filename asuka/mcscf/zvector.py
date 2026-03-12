@@ -1617,6 +1617,7 @@ def solve_mcscf_zvector(
     gcrotmk_k: int | None = None,
     recycle_space: list[tuple[np.ndarray | None, np.ndarray]] | None = None,
     hessian_op: MCSCFHessianOp | None = None,
+    precond_override: Callable[[np.ndarray], np.ndarray] | None = None,
     enforce_absorb_h1e_direct: bool = True,
     project_sa_rhs: bool = True,
     auto_rdm_backend_cuda: bool = True,
@@ -1768,30 +1769,36 @@ def solve_mcscf_zvector(
 
         diag_use: np.ndarray | None = op.diag
         precond_use: Callable[[np.ndarray], np.ndarray] | None = None
+        if precond_override is not None:
+            precond_use = precond_override
+            diag_use = None
         if op.is_sa and (not bool(op.orb_only)) and op.diag is not None and op.ci_ref_list is not None:
-            _sizes = tuple(int(np.asarray(c, dtype=np.float64).size) for c in op.ci_ref_list)
-            _cache_key = (
-                int(id(op.mv)),
-                int(id(op.diag)),
-                int(op.n_orb),
-                int(op.n_ci),
-                _sizes,
-            )
-            precond_use = _sa_precond_cache_get(_cache_key)
-            if precond_use is None:
-                try:
-                    precond_use = _build_sa_lagrange_precond(
-                        n_orb=int(op.n_orb),
-                        diag=np.asarray(op.diag, dtype=np.float64),
-                        ci_ref_list=op.ci_ref_list,
-                    )
-                    _sa_precond_cache_put(_cache_key, precond_use)
-                except Exception:
-                    precond_use = None
-            if precond_use is not None:
-                diag_use = None
+            if precond_override is not None:
+                pass
             else:
-                diag_use = op.diag
+                _sizes = tuple(int(np.asarray(c, dtype=np.float64).size) for c in op.ci_ref_list)
+                _cache_key = (
+                    int(id(op.mv)),
+                    int(id(op.diag)),
+                    int(op.n_orb),
+                    int(op.n_ci),
+                    _sizes,
+                )
+                precond_use = _sa_precond_cache_get(_cache_key)
+                if precond_use is None:
+                    try:
+                        precond_use = _build_sa_lagrange_precond(
+                            n_orb=int(op.n_orb),
+                            diag=np.asarray(op.diag, dtype=np.float64),
+                            ci_ref_list=op.ci_ref_list,
+                        )
+                        _sa_precond_cache_put(_cache_key, precond_use)
+                    except Exception:
+                        precond_use = None
+                if precond_use is not None:
+                    diag_use = None
+                else:
+                    diag_use = op.diag
 
         def _solve_gcrotmk_dispatch(b_vec: np.ndarray, x0_vec: np.ndarray | None):
             if not bool(op.gpu_mode):
@@ -1955,6 +1962,7 @@ def solve_mcscf_zvector(
 
         info_out = dict(info)
         info_out["absorb_h1e_direct"] = bool(absorb_direct_changed)
+        info_out["precond_override"] = bool(precond_override is not None)
         if bool(op.orb_only):
             # `mc1step.gen_g_hop` convention.
             info_out.setdefault("hessian_backend", "mc1step")

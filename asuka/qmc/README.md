@@ -4,8 +4,8 @@ Stochastic projector methods in CSF (GUGA/DRT) space.
 
 ## Purpose
 
-Implements FCIQMC/FCI-FRI style sparse-state propagation, spawning,
-coalescing, estimators, and projector step infrastructure.
+Implements scalable FCIQMC/FCI-FRI style sparse-state propagation,
+coalescing, estimators, and projector infrastructure.
 
 ## Public API
 
@@ -13,6 +13,8 @@ coalescing, estimators, and projector step infrastructure.
   `run_fcifri_block`, `FCIFRIRun`
 - Sparse/core helpers: `SparseVector`, `sparse_dot_sorted`, coalescers,
   `initiator_threshold`, shift/estimator helpers
+- The old int32-only CPU spawn/projector/subspace helper stack is no longer
+  part of the supported package surface.
 - Optional debug exports are re-exported when debug module is present.
 
 ## Workflows

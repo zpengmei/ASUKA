@@ -32,6 +32,628 @@ import numpy as np
 from asuka.kernels import cueri as cueri_kernels
 
 
+def _ppps_work_bucket_label(work: int) -> str:
+    w = int(work)
+    if w <= 8:
+        return "1..8"
+    if w <= 32:
+        return "9..32"
+    if w <= 128:
+        return "33..128"
+    return ">128"
+
+
+_PPPS_PACKED_EXACT_SHAPES: tuple[tuple[int, int], ...] = (
+    (1, 1),
+    (1, 3),
+    (1, 6),
+    (1, 9),
+    (3, 1),
+    (3, 3),
+    (3, 6),
+    (3, 9),
+    (6, 1),
+    (6, 3),
+    (6, 6),
+    (6, 9),
+    (9, 1),
+    (9, 3),
+    (9, 6),
+    (9, 9),
+)
+
+
+_PPPS_PACKED_SHAPE_TARGETS: tuple[str, ...] = (
+    "1x1",
+    "1x3",
+    "1x6",
+    "1x9",
+    "3x1",
+    "3x3",
+    "3x6",
+    "3x9",
+    "6x1",
+    "6x3",
+    "6x6",
+    "6x9",
+    "9x1",
+    "9x3",
+    "9x6",
+    "9x9",
+)
+
+_PPPS_PACKED_WORK_BUCKET_ORDER: tuple[str, ...] = ("1..8", "9..32", "33..128", ">128")
+_PPPS_PREPACKED_CONTEXT_SHAPES: tuple[tuple[int, int], ...] = (
+    (3, 3),
+    (1, 3),
+    (3, 1),
+    (1, 1),
+    (9, 3),
+    (9, 1),
+    (3, 9),
+    (1, 9),
+)
+
+
+@dataclass(frozen=True)
+class _PppsPackedGroup:
+    shape_key: str
+    work_bucket: str
+    transpose: bool
+    nAB: int
+    nCD: int
+    packed_start: int
+    packed_stop: int
+    original_task_idx: np.ndarray
+
+
+@dataclass(frozen=True)
+class _PppsPackedSlabPlan:
+    packed_task_spAB: np.ndarray
+    packed_task_spCD: np.ndarray
+    packed_nAB: np.ndarray
+    packed_nCD: np.ndarray
+    packed_to_original: np.ndarray
+    original_to_packed: np.ndarray
+    groups: tuple[_PppsPackedGroup, ...]
+    eligible_ntasks: int
+    fallback_ntasks: int
+
+
+@dataclass(frozen=True)
+class _DirectJKPppsPackedGroup:
+    task_idx: Any
+    task_spAB: Any
+    task_spCD: Any
+    nAB: int
+    nCD: int
+    exact: bool
+    ntasks: int
+    packed: Any = None
+
+
+@dataclass(frozen=True)
+class _DirectJKPppsPackedExactData:
+    Ax: Any
+    Ay: Any
+    Az: Any
+    Bx: Any
+    By: Any
+    Bz: Any
+    Cx: Any
+    Cy: Any
+    Cz: Any
+    ab_eta: Any
+    ab_Px: Any
+    ab_Py: Any
+    ab_Pz: Any
+    ab_cK: Any
+    cd_eta: Any
+    cd_Qx: Any
+    cd_Qy: Any
+    cd_Qz: Any
+    cd_cK: Any
+
+
+def _shape_key_from_npair(nAB: int, nCD: int) -> str:
+    return f"{int(nAB)}x{int(nCD)}"
+
+
+def _build_ppps_packed_slab_plan(
+    *,
+    task_spAB: np.ndarray,
+    task_spCD: np.ndarray,
+    sp_npair: np.ndarray,
+    transpose: bool,
+    target_shape_keys: tuple[str, ...] = _PPPS_PACKED_SHAPE_TARGETS,
+    max_tasks_per_group: int = 8192,
+) -> _PppsPackedSlabPlan:
+    task_spAB = np.asarray(task_spAB, dtype=np.int32).reshape(-1)
+    task_spCD = np.asarray(task_spCD, dtype=np.int32).reshape(-1)
+    if task_spAB.shape != task_spCD.shape:
+        raise ValueError("task_spAB and task_spCD must have the same shape")
+    if int(max_tasks_per_group) <= 0:
+        raise ValueError("max_tasks_per_group must be > 0")
+
+    ntasks = int(task_spAB.size)
+    if ntasks == 0:
+        empty_i32 = np.empty((0,), dtype=np.int32)
+        return _PppsPackedSlabPlan(
+            packed_task_spAB=empty_i32,
+            packed_task_spCD=empty_i32,
+            packed_nAB=empty_i32,
+            packed_nCD=empty_i32,
+            packed_to_original=empty_i32,
+            original_to_packed=empty_i32,
+            groups=tuple(),
+            eligible_ntasks=0,
+            fallback_ntasks=0,
+        )
+
+    sp_npair = np.asarray(sp_npair, dtype=np.int32).reshape(-1)
+    nAB = np.asarray(sp_npair[task_spAB], dtype=np.int32)
+    nCD = np.asarray(sp_npair[task_spCD], dtype=np.int32)
+    shape_keys = [_shape_key_from_npair(int(abv), int(cdv)) for abv, cdv in zip(nAB.tolist(), nCD.tolist())]
+    work_bins = [_ppps_work_bucket_label(int(abv) * int(cdv)) for abv, cdv in zip(nAB.tolist(), nCD.tolist())]
+
+    target_rank = {str(key): i for i, key in enumerate(tuple(target_shape_keys))}
+    work_rank = {str(key): i for i, key in enumerate(_PPPS_PACKED_WORK_BUCKET_ORDER)}
+
+    eligible_idx: list[int] = []
+    fallback_idx: list[int] = []
+    eligible_keys: dict[tuple[str, str], list[int]] = {}
+    fallback_keys: dict[tuple[str, str], list[int]] = {}
+    fallback_seen_order: list[tuple[str, str]] = []
+
+    for idx, (shape_key, work_bucket) in enumerate(zip(shape_keys, work_bins)):
+        key = (str(shape_key), str(work_bucket))
+        if shape_key in target_rank:
+            eligible_idx.append(int(idx))
+            eligible_keys.setdefault(key, []).append(int(idx))
+        else:
+            fallback_idx.append(int(idx))
+            if key not in fallback_keys:
+                fallback_keys[key] = []
+                fallback_seen_order.append(key)
+            fallback_keys[key].append(int(idx))
+
+    ordered_keys = sorted(
+        eligible_keys.keys(),
+        key=lambda key: (target_rank.get(key[0], len(target_rank)), work_rank.get(key[1], len(work_rank)), key[0], key[1]),
+    )
+    ordered_keys.extend(fallback_seen_order)
+
+    packed_perm_parts: list[np.ndarray] = []
+    groups: list[_PppsPackedGroup] = []
+    packed_start = 0
+    for key in ordered_keys:
+        if key in eligible_keys:
+            idx_list = eligible_keys[key]
+        else:
+            idx_list = fallback_keys[key]
+        idx_arr = np.asarray(idx_list, dtype=np.int32)
+        if idx_arr.size == 0:
+            continue
+        shape_key, work_bucket = key
+        first = int(idx_arr[0])
+        group_nAB = int(nAB[first])
+        group_nCD = int(nCD[first])
+        for offset in range(0, int(idx_arr.size), int(max_tasks_per_group)):
+            chunk = np.asarray(idx_arr[offset: offset + int(max_tasks_per_group)], dtype=np.int32)
+            if chunk.size == 0:
+                continue
+            packed_perm_parts.append(chunk)
+            packed_stop = packed_start + int(chunk.size)
+            groups.append(
+                _PppsPackedGroup(
+                    shape_key=str(shape_key),
+                    work_bucket=str(work_bucket),
+                    transpose=bool(transpose),
+                    nAB=int(group_nAB),
+                    nCD=int(group_nCD),
+                    packed_start=int(packed_start),
+                    packed_stop=int(packed_stop),
+                    original_task_idx=chunk,
+                )
+            )
+            packed_start = int(packed_stop)
+
+    packed_to_original = np.concatenate(packed_perm_parts).astype(np.int32, copy=False)
+    original_to_packed = np.empty((ntasks,), dtype=np.int32)
+    original_to_packed[packed_to_original] = np.arange(ntasks, dtype=np.int32)
+
+    return _PppsPackedSlabPlan(
+        packed_task_spAB=np.asarray(task_spAB[packed_to_original], dtype=np.int32),
+        packed_task_spCD=np.asarray(task_spCD[packed_to_original], dtype=np.int32),
+        packed_nAB=np.asarray(nAB[packed_to_original], dtype=np.int32),
+        packed_nCD=np.asarray(nCD[packed_to_original], dtype=np.int32),
+        packed_to_original=np.asarray(packed_to_original, dtype=np.int32),
+        original_to_packed=original_to_packed,
+        groups=tuple(groups),
+        eligible_ntasks=int(len(eligible_idx)),
+        fallback_ntasks=int(len(fallback_idx)),
+    )
+
+
+def _accumulate_ppps_packed_plan_stats(stats: dict[str, Any], plan: _PppsPackedSlabPlan) -> None:
+    stats["family_ntasks"] = int(stats.get("family_ntasks", 0)) + int(plan.packed_to_original.size)
+    stats["eligible_ntasks"] = int(stats.get("eligible_ntasks", 0)) + int(plan.eligible_ntasks)
+    stats["fallback_ntasks"] = int(stats.get("fallback_ntasks", 0)) + int(plan.fallback_ntasks)
+    stats["group_count"] = int(stats.get("group_count", 0)) + int(len(plan.groups))
+
+    shape_counts = stats.setdefault("shape_counts", {})
+    work_bin_counts = stats.setdefault("work_bin_counts", {})
+    group_counts = stats.setdefault("group_counts", {})
+    for group in plan.groups:
+        nt = int(group.packed_stop) - int(group.packed_start)
+        shape_counts[str(group.shape_key)] = int(shape_counts.get(str(group.shape_key), 0)) + int(nt)
+        work_bin_counts[str(group.work_bucket)] = int(work_bin_counts.get(str(group.work_bucket), 0)) + int(nt)
+        gkey = f"{group.shape_key}|{group.work_bucket}"
+        group_counts[gkey] = int(group_counts.get(gkey, 0)) + int(nt)
+
+
+def _build_direct_jk_ppps_packed_groups(
+    *,
+    task_spAB_dev,
+    task_spCD_dev,
+    task_spAB_cpu: np.ndarray,
+    task_spCD_cpu: np.ndarray,
+    sp_npair_cpu: np.ndarray,
+    dsp=None,
+    dbasis=None,
+    pair_tables=None,
+    exact_shapes: tuple[tuple[int, int], ...] = _PPPS_PREPACKED_CONTEXT_SHAPES,
+):
+    import cupy as cp  # noqa: PLC0415
+
+    task_spAB_cpu = np.asarray(task_spAB_cpu, dtype=np.int32).reshape(-1)
+    task_spCD_cpu = np.asarray(task_spCD_cpu, dtype=np.int32).reshape(-1)
+    if task_spAB_cpu.shape != task_spCD_cpu.shape:
+        raise ValueError("task_spAB_cpu and task_spCD_cpu must have the same shape")
+    ntasks = int(task_spAB_cpu.size)
+    if ntasks == 0:
+        return tuple()
+
+    sp_npair_cpu = np.asarray(sp_npair_cpu, dtype=np.int32).reshape(-1)
+    nAB = np.asarray(sp_npair_cpu[task_spAB_cpu], dtype=np.int32)
+    nCD = np.asarray(sp_npair_cpu[task_spCD_cpu], dtype=np.int32)
+    exact_mask = np.zeros((ntasks,), dtype=bool)
+    groups: list[_DirectJKPppsPackedGroup] = []
+
+    for npair_ab, npair_cd in tuple(exact_shapes):
+        idx = np.flatnonzero((nAB == int(npair_ab)) & (nCD == int(npair_cd))).astype(np.int32, copy=False)
+        if int(idx.size) == 0:
+            continue
+        idx_dev = cp.asarray(idx, dtype=cp.int32)
+        task_spAB_group = cp.ascontiguousarray(task_spAB_dev[idx_dev])
+        task_spCD_group = cp.ascontiguousarray(task_spCD_dev[idx_dev])
+        packed = None
+        if dsp is not None and dbasis is not None and pair_tables is not None:
+            packed = _pack_direct_jk_ppps_exact_group(
+                task_spAB=task_spAB_group,
+                task_spCD=task_spCD_group,
+                dsp=dsp,
+                dbasis=dbasis,
+                pair_tables=pair_tables,
+                nAB=int(npair_ab),
+                nCD=int(npair_cd),
+            )
+        groups.append(
+            _DirectJKPppsPackedGroup(
+                task_idx=idx_dev,
+                task_spAB=task_spAB_group,
+                task_spCD=task_spCD_group,
+                nAB=int(npair_ab),
+                nCD=int(npair_cd),
+                exact=True,
+                ntasks=int(idx.size),
+                packed=packed,
+            )
+        )
+        exact_mask[idx] = True
+
+    fallback_idx = np.flatnonzero(~exact_mask).astype(np.int32, copy=False)
+    if int(fallback_idx.size) > 0:
+        fallback_dev = cp.asarray(fallback_idx, dtype=cp.int32)
+        groups.append(
+            _DirectJKPppsPackedGroup(
+                task_idx=fallback_dev,
+                task_spAB=cp.ascontiguousarray(task_spAB_dev[fallback_dev]),
+                task_spCD=cp.ascontiguousarray(task_spCD_dev[fallback_dev]),
+                nAB=0,
+                nCD=0,
+                exact=False,
+                ntasks=int(fallback_idx.size),
+            )
+        )
+
+    return tuple(groups)
+
+
+def _pack_direct_jk_ppps_exact_group(
+    *,
+    task_spAB,
+    task_spCD,
+    dsp,
+    dbasis,
+    pair_tables,
+    nAB: int,
+    nCD: int,
+):
+    import cupy as cp  # noqa: PLC0415
+
+    A = dsp.sp_A[task_spAB]
+    B = dsp.sp_B[task_spAB]
+    C = dsp.sp_A[task_spCD]
+    Ax = cp.ascontiguousarray(dbasis.shell_cx[A])
+    Ay = cp.ascontiguousarray(dbasis.shell_cy[A])
+    Az = cp.ascontiguousarray(dbasis.shell_cz[A])
+    Bx = cp.ascontiguousarray(dbasis.shell_cx[B])
+    By = cp.ascontiguousarray(dbasis.shell_cy[B])
+    Bz = cp.ascontiguousarray(dbasis.shell_cz[B])
+    Cx = cp.ascontiguousarray(dbasis.shell_cx[C])
+    Cy = cp.ascontiguousarray(dbasis.shell_cy[C])
+    Cz = cp.ascontiguousarray(dbasis.shell_cz[C])
+
+    ab_base = dsp.sp_pair_start[task_spAB].astype(cp.int64, copy=False)
+    cd_base = dsp.sp_pair_start[task_spCD].astype(cp.int64, copy=False)
+    ab_offsets = cp.arange(int(nAB), dtype=cp.int64)[None, :]
+    cd_offsets = cp.arange(int(nCD), dtype=cp.int64)[None, :]
+    ab_idx = cp.ascontiguousarray((ab_base[:, None] + ab_offsets).reshape(-1))
+    cd_idx = cp.ascontiguousarray((cd_base[:, None] + cd_offsets).reshape(-1))
+
+    return _DirectJKPppsPackedExactData(
+        Ax=Ax,
+        Ay=Ay,
+        Az=Az,
+        Bx=Bx,
+        By=By,
+        Bz=Bz,
+        Cx=Cx,
+        Cy=Cy,
+        Cz=Cz,
+        ab_eta=cp.ascontiguousarray(pair_tables.pair_eta[ab_idx]),
+        ab_Px=cp.ascontiguousarray(pair_tables.pair_Px[ab_idx]),
+        ab_Py=cp.ascontiguousarray(pair_tables.pair_Py[ab_idx]),
+        ab_Pz=cp.ascontiguousarray(pair_tables.pair_Pz[ab_idx]),
+        ab_cK=cp.ascontiguousarray(pair_tables.pair_cK[ab_idx]),
+        cd_eta=cp.ascontiguousarray(pair_tables.pair_eta[cd_idx]),
+        cd_Qx=cp.ascontiguousarray(pair_tables.pair_Px[cd_idx]),
+        cd_Qy=cp.ascontiguousarray(pair_tables.pair_Py[cd_idx]),
+        cd_Qz=cp.ascontiguousarray(pair_tables.pair_Pz[cd_idx]),
+        cd_cK=cp.ascontiguousarray(pair_tables.pair_cK[cd_idx]),
+    )
+
+
+def _slice_direct_jk_ppps_packed_exact_data(packed: _DirectJKPppsPackedExactData, idx, nAB: int, nCD: int):
+    import cupy as cp  # noqa: PLC0415
+
+    idx = cp.asarray(idx, dtype=cp.int32)
+    def _sel1(x):
+        return cp.ascontiguousarray(x[idx])
+    def _sel2(x, width: int):
+        return cp.ascontiguousarray(x.reshape((-1, int(width)))[idx].reshape(-1))
+    return _DirectJKPppsPackedExactData(
+        Ax=_sel1(packed.Ax),
+        Ay=_sel1(packed.Ay),
+        Az=_sel1(packed.Az),
+        Bx=_sel1(packed.Bx),
+        By=_sel1(packed.By),
+        Bz=_sel1(packed.Bz),
+        Cx=_sel1(packed.Cx),
+        Cy=_sel1(packed.Cy),
+        Cz=_sel1(packed.Cz),
+        ab_eta=_sel2(packed.ab_eta, nAB),
+        ab_Px=_sel2(packed.ab_Px, nAB),
+        ab_Py=_sel2(packed.ab_Py, nAB),
+        ab_Pz=_sel2(packed.ab_Pz, nAB),
+        ab_cK=_sel2(packed.ab_cK, nAB),
+        cd_eta=_sel2(packed.cd_eta, nCD),
+        cd_Qx=_sel2(packed.cd_Qx, nCD),
+        cd_Qy=_sel2(packed.cd_Qy, nCD),
+        cd_Qz=_sel2(packed.cd_Qz, nCD),
+        cd_cK=_sel2(packed.cd_cK, nCD),
+    )
+
+
+_PPPS_PREPACKED_RAW_KERNEL = None
+
+
+def _get_ppps_prepacked_raw_kernel(cp):
+    global _PPPS_PREPACKED_RAW_KERNEL
+    if _PPPS_PREPACKED_RAW_KERNEL is not None:
+        return _PPPS_PREPACKED_RAW_KERNEL
+    code = r'''
+extern "C" __device__ __forceinline__ void boys_f0_f1_f2_f3_f4(
+    double T, double& F0, double& F1, double& F2, double& F3, double& F4) {
+  if (T < 1e-8) {
+    F0 = 1.0 - T / 3.0;
+    F1 = 1.0 / 3.0 - T / 5.0;
+    F2 = 1.0 / 5.0 - T / 7.0;
+    F3 = 1.0 / 7.0 - T / 9.0;
+    F4 = 1.0 / 9.0 - T / 11.0;
+    return;
+  }
+  const double sqrtT = sqrt(T);
+  F0 = 0.88622692545275801364908374167057 * erf(sqrtT) / sqrtT;
+  const double e = exp(-T);
+  F1 = (F0 - e) / (2.0 * T);
+  F2 = (3.0 * F1 - e) / (2.0 * T);
+  F3 = (5.0 * F2 - e) / (2.0 * T);
+  F4 = (7.0 * F3 - e) / (2.0 * T);
+}
+
+extern "C" __device__ __forceinline__ double t3_component(
+    int a, int b, int c, const double* dvec, double term_t3_f2, double term_t3_f3) {
+  const double dab = (a == b) ? dvec[c] : 0.0;
+  const double dac = (a == c) ? dvec[b] : 0.0;
+  const double dbc = (b == c) ? dvec[a] : 0.0;
+  return term_t3_f2 * (dab + dac + dbc) + term_t3_f3 * dvec[a] * dvec[b] * dvec[c];
+}
+
+extern "C" __global__ void ppps_prepacked_exact_scalar(
+    const double* Ax, const double* Ay, const double* Az,
+    const double* Bx, const double* By, const double* Bz,
+    const double* Cx, const double* Cy, const double* Cz,
+    const double* ab_eta, const double* ab_Px, const double* ab_Py, const double* ab_Pz, const double* ab_cK,
+    const double* cd_eta, const double* cd_Qx, const double* cd_Qy, const double* cd_Qz, const double* cd_cK,
+    int ntasks, int nAB, int nCD, double* eri_out) {
+  const int t = blockIdx.x * blockDim.x + threadIdx.x;
+  if (t >= ntasks) return;
+  const double ax = Ax[t], ay = Ay[t], az = Az[t];
+  const double bx = Bx[t], by = By[t], bz = Bz[t];
+  const double cx = Cx[t], cy = Cy[t], cz = Cz[t];
+  double acc[27];
+#pragma unroll
+  for (int i = 0; i < 27; ++i) acc[i] = 0.0;
+  const int ab0 = t * nAB;
+  const int cd0 = t * nCD;
+  for (int ii = 0; ii < nAB; ++ii) {
+    const int abi = ab0 + ii;
+    const double p = ab_eta[abi];
+    const double Px = ab_Px[abi];
+    const double Py = ab_Py[abi];
+    const double Pz = ab_Pz[abi];
+    const double PA[3] = {Px - ax, Py - ay, Pz - az};
+    const double PB[3] = {Px - bx, Py - by, Pz - bz};
+    const double cKab = ab_cK[abi];
+    for (int jj = 0; jj < nCD; ++jj) {
+      const int cdj = cd0 + jj;
+      const double q = cd_eta[cdj];
+      const double Qx = cd_Qx[cdj];
+      const double Qy = cd_Qy[cdj];
+      const double Qz = cd_Qz[cdj];
+      const double QC[3] = {Qx - cx, Qy - cy, Qz - cz};
+      const double dvec[3] = {Px - Qx, Py - Qy, Pz - Qz};
+      const double PQ2 = dvec[0]*dvec[0] + dvec[1]*dvec[1] + dvec[2]*dvec[2];
+      const double denom = p + q;
+      const double omega = p * q / denom;
+      const double T = omega * PQ2;
+      const double pref = 34.986836655249725 * rsqrt(denom) / (p * q);
+      const double base = pref * cKab * cd_cK[cdj];
+      double F0, F1, F2, F3, F4;
+      boys_f0_f1_f2_f3_f4(T, F0, F1, F2, F3, F4);
+      (void)F4;
+      const double I = base * F0;
+      const double omega_over_p = omega / p;
+      const double omega_over_q = omega / q;
+      const double Jp[3] = {
+        -omega_over_p * base * F1 * dvec[0],
+        -omega_over_p * base * F1 * dvec[1],
+        -omega_over_p * base * F1 * dvec[2]};
+      const double Jq[3] = {
+         omega_over_q * base * F1 * dvec[0],
+         omega_over_q * base * F1 * dvec[1],
+         omega_over_q * base * F1 * dvec[2]};
+      const double w2 = omega * omega;
+      const double w3 = w2 * omega;
+      const double inv4p2 = 1.0 / (4.0 * p * p);
+      const double inv4pq = 1.0 / (4.0 * p * q);
+      const double t4 = 4.0 * w2 * F2;
+      const double t2 = 2.0 * omega * F1;
+      double Kp[3][3];
+      double L[3][3];
+      for (int a = 0; a < 3; ++a) {
+        for (int b = 0; b < 3; ++b) {
+          const double dij = (a == b) ? 1.0 : 0.0;
+          const double H = base * (t4 * dvec[a] * dvec[b] - (a == b ? t2 : 0.0));
+          Kp[a][b] = (H + 2.0 * p * I * dij) * inv4p2;
+          L[a][b] = -H * inv4pq;
+        }
+      }
+      const double term_t3_f2 = 4.0 * w2 * base * F2;
+      const double term_t3_f3 = -8.0 * w3 * base * F3;
+      for (int ia = 0; ia < 3; ++ia) {
+        for (int ib = 0; ib < 3; ++ib) {
+          const double a = PA[ia];
+          const double b = PB[ib];
+          const double dij = (ia == ib) ? 1.0 : 0.0;
+          for (int ic = 0; ic < 3; ++ic) {
+            const double cc = QC[ic];
+            const double T3 = t3_component(ia, ib, ic, dvec, term_t3_f2, term_t3_f3);
+            const double M_ijk = (-T3 + 4.0 * p * q * dij * Jq[ic]) / (8.0 * p * p * q);
+            acc[ia * 9 + ib * 3 + ic] +=
+              M_ijk + cc * Kp[ia][ib] + b * L[ia][ic] + b * cc * Jp[ia]
+              + a * L[ib][ic] + a * cc * Jp[ib] + a * b * Jq[ic] + a * b * cc * I;
+          }
+        }
+      }
+    }
+  }
+  const int out0 = t * 27;
+  for (int i = 0; i < 27; ++i) eri_out[out0 + i] = acc[i];
+}
+'''
+    _PPPS_PREPACKED_RAW_KERNEL = cp.RawKernel(code, "ppps_prepacked_exact_scalar", options=("-std=c++17",))
+    return _PPPS_PREPACKED_RAW_KERNEL
+
+
+def _accumulate_ppps_shape_census(
+    census: dict[str, Any],
+    *,
+    cls: str,
+    transpose: bool,
+    nAB: np.ndarray,
+    nCD: np.ndarray,
+) -> None:
+    nAB = np.asarray(nAB, dtype=np.int64).reshape(-1)
+    nCD = np.asarray(nCD, dtype=np.int64).reshape(-1)
+    if nAB.shape != nCD.shape:
+        raise ValueError("nAB and nCD must have the same shape")
+    if nAB.size == 0:
+        return
+
+    census["family_ntasks"] = int(census.get("family_ntasks", 0)) + int(nAB.size)
+    by_class = census.setdefault("by_class", {})
+    by_class[str(cls)] = int(by_class.get(str(cls), 0)) + int(nAB.size)
+    by_transpose = census.setdefault("by_transpose", {})
+    tkey = "transpose" if bool(transpose) else "native"
+    by_transpose[tkey] = int(by_transpose.get(tkey, 0)) + int(nAB.size)
+
+    nAB_counts = census.setdefault("nAB_counts", {})
+    uniq_ab, counts_ab = np.unique(nAB, return_counts=True)
+    for val, cnt in zip(uniq_ab.tolist(), counts_ab.tolist()):
+        key = str(int(val))
+        nAB_counts[key] = int(nAB_counts.get(key, 0)) + int(cnt)
+
+    nCD_counts = census.setdefault("nCD_counts", {})
+    uniq_cd, counts_cd = np.unique(nCD, return_counts=True)
+    for val, cnt in zip(uniq_cd.tolist(), counts_cd.tolist()):
+        key = str(int(val))
+        nCD_counts[key] = int(nCD_counts.get(key, 0)) + int(cnt)
+
+    shape_counts = census.setdefault("shape_counts", {})
+    uniq_shapes, counts_shape = np.unique(np.stack((nAB, nCD), axis=1), axis=0, return_counts=True)
+    for (abv, cdv), cnt in zip(uniq_shapes.tolist(), counts_shape.tolist()):
+        key = f"{int(abv)}x{int(cdv)}"
+        shape_counts[key] = int(shape_counts.get(key, 0)) + int(cnt)
+
+    work = nAB * nCD
+    work_counts = census.setdefault("work_counts", {})
+    uniq_work, counts_work = np.unique(work, return_counts=True)
+    for val, cnt in zip(uniq_work.tolist(), counts_work.tolist()):
+        key = str(int(val))
+        work_counts[key] = int(work_counts.get(key, 0)) + int(cnt)
+
+    work_bin_counts = census.setdefault("work_bin_counts", {})
+    for val, cnt in zip(uniq_work.tolist(), counts_work.tolist()):
+        key = _ppps_work_bucket_label(int(val))
+        work_bin_counts[key] = int(work_bin_counts.get(key, 0)) + int(cnt)
+
+    work_sum = int(work.sum(dtype=np.int64))
+    census["total_work"] = int(census.get("total_work", 0)) + int(work_sum)
+    work_min = int(work.min())
+    work_max = int(work.max())
+    if "work_min" not in census:
+        census["work_min"] = int(work_min)
+    else:
+        census["work_min"] = min(int(census["work_min"]), int(work_min))
+    if "work_max" not in census:
+        census["work_max"] = int(work_max)
+    else:
+        census["work_max"] = max(int(census["work_max"]), int(work_max))
+
+
 @dataclass(frozen=True)
 class _SortedSlab:
     """Precomputed sorted task slab (shell-pair index pairs grouped by ERI class).
@@ -108,6 +730,7 @@ class DirectJKContext:
     # Presorted task slabs
     slabs: tuple            # tuple[_SortedSlab, ...]
     plans: tuple            # tuple[tuple[_DirectJKGroupPlan, ...], ...] aligned with slabs
+    ppps_packed_groups: tuple  # tuple[tuple[tuple[_DirectJKPppsPackedGroup, ...] | None, ...], ...]
     nsp: int
     ntasks: int
     eps_schwarz: float
@@ -245,11 +868,18 @@ class DirectJKWorkspace:
     """Per-device persistent workspace for direct J/K builds."""
 
     copy_stream: Any
-    upload_ab: list[Any]
-    upload_cd: list[Any]
+    upload_ab: list[Any] | None
+    upload_cd: list[Any] | None
     upload_done: list[Any]
     compute_done: list[Any]
     max_ntasks: int
+    D_flat: Any | None
+    J_flat: Any | None
+    K_flat: Any | None
+    J_bufs: Any | None
+    K_bufs: Any | None
+    max_nao2: int
+    max_n_bufs: int
 
 
 _DIRECT_JK_WS_BY_DEVICE: dict[int, DirectJKWorkspace | None] = {}
@@ -324,8 +954,6 @@ def release_direct_jk_workspace_cache() -> None:
 
 def _get_direct_jk_workspace(cp, ctx: DirectJKContext) -> DirectJKWorkspace | None:
     need = int(getattr(ctx, "max_cpu_slab_ntasks", 0) or 0)
-    if need <= 0:
-        return None
     dev = int(cp.cuda.runtime.getDevice())
     ws = _DIRECT_JK_WS_BY_DEVICE.get(dev)
     if ws is not None and int(ws.max_ntasks) >= need:
@@ -333,8 +961,12 @@ def _get_direct_jk_workspace(cp, ctx: DirectJKContext) -> DirectJKWorkspace | No
 
     # (Re)allocate upload buffers sized to the largest CPU slab in this context.
     copy_stream = cp.cuda.Stream(non_blocking=True)
-    upload_ab = [cp.empty((need,), dtype=cp.int32), cp.empty((need,), dtype=cp.int32)]
-    upload_cd = [cp.empty((need,), dtype=cp.int32), cp.empty((need,), dtype=cp.int32)]
+    if need > 0:
+        upload_ab = [cp.empty((need,), dtype=cp.int32), cp.empty((need,), dtype=cp.int32)]
+        upload_cd = [cp.empty((need,), dtype=cp.int32), cp.empty((need,), dtype=cp.int32)]
+    else:
+        upload_ab = None
+        upload_cd = None
     upload_done = [cp.cuda.Event(), cp.cuda.Event()]
     compute_done = [cp.cuda.Event(), cp.cuda.Event()]
     # Mark buffers as initially reusable.
@@ -349,9 +981,33 @@ def _get_direct_jk_workspace(cp, ctx: DirectJKContext) -> DirectJKWorkspace | No
         upload_done=upload_done,
         compute_done=compute_done,
         max_ntasks=int(need),
+        D_flat=None,
+        J_flat=None,
+        K_flat=None,
+        J_bufs=None,
+        K_bufs=None,
+        max_nao2=0,
+        max_n_bufs=0,
     )
     _DIRECT_JK_WS_BY_DEVICE[dev] = ws
     return ws
+
+
+def _ensure_direct_jk_matrix_buffers(cp, ws: DirectJKWorkspace | None, *, nao: int, n_bufs: int, want_J: bool, want_K: bool):
+    if ws is None:
+        return None, None, None, None, None
+
+    nao2 = int(nao) * int(nao)
+    if int(ws.max_nao2) < nao2 or ws.D_flat is None or ws.J_flat is None or ws.K_flat is None:
+        ws.D_flat = cp.empty((nao2,), dtype=cp.float64)
+        ws.J_flat = cp.empty((nao2,), dtype=cp.float64)
+        ws.K_flat = cp.empty((nao2,), dtype=cp.float64)
+        ws.max_nao2 = int(nao2)
+
+    D_flat = ws.D_flat[:nao2]
+    J_flat = ws.J_flat[:nao2] if want_J else None
+    K_flat = ws.K_flat[:nao2] if want_K else None
+    return D_flat, J_flat, K_flat, None, None
 
 
 def _auto_direct_jk_budgets(cp, *, max_slab_tasks: int | None, gpu_task_budget_bytes: int | None) -> tuple[int, int]:
@@ -705,6 +1361,7 @@ def make_direct_jk_context(
         sp_class_lo_cpu=sp_class_lo_cpu,
         slabs=tuple(slabs),
         plans=tuple(plans),
+        ppps_packed_groups=tuple(),
         nsp=int(nsp),
         ntasks=int(ntasks),
         eps_schwarz=float(eps_f),
@@ -828,10 +1485,6 @@ def direct_JK(
     D_gpu = cp.asarray(D, dtype=cp.float64)
     if D_gpu.ndim != 2 or D_gpu.shape != (nao, nao):
         raise ValueError(f"D must be ({nao}, {nao}), got {tuple(D_gpu.shape)}")
-    D_flat = cp.ascontiguousarray(D_gpu.ravel())
-
-    J_flat = cp.zeros((nao * nao,), dtype=cp.float64) if want_J else None
-    K_flat = cp.zeros((nao * nao,), dtype=cp.float64) if want_K else None
 
     # Density prescreening: compute max|D| per shell pair for CSAM screening
     eps_density_env = os.environ.get("ASUKA_DIRECT_JK_EPS_DENSITY", "")
@@ -853,6 +1506,11 @@ def direct_JK(
     hot_s1_env = str(os.environ.get("ASUKA_DENSE_CONTRACT_HOT_S1", "") or "").strip().lower()
     hot_s1_contract_enabled = hot_s1_env not in {"0", "false", "off", "no"}
     eri_block_pref_env = str(os.environ.get("ASUKA_DIRECT_JK_ERI_BLOCK_MODE", "") or "").strip().lower()
+    ppps_census_env = str(os.environ.get("ASUKA_DIRECT_JK_PPPS_CENSUS", "") or "").strip().lower()
+    ppps_census_enabled = ppps_census_env in {"1", "true", "on", "yes"}
+    ppps_packed_plan_env = str(os.environ.get("ASUKA_DIRECT_JK_PPPS_PACKED_PLAN", "") or "").strip().lower()
+    ppps_packed_plan_enabled = ppps_packed_plan_env in {"1", "true", "on", "yes"}
+    class_policy_env = _parse_direct_jk_class_policy_env(os.environ.get("ASUKA_DIRECT_JK_CLASS_POLICY", ""))
     if eri_block_pref_env:
         eri_block_pref = eri_block_pref_env in {"1", "true", "on", "yes"}
     else:
@@ -862,7 +1520,7 @@ def direct_JK(
         "ddss", "ssdp", "psds", "psdp", "psdd", "ppds", "dsds", "dsdp",
         "ppdp", "ppdd", "dsdd", "dpdp", "dpdd", "dddd",
     }
-    fused_enabled: set[str] = {"ssss"}
+    fused_enabled: set[str] = {"ssss", "psss", "psps"}
     fused_flag = str(os.environ.get("ASUKA_DIRECT_JK_FUSED", "") or "").strip().lower()
     if fused_flag in ("1", "true", "on", "yes"):
         fused_enabled = set(fused_supported)
@@ -888,6 +1546,28 @@ def direct_JK(
 
     # Multi-buffer J/K accumulation: distribute atomicAdd contention for fused kernels.
     n_bufs = _choose_n_bufs(nao) if fused_enabled else 1
+    D_flat, J_flat, K_flat, J_bufs, K_bufs = _ensure_direct_jk_matrix_buffers(
+        cp,
+        ws,
+        nao=int(nao),
+        n_bufs=int(n_bufs),
+        want_J=bool(want_J),
+        want_K=bool(want_K),
+    )
+    if D_flat is None:
+        D_flat = cp.ascontiguousarray(D_gpu.ravel())
+        J_flat = cp.zeros((nao * nao,), dtype=cp.float64) if want_J else None
+        K_flat = cp.zeros((nao * nao,), dtype=cp.float64) if want_K else None
+    else:
+        D_src = D_gpu.ravel()
+        if not bool(getattr(D_src.flags, "c_contiguous", False)):
+            D_src = cp.ascontiguousarray(D_src)
+        D_flat[...] = D_src
+        if J_flat is not None:
+            J_flat.fill(0.0)
+        if K_flat is not None:
+            K_flat.fill(0.0)
+
     if n_bufs > 1:
         J_bufs = cp.zeros((n_bufs, nao * nao), dtype=cp.float64) if want_J else None
         K_bufs = cp.zeros((n_bufs, nao * nao), dtype=cp.float64) if want_K else None
@@ -909,6 +1589,10 @@ def direct_JK(
         stats.setdefault("n_fused_calls", 0)
         stats.setdefault("fused_ntasks", 0)
         stats.setdefault("classes", {})
+        if ppps_census_enabled:
+            stats.setdefault("ppps_shape_census", {})
+        if ppps_packed_plan_enabled:
+            stats.setdefault("ppps_packed_plan", {})
     if profile is not None:
         profile.setdefault("direct_jk_classes", {})
 
@@ -953,6 +1637,24 @@ def direct_JK(
         if bool(warp_contract):
             return "staged_warp_contract", False, True
         return "staged_block", False, False
+
+    def _has_explicit_class_policy(default_label: str, kernel_label: str) -> bool:
+        env_eng = _normalize_direct_jk_engine(
+            class_policy_env.get(str(default_label).lower(), class_policy_env.get(str(kernel_label).lower(), ""))
+        )
+        return env_eng is not None
+
+    def _select_staged_eri_mode(default_label: str, kernel_label: str, *, use_warp_mode: bool) -> str:
+        env_eng = _normalize_direct_jk_engine(
+            class_policy_env.get(str(default_label).lower(), class_policy_env.get(str(kernel_label).lower(), ""))
+        )
+        if env_eng == "staged_block":
+            return "block"
+        if bool(use_warp_mode):
+            if str(kernel_label).lower() == "ppps" and env_eng is None:
+                return "auto"
+            return "warp"
+        return "block" if eri_block_pref else "auto"
 
     def _ensure_stats_row(bucket: dict[str, Any], cls: str, kernel_label: str, transpose: bool) -> dict[str, Any]:
         row = bucket.setdefault(
@@ -1059,7 +1761,7 @@ def direct_JK(
                 used_buf = int(cur_buf)
 
         slab_plan = ctx.plans[slab_i]
-        for gp in slab_plan:
+        for g, gp in enumerate(slab_plan):
             orig_cid = int(gp.orig_cid)
             cls = str(gp.class_label)
             klabel = str(gp.kernel_label).lower()
@@ -1100,6 +1802,26 @@ def direct_JK(
                     kernel_spAB_full = kernel_spAB_full[_idx]
                     kernel_spCD_full = kernel_spCD_full[_idx]
                     class_ntasks = n_survive
+
+            if ppps_census_enabled and stats is not None and klabel == "ppps" and class_ntasks > 0:
+                _nAB = cp.asnumpy(ctx.dsp.sp_npair[kernel_spAB_full]).astype(np.int64, copy=False)
+                _nCD = cp.asnumpy(ctx.dsp.sp_npair[kernel_spCD_full]).astype(np.int64, copy=False)
+                _accumulate_ppps_shape_census(
+                    stats.setdefault("ppps_shape_census", {}),
+                    cls=cls,
+                    transpose=transpose,
+                    nAB=_nAB,
+                    nCD=_nCD,
+                )
+            if ppps_packed_plan_enabled and stats is not None and klabel == "ppps" and class_ntasks > 0:
+                _sp_npair = cp.asnumpy(ctx.dsp.sp_npair).astype(np.int32, copy=False)
+                _plan = _build_ppps_packed_slab_plan(
+                    task_spAB=cp.asnumpy(kernel_spAB_full).astype(np.int32, copy=False),
+                    task_spCD=cp.asnumpy(kernel_spCD_full).astype(np.int32, copy=False),
+                    sp_npair=_sp_npair,
+                    transpose=transpose,
+                )
+                _accumulate_ppps_packed_plan_stats(stats.setdefault("ppps_packed_plan", {}), _plan)
 
             fused_fn = None
             if klabel in fused_enabled:
@@ -1215,7 +1937,8 @@ def direct_JK(
                 c1 = min(class_ntasks, c0 + chunk_ntasks)
                 if c1 <= c0:
                     continue
-
+                eri_mode = _select_staged_eri_mode(cls, klabel, use_warp_mode=use_warp_mode)
+                kernel_ms_before = float(profile.get("kernel_ms", 0.0)) if profile is not None else 0.0
                 sub_batch = KernelBatch(
                     task_idx=np.empty(0, dtype=np.int32),  # unused by run_kernel_batch_spd
                     kernel_tasks=TaskList(
@@ -1225,8 +1948,6 @@ def direct_JK(
                     kernel_class_id=np.int32(kernel_cid),
                     transpose=transpose,
                 )
-
-                kernel_ms_before = float(profile.get("kernel_ms", 0.0)) if profile is not None else 0.0
                 tiles = run_kernel_batch_spd(
                     sub_batch,
                     dbasis=ctx.dbasis,
@@ -1234,7 +1955,7 @@ def direct_JK(
                     pt=ctx.pair_tables,
                     stream=None,
                     threads=eval_threads,
-                    mode="warp" if use_warp_mode else ("block" if eri_block_pref else "auto"),
+                    mode=eri_mode,
                     profile=profile,
                     skip_transpose=True,
                 )
@@ -1397,6 +2118,7 @@ def direct_fock_rhf(
     hot_s1_env = str(os.environ.get("ASUKA_DENSE_CONTRACT_HOT_S1", "") or "").strip().lower()
     hot_s1_contract_enabled = hot_s1_env not in {"0", "false", "off", "no"}
     eri_block_pref_env = str(os.environ.get("ASUKA_DIRECT_JK_ERI_BLOCK_MODE", "") or "").strip().lower()
+    class_policy_env = _parse_direct_jk_class_policy_env(os.environ.get("ASUKA_DIRECT_JK_CLASS_POLICY", ""))
     if eri_block_pref_env:
         eri_block_pref = eri_block_pref_env in {"1", "true", "on", "yes"}
     else:
@@ -1436,6 +2158,24 @@ def direct_fock_rhf(
         lc = (x >> 16) & 0xFF
         ld = (x >> 24) & 0xFF
         return f"{_am_label(la)}{_am_label(lb)}{_am_label(lc)}{_am_label(ld)}"
+
+    def _has_explicit_class_policy(default_label: str, kernel_label: str) -> bool:
+        env_eng = _normalize_direct_jk_engine(
+            class_policy_env.get(str(default_label).lower(), class_policy_env.get(str(kernel_label).lower(), ""))
+        )
+        return env_eng is not None
+
+    def _select_staged_eri_mode(default_label: str, kernel_label: str, *, use_warp_mode: bool) -> str:
+        env_eng = _normalize_direct_jk_engine(
+            class_policy_env.get(str(default_label).lower(), class_policy_env.get(str(kernel_label).lower(), ""))
+        )
+        if env_eng == "staged_block":
+            return "block"
+        if bool(use_warp_mode):
+            if str(kernel_label).lower() == "ppps" and env_eng is None:
+                return "auto"
+            return "warp"
+        return "block" if eri_block_pref else "auto"
 
     sp_pair_start_fused = ctx.dsp.sp_pair_start
     if int(sp_pair_start_fused.shape[0]) == int(ctx.dsp.sp_npair.shape[0]) + 1:
@@ -1696,6 +2436,9 @@ def direct_fock_rhf(
                     transpose=transpose,
                 )
 
+                cls = _class_label(orig_cid)
+                klabel = _class_label(kernel_cid).lower()
+                eri_mode = _select_staged_eri_mode(cls, klabel, use_warp_mode=use_warp_mode)
                 tiles = run_kernel_batch_spd(
                     sub_batch,
                     dbasis=ctx.dbasis,
@@ -1703,7 +2446,7 @@ def direct_fock_rhf(
                     pt=ctx.pair_tables,
                     stream=None,
                     threads=eval_threads,
-                    mode="warp" if use_warp_mode else ("block" if eri_block_pref else "auto"),
+                    mode=eri_mode,
                     profile=profile,
                     skip_transpose=True,
                 )

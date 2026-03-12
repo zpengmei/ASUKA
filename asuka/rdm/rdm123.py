@@ -250,14 +250,19 @@ def _reorder_dm123_molcas_trans(
         dm3[:, q, :, :, q, :] -= dm2_vxtz
         for s in range(n):
             dm3[:, q, q, s, s, :] -= dm1
-    # OpenMolcas stores TG3 with full permutation symmetry of the three (tu),(vx),(yz) pairs.
-    dm3_sym = np.asarray(dm3, dtype=np.float64, order="C").copy()
-    dm3_sym += dm3.transpose(2, 3, 0, 1, 4, 5)
-    dm3_sym += dm3.transpose(4, 5, 2, 3, 0, 1)
-    dm3_sym += dm3.transpose(0, 1, 4, 5, 2, 3)
-    dm3_sym += dm3.transpose(2, 3, 4, 5, 0, 1)
-    dm3_sym += dm3.transpose(4, 5, 0, 1, 2, 3)
-    dm3 = np.asarray(dm3_sym * (1.0 / 6.0), dtype=np.float64, order="C")
+    # OpenMolcas `MKTG3` stores transition TG3 only in the canonical packed slot selected
+    # by sorting the usual pair indices (tu,vx,yz) in non-increasing order. Transition TG3
+    # is not obtained by averaging the six pair permutations.
+    n2 = int(n * n)
+    dm3_p = np.asarray(dm3, dtype=np.float64).reshape(n2, n2, n2, order="F")
+    pair_ids = np.arange(n2, dtype=np.int64)
+    ip1 = pair_ids[:, None, None]
+    ip2 = pair_ids[None, :, None]
+    ip3 = pair_ids[None, None, :]
+    hi = np.maximum(np.maximum(ip1, ip2), ip3)
+    lo = np.minimum(np.minimum(ip1, ip2), ip3)
+    mid = ip1 + ip2 + ip3 - hi - lo
+    dm3 = np.asarray(dm3_p[hi, mid, lo].reshape(n, n, n, n, n, n, order="F"), dtype=np.float64, order="C")
 
     return dm1, dm2, dm3
 

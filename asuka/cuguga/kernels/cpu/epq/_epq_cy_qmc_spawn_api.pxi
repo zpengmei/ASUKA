@@ -14,8 +14,8 @@ def qmc_spawn_hamiltonian_events_cy(
 ):
     """Spawn events for `-eps * H * x` (CPU compiled backend; OpenMP-capable).
 
-    This implements the same proposal logic as `asuka.qmc.spawn.spawn_hamiltonian_events`,
-    but runs the parent/event loops in Cython and can parallelize over parents.
+    This implements the legacy CPU proposal logic in Cython and can
+    parallelize over parents.
 
     Notes
     -----
@@ -326,4 +326,3 @@ def qmc_spawn_hamiltonian_events_cy(
                     )
 
     return evt_idx_arr, evt_val_arr
-

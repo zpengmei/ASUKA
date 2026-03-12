@@ -13,6 +13,7 @@ import warnings
 import numpy as np
 
 from asuka.integrals.df_integrals import DFMOIntegrals, DeviceDFMOIntegrals
+from asuka.integrals.direct_integrals import DeviceDirectMOIntegrals
 from asuka.cuguga.drt import DRT
 from asuka.cuguga.blas_threads import blas_thread_limit, openblas_get_num_threads
 from asuka.cuguga.davidson import davidson1 as davidson1_sym
@@ -155,6 +156,20 @@ class H1E2EContractOp:
     eri: Any
     fac: float = 1.0
 
+
+def _is_row_oracle_eri_like(eri: Any) -> bool:
+    return all(
+        hasattr(eri, name)
+        for name in ("norb", "j_ps", "rr_slice_h_eff", "contract_cols", "pair_norm")
+    )
+
+
+def _is_cuda_direct_eri_like(eri: Any) -> bool:
+    return isinstance(eri, DeviceDirectMOIntegrals) or all(
+        hasattr(eri, name)
+        for name in ("norb", "contract_w_block_device", "get_hdiag_slices_device")
+    )
+
 class _StreamObject:
     """Minimal solver base class for cuguga."""
 
@@ -190,6 +205,7 @@ class GUGAFCISolver(_StreamObject):
         use_epq_table,
         aggregate_offdiag_k,
         l_full_d,
+        direct_op_d,
         enable_fp64_emulation,
         gemm_backend,
         emulation_strategy,
@@ -230,6 +246,7 @@ class GUGAFCISolver(_StreamObject):
             use_epq_table=use_epq_table,
             aggregate_offdiag_k=aggregate_offdiag_k,
             l_full_d=l_full_d,
+            direct_op_d=direct_op_d,
             enable_fp64_emulation=enable_fp64_emulation,
             gemm_backend=gemm_backend,
             emulation_strategy=emulation_strategy,
@@ -688,6 +705,7 @@ class GUGAFCISolver(_StreamObject):
         nroots: int | None = None,
         **kwargs,
     ):
+        return_cupy = bool(kwargs.get("return_cupy", False))
         _frontend_controls = _resolve_kernel_frontend_controls_runtime(kwargs=kwargs, defaults=self)
         kernel_profile = bool(_frontend_controls["kernel_profile"])
         kernel_profile_cuda_sync = bool(_frontend_controls["kernel_profile_cuda_sync"])
@@ -807,7 +825,7 @@ class GUGAFCISolver(_StreamObject):
         ]
         matvec_cuda_mixed_low_precision_max_iter = _cuda_mode_cfg["matvec_cuda_mixed_low_precision_max_iter"]
 
-        if matvec_backend in ("cuda_eri_mat", "cuda"):
+        if matvec_backend in ("cuda_eri_mat", "cuda", "cuda_direct"):
             matvec_cuda_use_epq_preview_in = kwargs.get(
                 "matvec_cuda_use_epq_table",
                 getattr(self, "matvec_cuda_use_epq_table", None),
@@ -940,14 +958,21 @@ class GUGAFCISolver(_StreamObject):
         )
 
         # Cache the most recent Hamiltonian for `contract_2e` convenience.
-        self._h1e = np.asarray(h1e, dtype=np.float64)
+        try:
+            import cupy as _cp_h1e  # type: ignore[import-not-found]
+        except Exception:
+            _cp_h1e = None
+        if matvec_backend in ("cuda_eri_mat", "cuda", "cuda_direct") and _cp_h1e is not None:
+            self._h1e = _cp_h1e.asarray(h1e, dtype=_cp_h1e.float64)
+        else:
+            self._h1e = np.asarray(h1e, dtype=np.float64)
 
         cuda_matvec_ws = None
         cuda_ws_low = None
         cuda_fixed_ell_ws = None
         cuda_fixed_sell_ws = None
         cuda_cp = None
-        if matvec_backend in ("cuda_eri_mat", "cuda"):
+        if matvec_backend in ("cuda_eri_mat", "cuda", "cuda_direct"):
             try:
                 import cupy as cp  # type: ignore[import-not-found]
             except Exception as e:  # pragma: no cover
@@ -1024,15 +1049,27 @@ class GUGAFCISolver(_StreamObject):
                 df_eri_mat_max_bytes=int(matvec_cuda_df_eri_mat_max_bytes),
                 df_type=DFMOIntegrals,
                 device_df_type=DeviceDFMOIntegrals,
+                direct_device_type=DeviceDirectMOIntegrals,
                 restore_eri_4d_fn=_restore_eri_4d,
             )
             eri_mat_d = _ham_inputs["eri_mat_d"]
             l_full_d = _ham_inputs["l_full_d"]
+            direct_op_d = _ham_inputs["direct_op_d"]
             h_eff_d = _ham_inputs["h_eff_d"]
             if matvec_backend == "cuda_eri_mat" and eri_mat_d is None:
                 raise RuntimeError(
                     "matvec_backend='cuda_eri_mat' requires eri_mat; use matvec_backend='cuda' to run the DF L_full path"
                 )
+            if matvec_backend == "cuda_direct" and direct_op_d is None:
+                raise RuntimeError(
+                    "matvec_backend='cuda_direct' requires a device exact-direct operator"
+                )
+            if direct_op_d is not None:
+                matvec_cuda_dtype = "float64"
+                matvec_cuda_mixed_threshold = None
+                matvec_cuda_mixed_force_final_full_hop = False
+                matvec_cuda_mixed_final_full_subspace_refresh = False
+                matvec_cuda_mixed_low_precision_max_iter = None
             if kprof is not None:
                 if kernel_profile_cuda_sync:
                     cp.cuda.get_current_stream().synchronize()
@@ -1347,6 +1384,9 @@ class GUGAFCISolver(_StreamObject):
                 if bool(matvec_cuda_use_graph):
                     warnings.warn("CUDA DF (L_full): disabling CUDA Graph capture (requires ERI_mat)")
                     matvec_cuda_use_graph = False
+            if direct_op_d is not None and bool(matvec_cuda_use_graph):
+                warnings.warn("CUDA direct exact: disabling CUDA Graph capture (requires ERI_mat)")
+                matvec_cuda_use_graph = False
 
             # Mixed mode keeps a float32 low-precision workspace for throughput.
             matvec_cuda_aggregate_offdiag_main = bool(matvec_cuda_aggregate_offdiag)
@@ -1441,8 +1481,13 @@ class GUGAFCISolver(_StreamObject):
                 kprof["matvec_cuda_make_hdiag_cpu"] = bool(matvec_cuda_make_hdiag_cpu)
                 kprof["matvec_cuda_make_hdiag_cpu_ncsf_cutoff"] = int(matvec_cuda_make_hdiag_cpu_ncsf_cutoff)
 
-            main_ws_dtype = "float32" if str(matvec_cuda_dtype) == "float32" else "float64"
-            ws_cache_key = (ws_key, str(main_ws_dtype))
+            if direct_op_d is not None:
+                matvec_cuda_use_fused_hop = False
+                matvec_cuda_use_epq_table = False
+                main_ws_dtype = "float64"
+            else:
+                main_ws_dtype = "float32" if str(matvec_cuda_dtype) == "float32" else "float64"
+            ws_cache_key = (ws_key, str(main_ws_dtype), "direct" if direct_op_d is not None else "std")
             def _init_cuda_ws(
                 *,
                 use_epq_table: bool,
@@ -1463,6 +1508,7 @@ class GUGAFCISolver(_StreamObject):
                     state_dev=state_dev,
                     eri_mat=eri_mat_d,
                     l_full=l_full_d,
+                    direct_op=direct_op_d,
                     h_eff=h_eff_d,
                     j_tile=matvec_cuda_j_tile,
                     csr_capacity_mult=matvec_cuda_csr_capacity_mult,
@@ -1521,6 +1567,7 @@ class GUGAFCISolver(_StreamObject):
                 use_epq_table,
                 aggregate_offdiag_k,
                 l_full_d,
+                direct_op_d,
                 gemm_backend,
                 apply_mode,
                 epq_build_device,
@@ -1576,6 +1623,8 @@ class GUGAFCISolver(_StreamObject):
                     out.append("aggregate_offdiag_k")
                 if bool(getattr(ws, "l_full", None) is not None) != bool(l_full_d is not None):
                     out.append("l_full_presence")
+                if bool(getattr(ws, "direct_op", None) is not None) != bool(direct_op_d is not None):
+                    out.append("direct_op_presence")
                 if (
                     l_full_d is not None
                     and int(getattr(ws, "naux", 0)) != int(getattr(l_full_d, "shape", (0, 0))[1])
@@ -1628,6 +1677,7 @@ class GUGAFCISolver(_StreamObject):
                 use_epq_table=matvec_cuda_use_epq_table_main,
                 aggregate_offdiag_k=matvec_cuda_aggregate_offdiag_main,
                 l_full_d=l_full_d,
+                direct_op_d=direct_op_d,
                 enable_fp64_emulation=matvec_cuda_enable_fp64_emulation,
                 gemm_backend=matvec_cuda_gemm_backend,
                 emulation_strategy=matvec_cuda_emulation_strategy,
@@ -1670,6 +1720,7 @@ class GUGAFCISolver(_StreamObject):
                         use_epq_table=matvec_cuda_use_epq_table_main,
                         aggregate_offdiag_k=matvec_cuda_aggregate_offdiag_main,
                         l_full_d=l_full_d,
+                        direct_op_d=direct_op_d,
                         gemm_backend=matvec_cuda_gemm_backend,
                         apply_mode=matvec_cuda_apply_mode,
                         epq_build_device=matvec_cuda_epq_build_device_main,
@@ -1798,6 +1849,7 @@ class GUGAFCISolver(_StreamObject):
                     ws=cuda_ws,
                     eri_mat_d=eri_mat_d,
                     l_full_d=l_full_d,
+                    direct_op_d=direct_op_d,
                     h_eff_d=h_eff_d,
                     use_cuda_graph=bool(matvec_cuda_use_graph),
                     refresh_diag_cache_for_graph=True,
@@ -1863,6 +1915,7 @@ class GUGAFCISolver(_StreamObject):
                     use_epq_table=matvec_cuda_use_epq_table_low,
                     aggregate_offdiag_k=matvec_cuda_aggregate_offdiag,
                     l_full_d=l_full_d,
+                    direct_op_d=direct_op_d,
                     enable_fp64_emulation=False,
                     gemm_backend=matvec_cuda_gemm_backend_low,
                     emulation_strategy=matvec_cuda_emulation_strategy,
@@ -1981,6 +2034,7 @@ class GUGAFCISolver(_StreamObject):
                         ws=cuda_ws_low,
                         eri_mat_d=eri_mat_d,
                         l_full_d=l_full_d,
+                        direct_op_d=direct_op_d,
                         h_eff_d=h_eff_d,
                         use_cuda_graph=False,
                         refresh_diag_cache_for_graph=False,
@@ -2207,9 +2261,9 @@ class GUGAFCISolver(_StreamObject):
             kprof["eri_is_device_df"] = bool(isinstance(eri, DeviceDFMOIntegrals))
             kprof["matvec_backend"] = str(matvec_backend)
         if (
-            matvec_backend in ("cuda_eri_mat", "cuda")
+            matvec_backend in ("cuda_eri_mat", "cuda", "cuda_direct")
             and cuda_cp is not None
-            and (eri_mat_d is not None or l_full_d is not None)
+            and (eri_mat_d is not None or l_full_d is not None or _is_cuda_direct_eri_like(eri))
             and not bool(matvec_cuda_make_hdiag_cpu)
         ):
             try:
@@ -2231,7 +2285,7 @@ class GUGAFCISolver(_StreamObject):
                     idx_pq = (pp * norb_i + qq).ravel()
                     idx_qp = (qq * norb_i + pp).ravel()
                     eri_pqqp_d = eri_mat_d[idx_pq, idx_qp].reshape(norb_i, norb_i).copy()
-                else:
+                elif l_full_d is not None:
                     if l_full_d is None:  # pragma: no cover
                         raise RuntimeError("internal error: l_full_d is None in DF hdiag path")
                     # DF path: compute the small diagonal slices directly from L_full.
@@ -2254,6 +2308,12 @@ class GUGAFCISolver(_StreamObject):
                             raise RuntimeError("internal error: unexpected DF l_qp shape")
                         eri_pqqp_d[int(p_i)] = cuda_cp.sum(l_pq * l_qp, axis=1)
                     eri_pqqp_d = cuda_cp.ascontiguousarray(eri_pqqp_d)
+                else:
+                    if not _is_cuda_direct_eri_like(eri):  # pragma: no cover
+                        raise RuntimeError("internal error: expected exact-direct device operator")
+                    eri_ppqq_d, eri_pqqp_d = eri.get_hdiag_slices_device()
+                    eri_ppqq_d = cuda_cp.ascontiguousarray(cuda_cp.asarray(eri_ppqq_d, dtype=cuda_cp.float64))
+                    eri_pqqp_d = cuda_cp.ascontiguousarray(cuda_cp.asarray(eri_pqqp_d, dtype=cuda_cp.float64))
 
                 hdiag_d = _build_hdiag_det_guess(
                     state_dev,
@@ -2268,7 +2328,12 @@ class GUGAFCISolver(_StreamObject):
                 if kernel_profile_cuda_sync:
                     cuda_cp.cuda.get_current_stream().synchronize()
                 if kprof is not None:
-                    kprof["hdiag_backend"] = "cuda_det_guess" if eri_mat_d is not None else "cuda_det_guess_df_l_full"
+                    if eri_mat_d is not None:
+                        kprof["hdiag_backend"] = "cuda_det_guess"
+                    elif l_full_d is not None:
+                        kprof["hdiag_backend"] = "cuda_det_guess_df_l_full"
+                    else:
+                        kprof["hdiag_backend"] = "cuda_det_guess_direct_op"
             except Exception as e:
                 if kprof is not None:
                     kprof["make_hdiag_cuda_error"] = f"{type(e).__name__}: {e}"
@@ -2280,7 +2345,7 @@ class GUGAFCISolver(_StreamObject):
                 hdiag_d = None
                 hdiag = self.make_hdiag(h1e, eri, norb, nelec, orbsym=orbsym, wfnsym=wfnsym)
         else:
-            if strict_gpu and matvec_backend in ("cuda_eri_mat", "cuda"):
+            if strict_gpu and matvec_backend in ("cuda_eri_mat", "cuda", "cuda_direct"):
                 raise RuntimeError("strict_gpu=True requires CUDA hdiag path (CPU path reached)")
             if kprof is not None:
                 kprof["hdiag_backend"] = "cpu"
@@ -2293,6 +2358,25 @@ class GUGAFCISolver(_StreamObject):
                 denom = hdiag - float(e)
                 denom = np.where(np.abs(denom) < 1e-12, 1e-12, denom)
                 return dx / denom
+
+        cuda_device_backed_startup = bool(
+            matvec_backend in ("cuda_eri_mat", "cuda", "cuda_direct")
+            and cuda_cp is not None
+            and (eri_mat_d is not None or l_full_d is not None or _is_cuda_direct_eri_like(eri))
+        )
+
+        if cuda_device_backed_startup:
+            pspace_size = 0
+            unconverged_fallback_full_diag = False
+            matvec_cuda_davidson_subspace_eigh_cpu = False
+
+        if isinstance(eri, DeviceDFMOIntegrals) and eri.eri_mat is None:
+            pspace_size = 0
+            unconverged_fallback_full_diag = False
+
+        if _is_cuda_direct_eri_like(eri):
+            pspace_size = 0
+            unconverged_fallback_full_diag = False
 
         if ci0 is None and pspace_size > 0:
             if kprof is not None:
@@ -2320,20 +2404,30 @@ class GUGAFCISolver(_StreamObject):
         elif ci0 is None:
             if hdiag_d is not None and cuda_cp is not None:
                 if int(nroots) == 1:
-                    idx = np.asarray([int(cuda_cp.argmin(hdiag_d).get())], dtype=np.int64)
+                    idx_d = cuda_cp.asarray([cuda_cp.argmin(hdiag_d)], dtype=cuda_cp.int64)
                 else:
-                    idx_d = cuda_cp.argpartition(hdiag_d, int(nroots) - 1)[: int(nroots)]
-                    idx = np.asarray(cuda_cp.asnumpy(idx_d), dtype=np.int64)
+                    idx_d = cuda_cp.argpartition(hdiag_d, int(nroots) - 1)[: int(nroots)].astype(
+                        cuda_cp.int64, copy=False
+                    )
+                eye_rows = cuda_cp.zeros((int(len(idx_d)), int(ncsf)), dtype=cuda_cp.float64)
+                eye_rows[cuda_cp.arange(int(len(idx_d)), dtype=cuda_cp.int64), idx_d] = 1.0
+                ci0_norm = [cuda_cp.ascontiguousarray(eye_rows[i]) for i in range(int(len(idx_d)))]
             else:
                 assert hdiag is not None
                 idx = np.argsort(hdiag)[:nroots]
-            ci0_norm = []
-            for j in idx.tolist():
-                v = np.zeros(ncsf, dtype=np.float64)
-                v[int(j)] = 1.0
-                ci0_norm.append(v)
+                ci0_norm = []
+                for j in idx.tolist():
+                    v = np.zeros(ncsf, dtype=np.float64)
+                    v[int(j)] = 1.0
+                    ci0_norm.append(v)
         else:
             ci0_norm = _normalize_ci0(ci0, nroots=nroots, ncsf=ncsf)
+
+        if cuda_device_backed_startup and cuda_cp is not None:
+            ci0_norm = [
+                cuda_cp.ascontiguousarray(cuda_cp.asarray(v, dtype=cuda_cp.float64).ravel())
+                for v in ci0_norm
+            ]
 
         contract_ws: ContractWorkspace | None = None
         if matvec_backend == "contract":
@@ -2356,7 +2450,7 @@ class GUGAFCISolver(_StreamObject):
                 )
                 from asuka.integrals.contract_df import contract_h_csf_multi_df as _contract_h_csf_multi_df  # noqa: PLC0415
 
-                if isinstance(eri, DFMOIntegrals):
+                if isinstance(eri, DFMOIntegrals) or _is_row_oracle_eri_like(eri):
                     prof = {} if contract_prof_tot is not None else None
                     ys = _contract_h_csf_multi_df(
                         drt,
@@ -2391,8 +2485,11 @@ class GUGAFCISolver(_StreamObject):
                 return ys
 
             if matvec_backend == "row_oracle_df":
-                if not isinstance(eri, DFMOIntegrals):
-                    raise TypeError("matvec_backend='row_oracle_df' requires eri=DFMOIntegrals")
+                if not _is_row_oracle_eri_like(eri):
+                    raise TypeError(
+                        "matvec_backend='row_oracle_df' requires a row-oracle integral object "
+                        "with norb/j_ps/rr_slice_h_eff/contract_cols/pair_norm"
+                    )
                 return matvec_df_row_oracle(
                     drt,
                     h1e,
@@ -2419,7 +2516,7 @@ class GUGAFCISolver(_StreamObject):
                 "for better CPU utilization use matvec_backend='contract'"
             )
             self._warned_row_oracle_df = True
-        if matvec_backend in ("cuda_eri_mat", "cuda"):
+        if matvec_backend in ("cuda_eri_mat", "cuda", "cuda_direct"):
                 if cuda_matvec_ws is None or cuda_cp is None:
                     raise RuntimeError("internal error: CUDA matvec workspace is not initialized")
                 hop_prof: dict[str, float] | None = {} if bool(matvec_cuda_hop_profile) else None
@@ -2551,35 +2648,114 @@ class GUGAFCISolver(_StreamObject):
             # OpenMP thread settings are per OS thread. The threaded contract backend
             # configures each Python worker thread once (see `asuka.contract`), so avoid
             # toggling OpenMP settings in the main thread here.
-            with blas_cm:
-                if kprof is not None:
-                    res = davidson1_sym_result(
-                        hop,
-                        ci0_norm,
-                        precond,
-                        tol=tol,
-                        lindep=lindep,
-                        max_cycle=max_cycle,
-                        max_space=max_space,
-                        nroots=nroots,
-                        profile=True,
-                        **kwargs,
+            use_cpu_contract_eigsh = (
+                matvec_backend == "contract"
+                and not bool(kwargs.get("disable_cpu_contract_eigsh", False))
+                and int(ncsf) > int(nroots)
+                and int(ncsf) <= int(kwargs.get("cpu_contract_eigsh_ncsf_max", 50_000))
+            )
+            if bool(use_cpu_contract_eigsh):
+                try:
+                    import scipy.sparse.linalg as _spla_kernel  # noqa: PLC0415
+
+                    def _hop_one(vec: np.ndarray) -> np.ndarray:
+                        return np.asarray(hop([np.asarray(vec, dtype=np.float64).ravel()])[0], dtype=np.float64)
+
+                    def _hop_many(mat: np.ndarray) -> np.ndarray:
+                        mat = np.asarray(mat, dtype=np.float64)
+                        if mat.ndim == 1:
+                            return _hop_one(mat)
+                        ys = hop([np.asarray(mat[:, i], dtype=np.float64).ravel() for i in range(int(mat.shape[1]))])
+                        return np.asarray(np.column_stack(ys), dtype=np.float64)
+
+                    linop = _spla_kernel.LinearOperator(
+                        (int(ncsf), int(ncsf)),
+                        matvec=_hop_one,
+                        matmat=_hop_many,
+                        dtype=np.float64,
                     )
-                    self.converged, e, ci = res.converged, res.e, res.x
-                    kprof["davidson_niter"] = int(res.niter)
-                    kprof["davidson_stats"] = res.stats
-                else:
-                    self.converged, e, ci = davidson1_sym(
-                        hop,
-                        ci0_norm,
-                        precond,
-                        tol=tol,
-                        lindep=lindep,
-                        max_cycle=max_cycle,
-                        max_space=max_space,
-                        nroots=nroots,
-                        **kwargs,
+                    v0 = None if not ci0_norm else np.asarray(ci0_norm[0], dtype=np.float64).ravel()
+                    ncv = min(int(ncsf) - 1, max(20, 4 * int(nroots) + 8, 2 * int(max_space)))
+                    evals, evecs = _spla_kernel.eigsh(
+                        linop,
+                        k=int(nroots),
+                        which="SA",
+                        tol=float(tol),
+                        maxiter=max(1000, 20 * int(max_cycle)),
+                        ncv=ncv,
+                        v0=v0,
                     )
+                    order = np.argsort(np.asarray(evals, dtype=np.float64))
+                    e = np.asarray(evals, dtype=np.float64)[order]
+                    evecs = np.asarray(evecs[:, order], dtype=np.float64, order="F")
+                    ci = [np.asarray(evecs[:, i], dtype=np.float64) for i in range(int(nroots))]
+                    self.converged = np.ones((int(nroots),), dtype=np.bool_)
+                    if kprof is not None:
+                        kprof["cpu_contract_eigsh_used"] = True
+                        kprof["cpu_contract_eigsh_ncv"] = int(ncv)
+                except Exception as _cpu_contract_eigsh_e:
+                    if kprof is not None:
+                        kprof["cpu_contract_eigsh_used"] = False
+                        kprof["cpu_contract_eigsh_error"] = f"{type(_cpu_contract_eigsh_e).__name__}: {_cpu_contract_eigsh_e}"
+                    with blas_cm:
+                        if kprof is not None:
+                            res = davidson1_sym_result(
+                                hop,
+                                ci0_norm,
+                                precond,
+                                tol=tol,
+                                lindep=lindep,
+                                max_cycle=max_cycle,
+                                max_space=max_space,
+                                nroots=nroots,
+                                profile=True,
+                                **kwargs,
+                            )
+                            self.converged, e, ci = res.converged, res.e, res.x
+                            kprof["davidson_niter"] = int(res.niter)
+                            kprof["davidson_stats"] = res.stats
+                        else:
+                            self.converged, e, ci = davidson1_sym(
+                                hop,
+                                ci0_norm,
+                                precond,
+                                tol=tol,
+                                lindep=lindep,
+                                max_cycle=max_cycle,
+                                max_space=max_space,
+                                nroots=nroots,
+                                **kwargs,
+                            )
+            else:
+                with blas_cm:
+                    if kprof is not None:
+                        res = davidson1_sym_result(
+                            hop,
+                            ci0_norm,
+                            precond,
+                            tol=tol,
+                            lindep=lindep,
+                            max_cycle=max_cycle,
+                            max_space=max_space,
+                            nroots=nroots,
+                            profile=True,
+                            **kwargs,
+                        )
+                        self.converged, e, ci = res.converged, res.e, res.x
+                        kprof["davidson_niter"] = int(res.niter)
+                        kprof["davidson_stats"] = res.stats
+                    else:
+                        self.converged, e, ci = davidson1_sym(
+                            hop,
+                            ci0_norm,
+                            precond,
+                            tol=tol,
+                            lindep=lindep,
+                            max_cycle=max_cycle,
+                            max_space=max_space,
+                            nroots=nroots,
+                            **kwargs,
+                        )
             if kprof is not None:
                 kprof["davidson_s"] = time.perf_counter() - t0
                 if contract_prof_tot is not None:
@@ -2676,7 +2852,10 @@ class GUGAFCISolver(_StreamObject):
             )
         if nroots == 1:
             self.converged = bool(self.converged[0])
-            self.eci, self.ci = float(e[0]), np.ascontiguousarray(ci[0])
+            ci_out = np.ascontiguousarray(ci[0])
+            if return_cupy and cuda_cp is not None and matvec_backend in ("cuda_eri_mat", "cuda", "cuda_direct"):
+                ci_out = cuda_cp.ascontiguousarray(cuda_cp.asarray(ci[0], dtype=cuda_cp.float64).ravel())
+            self.eci, self.ci = float(e[0]), ci_out
             self._last_drt_key = drt_key
             if kprof is not None:
                 kprof.update(self._matvec_cuda_ws_cache_profile())
@@ -2686,7 +2865,10 @@ class GUGAFCISolver(_StreamObject):
                     print("GUGAFCISolver.kernel profile:", kprof)
             return self.eci, self.ci
 
-        self.eci, self.ci = e, [np.ascontiguousarray(v) for v in ci]
+        ci_out = [np.ascontiguousarray(v) for v in ci]
+        if return_cupy and cuda_cp is not None and matvec_backend in ("cuda_eri_mat", "cuda", "cuda_direct"):
+            ci_out = [cuda_cp.ascontiguousarray(cuda_cp.asarray(v, dtype=cuda_cp.float64).ravel()) for v in ci]
+        self.eci, self.ci = e, ci_out
         self._last_drt_key = drt_key
         if kprof is not None:
             kprof.update(self._matvec_cuda_ws_cache_profile())
@@ -2784,6 +2966,7 @@ class GUGAFCISolver(_StreamObject):
 
         # Avoid expensive pspace construction for approximate solves.
         kwargs["pspace_size"] = 0
+        return_cupy = bool(kwargs.get("return_cupy", False))
 
         matvec_backend = str(kwargs.get("matvec_backend", getattr(self, "matvec_backend", "contract"))).strip().lower()
         _approx_cuda_frontend = _resolve_approx_cuda_frontend_runtime(
@@ -2806,7 +2989,7 @@ class GUGAFCISolver(_StreamObject):
         # Fast path for the GPU backend (single-root): a small Arnoldi/Rayleigh-Ritz
         # solve with a bounded subspace, to avoid running a full Davidson solve
         # inside `mc.update_casdm`.
-        if matvec_backend in ("cuda_eri_mat", "cuda") and ci0 is not None and 1 <= nroots_i <= 4:
+        if matvec_backend in ("cuda_eri_mat", "cuda", "cuda_direct") and ci0 is not None and 1 <= nroots_i <= 4:
             try:
                 import cupy as cp  # type: ignore[import-not-found]
             except Exception:
@@ -2885,6 +3068,8 @@ class GUGAFCISolver(_StreamObject):
                     )
 
                     nops = norb_i * norb_i
+                    direct_op_d = None
+                    l_full_d = None
                     if isinstance(eri, DeviceDFMOIntegrals):
                         if eri.eri_mat is None:
                             raise RuntimeError("DeviceDFMOIntegrals requires eri_mat for matvec_backend='cuda_eri_mat'")
@@ -2892,7 +3077,23 @@ class GUGAFCISolver(_StreamObject):
                         eri_mat_d = cp.ascontiguousarray(eri_mat_d)
                         j_ps_d = cp.asarray(eri.j_ps, dtype=cp.float64)
                         j_ps_d = cp.ascontiguousarray(j_ps_d)
-                        h1e_d = cp.asarray(np.asarray(h1e, dtype=np.float64), dtype=cp.float64)
+                        h1e_d = cp.asarray(h1e, dtype=cp.float64)
+                        h_eff_d = h1e_d - 0.5 * j_ps_d
+                    elif isinstance(eri, DeviceDirectMOIntegrals):
+                        eri_mat_d = None
+                        direct_op_d = eri
+                        j_ps_src = getattr(eri, "j_ps_device", None)
+                        if j_ps_src is None:
+                            j_ps_src = eri.j_ps
+                        j_ps_d = cp.asarray(j_ps_src, dtype=cp.float64)
+                        j_ps_d = cp.ascontiguousarray(j_ps_d)
+                        h1e_d = cp.asarray(h1e, dtype=cp.float64)
+                        h_eff_d = h1e_d - 0.5 * j_ps_d
+                    elif isinstance(eri, cp.ndarray) and eri.ndim == 4:
+                        eri4_d = cp.ascontiguousarray(eri.astype(cp.float64, copy=False))
+                        eri_mat_d = cp.ascontiguousarray(eri4_d.reshape(nops, nops))
+                        j_ps_d = cp.einsum("pqqs->ps", eri4_d, optimize=True)
+                        h1e_d = cp.asarray(h1e, dtype=cp.float64)
                         h_eff_d = h1e_d - 0.5 * j_ps_d
                     else:
                         if isinstance(eri, DFMOIntegrals):
@@ -3103,8 +3304,12 @@ class GUGAFCISolver(_StreamObject):
                     matvec_cuda_threads_apply = int(_policy_apply2["threads_apply"])
                     matvec_cuda_max_g_mib = float(_policy_apply2["max_g_mib"])
                     matvec_cuda_cache_csr_tiles = _policy_apply2["cache_csr_tiles"]
+                    if direct_op_d is not None:
+                        approx_cuda_dtype = "float64"
+                        matvec_cuda_use_graph = False
+                        matvec_cuda_use_epq_table = False
 
-                    ws_cache_key = (ws_key, str(approx_cuda_dtype))
+                    ws_cache_key = (ws_key, str(approx_cuda_dtype), "direct" if direct_op_d is not None else "std")
                     cuda_ws = self._matvec_cuda_ws_cache_get(ws_cache_key)
                     want_max_g_bytes = int(matvec_cuda_max_g_mib * 1024 * 1024)
                     if self._ws_needs_rebuild(
@@ -3127,7 +3332,8 @@ class GUGAFCISolver(_StreamObject):
                         use_fused_hop=bool(getattr(self, "matvec_cuda_use_fused_hop", True)),
                         use_epq_table=matvec_cuda_use_epq_table,
                         aggregate_offdiag_k=matvec_cuda_aggregate_offdiag,
-                        l_full_d=None,
+                        l_full_d=l_full_d,
+                        direct_op_d=direct_op_d,
                         enable_fp64_emulation=matvec_cuda_enable_fp64_emulation,
                         gemm_backend=matvec_cuda_gemm_backend,
                         emulation_strategy=matvec_cuda_emulation_strategy,
@@ -3157,6 +3363,8 @@ class GUGAFCISolver(_StreamObject):
                                 drt_dev=drt_dev,
                                 state_dev=state_dev,
                                 eri_mat=eri_mat_d,
+                                l_full=l_full_d,
+                                direct_op=direct_op_d,
                                 h_eff=h_eff_d,
                                 j_tile=matvec_cuda_j_tile,
                                 csr_capacity_mult=matvec_cuda_csr_capacity_mult,
@@ -3179,7 +3387,10 @@ class GUGAFCISolver(_StreamObject):
                                 path_mode=_normalize_matvec_cuda_path_mode(
                                     getattr(self, "matvec_cuda_path_mode", "auto")
                                 ),
-                                use_fused_hop=bool(getattr(self, "matvec_cuda_use_fused_hop", True)),
+                                use_fused_hop=(
+                                    bool(getattr(self, "matvec_cuda_use_fused_hop", True))
+                                    and direct_op_d is None
+                                ),
                                 fp32_coeff_data=bool(matvec_cuda_fp32_coeff_data),
                                 use_epq_table=bool(use_epq_table),
                                 aggregate_offdiag_k=bool(matvec_cuda_aggregate_offdiag),
@@ -3228,6 +3439,7 @@ class GUGAFCISolver(_StreamObject):
                             ws=cuda_ws,
                             eri_mat_d=eri_mat_d,
                             l_full_d=l_full_d,
+                            direct_op_d=direct_op_d,
                             h_eff_d=h_eff_d,
                             use_cuda_graph=bool(matvec_cuda_use_graph),
                             refresh_diag_cache_for_graph=True,
@@ -3292,18 +3504,21 @@ class GUGAFCISolver(_StreamObject):
                     hsub = vmat.T.conj() @ avmat  # (m,m)
                     hsub = 0.5 * (hsub + hsub.T.conj())
 
-                    # For tiny subspace matrices, host eigh is typically faster than cuSOLVER dispatch.
-                    hsub_h = cp.asnumpy(hsub)
-                    evals_h, evecs_h = np.linalg.eigh(hsub_h)
-                    order = np.argsort(evals_h)[:nroots_i]
-                    evals_h = np.asarray(evals_h[order], dtype=np.float64)
-                    u_r = cp.asarray(evecs_h[:, order], dtype=cp.float64)
+                    evals_d, evecs_d = cp.linalg.eigh(hsub)
+                    order_d = cp.argsort(evals_d)[:nroots_i]
+                    evals_d = cp.asarray(evals_d[order_d], dtype=cp.float64)
+                    u_r = cp.asarray(evecs_d[:, order_d], dtype=cp.float64)
 
                     xmat = vmat @ u_r  # (ncsf, nroots)
                     xnorm = cp.linalg.norm(xmat, axis=0)
                     xmat = xmat / xnorm[None, :]
 
-                    e_out = evals_h + float(ecore)
+                    e_out_d = evals_d + float(ecore)
+                    if return_cupy:
+                        if nroots_i == 1:
+                            return float(e_out_d[0].item()), cp.ascontiguousarray(xmat[:, 0])
+                        return cp.ascontiguousarray(e_out_d), [cp.ascontiguousarray(xmat[:, i]) for i in range(nroots_i)]
+                    e_out = cp.asnumpy(e_out_d)
                     xmat_h = cp.asnumpy(xmat)
                     if nroots_i == 1:
                         return float(e_out[0]), np.ascontiguousarray(xmat_h[:, 0])
@@ -3337,7 +3552,7 @@ class GUGAFCISolver(_StreamObject):
             _cp_absorb = None
         # Force direct path when h1e is on GPU (tensor path requires numpy).
         _h1e_is_cupy = _cp_absorb is not None and isinstance(h1e, _cp_absorb.ndarray)
-        if absorb_h1e_mode in ("direct", "op", "wrapper") or backend in ("cuda_eri_mat", "cuda") or _h1e_is_cupy:
+        if absorb_h1e_mode in ("direct", "op", "wrapper") or backend in ("cuda_eri_mat", "cuda", "cuda_direct") or _h1e_is_cupy:
             # Keep h1e as-is (numpy or CuPy) — contract_2e CUDA path handles both.
             if _h1e_is_cupy:
                 _h1e_stored = _cp_absorb.asarray(h1e, dtype=_cp_absorb.float64)
@@ -3416,7 +3631,7 @@ class GUGAFCISolver(_StreamObject):
             or getattr(self, "matvec_backend", "contract")
         )
         use_aggregate_offdiag: bool | None = None
-        if backend in ("cuda_eri_mat", "cuda"):
+        if backend in ("cuda_eri_mat", "cuda", "cuda_direct"):
             aggregate_offdiag_in = kwargs.get(
                 "matvec_cuda_aggregate_offdiag",
                 getattr(self, "matvec_cuda_aggregate_offdiag", None),
@@ -3444,7 +3659,7 @@ class GUGAFCISolver(_StreamObject):
             contract_ws = _ContractWorkspace()
             self._contract_ws_cache[drt_key] = contract_ws
 
-        if backend in ("cuda_eri_mat", "cuda"):
+        if backend in ("cuda_eri_mat", "cuda", "cuda_direct"):
             if h1e is None:
                 raise ValueError(
                     "contract_2e backend 'cuda_eri_mat' requires explicit h1e; set "
@@ -3509,12 +3724,23 @@ class GUGAFCISolver(_StreamObject):
                 or getattr(cuda_ws, "_contract_2e_integral_key", None) != integral_key
                 or str(getattr(cuda_ws, "path_mode_requested", "auto")) != str(_path_mode_req)
             ):
+                l_full_d = None
+                direct_op_d = None
                 if isinstance(eri, DeviceDFMOIntegrals):
                     if eri.eri_mat is None:
                         raise ValueError("DeviceDFMOIntegrals requires eri_mat for CUDA contract_2e")
                     eri_mat_d = cp.ascontiguousarray(cp.asarray(eri.eri_mat, dtype=_ws_dtype))
                     j_ps_d = cp.ascontiguousarray(cp.asarray(eri.j_ps, dtype=_ws_dtype))
                     # h1e may be numpy or CuPy — cp.asarray handles both.
+                    h1e_d = cp.asarray(h1e, dtype=_ws_dtype)
+                    h_eff_d = h1e_d - 0.5 * j_ps_d
+                elif isinstance(eri, DeviceDirectMOIntegrals):
+                    eri_mat_d = None
+                    direct_op_d = eri
+                    j_ps_src = getattr(eri, "j_ps_device", None)
+                    if j_ps_src is None:
+                        j_ps_src = eri.j_ps
+                    j_ps_d = cp.ascontiguousarray(cp.asarray(j_ps_src, dtype=_ws_dtype))
                     h1e_d = cp.asarray(h1e, dtype=_ws_dtype)
                     h_eff_d = h1e_d - 0.5 * j_ps_d
                 elif isinstance(eri, cp.ndarray) and eri.ndim == 4:
@@ -3552,6 +3778,8 @@ class GUGAFCISolver(_StreamObject):
                         drt_dev=drt_dev,
                         state_dev=state_dev,
                         eri_mat=eri_mat_d,
+                        l_full=l_full_d,
+                        direct_op=direct_op_d,
                         h_eff=h_eff_d,
                         j_tile=int(getattr(self, "matvec_cuda_j_tile", 1024)) if int(getattr(self, "matvec_cuda_j_tile", 0)) > 0 else 1024,
                         csr_capacity_mult=float(getattr(self, "matvec_cuda_csr_capacity_mult", 2.0)),
@@ -3598,6 +3826,8 @@ class GUGAFCISolver(_StreamObject):
                     )
                 else:
                     cuda_ws.eri_mat = eri_mat_d
+                    cuda_ws.l_full = l_full_d
+                    cuda_ws.direct_op = direct_op_d
                     h_eff_flat_new = cuda_ws._as_h_eff_flat(h_eff_d)
                     if getattr(cuda_ws, "h_eff_flat", None) is None or tuple(getattr(cuda_ws.h_eff_flat, "shape", ())) != tuple(
                         getattr(h_eff_flat_new, "shape", ())
@@ -3610,7 +3840,7 @@ class GUGAFCISolver(_StreamObject):
                     else:
                         cp.copyto(cuda_ws.h_eff_flat, h_eff_flat_new)
                     cuda_ws._eri_diag_t = None
-                    if getattr(cuda_ws, "_eri_mat_t", None) is not None:
+                    if eri_mat_d is not None and getattr(cuda_ws, "_eri_mat_t", None) is not None:
                         cp.copyto(cuda_ws._eri_mat_t, cuda_ws.eri_mat.T)
                     elif getattr(cuda_ws, "_cuda_graph", None) is not None:
                         cuda_ws._cuda_graph = None
@@ -3634,6 +3864,33 @@ class GUGAFCISolver(_StreamObject):
             if scale != 1.0:
                 out = np.asarray(out, dtype=np.float64) * scale
             return np.asarray(out, dtype=np.float64)
+
+        if backend == "row_oracle_df":
+            if h1e is None:
+                raise ValueError("contract_2e backend 'row_oracle_df' requires explicit h1e")
+            if not _is_row_oracle_eri_like(eri):
+                raise TypeError(
+                    "contract_2e backend 'row_oracle_df' requires a row-oracle integral object "
+                    "with norb/j_ps/rr_slice_h_eff/contract_cols/pair_norm"
+                )
+            y = matvec_df_row_oracle(
+                drt,
+                np.asarray(h1e, dtype=np.float64, order="C"),
+                eri,
+                [np.asarray(civec, dtype=np.float64).ravel()],
+                max_out=int(kwargs.get("max_out", 200_000)),
+                screening=kwargs.get("screening", None),
+                state_cache=get_state_cache(drt),
+            )[0]
+            if scale != 1.0:
+                y = np.asarray(y, dtype=np.float64) * scale
+            if return_cupy:
+                try:
+                    import cupy as cp  # type: ignore[import-not-found]
+                except Exception:
+                    return np.asarray(y, dtype=np.float64)
+                return cp.asarray(y, dtype=cp.float64)
+            return np.asarray(y, dtype=np.float64)
 
         if isinstance(eri, DeviceDFMOIntegrals):
             if h1e is None:
@@ -3667,11 +3924,11 @@ class GUGAFCISolver(_StreamObject):
             if scale != 1.0:
                 out = np.asarray(out, dtype=np.float64) * scale
             return out
-        if isinstance(eri, DFMOIntegrals):
+        if isinstance(eri, DFMOIntegrals) or _is_row_oracle_eri_like(eri):
             if h1e is None:
                 h1e = getattr(self, "_h1e", None)
             if h1e is None:
-                raise ValueError("DFMOIntegrals requires h1e (pass `h1e=` or call `kernel` first)")
+                raise ValueError("contract_2e backend 'contract' requires h1e (pass `h1e=` or call `kernel` first)")
             from asuka.integrals.contract_df import contract_h_csf_multi_df as _contract_h_csf_multi_df  # noqa: PLC0415
 
             out = _contract_h_csf_multi_df(
@@ -3716,6 +3973,7 @@ class GUGAFCISolver(_StreamObject):
         norb = int(norb)
         neleca, nelecb, nelec_total, _sz_twos = self._normalize_nelec(nelec)
         twos = self._get_twos_target(neleca, nelecb)
+        return_cupy = bool(kwargs.pop("return_cupy", False))
         ne_constraints = kwargs.get("ne_constraints", getattr(self, "ne_constraints", None))
         drt = self._get_drt(
             norb,
@@ -3726,6 +3984,90 @@ class GUGAFCISolver(_StreamObject):
             ne_constraints=ne_constraints,
         )
         ncsf = int(drt.ncsf)
+        try:
+            import cupy as cp  # type: ignore[import-not-found]
+        except Exception:
+            cp = None
+
+        can_cuda_hdiag = bool(
+            cp is not None
+            and (
+                isinstance(h1e, cp.ndarray)
+                or isinstance(eri, cp.ndarray)
+                or isinstance(eri, DeviceDFMOIntegrals)
+                or _is_cuda_direct_eri_like(eri)
+            )
+        )
+        if can_cuda_hdiag:
+            from asuka.cuda.cuda_backend import (  # noqa: PLC0415
+                build_hdiag_det_guess_from_steps_inplace_device as _build_hdiag_det_guess,
+                make_device_drt as _make_device_drt,
+                make_device_state_cache as _make_device_state_cache,
+            )
+
+            ws_key = self._drt_key(
+                norb,
+                nelec_total,
+                twos,
+                orbsym=kwargs.get("orbsym", self.orbsym),
+                wfnsym=kwargs.get("wfnsym", self.wfnsym),
+                ne_constraints=ne_constraints,
+            )
+            drt_dev, state_dev = _get_or_create_cuda_matvec_state_runtime(
+                state_cache=self._matvec_cuda_state_cache,
+                ws_key=ws_key,
+                drt=drt,
+                make_device_drt_fn=_make_device_drt,
+                make_device_state_cache_fn=_make_device_state_cache,
+            )
+            _ = drt_dev
+
+            p = cp.arange(norb, dtype=cp.int32)
+            idx_pp = p * int(norb + 1)
+            h1e_diag_d = cp.asarray(cp.diag(cp.asarray(h1e, dtype=cp.float64)), dtype=cp.float64)
+
+            if isinstance(eri, DeviceDFMOIntegrals):
+                if eri.eri_mat is None:
+                    l_full_d = eri.l_full
+                    pair_norm_d = eri.pair_norm
+                    if l_full_d is None:
+                        raise ValueError("DeviceDFMOIntegrals requires either eri_mat or l_full for make_hdiag")
+                    l_full_d = cp.asarray(l_full_d, dtype=cp.float64)
+                    if pair_norm_d is None:
+                        pair_norm_d = cp.linalg.norm(l_full_d.reshape(norb, norb, -1), axis=2)
+                    else:
+                        pair_norm_d = cp.asarray(pair_norm_d, dtype=cp.float64)
+                    l_diag_d = cp.ascontiguousarray(l_full_d[idx_pp])
+                    eri_ppqq_d = cp.ascontiguousarray(l_diag_d @ l_diag_d.T)
+                    eri_pqqp_d = cp.ascontiguousarray(cp.square(pair_norm_d.reshape(norb, norb)))
+                else:
+                    eri_mat_d = cp.asarray(eri.eri_mat, dtype=cp.float64).reshape(norb, norb, norb, norb)
+                    eri_ppqq_d = cp.ascontiguousarray(cp.einsum("iijj->ij", eri_mat_d))
+                    eri_pqqp_d = cp.ascontiguousarray(cp.einsum("ijji->ij", eri_mat_d))
+            elif _is_cuda_direct_eri_like(eri):
+                eri_ppqq_d, eri_pqqp_d = eri.get_hdiag_slices_device()
+                eri_ppqq_d = cp.ascontiguousarray(cp.asarray(eri_ppqq_d, dtype=cp.float64))
+                eri_pqqp_d = cp.ascontiguousarray(cp.asarray(eri_pqqp_d, dtype=cp.float64))
+            else:
+                eri4_d = cp.asarray(eri, dtype=cp.float64).reshape(norb, norb, norb, norb)
+                eri_ppqq_d = cp.ascontiguousarray(cp.einsum("iijj->ij", eri4_d))
+                eri_pqqp_d = cp.ascontiguousarray(cp.einsum("ijji->ij", eri4_d))
+
+            neleca_det = (nelec_total + twos) // 2
+            hdiag_d = _build_hdiag_det_guess(
+                state_dev,
+                neleca_det=int(neleca_det),
+                h1e_diag=h1e_diag_d,
+                eri_ppqq=eri_ppqq_d,
+                eri_pqqp=eri_pqqp_d,
+                threads=256,
+                stream=cp.cuda.get_current_stream(),
+                sync=True,
+            )
+            if return_cupy:
+                return cp.asarray(hdiag_d, dtype=cp.float64).ravel()
+            return cp.asnumpy(hdiag_d).astype(np.float64, copy=False)
+
         if isinstance(eri, DFMOIntegrals):
             # Fast vectorized diagonal guess for DF integrals, matching df_diag.diagonal_element_det_guess_df.
             # This avoids an O(ncsf) Python loop (which can dominate runtime when using DFMOIntegrals).
@@ -3812,6 +4154,14 @@ class GUGAFCISolver(_StreamObject):
                 eri4 = np.asarray(eri_mat_h, dtype=np.float64, order="C").reshape(norb, norb, norb, norb)
                 eri_ppqq = np.einsum("iijj->ij", eri4)
                 eri_pqqp = np.einsum("ijji->ij", eri4)
+        elif _is_row_oracle_eri_like(eri):
+            eri_ppqq = np.empty((norb, norb), dtype=np.float64)
+            for q in range(norb):
+                occ_q = np.zeros((norb,), dtype=np.float64)
+                occ_q[q] = 1.0
+                rr_term = np.asarray(eri.rr_slice_h_eff(occ_q, half=0.5), dtype=np.float64, order="C")
+                eri_ppqq[:, q] = 2.0 * np.diag(rr_term)
+            eri_pqqp = np.square(np.asarray(eri.pair_norm, dtype=np.float64, order="C").reshape(norb, norb))
         else:
             eri4 = _restore_eri_4d(eri, norb).astype(np.float64, copy=False)
             eri_ppqq = np.einsum("iijj->ij", eri4)
@@ -3870,7 +4220,12 @@ class GUGAFCISolver(_StreamObject):
             wfnsym=kwargs.get("wfnsym", self.wfnsym),
             ne_constraints=ne_constraints,
         )
-        if isinstance(eri, DFMOIntegrals):
+        if _is_cuda_direct_eri_like(eri):
+            raise ValueError(
+                "pspace is not implemented for exact-direct device operators; "
+                "use matvec_backend='cuda_direct' with pspace_size=0 so startup seeds from hdiag"
+            )
+        if isinstance(eri, DFMOIntegrals) or _is_row_oracle_eri_like(eri):
             from asuka.integrals.oracle_df import connected_row_df as connected_row
         elif isinstance(eri, DeviceDFMOIntegrals):
             # DeviceDFMOIntegrals lacks the CPU DF interface needed by connected_row_df.
@@ -3936,6 +4291,7 @@ class GUGAFCISolver(_StreamObject):
         strict_gpu = bool(kwargs.get("strict_gpu", getattr(self, "strict_gpu", False)))
         rdm_block_nops = int(kwargs.get("rdm_block_nops", getattr(self, "rdm_block_nops", 8)))
         rdm_tmpdir = kwargs.get("rdm_tmpdir", getattr(self, "rdm_tmpdir", None))
+        return_cupy = bool(kwargs.get("return_cupy", False))
 
         max_memory = float(kwargs.get("max_memory", getattr(self, "max_memory", 4000.0)))
         ncsf = int(drt.ncsf)
@@ -4064,6 +4420,7 @@ class GUGAFCISolver(_StreamObject):
                 None if bit_offset is None else int(bit_offset),
                 bool(symmetrize_gram),
                 int(streaming_ncsf_cutoff),
+                bool(return_cupy),
             )
             if self._rdm12_cache_key == cache_key and self._rdm12_cache_val is not None:
                 return self._rdm12_cache_val
@@ -4088,7 +4445,7 @@ class GUGAFCISolver(_StreamObject):
             try:
                 out = make_rdm12_cuda(
                     drt,
-                    np.asarray(civec, dtype=np.float64),
+                    civec,
                     workspace=ws,
                     block_nops=rdm_block_nops,
                     build_threads=build_threads,
@@ -4102,6 +4459,7 @@ class GUGAFCISolver(_StreamObject):
                     fixed_point_mantissa_bit_offset=None if bit_offset is None else int(bit_offset),
                     symmetrize_gram=symmetrize_gram,
                     streaming_ncsf_cutoff=int(streaming_ncsf_cutoff),
+                    return_cupy=bool(return_cupy),
                 )
             except Exception as e:
                 if strict_gpu and matvec_backend.startswith("cuda"):
@@ -4154,6 +4512,7 @@ class GUGAFCISolver(_StreamObject):
             None if rdm_tmpdir is None else str(rdm_tmpdir),
             int(rdm_nthreads),
             None if rdm_blas_nthreads is None else int(rdm_blas_nthreads),
+            bool(return_cupy),
         )
         if self._rdm12_cache_key == cache_key and self._rdm12_cache_val is not None:
             return self._rdm12_cache_val
@@ -4180,6 +4539,12 @@ class GUGAFCISolver(_StreamObject):
                     )
             self._rdm12_cache_key = cache_key
             self._rdm12_cache_val = out
+            if bool(return_cupy):
+                try:
+                    import cupy as cp  # type: ignore[import-not-found]
+                except Exception as e:  # pragma: no cover
+                    raise RuntimeError("return_cupy=True requires CuPy") from e
+                return cp.asarray(out[0], dtype=cp.float64), cp.asarray(out[1], dtype=cp.float64)
             return out
 
         if rdm_backend != "legacy":
@@ -4262,6 +4627,12 @@ class GUGAFCISolver(_StreamObject):
                 out = _legacy_rdm12()
         self._rdm12_cache_key = cache_key
         self._rdm12_cache_val = out
+        if bool(return_cupy):
+            try:
+                import cupy as cp  # type: ignore[import-not-found]
+            except Exception as e:  # pragma: no cover
+                raise RuntimeError("return_cupy=True requires CuPy") from e
+            return cp.asarray(out[0], dtype=cp.float64), cp.asarray(out[1], dtype=cp.float64)
         return out
 
     def make_rdm123(self, civec, norb: int, nelec: int | tuple[int, int], **kwargs):
@@ -4755,7 +5126,24 @@ def _get_drt_epq_cache(drt: DRT):
     return get
 
 
-def _normalize_ci0(ci0, *, nroots: int, ncsf: int) -> list[np.ndarray]:
+def _normalize_ci0(ci0, *, nroots: int, ncsf: int) -> list[Any]:
+    try:
+        import cupy as _cp_ci0  # type: ignore[import-not-found]
+    except Exception:  # pragma: no cover
+        _cp_ci0 = None
+
+    if _cp_ci0 is not None and isinstance(ci0, _cp_ci0.ndarray):
+        arr = _cp_ci0.asarray(ci0, dtype=_cp_ci0.float64)
+        if arr.ndim == 1:
+            if int(arr.size) != ncsf:
+                raise ValueError("ci0 has wrong length")
+            return [_cp_ci0.ascontiguousarray(arr)]
+        if arr.ndim == 2:
+            if tuple(arr.shape) != (nroots, ncsf):
+                raise ValueError("ci0 has wrong shape")
+            return [_cp_ci0.ascontiguousarray(arr[i]) for i in range(nroots)]
+        raise ValueError("ci0 must be 1D or 2D ndarray")
+
     if isinstance(ci0, np.ndarray):
         arr = np.asarray(ci0, dtype=np.float64)
         if arr.ndim == 1:
@@ -4771,12 +5159,18 @@ def _normalize_ci0(ci0, *, nroots: int, ncsf: int) -> list[np.ndarray]:
     if isinstance(ci0, (list, tuple)):
         if len(ci0) != nroots:
             raise ValueError("ci0 list length must equal nroots")
-        out: list[np.ndarray] = []
+        out: list[Any] = []
         for v in ci0:
-            vv = np.asarray(v, dtype=np.float64).ravel()
+            if _cp_ci0 is not None and isinstance(v, _cp_ci0.ndarray):
+                vv = _cp_ci0.asarray(v, dtype=_cp_ci0.float64).ravel()
+            else:
+                vv = np.asarray(v, dtype=np.float64).ravel()
             if vv.size != ncsf:
                 raise ValueError("ci0 vector has wrong length")
-            out.append(np.ascontiguousarray(vv))
+            if _cp_ci0 is not None and isinstance(vv, _cp_ci0.ndarray):
+                out.append(_cp_ci0.ascontiguousarray(vv))
+            else:
+                out.append(np.ascontiguousarray(vv))
         return out
 
     raise ValueError("unsupported ci0 type")

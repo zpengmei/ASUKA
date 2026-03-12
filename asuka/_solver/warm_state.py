@@ -6,7 +6,7 @@ import numpy as np
 
 WARM_STATE_FORMAT_VERSION = 1
 WARM_CUDA_MATVEC_BACKENDS = frozenset(
-    ("cuda_eri_mat", "cuda", "cuda_fixed_ell", "cuda_ell", "cuda_fixed_sell", "cuda_sell")
+    ("cuda_eri_mat", "cuda", "cuda_direct", "cuda_fixed_ell", "cuda_ell", "cuda_fixed_sell", "cuda_sell")
 )
 
 

@@ -1,8 +1,7 @@
 """Stochastic projector methods (FCIQMC / FCI-FRI) in the CSF (GUGA/DRT) basis.
 
 Top-level exports are intentionally limited to scalable or label-generic APIs.
-Small-space validation helpers remain available from their defining submodules
-but are not re-exported here.
+Legacy small-space helper modules have been removed from the production surface.
 """
 
 from __future__ import annotations
@@ -11,7 +10,7 @@ from .estimators import choose_reference_index, projected_energy_ref, rayleigh_e
 from .fcifri import FCIFRIRun, run_fcifri_block, run_fcifri_ground
 from .fciqmc import FCIQMCRun, run_fciqmc, update_shift
 from .omp import have_openmp, maybe_set_openmp_threads, openmp_max_threads, openmp_set_num_threads
-from .projector import initiator_threshold
+from .initiator import initiator_threshold
 from .sparse import (
     SparseVector,
     coalesce_coo_auto_f64,

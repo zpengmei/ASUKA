@@ -19,6 +19,7 @@ from asuka.mcscf.dense_eri_cpu import (
     dense_ppaa_papa_from_tiles_cpu,
     dense_vhf_ao_from_tiles_cpu,
 )
+from asuka.mcscf.newton_mc1step_adapter import NewtonMC1StepAdapterMixin
 from asuka.mcscf.orbital_grad import cayley_update
 
 
@@ -170,7 +171,7 @@ def build_dense_newton_eris(
 
 
 @dataclass
-class DenseNewtonCASSCFAdapter:
+class DenseNewtonCASSCFAdapter(NewtonMC1StepAdapterMixin):
     """Minimal CASSCF-like adapter for `newton_casscf.gen_g_hop_internal` (dense 4c).
 
     Attributes
@@ -337,7 +338,7 @@ class DenseNewtonCASSCFAdapter:
         mat[idx] = v
         return mat - mat.T
 
-    def update_rotate_matrix(self, dx: Any, u0: Any = 1) -> np.ndarray:
+    def update_rotate_matrix(self, dx: Any, u0: Any = 1) -> Any:
         """Apply orbital rotation `dx` to `u0`.
 
         Parameters
@@ -353,8 +354,14 @@ class DenseNewtonCASSCFAdapter:
             Updated rotation matrix.
         """
         dr = self.unpack_uniq_var(dx)
-        u = cayley_update(np, dr)
-        return np.dot(u0, np.asarray(u, dtype=np.float64))
+        xp, _ = _get_xp(dr, u0)
+        dr = xp.asarray(dr, dtype=xp.float64)
+        u = cayley_update(xp, dr)
+        if np.isscalar(u0):
+            if float(u0) == 1.0:
+                return u
+            raise ValueError("scalar orbital rotation is only supported for u0=1")
+        return xp.asarray(u0, dtype=xp.float64) @ xp.asarray(u, dtype=xp.float64)
 
     def update_jk_in_ah(
         self,

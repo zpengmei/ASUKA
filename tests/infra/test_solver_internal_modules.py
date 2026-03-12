@@ -100,6 +100,9 @@ from asuka._solver.warm_state_runtime import (
     warm_state_ci0_if_compatible,
     warm_state_summary,
 )
+from asuka.solver import _normalize_ci0
+from asuka.mcscf.newton_casscf import _orthonormalize_ci_columns, _pack_ci_getters, project_ci_root_span
+from asuka.mcscf.state_average import make_state_averaged_rdms
 
 
 def _make_ws_cache_solver_stub(*, budget: int = 0, fraction: float = 0.2):
@@ -184,6 +187,68 @@ def test_drt_runtime_build_and_cache():
     assert key1 == key2 == key3
     assert drt1 is drt2
     assert int(drt1.norb) == 2
+
+
+def test_pack_ci_getters_accepts_cupy_when_available():
+    cp = pytest.importorskip("cupy")
+    ci0 = [cp.asarray([1.0, 0.0, 0.0]), cp.asarray([0.0, 1.0, 0.0])]
+    packed = _pack_ci_getters(ci0)
+    joined = packed.pack(ci0)
+    assert isinstance(joined, cp.ndarray)
+    parts = packed.unpack(joined)
+    assert len(parts) == 2
+    assert all(isinstance(p, cp.ndarray) for p in parts)
+    assert float(cp.linalg.norm(parts[0] - ci0[0]).item()) < 1e-12
+    assert float(cp.linalg.norm(parts[1] - ci0[1]).item()) < 1e-12
+
+
+def test_ci_projection_and_orthonormalize_accept_cupy_when_available():
+    cp = pytest.importorskip("cupy")
+    ref = [
+        cp.asarray([1.0, 0.0, 0.0], dtype=cp.float64),
+        cp.asarray([0.0, 1.0, 0.0], dtype=cp.float64),
+    ]
+    vecs = [
+        cp.asarray([1.0, 0.5, 1.0], dtype=cp.float64),
+        cp.asarray([0.5, 1.0, -1.0], dtype=cp.float64),
+    ]
+    proj = project_ci_root_span(ref, vecs)
+    assert all(isinstance(v, cp.ndarray) for v in proj)
+    vecs_full_rank = [
+        cp.asarray([1.0, 0.5, 0.25], dtype=cp.float64),
+        cp.asarray([0.25, 1.0, -0.5], dtype=cp.float64),
+    ]
+    ortho = _orthonormalize_ci_columns(vecs_full_rank, ref_list=ref)
+    assert all(isinstance(v, cp.ndarray) for v in ortho)
+    gram = cp.stack(ortho, axis=1).T @ cp.stack(ortho, axis=1)
+    assert float(cp.linalg.norm(gram - cp.eye(2, dtype=cp.float64)).item()) < 1e-10
+
+
+def test_make_state_averaged_rdms_accepts_cupy_when_available():
+    cp = pytest.importorskip("cupy")
+
+    class _DummySolver:
+        def make_rdm12(self, civec, ncas, nelecas, **kwargs):
+            xp = cp if isinstance(civec, cp.ndarray) or bool(kwargs.get("return_cupy", False)) else np
+            dm1 = xp.eye(int(ncas), dtype=xp.float64) * xp.sum(xp.asarray(civec, dtype=xp.float64))
+            dm2 = xp.zeros((int(ncas), int(ncas), int(ncas), int(ncas)), dtype=xp.float64)
+            return dm1, dm2
+
+    ci_list = [
+        cp.asarray([1.0, 0.0], dtype=cp.float64),
+        cp.asarray([0.0, 2.0], dtype=cp.float64),
+    ]
+    dm1, dm2 = make_state_averaged_rdms(
+        _DummySolver(),
+        ci_list,
+        [0.25, 0.75],
+        ncas=2,
+        nelecas=2,
+        solver_kwargs={"return_cupy": True},
+    )
+    assert isinstance(dm1, cp.ndarray)
+    assert isinstance(dm2, cp.ndarray)
+    assert float(cp.linalg.norm(dm1 - cp.eye(2, dtype=cp.float64) * 1.75).item()) < 1e-12
 
 
 def test_matvec_runtime_kernel_cuda_execution_mode_defaults_for_non_cuda():
@@ -797,6 +862,25 @@ def test_kernel_runtime_resolve_nroots_and_warm_start_and_dry_run():
     )
     assert marker["called"] is True
     assert np.allclose(dry2["ci"][0], np.asarray([0.2, 0.8]))
+
+
+def test_solver_normalize_ci0_accepts_cupy():
+    cp = pytest.importorskip("cupy")
+    try:
+        _ = int(cp.cuda.runtime.getDeviceCount())
+    except Exception:
+        pytest.skip("CUDA device unavailable")
+
+    ci0 = cp.asarray([1.0, 0.0, 0.0], dtype=cp.float64)
+    out = _normalize_ci0(ci0, nroots=1, ncsf=3)
+    assert len(out) == 1
+    assert isinstance(out[0], cp.ndarray)
+    assert out[0].shape == (3,)
+
+    ci0_2d = cp.asarray([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]], dtype=cp.float64)
+    out2 = _normalize_ci0(ci0_2d, nroots=2, ncsf=3)
+    assert len(out2) == 2
+    assert all(isinstance(v, cp.ndarray) for v in out2)
 
 
 def test_kernel_runtime_dense_fastpath_and_precompute_state_cache():

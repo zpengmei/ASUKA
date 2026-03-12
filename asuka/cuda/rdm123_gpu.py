@@ -653,6 +653,23 @@ def _p2lev_perm_inv(n: int) -> tuple[np.ndarray, np.ndarray]:
     return perm, inv
 
 
+def _canonicalize_dm3_pair_triples_cuda(cp, dm3: Any, n: int) -> Any:
+    """Mirror OpenMolcas packed-TG3 semantics by copying the canonical pair-triple slot."""
+
+    n = int(n)
+    n2 = int(n * n)
+    dm3_p = cp.ascontiguousarray(dm3).reshape(n2, n2, n2, order="F")
+    pair_ids = cp.arange(n2, dtype=cp.int64)
+    ip1 = pair_ids[:, None, None]
+    ip2 = pair_ids[None, :, None]
+    ip3 = pair_ids[None, None, :]
+    hi = cp.maximum(cp.maximum(ip1, ip2), ip3)
+    lo = cp.minimum(cp.minimum(ip1, ip2), ip3)
+    mid = ip1 + ip2 + ip3 - hi - lo
+    dm3_can = dm3_p[hi, mid, lo]
+    return cp.ascontiguousarray(dm3_can.reshape(n, n, n, n, n, n, order="F"), dtype=cp.float64)
+
+
 def make_trans_rdm123_raw_cuda(
     drt: DRT,
     ci_bra: Any,
@@ -1152,7 +1169,6 @@ def reorder_dm123_molcas_trans_cuda(
             has_rdm123_reorder_device,
             dm2_delta_correction_inplace_device,
             dm3_delta_correction_inplace_device,
-            dm3_6way_symmetry_inplace_device,
         )
         _use_p5 = has_rdm123_reorder_device()
     except Exception:
@@ -1187,10 +1203,7 @@ def reorder_dm123_molcas_trans_cuda(
         dm3_delta_correction_inplace_device(
             dm3.ravel(), dm2.ravel(), cp.ascontiguousarray(dm1).ravel(), n=n,
         )
-        # dm3 6-way symmetry
-        dm3_sym = cp.empty_like(dm3)
-        dm3_6way_symmetry_inplace_device(dm3.ravel(), dm3_sym.ravel(), n=n)
-        dm3 = dm3_sym
+        dm3 = _canonicalize_dm3_pair_triples_cuda(cp, dm3, n)
     else:
         # 3-body delta correction (transition; no bra=ket symmetrization):
         dm2_vxtz = dm2.transpose(2, 0, 1, 3)  # (t,v,x,z) = dm2[v,x,t,z]
@@ -1201,14 +1214,7 @@ def reorder_dm123_molcas_trans_cuda(
             for s in range(n):
                 dm3[:, q, q, s, s, :] -= dm1
 
-        # Full pair-permutation symmetry of TG3:
-        dm3_sym = cp.ascontiguousarray(dm3, dtype=cp.float64).copy()
-        dm3_sym += dm3.transpose(2, 3, 0, 1, 4, 5)
-        dm3_sym += dm3.transpose(4, 5, 2, 3, 0, 1)
-        dm3_sym += dm3.transpose(0, 1, 4, 5, 2, 3)
-        dm3_sym += dm3.transpose(2, 3, 4, 5, 0, 1)
-        dm3_sym += dm3.transpose(4, 5, 0, 1, 2, 3)
-        dm3 = cp.ascontiguousarray(dm3_sym * (1.0 / 6.0), dtype=cp.float64)
+        dm3 = _canonicalize_dm3_pair_triples_cuda(cp, dm3, n)
 
     if profile is not None:
         _sync(cp)

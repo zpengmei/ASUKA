@@ -22,6 +22,7 @@ Limitations (current)
 """
 
 from dataclasses import dataclass
+from types import SimpleNamespace
 from typing import Any, Sequence
 import os
 import time
@@ -379,7 +380,7 @@ def _estimate_b_whitened_nbytes(ao_basis: Any, aux_basis: Any) -> int:
     return int(nao) * int(nao) * int(naux) * 8
 
 
-@dataclass(frozen=True)
+@dataclass
 class CASSCFResult:
     mol: Molecule
     basis_name: str
@@ -451,7 +452,7 @@ def casscf_orbital_gradient_df(
         weights,
         ncas=int(casscf.ncas),
         nelecas=casscf.nelecas,
-        solver_kwargs=solver_kwargs,
+        solver_kwargs=dict(solver_kwargs),
     )
 
     return orbital_gradient_df(
@@ -502,7 +503,7 @@ def casscf_orbital_gradient_dense(
         weights,
         ncas=int(casscf.ncas),
         nelecas=casscf.nelecas,
-        solver_kwargs=solver_kwargs,
+        solver_kwargs=dict(solver_kwargs),
     )
 
     return orbital_gradient_dense(
@@ -629,12 +630,16 @@ def run_casscf_df(
     casci_backend_s = str(casci_backend).strip().lower()
     if casci_backend_s not in {"df", "dense_cpu", "dense_gpu", "thc"}:
         raise ValueError("casci_backend must be one of: 'df', 'dense_cpu', 'dense_gpu', 'thc'")
+    two_e_backend_s = str(getattr(scf_out, "two_e_backend", "") or "").strip().lower()
     direct_mode = bool(
         getattr(scf_out, "direct_jk_ctx", None) is not None
-        or str(getattr(scf_out, "two_e_backend", "") or "").strip().lower() == "direct"
+        or two_e_backend_s in {"direct", "direct_df"}
     )
-    if direct_mode and casci_backend_s != "dense_gpu":
-        raise ValueError("direct two-electron backend requires casci_backend='dense_gpu'")
+    if direct_mode:
+        allowed_casci_backends = {"dense_gpu", "df"} if two_e_backend_s == "direct" else {"df"}
+        if casci_backend_s not in allowed_casci_backends:
+            allowed_s = ", ".join(sorted(allowed_casci_backends))
+            raise ValueError(f"{two_e_backend_s} two-electron backend requires casci_backend in {{{allowed_s}}}")
 
     # Keep the incoming SCF object unchanged in the returned result.
     # CASSCF now accepts both DF layouts directly:
@@ -648,37 +653,46 @@ def run_casscf_df(
     naux_df_work = 0
 
     if casci_backend_s == "df":
-        if B is None:
+        if B is None and two_e_backend_s == "direct":
+            naux_df_work = 0
+        elif B is None and two_e_backend_s == "direct_df":
+            L_metric = getattr(scf_out_in, "df_L", None)
+            L_shape = getattr(L_metric, "shape", None)
+            if L_shape is None or len(L_shape) != 2 or int(L_shape[0]) != int(L_shape[1]):
+                raise ValueError("casci_backend='df' with two_e_backend='direct_df' requires square scf_out.df_L")
+            naux_df_work = int(L_shape[0])
+        elif B is None:
             raise ValueError("casci_backend='df' requires scf_out.df_B (cached DF factors)")
-        B_shape = getattr(B, "shape", None)
-        if B_shape is None:
-            raise ValueError("scf_out.df_B must have a shape")
+        else:
+            B_shape = getattr(B, "shape", None)
+            if B_shape is None:
+                raise ValueError("scf_out.df_B must have a shape")
 
-        if len(B_shape) == 2:
-            packed_qp_input = True
-            from asuka.integrals.tri_packed import ntri_from_nao  # noqa: PLC0415
+            if len(B_shape) == 2:
+                packed_qp_input = True
+                from asuka.integrals.tri_packed import ntri_from_nao  # noqa: PLC0415
 
-            naux, ntri = map(int, B_shape)
-            expected_ntri = int(ntri_from_nao(int(nao_work)))
-            if int(ntri) != int(expected_ntri):
-                raise ValueError(
-                    "Packed DF factors must have shape (naux, nao*(nao+1)/2). "
-                    f"Got df_B.shape={tuple(map(int, B_shape))} but expected ntri={int(expected_ntri)} for nao={int(nao_work)}."
-                )
-            naux_df_work = int(naux)
-        elif len(B_shape) == 3:
-            if int(B_shape[0]) != int(nao_work) or int(B_shape[1]) != int(nao_work):
+                naux, ntri = map(int, B_shape)
+                expected_ntri = int(ntri_from_nao(int(nao_work)))
+                if int(ntri) != int(expected_ntri):
+                    raise ValueError(
+                        "Packed DF factors must have shape (naux, nao*(nao+1)/2). "
+                        f"Got df_B.shape={tuple(map(int, B_shape))} but expected ntri={int(expected_ntri)} for nao={int(nao_work)}."
+                    )
+                naux_df_work = int(naux)
+            elif len(B_shape) == 3:
+                if int(B_shape[0]) != int(nao_work) or int(B_shape[1]) != int(nao_work):
+                    raise ValueError(
+                        "DF-CASSCF requires scf_out.df_B in mnQ layout (nao,nao,naux) "
+                        f"or packed Qp layout (naux,ntri). Got df_B.shape={tuple(map(int, B_shape))} for nao={int(nao_work)}."
+                    )
+                naux_df_work = int(B_shape[2])
+            else:
                 raise ValueError(
                     "DF-CASSCF requires scf_out.df_B in mnQ layout (nao,nao,naux) "
-                    f"or packed Qp layout (naux,ntri). Got df_B.shape={tuple(map(int, B_shape))} for nao={int(nao_work)}."
+                    "or packed Qp layout (naux,ntri). "
+                    f"Got df_B.shape={tuple(map(int, B_shape))}."
                 )
-            naux_df_work = int(B_shape[2])
-        else:
-            raise ValueError(
-                "DF-CASSCF requires scf_out.df_B in mnQ layout (nao,nao,naux) "
-                "or packed Qp layout (naux,ntri). "
-                f"Got df_B.shape={tuple(map(int, B_shape))}."
-            )
 
     ncore = int(ncore)
     ncas = int(ncas)
@@ -923,6 +937,14 @@ def run_casscf_df(
     C = _as_xp_f64(xp, C)
     _restore_cuda_pool = _apply_casscf_cuda_pool_policy(probe=_xp_probe, label="run_casscf_df")
 
+    def _sa_solver_kwargs_live(base_kwargs: dict[str, Any]) -> dict[str, Any]:
+        out = dict(base_kwargs)
+        if xp is not np:
+            out.setdefault("rdm_backend", "cuda")
+            out.setdefault("return_cupy", True)
+            out.setdefault("strict_gpu", True)
+        return out
+
     # Optionally scramble frontier virtual orbitals to avoid local minima.
     # With diffuse basis sets (aug-/jun-cc-pVXZ), the lowest HF virtuals are
     # often Rydberg-type.  Scrambling forces the CASSCF optimizer to explore.
@@ -941,11 +963,13 @@ def run_casscf_df(
     if casci_backend_s == "df":
         # DF CASCI can run on CPU (DFMOIntegrals + contract/row_oracle_df) or on CUDA
         # (DeviceDFMOIntegrals + cuda/cuda_eri_mat). Pick the path based on `matvec_backend`.
-        if matvec_backend_s in {"cuda_eri_mat", "cuda"}:
+        if matvec_backend_s in {"cuda_eri_mat", "cuda", "cuda_direct"}:
             if not bool(_is_gpu):
                 raise ValueError("matvec_backend='cuda' requires scf_out with GPU DF factors (CuPy arrays)")
         elif matvec_backend_s not in {"contract", "row_oracle_df"}:
-            raise ValueError("casci_backend='df' requires matvec_backend in {'contract','row_oracle_df','cuda','cuda_eri_mat'}")
+            raise ValueError(
+                "casci_backend='df' requires matvec_backend in {'contract','row_oracle_df','cuda','cuda_eri_mat','cuda_direct'}"
+            )
     elif casci_backend_s == "thc":
         if getattr(scf_out, "thc_factors", None) is None:
             raise ValueError("casci_backend='thc' requires scf_out.thc_factors (cached THC factors)")
@@ -1029,7 +1053,7 @@ def run_casscf_df(
 
     # Propagate GPU backends to the solver so that trans_rdm12 / contract_2e
     # (called directly by the AH orbital optimizer) also run on GPU.
-    if matvec_backend_s in {"cuda_eri_mat", "cuda"}:
+    if matvec_backend_s in {"cuda_eri_mat", "cuda", "cuda_direct"}:
         fcisolver_use.matvec_backend = str(matvec_backend_s)
         # rdm_backend="auto" will now pick CUDA because matvec_backend starts
         # with "cuda".  Force it explicitly for clarity.
@@ -1058,22 +1082,22 @@ def run_casscf_df(
             max_tile_bytes=int(max_tile_bytes),
             eps_ao=float(dense_gpu_eps_ao),
         )
-        if direct_mode:
-            from asuka.mcscf.two_e_provider import resolve_two_e_provider  # noqa: PLC0415
+    if matvec_backend_s in {"cuda_eri_mat", "cuda", "cuda_direct"} and casci_backend_s in {"df", "dense_gpu"}:
+        from asuka.mcscf.two_e_provider import resolve_two_e_provider  # noqa: PLC0415
 
-            two_e_provider = resolve_two_e_provider(
-                scf_out,
-                dense_gpu_builder=dense_gpu_builder,
-                dense_gpu_builder_mol=dense_gpu_builder_mol,
-                dense_gpu_threads=int(dense_gpu_threads),
-                dense_max_tile_bytes=int(max_tile_bytes),
-                dense_eps_ao=float(dense_gpu_eps_ao),
-                dense_gpu_ao_rep=str(dense_gpu_ao_rep),
-            )
-            if two_e_provider is None:  # pragma: no cover
-                raise RuntimeError("failed to resolve two-electron provider for direct mode")
-            if profile is not None:
-                profile["two_e_provider_kind"] = str(getattr(two_e_provider, "kind", "unknown"))
+        two_e_provider = resolve_two_e_provider(
+            scf_out,
+            dense_gpu_builder=dense_gpu_builder,
+            dense_gpu_builder_mol=dense_gpu_builder_mol,
+            dense_gpu_threads=int(dense_gpu_threads),
+            dense_max_tile_bytes=int(max_tile_bytes),
+            dense_eps_ao=float(dense_gpu_eps_ao),
+            dense_gpu_ao_rep=str(dense_gpu_ao_rep),
+        )
+        if direct_mode and two_e_provider is None:  # pragma: no cover
+            raise RuntimeError("failed to resolve two-electron provider for direct mode")
+        if profile is not None and two_e_provider is not None:
+            profile["two_e_provider_kind"] = str(getattr(two_e_provider, "kind", "unknown"))
 
     e_last = None
     e_ref = None
@@ -1183,13 +1207,12 @@ def run_casscf_df(
     ah_hcore_np = None
     ah_conv_tol_grad_eff = max(float(conv_tol_grad), float(ah_conv_tol_grad))
     ah_conv_tol_energy_eff = max(float(tol), float(ah_conv_tol_energy))
-
     for it in range(1, int(max_cycle_macro) + 1):
         _t_iter_start = time.perf_counter() if profile is not None else 0.0
 
         # 1) CASCI (CI solve + active-space integrals)
         # On iter > 1 with warm-start CI, use reduced Davidson iterations
-        _casci_kwargs = dict(solver_kwargs)
+        _casci_kwargs = _sa_solver_kwargs_live(solver_kwargs)
         if it > 1 and ci_max_cycle_inner is not None and prev_ci_list is not None:
             _casci_kwargs.setdefault("max_cycle", int(ci_max_cycle_inner))
             _casci_kwargs.setdefault("warn_on_unconverged", False)
@@ -1198,7 +1221,32 @@ def run_casscf_df(
         if b_cache_enabled and cached_b_whitened is None:
             casci_cache_out = {}
         cached_b_in = cached_b_whitened if b_cache_enabled else None
-        if casci_backend_s == "df":
+        if two_e_backend_s == "direct" and matvec_backend_s in {"cuda_direct", "contract", "row_oracle_df"}:
+            from .casci import run_casci_direct_exact  # noqa: PLC0415
+
+            casci_out = run_casci_direct_exact(
+                scf_out,
+                ncore=int(ncore),
+                ncas=int(ncas),
+                nelecas=nelecas,
+                mo_coeff=C,
+                ci0=prev_ci_list,
+                fcisolver=fcisolver_use,
+                twos=twos,
+                nroots=int(nroots),
+                matvec_backend=str(matvec_backend_s),
+                dense_gpu_ao_rep=str(dense_gpu_ao_rep),
+                dense_gpu_builder_mol=dense_gpu_builder_mol,
+                dense_gpu_builder=dense_gpu_builder,
+                two_e_provider=two_e_provider,
+                dense_exact_jk=bool(dense_exact_jk),
+                threads=int(dense_gpu_threads),
+                eps_ao=float(dense_gpu_eps_ao),
+                max_tile_bytes=int(max_tile_bytes),
+                profile=casci_profile,
+                **_casci_kwargs,
+            )
+        elif casci_backend_s == "df":
             if matvec_backend_s in {"cuda_eri_mat", "cuda"}:
                 casci_out = run_casci_df(
                     scf_out,
@@ -1319,9 +1367,9 @@ def run_casscf_df(
                 b_cache_disabled_reason = "cache_build_failed"
                 if profile is not None:
                     profile["cueri_b_cache_disabled_reason"] = str(casci_cache_out["cache_build_failed"])
-        if profile is not None:
-            profile["cueri_b_cache_resident"] = bool(cached_b_whitened is not None)
-
+            if profile is not None:
+                profile["cueri_b_cache_resident"] = bool(cached_b_whitened is not None)
+        
         # Root energies/CI (track ordering by overlap for weighted SA cases).
         _t_post_casci = time.perf_counter() if profile is not None else 0.0
         if nroots == 1:
@@ -1330,20 +1378,20 @@ def run_casscf_df(
             e_roots = np.asarray(casci_out.e_tot, dtype=np.float64).ravel()
             if int(e_roots.size) != nroots:
                 raise RuntimeError("CASCI returned unexpected number of root energies")
-
+    
         ci_list = ci_as_list(casci_out.ci, nroots=nroots)
         if prev_ci_list is not None and nroots > 1:
             perm = match_roots_by_overlap(prev_ci_list, ci_list)
             e_roots = e_roots[perm]
             ci_list = [ci_list[int(j)] for j in perm.tolist()]
             fix_ci_phases(prev_ci_list, ci_list)
-
+    
         prev_ci_list = [c.copy() for c in ci_list]
         ci_out = ci_list if nroots > 1 else ci_list[0]
-
+    
         e_avg = float(np.dot(weights, e_roots))
         _t_pre_rdm = time.perf_counter() if profile is not None else 0.0
-
+    
         if step_rejection_enabled and e_ref is not None and float(e_avg) > float(e_ref) + float(step_rejection_tol):
             n_step_rejected += 1
             n_consecutive_rejected += 1
@@ -1438,7 +1486,7 @@ def run_casscf_df(
                 if accepted_since_reject >= int(step_recovery_interval):
                     max_stepsize_cur = min(float(max_stepsize), float(max_stepsize_cur) * float(step_recovery_factor))
                     accepted_since_reject = 0
-
+    
         if orbital_optimizer == "ah":
             try:
                 from asuka.mcscf.newton_df import DFNewtonCASSCFAdapter  # noqa: PLC0415
@@ -1449,7 +1497,7 @@ def run_casscf_df(
                 import cupy as _cp_ah  # type: ignore
             except Exception:
                 _cp_ah = None
-
+    
             if ah_df_B is None:
                 _raw_df_B = getattr(scf_out, "df_B", None)
                 if _raw_df_B is not None:
@@ -1468,21 +1516,30 @@ def run_casscf_df(
                         ah_df_B = np.asarray(_raw_df_B, dtype=np.float64, order="C")
             if ah_hcore_np is None:
                 H0 = getattr(scf_out.int1e, "hcore")
-                if _cp_ah is not None and isinstance(H0, _cp_ah.ndarray):
-                    H0 = _cp_ah.asnumpy(H0)
-                ah_hcore_np = np.asarray(H0, dtype=np.float64)
+                if casci_backend_s == "dense_cpu":
+                    if _cp_ah is not None and isinstance(H0, _cp_ah.ndarray):
+                        H0 = _cp_ah.asnumpy(H0)
+                    ah_hcore_np = np.asarray(H0, dtype=np.float64)
+                else:
+                    if _cp_ah is not None and isinstance(H0, _cp_ah.ndarray):
+                        ah_hcore_np = _cp_ah.ascontiguousarray(_cp_ah.asarray(H0, dtype=_cp_ah.float64))
+                    else:
+                        ah_hcore_np = np.asarray(H0, dtype=np.float64)
 
             C_np = C
-            if _cp_ah is not None and isinstance(C_np, _cp_ah.ndarray):
-                C_np = _cp_ah.asnumpy(C_np)
-            C_np = np.asarray(C_np, dtype=np.float64)
-
+            if casci_backend_s == "dense_cpu":
+                if _cp_ah is not None and isinstance(C_np, _cp_ah.ndarray):
+                    C_np = _cp_ah.asnumpy(C_np)
+                C_np = np.asarray(C_np, dtype=np.float64)
+            elif _cp_ah is not None and isinstance(C_np, _cp_ah.ndarray):
+                C_np = _cp_ah.ascontiguousarray(_cp_ah.asarray(C_np, dtype=_cp_ah.float64))
+    
             # Create a mixed-precision copy of the solver for the AH operator.
             # The Krylov solver is iterative and tolerant of ~1e-3 relative error,
             # so TF32 GEMM + FP32 coefficients are safe and roughly 2× faster.
             import copy as _copy
             ah_fcisolver = _copy.copy(fcisolver_use)
-            if matvec_backend_s in {"cuda_eri_mat", "cuda"}:
+            if matvec_backend_s in {"cuda_eri_mat", "cuda", "cuda_direct"}:
                 # Give the AH solver its own workspace caches so FP32 workspaces
                 # don't overwrite the CASCI solver's FP64 workspaces.
                 ah_fcisolver._matvec_cuda_ws_cache = {}
@@ -1493,15 +1550,24 @@ def run_casscf_df(
                 # Keep rdm_cuda_gemm_backend at FP64 — make_rdm12 workspace
                 # requires FP64 dtype, and gemmex_tf32 is only valid for FP32.
                 # trans_rdm12 is a smaller cost and stays FP64.
-
+    
             # Resolve ao_eri for dense-mode AH (when df_B is None).
             _ah_ao_eri = None
             if ah_df_B is None and casci_backend_s in ("dense_gpu", "dense_cpu"):
                 _ah_ao_eri = getattr(scf_out, "ao_eri", None)
-
+    
             # THC ERI provider for AH when using THC backend.
-            _ah_eri_provider = two_e_provider if direct_mode else None
-            _ah_jk_provider = two_e_provider if direct_mode else None
+            _ah_eri_provider = (
+                two_e_provider
+                if (
+                    two_e_provider is not None
+                    and hasattr(two_e_provider, "build_pq_uv")
+                    and hasattr(two_e_provider, "build_pu_qv")
+                    and hasattr(two_e_provider, "contract_pu_wx_dm2")
+                )
+                else None
+            )
+            _ah_jk_provider = two_e_provider
             if _ah_eri_provider is None and casci_backend_s == "thc":
                 _thc_fac = getattr(scf_out, "thc_factors", None)
                 if _thc_fac is not None:
@@ -1527,6 +1593,7 @@ def run_casscf_df(
                 aux_block_naux=int(newton_aux_block_naux),
                 jk_provider=_ah_jk_provider,
                 eri_provider=_ah_eri_provider,
+                stream_provider_eris=bool(_ah_eri_provider is not None),
             )
             mc_ah.max_stepsize = float(max_stepsize_cur)
             mc_ah.ah_level_shift = float(ah_level_shift)
@@ -1556,7 +1623,7 @@ def run_casscf_df(
                 # a dict to avoid exploding the public driver signature further.
                 for k, v in dict(ah_options).items():
                     setattr(mc_ah, str(k), v)
-
+    
             _t_pre_ah = time.perf_counter() if profile is not None else 0.0
             eris_ah = mc_ah.ao2mo(C_np)
             _t_post_ao2mo = time.perf_counter() if profile is not None else 0.0
@@ -1679,7 +1746,7 @@ def run_casscf_df(
                         if hasattr(fcisolver_use, '_last_kernel_profile') and fcisolver_use._last_kernel_profile:
                             hist[-1]["solver_kernel_profile"] = dict(fcisolver_use._last_kernel_profile)
                 break
-
+    
             # Enhancement D: DIIS extrapolation on AH orbital rotations.
             # Disabled for large CAS with ah_auto_scale (PySCF doesn't use
             # DIIS in Newton CASSCF; empirically it causes energy spikes).
@@ -1699,19 +1766,32 @@ def run_casscf_df(
                         _I = np.eye(nmo, dtype=np.float64)
                         U_ah = np.linalg.solve(_I - 0.5 * _X_d, _I + 0.5 * _X_d)
                         ah_diis_used = True
-
-            C_np = np.asarray(C_np, dtype=np.float64) @ np.asarray(U_ah, dtype=np.float64)
-            if _cp_ah is not None and isinstance(C, _cp_ah.ndarray):
-                C = _cp_ah.asarray(C_np, dtype=C.dtype)
+    
+            _use_gpu_rot = bool(
+                _cp_ah is not None
+                and (
+                    isinstance(C, _cp_ah.ndarray)
+                    or isinstance(C_np, _cp_ah.ndarray)
+                    or isinstance(U_ah, _cp_ah.ndarray)
+                )
+            )
+            if _use_gpu_rot:
+                C_np = _cp_ah.asarray(C_np, dtype=_cp_ah.float64) @ _cp_ah.asarray(U_ah, dtype=_cp_ah.float64)
+                C = _cp_ah.asarray(C_np, dtype=(C.dtype if isinstance(C, _cp_ah.ndarray) else _cp_ah.float64))
             else:
+                C_np = np.asarray(C_np, dtype=np.float64) @ np.asarray(U_ah, dtype=np.float64)
                 C = np.asarray(C_np, dtype=np.float64)
             ci_ah_list = ci_as_list(ci_ah_out, nroots=nroots)
-            prev_ci_list = [np.asarray(c, dtype=np.float64).copy() for c in ci_ah_list]
-
+            if _cp_ah is not None and any(isinstance(c, _cp_ah.ndarray) for c in ci_ah_list):
+                prev_ci_list = [_cp_ah.asarray(c, dtype=_cp_ah.float64).copy() for c in ci_ah_list]
+            else:
+                prev_ci_list = [np.asarray(c, dtype=np.float64).copy() for c in ci_ah_list]
+            ci_out = prev_ci_list if nroots > 1 else prev_ci_list[0]
+    
             e_last = e_avg
             e_ref = e_avg
             C_ref = C.copy()
-
+    
             if profile is not None:
                 _t_iter_end = time.perf_counter()
                 hist = profile.setdefault("history", [])
@@ -1756,10 +1836,11 @@ def run_casscf_df(
                     if hasattr(fcisolver_use, '_last_kernel_profile') and fcisolver_use._last_kernel_profile:
                         hist[-1]["solver_kernel_profile"] = dict(fcisolver_use._last_kernel_profile)
             continue
-
+    
         elif orbital_optimizer == "1step":
             try:
                 from asuka.mcscf.newton_df import DFNewtonCASSCFAdapter  # noqa: PLC0415
+                from asuka.mcscf.newton_dense import DenseNewtonCASSCFAdapter  # noqa: PLC0415
                 from asuka.mcscf.newton_casscf import rotate_orb_ah as _rotate_orb_ah  # noqa: PLC0415
             except Exception as exc:  # pragma: no cover
                 raise RuntimeError("orbital_optimizer='1step' requires asuka.mcscf.newton_casscf support") from exc
@@ -1767,7 +1848,7 @@ def run_casscf_df(
                 import cupy as _cp_1s  # type: ignore
             except Exception:
                 _cp_1s = None
-
+    
             if ah_df_B is None:
                 _raw_df_B = getattr(scf_out, "df_B", None)
                 if _raw_df_B is not None:
@@ -1775,17 +1856,26 @@ def run_casscf_df(
                         ah_df_B = _cp_1s.ascontiguousarray(_cp_1s.asarray(_raw_df_B, dtype=_cp_1s.float64))
                     else:
                         ah_df_B = np.asarray(_raw_df_B, dtype=np.float64, order="C")
-            if ah_hcore_np is None:
-                H0 = getattr(scf_out.int1e, "hcore")
-                if _cp_1s is not None and isinstance(H0, _cp_1s.ndarray):
-                    H0 = _cp_1s.asnumpy(H0)
-                ah_hcore_np = np.asarray(H0, dtype=np.float64)
+                if ah_hcore_np is None:
+                    H0 = getattr(scf_out.int1e, "hcore")
+                    if casci_backend_s == "dense_cpu":
+                        if _cp_1s is not None and isinstance(H0, _cp_1s.ndarray):
+                            H0 = _cp_1s.asnumpy(H0)
+                        ah_hcore_np = np.asarray(H0, dtype=np.float64)
+                    else:
+                        if _cp_1s is not None and isinstance(H0, _cp_1s.ndarray):
+                            ah_hcore_np = _cp_1s.ascontiguousarray(_cp_1s.asarray(H0, dtype=_cp_1s.float64))
+                        else:
+                            ah_hcore_np = np.asarray(H0, dtype=np.float64)
 
-            C_np = C
-            if _cp_1s is not None and isinstance(C_np, _cp_1s.ndarray):
-                C_np = _cp_1s.asnumpy(C_np)
-            C_np = np.asarray(C_np, dtype=np.float64)
-
+                C_np = C
+                if casci_backend_s == "dense_cpu":
+                    if _cp_1s is not None and isinstance(C_np, _cp_1s.ndarray):
+                        C_np = _cp_1s.asnumpy(C_np)
+                    C_np = np.asarray(C_np, dtype=np.float64)
+                elif _cp_1s is not None:
+                    C_np = _cp_1s.ascontiguousarray(_cp_1s.asarray(C_np, dtype=_cp_1s.float64))
+    
             # Build RDMs for the orbital optimizer.
             dm1_act, dm2_act = make_state_averaged_rdms(
                 fcisolver_use,
@@ -1793,45 +1883,90 @@ def run_casscf_df(
                 weights,
                 ncas=int(ncas),
                 nelecas=nelecas,
-                solver_kwargs=solver_kwargs,
+                solver_kwargs=_sa_solver_kwargs_live(solver_kwargs),
             )
-
+    
             import copy as _copy_1s
             ah_fcisolver_1s = _copy_1s.copy(fcisolver_use)
-            if matvec_backend_s in {"cuda_eri_mat", "cuda"}:
+            if matvec_backend_s in {"cuda_eri_mat", "cuda", "cuda_direct"}:
                 ah_fcisolver_1s._matvec_cuda_ws_cache = {}
                 ah_fcisolver_1s._matvec_cuda_state_cache = {}
                 ah_fcisolver_1s._rdm_cuda_ws_cache = {}
-
+    
             # THC ERI provider for 1step when using THC backend.
-            _1s_eri_provider = two_e_provider if direct_mode else None
-            _1s_jk_provider = two_e_provider if direct_mode else None
+            _1s_eri_provider = (
+                two_e_provider
+                if (
+                    two_e_provider is not None
+                    and hasattr(two_e_provider, "build_pq_uv")
+                    and hasattr(two_e_provider, "build_pu_qv")
+                    and hasattr(two_e_provider, "contract_pu_wx_dm2")
+                )
+                else None
+            )
+            _1s_jk_provider = two_e_provider
             if _1s_eri_provider is None and casci_backend_s == "thc":
                 _thc_fac_1s = getattr(scf_out, "thc_factors", None)
                 if _thc_fac_1s is not None:
                     from asuka.mcscf.newton_df import THCERIProvider as _THCProv1s  # noqa: PLC0415
                     _1s_eri_provider = _THCProv1s(_thc_fac_1s)
                     _1s_jk_provider = _1s_eri_provider
-
-            mc_1s = DFNewtonCASSCFAdapter(
-                df_B=ah_df_B,
-                ao_eri=None,
-                hcore_ao=ah_hcore_np,
-                ncore=int(ncore),
-                ncas=int(ncas),
-                nelecas=nelecas,
-                mo_coeff=C_np,
-                fcisolver=ah_fcisolver_1s,
-                dense_gpu_builder=None,
-                weights=[float(w) for w in np.asarray(weights, dtype=np.float64).ravel().tolist()],
-                frozen=None,
-                internal_rotation=False,
-                extrasym=None,
-                mixed_precision=bool(newton_mixed_precision),
-                aux_block_naux=int(newton_aux_block_naux),
-                jk_provider=_1s_jk_provider,
-                eri_provider=_1s_eri_provider,
-            )
+    
+            _1s_adapter_cls = DenseNewtonCASSCFAdapter if casci_backend_s == "dense_cpu" else DFNewtonCASSCFAdapter
+            if _1s_adapter_cls is DenseNewtonCASSCFAdapter:
+                _mol_1s = getattr(scf_out, "mol", None)
+                if hasattr(_mol_1s, "coords_bohr"):
+                    _atom_coords_bohr_1s = np.asarray(_mol_1s.coords_bohr, dtype=np.float64)
+                elif hasattr(_mol_1s, "atom_coords"):
+                    _atom_coords_bohr_1s = np.asarray(_mol_1s.atom_coords(unit="Bohr"), dtype=np.float64)
+                else:
+                    raise ValueError("dense 1step adapter requires mol.coords_bohr or mol.atom_coords(unit='Bohr')")
+                mc_1s = DenseNewtonCASSCFAdapter(
+                    ao_basis=scf_out.ao_basis,
+                    atom_coords_bohr=_atom_coords_bohr_1s,
+                    hcore_ao=ah_hcore_np,
+                    ncore=int(ncore),
+                    ncas=int(ncas),
+                    nelecas=nelecas,
+                    mo_coeff=C_np,
+                    fcisolver=ah_fcisolver_1s,
+                    eri_cache_cpu=None,
+                    pair_table_threads=0,
+                    max_tile_bytes=int(max_tile_bytes),
+                    eri_threads=int(dense_cpu_threads),
+                    weights=[float(w) for w in np.asarray(weights, dtype=np.float64).ravel().tolist()],
+                    frozen=None,
+                    internal_rotation=False,
+                    extrasym=None,
+                )
+            else:
+                _ah_ao_eri_1s = None
+                if ah_df_B is None and casci_backend_s in {"dense_gpu", "dense_cpu"}:
+                    _ah_ao_eri_1s = getattr(scf_out, "ao_eri", None)
+                mc_1s = DFNewtonCASSCFAdapter(
+                    df_B=ah_df_B,
+                    ao_eri=_ah_ao_eri_1s,
+                    hcore_ao=ah_hcore_np,
+                    ncore=int(ncore),
+                    ncas=int(ncas),
+                    nelecas=nelecas,
+                    mo_coeff=C_np,
+                    fcisolver=ah_fcisolver_1s,
+                    dense_gpu_builder=(
+                        dense_gpu_builder
+                        if casci_backend_s == "dense_gpu"
+                        else None
+                    ),
+                    weights=[float(w) for w in np.asarray(weights, dtype=np.float64).ravel().tolist()],
+                    frozen=None,
+                    internal_rotation=False,
+                    extrasym=None,
+                    mixed_precision=bool(newton_mixed_precision),
+                    aux_block_naux=int(newton_aux_block_naux),
+                    jk_provider=_1s_jk_provider,
+                    eri_provider=_1s_eri_provider,
+                    stream_provider_eris=bool(_1s_eri_provider is not None),
+                )
             # PySCF mc1step defaults.
             mc_1s.max_stepsize = min(float(max_stepsize), 0.02)
             mc_1s.ah_start_tol = 2.5
@@ -1844,28 +1979,143 @@ def run_casscf_df(
             mc_1s.ah_max_cycle = int(ah_max_cycle)
             mc_1s.ah_lindep = float(ah_lindep)
             mc_1s.verbose = 0
+            mc_1s.conv_tol = float(tol)
+            mc_1s.max_memory = int(getattr(fcisolver_use, "max_memory", 4000) or 4000)
+            mc_1s.ci_response_space = 4
+            mc_1s.ci_grad_trust_region = 3.0
             if ah_options:
                 for k, v in dict(ah_options).items():
                     setattr(mc_1s, str(k), v)
-
+    
             _t_pre_1s = time.perf_counter() if profile is not None else 0.0
             eris_1s = mc_1s.ao2mo(C_np)
             _t_post_ao2mo_1s = time.perf_counter() if profile is not None else 0.0
             ci_1s_in = ci_list if nroots > 1 else ci_list[0]
-            U_1s, norm_gorb_1s, stat_1s = _rotate_orb_ah(
-                mc_1s,
-                C_np,
-                dm1_act,
-                dm2_act,
-                eris_1s,
-                ci_1s_in,
-                weights=[float(w) for w in np.asarray(weights, dtype=np.float64).ravel().tolist()],
-                strict_weights=False,
-                verbose=0,
-            )
+            _used_mc1step_refresh = False
+            if nroots == 1:
+                _used_mc1step_refresh = True
+                _mc1s_on_gpu = bool(_cp_1s is not None and isinstance(C_np, _cp_1s.ndarray))
+                if _mc1s_on_gpu:
+                    ci_cur = _cp_1s.asarray(ci_1s_in, dtype=_cp_1s.float64)
+                else:
+                    ci_cur = np.asarray(ci_1s_in, dtype=np.float64)
+                if _mc1s_on_gpu:
+                    casdm1_1s = _cp_1s.asarray(dm1_act, dtype=_cp_1s.float64)
+                    casdm2_1s = _cp_1s.asarray(dm2_act, dtype=_cp_1s.float64)
+                else:
+                    casdm1_1s = np.asarray(dm1_act, dtype=np.float64)
+                    casdm2_1s = np.asarray(dm2_act, dtype=np.float64)
+                casdm1_prev_1s = casdm1_1s.copy()
+                casdm1_last_1s = casdm1_1s.copy()
+                norm_ddm_1s = 1e2
+                norm_gci_1s = None
+                env_1s = {
+                    "de": 0.0 if e_last is None else float(e_avg) - float(e_last),
+                    "norm_ddm": float(norm_ddm_1s),
+                    "max_stepsize": float(max_stepsize_cur),
+                }
+                max_cycle_micro_1s = int(mc_1s.micro_cycle_scheduler(env_1s))
+                max_stepsize_1s = float(mc_1s.max_stepsize_scheduler(env_1s))
+                mc_1s._mc1step_ci_current = ci_cur
+                rota_1s = mc_1s.rotate_orb_cc(
+                    C_np,
+                    lambda: mc_1s._mc1step_ci_current,
+                    lambda: casdm1_1s,
+                    lambda: casdm2_1s,
+                    eris_1s,
+                    ah_x0_guess,
+                    float(ah_conv_tol_grad_eff) * 0.3,
+                    max_stepsize_1s,
+                    0,
+                )
+                if _mc1s_on_gpu:
+                    _U_last = _cp_1s.eye(int(C_np.shape[1]), dtype=_cp_1s.float64)
+                    _g_orb_last = _cp_1s.zeros((allowed_nvar,), dtype=_cp_1s.float64) if allowed_nvar > 0 else _cp_1s.zeros((1,), dtype=_cp_1s.float64)
+                else:
+                    _U_last = np.eye(int(C_np.shape[1]), dtype=np.float64)
+                    _g_orb_last = np.zeros((allowed_nvar,), dtype=np.float64) if allowed_nvar > 0 else np.zeros((1,), dtype=np.float64)
+                _njk_last = 0
+                _imicro_1s = 0
+                for _U_step, _g_orb_step, _njk_step, _r0_step in rota_1s:
+                    _imicro_1s += 1
+                    if _mc1s_on_gpu:
+                        _U_last = _cp_1s.asarray(_U_step, dtype=_cp_1s.float64)
+                        _g_orb_last = _cp_1s.asarray(_g_orb_step, dtype=_cp_1s.float64)
+                        _norm_gorb_step = float(_cp_1s.linalg.norm(_g_orb_last).item())
+                        _norm_t_step = float(_cp_1s.linalg.norm(_U_last - _cp_1s.eye(int(C_np.shape[1]), dtype=_cp_1s.float64)).item())
+                    else:
+                        _U_last = np.asarray(_U_step, dtype=np.float64)
+                        _g_orb_last = np.asarray(_g_orb_step, dtype=np.float64)
+                        _norm_gorb_step = float(np.linalg.norm(_g_orb_last))
+                        _norm_t_step = float(np.linalg.norm(_U_last - np.eye(int(C_np.shape[1]), dtype=np.float64)))
+                    _njk_last = int(_njk_step)
+                    ah_x0_guess = _r0_step
+                    if _imicro_1s >= max_cycle_micro_1s:
+                        break
+                    casdm1_1s, casdm2_1s, _gci_step, ci_cur = mc_1s.update_casdm(
+                        C_np,
+                        _U_last,
+                        mc_1s._mc1step_ci_current,
+                        float(e_avg - float(casci_out.ecore)),
+                        eris_1s,
+                        {
+                                "norm_gorb": float(_norm_gorb_step),
+                                "imicro": int(_imicro_1s),
+                            },
+                    )
+                    if _mc1s_on_gpu:
+                        mc_1s._mc1step_ci_current = _cp_1s.asarray(ci_cur, dtype=_cp_1s.float64)
+                        norm_ddm_1s = float(_cp_1s.linalg.norm(casdm1_1s - casdm1_last_1s).item())
+                        norm_ddm_micro_1s = float(_cp_1s.linalg.norm(casdm1_1s - casdm1_prev_1s).item())
+                        casdm1_prev_1s = _cp_1s.asarray(casdm1_1s, dtype=_cp_1s.float64)
+                        norm_gci_1s = None if _gci_step is None else float(_cp_1s.linalg.norm(_cp_1s.asarray(_gci_step, dtype=_cp_1s.float64).ravel()).item())
+                    else:
+                        mc_1s._mc1step_ci_current = np.asarray(ci_cur, dtype=np.float64)
+                        norm_ddm_1s = float(np.linalg.norm(casdm1_1s - casdm1_last_1s))
+                        norm_ddm_micro_1s = float(np.linalg.norm(casdm1_1s - casdm1_prev_1s))
+                        casdm1_prev_1s = np.asarray(casdm1_1s, dtype=np.float64)
+                        norm_gci_1s = None if _gci_step is None else float(np.linalg.norm(np.asarray(_gci_step, dtype=np.float64).ravel()))
+                    if (
+                        _norm_t_step < ah_conv_tol_grad_eff
+                        or (
+                            _norm_gorb_step < float(ah_conv_tol_grad_eff) * 0.5
+                            and (
+                                norm_ddm_1s < float(ah_conv_tol_grad_eff) * 1.2
+                                or norm_ddm_micro_1s < float(ah_conv_tol_grad_eff) * 1.2
+                            )
+                        )
+                    ):
+                        break
+                try:
+                    rota_1s.close()
+                except Exception:
+                    pass
+                U_1s = _U_last
+                if _mc1s_on_gpu:
+                    grad_norm = float(_cp_1s.linalg.norm(_g_orb_last).item())
+                else:
+                    grad_norm = float(np.linalg.norm(_g_orb_last))
+                stat_1s = SimpleNamespace(imic=int(_imicro_1s), tot_hop=int(_njk_last), tot_kf=0)
+                if _mc1s_on_gpu:
+                    prev_ci_list = [_cp_1s.asarray(ci_cur, dtype=_cp_1s.float64).copy()]
+                else:
+                    prev_ci_list = [np.asarray(ci_cur, dtype=np.float64).copy()]
+                ci_out = prev_ci_list if nroots > 1 else prev_ci_list[0]
+            else:
+                U_1s, norm_gorb_1s, stat_1s = _rotate_orb_ah(
+                    mc_1s,
+                    C_np,
+                    dm1_act,
+                    dm2_act,
+                    eris_1s,
+                    ci_1s_in,
+                    weights=[float(w) for w in np.asarray(weights, dtype=np.float64).ravel().tolist()],
+                    strict_weights=False,
+                    verbose=0,
+                )
+                grad_norm = float(norm_gorb_1s)
             _t_post_1s = time.perf_counter() if profile is not None else 0.0
-            grad_norm = float(norm_gorb_1s)
-
+    
             de = float("inf") if e_last is None else abs(float(e_avg) - float(e_last))
             if e_last is not None and de < tol and grad_norm < conv_tol_grad:
                 converged = True
@@ -1884,7 +2134,7 @@ def run_casscf_df(
                     _n_e_stall_loose = 0
                 if _n_e_stall_loose >= 8:
                     converged = True
-
+    
             if converged:
                 e_last = e_avg
                 if profile is not None:
@@ -1910,19 +2160,25 @@ def run_casscf_df(
                                 "1step_micro_iters": int(stat_1s.imic),
                                 "1step_hop_iters": int(stat_1s.tot_hop),
                                 "1step_keyframes": int(stat_1s.tot_kf),
+                                "1step_mode": "mc1step_refresh" if _used_mc1step_refresh else "orbital_only",
                             }
                         )
                 break
 
             # Apply rotation.
-            C_np = np.asarray(C_np, dtype=np.float64) @ np.asarray(U_1s, dtype=np.float64)
+            if _cp_1s is not None and isinstance(C_np, _cp_1s.ndarray):
+                C_np = _cp_1s.asarray(C_np, dtype=_cp_1s.float64) @ _cp_1s.asarray(U_1s, dtype=_cp_1s.float64)
+            else:
+                C_np = np.asarray(C_np, dtype=np.float64) @ np.asarray(U_1s, dtype=np.float64)
             if _cp_1s is not None and isinstance(C, _cp_1s.ndarray):
                 C = _cp_1s.asarray(C_np, dtype=C.dtype)
             else:
                 C = np.asarray(C_np, dtype=np.float64)
-
+    
             e_last = e_avg
-
+            e_ref = e_avg
+            C_ref = C.copy()
+    
             if profile is not None:
                 _t_iter_end = time.perf_counter()
                 hist = profile.setdefault("history", [])
@@ -1946,10 +2202,11 @@ def run_casscf_df(
                             "1step_micro_iters": int(stat_1s.imic),
                             "1step_hop_iters": int(stat_1s.tot_hop),
                             "1step_keyframes": int(stat_1s.tot_kf),
+                            "1step_mode": "mc1step_refresh" if _used_mc1step_refresh else "orbital_only",
                         }
                     )
             continue
-
+    
         dm1_act, dm2_act = make_state_averaged_rdms(
             fcisolver_use,
             ci_list,
@@ -1958,10 +2215,10 @@ def run_casscf_df(
             nelecas=nelecas,
             solver_kwargs=solver_kwargs,
         )
-
+    
         orbgrad_profile = profile.setdefault("orbgrad", {}) if profile is not None else None
         _t_pre_orbgrad = time.perf_counter() if profile is not None else 0.0
-        if casci_backend_s == "df":
+        if casci_backend_s == "df" and two_e_backend_s not in {"direct", "direct_df"}:
             gmat, grad_norm, eps = orbital_gradient_df(
                 scf_out,
                 C=C,
@@ -1987,7 +2244,7 @@ def run_casscf_df(
             eps_ao_use = float(dense_cpu_eps_ao) if casci_backend_s == "dense_cpu" else float(dense_gpu_eps_ao)
             threads_use = int(dense_cpu_threads) if casci_backend_s == "dense_cpu" else int(dense_gpu_threads)
             blas_use = None if dense_cpu_blas_nthreads is None else int(dense_cpu_blas_nthreads)
-
+    
             gmat, grad_norm, eps = orbital_gradient_dense(
                 scf_out,
                 C=C,
@@ -2009,7 +2266,7 @@ def run_casscf_df(
             )
         g_vec = gmat[allowed_xp].ravel()
         _t_post_orbgrad = time.perf_counter() if profile is not None else 0.0
-
+    
         # Resolve deferred adaptive step-size action for non-AH path.
         if _adaptive_action.startswith("pending"):
             _stall_grad_thr = conv_tol_grad * 10.0
@@ -2034,7 +2291,7 @@ def run_casscf_df(
                     else:
                         _adaptive_action = "hold"
             prev_grad_norm = grad_norm
-
+    
         if profile is not None:
             ws_reused = None
             ws_rebuild_mismatches = None
@@ -2081,7 +2338,7 @@ def run_casscf_df(
                 )
                 if hasattr(fcisolver_use, '_last_kernel_profile') and fcisolver_use._last_kernel_profile:
                     hist[-1]["solver_kernel_profile"] = dict(fcisolver_use._last_kernel_profile)
-
+    
         if e_last is not None:
             de = abs(float(e_avg) - float(e_last))
             if de < tol and grad_norm < conv_tol_grad:
@@ -2091,16 +2348,16 @@ def run_casscf_df(
         e_last = e_avg
         e_ref = e_avg
         C_ref = C.copy()
-
+    
         # 3) Orbital update (Cayley transform).
         #    Default: L-BFGS in the non-redundant rotation variables with a diagonal
         #    (energy-difference) preconditioner as H0.
         denom = eps[:, None] - eps[None, :]
         denom_floor = 1e-8
         denom = xp.where(xp.abs(denom) < denom_floor, denom_floor, xp.abs(denom))
-
+    
         inv_h = 1.0 / denom[allowed_xp].ravel()
-
+    
         step_vec_grad = (-damp) * (g_vec * inv_h)
         lbfgs_fallback_used = False
         if orbital_optimizer == "lbfgs" and lbfgs is not None and lbfgs.enabled:
@@ -2123,7 +2380,7 @@ def run_casscf_df(
                 step_vec = step_vec_lbfgs
         else:
             step_vec = step_vec_grad
-
+    
         qune_mode = "QN" if orbital_optimizer == "lbfgs" else "SX"
         if (
             qune_enabled
@@ -2171,7 +2428,7 @@ def run_casscf_df(
                     qune_nls += 1
             if float(e_avg) > float(qune_prev_energy):
                 step_vec = step_vec * float(qune_uphill_scale)
-
+    
         diis_used = False
         if (
             diis is not None
@@ -2186,7 +2443,7 @@ def run_casscf_df(
                 if step_vec_diis is not None:
                     step_vec = step_vec_diis
                     diis_used = True
-
+    
         max_abs = float(xp.max(xp.abs(step_vec)).item()) if allowed_nvar else 0.0
         if max_abs > max_stepsize_cur:
             step_vec = step_vec * (float(max_stepsize_cur) / float(max_abs))
@@ -2194,12 +2451,12 @@ def run_casscf_df(
             step_norm = float(xp.linalg.norm(step_vec).item())
             step_scale = 1.0 / (1.0 + float(step_norm_scale_alpha) * step_norm)
             step_vec = step_vec * float(step_scale)
-
+    
         step_lower = xp.zeros((nmo, nmo), dtype=xp.float64)
         step_lower[allowed_xp] = step_vec
         step_lower = xp.tril(step_lower, k=-1)
         A = step_lower - step_lower.T
-
+    
         U = cayley_update(xp, A)
         C = C @ U
         if orbital_optimizer == "lbfgs" and lbfgs is not None and lbfgs.enabled:
@@ -2208,7 +2465,7 @@ def run_casscf_df(
         qune_prev_step = step_vec.copy() if allowed_nvar else None
         qune_prev_energy = float(e_avg)
         qune_prev_fp = 2.0 * float((g_vec * step_vec).sum().item()) if allowed_nvar else None
-
+    
         # Record orbital-update timing in the last history entry
         if profile is not None:
             _t_iter_end = time.perf_counter()
@@ -2219,15 +2476,39 @@ def run_casscf_df(
                 hist[-1]["orbital_diis_used"] = bool(diis_used)
                 hist[-1]["lbfgs_fallback_used"] = bool(lbfgs_fallback_used)
                 hist[-1]["qune_step_mode"] = str(qune_mode)
-
+    
     if casci_out is None:  # pragma: no cover
         raise RuntimeError("internal error: CASSCF loop did not produce a CASCI result")
 
     # Final full CASCI to get accurate energy when inner iterations used
     # reduced Davidson cycles.
-    if ci_max_cycle_inner is not None and converged and casci_backend_s == "df":
+    if ci_max_cycle_inner is not None and converged and (casci_backend_s == "df" or two_e_backend_s == "direct"):
         cached_b_in = cached_b_whitened if b_cache_enabled else None
-        if matvec_backend_s in {"cuda_eri_mat", "cuda"}:
+        if two_e_backend_s == "direct" and matvec_backend_s in {"cuda_direct", "contract", "row_oracle_df"}:
+            from .casci import run_casci_direct_exact  # noqa: PLC0415
+
+            casci_out = run_casci_direct_exact(
+                scf_out,
+                ncore=int(ncore),
+                ncas=int(ncas),
+                nelecas=nelecas,
+                mo_coeff=C,
+                ci0=prev_ci_list,
+                fcisolver=fcisolver_use,
+                twos=twos,
+                nroots=int(nroots),
+                matvec_backend=str(matvec_backend_s),
+                dense_gpu_ao_rep=str(dense_gpu_ao_rep),
+                dense_gpu_builder_mol=dense_gpu_builder_mol,
+                dense_gpu_builder=dense_gpu_builder,
+                two_e_provider=two_e_provider,
+                dense_exact_jk=bool(dense_exact_jk),
+                threads=int(dense_gpu_threads),
+                eps_ao=float(dense_gpu_eps_ao),
+                max_tile_bytes=int(max_tile_bytes),
+                **_sa_solver_kwargs_live(solver_kwargs),
+            )
+        elif matvec_backend_s in {"cuda_eri_mat", "cuda"}:
             casci_out = run_casci_df(
                 scf_out,
                 ncore=int(ncore),
@@ -2243,7 +2524,7 @@ def run_casscf_df(
                 aux_block_naux=int(aux_block_naux),
                 max_tile_bytes=int(max_tile_bytes),
                 cached_b_whitened=cached_b_in,
-                **solver_kwargs,
+                **_sa_solver_kwargs_live(solver_kwargs),
             )
         else:
             from .casci import run_casci_df_cpu  # noqa: PLC0415
@@ -2304,7 +2585,10 @@ def run_casscf_df(
     try:
         from dataclasses import replace as _dc_replace  # noqa: PLC0415
 
-        casci_out = _dc_replace(casci_out, scf_out=scf_out_in)
+        _casci_replace_kwargs = {"scf_out": scf_out_in}
+        if ci_out is not None:
+            _casci_replace_kwargs["ci"] = ci_out
+        casci_out = _dc_replace(casci_out, **_casci_replace_kwargs)
     except Exception:
         pass
 
@@ -2332,8 +2616,8 @@ def run_casscf_df(
     )
     _restore_cuda_pool()
     return result
-
-
+    
+    
 def run_casscf_dense_cpu(
     scf_out: RHFDFRunResult | ROHFDFRunResult,
     *,
@@ -2456,8 +2740,14 @@ def run_casscf(
     if backend_s == "cuda" and not bool(is_gpu):
         raise ValueError("backend='cuda' requires scf_out with GPU arrays (use frontend.run_*_df or run_*_dense with backend='cuda')")
 
+    two_e_backend_s = str(getattr(scf_out, "two_e_backend", "") or "").strip().lower()
     if matvec_backend is None:
-        matvec_backend = "cuda_eri_mat" if backend_s == "cuda" else "contract"
+        if backend_s == "cuda" and two_e_backend_s == "direct":
+            matvec_backend = "cuda_direct"
+        elif backend_s == "cuda" and two_e_backend_s == "direct_df":
+            matvec_backend = "cuda"
+        else:
+            matvec_backend = "cuda_eri_mat" if backend_s == "cuda" else "contract"
     run_config = _dc_replace(run_config, matvec_backend=str(matvec_backend))
     if "root_weights" in run_kwargs and run_kwargs["root_weights"] is not None:
         weights_obj = tuple(float(w) for w in np.asarray(run_kwargs["root_weights"], dtype=np.float64).ravel())
@@ -2478,18 +2768,27 @@ def run_casscf(
 
     direct_mode = bool(
         getattr(scf_out, "direct_jk_ctx", None) is not None
-        or str(getattr(scf_out, "two_e_backend", "") or "").strip().lower() == "direct"
+        or two_e_backend_s in {"direct", "direct_df"}
     )
     if direct_mode:
         if backend_s != "cuda":
             raise NotImplementedError("direct two-electron backend currently requires backend='cuda' for CASSCF")
+        direct_matvec_backend = str(matvec_backend)
+        if two_e_backend_s == "direct" and str(direct_matvec_backend).strip().lower() in {"cuda_direct", "contract", "row_oracle_df"}:
+            direct_casci_backend = "df"
+        else:
+            direct_casci_backend = "df" if two_e_backend_s == "direct_df" else "dense_gpu"
+        if two_e_backend_s == "direct_df" and matvec_backend is None:
+            direct_matvec_backend = "cuda"
+        if two_e_backend_s == "direct_df":
+            kwargs.setdefault("want_eri_mat", bool(str(direct_matvec_backend).strip().lower() == "cuda_eri_mat"))
         result = run_casscf_df(
             scf_out,
             ncore=int(ncore),
             ncas=int(ncas),
             nelecas=nelecas,
-            casci_backend="dense_gpu",
-            matvec_backend=str(matvec_backend),
+            casci_backend=str(direct_casci_backend),
+            matvec_backend=str(direct_matvec_backend),
             **kwargs,
         )
         return _dc_replace(result, run_config=run_config)
@@ -2531,7 +2830,7 @@ def run_casscf(
             **kwargs,
         )
         return _dc_replace(result, run_config=run_config)
-
+    
     result = run_casscf_df(
         scf_out,
         ncore=int(ncore),

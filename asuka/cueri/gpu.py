@@ -66,6 +66,25 @@ def _detect_cuda_kernel_limits(*, default_lmax: int = 5, default_nroots: int = 1
 
 CUDA_MAX_L, CUDA_MAX_NROOTS = _detect_cuda_kernel_limits()
 
+_PPPS_PACKED_EXACT_SHAPES: tuple[tuple[int, int], ...] = (
+    (1, 1),
+    (1, 3),
+    (1, 6),
+    (1, 9),
+    (3, 1),
+    (3, 3),
+    (3, 6),
+    (3, 9),
+    (6, 1),
+    (6, 3),
+    (6, 6),
+    (6, 9),
+    (9, 1),
+    (9, 3),
+    (9, 6),
+    (9, 9),
+)
+
 
 def warmup_cuda(*, gemm_n: int = 256, chol_n: int = 256, stream=None) -> None:
     """Warm up CUDA libraries (cuBLAS/cuSOLVER) to reduce first-call overhead.
@@ -3868,6 +3887,58 @@ def eri_psps_device(
         return out.ravel()
 
 
+def _dispatch_ppps_packed_exact_small_groups(
+    *,
+    task_ab,
+    task_cd,
+    shell_pairs: DeviceShellPairs,
+    basis: DeviceBasisSS,
+    pair_tables: DevicePairTables,
+    out,
+    threads: int,
+    stream,
+):
+    import cupy as cp
+
+    nAB = shell_pairs.sp_npair[task_ab].astype(cp.int32, copy=False)
+    nCD = shell_pairs.sp_npair[task_cd].astype(cp.int32, copy=False)
+    supported_mask = cp.zeros((int(task_ab.shape[0]),), dtype=cp.bool_)
+
+    for npair_ab_expected, npair_cd_expected in _PPPS_PACKED_EXACT_SHAPES:
+        mask = (nAB == int(npair_ab_expected)) & (nCD == int(npair_cd_expected))
+        idx = cp.nonzero(mask)[0]
+        if int(idx.size) == 0:
+            continue
+        ab_group = cp.ascontiguousarray(task_ab[idx])
+        cd_group = cp.ascontiguousarray(task_cd[idx])
+        _ext.eri_ppps_exact_shape_indexed_inplace_device(
+            ab_group,
+            cd_group,
+            idx.astype(cp.int32, copy=False),
+            shell_pairs.sp_A,
+            shell_pairs.sp_B,
+            shell_pairs.sp_pair_start,
+            shell_pairs.sp_npair,
+            basis.shell_cx,
+            basis.shell_cy,
+            basis.shell_cz,
+            pair_tables.pair_eta,
+            pair_tables.pair_Px,
+            pair_tables.pair_Py,
+            pair_tables.pair_Pz,
+            pair_tables.pair_cK,
+            out.ravel(),
+            int(npair_ab_expected),
+            int(npair_cd_expected),
+            int(threads),
+            int(_stream_ptr(stream)),
+            False,
+        )
+        supported_mask |= mask
+
+    return supported_mask, nAB, nCD
+
+
 def eri_ppps_device(
     tasks: TaskList,
     basis: DeviceBasisSS,
@@ -3994,26 +4065,76 @@ def eri_ppps_device(
             ab_small = cp.ascontiguousarray(task_ab[small_idx])
             cd_small = cp.ascontiguousarray(task_cd[small_idx])
             out_small = cp.empty((int(ab_small.shape[0]), 27), dtype=cp.float64)
-            _ext.eri_ppps_warp_inplace_device(
-                ab_small,
-                cd_small,
-                shell_pairs.sp_A,
-                shell_pairs.sp_B,
-                shell_pairs.sp_pair_start,
-                shell_pairs.sp_npair,
-                basis.shell_cx,
-                basis.shell_cy,
-                basis.shell_cz,
-                pair_tables.pair_eta,
-                pair_tables.pair_Px,
-                pair_tables.pair_Py,
-                pair_tables.pair_Pz,
-                pair_tables.pair_cK,
-                out_small.ravel(),
-                int(threads),
-                int(_stream_ptr(stream)),
-                False,
+            supported_mask, nAB_small, nCD_small = _dispatch_ppps_packed_exact_small_groups(
+                task_ab=ab_small,
+                task_cd=cd_small,
+                shell_pairs=shell_pairs,
+                basis=basis,
+                pair_tables=pair_tables,
+                out=out_small,
+                threads=int(threads),
+                stream=stream,
             )
+            fallback_small_idx = cp.nonzero(~supported_mask)[0]
+            if int(fallback_small_idx.size) > 0:
+                fallback_ab = cp.ascontiguousarray(ab_small[fallback_small_idx])
+                fallback_cd = cp.ascontiguousarray(cd_small[fallback_small_idx])
+                fallback_out = cp.empty((int(fallback_ab.shape[0]), 27), dtype=cp.float64)
+                fallback_work = nAB_small[fallback_small_idx].astype(cp.int64) * nCD_small[fallback_small_idx].astype(cp.int64)
+                tiny_fallback_mask = fallback_work <= 128
+                tiny_fallback_idx = cp.nonzero(tiny_fallback_mask)[0]
+                warp_fallback_idx = cp.nonzero(~tiny_fallback_mask)[0]
+                if int(tiny_fallback_idx.size) > 0:
+                    ab_tiny = cp.ascontiguousarray(fallback_ab[tiny_fallback_idx])
+                    cd_tiny = cp.ascontiguousarray(fallback_cd[tiny_fallback_idx])
+                    out_tiny = cp.empty((int(ab_tiny.shape[0]), 27), dtype=cp.float64)
+                    _ext.eri_ppps_tiny_warp_inplace_device(
+                        ab_tiny,
+                        cd_tiny,
+                        shell_pairs.sp_A,
+                        shell_pairs.sp_B,
+                        shell_pairs.sp_pair_start,
+                        shell_pairs.sp_npair,
+                        basis.shell_cx,
+                        basis.shell_cy,
+                        basis.shell_cz,
+                        pair_tables.pair_eta,
+                        pair_tables.pair_Px,
+                        pair_tables.pair_Py,
+                        pair_tables.pair_Pz,
+                        pair_tables.pair_cK,
+                        out_tiny.ravel(),
+                        int(threads),
+                        int(_stream_ptr(stream)),
+                        False,
+                    )
+                    fallback_out[tiny_fallback_idx] = out_tiny
+                if int(warp_fallback_idx.size) > 0:
+                    ab_warp = cp.ascontiguousarray(fallback_ab[warp_fallback_idx])
+                    cd_warp = cp.ascontiguousarray(fallback_cd[warp_fallback_idx])
+                    out_warp = cp.empty((int(ab_warp.shape[0]), 27), dtype=cp.float64)
+                    _ext.eri_ppps_warp_inplace_device(
+                        ab_warp,
+                        cd_warp,
+                        shell_pairs.sp_A,
+                        shell_pairs.sp_B,
+                        shell_pairs.sp_pair_start,
+                        shell_pairs.sp_npair,
+                        basis.shell_cx,
+                        basis.shell_cy,
+                        basis.shell_cz,
+                        pair_tables.pair_eta,
+                        pair_tables.pair_Px,
+                        pair_tables.pair_Py,
+                        pair_tables.pair_Pz,
+                        pair_tables.pair_cK,
+                        out_warp.ravel(),
+                        int(threads),
+                        int(_stream_ptr(stream)),
+                        False,
+                    )
+                    fallback_out[warp_fallback_idx] = out_warp
+                out_small[fallback_small_idx] = fallback_out
             out[small_idx] = out_small
 
         if int(med_idx.size) > 0:

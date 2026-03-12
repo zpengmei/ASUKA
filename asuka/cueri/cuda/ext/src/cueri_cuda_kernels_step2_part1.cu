@@ -38,6 +38,13 @@ __device__ __forceinline__ double warp_reduce_sum(double x) {
   return x;
 }
 
+__device__ __forceinline__ double subwarp8_reduce_sum(double x) {
+  x += __shfl_down_sync(0xffffffff, x, 4, 8);
+  x += __shfl_down_sync(0xffffffff, x, 2, 8);
+  x += __shfl_down_sync(0xffffffff, x, 1, 8);
+  return x;
+}
+
 __device__ __forceinline__ double block_reduce_sum(double x) {
   __shared__ double shared[32];  // up to 1024 threads
   const int lane = threadIdx.x & 31;
@@ -50,6 +57,83 @@ __device__ __forceinline__ double block_reduce_sum(double x) {
   x = (threadIdx.x < (blockDim.x >> 5)) ? shared[lane] : 0.0;
   if (wid == 0) x = warp_reduce_sum(x);
   return x;
+}
+
+__device__ __forceinline__ void accumulate_jk_single_value(
+    double val,
+    const double* D_mat,
+    double* J_mat,
+    double* K_mat,
+    int a,
+    int b,
+    int c,
+    int d,
+    bool ab_neq,
+    bool cd_neq,
+    bool bk_swap,
+    double f_ab,
+    double f_cd,
+    int64_t N) {
+  if (val == 0.0) return;
+  if (J_mat != nullptr) {
+    const double Dcd = D_mat[c * N + d];
+    atomicAdd(&J_mat[a * N + b], f_cd * val * Dcd);
+    if (ab_neq) atomicAdd(&J_mat[b * N + a], f_cd * val * Dcd);
+    if (bk_swap) {
+      const double Dab = D_mat[a * N + b];
+      atomicAdd(&J_mat[c * N + d], f_ab * val * Dab);
+      if (cd_neq) atomicAdd(&J_mat[d * N + c], f_ab * val * Dab);
+    }
+  }
+  if (K_mat != nullptr) {
+    atomicAdd(&K_mat[a * N + c], val * D_mat[b * N + d]);
+    if (cd_neq) atomicAdd(&K_mat[a * N + d], val * D_mat[b * N + c]);
+    if (ab_neq) atomicAdd(&K_mat[b * N + c], val * D_mat[a * N + d]);
+    if (ab_neq && cd_neq) atomicAdd(&K_mat[b * N + d], val * D_mat[a * N + c]);
+    if (bk_swap) {
+      atomicAdd(&K_mat[c * N + a], val * D_mat[d * N + b]);
+      if (cd_neq) atomicAdd(&K_mat[d * N + a], val * D_mat[c * N + b]);
+      if (ab_neq) atomicAdd(&K_mat[c * N + b], val * D_mat[d * N + a]);
+      if (ab_neq && cd_neq) atomicAdd(&K_mat[d * N + b], val * D_mat[c * N + a]);
+    }
+  }
+}
+
+__device__ __forceinline__ void accumulate_fock_single_value(
+    double val,
+    const double* D_mat,
+    double* F_mat,
+    int a,
+    int b,
+    int c,
+    int d,
+    bool ab_neq,
+    bool cd_neq,
+    bool bk_swap,
+    double f_ab,
+    double f_cd,
+    int64_t N) {
+  if (val == 0.0 || F_mat == nullptr) return;
+  const double Dcd = D_mat[c * N + d];
+  atomicAdd(&F_mat[a * N + b], f_cd * val * Dcd);
+  if (ab_neq) atomicAdd(&F_mat[b * N + a], f_cd * val * Dcd);
+  if (bk_swap) {
+    const double Dab = D_mat[a * N + b];
+    atomicAdd(&F_mat[c * N + d], f_ab * val * Dab);
+    if (cd_neq) atomicAdd(&F_mat[d * N + c], f_ab * val * Dab);
+  }
+
+  constexpr double alpha = -0.5;
+  atomicAdd(&F_mat[a * N + c], alpha * val * D_mat[b * N + d]);
+  if (cd_neq) atomicAdd(&F_mat[a * N + d], alpha * val * D_mat[b * N + c]);
+  if (ab_neq) atomicAdd(&F_mat[b * N + c], alpha * val * D_mat[a * N + d]);
+  if (ab_neq && cd_neq) atomicAdd(&F_mat[b * N + d], alpha * val * D_mat[a * N + c]);
+  if (bk_swap) {
+    atomicAdd(&F_mat[c * N + a], alpha * val * D_mat[d * N + b]);
+    if (cd_neq) atomicAdd(&F_mat[d * N + a], alpha * val * D_mat[c * N + b]);
+    if (ab_neq) atomicAdd(&F_mat[c * N + b], alpha * val * D_mat[d * N + a]);
+    if (ab_neq && cd_neq) atomicAdd(&F_mat[d * N + b], alpha * val * D_mat[c * N + a]);
+  }
 }
 
 __device__ __forceinline__ void boys_f0_f1_f2(double T, double& F0, double& F1, double& F2) {
@@ -1671,5 +1755,81 @@ inline int sanitize_component_warp_threads(int threads) {
   return t < 32 ? 32 : t;
 }
 
+inline int sanitize_halfwarp_launch_threads(int threads) {
+  int t = threads;
+  if (t <= 0) t = 128;
+  if (t > 256) t = 256;
+  t = (t / 32) * 32;
+  return t < 32 ? 32 : t;
+}
+
+inline int sanitize_subwarp8_launch_threads(int threads) {
+  int t = threads;
+  if (t <= 0) t = 128;
+  if (t > 256) t = 256;
+  t = (t / 32) * 32;
+  return t < 32 ? 32 : t;
+}
+
 }  // namespace
+
+extern "C" cudaError_t cueri_eri_psss_warp_launch_stream(
+    const int32_t* task_spAB,
+    const int32_t* task_spCD,
+    int ntasks,
+    const int32_t* sp_A,
+    const int32_t* sp_B,
+    const int32_t* sp_pair_start,
+    const int32_t* sp_npair,
+    const double* shell_cx,
+    const double* shell_cy,
+    const double* shell_cz,
+    const double* pair_eta,
+    const double* pair_Px,
+    const double* pair_Py,
+    const double* pair_Pz,
+    const double* pair_cK,
+    double* eri_out,
+    cudaStream_t stream,
+    int threads) {
+  if (ntasks <= 0) return ntasks == 0 ? cudaSuccess : cudaErrorInvalidValue;
+  const int launch_threads = sanitize_subwarp8_launch_threads(threads);
+  const int warps_per_block = launch_threads >> 5;
+  const int tasks_per_block = warps_per_block << 2;
+  const int blocks = (ntasks + tasks_per_block - 1) / tasks_per_block;
+  KernelERI_psss_subwarp8<<<static_cast<unsigned int>(blocks), launch_threads, 0, stream>>>(
+      task_spAB, task_spCD, ntasks, sp_A, sp_B, sp_pair_start, sp_npair,
+      shell_cx, shell_cy, shell_cz, pair_eta, pair_Px, pair_Py, pair_Pz, pair_cK, eri_out);
+  return cudaGetLastError();
+}
+
+extern "C" cudaError_t cueri_eri_psps_warp_launch_stream(
+    const int32_t* task_spAB,
+    const int32_t* task_spCD,
+    int ntasks,
+    const int32_t* sp_A,
+    const int32_t* sp_B,
+    const int32_t* sp_pair_start,
+    const int32_t* sp_npair,
+    const double* shell_cx,
+    const double* shell_cy,
+    const double* shell_cz,
+    const double* pair_eta,
+    const double* pair_Px,
+    const double* pair_Py,
+    const double* pair_Pz,
+    const double* pair_cK,
+    double* eri_out,
+    cudaStream_t stream,
+    int threads) {
+  if (ntasks <= 0) return ntasks == 0 ? cudaSuccess : cudaErrorInvalidValue;
+  const int launch_threads = sanitize_subwarp8_launch_threads(threads);
+  const int warps_per_block = launch_threads >> 5;
+  const int tasks_per_block = warps_per_block << 2;
+  const int blocks = (ntasks + tasks_per_block - 1) / tasks_per_block;
+  KernelERI_psps_warp<<<static_cast<unsigned int>(blocks), launch_threads, 0, stream>>>(
+      task_spAB, task_spCD, ntasks, sp_A, sp_B, sp_pair_start, sp_npair,
+      shell_cx, shell_cy, shell_cz, pair_eta, pair_Px, pair_Py, pair_Pz, pair_cK, eri_out);
+  return cudaGetLastError();
+}
 

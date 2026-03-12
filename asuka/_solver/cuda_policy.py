@@ -239,7 +239,7 @@ def resolve_kernel_cuda_policy(
     )
 
     matvec_cuda_aggregate_offdiag_preview = None
-    if str(matvec_backend) in ("cuda_eri_mat", "cuda"):
+    if str(matvec_backend) in ("cuda_eri_mat", "cuda", "cuda_direct"):
         aggregate_preview_in = kwargs.get(
             "matvec_cuda_aggregate_offdiag",
             getattr(defaults, "matvec_cuda_aggregate_offdiag", None),

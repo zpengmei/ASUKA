@@ -69,6 +69,10 @@ _EPQ_SYM_SPMAT_CACHE: weakref.WeakKeyDictionary[
 ] = weakref.WeakKeyDictionary()
 
 
+def _has_row_oracle_contract(eri: object) -> bool:
+    return hasattr(eri, "contract_cols") and callable(getattr(eri, "contract_cols", None))
+
+
 def _split_chunks(n: int, chunks: int) -> list[tuple[int, int]]:
     n = int(n)
     chunks = int(chunks)
@@ -770,6 +774,34 @@ def contract_h_csf_multi_df(
             out += mat.dot(g)  # type: ignore[operator]
         return out
 
+    def build_g_flat_generic() -> np.ndarray:
+        if getattr(df_eri, "l_full", None) is not None:
+            if blas_nthreads is None:
+                tmp = df_eri.l_full.T @ t_flat  # (naux, ncsf*nvec)
+                return 0.5 * (df_eri.l_full @ tmp)  # (nops, ncsf*nvec)
+            with blas_thread_limit(int(blas_nthreads)):
+                tmp = df_eri.l_full.T @ t_flat  # (naux, ncsf*nvec)
+                return 0.5 * (df_eri.l_full @ tmp)  # (nops, ncsf*nvec)
+        if _has_row_oracle_contract(df_eri):
+            pair_ids_all = np.arange(nops, dtype=np.int32)
+            g_cols = [
+                np.asarray(
+                    df_eri.contract_cols(
+                        pair_ids_all,
+                        t_flat[:, col],
+                        half=0.5,
+                        eri_mat_max_bytes=0,
+                    ),
+                    dtype=np.float64,
+                    order="C",
+                )
+                for col in range(m)
+            ]
+            if not g_cols:
+                return np.zeros((nops, 0), dtype=np.float64)
+            return np.asarray(np.stack(g_cols, axis=1), dtype=np.float64, order="C")
+        raise TypeError("row-oracle integral object must provide l_full or contract_cols")
+
     h1_chunks = _split_chunks(len(h1_pairs), min(nthreads, len(h1_pairs))) if h1_pairs else []
     rs_chunks = _split_chunks(len(rs_ids), min(nthreads, len(rs_ids)))
     pq_chunks = _split_chunks(nops, min(nthreads, nops))
@@ -786,13 +818,7 @@ def contract_h_csf_multi_df(
         if profile_out is not None and t_build0 is not None:
             profile_out["gen_t_build_s"] = time.perf_counter() - t_build0
         t_gemm0 = time.perf_counter() if profile_out is not None else None
-        if blas_nthreads is None:
-            tmp = df_eri.l_full.T @ t_flat  # (naux, ncsf*nvec)
-            g_flat = 0.5 * (df_eri.l_full @ tmp)  # (nops, ncsf*nvec)
-        else:
-            with blas_thread_limit(int(blas_nthreads)):
-                tmp = df_eri.l_full.T @ t_flat  # (naux, ncsf*nvec)
-                g_flat = 0.5 * (df_eri.l_full @ tmp)  # (nops, ncsf*nvec)
+        g_flat = build_g_flat_generic()
         if profile_out is not None and t_gemm0 is not None:
             profile_out["gen_gemm_s"] = time.perf_counter() - t_gemm0
         t_apply0 = time.perf_counter() if profile_out is not None else None
@@ -832,13 +858,7 @@ def contract_h_csf_multi_df(
                 profile_out["gen_t_build_s"] = time.perf_counter() - t_build0
 
             t_gemm0 = time.perf_counter() if profile_out is not None else None
-            if blas_nthreads is None:
-                tmp = df_eri.l_full.T @ t_flat  # (naux, ncsf*nvec)
-                g_flat = 0.5 * (df_eri.l_full @ tmp)  # (nops, ncsf*nvec)
-            else:
-                with blas_thread_limit(int(blas_nthreads)):
-                    tmp = df_eri.l_full.T @ t_flat  # (naux, ncsf*nvec)
-                    g_flat = 0.5 * (df_eri.l_full @ tmp)  # (nops, ncsf*nvec)
+            g_flat = build_g_flat_generic()
             if profile_out is not None and t_gemm0 is not None:
                 profile_out["gen_gemm_s"] = time.perf_counter() - t_gemm0
 

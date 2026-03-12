@@ -69,6 +69,13 @@ def _find_shell_pair_indices(shell_pairs, shell_l: np.ndarray, la: int, lb: int,
     return np.asarray(hits, dtype=np.int32)
 
 
+def _find_shell_pair_with_npair(shell_pairs, shell_l: np.ndarray, la: int, lb: int, *, npair: int) -> np.int32:
+    for idx, (A, B, n) in enumerate(zip(shell_pairs.sp_A, shell_pairs.sp_B, shell_pairs.sp_npair)):
+        if int(shell_l[int(A)]) == int(la) and int(shell_l[int(B)]) == int(lb) and int(n) == int(npair):
+            return np.int32(idx)
+    pytest.skip(f"basis does not provide shell pair ({la},{lb}) with npair={npair}")
+
+
 def _pair_grid(task_ab: np.ndarray, task_cd: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     ab = np.repeat(np.asarray(task_ab, dtype=np.int32), int(task_cd.shape[0]))
     cd = np.tile(np.asarray(task_cd, dtype=np.int32), int(task_ab.shape[0]))
@@ -86,6 +93,25 @@ def _explicit_tile_reference(basis, shell_pairs, task_ab: np.ndarray, task_cd: n
         D = int(shell_pairs.sp_B[int(spCD)])
         ref_tiles.append(np.asarray(eri_int2e_cart_tile(basis, A, B, C, D), dtype=np.float64).reshape(-1))
     return np.stack(ref_tiles, axis=0)
+
+
+def _assert_explicit_mode_parity(device_fn, quartet_test_system, task_ab, task_cd, *, mode, extra_kwargs, width):
+    from asuka.cueri.tasks import TaskList
+
+    tasks = TaskList(task_spAB=np.asarray(task_ab, dtype=np.int32), task_spCD=np.asarray(task_cd, dtype=np.int32))
+    ref = _explicit_tile_reference(quartet_test_system.basis, quartet_test_system.shell_pairs, task_ab, task_cd)
+    got = cupy.asnumpy(
+        device_fn(
+            tasks,
+            quartet_test_system.dbasis,
+            quartet_test_system.dsp,
+            quartet_test_system.pair_tables,
+            threads=256,
+            mode=mode,
+            **extra_kwargs,
+        ).reshape((-1, int(width)))
+    )
+    np.testing.assert_allclose(got, ref, rtol=1e-10, atol=2e-11)
 
 
 @pytest.fixture(scope="module")
@@ -137,6 +163,77 @@ def generic_quartet_test_system():
 
 
 @pytest.mark.parametrize(("mode", "extra_kwargs"), _MODE_CASES)
+def test_psss_mode_parity_against_cpu_reference(quartet_test_system, mode, extra_kwargs):
+    from asuka.cueri.gpu import eri_psss_device
+
+    ps_idx = _find_shell_pair_indices(quartet_test_system.shell_pairs, quartet_test_system.shell_l, 1, 0, limit=2)
+    ss_idx = _find_shell_pair_indices(quartet_test_system.shell_pairs, quartet_test_system.shell_l, 0, 0, limit=2)
+    task_ab, task_cd = _pair_grid(ps_idx, ss_idx)
+    _assert_explicit_mode_parity(
+        eri_psss_device,
+        quartet_test_system,
+        task_ab,
+        task_cd,
+        mode=mode,
+        extra_kwargs=extra_kwargs,
+        width=3,
+    )
+
+
+@pytest.mark.parametrize(("mode", "extra_kwargs"), _MODE_CASES)
+def test_ppss_mode_parity_against_cpu_reference(quartet_test_system, mode, extra_kwargs):
+    from asuka.cueri.gpu import eri_ppss_device
+
+    pp_idx = _find_shell_pair_indices(quartet_test_system.shell_pairs, quartet_test_system.shell_l, 1, 1, limit=2)
+    ss_idx = _find_shell_pair_indices(quartet_test_system.shell_pairs, quartet_test_system.shell_l, 0, 0, limit=2)
+    task_ab, task_cd = _pair_grid(pp_idx, ss_idx)
+    _assert_explicit_mode_parity(
+        eri_ppss_device,
+        quartet_test_system,
+        task_ab,
+        task_cd,
+        mode=mode,
+        extra_kwargs=extra_kwargs,
+        width=9,
+    )
+
+
+@pytest.mark.parametrize(("mode", "extra_kwargs"), _MODE_CASES)
+def test_psps_mode_parity_against_cpu_reference(quartet_test_system, mode, extra_kwargs):
+    from asuka.cueri.gpu import eri_psps_device
+
+    ps_idx = _find_shell_pair_indices(quartet_test_system.shell_pairs, quartet_test_system.shell_l, 1, 0, limit=2)
+    task_ab, task_cd = _pair_grid(ps_idx, ps_idx)
+    _assert_explicit_mode_parity(
+        eri_psps_device,
+        quartet_test_system,
+        task_ab,
+        task_cd,
+        mode=mode,
+        extra_kwargs=extra_kwargs,
+        width=9,
+    )
+
+
+@pytest.mark.parametrize(("mode", "extra_kwargs"), _MODE_CASES)
+def test_dsss_mode_parity_against_cpu_reference(quartet_test_system, mode, extra_kwargs):
+    from asuka.cueri.gpu import eri_dsss_device
+
+    ds_idx = _find_shell_pair_indices(quartet_test_system.shell_pairs, quartet_test_system.shell_l, 2, 0, limit=2)
+    ss_idx = _find_shell_pair_indices(quartet_test_system.shell_pairs, quartet_test_system.shell_l, 0, 0, limit=2)
+    task_ab, task_cd = _pair_grid(ds_idx, ss_idx)
+    _assert_explicit_mode_parity(
+        eri_dsss_device,
+        quartet_test_system,
+        task_ab,
+        task_cd,
+        mode=mode,
+        extra_kwargs=extra_kwargs,
+        width=6,
+    )
+
+
+@pytest.mark.parametrize(("mode", "extra_kwargs"), _MODE_CASES)
 def test_ppps_mode_parity_against_cpu_reference(quartet_test_system, mode, extra_kwargs):
     from asuka.cueri.gpu import eri_ppps_device
     from asuka.cueri.tasks import TaskList
@@ -160,6 +257,103 @@ def test_ppps_mode_parity_against_cpu_reference(quartet_test_system, mode, extra
     )
 
     np.testing.assert_allclose(got, ref, rtol=1e-10, atol=1e-11, err_msg=f"ppps mismatch in mode={mode}")
+
+
+def test_ppps_auto_mode_tiny_bucket_against_cpu_reference(quartet_test_system):
+    from asuka.cueri.gpu import eri_ppps_device
+    from asuka.cueri.tasks import TaskList
+
+    pp_idx = _find_shell_pair_with_npair(quartet_test_system.shell_pairs, quartet_test_system.shell_l, 1, 1, npair=9)
+    ps_idx = _find_shell_pair_with_npair(quartet_test_system.shell_pairs, quartet_test_system.shell_l, 1, 0, npair=9)
+    task_ab = np.asarray([pp_idx], dtype=np.int32)
+    task_cd = np.asarray([ps_idx], dtype=np.int32)
+    tasks = TaskList(task_spAB=task_ab, task_spCD=task_cd)
+
+    ref = _explicit_tile_reference(quartet_test_system.basis, quartet_test_system.shell_pairs, task_ab, task_cd)
+    got = cupy.asnumpy(
+        eri_ppps_device(
+            tasks,
+            quartet_test_system.dbasis,
+            quartet_test_system.dsp,
+            quartet_test_system.pair_tables,
+            threads=256,
+            mode="auto",
+            work_small_max=512,
+            work_large_min=200_000,
+            blocks_per_task=4,
+        ).reshape((-1, 27))
+    )
+
+    np.testing.assert_allclose(got, ref, rtol=1e-10, atol=1e-11)
+
+
+def test_ppps_auto_mode_regular_small_bucket_against_cpu_reference(quartet_test_system):
+    from asuka.cueri.gpu import eri_ppps_device
+    from asuka.cueri.tasks import TaskList
+
+    pp_idx = _find_shell_pair_with_npair(quartet_test_system.shell_pairs, quartet_test_system.shell_l, 1, 1, npair=9)
+    ps_idx = _find_shell_pair_with_npair(quartet_test_system.shell_pairs, quartet_test_system.shell_l, 1, 0, npair=18)
+    task_ab = np.asarray([pp_idx], dtype=np.int32)
+    task_cd = np.asarray([ps_idx], dtype=np.int32)
+    tasks = TaskList(task_spAB=task_ab, task_spCD=task_cd)
+
+    ref = _explicit_tile_reference(quartet_test_system.basis, quartet_test_system.shell_pairs, task_ab, task_cd)
+    got = cupy.asnumpy(
+        eri_ppps_device(
+            tasks,
+            quartet_test_system.dbasis,
+            quartet_test_system.dsp,
+            quartet_test_system.pair_tables,
+            threads=256,
+            mode="auto",
+            work_small_max=512,
+            work_large_min=200_000,
+            blocks_per_task=4,
+        ).reshape((-1, 27))
+    )
+
+    np.testing.assert_allclose(got, ref, rtol=1e-10, atol=1e-11)
+
+
+@pytest.mark.parametrize(
+    ("npair_ab", "npair_cd"),
+    [
+        (1, 1),
+        (1, 3),
+        (3, 1),
+        (3, 3),
+        (9, 3),
+        (9, 1),
+        (3, 9),
+        (1, 9),
+    ],
+)
+def test_ppps_auto_mode_packed_exact_shapes_against_cpu_reference(quartet_test_system, npair_ab: int, npair_cd: int):
+    from asuka.cueri.gpu import eri_ppps_device
+    from asuka.cueri.tasks import TaskList
+
+    pp_idx = _find_shell_pair_with_npair(quartet_test_system.shell_pairs, quartet_test_system.shell_l, 1, 1, npair=int(npair_ab))
+    ps_idx = _find_shell_pair_with_npair(quartet_test_system.shell_pairs, quartet_test_system.shell_l, 1, 0, npair=int(npair_cd))
+    task_ab = np.asarray([pp_idx], dtype=np.int32)
+    task_cd = np.asarray([ps_idx], dtype=np.int32)
+    tasks = TaskList(task_spAB=task_ab, task_spCD=task_cd)
+
+    ref = _explicit_tile_reference(quartet_test_system.basis, quartet_test_system.shell_pairs, task_ab, task_cd)
+    got = cupy.asnumpy(
+        eri_ppps_device(
+            tasks,
+            quartet_test_system.dbasis,
+            quartet_test_system.dsp,
+            quartet_test_system.pair_tables,
+            threads=256,
+            mode="auto",
+            work_small_max=512,
+            work_large_min=200_000,
+            blocks_per_task=4,
+        ).reshape((-1, 27))
+    )
+
+    np.testing.assert_allclose(got, ref, rtol=1e-10, atol=1e-11)
 
 
 @pytest.mark.parametrize(("mode", "extra_kwargs"), _MODE_CASES)
