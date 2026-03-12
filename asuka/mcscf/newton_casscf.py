@@ -1985,23 +1985,19 @@ def _build_internal_cache(
         mo_xp = _to_xp_f64(mo, xp)
         C_act_xp = _to_xp_f64(C_act_ref, xp)
         C_occ_xp = xp.ascontiguousarray(mo_xp[:, :nocc])
-        paaa = xp.asarray(
-            provider.build_pu_wx(mo_xp, C_act_xp),
+        full_ppaa = xp.asarray(
+            provider.build_pq_uv(mo_xp, C_act_xp),
             dtype=xp.float64,
-        ).reshape(nmo, ncas, ncas, ncas)
-        eri_cas = xp.asarray(
-            provider.build_pq_uv(C_act_xp, C_act_xp),
+        ).reshape(nmo, nmo, ncas, ncas)
+        full_papa = xp.asarray(
+            provider.build_pu_qv(mo_xp, C_act_xp),
             dtype=xp.float64,
-        ).reshape(ncas, ncas, ncas, ncas)
-        occ_ppaa = xp.asarray(
-            provider.build_pq_uv(C_occ_xp, C_act_xp),
-            dtype=xp.float64,
-        ).reshape(nocc, nocc, ncas, ncas)
-        occ_papa = xp.asarray(
-            provider.build_pu_qv(C_occ_xp, C_act_xp),
-            dtype=xp.float64,
-        ).reshape(nocc, ncas, nocc, ncas)
-
+        ).reshape(nmo, ncas, nmo, ncas)
+        paaa = full_ppaa[:, ncore:nocc, :, :]
+        eri_cas = full_ppaa[ncore:nocc, ncore:nocc, :, :]
+        occ_ppaa = full_ppaa[:nocc, :nocc, :, :]
+        occ_papa = full_papa[:nocc, :, :nocc, :]
+        del C_occ_xp
         arange_nocc = xp.arange(nocc)
         ppaa_diag = occ_ppaa[arange_nocc, arange_nocc]
         papa_diag = occ_papa[arange_nocc, :, arange_nocc, :]
@@ -2009,8 +2005,18 @@ def _build_internal_cache(
         jkcaa_r = xp.einsum("pik,rik->rpi", jkcaa_kernel, casdm1_g, optimize=True)
 
         vhf_a_list = []
-        g_dm2_list = []
-        hdm2_list = []
+        _ppaa_2d = full_ppaa.reshape(nmo * nmo, ncas * ncas)
+        _papa_t_2d = full_papa.transpose(0, 2, 1, 3).reshape(nmo * nmo, ncas * ncas)
+        _dm2_2d = casdm2_g.reshape(nroots, ncas * ncas, ncas * ncas)
+        _dm2tmp_2d = dm2tmp_g.reshape(nroots, ncas * ncas, ncas * ncas)
+        jtmp_full = xp.stack([_ppaa_2d @ _dm2_2d[r] for r in range(nroots)]).reshape(
+            nroots, nmo, nmo, ncas, ncas
+        )
+        ktmp_full = xp.stack([_papa_t_2d @ _dm2tmp_2d[r] for r in range(nroots)]).reshape(
+            nroots, nmo, nmo, ncas, ncas
+        )
+        hdm2_r = (jtmp_full + ktmp_full).transpose(0, 1, 3, 2, 4)
+        g_dm2_r = xp.einsum("rpuuv->rpv", jtmp_full[:, :, ncore:nocc, :, :], optimize=True)
         for r in range(nroots):
             D_act_r = C_act_xp @ casdm1_g[r] @ C_act_xp.T
             Jr, Kr = provider.jk(D_act_r, want_J=True, want_K=True)
@@ -2018,38 +2024,7 @@ def _build_internal_cache(
                 raise RuntimeError("provider.jk returned None while J/K were requested")
             v_ao = xp.asarray(Jr, dtype=xp.float64) - 0.5 * xp.asarray(Kr, dtype=xp.float64)
             vhf_a_list.append(mo_xp.T @ v_ao @ mo_xp)
-            g_dm2_r = provider.contract_pu_wx_dm2(
-                C_mo=mo_xp,
-                C_act=C_act_xp,
-                dm2_wxuv=casdm2_g[r],
-                out=None,
-                profile=None,
-            )
-            g_dm2_list.append(xp.asarray(g_dm2_r, dtype=xp.float64))
-
-            hdm2_r = xp.zeros((nmo, ncas, nmo, ncas), dtype=xp.float64)
-            for q in range(nmo):
-                qcol = xp.ascontiguousarray(mo_xp[:, q : q + 1])
-                C_mix = xp.concatenate((mo_xp, qcol), axis=1)
-                pq_uv_mix = xp.asarray(
-                    provider.build_pq_uv(C_mix, C_act_xp),
-                    dtype=xp.float64,
-                ).reshape(nmo + 1, nmo + 1, ncas, ncas)
-                pq_uv_q = pq_uv_mix[:nmo, nmo, :, :]
-                jtmp_q = xp.einsum("puv,uvwx->pwx", pq_uv_q, casdm2_g[r], optimize=True)
-
-                pu_qv_mix = xp.asarray(
-                    provider.build_pu_qv(C_mix, C_act_xp),
-                    dtype=xp.float64,
-                ).reshape(nmo + 1, ncas, nmo + 1, ncas)
-                pu_qv_q = pu_qv_mix[:nmo, :, nmo, :]
-                ktmp_q = xp.einsum("puv,uvwx->pwx", pu_qv_q, dm2tmp_g[r], optimize=True)
-                hdm2_r[:, :, q, :] = jtmp_q + ktmp_q
-            hdm2_list.append(hdm2_r)
-
         vhf_a_r = xp.stack(vhf_a_list, axis=0)
-        g_dm2_r = xp.stack(g_dm2_list, axis=0)
-        hdm2_r = xp.stack(hdm2_list, axis=0)
     else:
         ppaa_arr = _to_xp_f64(ppaa, xp)  # (nmo,nmo,ncas,ncas)
         papa_arr = _to_xp_f64(papa, xp)  # (nmo,ncas,nmo,ncas)
@@ -4667,10 +4642,17 @@ def gen_g_hop_orbital(
     if provider is not None and C_act_ref is not None:
         mo_xp = _to_xp_f64(mo, xp)
         C_act_xp = _to_xp_f64(C_act_ref, xp)
-        C_occ_xp = xp.ascontiguousarray(mo_xp[:, :nocc])
-        paaa = xp.asarray(provider.build_pu_wx(mo_xp, C_act_xp), dtype=xp.float64).reshape(nmo, ncas, ncas, ncas)
-        occ_ppaa = xp.asarray(provider.build_pq_uv(C_occ_xp, C_act_xp), dtype=xp.float64).reshape(nocc, nocc, ncas, ncas)
-        occ_papa = xp.asarray(provider.build_pu_qv(C_occ_xp, C_act_xp), dtype=xp.float64).reshape(nocc, ncas, nocc, ncas)
+        full_ppaa = xp.asarray(
+            provider.build_pq_uv(mo_xp, C_act_xp),
+            dtype=xp.float64,
+        ).reshape(nmo, nmo, ncas, ncas)
+        full_papa = xp.asarray(
+            provider.build_pu_qv(mo_xp, C_act_xp),
+            dtype=xp.float64,
+        ).reshape(nmo, ncas, nmo, ncas)
+        paaa = full_ppaa[:, ncore:nocc, :, :]
+        occ_ppaa = full_ppaa[:nocc, :nocc, :, :]
+        occ_papa = full_papa[:nocc, :, :nocc, :]
 
         D_act = C_act_xp @ casdm1_g @ C_act_xp.T
         Ja, Ka = provider.jk(D_act, want_J=True, want_K=True)
@@ -4686,18 +4668,9 @@ def gen_g_hop_orbital(
         jkcaa = _to_np_f64(xp.einsum("pik,ik->pi", jkcaa_kernel, casdm1_g, optimize=True))
 
         dm2tmp = casdm2_g.transpose(1, 2, 0, 3) + casdm2_g.transpose(0, 2, 1, 3)
-        hdm2_xp = xp.zeros((nmo, ncas, nmo, ncas), dtype=xp.float64)
-        for q in range(nmo):
-            qcol = xp.ascontiguousarray(mo_xp[:, q : q + 1])
-            C_mix = xp.concatenate((mo_xp, qcol), axis=1)
-            pq_uv_mix = xp.asarray(provider.build_pq_uv(C_mix, C_act_xp), dtype=xp.float64).reshape(nmo + 1, nmo + 1, ncas, ncas)
-            pq_uv_q = pq_uv_mix[:nmo, nmo, :, :]
-            jtmp_q = xp.einsum("puv,uvwx->pwx", pq_uv_q, casdm2_g, optimize=True)
-
-            pu_qv_mix = xp.asarray(provider.build_pu_qv(C_mix, C_act_xp), dtype=xp.float64).reshape(nmo + 1, ncas, nmo + 1, ncas)
-            pu_qv_q = pu_qv_mix[:nmo, :, nmo, :]
-            ktmp_q = xp.einsum("puv,uvwx->pwx", pu_qv_q, dm2tmp, optimize=True)
-            hdm2_xp[:, :, q, :] = jtmp_q + ktmp_q
+        jtmp_full = xp.einsum("pquv,uvwx->pqwx", full_ppaa, casdm2_g, optimize=True)
+        ktmp_full = xp.einsum("puqv,uvwx->pqwx", full_papa, dm2tmp, optimize=True)
+        hdm2_xp = (jtmp_full + ktmp_full).transpose(0, 2, 1, 3)
         hdm2 = _to_np_f64(hdm2_xp)
     else:
         ppaa_arr = _to_xp_f64(ppaa, xp)

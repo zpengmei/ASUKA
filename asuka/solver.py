@@ -605,6 +605,7 @@ class GUGAFCISolver(_StreamObject):
         matvec_cuda_mixed_final_full_subspace_refresh,
         matvec_cuda_davidson_subspace_eigh_cpu,
         matvec_cuda_davidson_subspace_eigh_cpu_max_m,
+        return_cupy,
     ):
         """Unified GPU Davidson call with profiling and mixed-precision support."""
         from asuka.cuda.cuda_davidson import davidson_sym_gpu  # noqa: PLC0415
@@ -657,6 +658,7 @@ class GUGAFCISolver(_StreamObject):
             profile_cuda_sync=kernel_profile_cuda_sync,
             subspace_eigh_cpu=bool(matvec_cuda_davidson_subspace_eigh_cpu),
             subspace_eigh_cpu_max_m=int(matvec_cuda_davidson_subspace_eigh_cpu_max_m),
+            return_cupy=bool(return_cupy),
         )
 
         if kprof is not None:
@@ -2558,6 +2560,7 @@ class GUGAFCISolver(_StreamObject):
                     matvec_cuda_mixed_final_full_subspace_refresh=matvec_cuda_mixed_final_full_subspace_refresh,
                     matvec_cuda_davidson_subspace_eigh_cpu=matvec_cuda_davidson_subspace_eigh_cpu,
                     matvec_cuda_davidson_subspace_eigh_cpu_max_m=matvec_cuda_davidson_subspace_eigh_cpu_max_m,
+                    return_cupy=bool(return_cupy),
                 )
                 self.converged, e, ci = res.converged, res.e, res.x
         elif matvec_backend in ("cuda_fixed_ell", "cuda_ell"):
@@ -2761,7 +2764,10 @@ class GUGAFCISolver(_StreamObject):
                 if contract_prof_tot is not None:
                     kprof["matvec_contract_profile"] = contract_prof_tot
 
-        conv_arr = np.asarray(self.converged, dtype=np.bool_).ravel()
+        if cuda_cp is not None and isinstance(self.converged, cuda_cp.ndarray):
+            conv_arr = np.asarray(cuda_cp.asnumpy(self.converged), dtype=np.bool_).ravel()
+        else:
+            conv_arr = np.asarray(self.converged, dtype=np.bool_).ravel()
         if int(conv_arr.size) == 1 and int(nroots) > 1:
             conv_arr = np.repeat(conv_arr, int(nroots))
         if int(conv_arr.size) != int(nroots):
@@ -2834,10 +2840,26 @@ class GUGAFCISolver(_StreamObject):
                 if warn_on_unconverged:
                     warnings.warn(msg)
 
-        e = np.asarray(e, dtype=np.float64) + float(ecore)
+        if cuda_cp is not None and isinstance(e, cuda_cp.ndarray):
+            e_dev = cuda_cp.asarray(e, dtype=cuda_cp.float64) + float(ecore)
+            e_host = np.asarray(cuda_cp.asnumpy(e_dev), dtype=np.float64)
+        else:
+            e_dev = None
+            e_host = np.asarray(e, dtype=np.float64) + float(ecore)
         if warm_state_update:
+            ci_warm = ci
+            if cuda_cp is not None:
+                if isinstance(ci_warm, (list, tuple)):
+                    ci_warm = [
+                        np.asarray(cuda_cp.asnumpy(v), dtype=np.float64).ravel()
+                        if isinstance(v, cuda_cp.ndarray)
+                        else np.asarray(v, dtype=np.float64).ravel()
+                        for v in ci_warm
+                    ]
+                elif isinstance(ci_warm, cuda_cp.ndarray):
+                    ci_warm = [np.asarray(cuda_cp.asnumpy(ci_warm), dtype=np.float64).ravel()]
             self._update_warm_state(
-                ci=ci,
+                ci=ci_warm,
                 norb=int(norb),
                 nelec_total=int(nelec_total),
                 twos=int(twos),
@@ -2851,11 +2873,16 @@ class GUGAFCISolver(_StreamObject):
                 mo_occ=warm_state_mo_occ,
             )
         if nroots == 1:
-            self.converged = bool(self.converged[0])
-            ci_out = np.ascontiguousarray(ci[0])
+            self.converged = bool(np.asarray(self.converged, dtype=np.bool_).ravel()[0])
+            ci_out = ci[0]
             if return_cupy and cuda_cp is not None and matvec_backend in ("cuda_eri_mat", "cuda", "cuda_direct"):
-                ci_out = cuda_cp.ascontiguousarray(cuda_cp.asarray(ci[0], dtype=cuda_cp.float64).ravel())
-            self.eci, self.ci = float(e[0]), ci_out
+                if not isinstance(ci_out, cuda_cp.ndarray):
+                    ci_out = cuda_cp.ascontiguousarray(cuda_cp.asarray(ci_out, dtype=cuda_cp.float64).ravel())
+                else:
+                    ci_out = cuda_cp.ascontiguousarray(ci_out.ravel())
+            else:
+                ci_out = np.ascontiguousarray(np.asarray(ci_out, dtype=np.float64).ravel())
+            self.eci, self.ci = float(e_host[0]), ci_out
             self._last_drt_key = drt_key
             if kprof is not None:
                 kprof.update(self._matvec_cuda_ws_cache_profile())
@@ -2865,10 +2892,16 @@ class GUGAFCISolver(_StreamObject):
                     print("GUGAFCISolver.kernel profile:", kprof)
             return self.eci, self.ci
 
-        ci_out = [np.ascontiguousarray(v) for v in ci]
         if return_cupy and cuda_cp is not None and matvec_backend in ("cuda_eri_mat", "cuda", "cuda_direct"):
-            ci_out = [cuda_cp.ascontiguousarray(cuda_cp.asarray(v, dtype=cuda_cp.float64).ravel()) for v in ci]
-        self.eci, self.ci = e, ci_out
+            ci_out = [
+                (cuda_cp.ascontiguousarray(v.ravel()) if isinstance(v, cuda_cp.ndarray) else cuda_cp.ascontiguousarray(cuda_cp.asarray(v, dtype=cuda_cp.float64).ravel()))
+                for v in ci
+            ]
+            e_out = e_dev if e_dev is not None else cuda_cp.asarray(e_host, dtype=cuda_cp.float64)
+        else:
+            ci_out = [np.ascontiguousarray(np.asarray(v, dtype=np.float64).ravel()) for v in ci]
+            e_out = e_host
+        self.eci, self.ci = e_out, ci_out
         self._last_drt_key = drt_key
         if kprof is not None:
             kprof.update(self._matvec_cuda_ws_cache_profile())
