@@ -224,7 +224,7 @@ def test_direct_jk_ppps_routing_mode(monkeypatch, policy, expected_mode):
 
 def test_direct_jk_single_iteration():
     """Verify single-iteration J/K values match dense (random D)."""
-    import cupy as cp
+    cp = pytest.importorskip("cupy")
 
     from asuka.frontend.one_electron import build_ao_basis_cart
     from asuka.integrals.int1e_cart import build_int1e_cart, nao_cart_from_basis

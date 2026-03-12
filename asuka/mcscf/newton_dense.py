@@ -19,7 +19,7 @@ from asuka.mcscf.dense_eri_cpu import (
     dense_ppaa_papa_from_tiles_cpu,
     dense_vhf_ao_from_tiles_cpu,
 )
-from asuka.mcscf.newton_mc1step_adapter import NewtonMC1StepAdapterMixin
+from asuka.mcscf.newton_mc1step_adapter import NewtonMC1StepAdapterMixin, _get_xp
 from asuka.mcscf.orbital_grad import cayley_update
 
 

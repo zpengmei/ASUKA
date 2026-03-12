@@ -183,7 +183,7 @@ def ws_needs_rebuild(
     use_epq_table: bool,
     aggregate_offdiag_k: bool,
     l_full_d: Any,
-    direct_op_d: Any,
+    direct_op_d: Any = None,
     enable_fp64_emulation: bool,
     gemm_backend: str,
     emulation_strategy: str,

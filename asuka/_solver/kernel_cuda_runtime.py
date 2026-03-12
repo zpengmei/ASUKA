@@ -339,7 +339,7 @@ def refresh_cuda_workspace_hamiltonian_inplace(
     ws: Any,
     eri_mat_d: Any,
     l_full_d: Any,
-    direct_op_d: Any,
+    direct_op_d: Any = None,
     h_eff_d: Any,
     use_cuda_graph: bool,
     refresh_diag_cache_for_graph: bool,

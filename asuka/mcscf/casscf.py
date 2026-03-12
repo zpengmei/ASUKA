@@ -1848,17 +1848,26 @@ def run_casscf_df(
                 import cupy as _cp_1s  # type: ignore
             except Exception:
                 _cp_1s = None
-    
+            _force_cpu_1s = bool(xp is np)
+            _host_ah_1s = bool(_force_cpu_1s or int(nroots) > 1)
+
+            def _to_host_f64_1s(a: Any) -> np.ndarray:
+                if _cp_1s is not None and isinstance(a, _cp_1s.ndarray):
+                    a = _cp_1s.asnumpy(a)
+                return np.asarray(a, dtype=np.float64)
+
             if ah_df_B is None:
                 _raw_df_B = getattr(scf_out, "df_B", None)
                 if _raw_df_B is not None:
-                    if _cp_1s is not None and isinstance(_raw_df_B, _cp_1s.ndarray):
+                    if _host_ah_1s:
+                        ah_df_B = _to_host_f64_1s(_raw_df_B)
+                    elif _cp_1s is not None and isinstance(_raw_df_B, _cp_1s.ndarray):
                         ah_df_B = _cp_1s.ascontiguousarray(_cp_1s.asarray(_raw_df_B, dtype=_cp_1s.float64))
                     else:
                         ah_df_B = np.asarray(_raw_df_B, dtype=np.float64, order="C")
                 if ah_hcore_np is None:
                     H0 = getattr(scf_out.int1e, "hcore")
-                    if casci_backend_s == "dense_cpu":
+                    if _host_ah_1s or casci_backend_s == "dense_cpu":
                         if _cp_1s is not None and isinstance(H0, _cp_1s.ndarray):
                             H0 = _cp_1s.asnumpy(H0)
                         ah_hcore_np = np.asarray(H0, dtype=np.float64)
@@ -1869,10 +1878,8 @@ def run_casscf_df(
                             ah_hcore_np = np.asarray(H0, dtype=np.float64)
 
                 C_np = C
-                if casci_backend_s == "dense_cpu":
-                    if _cp_1s is not None and isinstance(C_np, _cp_1s.ndarray):
-                        C_np = _cp_1s.asnumpy(C_np)
-                    C_np = np.asarray(C_np, dtype=np.float64)
+                if _host_ah_1s or casci_backend_s == "dense_cpu":
+                    C_np = _to_host_f64_1s(C_np)
                 elif _cp_1s is not None:
                     C_np = _cp_1s.ascontiguousarray(_cp_1s.asarray(C_np, dtype=_cp_1s.float64))
     
@@ -1967,6 +1974,7 @@ def run_casscf_df(
                     eri_provider=_1s_eri_provider,
                     stream_provider_eris=bool(_1s_eri_provider is not None),
                 )
+            mc_1s._asuka_force_cpu = bool(_host_ah_1s)
             # PySCF mc1step defaults.
             mc_1s.max_stepsize = min(float(max_stepsize), 0.02)
             mc_1s.ah_start_tol = 2.5
@@ -1994,17 +2002,17 @@ def run_casscf_df(
             _used_mc1step_refresh = False
             if nroots == 1:
                 _used_mc1step_refresh = True
-                _mc1s_on_gpu = bool(_cp_1s is not None and isinstance(C_np, _cp_1s.ndarray))
+                _mc1s_on_gpu = bool((not _host_ah_1s) and _cp_1s is not None and isinstance(C_np, _cp_1s.ndarray))
                 if _mc1s_on_gpu:
                     ci_cur = _cp_1s.asarray(ci_1s_in, dtype=_cp_1s.float64)
                 else:
-                    ci_cur = np.asarray(ci_1s_in, dtype=np.float64)
+                    ci_cur = _to_host_f64_1s(ci_1s_in)
                 if _mc1s_on_gpu:
                     casdm1_1s = _cp_1s.asarray(dm1_act, dtype=_cp_1s.float64)
                     casdm2_1s = _cp_1s.asarray(dm2_act, dtype=_cp_1s.float64)
                 else:
-                    casdm1_1s = np.asarray(dm1_act, dtype=np.float64)
-                    casdm2_1s = np.asarray(dm2_act, dtype=np.float64)
+                    casdm1_1s = _to_host_f64_1s(dm1_act)
+                    casdm2_1s = _to_host_f64_1s(dm2_act)
                 casdm1_prev_1s = casdm1_1s.copy()
                 casdm1_last_1s = casdm1_1s.copy()
                 norm_ddm_1s = 1e2
@@ -2070,11 +2078,11 @@ def run_casscf_df(
                         casdm1_prev_1s = _cp_1s.asarray(casdm1_1s, dtype=_cp_1s.float64)
                         norm_gci_1s = None if _gci_step is None else float(_cp_1s.linalg.norm(_cp_1s.asarray(_gci_step, dtype=_cp_1s.float64).ravel()).item())
                     else:
-                        mc_1s._mc1step_ci_current = np.asarray(ci_cur, dtype=np.float64)
+                        mc_1s._mc1step_ci_current = _to_host_f64_1s(ci_cur)
                         norm_ddm_1s = float(np.linalg.norm(casdm1_1s - casdm1_last_1s))
                         norm_ddm_micro_1s = float(np.linalg.norm(casdm1_1s - casdm1_prev_1s))
-                        casdm1_prev_1s = np.asarray(casdm1_1s, dtype=np.float64)
-                        norm_gci_1s = None if _gci_step is None else float(np.linalg.norm(np.asarray(_gci_step, dtype=np.float64).ravel()))
+                        casdm1_prev_1s = _to_host_f64_1s(casdm1_1s)
+                        norm_gci_1s = None if _gci_step is None else float(np.linalg.norm(_to_host_f64_1s(_gci_step).ravel()))
                     if (
                         _norm_t_step < ah_conv_tol_grad_eff
                         or (
@@ -2099,7 +2107,7 @@ def run_casscf_df(
                 if _mc1s_on_gpu:
                     prev_ci_list = [_cp_1s.asarray(ci_cur, dtype=_cp_1s.float64).copy()]
                 else:
-                    prev_ci_list = [np.asarray(ci_cur, dtype=np.float64).copy()]
+                    prev_ci_list = [_to_host_f64_1s(ci_cur).copy()]
                 ci_out = prev_ci_list if nroots > 1 else prev_ci_list[0]
             else:
                 U_1s, norm_gorb_1s, stat_1s = _rotate_orb_ah(
@@ -2729,6 +2737,22 @@ def run_casscf(
         kwargs=run_kwargs,
     )
 
+    _ms_cuda_env = str(os.environ.get("ASUKA_MS_CUDA", "")).strip().lower()
+    _ss_eri_mode_env = str(os.environ.get("ASUKA_SS_ERI_MODE", "")).strip().lower()
+    _ms_force_dense_cpu = (
+        backend_s == "cuda"
+        and matvec_backend is None
+        and int(run_config.nroots) > 1
+        and _ms_cuda_env in {"0", "off", "false", "no"}
+        and _ss_eri_mode_env == "dense"
+    )
+    _casci_backend_forced: str | None = None
+    if _ms_force_dense_cpu:
+        backend_s = "cpu"
+        _casci_backend_forced = "dense_cpu"
+        run_kwargs.setdefault("casci_backend", "dense_cpu")
+        run_config = _dc_replace(run_config, backend="cpu", kwargs=run_kwargs)
+
     C0 = getattr(scf_out.scf, "mo_coeff", None)
     _direct_probe = getattr(getattr(scf_out, "direct_jk_ctx", None), "sp_A_dev", None)
     _xp_probe = (
@@ -2766,6 +2790,10 @@ def run_casscf(
     if not df_b:
         kwargs.setdefault("dense_exact_jk", "auto")
 
+    casci_backend_override = kwargs.pop("casci_backend", None)
+    if casci_backend_override is None:
+        casci_backend_override = _casci_backend_forced
+
     direct_mode = bool(
         getattr(scf_out, "direct_jk_ctx", None) is not None
         or two_e_backend_s in {"direct", "direct_df"}
@@ -2787,7 +2815,7 @@ def run_casscf(
             ncore=int(ncore),
             ncas=int(ncas),
             nelecas=nelecas,
-            casci_backend=str(direct_casci_backend),
+            casci_backend=str(casci_backend_override if casci_backend_override is not None else direct_casci_backend),
             matvec_backend=str(direct_matvec_backend),
             **kwargs,
         )
@@ -2803,7 +2831,7 @@ def run_casscf(
                 ncore=int(ncore),
                 ncas=int(ncas),
                 nelecas=nelecas,
-                casci_backend="thc",
+                casci_backend=str(casci_backend_override if casci_backend_override is not None else "thc"),
                 matvec_backend=str(matvec_backend),
                 **kwargs,
             )
@@ -2813,7 +2841,7 @@ def run_casscf(
             ncore=int(ncore),
             ncas=int(ncas),
             nelecas=nelecas,
-            casci_backend="df",
+            casci_backend=str(casci_backend_override if casci_backend_override is not None else "df"),
             matvec_backend=str(matvec_backend),
             **kwargs,
         )
@@ -2825,7 +2853,7 @@ def run_casscf(
             ncore=int(ncore),
             ncas=int(ncas),
             nelecas=nelecas,
-            casci_backend="dense_gpu",
+            casci_backend=str(casci_backend_override if casci_backend_override is not None else "dense_gpu"),
             matvec_backend=str(matvec_backend),
             **kwargs,
         )
@@ -2836,7 +2864,7 @@ def run_casscf(
         ncore=int(ncore),
         ncas=int(ncas),
         nelecas=nelecas,
-        casci_backend="dense_cpu",
+        casci_backend=str(casci_backend_override if casci_backend_override is not None else "dense_cpu"),
         matvec_backend=str(matvec_backend),
         **kwargs,
     )

@@ -30,7 +30,7 @@ def _get_xp(*arrays: Any):
 
 def _to_xp_f64(a: Any, xp: Any):
     if xp is np:
-        return np.asarray(a, dtype=np.float64)
+        return _to_numpy_f64(a)
     return xp.asarray(a, dtype=xp.float64)
 
 
@@ -283,9 +283,12 @@ class NewtonMC1StepAdapterMixin:
 
     def solve_approx_ci(self, h1: Any, h2: Any, ci0: Any, ecore: float, e_cas: float, envs: dict[str, Any]):
         xp, _on_gpu = _get_xp(h1, h2, ci0)
-        h1_solver = h1 if xp is not np else np.asarray(h1, dtype=np.float64)
-        h2_solver = h2 if xp is not np else np.asarray(h2, dtype=np.float64)
-        ci0_solver = ci0 if xp is not np else np.asarray(ci0, dtype=np.float64)
+        if bool(getattr(self, "_asuka_force_cpu", False)):
+            xp = np
+            _on_gpu = False
+        h1_solver = h1 if xp is not np else _to_numpy_f64(h1)
+        h2_solver = h2 if xp is not np else _to_numpy_f64(h2)
+        ci0_solver = ci0 if xp is not np else _to_numpy_f64(ci0)
         ncas = int(self.ncas)
         nelecas = self.nelecas
         if "norm_gorb" in envs:
@@ -386,6 +389,9 @@ class NewtonMC1StepAdapterMixin:
     def update_casdm(self, mo: Any, u: Any, fcivec: Any, e_cas: float, eris: Any, envs: dict[str, Any] | None = None):
         envs = {} if envs is None else envs
         xp, _on_gpu = _get_xp(mo, u, getattr(eris, "ppaa", None), getattr(eris, "papa", None), getattr(eris, "vhf_c", None))
+        if bool(getattr(self, "_asuka_force_cpu", False)):
+            xp = np
+            _on_gpu = False
         ncas = int(self.ncas)
         ncore = int(self.ncore)
         nocc = ncore + ncas

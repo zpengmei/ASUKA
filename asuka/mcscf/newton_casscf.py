@@ -59,6 +59,8 @@ def _to_xp_f64(a: Any, xp: Any = None) -> Any:
     """
     if xp is None:
         xp, _ = _get_xp(a)
+    if xp is np:
+        return _to_np_f64(a)
     return xp.asarray(a, dtype=xp.float64)
 
 
@@ -5599,8 +5601,27 @@ def rotate_orb_ah(
     g_orb, h_op_orb, h_diag_orb, gorb_update = gen_g_hop_orbital(
         casscf, mo, ci0, eris, weights=weights, strict_weights=strict_weights,
     )
+    force_cpu = bool(getattr(casscf, "_asuka_force_cpu", False))
+    if force_cpu:
+        _h_op_orb = h_op_orb
+        _gorb_update = gorb_update
 
-    norm_gorb = float(np.linalg.norm(g_orb))
+        def h_op_orb(x: Any) -> np.ndarray:
+            return _to_np_f64(_h_op_orb(_to_np_f64(x))).ravel()
+
+        def gorb_update(u_rot: Any, ci_new: Any) -> tuple[np.ndarray, Any, np.ndarray]:
+            g_kf, h_op_kf, h_diag_kf = _gorb_update(_to_np_f64(u_rot), ci_new)
+
+            def _h_op_kf_cpu(x: Any) -> np.ndarray:
+                return _to_np_f64(h_op_kf(_to_np_f64(x))).ravel()
+
+            return _to_np_f64(g_kf).ravel(), _h_op_kf_cpu, _to_np_f64(h_diag_kf).ravel()
+
+        g_orb = _to_np_f64(g_orb).ravel()
+        h_diag_orb = _to_np_f64(h_diag_orb).ravel()
+
+    orb_xp, _ = _get_xp(g_orb)
+    norm_gorb = _norm_f64(g_orb)
     norm_gkf = norm_gorb
 
     stat = OrbitalMicroStats(imic=0, tot_hop=0, tot_kf=1, norm_gorb=norm_gorb)
@@ -5608,14 +5629,17 @@ def rotate_orb_ah(
     if norm_gorb < 1e-8:
         return np.eye(nmo, dtype=np.float64), norm_gorb, stat
 
-    u = np.eye(nmo, dtype=np.float64)
-    dr = np.zeros_like(g_orb)
-    x0_guess = g_orb.copy()
+    if force_cpu:
+        u = np.eye(nmo, dtype=np.float64)
+    else:
+        u = orb_xp.eye(nmo, dtype=orb_xp.float64)
+    dr = orb_xp.zeros_like(g_orb)
+    x0_guess = orb_xp.asarray(g_orb, dtype=orb_xp.float64).copy()
 
     def _make_precond(hdiag: np.ndarray, ls: float) -> Callable[[np.ndarray, float], np.ndarray]:
         def _p(x: np.ndarray, e: float) -> np.ndarray:
-            x = np.asarray(x, dtype=np.float64).ravel()
-            hd = np.asarray(hdiag, dtype=np.float64).ravel() - (float(e) - float(ls))
+            x = _to_np_f64(x).ravel()
+            hd = _to_np_f64(hdiag).ravel() - (float(e) - float(ls))
             eps = 1e-8
             mask = np.abs(hd) < eps
             if np.any(mask):
@@ -5645,7 +5669,7 @@ def rotate_orb_ah(
         ):
             stat.tot_hop = stat.tot_hop + 1
 
-            norm_residual = float(np.linalg.norm(residual))
+            norm_residual = _norm_f64(residual)
             accept_step = (
                 bool(ah_conv)
                 or int(ihop) == int(ah_max_cycle)
@@ -5655,11 +5679,15 @@ def rotate_orb_ah(
             if not accept_step:
                 continue
 
-            dxi = np.asarray(dxi, dtype=np.float64).ravel()
-            hdxi = np.asarray(hdxi, dtype=np.float64).ravel()
+            if force_cpu:
+                dxi = _to_np_f64(dxi).ravel()
+                hdxi = _to_np_f64(hdxi).ravel()
+            else:
+                dxi = _to_xp_f64(dxi, orb_xp).ravel()
+                hdxi = _to_xp_f64(hdxi, orb_xp).ravel()
 
             # Clip step to max_stepsize.
-            max_abs = float(np.max(np.abs(dxi))) if dxi.size > 0 else 0.0
+            max_abs = _scalar_real_float(orb_xp.max(orb_xp.abs(dxi))) if int(dxi.size) > 0 else 0.0
             if max_abs > max_stepsize:
                 scale = max_stepsize / max_abs
                 dxi = dxi * scale
@@ -5667,8 +5695,8 @@ def rotate_orb_ah(
                 log.debug1("Scale orbital AH step by %g", scale)
 
             # Predict gradient and trust-region check.
-            g_trial = np.asarray(g_orb, dtype=np.float64) + np.asarray(hdxi, dtype=np.float64)
-            norm_g_trial = float(np.linalg.norm(g_trial))
+            g_trial = orb_xp.asarray(g_orb, dtype=orb_xp.float64) + orb_xp.asarray(hdxi, dtype=orb_xp.float64)
+            norm_g_trial = _norm_f64(g_trial)
             if stat.imic >= 2 and norm_g_trial > norm_gkf * ah_grad_trust_region:
                 log.debug("Orbital |g| trust fail; stop micro-iterations.")
                 break
@@ -5677,12 +5705,12 @@ def rotate_orb_ah(
             stat.imic += 1
             dr += dxi
             g_orb = g_trial
-            norm_gorb = float(np.linalg.norm(g_orb))
+            norm_gorb = _norm_f64(g_orb)
             ikf += 1
             x0_guess = dxi.copy()
             log.debug(
                 "    orb imic %d  |g|=%3.2e  |dxi|=%3.2e  max=%3.2e",
-                stat.imic, norm_gorb, float(np.linalg.norm(dxi)), max_abs,
+                stat.imic, norm_gorb, _norm_f64(dxi), max_abs,
             )
 
             if stat.imic >= max_cycle_micro:
@@ -5697,9 +5725,9 @@ def rotate_orb_ah(
                 )
                 g_kf, h_op_kf, h_diag_kf = gorb_update(u_trial, ci0)
                 stat.tot_kf += 1
-                norm_gkf_new = float(np.linalg.norm(g_kf))
+                norm_gkf_new = _norm_f64(g_kf)
 
-                norm_dg = float(np.linalg.norm(g_kf - g_orb))
+                norm_dg = _norm_f64(g_kf - g_orb)
                 if norm_dg < norm_gorb * ah_grad_trust_region:
                     u = u_trial
                     dr[:] = 0.0
