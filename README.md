@@ -402,13 +402,13 @@ a different stage of the ERI pipeline:
 
 **Precision modes and accuracy (H2O / 6-31G, direct backend):**
 
-| Mode | Env vars | |ΔE| vs FP64 | Notes |
+| Mode | Env vars | \|ΔE\| vs FP64 | Notes |
 |---|---|---|---|
 | FP64 (reference) | `MIXED_PRECISION=0` | 0 | Baseline |
-| Mixed compute | `MIXED_PRECISION=1` | ~3e-8 | Default. FP32 for Ix·Iy·Iz products only. |
-| Mixed + FP32 tiles | `MIXED_PRECISION=1 TILE_F32=1` | ~3e-7 | Halves tile bandwidth. |
-| Mixed + FP32 accum | `MIXED_PRECISION=1 F32_ACCUM=1` | ~1e-7 | FP32 accumulators for s/p quartets. |
-| All aggressive | `MIXED_PRECISION=1 TILE_F32=1 F32_ACCUM=1` | ~1e-7 | Maximum throughput. |
+| Mixed compute | `MIXED_PRECISION=1` | \~3e-8 | Default. FP32 for Ix·Iy·Iz products only. |
+| Mixed + FP32 tiles | `MIXED_PRECISION=1 TILE_F32=1` | \~3e-7 | Halves tile bandwidth. |
+| Mixed + FP32 accum | `MIXED_PRECISION=1 F32_ACCUM=1` | \~1e-7 | FP32 accumulators for s/p quartets. |
+| All aggressive | `MIXED_PRECISION=1 TILE_F32=1 F32_ACCUM=1` | \~1e-7 | Maximum throughput. |
 
 All modes produce total energies within **2 microHartree** of the FP64 reference.
 Mixed precision only affects the `direct` and `direct_df` two-electron backends;
