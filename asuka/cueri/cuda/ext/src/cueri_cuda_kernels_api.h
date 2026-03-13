@@ -634,6 +634,130 @@ extern "C" cudaError_t cueri_eri_dsss_multiblock_launch_stream(
     cudaStream_t stream,
     int threads);
 
+// ---------------------------------------------------------------------------
+// Mixed-precision ERI launchers for hand-written s/p kernels.
+// _f32: FP64 compute + FP32 output
+// _mixed: mixed-precision compute + FP64 output
+// _mixed_f32: mixed-precision compute + FP32 output
+// ---------------------------------------------------------------------------
+#define CUERI_DECL_MIXED_LAUNCHER(NAME, NCOMP_COMMENT)                       \
+extern "C" cudaError_t cueri_eri_##NAME##_f32_launch_stream(                 \
+    const int32_t* task_spAB, const int32_t* task_spCD, int ntasks,          \
+    const int32_t* sp_A, const int32_t* sp_B,                               \
+    const int32_t* sp_pair_start, const int32_t* sp_npair,                   \
+    const double* shell_cx, const double* shell_cy, const double* shell_cz,  \
+    const double* pair_eta,                                                  \
+    const double* pair_Px, const double* pair_Py, const double* pair_Pz,     \
+    const double* pair_cK,                                                   \
+    float* eri_out,                                                          \
+    cudaStream_t stream, int threads);                                       \
+extern "C" cudaError_t cueri_eri_##NAME##_mixed_launch_stream(               \
+    const int32_t* task_spAB, const int32_t* task_spCD, int ntasks,          \
+    const int32_t* sp_A, const int32_t* sp_B,                               \
+    const int32_t* sp_pair_start, const int32_t* sp_npair,                   \
+    const double* shell_cx, const double* shell_cy, const double* shell_cz,  \
+    const double* pair_eta,                                                  \
+    const double* pair_Px, const double* pair_Py, const double* pair_Pz,     \
+    const double* pair_cK,                                                   \
+    double* eri_out,                                                         \
+    cudaStream_t stream, int threads);                                       \
+extern "C" cudaError_t cueri_eri_##NAME##_mixed_f32_launch_stream(           \
+    const int32_t* task_spAB, const int32_t* task_spCD, int ntasks,          \
+    const int32_t* sp_A, const int32_t* sp_B,                               \
+    const int32_t* sp_pair_start, const int32_t* sp_npair,                   \
+    const double* shell_cx, const double* shell_cy, const double* shell_cz,  \
+    const double* pair_eta,                                                  \
+    const double* pair_Px, const double* pair_Py, const double* pair_Pz,     \
+    const double* pair_cK,                                                   \
+    float* eri_out,                                                          \
+    cudaStream_t stream, int threads);
+
+// _f32accum: mixed-precision compute + FP32 accumulator + FP64 output
+// _f32accum_f32: mixed-precision compute + FP32 accumulator + FP32 output
+// ---------------------------------------------------------------------------
+#define CUERI_DECL_F32ACCUM_LAUNCHER(NAME, NCOMP_COMMENT)                     \
+extern "C" cudaError_t cueri_eri_##NAME##_f32accum_launch_stream(             \
+    const int32_t* task_spAB, const int32_t* task_spCD, int ntasks,           \
+    const int32_t* sp_A, const int32_t* sp_B,                                \
+    const int32_t* sp_pair_start, const int32_t* sp_npair,                    \
+    const double* shell_cx, const double* shell_cy, const double* shell_cz,   \
+    const double* pair_eta,                                                   \
+    const double* pair_Px, const double* pair_Py, const double* pair_Pz,      \
+    const double* pair_cK,                                                    \
+    double* eri_out,                                                          \
+    cudaStream_t stream, int threads);                                        \
+extern "C" cudaError_t cueri_eri_##NAME##_f32accum_f32_launch_stream(         \
+    const int32_t* task_spAB, const int32_t* task_spCD, int ntasks,           \
+    const int32_t* sp_A, const int32_t* sp_B,                                \
+    const int32_t* sp_pair_start, const int32_t* sp_npair,                    \
+    const double* shell_cx, const double* shell_cy, const double* shell_cz,   \
+    const double* pair_eta,                                                   \
+    const double* pair_Px, const double* pair_Py, const double* pair_Pz,      \
+    const double* pair_cK,                                                    \
+    float* eri_out,                                                           \
+    cudaStream_t stream, int threads);
+
+// Hand-written s/p kernels (step2_part3.cu)
+CUERI_DECL_MIXED_LAUNCHER(psss, 3)
+CUERI_DECL_MIXED_LAUNCHER(ppss, 9)
+CUERI_DECL_MIXED_LAUNCHER(psps, 9)
+CUERI_DECL_MIXED_LAUNCHER(dsss, 6)
+CUERI_DECL_MIXED_LAUNCHER(ppps, 27)
+CUERI_DECL_MIXED_LAUNCHER(pppp, 81)
+CUERI_DECL_F32ACCUM_LAUNCHER(psss, 3)
+CUERI_DECL_F32ACCUM_LAUNCHER(ppss, 9)
+CUERI_DECL_F32ACCUM_LAUNCHER(psps, 9)
+CUERI_DECL_F32ACCUM_LAUNCHER(dsss, 6)
+CUERI_DECL_F32ACCUM_LAUNCHER(ppps, 27)
+CUERI_DECL_F32ACCUM_LAUNCHER(pppp, 81)
+
+// Generated kernels (wave1/wave2) — d/f/g shell classes
+CUERI_DECL_MIXED_LAUNCHER(ssdp, 18)
+CUERI_DECL_MIXED_LAUNCHER(psds, 18)
+CUERI_DECL_MIXED_LAUNCHER(psdp, 54)
+CUERI_DECL_MIXED_LAUNCHER(psdd, 108)
+CUERI_DECL_MIXED_LAUNCHER(ppds, 54)
+CUERI_DECL_MIXED_LAUNCHER(ppdp, 162)
+CUERI_DECL_MIXED_LAUNCHER(ppdd, 324)
+CUERI_DECL_MIXED_LAUNCHER(dsds, 36)
+CUERI_DECL_MIXED_LAUNCHER(dsdp, 108)
+CUERI_DECL_MIXED_LAUNCHER(dsdd, 216)
+CUERI_DECL_MIXED_LAUNCHER(dpdp, 324)
+CUERI_DECL_MIXED_LAUNCHER(dpdd, 648)
+CUERI_DECL_MIXED_LAUNCHER(dddd, 1296)
+CUERI_DECL_MIXED_LAUNCHER(ddss, 36)
+CUERI_DECL_MIXED_LAUNCHER(fpss, 30)
+CUERI_DECL_MIXED_LAUNCHER(fdss, 60)
+CUERI_DECL_MIXED_LAUNCHER(ffss, 100)
+CUERI_DECL_MIXED_LAUNCHER(fpps, 90)
+CUERI_DECL_MIXED_LAUNCHER(fdps, 180)
+CUERI_DECL_MIXED_LAUNCHER(ffps, 300)
+CUERI_DECL_MIXED_LAUNCHER(fpds, 180)
+CUERI_DECL_MIXED_LAUNCHER(fdds, 360)
+CUERI_DECL_MIXED_LAUNCHER(ffds, 600)
+CUERI_DECL_MIXED_LAUNCHER(ssfs, 10)
+CUERI_DECL_MIXED_LAUNCHER(psfs, 30)
+CUERI_DECL_MIXED_LAUNCHER(ppfs, 90)
+CUERI_DECL_MIXED_LAUNCHER(dsfs, 60)
+CUERI_DECL_MIXED_LAUNCHER(fsfs, 100)
+CUERI_DECL_MIXED_LAUNCHER(dpfs, 180)
+CUERI_DECL_MIXED_LAUNCHER(fpfs, 300)
+CUERI_DECL_MIXED_LAUNCHER(ddfs, 360)
+CUERI_DECL_MIXED_LAUNCHER(fdfs, 600)
+CUERI_DECL_MIXED_LAUNCHER(fffs, 1000)
+CUERI_DECL_MIXED_LAUNCHER(ssgs, 15)
+CUERI_DECL_MIXED_LAUNCHER(psgs, 45)
+CUERI_DECL_MIXED_LAUNCHER(ppgs, 135)
+CUERI_DECL_MIXED_LAUNCHER(dsgs, 90)
+CUERI_DECL_MIXED_LAUNCHER(fsgs, 150)
+CUERI_DECL_MIXED_LAUNCHER(dpgs, 270)
+CUERI_DECL_MIXED_LAUNCHER(fpgs, 450)
+CUERI_DECL_MIXED_LAUNCHER(ddgs, 540)
+CUERI_DECL_MIXED_LAUNCHER(fdgs, 900)
+CUERI_DECL_MIXED_LAUNCHER(ffgs, 1500)
+
+#undef CUERI_DECL_MIXED_LAUNCHER
+
 extern "C" cudaError_t cueri_eri_ddss_launch_stream(
     const int32_t* task_spAB,
     const int32_t* task_spCD,
@@ -2448,10 +2572,11 @@ extern "C" cudaError_t cueri_contract_jk_tiles_ordered_launch_stream(
     int nD,
     const double* tile_vals,  // size ntasks * (nA*nB) * (nC*nD)
     const double* D_mat,      // size nao*nao, row-major density matrix
-    double* J_mat,            // size nao*nao, row-major Coulomb output (or NULL)
-    double* K_mat,            // size nao*nao, row-major exchange output (or NULL)
+    double* J_mat,            // size n_bufs*nao*nao, row-major Coulomb output (or NULL)
+    double* K_mat,            // size n_bufs*nao*nao, row-major exchange output (or NULL)
     cudaStream_t stream,
-    int threads);
+    int threads,
+    int n_bufs = 1);
 
 // Multi-density direct J/K contraction: evaluate each ERI tile once and contract
 // against two density matrices (Da, Db) simultaneously.  Produces (Ja, Ka, Jb, Kb).
@@ -2497,7 +2622,8 @@ extern "C" cudaError_t cueri_contract_jk_warp_launch_stream(
     const double* D_mat,
     double* J_mat,
     double* K_mat,
-    cudaStream_t stream);
+    cudaStream_t stream,
+    int n_bufs = 1);
 
 extern "C" cudaError_t cueri_contract_jk_warp_multi2_launch_stream(
     const int32_t* task_spAB,
@@ -2559,6 +2685,62 @@ extern "C" cudaError_t cueri_contract_fock_warp_launch_stream(
     double* F_mat,
     cudaStream_t stream);
 
+// FP32 tile variants: same as above but tile_vals is float* (cast to double inside kernel).
+extern "C" cudaError_t cueri_contract_jk_tiles_ordered_f32_launch_stream(
+    const int32_t* task_spAB,
+    const int32_t* task_spCD,
+    int ntasks,
+    const int32_t* sp_A,
+    const int32_t* sp_B,
+    const int32_t* shell_ao_start,
+    int nao,
+    int nA,
+    int nB,
+    int nC,
+    int nD,
+    const float* tile_vals,
+    const double* D_mat,
+    double* J_mat,
+    double* K_mat,
+    cudaStream_t stream,
+    int threads,
+    int n_bufs = 1);
+
+extern "C" cudaError_t cueri_contract_fock_tiles_ordered_f32_launch_stream(
+    const int32_t* task_spAB,
+    const int32_t* task_spCD,
+    int ntasks,
+    const int32_t* sp_A,
+    const int32_t* sp_B,
+    const int32_t* shell_ao_start,
+    int nao,
+    int nA,
+    int nB,
+    int nC,
+    int nD,
+    const float* tile_vals,
+    const double* D_mat,
+    double* F_mat,
+    cudaStream_t stream,
+    int threads);
+
+extern "C" cudaError_t cueri_scatter_eri_tiles_ordered_f32_launch_stream(
+    const int32_t* task_spAB,
+    const int32_t* task_spCD,
+    int ntasks,
+    const int32_t* sp_A,
+    const int32_t* sp_B,
+    const int32_t* shell_ao_start,
+    int nao,
+    int nA,
+    int nB,
+    int nC,
+    int nD,
+    const float* tile_vals,
+    double* eri_mat,
+    cudaStream_t stream,
+    int threads);
+
 // Fused ERI->Fock for dominant SPD classes: evaluate ERIs and immediately
 // contract into RHF Fock (F += J - 0.5*K), eliminating the tile round-trip.
 //
@@ -2588,7 +2770,8 @@ extern "C" cudaError_t cueri_fused_fock_psss_launch_stream(
     double* F_mat,
     cudaStream_t stream,
     int threads,
-    int n_bufs);
+    int n_bufs,
+    bool mixed_prec);
 
 
 extern "C" cudaError_t cueri_fused_jk_psss_launch_stream(
@@ -2614,7 +2797,8 @@ extern "C" cudaError_t cueri_fused_jk_psss_launch_stream(
     double* K_mat,
     cudaStream_t stream,
     int threads,
-    int n_bufs);
+    int n_bufs,
+    bool mixed_prec);
 
 extern "C" cudaError_t cueri_fused_fock_dsss_launch_stream(
     const int32_t* task_spAB,
@@ -2638,7 +2822,8 @@ extern "C" cudaError_t cueri_fused_fock_dsss_launch_stream(
     double* F_mat,
     cudaStream_t stream,
     int threads,
-    int n_bufs);
+    int n_bufs,
+    bool mixed_prec);
 
 
 extern "C" cudaError_t cueri_fused_jk_dsss_launch_stream(
@@ -2664,7 +2849,8 @@ extern "C" cudaError_t cueri_fused_jk_dsss_launch_stream(
     double* K_mat,
     cudaStream_t stream,
     int threads,
-    int n_bufs);
+    int n_bufs,
+    bool mixed_prec);
 
 extern "C" cudaError_t cueri_fused_fock_ppss_launch_stream(
     const int32_t* task_spAB,
@@ -2688,7 +2874,8 @@ extern "C" cudaError_t cueri_fused_fock_ppss_launch_stream(
     double* F_mat,
     cudaStream_t stream,
     int threads,
-    int n_bufs);
+    int n_bufs,
+    bool mixed_prec);
 
 
 extern "C" cudaError_t cueri_fused_jk_ppss_launch_stream(
@@ -2714,7 +2901,8 @@ extern "C" cudaError_t cueri_fused_jk_ppss_launch_stream(
     double* K_mat,
     cudaStream_t stream,
     int threads,
-    int n_bufs);
+    int n_bufs,
+    bool mixed_prec);
 
 extern "C" cudaError_t cueri_fused_fock_psps_launch_stream(
     const int32_t* task_spAB,
@@ -2738,7 +2926,8 @@ extern "C" cudaError_t cueri_fused_fock_psps_launch_stream(
     double* F_mat,
     cudaStream_t stream,
     int threads,
-    int n_bufs);
+    int n_bufs,
+    bool mixed_prec);
 
 
 extern "C" cudaError_t cueri_fused_jk_psps_launch_stream(
@@ -2764,7 +2953,8 @@ extern "C" cudaError_t cueri_fused_jk_psps_launch_stream(
     double* K_mat,
     cudaStream_t stream,
     int threads,
-    int n_bufs);
+    int n_bufs,
+    bool mixed_prec);
 
 extern "C" cudaError_t cueri_fused_fock_ppps_launch_stream(
     const int32_t* task_spAB,
@@ -2788,7 +2978,8 @@ extern "C" cudaError_t cueri_fused_fock_ppps_launch_stream(
     double* F_mat,
     cudaStream_t stream,
     int threads,
-    int n_bufs);
+    int n_bufs,
+    bool mixed_prec);
 
 
 extern "C" cudaError_t cueri_fused_jk_ppps_launch_stream(
@@ -2814,7 +3005,8 @@ extern "C" cudaError_t cueri_fused_jk_ppps_launch_stream(
     double* K_mat,
     cudaStream_t stream,
     int threads,
-    int n_bufs);
+    int n_bufs,
+    bool mixed_prec);
 
 extern "C" cudaError_t cueri_fused_fock_ddss_launch_stream(
     const int32_t* task_spAB,
@@ -2838,7 +3030,8 @@ extern "C" cudaError_t cueri_fused_fock_ddss_launch_stream(
     double* F_mat,
     cudaStream_t stream,
     int threads,
-    int n_bufs);
+    int n_bufs,
+    bool mixed_prec);
 
 
 extern "C" cudaError_t cueri_fused_jk_ddss_launch_stream(
@@ -2864,7 +3057,8 @@ extern "C" cudaError_t cueri_fused_jk_ddss_launch_stream(
     double* K_mat,
     cudaStream_t stream,
     int threads,
-    int n_bufs);
+    int n_bufs,
+    bool mixed_prec);
 
 extern "C" cudaError_t cueri_fused_fock_ssdp_launch_stream(
     const int32_t* task_spAB,
@@ -2888,7 +3082,8 @@ extern "C" cudaError_t cueri_fused_fock_ssdp_launch_stream(
     double* F_mat,
     cudaStream_t stream,
     int threads,
-    int n_bufs);
+    int n_bufs,
+    bool mixed_prec);
 
 
 extern "C" cudaError_t cueri_fused_jk_ssdp_launch_stream(
@@ -2914,7 +3109,8 @@ extern "C" cudaError_t cueri_fused_jk_ssdp_launch_stream(
     double* K_mat,
     cudaStream_t stream,
     int threads,
-    int n_bufs);
+    int n_bufs,
+    bool mixed_prec);
 
 extern "C" cudaError_t cueri_fused_fock_psds_launch_stream(
     const int32_t* task_spAB,
@@ -2938,7 +3134,8 @@ extern "C" cudaError_t cueri_fused_fock_psds_launch_stream(
     double* F_mat,
     cudaStream_t stream,
     int threads,
-    int n_bufs);
+    int n_bufs,
+    bool mixed_prec);
 
 
 extern "C" cudaError_t cueri_fused_jk_psds_launch_stream(
@@ -2964,7 +3161,8 @@ extern "C" cudaError_t cueri_fused_jk_psds_launch_stream(
     double* K_mat,
     cudaStream_t stream,
     int threads,
-    int n_bufs);
+    int n_bufs,
+    bool mixed_prec);
 
 extern "C" cudaError_t cueri_fused_fock_psdp_launch_stream(
     const int32_t* task_spAB,
@@ -2988,7 +3186,8 @@ extern "C" cudaError_t cueri_fused_fock_psdp_launch_stream(
     double* F_mat,
     cudaStream_t stream,
     int threads,
-    int n_bufs);
+    int n_bufs,
+    bool mixed_prec);
 
 
 extern "C" cudaError_t cueri_fused_jk_psdp_launch_stream(
@@ -3014,7 +3213,8 @@ extern "C" cudaError_t cueri_fused_jk_psdp_launch_stream(
     double* K_mat,
     cudaStream_t stream,
     int threads,
-    int n_bufs);
+    int n_bufs,
+    bool mixed_prec);
 
 extern "C" cudaError_t cueri_fused_fock_psdd_launch_stream(
     const int32_t* task_spAB,
@@ -3038,7 +3238,8 @@ extern "C" cudaError_t cueri_fused_fock_psdd_launch_stream(
     double* F_mat,
     cudaStream_t stream,
     int threads,
-    int n_bufs);
+    int n_bufs,
+    bool mixed_prec);
 
 
 extern "C" cudaError_t cueri_fused_jk_psdd_launch_stream(
@@ -3064,7 +3265,8 @@ extern "C" cudaError_t cueri_fused_jk_psdd_launch_stream(
     double* K_mat,
     cudaStream_t stream,
     int threads,
-    int n_bufs);
+    int n_bufs,
+    bool mixed_prec);
 
 extern "C" cudaError_t cueri_fused_fock_ppds_launch_stream(
     const int32_t* task_spAB,
@@ -3088,7 +3290,8 @@ extern "C" cudaError_t cueri_fused_fock_ppds_launch_stream(
     double* F_mat,
     cudaStream_t stream,
     int threads,
-    int n_bufs);
+    int n_bufs,
+    bool mixed_prec);
 
 
 extern "C" cudaError_t cueri_fused_jk_ppds_launch_stream(
@@ -3114,7 +3317,8 @@ extern "C" cudaError_t cueri_fused_jk_ppds_launch_stream(
     double* K_mat,
     cudaStream_t stream,
     int threads,
-    int n_bufs);
+    int n_bufs,
+    bool mixed_prec);
 
 extern "C" cudaError_t cueri_fused_fock_dsds_launch_stream(
     const int32_t* task_spAB,
@@ -3138,7 +3342,8 @@ extern "C" cudaError_t cueri_fused_fock_dsds_launch_stream(
     double* F_mat,
     cudaStream_t stream,
     int threads,
-    int n_bufs);
+    int n_bufs,
+    bool mixed_prec);
 
 
 extern "C" cudaError_t cueri_fused_jk_dsds_launch_stream(
@@ -3164,7 +3369,8 @@ extern "C" cudaError_t cueri_fused_jk_dsds_launch_stream(
     double* K_mat,
     cudaStream_t stream,
     int threads,
-    int n_bufs);
+    int n_bufs,
+    bool mixed_prec);
 
 extern "C" cudaError_t cueri_fused_fock_dsdp_launch_stream(
     const int32_t* task_spAB,
@@ -3188,7 +3394,8 @@ extern "C" cudaError_t cueri_fused_fock_dsdp_launch_stream(
     double* F_mat,
     cudaStream_t stream,
     int threads,
-    int n_bufs);
+    int n_bufs,
+    bool mixed_prec);
 
 
 extern "C" cudaError_t cueri_fused_jk_dsdp_launch_stream(
@@ -3214,7 +3421,8 @@ extern "C" cudaError_t cueri_fused_jk_dsdp_launch_stream(
     double* K_mat,
     cudaStream_t stream,
     int threads,
-    int n_bufs);
+    int n_bufs,
+    bool mixed_prec);
 
 // Fused ssss->Fock: evaluates (ss|ss) ERI inline, accumulates F = J - 0.5*K.
 extern "C" cudaError_t cueri_fused_fock_ssss_launch_stream(
@@ -3239,7 +3447,8 @@ extern "C" cudaError_t cueri_fused_fock_ssss_launch_stream(
     double* F_mat,
     cudaStream_t stream,
     int threads,
-    int n_bufs);
+    int n_bufs,
+    bool mixed_prec);
 
 // Fused ssss+JK (D3 partial): evaluates (ss|ss) ERI inline, eliminates tile round-trip.
 extern "C" cudaError_t cueri_fused_jk_ssss_launch_stream(
@@ -3263,7 +3472,8 @@ extern "C" cudaError_t cueri_fused_jk_ssss_launch_stream(
     cudaStream_t stream,
     int threads,
     bool use_fast_boys,
-    int n_bufs);
+    int n_bufs,
+    bool mixed_prec);
 
 // Cartesian->spherical transform for ERI tiles.
 extern "C" cudaError_t cueri_cart2sph_eri_right_launch_stream(

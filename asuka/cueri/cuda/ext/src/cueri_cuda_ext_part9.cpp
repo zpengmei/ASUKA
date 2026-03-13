@@ -538,7 +538,10 @@ void cueri_bind_part9(py::module_& m) {
         require_typestr(spa, "sp_A", "<i4");
         require_typestr(spb, "sp_B", "<i4");
         require_typestr(sh0, "shell_ao_start", "<i4");
-        require_typestr(tile, "tile_vals", "<f8");
+        const bool tile_f8 = typestr_matches(tile, "<f8");
+        const bool tile_f4 = typestr_matches(tile, "<f4");
+        if (!tile_f8 && !tile_f4)
+          throw std::invalid_argument("tile_vals must be float64 or float32");
         require_typestr(out, "eri_mat", "<f8");
 
         const int64_t ntasks = require_1d(ab, "task_spAB");
@@ -566,24 +569,45 @@ void cueri_bind_part9(py::module_& m) {
         }
 
         cudaStream_t stream = stream_from_uint(stream_ptr);
-        throw_on_cuda_error(
-            cueri_scatter_eri_tiles_ordered_launch_stream(
-                static_cast<const int32_t*>(ab.ptr),
-                static_cast<const int32_t*>(cd.ptr),
-                static_cast<int>(ntasks),
-                static_cast<const int32_t*>(spa.ptr),
-                static_cast<const int32_t*>(spb.ptr),
-                static_cast<const int32_t*>(sh0.ptr),
-                static_cast<int>(nao),
-                static_cast<int>(nA),
-                static_cast<int>(nB),
-                static_cast<int>(nC),
-                static_cast<int>(nD),
-                static_cast<const double*>(tile.ptr),
-                static_cast<double*>(out.ptr),
-                stream,
-                threads),
-            "cueri_scatter_eri_tiles_ordered_launch_stream");
+        if (tile_f8) {
+          throw_on_cuda_error(
+              cueri_scatter_eri_tiles_ordered_launch_stream(
+                  static_cast<const int32_t*>(ab.ptr),
+                  static_cast<const int32_t*>(cd.ptr),
+                  static_cast<int>(ntasks),
+                  static_cast<const int32_t*>(spa.ptr),
+                  static_cast<const int32_t*>(spb.ptr),
+                  static_cast<const int32_t*>(sh0.ptr),
+                  static_cast<int>(nao),
+                  static_cast<int>(nA),
+                  static_cast<int>(nB),
+                  static_cast<int>(nC),
+                  static_cast<int>(nD),
+                  static_cast<const double*>(tile.ptr),
+                  static_cast<double*>(out.ptr),
+                  stream,
+                  threads),
+              "cueri_scatter_eri_tiles_ordered_launch_stream");
+        } else {
+          throw_on_cuda_error(
+              cueri_scatter_eri_tiles_ordered_f32_launch_stream(
+                  static_cast<const int32_t*>(ab.ptr),
+                  static_cast<const int32_t*>(cd.ptr),
+                  static_cast<int>(ntasks),
+                  static_cast<const int32_t*>(spa.ptr),
+                  static_cast<const int32_t*>(spb.ptr),
+                  static_cast<const int32_t*>(sh0.ptr),
+                  static_cast<int>(nao),
+                  static_cast<int>(nA),
+                  static_cast<int>(nB),
+                  static_cast<int>(nC),
+                  static_cast<int>(nD),
+                  static_cast<const float*>(tile.ptr),
+                  static_cast<double*>(out.ptr),
+                  stream,
+                  threads),
+              "cueri_scatter_eri_tiles_ordered_f32_launch_stream");
+        }
         if (sync) throw_on_cuda_error(cudaStreamSynchronize(stream), "cudaStreamSynchronize");
       },
       py::arg("task_spAB"),
@@ -621,11 +645,13 @@ void cueri_bind_part9(py::module_& m) {
          py::object K_mat,
          int threads,
          uint64_t stream_ptr,
-         bool sync) {
+         bool sync,
+         int n_bufs) {
         require_threads_multiple_of_32(threads, "contract_jk_tiles_ordered_inplace_device");
         if (nao <= 0 || nA <= 0 || nB <= 0 || nC <= 0 || nD <= 0) {
           throw std::invalid_argument("nao/nA/nB/nC/nD must be > 0");
         }
+        if (n_bufs < 1) n_bufs = 1;
 
         auto ab = cuda_array_view_from_object(task_spAB, "task_spAB");
         auto cd = cuda_array_view_from_object(task_spCD, "task_spCD");
@@ -640,7 +666,10 @@ void cueri_bind_part9(py::module_& m) {
         require_typestr(spa, "sp_A", "<i4");
         require_typestr(spb, "sp_B", "<i4");
         require_typestr(sh0, "shell_ao_start", "<i4");
-        require_typestr(tile, "tile_vals", "<f8");
+        const bool tile_f8 = typestr_matches(tile, "<f8");
+        const bool tile_f4 = typestr_matches(tile, "<f4");
+        if (!tile_f8 && !tile_f4)
+          throw std::invalid_argument("tile_vals must be float64 or float32");
         require_typestr(d_arr, "D_mat", "<f8");
 
         const int64_t ntasks = require_1d(ab, "task_spAB");
@@ -662,6 +691,7 @@ void cueri_bind_part9(py::module_& m) {
         }
 
         const int64_t nao2 = static_cast<int64_t>(nao) * static_cast<int64_t>(nao);
+        const int64_t needed_jk = static_cast<int64_t>(n_bufs) * nao2;
         if (require_1d(d_arr, "D_mat") != nao2) {
           throw std::invalid_argument("D_mat must have shape (nao*nao,)");
         }
@@ -671,8 +701,8 @@ void cueri_bind_part9(py::module_& m) {
         if (!J_mat.is_none()) {
           auto j_arr = cuda_array_view_from_object(J_mat, "J_mat");
           require_typestr(j_arr, "J_mat", "<f8");
-          if (require_1d(j_arr, "J_mat") != nao2) {
-            throw std::invalid_argument("J_mat must have shape (nao*nao,)");
+          if (require_1d(j_arr, "J_mat") != needed_jk) {
+            throw std::invalid_argument("J_mat must have shape (n_bufs*nao*nao,)");
           }
           j_ptr = static_cast<double*>(j_arr.ptr);
         }
@@ -682,33 +712,58 @@ void cueri_bind_part9(py::module_& m) {
         if (!K_mat.is_none()) {
           auto k_arr = cuda_array_view_from_object(K_mat, "K_mat");
           require_typestr(k_arr, "K_mat", "<f8");
-          if (require_1d(k_arr, "K_mat") != nao2) {
-            throw std::invalid_argument("K_mat must have shape (nao*nao,)");
+          if (require_1d(k_arr, "K_mat") != needed_jk) {
+            throw std::invalid_argument("K_mat must have shape (n_bufs*nao*nao,)");
           }
           k_ptr = static_cast<double*>(k_arr.ptr);
         }
 
         cudaStream_t stream = stream_from_uint(stream_ptr);
-        throw_on_cuda_error(
-            cueri_contract_jk_tiles_ordered_launch_stream(
-                static_cast<const int32_t*>(ab.ptr),
-                static_cast<const int32_t*>(cd.ptr),
-                static_cast<int>(ntasks),
-                static_cast<const int32_t*>(spa.ptr),
-                static_cast<const int32_t*>(spb.ptr),
-                static_cast<const int32_t*>(sh0.ptr),
-                static_cast<int>(nao),
-                static_cast<int>(nA),
-                static_cast<int>(nB),
-                static_cast<int>(nC),
-                static_cast<int>(nD),
-                static_cast<const double*>(tile.ptr),
-                static_cast<const double*>(d_arr.ptr),
-                j_ptr,
-                k_ptr,
-                stream,
-                threads),
-            "cueri_contract_jk_tiles_ordered_launch_stream");
+        if (tile_f8) {
+          throw_on_cuda_error(
+              cueri_contract_jk_tiles_ordered_launch_stream(
+                  static_cast<const int32_t*>(ab.ptr),
+                  static_cast<const int32_t*>(cd.ptr),
+                  static_cast<int>(ntasks),
+                  static_cast<const int32_t*>(spa.ptr),
+                  static_cast<const int32_t*>(spb.ptr),
+                  static_cast<const int32_t*>(sh0.ptr),
+                  static_cast<int>(nao),
+                  static_cast<int>(nA),
+                  static_cast<int>(nB),
+                  static_cast<int>(nC),
+                  static_cast<int>(nD),
+                  static_cast<const double*>(tile.ptr),
+                  static_cast<const double*>(d_arr.ptr),
+                  j_ptr,
+                  k_ptr,
+                  stream,
+                  threads,
+                  n_bufs),
+              "cueri_contract_jk_tiles_ordered_launch_stream");
+        } else {
+          throw_on_cuda_error(
+              cueri_contract_jk_tiles_ordered_f32_launch_stream(
+                  static_cast<const int32_t*>(ab.ptr),
+                  static_cast<const int32_t*>(cd.ptr),
+                  static_cast<int>(ntasks),
+                  static_cast<const int32_t*>(spa.ptr),
+                  static_cast<const int32_t*>(spb.ptr),
+                  static_cast<const int32_t*>(sh0.ptr),
+                  static_cast<int>(nao),
+                  static_cast<int>(nA),
+                  static_cast<int>(nB),
+                  static_cast<int>(nC),
+                  static_cast<int>(nD),
+                  static_cast<const float*>(tile.ptr),
+                  static_cast<const double*>(d_arr.ptr),
+                  j_ptr,
+                  k_ptr,
+                  stream,
+                  threads,
+                  n_bufs),
+              "cueri_contract_jk_tiles_ordered_f32_launch_stream");
+        }
         if (sync) throw_on_cuda_error(cudaStreamSynchronize(stream), "cudaStreamSynchronize");
       },
       py::arg("task_spAB"),
@@ -727,7 +782,8 @@ void cueri_bind_part9(py::module_& m) {
       py::arg("K_mat"),
       py::arg("threads") = 256,
       py::arg("stream") = 0,
-      py::arg("sync") = true);
+      py::arg("sync") = true,
+      py::arg("n_bufs") = 1);
 
   // RHF Fock contraction: contract ERI tiles with density D → F += J - 0.5*K.
   m.def(
@@ -767,7 +823,10 @@ void cueri_bind_part9(py::module_& m) {
         require_typestr(spa, "sp_A", "<i4");
         require_typestr(spb, "sp_B", "<i4");
         require_typestr(sh0, "shell_ao_start", "<i4");
-        require_typestr(tile, "tile_vals", "<f8");
+        const bool tile_f8 = typestr_matches(tile, "<f8");
+        const bool tile_f4 = typestr_matches(tile, "<f4");
+        if (!tile_f8 && !tile_f4)
+          throw std::invalid_argument("tile_vals must be float64 or float32");
         require_typestr(d_arr, "D_mat", "<f8");
         require_typestr(f_arr, "F_mat", "<f8");
 
@@ -798,25 +857,47 @@ void cueri_bind_part9(py::module_& m) {
         }
 
         cudaStream_t stream = stream_from_uint(stream_ptr);
-        throw_on_cuda_error(
-            cueri_contract_fock_tiles_ordered_launch_stream(
-                static_cast<const int32_t*>(ab.ptr),
-                static_cast<const int32_t*>(cd.ptr),
-                static_cast<int>(ntasks),
-                static_cast<const int32_t*>(spa.ptr),
-                static_cast<const int32_t*>(spb.ptr),
-                static_cast<const int32_t*>(sh0.ptr),
-                static_cast<int>(nao),
-                static_cast<int>(nA),
-                static_cast<int>(nB),
-                static_cast<int>(nC),
-                static_cast<int>(nD),
-                static_cast<const double*>(tile.ptr),
-                static_cast<const double*>(d_arr.ptr),
-                static_cast<double*>(f_arr.ptr),
-                stream,
-                threads),
-            "cueri_contract_fock_tiles_ordered_launch_stream");
+        if (tile_f8) {
+          throw_on_cuda_error(
+              cueri_contract_fock_tiles_ordered_launch_stream(
+                  static_cast<const int32_t*>(ab.ptr),
+                  static_cast<const int32_t*>(cd.ptr),
+                  static_cast<int>(ntasks),
+                  static_cast<const int32_t*>(spa.ptr),
+                  static_cast<const int32_t*>(spb.ptr),
+                  static_cast<const int32_t*>(sh0.ptr),
+                  static_cast<int>(nao),
+                  static_cast<int>(nA),
+                  static_cast<int>(nB),
+                  static_cast<int>(nC),
+                  static_cast<int>(nD),
+                  static_cast<const double*>(tile.ptr),
+                  static_cast<const double*>(d_arr.ptr),
+                  static_cast<double*>(f_arr.ptr),
+                  stream,
+                  threads),
+              "cueri_contract_fock_tiles_ordered_launch_stream");
+        } else {
+          throw_on_cuda_error(
+              cueri_contract_fock_tiles_ordered_f32_launch_stream(
+                  static_cast<const int32_t*>(ab.ptr),
+                  static_cast<const int32_t*>(cd.ptr),
+                  static_cast<int>(ntasks),
+                  static_cast<const int32_t*>(spa.ptr),
+                  static_cast<const int32_t*>(spb.ptr),
+                  static_cast<const int32_t*>(sh0.ptr),
+                  static_cast<int>(nao),
+                  static_cast<int>(nA),
+                  static_cast<int>(nB),
+                  static_cast<int>(nC),
+                  static_cast<int>(nD),
+                  static_cast<const float*>(tile.ptr),
+                  static_cast<const double*>(d_arr.ptr),
+                  static_cast<double*>(f_arr.ptr),
+                  stream,
+                  threads),
+              "cueri_contract_fock_tiles_ordered_f32_launch_stream");
+        }
         if (sync) throw_on_cuda_error(cudaStreamSynchronize(stream), "cudaStreamSynchronize");
       },
       py::arg("task_spAB"),
@@ -1001,10 +1082,12 @@ void cueri_bind_part9(py::module_& m) {
          py::object K_mat,
          int /*threads*/,  // accepted but ignored — block is always 32
          uint64_t stream_ptr,
-         bool sync) {
+         bool sync,
+         int n_bufs) {
         if (nao <= 0 || nA <= 0 || nB <= 0 || nC <= 0 || nD <= 0) {
           throw std::invalid_argument("nao/nA/nB/nC/nD must be > 0");
         }
+        if (n_bufs < 1) n_bufs = 1;
 
         auto ab = cuda_array_view_from_object(task_spAB, "task_spAB");
         auto cd = cuda_array_view_from_object(task_spCD, "task_spCD");
@@ -1035,6 +1118,7 @@ void cueri_bind_part9(py::module_& m) {
         if (require_1d(tile, "tile_vals") != ntasks * nAB * nCD)
           throw std::invalid_argument("tile_vals shape mismatch");
         const int64_t nao2 = static_cast<int64_t>(nao) * nao;
+        const int64_t needed_jk = static_cast<int64_t>(n_bufs) * nao2;
         if (require_1d(d_arr, "D_mat") != nao2)
           throw std::invalid_argument("D_mat must have shape (nao*nao,)");
 
@@ -1042,16 +1126,16 @@ void cueri_bind_part9(py::module_& m) {
         if (!J_mat.is_none()) {
           auto j_arr = cuda_array_view_from_object(J_mat, "J_mat");
           require_typestr(j_arr, "J_mat", "<f8");
-          if (require_1d(j_arr, "J_mat") != nao2)
-            throw std::invalid_argument("J_mat shape mismatch");
+          if (require_1d(j_arr, "J_mat") != needed_jk)
+            throw std::invalid_argument("J_mat must have shape (n_bufs*nao*nao,)");
           j_ptr = static_cast<double*>(j_arr.ptr);
         }
         double* k_ptr = nullptr;
         if (!K_mat.is_none()) {
           auto k_arr = cuda_array_view_from_object(K_mat, "K_mat");
           require_typestr(k_arr, "K_mat", "<f8");
-          if (require_1d(k_arr, "K_mat") != nao2)
-            throw std::invalid_argument("K_mat shape mismatch");
+          if (require_1d(k_arr, "K_mat") != needed_jk)
+            throw std::invalid_argument("K_mat must have shape (n_bufs*nao*nao,)");
           k_ptr = static_cast<double*>(k_arr.ptr);
         }
 
@@ -1067,7 +1151,7 @@ void cueri_bind_part9(py::module_& m) {
                 nao, nA, nB, nC, nD,
                 static_cast<const double*>(tile.ptr),
                 static_cast<const double*>(d_arr.ptr),
-                j_ptr, k_ptr, stream),
+                j_ptr, k_ptr, stream, n_bufs),
             "cueri_contract_jk_warp_launch_stream");
         if (sync) throw_on_cuda_error(cudaStreamSynchronize(stream), "cudaStreamSynchronize");
       },
@@ -1087,7 +1171,8 @@ void cueri_bind_part9(py::module_& m) {
       py::arg("K_mat"),
       py::arg("threads") = 32,
       py::arg("stream") = 0,
-      py::arg("sync") = true);
+      py::arg("sync") = true,
+      py::arg("n_bufs") = 1);
 
   // Warp-reduce RHF Fock contraction: 1 warp per task, fixed block=32 threads.
   m.def(
@@ -1207,7 +1292,8 @@ void cueri_bind_part9(py::module_& m) {
       double* F_mat,
       cudaStream_t stream,
       int threads,
-      int n_bufs);
+      int n_bufs,
+      bool mixed_prec);
 
   using FusedJKLaunchFn = cudaError_t (*)(
       const int32_t* task_spAB,
@@ -1232,7 +1318,8 @@ void cueri_bind_part9(py::module_& m) {
       double* K_mat,
       cudaStream_t stream,
       int threads,
-      int n_bufs);
+      int n_bufs,
+      bool mixed_prec);
 
   auto bind_fused_fock_spd = [&](const char* cls, FusedFockLaunchFn fn, const char* cuda_name) {
     std::string pyname = std::string("fused_fock_") + cls + "_inplace_device";
@@ -1259,7 +1346,8 @@ void cueri_bind_part9(py::module_& m) {
                                 int threads,
                                 uint64_t stream_ptr,
                                 bool sync,
-                                int n_bufs) {
+                                int n_bufs,
+                                bool mixed_prec) {
           require_threads_multiple_of_32(threads, pyname.c_str());
           if (nao <= 0) throw std::invalid_argument("nao must be > 0");
 
@@ -1356,7 +1444,8 @@ void cueri_bind_part9(py::module_& m) {
                  static_cast<double*>(f_arr.ptr),
                  stream,
                  threads,
-                 n_bufs),
+                 n_bufs,
+                 mixed_prec),
               cuda_name);
           if (sync) throw_on_cuda_error(cudaStreamSynchronize(stream), "cudaStreamSynchronize");
         },
@@ -1381,7 +1470,8 @@ void cueri_bind_part9(py::module_& m) {
         py::arg("threads") = 256,
         py::arg("stream") = 0,
         py::arg("sync") = true,
-        py::arg("n_bufs") = 1);
+        py::arg("n_bufs") = 1,
+        py::arg("mixed_prec") = false);
   };
 
   auto bind_fused_jk_spd = [&](const char* cls, FusedJKLaunchFn fn, const char* cuda_name) {
@@ -1410,7 +1500,8 @@ void cueri_bind_part9(py::module_& m) {
                                 int threads,
                                 uint64_t stream_ptr,
                                 bool sync,
-                                int n_bufs) {
+                                int n_bufs,
+                                bool mixed_prec) {
           require_threads_multiple_of_32(threads, pyname.c_str());
           if (nao <= 0) throw std::invalid_argument("nao must be > 0");
 
@@ -1519,7 +1610,8 @@ void cueri_bind_part9(py::module_& m) {
                  k_ptr,
                  stream,
                  threads,
-                 n_bufs),
+                 n_bufs,
+                 mixed_prec),
               cuda_name);
           if (sync) throw_on_cuda_error(cudaStreamSynchronize(stream), "cudaStreamSynchronize");
         },
@@ -1545,7 +1637,8 @@ void cueri_bind_part9(py::module_& m) {
         py::arg("threads") = 256,
         py::arg("stream") = 0,
         py::arg("sync") = true,
-        py::arg("n_bufs") = 1);
+        py::arg("n_bufs") = 1,
+        py::arg("mixed_prec") = false);
   };
 
   bind_fused_fock_spd("ssss", cueri_fused_fock_ssss_launch_stream, "cueri_fused_fock_ssss_launch_stream");
@@ -1733,7 +1826,8 @@ void cueri_bind_part9(py::module_& m) {
          uint64_t stream_ptr,
          bool sync,
          bool fast_boys,
-         int n_bufs) {
+         int n_bufs,
+         bool mixed_prec) {
         require_threads_multiple_of_32(threads, "fused_jk_ssss_inplace_device");
         if (nao <= 0) throw std::invalid_argument("nao must be > 0");
 
@@ -1820,7 +1914,7 @@ void cueri_bind_part9(py::module_& m) {
                 nao,
                 static_cast<const double*>(d_arr.ptr),
                 j_ptr, k_ptr,
-                stream, threads, fast_boys, n_bufs),
+                stream, threads, fast_boys, n_bufs, mixed_prec),
             "cueri_fused_jk_ssss_launch_stream");
         if (sync) throw_on_cuda_error(cudaStreamSynchronize(stream), "cudaStreamSynchronize");
       },
@@ -1844,7 +1938,8 @@ void cueri_bind_part9(py::module_& m) {
       py::arg("stream") = 0,
       py::arg("sync") = true,
       py::arg("fast_boys") = false,
-      py::arg("n_bufs") = 1);
+      py::arg("n_bufs") = 1,
+      py::arg("mixed_prec") = false);
 
   #if !defined(CUERI_FAST_DEV_DIRECT_JK) && !defined(CUERI_FAST_DEV_STEP2_ONLY)
   // ERI tile cart->sph transform.

@@ -934,6 +934,12 @@ def emit_flat_kernel(q: QuartetClass, stride: int) -> str:
 
     All component expressions are inlined so the kernel is self-contained
     and can be placed in any TU by the splitter without dependency issues.
+
+    Template parameters:
+      NROOTS: Boys function root count (compile-time).
+      kTileF32: When true, write output tile in FP32 (halves bandwidth).
+      kMixedPrec: When true, evaluate Ux/Uy/Uz components in FP32
+                  (32x faster on RTX 4090) while keeping accumulation in FP64.
     """
     nA = ncart(q.la)
     nB = ncart(q.lb)
@@ -978,10 +984,11 @@ def emit_flat_kernel(q: QuartetClass, stride: int) -> str:
     dedup_y = dedup_axis_exprs(comp_exprs_y)
     dedup_z = dedup_axis_exprs(comp_exprs_z)
 
+    flat_launch_threads = 128  # must match kFlatThreads in emit_launchers
     fn: list[str] = []
     fn.extend([
-        f"template <int NROOTS>",
-        f"__global__ void KernelERI_{q.name}_flat(",
+        f"template <int NROOTS, bool kTileF32 = false, bool kMixedPrec = false>",
+        f"__global__ void __launch_bounds__({flat_launch_threads}) KernelERI_{q.name}_flat(",
         "    const int32_t* __restrict__ task_spAB,",
         "    const int32_t* __restrict__ task_spCD,",
         "    int ntasks,",
@@ -997,7 +1004,8 @@ def emit_flat_kernel(q: QuartetClass, stride: int) -> str:
         "    const double* __restrict__ pair_Py,",
         "    const double* __restrict__ pair_Pz,",
         "    const double* __restrict__ pair_cK,",
-        "    double* __restrict__ eri_out) {",
+        "    double* __restrict__ eri_out_f64,",
+        "    float*  __restrict__ eri_out_f32) {",
         "  const int t = static_cast<int>(blockIdx.x) * static_cast<int>(blockDim.x) + static_cast<int>(threadIdx.x);",
         "  if (t >= ntasks) return;",
         "",
@@ -1048,9 +1056,11 @@ def emit_flat_kernel(q: QuartetClass, stride: int) -> str:
         f"  double Gx[{flat_gsize}];",
         f"  double Gy[{flat_gsize}];",
         f"  double Gz[{flat_gsize}];",
-        f"  double Ux[{len(dedup_x.uniq)}];",
-        f"  double Uy[{len(dedup_y.uniq)}];",
-        f"  double Uz[{len(dedup_z.uniq)}];",
+        "  // Component type: FP32 when kMixedPrec, else FP64.",
+        "  using comp_t = typename std::conditional<kMixedPrec, float, double>::type;",
+        f"  comp_t Ux[{len(dedup_x.uniq)}];",
+        f"  comp_t Uy[{len(dedup_y.uniq)}];",
+        f"  comp_t Uz[{len(dedup_z.uniq)}];",
         f"  double tile[{ncomp}];",
     ])
     for i in range(ncomp):
@@ -1101,26 +1111,38 @@ def emit_flat_kernel(q: QuartetClass, stride: int) -> str:
         "        const double sc = base * w;",
     ])
     for i, expr in enumerate(dedup_x.uniq):
-        fn.append(f"        Ux[{i}] = {expr};")
+        fn.append(f"        Ux[{i}] = static_cast<comp_t>({expr});")
     for i, expr in enumerate(dedup_y.uniq):
-        fn.append(f"        Uy[{i}] = {expr};")
+        fn.append(f"        Uy[{i}] = static_cast<comp_t>({expr});")
     for i, expr in enumerate(dedup_z.uniq):
-        fn.append(f"        Uz[{i}] = {expr};")
+        fn.append(f"        Uz[{i}] = static_cast<comp_t>({expr});")
     for i in range(ncomp):
+        xi = dedup_x.map_idx[i]
+        yi = dedup_y.map_idx[i]
+        zi = dedup_z.map_idx[i]
+        # When kMixedPrec: Ux*Uy in FP32, promote to FP64 for accumulation.
         fn.append(
-            f"        tile[{i}] += sc * Ux[{dedup_x.map_idx[i]}] * Uy[{dedup_y.map_idx[i]}] * Uz[{dedup_z.map_idx[i]}];"
+            f"        tile[{i}] += sc * static_cast<double>(Ux[{xi}] * Uy[{yi}]) * static_cast<double>(Uz[{zi}]);"
         )
     fn.extend([
         "      }",
         "    }",
         "  }",
         "",
-        "  // Write output tile.",
-        f"  double* out = eri_out + static_cast<int64_t>(t) * static_cast<int64_t>({ncomp});",
+        "  // Write output tile: FP32 or FP64 depending on kTileF32.",
+        "  if constexpr (kTileF32) {",
+        f"    float* out = eri_out_f32 + static_cast<int64_t>(t) * static_cast<int64_t>({ncomp});",
     ])
     for i in range(ncomp):
-        fn.append(f"  out[{i}] = tile[{i}];")
+        fn.append(f"    out[{i}] = __double2float_rn(tile[{i}]);")
     fn.extend([
+        "  } else {",
+        f"    double* out = eri_out_f64 + static_cast<int64_t>(t) * static_cast<int64_t>({ncomp});",
+    ])
+    for i in range(ncomp):
+        fn.append(f"    out[{i}] = tile[{i}];")
+    fn.extend([
+        "  }",
         "}",
         "",
     ])
@@ -1138,8 +1160,8 @@ def emit_fused_fock_kernel(q: QuartetClass, stride: int) -> str:
     out: list[str] = []
     out.extend(
         [
-            "template <int NROOTS>",
-            f"__global__ void KernelFusedFock_{q.name}_fixed(",
+            "template <int NROOTS, bool kMixedPrec = false>",
+            f"__global__ void __launch_bounds__({int(FUSED_FOCK_THREADS_OVERRIDES.get(q.name, 64))}) KernelFusedFock_{q.name}_fixed(",
             "    const int32_t* task_spAB,",
             "    const int32_t* task_spCD,",
             "    int ntasks,",
@@ -1221,6 +1243,8 @@ def emit_fused_fock_kernel(q: QuartetClass, stride: int) -> str:
             "  const int nPairAB = static_cast<int>(sp_npair[spAB]);",
             "  const int nPairCD = static_cast<int>(sp_npair[spCD]);",
             "",
+            "  using comp_t = typename std::conditional<kMixedPrec, float, double>::type;",
+            "",
             "  for (int ebase = 0; ebase < kNComp; ebase += 32) {",
             "    const int e = ebase + lane;",
             "    const bool active = (e < kNComp);",
@@ -1272,10 +1296,10 @@ def emit_fused_fock_kernel(q: QuartetClass, stride: int) -> str:
             "          }",
             "          __syncwarp();",
             "          if (active) {",
-            "            const double Ix = eval_%s_x(e, Gx, xij, xij2, xkl, xkl2);" % q.name,
-            "            const double Iy = eval_%s_y(e, Gy, yij, yij2, ykl, ykl2);" % q.name,
-            "            const double Iz = eval_%s_z(e, Gz, zij, zij2, zkl, zkl2);" % q.name,
-            "            val += sh_sc[0] * (Ix * Iy * Iz);",
+            "            const comp_t Ix = static_cast<comp_t>(eval_%s_x(e, Gx, xij, xij2, xkl, xkl2));" % q.name,
+            "            const comp_t Iy = static_cast<comp_t>(eval_%s_y(e, Gy, yij, yij2, ykl, ykl2));" % q.name,
+            "            const comp_t Iz = static_cast<comp_t>(eval_%s_z(e, Gz, zij, zij2, zkl, zkl2));" % q.name,
+            "            val += sh_sc[0] * static_cast<double>(Ix * Iy) * static_cast<double>(Iz);",
             "          }",
             "          __syncwarp();",
             "        }",
@@ -1340,7 +1364,8 @@ def emit_fused_fock_launcher(q: QuartetClass, stride: int) -> str:
             "    double* F_mat,",
             "    cudaStream_t stream,",
             "    int threads,",
-            "    int n_bufs) {",
+            "    int n_bufs,",
+            "    bool mixed_prec) {",
             "  if (ntasks < 0 || nao <= 0) return cudaErrorInvalidValue;",
             "  if (ntasks == 0) return cudaSuccess;",
             f"  constexpr int kDefaultThreads = {launch_threads};",
@@ -1349,21 +1374,29 @@ def emit_fused_fock_launcher(q: QuartetClass, stride: int) -> str:
             f"  constexpr int kGSize_{q.name} = {stride} * {stride};",
             f"  constexpr int kWarpDoubles_{q.name} = 3 * kGSize_{q.name} + 2 * {nroots} + 11 + {q.ncomp};",
             f"  size_t shmem_{q.name} = 0;",
-            f"  const cudaError_t prep_{q.name} = cueri_prepare_fused_fock_warp_launch(",
-            f"      KernelFusedFock_{q.name}_fixed<{nroots}>,",
-            "      threads,",
-            "      kDefaultThreads,",
-            "      ntasks,",
-            f"      kWarpDoubles_{q.name},",
-            "      &launch_threads,",
-            "      &blocks,",
-            f"      &shmem_{q.name});",
-            f"  if (prep_{q.name} != cudaSuccess) return prep_{q.name};",
-            f"  KernelFusedFock_{q.name}_fixed<{nroots}><<<blocks, launch_threads, shmem_{q.name}, stream>>>(",
-            "      task_spAB, task_spCD, ntasks, sp_A, sp_B, sp_pair_start, sp_npair,",
-            "      shell_cx, shell_cy, shell_cz,",
-            "      pair_eta, pair_Px, pair_Py, pair_Pz, pair_cK,",
-            "      shell_ao_start, nao, D_mat, F_mat, n_bufs);",
+            "  if (mixed_prec) {",
+            f"    const cudaError_t prep_{q.name} = cueri_prepare_fused_fock_warp_launch(",
+            f"        KernelFusedFock_{q.name}_fixed<{nroots}, true>,",
+            "        threads, kDefaultThreads, ntasks,",
+            f"        kWarpDoubles_{q.name}, &launch_threads, &blocks, &shmem_{q.name});",
+            f"    if (prep_{q.name} != cudaSuccess) return prep_{q.name};",
+            f"    KernelFusedFock_{q.name}_fixed<{nroots}, true><<<blocks, launch_threads, shmem_{q.name}, stream>>>(",
+            "        task_spAB, task_spCD, ntasks, sp_A, sp_B, sp_pair_start, sp_npair,",
+            "        shell_cx, shell_cy, shell_cz,",
+            "        pair_eta, pair_Px, pair_Py, pair_Pz, pair_cK,",
+            "        shell_ao_start, nao, D_mat, F_mat, n_bufs);",
+            "  } else {",
+            f"    const cudaError_t prep_{q.name} = cueri_prepare_fused_fock_warp_launch(",
+            f"        KernelFusedFock_{q.name}_fixed<{nroots}, false>,",
+            "        threads, kDefaultThreads, ntasks,",
+            f"        kWarpDoubles_{q.name}, &launch_threads, &blocks, &shmem_{q.name});",
+            f"    if (prep_{q.name} != cudaSuccess) return prep_{q.name};",
+            f"    KernelFusedFock_{q.name}_fixed<{nroots}, false><<<blocks, launch_threads, shmem_{q.name}, stream>>>(",
+            "        task_spAB, task_spCD, ntasks, sp_A, sp_B, sp_pair_start, sp_npair,",
+            "        shell_cx, shell_cy, shell_cz,",
+            "        pair_eta, pair_Px, pair_Py, pair_Pz, pair_cK,",
+            "        shell_ao_start, nao, D_mat, F_mat, n_bufs);",
+            "  }",
             "  return cudaGetLastError();",
             "}",
             "",
@@ -1382,8 +1415,8 @@ def emit_fused_jk_kernel(q: QuartetClass, stride: int) -> str:
     out: list[str] = []
     out.extend(
         [
-            "template <int NROOTS>",
-            f"__global__ void KernelFusedJK_{q.name}_fixed(",
+            "template <int NROOTS, bool kMixedPrec = false>",
+            f"__global__ void __launch_bounds__({int(FUSED_JK_THREADS_OVERRIDES.get(q.name, 64))}) KernelFusedJK_{q.name}_fixed(",
             "    const int32_t* task_spAB,",
             "    const int32_t* task_spCD,",
             "    int ntasks,",
@@ -1466,6 +1499,8 @@ def emit_fused_jk_kernel(q: QuartetClass, stride: int) -> str:
             "  const int nPairAB = static_cast<int>(sp_npair[spAB]);",
             "  const int nPairCD = static_cast<int>(sp_npair[spCD]);",
             "",
+            "  using comp_t = typename std::conditional<kMixedPrec, float, double>::type;",
+            "",
             "  for (int ebase = 0; ebase < kNComp; ebase += 32) {",
             "    const int e = ebase + lane;",
             "    const bool active = (e < kNComp);",
@@ -1517,10 +1552,10 @@ def emit_fused_jk_kernel(q: QuartetClass, stride: int) -> str:
             "          }",
             "          __syncwarp();",
             "          if (active) {",
-            "            const double Ix = eval_%s_x(e, Gx, xij, xij2, xkl, xkl2);" % q.name,
-            "            const double Iy = eval_%s_y(e, Gy, yij, yij2, ykl, ykl2);" % q.name,
-            "            const double Iz = eval_%s_z(e, Gz, zij, zij2, zkl, zkl2);" % q.name,
-            "            val += sh_sc[0] * (Ix * Iy * Iz);",
+            "            const comp_t Ix = static_cast<comp_t>(eval_%s_x(e, Gx, xij, xij2, xkl, xkl2));" % q.name,
+            "            const comp_t Iy = static_cast<comp_t>(eval_%s_y(e, Gy, yij, yij2, ykl, ykl2));" % q.name,
+            "            const comp_t Iz = static_cast<comp_t>(eval_%s_z(e, Gz, zij, zij2, zkl, zkl2));" % q.name,
+            "            val += sh_sc[0] * static_cast<double>(Ix * Iy) * static_cast<double>(Iz);",
             "          }",
             "          __syncwarp();",
             "        }",
@@ -1586,7 +1621,8 @@ def emit_fused_jk_launcher(q: QuartetClass, stride: int) -> str:
             "    double* K_mat,",
             "    cudaStream_t stream,",
             "    int threads,",
-            "    int n_bufs) {",
+            "    int n_bufs,",
+            "    bool mixed_prec) {",
             "  if (ntasks < 0 || nao <= 0) return cudaErrorInvalidValue;",
             "  if (ntasks == 0) return cudaSuccess;",
             f"  constexpr int kDefaultThreads = {launch_threads};",
@@ -1595,21 +1631,29 @@ def emit_fused_jk_launcher(q: QuartetClass, stride: int) -> str:
             f"  constexpr int kGSize_{q.name} = {stride} * {stride};",
             f"  constexpr int kWarpDoubles_{q.name} = 3 * kGSize_{q.name} + 2 * {nroots} + 11 + {q.ncomp};",
             f"  size_t shmem_{q.name} = 0;",
-            f"  const cudaError_t prep_{q.name} = cueri_prepare_fused_fock_warp_launch(",
-            f"      KernelFusedJK_{q.name}_fixed<{nroots}>,",
-            "      threads,",
-            "      kDefaultThreads,",
-            "      ntasks,",
-            f"      kWarpDoubles_{q.name},",
-            "      &launch_threads,",
-            "      &blocks,",
-            f"      &shmem_{q.name});",
-            f"  if (prep_{q.name} != cudaSuccess) return prep_{q.name};",
-            f"  KernelFusedJK_{q.name}_fixed<{nroots}><<<blocks, launch_threads, shmem_{q.name}, stream>>>(",
-            "      task_spAB, task_spCD, ntasks, sp_A, sp_B, sp_pair_start, sp_npair,",
-            "      shell_cx, shell_cy, shell_cz,",
-            "      pair_eta, pair_Px, pair_Py, pair_Pz, pair_cK,",
-            "      shell_ao_start, nao, D_mat, J_mat, K_mat, n_bufs);",
+            "  if (mixed_prec) {",
+            f"    const cudaError_t prep_{q.name} = cueri_prepare_fused_fock_warp_launch(",
+            f"        KernelFusedJK_{q.name}_fixed<{nroots}, true>,",
+            "        threads, kDefaultThreads, ntasks,",
+            f"        kWarpDoubles_{q.name}, &launch_threads, &blocks, &shmem_{q.name});",
+            f"    if (prep_{q.name} != cudaSuccess) return prep_{q.name};",
+            f"    KernelFusedJK_{q.name}_fixed<{nroots}, true><<<blocks, launch_threads, shmem_{q.name}, stream>>>(",
+            "        task_spAB, task_spCD, ntasks, sp_A, sp_B, sp_pair_start, sp_npair,",
+            "        shell_cx, shell_cy, shell_cz,",
+            "        pair_eta, pair_Px, pair_Py, pair_Pz, pair_cK,",
+            "        shell_ao_start, nao, D_mat, J_mat, K_mat, n_bufs);",
+            "  } else {",
+            f"    const cudaError_t prep_{q.name} = cueri_prepare_fused_fock_warp_launch(",
+            f"        KernelFusedJK_{q.name}_fixed<{nroots}, false>,",
+            "        threads, kDefaultThreads, ntasks,",
+            f"        kWarpDoubles_{q.name}, &launch_threads, &blocks, &shmem_{q.name});",
+            f"    if (prep_{q.name} != cudaSuccess) return prep_{q.name};",
+            f"    KernelFusedJK_{q.name}_fixed<{nroots}, false><<<blocks, launch_threads, shmem_{q.name}, stream>>>(",
+            "        task_spAB, task_spCD, ntasks, sp_A, sp_B, sp_pair_start, sp_npair,",
+            "        shell_cx, shell_cy, shell_cz,",
+            "        pair_eta, pair_Px, pair_Py, pair_Pz, pair_cK,",
+            "        shell_ao_start, nao, D_mat, J_mat, K_mat, n_bufs);",
+            "  }",
             "  return cudaGetLastError();",
             "}",
             "",
@@ -1646,9 +1690,96 @@ def emit_launchers(q: QuartetClass, stride: int) -> str:
             "  // Flat kernel: one thread per task, 100% utilization.",
             "  constexpr int kFlatThreads = 128;",
             "  const int blocks = (ntasks + kFlatThreads - 1) / kFlatThreads;",
-            f"  KernelERI_{q.name}_flat<{nroots}><<<blocks, kFlatThreads, 0, stream>>>(",
+            f"  KernelERI_{q.name}_flat<{nroots}, false, false><<<blocks, kFlatThreads, 0, stream>>>(",
             "      task_spAB, task_spCD, ntasks, sp_A, sp_B, sp_pair_start, sp_npair, shell_cx, shell_cy, shell_cz,",
-            "      pair_eta, pair_Px, pair_Py, pair_Pz, pair_cK, eri_out);",
+            "      pair_eta, pair_Px, pair_Py, pair_Pz, pair_cK, eri_out, nullptr);",
+            "  return cudaGetLastError();",
+            "}",
+            "",
+            # --- FP32 tile output launcher ---
+            f'extern "C" cudaError_t cueri_eri_{q.name}_f32_launch_stream(',
+            "    const int32_t* task_spAB,",
+            "    const int32_t* task_spCD,",
+            "    int ntasks,",
+            "    const int32_t* sp_A,",
+            "    const int32_t* sp_B,",
+            "    const int32_t* sp_pair_start,",
+            "    const int32_t* sp_npair,",
+            "    const double* shell_cx,",
+            "    const double* shell_cy,",
+            "    const double* shell_cz,",
+            "    const double* pair_eta,",
+            "    const double* pair_Px,",
+            "    const double* pair_Py,",
+            "    const double* pair_Pz,",
+            "    const double* pair_cK,",
+            "    float* eri_out_f32,",
+            "    cudaStream_t stream,",
+            "    int threads) {",
+            "  if (ntasks <= 0) return (ntasks == 0) ? cudaSuccess : cudaErrorInvalidValue;",
+            "  constexpr int kFlatThreads = 128;",
+            "  const int blocks = (ntasks + kFlatThreads - 1) / kFlatThreads;",
+            f"  KernelERI_{q.name}_flat<{nroots}, true, false><<<blocks, kFlatThreads, 0, stream>>>(",
+            "      task_spAB, task_spCD, ntasks, sp_A, sp_B, sp_pair_start, sp_npair, shell_cx, shell_cy, shell_cz,",
+            "      pair_eta, pair_Px, pair_Py, pair_Pz, pair_cK, nullptr, eri_out_f32);",
+            "  return cudaGetLastError();",
+            "}",
+            "",
+            # --- Mixed-precision launcher (FP32 components + FP64 tile) ---
+            f'extern "C" cudaError_t cueri_eri_{q.name}_mixed_launch_stream(',
+            "    const int32_t* task_spAB,",
+            "    const int32_t* task_spCD,",
+            "    int ntasks,",
+            "    const int32_t* sp_A,",
+            "    const int32_t* sp_B,",
+            "    const int32_t* sp_pair_start,",
+            "    const int32_t* sp_npair,",
+            "    const double* shell_cx,",
+            "    const double* shell_cy,",
+            "    const double* shell_cz,",
+            "    const double* pair_eta,",
+            "    const double* pair_Px,",
+            "    const double* pair_Py,",
+            "    const double* pair_Pz,",
+            "    const double* pair_cK,",
+            "    double* eri_out,",
+            "    cudaStream_t stream,",
+            "    int threads) {",
+            "  if (ntasks <= 0) return (ntasks == 0) ? cudaSuccess : cudaErrorInvalidValue;",
+            "  constexpr int kFlatThreads = 128;",
+            "  const int blocks = (ntasks + kFlatThreads - 1) / kFlatThreads;",
+            f"  KernelERI_{q.name}_flat<{nroots}, false, true><<<blocks, kFlatThreads, 0, stream>>>(",
+            "      task_spAB, task_spCD, ntasks, sp_A, sp_B, sp_pair_start, sp_npair, shell_cx, shell_cy, shell_cz,",
+            "      pair_eta, pair_Px, pair_Py, pair_Pz, pair_cK, eri_out, nullptr);",
+            "  return cudaGetLastError();",
+            "}",
+            "",
+            # --- Mixed-precision + FP32 tile output launcher ---
+            f'extern "C" cudaError_t cueri_eri_{q.name}_mixed_f32_launch_stream(',
+            "    const int32_t* task_spAB,",
+            "    const int32_t* task_spCD,",
+            "    int ntasks,",
+            "    const int32_t* sp_A,",
+            "    const int32_t* sp_B,",
+            "    const int32_t* sp_pair_start,",
+            "    const int32_t* sp_npair,",
+            "    const double* shell_cx,",
+            "    const double* shell_cy,",
+            "    const double* shell_cz,",
+            "    const double* pair_eta,",
+            "    const double* pair_Px,",
+            "    const double* pair_Py,",
+            "    const double* pair_Pz,",
+            "    const double* pair_cK,",
+            "    float* eri_out_f32,",
+            "    cudaStream_t stream,",
+            "    int threads) {",
+            "  if (ntasks <= 0) return (ntasks == 0) ? cudaSuccess : cudaErrorInvalidValue;",
+            "  constexpr int kFlatThreads = 128;",
+            "  const int blocks = (ntasks + kFlatThreads - 1) / kFlatThreads;",
+            f"  KernelERI_{q.name}_flat<{nroots}, true, true><<<blocks, kFlatThreads, 0, stream>>>(",
+            "      task_spAB, task_spCD, ntasks, sp_A, sp_B, sp_pair_start, sp_npair, shell_cx, shell_cy, shell_cz,",
+            "      pair_eta, pair_Px, pair_Py, pair_Pz, pair_cK, nullptr, eri_out_f32);",
             "  return cudaGetLastError();",
             "}",
             "",
@@ -1737,6 +1868,7 @@ def generate_text(*, wave_name: str, classes: list[QuartetClass]) -> str:
         "",
         "#include <cmath>",
         "#include <cstdint>",
+        "#include <type_traits>",
         "",
         '#include "cueri_cuda_kernels_api.h"',
     ]

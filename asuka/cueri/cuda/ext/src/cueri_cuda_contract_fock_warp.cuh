@@ -18,8 +18,10 @@ __device__ __forceinline__ double cueri_warp_reduce_sum_fock(double x) {
 
 // Contract one ERI tile into RHF Fock: F += J(D) - 0.5*K(D).
 // Uses 1 warp per task; inner loops are warp-strided; lane-0 atomics only.
+// TileT template: double (default) or float for mixed-precision FP32 tiles.
+template <typename TileT = double>
 __device__ __forceinline__ void cueri_contract_fock_warp_single(
-    const double* __restrict__ tile,
+    const TileT* __restrict__ tile,
     const double* __restrict__ D_mat,
     double* F_mat,
     int lane,
@@ -56,7 +58,7 @@ __device__ __forceinline__ void cueri_contract_fock_warp_single(
     for (int icd = lane; icd < nCD; icd += 32) {
       const int ic = icd / nD;
       const int id = icd - ic * nD;
-      pj += tile[iab * nCD + icd] * D_mat[(c0 + ic) * N + (d0 + id)];
+      pj += static_cast<double>(tile[iab * nCD + icd]) * D_mat[(c0 + ic) * N + (d0 + id)];
     }
     pj = cueri_warp_reduce_sum_fock(pj);
     if (lane == 0 && pj != 0.0) {
@@ -76,7 +78,7 @@ __device__ __forceinline__ void cueri_contract_fock_warp_single(
       for (int iab = lane; iab < nAB; iab += 32) {
         const int ia = iab / nB;
         const int ib = iab - ia * nB;
-        pj += tile[iab * nCD + icd] * D_mat[(a0 + ia) * N + (b0 + ib)];
+        pj += static_cast<double>(tile[iab * nCD + icd]) * D_mat[(a0 + ia) * N + (b0 + ib)];
       }
       pj = cueri_warp_reduce_sum_fock(pj);
       if (lane == 0 && pj != 0.0) {
@@ -99,7 +101,7 @@ __device__ __forceinline__ void cueri_contract_fock_warp_single(
     for (int ibd = lane; ibd < nB * nD; ibd += 32) {
       const int ib = ibd / nD;
       const int id = ibd - ib * nD;
-      pk += tile[(ia * nB + ib) * nCD + ic * nD + id] * D_mat[(b0 + ib) * N + (d0 + id)];
+      pk += static_cast<double>(tile[(ia * nB + ib) * nCD + ic * nD + id]) * D_mat[(b0 + ib) * N + (d0 + id)];
     }
     pk = cueri_warp_reduce_sum_fock(pk);
     if (lane == 0 && pk != 0.0) {
@@ -119,7 +121,7 @@ __device__ __forceinline__ void cueri_contract_fock_warp_single(
       for (int ibc = lane; ibc < nB * nC; ibc += 32) {
         const int ib = ibc / nC;
         const int ic = ibc - ib * nC;
-        pk += tile[(ia * nB + ib) * nCD + ic * nD + id] * D_mat[(b0 + ib) * N + (c0 + ic)];
+        pk += static_cast<double>(tile[(ia * nB + ib) * nCD + ic * nD + id]) * D_mat[(b0 + ib) * N + (c0 + ic)];
       }
       pk = cueri_warp_reduce_sum_fock(pk);
       if (lane == 0 && pk != 0.0) {
@@ -140,7 +142,7 @@ __device__ __forceinline__ void cueri_contract_fock_warp_single(
       for (int iad = lane; iad < nA * nD; iad += 32) {
         const int ia = iad / nD;
         const int id = iad - ia * nD;
-        pk += tile[(ia * nB + ib) * nCD + ic * nD + id] * D_mat[(a0 + ia) * N + (d0 + id)];
+        pk += static_cast<double>(tile[(ia * nB + ib) * nCD + ic * nD + id]) * D_mat[(a0 + ia) * N + (d0 + id)];
       }
       pk = cueri_warp_reduce_sum_fock(pk);
       if (lane == 0 && pk != 0.0) {
@@ -161,7 +163,7 @@ __device__ __forceinline__ void cueri_contract_fock_warp_single(
       for (int iac = lane; iac < nA * nC; iac += 32) {
         const int ia = iac / nC;
         const int ic = iac - ia * nC;
-        pk += tile[(ia * nB + ib) * nCD + ic * nD + id] * D_mat[(a0 + ia) * N + (c0 + ic)];
+        pk += static_cast<double>(tile[(ia * nB + ib) * nCD + ic * nD + id]) * D_mat[(a0 + ia) * N + (c0 + ic)];
       }
       pk = cueri_warp_reduce_sum_fock(pk);
       if (lane == 0 && pk != 0.0) {

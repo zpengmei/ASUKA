@@ -10,12 +10,27 @@ namespace cueri_rys {
 
 constexpr double kPi = 3.141592653589793238462643383279502884;
 
+}  // namespace cueri_rys (temporarily close to define kPi before LUT)
+
+#ifdef CUERI_BOYS_LUT
+#include "cueri_cuda_rys_lut.cuh"
+#endif
+
+namespace cueri_rys {
+
 __device__ inline double clamp_double(double x, double lo, double hi) { return fmin(fmax(x, lo), hi); }
 
 template <int MMAX>
 __device__ inline void boys_fm_ref(double T, double* F) {
   // Computes F[0..MMAX] for Boys function:
   //   F_m(T) = ∫_0^1 t^{2m} exp(-T t^2) dt
+#ifdef CUERI_BOYS_LUT
+  // Use pre-computed Chebyshev lookup table: constant-time evaluation
+  // via 7 FMA ops per m-value. Falls back to asymptotic for T > T_max.
+  static_assert(MMAX <= kBoysLutMmax, "MMAX exceeds Boys LUT table range");
+  boys_fm_lut<MMAX>(T, F);
+  return;
+#endif
   // Strategy:
   // - T tiny: compute F_MMAX by series, recurse downward.
   // - else: compute F0 via erf, recurse upward.
@@ -322,7 +337,9 @@ __device__ inline void rys_roots_weights(double T, double* r, double* w) {
 template <>
 __device__ inline void rys_roots_weights<1>(double T, double* r, double* w) {
   double F[2];
-#ifdef CUERI_FAST_BOYS
+#ifdef CUERI_BOYS_LUT
+  boys_fm_lut<1>(T, F);
+#elif defined(CUERI_FAST_BOYS)
   boys_fm_fast<1>(T, F);
 #else
   boys_fm_ref<1>(T, F);
@@ -337,7 +354,9 @@ __device__ inline void rys_roots_weights<1>(double T, double* r, double* w) {
 template <>
 __device__ inline void rys_roots_weights<2>(double T, double* r, double* w) {
   double mu[4];
-#ifdef CUERI_FAST_BOYS
+#ifdef CUERI_BOYS_LUT
+  boys_fm_lut<3>(T, mu);  // mu[0..3] = F0..F3
+#elif defined(CUERI_FAST_BOYS)
   boys_fm_fast<3>(T, mu);  // mu[0..3] = F0..F3
 #else
   boys_fm_ref<3>(T, mu);  // mu[0..3] = F0..F3
@@ -387,7 +406,9 @@ __device__ inline void rys_roots_weights<2>(double T, double* r, double* w) {
 template <>
 __device__ inline void rys_roots_weights<3>(double T, double* r, double* w) {
   double mu[6];
-#ifdef CUERI_FAST_BOYS
+#ifdef CUERI_BOYS_LUT
+  boys_fm_lut<5>(T, mu);  // mu[0..5] = F0..F5
+#elif defined(CUERI_FAST_BOYS)
   boys_fm_fast<5>(T, mu);  // mu[0..5] = F0..F5
 #else
   boys_fm_ref<5>(T, mu);  // mu[0..5] = F0..F5

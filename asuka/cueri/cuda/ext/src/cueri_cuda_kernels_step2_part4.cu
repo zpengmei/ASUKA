@@ -1435,8 +1435,8 @@ __global__ void KernelFused_ppps_warp_component(
       double* F_mat = out0_mat + buf_off;
       accumulate_fock_single_value(acc, D_mat, F_mat, a, b, c, d0, ab_neq, cd_neq, bk_swap, f_ab, f_cd, N);
     } else {
-      double* J_mat = out0_mat + buf_off;
-      double* K_mat = out1_mat + buf_off;
+      double* J_mat = (out0_mat != nullptr) ? out0_mat + buf_off : nullptr;
+      double* K_mat = (out1_mat != nullptr) ? out1_mat + buf_off : nullptr;
       accumulate_jk_single_value(acc, D_mat, J_mat, K_mat, a, b, c, d0, ab_neq, cd_neq, bk_swap, f_ab, f_cd, N);
     }
   }
@@ -2711,7 +2711,9 @@ extern "C" cudaError_t cueri_fused_fock_ppps_launch_stream(
     double* F_mat,
     cudaStream_t stream,
     int threads,
-    int n_bufs) {
+    int n_bufs,
+    bool mixed_prec) {
+  (void)mixed_prec;  // ppps uses warp_component kernels, mixed_prec not yet implemented
   if (ntasks < 0 || nao <= 0) return cudaErrorInvalidValue;
   if (ntasks == 0) return cudaSuccess;
   if (threads < 32 || (threads & 31) != 0) return cudaErrorInvalidValue;
@@ -2795,7 +2797,9 @@ extern "C" cudaError_t cueri_fused_jk_ppps_launch_stream(
     double* K_mat,
     cudaStream_t stream,
     int threads,
-    int n_bufs) {
+    int n_bufs,
+    bool mixed_prec) {
+  (void)mixed_prec;  // ppps uses warp_component kernels, mixed_prec not yet implemented
   if (ntasks < 0 || nao <= 0) return cudaErrorInvalidValue;
   if (ntasks == 0) return cudaSuccess;
   if (threads < 32 || (threads & 31) != 0) return cudaErrorInvalidValue;

@@ -1370,7 +1370,7 @@ def _compute_ci_cc_matvec_block(
 
     # Accept ci1 as list/tuple (per-root) or as a packed vector.
     if isinstance(ci1, (list, tuple)):
-        ci1_list = [np.asarray(c, dtype=np.float64).ravel() for c in ci1]
+        ci1_list = [_to_np_f64(c).ravel() for c in ci1]
     else:
         ci1_arr = np.asarray(ci1, dtype=np.float64)
         if nroots == 1:
@@ -2121,13 +2121,21 @@ def _build_internal_cache(
             return_cupy=bool(_on_gpu),
         )
         eci0 = np.asarray(
-            [_scalar_real_float(xp.dot(xp.asarray(c, dtype=xp.float64), xp.asarray(hc, dtype=xp.float64))) for c, hc in zip(ci0_list, hci0)],
+            [
+                _scalar_real_float(
+                    xp.dot(
+                        _to_xp_f64(c, xp).ravel(),
+                        _to_xp_f64(hc, xp).ravel(),
+                    )
+                )
+                for c, hc in zip(ci0_list, hci0)
+            ],
             dtype=np.float64,
         )
         gci0 = [
-            xp.asarray(hc, dtype=xp.float64) - xp.asarray(c, dtype=xp.float64) * float(e)
+            _to_xp_f64(hc, xp) - _to_xp_f64(c, xp) * float(e)
             if bool(_on_gpu)
-            else hc - c * float(e)
+            else _to_np_f64(hc) - _to_np_f64(c) * float(e)
             for hc, c, e in zip(hci0, ci0_list, eci0)
         ]
 
@@ -2206,7 +2214,7 @@ def _build_internal_cache(
         hci_diag = [
             (_to_xp_f64(hd0, xp) - float(ec) - xp.asarray(gc, dtype=xp.float64) * xp.asarray(c, dtype=xp.float64) * 2.0)
             if bool(_on_gpu)
-            else hd0 - float(ec) - gc * c * 2.0
+            else _to_np_f64(hd0) - float(ec) - _to_np_f64(gc) * _to_np_f64(c) * 2.0
             for ec, gc, c in zip(eci0, gci0, ci0_list)
         ]
         hci_diag = [h * float(wi) for h, wi in zip(hci_diag, w)]
@@ -2286,7 +2294,7 @@ def _compute_orb_oc_matvec_block(
 
     # Accept ci1 as list/tuple (per-root) or as packed vector.
     if isinstance(ci1, (list, tuple)):
-        ci1_list = [np.asarray(c, dtype=np.float64).ravel() for c in ci1]
+        ci1_list = [_to_np_f64(c).ravel() for c in ci1]
     else:
         ci1_arr = np.asarray(ci1, dtype=np.float64)
         if nroots == 1:
@@ -3045,17 +3053,33 @@ def gen_g_hop_internal(
             _c2e_kw["contract_2e_backend"] = "cuda"
         with _ah_mixed_precision_ctx(fcisolver, ah_mixed_precision), _absorb_ctx():
             hci1 = [
-                fcisolver.contract_2e(_op_h0, c1, cache.ncas, cache.nelecas, **_c2e_kw).ravel()
+                (
+                    _to_xp_f64(
+                        fcisolver.contract_2e(_op_h0, c1, cache.ncas, cache.nelecas, **_c2e_kw),
+                        xp,
+                    ).ravel()
+                    if on_gpu
+                    else _to_np_f64(
+                        fcisolver.contract_2e(_op_h0, c1, cache.ncas, cache.nelecas, **_c2e_kw)
+                    ).ravel()
+                )
                 for c1 in ci1_list
             ]
         # Intermediate-normalisation correction (zero float() calls on GPU).
-        hci1 = [hc1 - c1 * ec0 for hc1, c1, ec0 in zip(hci1, ci1_list, _eci0)]
         hci1 = [
-            hc1 - (hc0 - c0 * ec0) * xp.dot(c0, c1)
+            _to_xp_f64(hc1, xp) - _to_xp_f64(c1, xp) * ec0
+            if on_gpu
+            else _to_np_f64(hc1) - _to_np_f64(c1) * ec0
+            for hc1, c1, ec0 in zip(hci1, ci1_list, _eci0)
+        ]
+        hci1 = [
+            _to_xp_f64(hc1, xp)
+            - (_to_xp_f64(hc0, xp) - _to_xp_f64(c0, xp) * ec0) * xp.dot(_to_xp_f64(c0, xp), _to_xp_f64(c1, xp))
             for hc1, hc0, c0, ec0, c1 in zip(hci1, _hci0, _ci0, _eci0, ci1_list)
         ]
         hci1 = [
-            hc1 - c0 * xp.dot(hc0 - c0 * ec0, c1)
+            _to_xp_f64(hc1, xp)
+            - _to_xp_f64(c0, xp) * xp.dot(_to_xp_f64(hc0, xp) - _to_xp_f64(c0, xp) * ec0, _to_xp_f64(c1, xp))
             for hc1, hc0, c0, ec0, c1 in zip(hci1, _hci0, _ci0, _eci0, ci1_list)
         ]
 
@@ -3393,10 +3417,22 @@ def gen_g_hop_internal(
         with _ah_mixed_precision_ctx(fcisolver, ah_mixed_precision), _absorb_ctx():
             op_k = fcisolver.absorb_h1e(h1aa, aaaa, cache.ncas, cache.nelecas, 0.5)
             kci0 = [
-                fcisolver.contract_2e(op_k, c0, cache.ncas, cache.nelecas, **_c2e_kw).ravel()
+                (
+                    _to_xp_f64(
+                        fcisolver.contract_2e(op_k, c0, cache.ncas, cache.nelecas, **_c2e_kw),
+                        xp,
+                    ).ravel()
+                    if on_gpu
+                    else _to_np_f64(
+                        fcisolver.contract_2e(op_k, c0, cache.ncas, cache.nelecas, **_c2e_kw)
+                    ).ravel()
+                )
                 for c0 in _ci0
             ]
-        kci0 = [kc0 - xp.dot(kc0, c0) * c0 for kc0, c0 in zip(kci0, _ci0)]
+        kci0 = [
+            _to_xp_f64(kc0, xp) - xp.dot(_to_xp_f64(kc0, xp), _to_xp_f64(c0, xp)) * _to_xp_f64(c0, xp)
+            for kc0, c0 in zip(kci0, _ci0)
+        ]
         hci1 = [hc1 + kc0 for hc1, kc0 in zip(hci1, kci0)]
         hci1 = [hc1 * wi for hc1, wi in zip(hci1, _weights)]
 
@@ -3429,7 +3465,7 @@ def gen_g_hop_internal(
 
         # SA overlap contribution.
         s10 = xp.asarray(
-            [xp.dot(c1, c0) * 2.0 * wi for c1, c0, wi in zip(ci1_list, _ci0, _weights)],
+            [xp.dot(_to_xp_f64(c1, xp), _to_xp_f64(c0, xp)) * 2.0 * wi for c1, c0, wi in zip(ci1_list, _ci0, _weights)],
             dtype=xp.float64,
         )
         if cache.ncore:

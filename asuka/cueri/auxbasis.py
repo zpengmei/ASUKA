@@ -41,6 +41,10 @@ def infer_jkfit_auxbasis_name(orbital_basis_name: str) -> str:
     if "jkfit" in name:
         return name
 
+    # Def2-TC family: tensor-core-optimized auxiliary bases.
+    if name.startswith("def2-tc-"):
+        return f"{name}-jkfit"
+
     # Def2 family: def2-*-jkfit exists for many standard bases.
     if name.startswith("def2-"):
         return f"{name}-jkfit"

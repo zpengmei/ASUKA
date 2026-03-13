@@ -967,7 +967,9 @@ extern "C" cudaError_t cueri_fused_fock_ssss_launch_stream(
     double* F_mat,
     cudaStream_t stream,
     int threads,
-    int n_bufs) {
+    int n_bufs,
+    bool mixed_prec) {
+  (void)mixed_prec;  // ignored for ssss (bandwidth-bound)
   if (ntasks <= 0) return cudaSuccess;
   if (threads < 32 || (threads & 31) != 0) return cudaErrorInvalidValue;
   const int warps_per_block = threads >> 5;
@@ -1002,7 +1004,9 @@ extern "C" cudaError_t cueri_fused_jk_ssss_launch_stream(
     cudaStream_t stream,
     int threads,
     bool use_fast_boys,
-    int n_bufs) {
+    int n_bufs,
+    bool mixed_prec) {
+  (void)mixed_prec;  // ignored for ssss (bandwidth-bound)
   if (ntasks <= 0) return cudaSuccess;
   if (threads < 32 || (threads & 31) != 0) return cudaErrorInvalidValue;
   const int warps_per_block = threads >> 5;

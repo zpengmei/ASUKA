@@ -49,7 +49,7 @@ def _kernel_trailing_gap(block_lines: list[str]) -> list[str]:
         next_kernel = len(block_lines)
         for j in range(body_end, len(block_lines)):
             stripped = block_lines[j].strip()
-            if stripped == "template <int NROOTS>" or rx_global.match(block_lines[j]):
+            if stripped.startswith("template <int NROOTS") or rx_global.match(block_lines[j]):
                 next_kernel = j
                 break
         return block_lines[body_end:next_kernel]
@@ -74,7 +74,7 @@ def _find_line_exact(lines: list[str], text: str, start: int = 0) -> int:
 
 def _kernel_names_in_order(lines: list[str], ns_start: int, ns_end: int) -> list[str]:
     """Return kernel names in source order (e.g. 'psds', 'ppds', ...)."""
-    rx = re.compile(r"^__global__ void KernelERI_(\w+?)_flat\s*\(")
+    rx = re.compile(r"^__global__ void\s+(?:__launch_bounds__\(\d+\)\s+)?KernelERI_(\w+?)_flat\s*\(")
     names: list[str] = []
     for line in lines[ns_start:ns_end]:
         m = rx.match(line)
@@ -94,7 +94,7 @@ def _kernel_block_bounds(
     # Find where the shared helpers end: right after the closing } of
     # compute_G_stride_fixed (the only template helper in the shared area).
     # Strategy: find each kernel's first device helper (eval_<name>_x).
-    rx_global = re.compile(r"^__global__ void KernelERI_(\w+?)_flat\s*\(")
+    rx_global = re.compile(r"^__global__ void\s+(?:__launch_bounds__\(\d+\)\s+)?KernelERI_(\w+?)_flat\s*\(")
 
     # Collect the line index of each __global__ marker (absolute in file)
     global_lines: dict[str, int] = {}
@@ -111,8 +111,8 @@ def _kernel_block_bounds(
     for name in kernel_names:
         gl = global_lines[name]
         # The template line is just above the __global__ line
-        assert lines[gl - 1].strip() == "template <int NROOTS>", (
-            f"Expected 'template <int NROOTS>' before __global__ for kernel {name}, "
+        assert lines[gl - 1].strip().startswith("template <int NROOTS"), (
+            f"Expected 'template <int NROOTS...' before __global__ for kernel {name}, "
             f"got: {lines[gl-1]!r}"
         )
         kernel_template_lines.append(gl - 1)

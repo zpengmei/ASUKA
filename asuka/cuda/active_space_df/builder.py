@@ -66,6 +66,7 @@ class ActiveSpaceDFBuilder:
         *,
         method: str = "auto",
         cublas_math_mode: str | None = None,
+        eri_precision: str | None = None,
         want_eri_mat: bool = True,
         want_j_ps: bool = True,
         want_pair_norm: bool = True,
@@ -280,7 +281,24 @@ class ActiveSpaceDFBuilder:
             eri_mat = None
             if want_eri_mat:
                 # Dense pair-space ERI matrix: (pq|rs) = sum_L d[L,pq] d[L,rs]
-                if out is not None:
+                # Use mixed-precision GEMM when requested (k=naux can be large).
+                # Auto-read from PrecisionPolicy if not explicitly set.
+                _eri_prec = eri_precision
+                if _eri_prec is None:
+                    try:
+                        from asuka.cuda.mixed_precision_policy import PrecisionPolicy
+                        _eri_prec = PrecisionPolicy.from_env().eri_matrix
+                    except Exception:
+                        _eri_prec = "fp64"
+                if _eri_prec is not None and _eri_prec != "fp64":
+                    from asuka.cuda.mixed_precision import gemm_dispatched
+                    eri_mat = gemm_dispatched(
+                        l_full, l_full.T, precision=_eri_prec,
+                        out=out.eri_mat if out is not None else None,
+                    )
+                    if out is None:
+                        eri_mat = cp.ascontiguousarray(eri_mat)
+                elif out is not None:
                     eri_mat = out.eri_mat
                     cp.dot(l_full, l_full.T, out=eri_mat)
                 else:

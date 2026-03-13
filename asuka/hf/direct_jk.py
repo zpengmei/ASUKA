@@ -29,6 +29,11 @@ from dataclasses import dataclass
 from typing import Any
 
 import numpy as np
+from .direct_jk_cost import (
+    estimate_direct_fock_contract_cost,
+    estimate_direct_jk_contract_cost,
+    merge_contract_cost_row,
+)
 from asuka.kernels import cueri as cueri_kernels
 
 
@@ -677,7 +682,16 @@ def _choose_n_bufs(nao: int, vram_budget_mb: int = 500) -> int:
 
     Distributes atomicAdd contention across N independent Fock buffers.
     Bounded by VRAM budget so that ``N * nao^2 * 8`` bytes stays under *vram_budget_mb*.
+
+    For large nao (>= 200), atomic contention is negligible and the
+    multi-buffer reduction overhead dominates, so return 1.
     """
+    env_val = os.environ.get("ASUKA_DIRECT_JK_N_BUFS", "")
+    if env_val.strip():
+        return max(1, int(env_val))
+    # For large matrices, atomic contention on nao^2 targets is negligible.
+    if nao >= 200:
+        return 1
     buf_bytes = nao * nao * 8
     if buf_bytes <= 0:
         return 1
@@ -950,6 +964,85 @@ def release_direct_jk_workspace_cache() -> None:
         _DIRECT_JK_WS_BY_DEVICE.clear()
     except Exception:
         pass
+
+
+def _direct_jk_symmetry_histogram(task_spAB, task_spCD, sp_A, sp_B, cp) -> np.ndarray:
+    """Compact 8-bin symmetry histogram for a class chunk on device."""
+
+    nt = int(getattr(task_spAB, "size", 0))
+    if nt <= 0:
+        return np.zeros((8,), dtype=np.int64)
+    ab_neq = (sp_A[task_spAB] != sp_B[task_spAB]).astype(cp.int32)
+    cd_neq = (sp_A[task_spCD] != sp_B[task_spCD]).astype(cp.int32)
+    bra_ket_swap = (task_spAB != task_spCD).astype(cp.int32)
+    case = (ab_neq << 2) | (cd_neq << 1) | bra_ket_swap
+    hist_dev = cp.bincount(case, minlength=8)
+    return np.asarray(cp.asnumpy(hist_dev), dtype=np.int64)
+
+
+
+def _attach_direct_jk_contract_cost(
+    row: dict[str, Any] | None,
+    *,
+    cp,
+    ctx: DirectJKContext,
+    task_spAB,
+    task_spCD,
+    nA: int,
+    nB: int,
+    nC: int,
+    nD: int,
+    contract_mode: str,
+    want_J: bool,
+    want_K: bool,
+    n_dm: int = 1,
+) -> None:
+    if row is None:
+        return
+    if not bool(want_J) and not bool(want_K):
+        return
+    hist = _direct_jk_symmetry_histogram(task_spAB, task_spCD, ctx.sp_A_dev, ctx.sp_B_dev, cp)
+    cost = estimate_direct_jk_contract_cost(
+        histogram=hist,
+        nA=int(nA),
+        nB=int(nB),
+        nC=int(nC),
+        nD=int(nD),
+        contract_mode=str(contract_mode),
+        want_J=bool(want_J),
+        want_K=bool(want_K),
+        n_dm=int(n_dm),
+    )
+    merge_contract_cost_row(row, cost)
+
+
+def _attach_direct_fock_contract_cost(
+    row: dict[str, Any] | None,
+    *,
+    cp,
+    ctx: DirectJKContext,
+    task_spAB,
+    task_spCD,
+    nA: int,
+    nB: int,
+    nC: int,
+    nD: int,
+    contract_mode: str,
+    n_dm: int = 1,
+) -> None:
+    if row is None:
+        return
+    hist = _direct_jk_symmetry_histogram(task_spAB, task_spCD, ctx.sp_A_dev, ctx.sp_B_dev, cp)
+    cost = estimate_direct_fock_contract_cost(
+        histogram=hist,
+        nA=int(nA),
+        nB=int(nB),
+        nC=int(nC),
+        nD=int(nD),
+        contract_mode=str(contract_mode),
+        n_dm=int(n_dm),
+    )
+    merge_contract_cost_row(row, cost)
 
 
 def _get_direct_jk_workspace(cp, ctx: DirectJKContext) -> DirectJKWorkspace | None:
@@ -1442,6 +1535,9 @@ def direct_JK(
     want_K: bool = True,
     profile: dict | None = None,
     stats: dict | None = None,
+    tile_dtype: str | None = None,
+    mixed_precision: bool | None = None,
+    f32_accum: bool | None = None,
 ):
     """Build J and K via streaming integral-direct 4-center evaluation.
 
@@ -1472,10 +1568,19 @@ def direct_JK(
         return None, None
 
     import cupy as cp  # noqa: PLC0415
+    import os as _os  # noqa: PLC0415
 
     _ext = cueri_kernels.require_ext()
     from asuka.cueri.eri_dispatch import KernelBatch, run_kernel_batch_spd  # noqa: PLC0415
     from asuka.cueri.tasks import TaskList  # noqa: PLC0415
+
+    # Mixed-precision ERI defaults from env vars.
+    if tile_dtype is None:
+        tile_dtype = "float32" if _os.environ.get("ASUKA_ERI_TILE_F32", "") == "1" else "float64"
+    if mixed_precision is None:
+        mixed_precision = _os.environ.get("ASUKA_ERI_MIXED_PRECISION", "1") != "0"
+    if f32_accum is None:
+        f32_accum = _os.environ.get("ASUKA_ERI_F32_ACCUM", "") == "1"
 
     nao = ctx.nao
     base_threads = int(ctx.threads)
@@ -1544,8 +1649,8 @@ def direct_JK(
     if class_policy_env:
         class_policy.update(class_policy_env)
 
-    # Multi-buffer J/K accumulation: distribute atomicAdd contention for fused kernels.
-    n_bufs = _choose_n_bufs(nao) if fused_enabled else 1
+    # Multi-buffer J/K accumulation: distribute atomicAdd contention.
+    n_bufs = _choose_n_bufs(nao)
     D_flat, J_flat, K_flat, J_bufs, K_bufs = _ensure_direct_jk_matrix_buffers(
         cp,
         ws,
@@ -1861,6 +1966,28 @@ def direct_JK(
                 prof_row.setdefault("fused_ms", 0.0)
                 prof_row["calls"] = int(prof_row.get("calls", 0)) + (1 if use_fused else int((class_ntasks + chunk_ntasks - 1) // chunk_ntasks))
 
+            if stats is not None and row is not None:
+                if use_fused:
+                    row["contract_fused_tile_roundtrip_bytes_saved_vs_staged"] = int(
+                        row.get("contract_fused_tile_roundtrip_bytes_saved_vs_staged", 0)
+                    ) + int(class_ntasks) * int(nA) * int(nB) * int(nC) * int(nD) * 16
+                else:
+                    _attach_direct_jk_contract_cost(
+                        row,
+                        cp=cp,
+                        ctx=ctx,
+                        task_spAB=kernel_spAB_full,
+                        task_spCD=kernel_spCD_full,
+                        nA=int(nA),
+                        nB=int(nB),
+                        nC=int(nC),
+                        nD=int(nD),
+                        contract_mode=("warp" if use_warp_contract else "staged"),
+                        want_J=bool(want_J),
+                        want_K=bool(want_K),
+                        n_dm=1,
+                    )
+
             if use_fused and fused_fn is not None:
                 if profile is not None:
                     _tc0 = cp.cuda.Event()
@@ -1891,6 +2018,7 @@ def direct_JK(
                         False,
                         False,
                         n_bufs=int(n_bufs),
+                        mixed_prec=bool(mixed_precision),
                     )
                 else:
                     fused_fn(
@@ -1917,6 +2045,7 @@ def direct_JK(
                         int(stream_ptr),
                         False,
                         n_bufs=int(n_bufs),
+                        mixed_prec=bool(mixed_precision),
                     )
                 n_kernel_calls += 1
                 if stats is not None:
@@ -1958,6 +2087,9 @@ def direct_JK(
                     mode=eri_mode,
                     profile=profile,
                     skip_transpose=True,
+                    tile_dtype=tile_dtype,
+                    mixed_precision=mixed_precision,
+                    f32_accum=f32_accum,
                 )
                 n_kernel_calls += 1
                 if stats is not None:
@@ -1971,11 +2103,17 @@ def direct_JK(
                     _tc1 = cp.cuda.Event()
                     _tc0.record()
 
+                # Warp contraction does not support FP32 tiles; fall back to non-warp.
+                _tile_is_f32 = (tiles.dtype == cp.float32)
                 contract_fn = (
                     _ext.contract_jk_tiles_ordered_warp_inplace_device
-                    if use_warp_contract
+                    if use_warp_contract and not _tile_is_f32
                     else _ext.contract_jk_tiles_ordered_inplace_device
                 )
+
+                # Multi-buffer: use J_bufs/K_bufs when n_bufs > 1.
+                _J_contract = J_bufs.ravel() if (n_bufs > 1 and J_bufs is not None) else J_flat
+                _K_contract = K_bufs.ravel() if (n_bufs > 1 and K_bufs is not None) else K_flat
 
                 # When transpose=True, the kernel produced tiles in
                 # (nCD_orig, nAB_orig) layout.  Instead of transposing +
@@ -1995,11 +2133,12 @@ def direct_JK(
                         int(nB),
                         tiles.ravel(),
                         D_flat,
-                        J_flat,
-                        K_flat,
+                        _J_contract,
+                        _K_contract,
                         int(contract_threads),
                         int(stream_ptr),
                         False,
+                        n_bufs=int(n_bufs),
                     )
                 else:
                     contract_fn(
@@ -2015,11 +2154,12 @@ def direct_JK(
                         int(nD),
                         tiles.ravel(),
                         D_flat,
-                        J_flat,
-                        K_flat,
+                        _J_contract,
+                        _K_contract,
                         int(contract_threads),
                         int(stream_ptr),
                         False,
+                        n_bufs=int(n_bufs),
                     )
                 if stats is not None:
                     stats["n_contract_calls"] = int(stats.get("n_contract_calls", 0)) + 1
@@ -2069,6 +2209,9 @@ def direct_fock_rhf(
     *,
     profile: dict | None = None,
     stats: dict | None = None,
+    tile_dtype: str | None = None,
+    mixed_precision: bool | None = None,
+    f32_accum: bool | None = None,
 ):
     """Build the RHF Fock matrix directly: F = h + J(D) - 0.5 * K(D).
 
@@ -2082,6 +2225,14 @@ def direct_fock_rhf(
     from asuka.cueri.eri_dispatch import KernelBatch, run_kernel_batch_spd  # noqa: PLC0415
     from asuka.cueri.tasks import TaskList  # noqa: PLC0415
     import os  # noqa: PLC0415
+
+    # Mixed-precision ERI defaults from env vars.
+    if tile_dtype is None:
+        tile_dtype = "float32" if os.environ.get("ASUKA_ERI_TILE_F32", "") == "1" else "float64"
+    if mixed_precision is None:
+        mixed_precision = os.environ.get("ASUKA_ERI_MIXED_PRECISION", "1") != "0"
+    if f32_accum is None:
+        f32_accum = os.environ.get("ASUKA_ERI_F32_ACCUM", "") == "1"
 
     nao = ctx.nao
     base_threads = int(ctx.threads)
@@ -2211,8 +2362,8 @@ def direct_fock_rhf(
         fused_enabled |= {x.strip().lower() for x in fused_enable.replace(" ", ",").split(",") if x.strip()}
     fused_enabled &= fused_supported
 
-    # Multi-buffer Fock accumulation: distribute atomicAdd contention for fused kernels.
-    n_bufs = _choose_n_bufs(nao) if fused_enabled else 1
+    # Multi-buffer Fock accumulation: distribute atomicAdd contention.
+    n_bufs = _choose_n_bufs(nao)
     if n_bufs > 1:
         F_bufs = cp.zeros((n_bufs, nao * nao), dtype=cp.float64)
     else:
@@ -2371,6 +2522,7 @@ def direct_fock_rhf(
                 fused_fn = getattr(_ext, f"fused_fock_{klabel}_inplace_device", None)
                 use_fused = fused_fn is not None
 
+            row = None
             if stats is not None:
                 cls = _class_label(orig_cid)
                 row = stats.setdefault("classes", {}).setdefault(cls, {"ntasks": 0, "chunks": 0, "path": ""})
@@ -2387,6 +2539,26 @@ def direct_fock_rhf(
                 path = "fock_fused" if use_fused else ("fock_staged_hot_s1" if (hot_s1 and hot_s1_contract_enabled) else "fock_staged")
                 prev = str(row.get("path", "") or "")
                 row["path"] = path if (not prev or prev == path) else "mixed"
+
+            if stats is not None and row is not None:
+                if use_fused:
+                    row["contract_fused_tile_roundtrip_bytes_saved_vs_staged"] = int(
+                        row.get("contract_fused_tile_roundtrip_bytes_saved_vs_staged", 0)
+                    ) + int(class_ntasks) * int(nA) * int(nB) * int(nC) * int(nD) * 16
+                else:
+                    _attach_direct_fock_contract_cost(
+                        row,
+                        cp=cp,
+                        ctx=ctx,
+                        task_spAB=kernel_spAB_full,
+                        task_spCD=kernel_spCD_full,
+                        nA=int(nA),
+                        nB=int(nB),
+                        nC=int(nC),
+                        nD=int(nD),
+                        contract_mode=("warp" if use_warp_contract else "staged"),
+                        n_dm=1,
+                    )
 
             if use_fused and fused_fn is not None:
                 # One fused kernel per class group (no tile allocation / contraction launch).
@@ -2413,6 +2585,7 @@ def direct_fock_rhf(
                     int(stream_ptr),
                     False,
                     n_bufs=int(n_bufs),
+                    mixed_prec=bool(mixed_precision),
                 )
                 n_kernel_calls += 1
                 if stats is not None:
@@ -2449,6 +2622,9 @@ def direct_fock_rhf(
                     mode=eri_mode,
                     profile=profile,
                     skip_transpose=True,
+                    tile_dtype=tile_dtype,
+                    mixed_precision=mixed_precision,
+                    f32_accum=f32_accum,
                 )
                 n_kernel_calls += 1
                 if stats is not None:
@@ -2459,9 +2635,11 @@ def direct_fock_rhf(
                     _tc1 = cp.cuda.Event()
                     _tc0.record()
 
+                # Warp contraction does not support FP32 tiles; fall back to non-warp.
+                _tile_is_f32 = (tiles.dtype == cp.float32)
                 contract_fn = (
                     _ext.contract_fock_tiles_ordered_warp_inplace_device
-                    if use_warp_contract
+                    if use_warp_contract and not _tile_is_f32
                     else _ext.contract_fock_tiles_ordered_inplace_device
                 )
 
@@ -2544,6 +2722,9 @@ def direct_JK_multi(
     want_K: bool = True,
     profile: dict | None = None,
     stats: dict | None = None,
+    tile_dtype: str | None = None,
+    mixed_precision: bool | None = None,
+    f32_accum: bool | None = None,
 ):
     """Build (Ja, Ka, Jb, Kb) evaluating each ERI tile once.
 
@@ -2568,10 +2749,19 @@ def direct_JK_multi(
         return None, None, None, None
 
     import cupy as cp  # noqa: PLC0415
+    import os as _os  # noqa: PLC0415
 
     _ext = cueri_kernels.require_ext()
     from asuka.cueri.eri_dispatch import KernelBatch, run_kernel_batch_spd  # noqa: PLC0415
     from asuka.cueri.tasks import TaskList  # noqa: PLC0415
+
+    # Mixed-precision ERI defaults from env vars.
+    if tile_dtype is None:
+        tile_dtype = "float32" if _os.environ.get("ASUKA_ERI_TILE_F32", "") == "1" else "float64"
+    if mixed_precision is None:
+        mixed_precision = _os.environ.get("ASUKA_ERI_MIXED_PRECISION", "1") != "0"
+    if f32_accum is None:
+        f32_accum = _os.environ.get("ASUKA_ERI_F32_ACCUM", "") == "1"
 
     nao = ctx.nao
     base_threads = int(ctx.threads)
@@ -2762,6 +2952,21 @@ def direct_JK_multi(
                 path = "staged_hot_s1_multi2" if (hot_s1 and hot_s1_contract_enabled) else "staged"
                 prev = str(row.get("path", "") or "")
                 row["path"] = path if (not prev or prev == path) else "mixed"
+                _attach_direct_jk_contract_cost(
+                    row,
+                    cp=cp,
+                    ctx=ctx,
+                    task_spAB=kernel_spAB_full,
+                    task_spCD=kernel_spCD_full,
+                    nA=int(nA),
+                    nB=int(nB),
+                    nC=int(nC),
+                    nD=int(nD),
+                    contract_mode=("warp" if use_warp_contract else "staged"),
+                    want_J=bool(want_J),
+                    want_K=bool(want_K),
+                    n_dm=2,
+                )
 
             for c0 in range(0, class_ntasks, chunk_ntasks):
                 c1 = min(class_ntasks, c0 + chunk_ntasks)
@@ -2788,6 +2993,9 @@ def direct_JK_multi(
                     mode="warp" if use_warp_mode else ("block" if eri_block_pref else "auto"),
                     profile=profile,
                     skip_transpose=True,
+                    tile_dtype=tile_dtype,
+                    mixed_precision=mixed_precision,
+                    f32_accum=f32_accum,
                 )
                 n_kernel_calls += 1
                 if stats is not None:
@@ -2798,9 +3006,11 @@ def direct_JK_multi(
                     _tc1 = cp.cuda.Event()
                     _tc0.record()
 
+                # Warp/multi2 contraction does not support FP32 tiles; fall back to non-warp.
+                _tile_is_f32 = (tiles.dtype == cp.float32)
                 contract_fn = (
                     _ext.contract_jk_tiles_ordered_warp_multi2_inplace_device
-                    if use_warp_contract
+                    if use_warp_contract and not _tile_is_f32
                     else _ext.contract_jk_tiles_ordered_multi2_inplace_device
                 )
 

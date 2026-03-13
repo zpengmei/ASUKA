@@ -1300,4 +1300,84 @@ void cueri_bind_part1(py::module_& m) {
       m, "dddd", 1296, cueri_eri_dddd_launch_stream, cueri_eri_dddd_warp_launch_stream, cueri_eri_dddd_multiblock_launch_stream);
 #endif
 
+  // Mixed-precision ERI bindings for hand-written s/p kernels.
+  bind_mixed_precision_eri(m, "psss", 3,
+      cueri_eri_psss_launch_stream, cueri_eri_psss_f32_launch_stream,
+      cueri_eri_psss_mixed_launch_stream, cueri_eri_psss_mixed_f32_launch_stream,
+      cueri_eri_psss_f32accum_launch_stream, cueri_eri_psss_f32accum_f32_launch_stream);
+  bind_mixed_precision_eri(m, "ppss", 9,
+      cueri_eri_ppss_launch_stream, cueri_eri_ppss_f32_launch_stream,
+      cueri_eri_ppss_mixed_launch_stream, cueri_eri_ppss_mixed_f32_launch_stream,
+      cueri_eri_ppss_f32accum_launch_stream, cueri_eri_ppss_f32accum_f32_launch_stream);
+  bind_mixed_precision_eri(m, "psps", 9,
+      cueri_eri_psps_launch_stream, cueri_eri_psps_f32_launch_stream,
+      cueri_eri_psps_mixed_launch_stream, cueri_eri_psps_mixed_f32_launch_stream,
+      cueri_eri_psps_f32accum_launch_stream, cueri_eri_psps_f32accum_f32_launch_stream);
+  bind_mixed_precision_eri(m, "dsss", 6,
+      cueri_eri_dsss_launch_stream, cueri_eri_dsss_f32_launch_stream,
+      cueri_eri_dsss_mixed_launch_stream, cueri_eri_dsss_mixed_f32_launch_stream,
+      cueri_eri_dsss_f32accum_launch_stream, cueri_eri_dsss_f32accum_f32_launch_stream);
+  bind_mixed_precision_eri(m, "ppps", 27,
+      cueri_eri_ppps_launch_stream, cueri_eri_ppps_f32_launch_stream,
+      cueri_eri_ppps_mixed_launch_stream, cueri_eri_ppps_mixed_f32_launch_stream,
+      cueri_eri_ppps_f32accum_launch_stream, cueri_eri_ppps_f32accum_f32_launch_stream);
+  bind_mixed_precision_eri(m, "pppp", 81,
+      cueri_eri_pppp_launch_stream, cueri_eri_pppp_f32_launch_stream,
+      cueri_eri_pppp_mixed_launch_stream, cueri_eri_pppp_mixed_f32_launch_stream,
+      cueri_eri_pppp_f32accum_launch_stream, cueri_eri_pppp_f32accum_f32_launch_stream);
+
+#ifndef CUERI_FAST_DEV_STEP2_ONLY
+  // Mixed-precision ERI bindings for generated d/f/g-shell kernels.
+#define BIND_MIXED_GEN(NAME, NC) \
+  bind_mixed_precision_eri(m, #NAME, NC, \
+      cueri_eri_##NAME##_launch_stream, cueri_eri_##NAME##_f32_launch_stream, \
+      cueri_eri_##NAME##_mixed_launch_stream, cueri_eri_##NAME##_mixed_f32_launch_stream)
+
+  BIND_MIXED_GEN(ssdp, 18);
+  BIND_MIXED_GEN(psds, 18);
+  BIND_MIXED_GEN(psdp, 54);
+  BIND_MIXED_GEN(psdd, 108);
+  BIND_MIXED_GEN(ppds, 54);
+  BIND_MIXED_GEN(ppdp, 162);
+  BIND_MIXED_GEN(ppdd, 324);
+  BIND_MIXED_GEN(dsds, 36);
+  BIND_MIXED_GEN(dsdp, 108);
+  BIND_MIXED_GEN(dsdd, 216);
+  BIND_MIXED_GEN(dpdp, 324);
+  BIND_MIXED_GEN(dpdd, 648);
+  BIND_MIXED_GEN(dddd, 1296);
+  BIND_MIXED_GEN(ddss, 36);
+  BIND_MIXED_GEN(fpss, 30);
+  BIND_MIXED_GEN(fdss, 60);
+  BIND_MIXED_GEN(ffss, 100);
+  BIND_MIXED_GEN(fpps, 90);
+  BIND_MIXED_GEN(fdps, 180);
+  BIND_MIXED_GEN(ffps, 300);
+  BIND_MIXED_GEN(fpds, 180);
+  BIND_MIXED_GEN(fdds, 360);
+  BIND_MIXED_GEN(ffds, 600);
+  BIND_MIXED_GEN(ssfs, 10);
+  BIND_MIXED_GEN(psfs, 30);
+  BIND_MIXED_GEN(ppfs, 90);
+  BIND_MIXED_GEN(dsfs, 60);
+  BIND_MIXED_GEN(fsfs, 100);
+  BIND_MIXED_GEN(dpfs, 180);
+  BIND_MIXED_GEN(fpfs, 300);
+  BIND_MIXED_GEN(ddfs, 360);
+  BIND_MIXED_GEN(fdfs, 600);
+  BIND_MIXED_GEN(fffs, 1000);
+  BIND_MIXED_GEN(ssgs, 15);
+  BIND_MIXED_GEN(psgs, 45);
+  BIND_MIXED_GEN(ppgs, 135);
+  BIND_MIXED_GEN(dsgs, 90);
+  BIND_MIXED_GEN(fsgs, 150);
+  BIND_MIXED_GEN(dpgs, 270);
+  BIND_MIXED_GEN(fpgs, 450);
+  BIND_MIXED_GEN(ddgs, 540);
+  BIND_MIXED_GEN(fdgs, 900);
+  BIND_MIXED_GEN(ffgs, 1500);
+
+#undef BIND_MIXED_GEN
+#endif
+
 }

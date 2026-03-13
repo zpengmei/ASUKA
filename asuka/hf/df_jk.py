@@ -532,6 +532,7 @@ def df_K_from_BQ_Cocc(
     *,
     q_block: int = 128,
     cublas_math_mode: str | None = None,
+    syrk_precision: str | None = None,
     profile: dict | None = None,
 ):
     """Occupied-driven DF exchange (RI-K) without a dense D.
@@ -643,6 +644,21 @@ def df_K_from_BQ_Cocc(
 
     # CuPy fallback: einsum + GEMM (allocates intermediates).
     K = xp.zeros((nao, nao), dtype=xp.float64)
+    # Auto-read from PrecisionPolicy if not explicitly set.
+    _syrk_prec = syrk_precision
+    if _syrk_prec is None and hasattr(xp, "cuda"):
+        try:
+            from asuka.cuda.mixed_precision_policy import PrecisionPolicy
+            _syrk_prec = PrecisionPolicy.from_env().df_k_syrk
+        except Exception:
+            _syrk_prec = None
+    _use_mixed = (
+        _syrk_prec is not None
+        and _syrk_prec != "fp64"
+        and hasattr(xp, "cuda")
+    )
+    if _use_mixed:
+        from asuka.cuda.mixed_precision import gemm_dispatched as _gemm_disp
     with _cublas_math_mode_ctx(xp, cublas_math_mode):
         for q0 in range(0, int(naux), int(q_block)):
             q1 = min(int(naux), int(q0) + int(q_block))
@@ -655,7 +671,10 @@ def df_K_from_BQ_Cocc(
                 tmp = xp.ascontiguousarray(tmp)
 
             U = tmp.reshape((nao, q * nocc))
-            K += U @ U.T
+            if _use_mixed:
+                K += _gemm_disp(U, U.T, precision=_syrk_prec)
+            else:
+                K += U @ U.T
 
     if profile is not None:
         jk_prof = profile.setdefault("jk", {})

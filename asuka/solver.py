@@ -141,6 +141,18 @@ except Exception:  # pragma: no cover
     _csc_matmul_dense_inplace_cy = None
     _csc_quadratic_form_cy = None
 
+
+def _asnumpy_f64(a: Any) -> np.ndarray:
+    """Convert numpy/cupy arrays to numpy.float64 without implicit device casts."""
+
+    try:
+        import cupy as cp  # type: ignore[import-not-found]
+    except Exception:
+        cp = None  # type: ignore
+    if cp is not None and isinstance(a, cp.ndarray):  # type: ignore[attr-defined]
+        a = cp.asnumpy(a)
+    return np.asarray(a, dtype=np.float64)
+
 @dataclass(frozen=True)
 class H1E2EContractOp:
     """Container for passing (h1e, eri) to `contract_2e` without forming an absorbed 2e tensor.
@@ -3886,7 +3898,7 @@ class GUGAFCISolver(_StreamObject):
             if isinstance(civec, cp.ndarray):
                 x_d = cp.ascontiguousarray(civec.astype(_ws_dtype, copy=False).ravel())
             else:
-                x_d = cp.ascontiguousarray(cp.asarray(np.asarray(civec, dtype=np.float64), dtype=_ws_dtype).ravel())
+                x_d = cp.ascontiguousarray(cp.asarray(_asnumpy_f64(civec), dtype=_ws_dtype).ravel())
             y_d = cuda_ws.hop(x_d, sync=True, check_overflow=True)
             if return_cupy:
                 out_d = y_d.astype(cp.float64, copy=False)
@@ -3910,7 +3922,7 @@ class GUGAFCISolver(_StreamObject):
                 drt,
                 np.asarray(h1e, dtype=np.float64, order="C"),
                 eri,
-                [np.asarray(civec, dtype=np.float64).ravel()],
+                [_asnumpy_f64(civec).ravel()],
                 max_out=int(kwargs.get("max_out", 200_000)),
                 screening=kwargs.get("screening", None),
                 state_cache=get_state_cache(drt),
@@ -3948,7 +3960,7 @@ class GUGAFCISolver(_StreamObject):
                 drt,
                 h1e,
                 eri4,
-                [np.asarray(civec)],
+                [_asnumpy_f64(civec)],
                 precompute_epq=True,
                 nthreads=contract_nthreads,
                 blas_nthreads=contract_blas_nthreads,
@@ -3968,7 +3980,7 @@ class GUGAFCISolver(_StreamObject):
                 drt,
                 h1e,
                 eri,
-                [np.asarray(civec)],
+                [_asnumpy_f64(civec)],
                 precompute_epq=True,
                 nthreads=contract_nthreads,
                 blas_nthreads=contract_blas_nthreads,
@@ -3979,7 +3991,7 @@ class GUGAFCISolver(_StreamObject):
             out = _contract_eri_epq_eqrs_multi(
                 drt,
                 eri,
-                [np.asarray(civec)],
+                [_asnumpy_f64(civec)],
                 precompute_epq=True,
                 nthreads=contract_nthreads,
                 blas_nthreads=contract_blas_nthreads,
@@ -3992,7 +4004,7 @@ class GUGAFCISolver(_StreamObject):
                 drt,
                 h1e,
                 eri,
-                [np.asarray(civec)],
+                [_asnumpy_f64(civec)],
                 precompute_epq=True,
                 nthreads=contract_nthreads,
                 blas_nthreads=contract_blas_nthreads,
@@ -4556,7 +4568,7 @@ class GUGAFCISolver(_StreamObject):
             if rdm_blas_nthreads is None:
                 out = make_rdm12_streaming(
                     drt,
-                    np.asarray(civec, dtype=np.float64),
+                    _asnumpy_f64(civec),
                     max_memory_mb=max_memory,
                     block_nops=rdm_block_nops,
                     tmpdir=None if rdm_tmpdir is None else str(rdm_tmpdir),
@@ -4565,7 +4577,7 @@ class GUGAFCISolver(_StreamObject):
                 with blas_thread_limit(int(rdm_blas_nthreads)):
                     out = make_rdm12_streaming(
                         drt,
-                        np.asarray(civec, dtype=np.float64),
+                        _asnumpy_f64(civec),
                         max_memory_mb=max_memory,
                         block_nops=rdm_block_nops,
                         tmpdir=None if rdm_tmpdir is None else str(rdm_tmpdir),
@@ -4587,7 +4599,7 @@ class GUGAFCISolver(_StreamObject):
             # Legacy (reference) implementation: builds t_pq in RAM and uses a Gram product.
             # This path is kept for small systems / debugging; it still avoids occ_table by
             # using the E_pq cache's step table for the diagonal E_pp contribution.
-            c = np.asarray(civec, dtype=np.float64).ravel()
+            c = _asnumpy_f64(civec).ravel()
             cache_obj = _get_epq_action_cache(drt)
             step_to_occ = np.asarray([0.0, 1.0, 1.0, 2.0], dtype=np.float64)  # E,U,L,D
 
@@ -4725,7 +4737,7 @@ class GUGAFCISolver(_StreamObject):
         if rdm_blas_nthreads is None:
             dm1, dm2, dm3 = _make_rdm123_pyscf(
                 drt,
-                np.asarray(civec, dtype=np.float64),
+                _asnumpy_f64(civec),
                 max_memory_mb=max_memory,
                 reorder=reorder,
             )
@@ -4733,7 +4745,7 @@ class GUGAFCISolver(_StreamObject):
             with blas_thread_limit(int(rdm_blas_nthreads)):
                 dm1, dm2, dm3 = _make_rdm123_pyscf(
                     drt,
-                    np.asarray(civec, dtype=np.float64),
+                    _asnumpy_f64(civec),
                     max_memory_mb=max_memory,
                     reorder=reorder,
                 )
@@ -4800,7 +4812,7 @@ class GUGAFCISolver(_StreamObject):
             raise RuntimeError("strict_gpu=True forbids non-CUDA make_rdm1 backends in CUDA matvec workflows")
 
         cache_obj = _get_epq_action_cache(drt)
-        c = np.asarray(civec, dtype=np.float64).ravel()
+        c = _asnumpy_f64(civec).ravel()
 
         step_to_occ = np.asarray([0.0, 1.0, 1.0, 2.0], dtype=np.float64)  # E,U,L,D
         occ = step_to_occ[cache_obj.steps]
@@ -4877,8 +4889,8 @@ class GUGAFCISolver(_StreamObject):
             ne_constraints=ne_constraints,
         )
         _validate_civec_shape(ci_ket, int(drt.ncsf))
-        cbra = np.asarray(ci_bra, dtype=np.float64).ravel()
-        cket = np.asarray(ci_ket, dtype=np.float64).ravel()
+        cbra = _asnumpy_f64(ci_bra).ravel()
+        cket = _asnumpy_f64(ci_ket).ravel()
 
         # Ensure the state-cache for diagonal E_pp (steps table) exists. This also enables
         # `_csr_for_epq` to build per-(p,q) actions on demand.
@@ -5070,11 +5082,11 @@ class GUGAFCISolver(_StreamObject):
             if _cp_rdm is not None and isinstance(ci_bra, _cp_rdm.ndarray):
                 _bra = ci_bra.astype(_cp_rdm.float64, copy=False)
             else:
-                _bra = np.asarray(ci_bra, dtype=np.float64)
+                _bra = _asnumpy_f64(ci_bra)
             if _cp_rdm is not None and isinstance(ci_ket, _cp_rdm.ndarray):
                 _ket = ci_ket.astype(_cp_rdm.float64, copy=False)
             else:
-                _ket = np.asarray(ci_ket, dtype=np.float64)
+                _ket = _asnumpy_f64(ci_ket)
             return trans_rdm12_cuda(
                 drt,
                 _bra,
@@ -5131,8 +5143,8 @@ class GUGAFCISolver(_StreamObject):
         if rdm_blas_nthreads is None:
             return trans_rdm12_streaming(
                 drt,
-                np.asarray(ci_bra, dtype=np.float64),
-                np.asarray(ci_ket, dtype=np.float64),
+                _asnumpy_f64(ci_bra),
+                _asnumpy_f64(ci_ket),
                 max_memory_mb=max_memory,
                 block_nops=rdm_block_nops,
                 tmpdir=None if rdm_tmpdir is None else str(rdm_tmpdir),
@@ -5141,8 +5153,8 @@ class GUGAFCISolver(_StreamObject):
         with blas_thread_limit(int(rdm_blas_nthreads)):
             return trans_rdm12_streaming(
                 drt,
-                np.asarray(ci_bra, dtype=np.float64),
-                np.asarray(ci_ket, dtype=np.float64),
+                _asnumpy_f64(ci_bra),
+                _asnumpy_f64(ci_ket),
                 max_memory_mb=max_memory,
                 block_nops=rdm_block_nops,
                 tmpdir=None if rdm_tmpdir is None else str(rdm_tmpdir),

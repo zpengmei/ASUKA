@@ -137,6 +137,7 @@ def main(argv: list[str] | None = None) -> None:
     )
     ap.add_argument("--clean", action="store_true", help="Remove the build directory before configuring")
     ap.add_argument("--fast-boys", action="store_true", help="Enable CUERI_FAST_BOYS (faster Boys moments for NROOTS<=3)")
+    ap.add_argument("--boys-lut", action="store_true", help="Enable CUERI_BOYS_LUT (Chebyshev lookup table for Boys function)")
     ap.add_argument(
         "--fast-dev-direct-jk",
         action="store_true",
@@ -227,6 +228,8 @@ def main(argv: list[str] | None = None) -> None:
     ]
     if bool(args.fast_boys):
         cmake_args.append("-DCUERI_FAST_BOYS=ON")
+    if bool(args.boys_lut):
+        cmake_args.append("-DCUERI_BOYS_LUT=ON")
     if build_variant == "fastdev_direct_jk":
         cmake_args.append("-DCUERI_FAST_DEV_DIRECT_JK=ON")
     elif build_variant == "fastdev_step2":

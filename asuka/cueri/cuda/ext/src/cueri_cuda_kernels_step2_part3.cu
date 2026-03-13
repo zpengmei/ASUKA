@@ -5,10 +5,14 @@
 
 #include <cmath>
 #include <cstdint>
+#include <type_traits>
 
 #include "cueri_cuda_kernels_api.h"
 #include "cueri_cuda_contract_fock_warp.cuh"
 #include "cueri_cuda_contract_jk_warp.cuh"
+#ifdef CUERI_BOYS_LUT
+#include "cueri_cuda_rys_device.cuh"
+#endif
 
 namespace {
 
@@ -123,6 +127,12 @@ __device__ __forceinline__ void accumulate_fock_single_value(
 }
 
 __device__ __forceinline__ void boys_f0_f1_f2(double T, double& F0, double& F1, double& F2) {
+#ifdef CUERI_BOYS_LUT
+  double F[3];
+  cueri_rys::boys_fm_lut<2>(T, F);
+  F0 = F[0]; F1 = F[1]; F2 = F[2];
+  return;
+#endif
   // Robust for small T: evaluate F2 by series, then get F1/F0 by downward recursion:
   //   F_{m-1} = (2T*F_m + exp(-T)) / (2m-1)
   if (T < 1.0) {
@@ -150,6 +160,12 @@ __device__ __forceinline__ void boys_f0_f1_f2(double T, double& F0, double& F1, 
 }
 
 __device__ __forceinline__ void boys_f0_f1_f2_f3_f4(double T, double& F0, double& F1, double& F2, double& F3, double& F4) {
+#ifdef CUERI_BOYS_LUT
+  double F[5];
+  cueri_rys::boys_fm_lut<4>(T, F);
+  F0 = F[0]; F1 = F[1]; F2 = F[2]; F3 = F[3]; F4 = F[4];
+  return;
+#endif
   // Robust for small T: evaluate F4 by series, then get F3..F0 by downward recursion:
   //   F_{m-1} = (2T*F_m + exp(-T)) / (2m-1)
   if (T < 1.0) {
@@ -181,6 +197,12 @@ __device__ __forceinline__ void boys_f0_f1_f2_f3_f4(double T, double& F0, double
 }
 
 __device__ __forceinline__ void boys_f0_f1(double T, double& F0, double& F1) {
+#ifdef CUERI_BOYS_LUT
+  double F[2];
+  cueri_rys::boys_fm_lut<1>(T, F);
+  F0 = F[0]; F1 = F[1];
+  return;
+#endif
   if (T < 1.0) {
     double term = 1.0;
     double f1 = 0.0;
@@ -968,8 +990,8 @@ __global__ void KernelFused_psps_subwarp8(
     accumulate_fock_single_value(s21, D_mat, F_mat, a0 + 2, b0, c0 + 1, d0, ab_neq, cd_neq, bk_swap, f_ab, f_cd, N);
     accumulate_fock_single_value(s22, D_mat, F_mat, a0 + 2, b0, c0 + 2, d0, ab_neq, cd_neq, bk_swap, f_ab, f_cd, N);
   } else {
-    double* J_mat = out0_mat + buf_off;
-    double* K_mat = out1_mat + buf_off;
+    double* J_mat = (out0_mat != nullptr) ? out0_mat + buf_off : nullptr;
+    double* K_mat = (out1_mat != nullptr) ? out1_mat + buf_off : nullptr;
     accumulate_jk_single_value(s00, D_mat, J_mat, K_mat, a0 + 0, b0, c0 + 0, d0, ab_neq, cd_neq, bk_swap, f_ab, f_cd, N);
     accumulate_jk_single_value(s01, D_mat, J_mat, K_mat, a0 + 0, b0, c0 + 1, d0, ab_neq, cd_neq, bk_swap, f_ab, f_cd, N);
     accumulate_jk_single_value(s02, D_mat, J_mat, K_mat, a0 + 0, b0, c0 + 2, d0, ab_neq, cd_neq, bk_swap, f_ab, f_cd, N);
@@ -989,6 +1011,7 @@ __global__ void KernelFused_psps_subwarp8(
 // because it avoids wasting 112/128 threads per task.
 // ---------------------------------------------------------------------------
 
+template <bool kTileF32 = false, bool kMixedPrec = false, bool kF32Accum = false>
 __global__ void KernelERI_psss_flat(
     const int32_t* __restrict__ task_spAB,
     const int32_t* __restrict__ task_spCD,
@@ -1004,9 +1027,12 @@ __global__ void KernelERI_psss_flat(
     const double* __restrict__ pair_Py,
     const double* __restrict__ pair_Pz,
     const double* __restrict__ pair_cK,
-    double* __restrict__ eri_out) {
+    double* __restrict__ eri_out_f64,
+    float*  __restrict__ eri_out_f32) {
   const int t = static_cast<int>(blockIdx.x) * static_cast<int>(blockDim.x) + static_cast<int>(threadIdx.x);
   if (t >= ntasks) return;
+  using comp_t = typename std::conditional<kMixedPrec, float, double>::type;
+  using accum_t = typename std::conditional<kF32Accum, float, double>::type;
 
   const int spAB = static_cast<int>(task_spAB[t]);
   const int spCD = static_cast<int>(task_spCD[t]);
@@ -1018,7 +1044,7 @@ __global__ void KernelERI_psss_flat(
   const int nAB = static_cast<int>(sp_npair[spAB]);
   const int nCD = static_cast<int>(sp_npair[spCD]);
 
-  double sx = 0.0, sy = 0.0, sz = 0.0;
+  accum_t sx = 0, sy = 0, sz = 0;
   for (int i = 0; i < nAB; ++i) {
     const int ki = baseAB + i;
     const double p = pair_eta[ki];
@@ -1038,18 +1064,36 @@ __global__ void KernelERI_psss_flat(
       const double base = pref * cKi * pair_cK[kj];
       double F0, F1;
       boys_f0_f1(T, F0, F1);
-      const double q_over = q / denom;
-      sx += base * (-(Ax - Pxi) * F0 - q_over * dx * F1);
-      sy += base * (-(Ay - Pyi) * F0 - q_over * dy * F1);
-      sz += base * (-(Az - Pzi) * F0 - q_over * dz * F1);
+      // Cast to comp_t for component evaluation (FP32 when kMixedPrec)
+      const comp_t base_c = static_cast<comp_t>(base);
+      const comp_t F0_c = static_cast<comp_t>(F0);
+      const comp_t F1_c = static_cast<comp_t>(F1);
+      const comp_t qo_c = static_cast<comp_t>(q / denom);
+      const comp_t dx_c = static_cast<comp_t>(dx);
+      const comp_t dy_c = static_cast<comp_t>(dy);
+      const comp_t dz_c = static_cast<comp_t>(dz);
+      const comp_t PAx_c = static_cast<comp_t>(Ax - Pxi);
+      const comp_t PAy_c = static_cast<comp_t>(Ay - Pyi);
+      const comp_t PAz_c = static_cast<comp_t>(Az - Pzi);
+      sx += static_cast<accum_t>(base_c * (-PAx_c * F0_c - qo_c * dx_c * F1_c));
+      sy += static_cast<accum_t>(base_c * (-PAy_c * F0_c - qo_c * dy_c * F1_c));
+      sz += static_cast<accum_t>(base_c * (-PAz_c * F0_c - qo_c * dz_c * F1_c));
     }
   }
-  const int out = t * 3;
-  eri_out[out + 0] = sx;
-  eri_out[out + 1] = sy;
-  eri_out[out + 2] = sz;
+  if constexpr (kTileF32) {
+    const int out = t * 3;
+    eri_out_f32[out + 0] = static_cast<float>(sx);
+    eri_out_f32[out + 1] = static_cast<float>(sy);
+    eri_out_f32[out + 2] = static_cast<float>(sz);
+  } else {
+    const int out = t * 3;
+    eri_out_f64[out + 0] = static_cast<double>(sx);
+    eri_out_f64[out + 1] = static_cast<double>(sy);
+    eri_out_f64[out + 2] = static_cast<double>(sz);
+  }
 }
 
+template <bool kTileF32 = false, bool kMixedPrec = false, bool kF32Accum = false>
 __global__ void KernelERI_ppss_flat(
     const int32_t* __restrict__ task_spAB,
     const int32_t* __restrict__ task_spCD,
@@ -1066,9 +1110,12 @@ __global__ void KernelERI_ppss_flat(
     const double* __restrict__ pair_Py,
     const double* __restrict__ pair_Pz,
     const double* __restrict__ pair_cK,
-    double* __restrict__ eri_out) {
+    double* __restrict__ eri_out_f64,
+    float*  __restrict__ eri_out_f32) {
   const int t = static_cast<int>(blockIdx.x) * static_cast<int>(blockDim.x) + static_cast<int>(threadIdx.x);
   if (t >= ntasks) return;
+  using comp_t = typename std::conditional<kMixedPrec, float, double>::type;
+  using accum_t = typename std::conditional<kF32Accum, float, double>::type;
 
   const int spAB = static_cast<int>(task_spAB[t]);
   const int spCD = static_cast<int>(task_spCD[t]);
@@ -1082,7 +1129,7 @@ __global__ void KernelERI_ppss_flat(
   const int nAB = static_cast<int>(sp_npair[spAB]);
   const int nCD = static_cast<int>(sp_npair[spCD]);
 
-  double s00=0, s01=0, s02=0, s10=0, s11=0, s12=0, s20=0, s21=0, s22=0;
+  accum_t s00=0, s01=0, s02=0, s10=0, s11=0, s12=0, s20=0, s21=0, s22=0;
   for (int i = 0; i < nAB; ++i) {
     const int ki = baseAB + i;
     const double p = pair_eta[ki];
@@ -1104,38 +1151,62 @@ __global__ void KernelERI_ppss_flat(
       const double base = pref * cKi * pair_cK[kj];
       double F0, F1, F2;
       boys_f0_f1_f2(T, F0, F1, F2);
-      const double I = base * F0;
-      const double omega_over_p = omega / p;
-      const double Jx = -omega_over_p * base * F1 * dx;
-      const double Jy = -omega_over_p * base * F1 * dy;
-      const double Jz = -omega_over_p * base * F1 * dz;
-      const double inv4p2 = 1.0 / (4.0 * p * p);
-      const double w2 = omega * omega;
-      const double t4 = 4.0 * w2 * F2;
-      const double t2 = 2.0 * omega * F1;
-      const double Kxx = (base * (t4*dx*dx - t2) + 2.0*p*I) * inv4p2;
-      const double Kyy = (base * (t4*dy*dy - t2) + 2.0*p*I) * inv4p2;
-      const double Kzz = (base * (t4*dz*dz - t2) + 2.0*p*I) * inv4p2;
-      const double Kxy = (base * (t4*dx*dy)) * inv4p2;
-      const double Kxz = (base * (t4*dx*dz)) * inv4p2;
-      const double Kyz = (base * (t4*dy*dz)) * inv4p2;
-      s00 += Kxx + PAx*Jx + PBx*Jx + PAx*PBx*I;
-      s01 += Kxy + PAx*Jy + PBy*Jx + PAx*PBy*I;
-      s02 += Kxz + PAx*Jz + PBz*Jx + PAx*PBz*I;
-      s10 += Kxy + PAy*Jx + PBx*Jy + PAy*PBx*I;
-      s11 += Kyy + PAy*Jy + PBy*Jy + PAy*PBy*I;
-      s12 += Kyz + PAy*Jz + PBz*Jy + PAy*PBz*I;
-      s20 += Kxz + PAz*Jx + PBx*Jz + PAz*PBx*I;
-      s21 += Kyz + PAz*Jy + PBy*Jz + PAz*PBy*I;
-      s22 += Kzz + PAz*Jz + PBz*Jz + PAz*PBz*I;
+      // Cast to comp_t for component evaluation (FP32 when kMixedPrec)
+      const comp_t base_c = static_cast<comp_t>(base);
+      const comp_t F0_c = static_cast<comp_t>(F0);
+      const comp_t F1_c = static_cast<comp_t>(F1);
+      const comp_t F2_c = static_cast<comp_t>(F2);
+      const comp_t p_c = static_cast<comp_t>(p);
+      const comp_t omega_c = static_cast<comp_t>(omega);
+      const comp_t oop_c = static_cast<comp_t>(omega / p);
+      const comp_t dx_c = static_cast<comp_t>(dx);
+      const comp_t dy_c = static_cast<comp_t>(dy);
+      const comp_t dz_c = static_cast<comp_t>(dz);
+      const comp_t PAx_c = static_cast<comp_t>(PAx);
+      const comp_t PAy_c = static_cast<comp_t>(PAy);
+      const comp_t PAz_c = static_cast<comp_t>(PAz);
+      const comp_t PBx_c = static_cast<comp_t>(PBx);
+      const comp_t PBy_c = static_cast<comp_t>(PBy);
+      const comp_t PBz_c = static_cast<comp_t>(PBz);
+      const comp_t I_c = base_c * F0_c;
+      const comp_t Jx_c = -oop_c * base_c * F1_c * dx_c;
+      const comp_t Jy_c = -oop_c * base_c * F1_c * dy_c;
+      const comp_t Jz_c = -oop_c * base_c * F1_c * dz_c;
+      const comp_t inv4p2_c = static_cast<comp_t>(1.0) / (static_cast<comp_t>(4.0) * p_c * p_c);
+      const comp_t w2_c = omega_c * omega_c;
+      const comp_t t4_c = static_cast<comp_t>(4.0) * w2_c * F2_c;
+      const comp_t t2_c = static_cast<comp_t>(2.0) * omega_c * F1_c;
+      const comp_t Kxx_c = (base_c * (t4_c*dx_c*dx_c - t2_c) + static_cast<comp_t>(2.0)*p_c*I_c) * inv4p2_c;
+      const comp_t Kyy_c = (base_c * (t4_c*dy_c*dy_c - t2_c) + static_cast<comp_t>(2.0)*p_c*I_c) * inv4p2_c;
+      const comp_t Kzz_c = (base_c * (t4_c*dz_c*dz_c - t2_c) + static_cast<comp_t>(2.0)*p_c*I_c) * inv4p2_c;
+      const comp_t Kxy_c = (base_c * (t4_c*dx_c*dy_c)) * inv4p2_c;
+      const comp_t Kxz_c = (base_c * (t4_c*dx_c*dz_c)) * inv4p2_c;
+      const comp_t Kyz_c = (base_c * (t4_c*dy_c*dz_c)) * inv4p2_c;
+      s00 += static_cast<accum_t>(Kxx_c + PAx_c*Jx_c + PBx_c*Jx_c + PAx_c*PBx_c*I_c);
+      s01 += static_cast<accum_t>(Kxy_c + PAx_c*Jy_c + PBy_c*Jx_c + PAx_c*PBy_c*I_c);
+      s02 += static_cast<accum_t>(Kxz_c + PAx_c*Jz_c + PBz_c*Jx_c + PAx_c*PBz_c*I_c);
+      s10 += static_cast<accum_t>(Kxy_c + PAy_c*Jx_c + PBx_c*Jy_c + PAy_c*PBx_c*I_c);
+      s11 += static_cast<accum_t>(Kyy_c + PAy_c*Jy_c + PBy_c*Jy_c + PAy_c*PBy_c*I_c);
+      s12 += static_cast<accum_t>(Kyz_c + PAy_c*Jz_c + PBz_c*Jy_c + PAy_c*PBz_c*I_c);
+      s20 += static_cast<accum_t>(Kxz_c + PAz_c*Jx_c + PBx_c*Jz_c + PAz_c*PBx_c*I_c);
+      s21 += static_cast<accum_t>(Kyz_c + PAz_c*Jy_c + PBy_c*Jz_c + PAz_c*PBy_c*I_c);
+      s22 += static_cast<accum_t>(Kzz_c + PAz_c*Jz_c + PBz_c*Jz_c + PAz_c*PBz_c*I_c);
     }
   }
-  const int out = t * 9;
-  eri_out[out+0]=s00; eri_out[out+1]=s01; eri_out[out+2]=s02;
-  eri_out[out+3]=s10; eri_out[out+4]=s11; eri_out[out+5]=s12;
-  eri_out[out+6]=s20; eri_out[out+7]=s21; eri_out[out+8]=s22;
+  if constexpr (kTileF32) {
+    const int out = t * 9;
+    eri_out_f32[out+0]=static_cast<float>(s00); eri_out_f32[out+1]=static_cast<float>(s01); eri_out_f32[out+2]=static_cast<float>(s02);
+    eri_out_f32[out+3]=static_cast<float>(s10); eri_out_f32[out+4]=static_cast<float>(s11); eri_out_f32[out+5]=static_cast<float>(s12);
+    eri_out_f32[out+6]=static_cast<float>(s20); eri_out_f32[out+7]=static_cast<float>(s21); eri_out_f32[out+8]=static_cast<float>(s22);
+  } else {
+    const int out = t * 9;
+    eri_out_f64[out+0]=static_cast<double>(s00); eri_out_f64[out+1]=static_cast<double>(s01); eri_out_f64[out+2]=static_cast<double>(s02);
+    eri_out_f64[out+3]=static_cast<double>(s10); eri_out_f64[out+4]=static_cast<double>(s11); eri_out_f64[out+5]=static_cast<double>(s12);
+    eri_out_f64[out+6]=static_cast<double>(s20); eri_out_f64[out+7]=static_cast<double>(s21); eri_out_f64[out+8]=static_cast<double>(s22);
+  }
 }
 
+template <bool kTileF32 = false, bool kMixedPrec = false, bool kF32Accum = false>
 __global__ void KernelERI_psps_flat(
     const int32_t* __restrict__ task_spAB,
     const int32_t* __restrict__ task_spCD,
@@ -1152,9 +1223,12 @@ __global__ void KernelERI_psps_flat(
     const double* __restrict__ pair_Py,
     const double* __restrict__ pair_Pz,
     const double* __restrict__ pair_cK,
-    double* __restrict__ eri_out) {
+    double* __restrict__ eri_out_f64,
+    float*  __restrict__ eri_out_f32) {
   const int t = static_cast<int>(blockIdx.x) * static_cast<int>(blockDim.x) + static_cast<int>(threadIdx.x);
   if (t >= ntasks) return;
+  using comp_t = typename std::conditional<kMixedPrec, float, double>::type;
+  using accum_t = typename std::conditional<kF32Accum, float, double>::type;
 
   const int spAB = static_cast<int>(task_spAB[t]);
   const int spCD = static_cast<int>(task_spCD[t]);
@@ -1168,7 +1242,7 @@ __global__ void KernelERI_psps_flat(
   const int nAB = static_cast<int>(sp_npair[spAB]);
   const int nCD = static_cast<int>(sp_npair[spCD]);
 
-  double s00=0, s01=0, s02=0, s10=0, s11=0, s12=0, s20=0, s21=0, s22=0;
+  accum_t s00=0, s01=0, s02=0, s10=0, s11=0, s12=0, s20=0, s21=0, s22=0;
   for (int i = 0; i < nAB; ++i) {
     const int ki = baseAB + i;
     const double p = pair_eta[ki];
@@ -1188,43 +1262,67 @@ __global__ void KernelERI_psps_flat(
       const double base = pref * cKi * pair_cK[kj];
       double F0, F1, F2;
       boys_f0_f1_f2(T, F0, F1, F2);
-      const double I = base * F0;
-      const double omega_over_p = omega / p;
-      const double omega_over_q = omega / q;
-      const double Jpx = -omega_over_p * base * F1 * dx;
-      const double Jpy = -omega_over_p * base * F1 * dy;
-      const double Jpz = -omega_over_p * base * F1 * dz;
-      const double Jqx = omega_over_q * base * F1 * dx;
-      const double Jqy = omega_over_q * base * F1 * dy;
-      const double Jqz = omega_over_q * base * F1 * dz;
-      const double w2 = omega * omega;
-      const double t4 = 4.0 * w2 * F2;
-      const double t2 = 2.0 * omega * F1;
-      const double inv4pq = 1.0 / (4.0 * p * q);
-      const double Lxx = -(base * (t4*dx*dx - t2)) * inv4pq;
-      const double Lyy = -(base * (t4*dy*dy - t2)) * inv4pq;
-      const double Lzz = -(base * (t4*dz*dz - t2)) * inv4pq;
-      const double Lxy = -(base * (t4*dx*dy)) * inv4pq;
-      const double Lxz = -(base * (t4*dx*dz)) * inv4pq;
-      const double Lyz = -(base * (t4*dy*dz)) * inv4pq;
-      const double QCx = Qx - Cx, QCy = Qy - Cy, QCz = Qz - Cz;
-      s00 += Lxx + QCx*Jpx + PAx*Jqx + PAx*QCx*I;
-      s01 += Lxy + QCy*Jpx + PAx*Jqy + PAx*QCy*I;
-      s02 += Lxz + QCz*Jpx + PAx*Jqz + PAx*QCz*I;
-      s10 += Lxy + QCx*Jpy + PAy*Jqx + PAy*QCx*I;
-      s11 += Lyy + QCy*Jpy + PAy*Jqy + PAy*QCy*I;
-      s12 += Lyz + QCz*Jpy + PAy*Jqz + PAy*QCz*I;
-      s20 += Lxz + QCx*Jpz + PAz*Jqx + PAz*QCx*I;
-      s21 += Lyz + QCy*Jpz + PAz*Jqy + PAz*QCy*I;
-      s22 += Lzz + QCz*Jpz + PAz*Jqz + PAz*QCz*I;
+      // Cast to comp_t for component evaluation (FP32 when kMixedPrec)
+      const comp_t base_c = static_cast<comp_t>(base);
+      const comp_t F0_c = static_cast<comp_t>(F0);
+      const comp_t F1_c = static_cast<comp_t>(F1);
+      const comp_t F2_c = static_cast<comp_t>(F2);
+      const comp_t p_c = static_cast<comp_t>(p);
+      const comp_t q_c = static_cast<comp_t>(q);
+      const comp_t omega_c = static_cast<comp_t>(omega);
+      const comp_t oop_c = static_cast<comp_t>(omega / p);
+      const comp_t ooq_c = static_cast<comp_t>(omega / q);
+      const comp_t dx_c = static_cast<comp_t>(dx);
+      const comp_t dy_c = static_cast<comp_t>(dy);
+      const comp_t dz_c = static_cast<comp_t>(dz);
+      const comp_t PAx_c = static_cast<comp_t>(PAx);
+      const comp_t PAy_c = static_cast<comp_t>(PAy);
+      const comp_t PAz_c = static_cast<comp_t>(PAz);
+      const comp_t I_c = base_c * F0_c;
+      const comp_t Jpx_c = -oop_c * base_c * F1_c * dx_c;
+      const comp_t Jpy_c = -oop_c * base_c * F1_c * dy_c;
+      const comp_t Jpz_c = -oop_c * base_c * F1_c * dz_c;
+      const comp_t Jqx_c = ooq_c * base_c * F1_c * dx_c;
+      const comp_t Jqy_c = ooq_c * base_c * F1_c * dy_c;
+      const comp_t Jqz_c = ooq_c * base_c * F1_c * dz_c;
+      const comp_t w2_c = omega_c * omega_c;
+      const comp_t t4_c = static_cast<comp_t>(4.0) * w2_c * F2_c;
+      const comp_t t2_c = static_cast<comp_t>(2.0) * omega_c * F1_c;
+      const comp_t inv4pq_c = static_cast<comp_t>(1.0) / (static_cast<comp_t>(4.0) * p_c * q_c);
+      const comp_t Lxx_c = -(base_c * (t4_c*dx_c*dx_c - t2_c)) * inv4pq_c;
+      const comp_t Lyy_c = -(base_c * (t4_c*dy_c*dy_c - t2_c)) * inv4pq_c;
+      const comp_t Lzz_c = -(base_c * (t4_c*dz_c*dz_c - t2_c)) * inv4pq_c;
+      const comp_t Lxy_c = -(base_c * (t4_c*dx_c*dy_c)) * inv4pq_c;
+      const comp_t Lxz_c = -(base_c * (t4_c*dx_c*dz_c)) * inv4pq_c;
+      const comp_t Lyz_c = -(base_c * (t4_c*dy_c*dz_c)) * inv4pq_c;
+      const comp_t QCx_c = static_cast<comp_t>(Qx - Cx);
+      const comp_t QCy_c = static_cast<comp_t>(Qy - Cy);
+      const comp_t QCz_c = static_cast<comp_t>(Qz - Cz);
+      s00 += static_cast<accum_t>(Lxx_c + QCx_c*Jpx_c + PAx_c*Jqx_c + PAx_c*QCx_c*I_c);
+      s01 += static_cast<accum_t>(Lxy_c + QCy_c*Jpx_c + PAx_c*Jqy_c + PAx_c*QCy_c*I_c);
+      s02 += static_cast<accum_t>(Lxz_c + QCz_c*Jpx_c + PAx_c*Jqz_c + PAx_c*QCz_c*I_c);
+      s10 += static_cast<accum_t>(Lxy_c + QCx_c*Jpy_c + PAy_c*Jqx_c + PAy_c*QCx_c*I_c);
+      s11 += static_cast<accum_t>(Lyy_c + QCy_c*Jpy_c + PAy_c*Jqy_c + PAy_c*QCy_c*I_c);
+      s12 += static_cast<accum_t>(Lyz_c + QCz_c*Jpy_c + PAy_c*Jqz_c + PAy_c*QCz_c*I_c);
+      s20 += static_cast<accum_t>(Lxz_c + QCx_c*Jpz_c + PAz_c*Jqx_c + PAz_c*QCx_c*I_c);
+      s21 += static_cast<accum_t>(Lyz_c + QCy_c*Jpz_c + PAz_c*Jqy_c + PAz_c*QCy_c*I_c);
+      s22 += static_cast<accum_t>(Lzz_c + QCz_c*Jpz_c + PAz_c*Jqz_c + PAz_c*QCz_c*I_c);
     }
   }
-  const int out = t * 9;
-  eri_out[out+0]=s00; eri_out[out+1]=s01; eri_out[out+2]=s02;
-  eri_out[out+3]=s10; eri_out[out+4]=s11; eri_out[out+5]=s12;
-  eri_out[out+6]=s20; eri_out[out+7]=s21; eri_out[out+8]=s22;
+  if constexpr (kTileF32) {
+    const int out = t * 9;
+    eri_out_f32[out+0]=static_cast<float>(s00); eri_out_f32[out+1]=static_cast<float>(s01); eri_out_f32[out+2]=static_cast<float>(s02);
+    eri_out_f32[out+3]=static_cast<float>(s10); eri_out_f32[out+4]=static_cast<float>(s11); eri_out_f32[out+5]=static_cast<float>(s12);
+    eri_out_f32[out+6]=static_cast<float>(s20); eri_out_f32[out+7]=static_cast<float>(s21); eri_out_f32[out+8]=static_cast<float>(s22);
+  } else {
+    const int out = t * 9;
+    eri_out_f64[out+0]=static_cast<double>(s00); eri_out_f64[out+1]=static_cast<double>(s01); eri_out_f64[out+2]=static_cast<double>(s02);
+    eri_out_f64[out+3]=static_cast<double>(s10); eri_out_f64[out+4]=static_cast<double>(s11); eri_out_f64[out+5]=static_cast<double>(s12);
+    eri_out_f64[out+6]=static_cast<double>(s20); eri_out_f64[out+7]=static_cast<double>(s21); eri_out_f64[out+8]=static_cast<double>(s22);
+  }
 }
 
+template <bool kTileF32 = false, bool kMixedPrec = false, bool kF32Accum = false>
 __global__ void KernelERI_dsss_flat(
     const int32_t* __restrict__ task_spAB,
     const int32_t* __restrict__ task_spCD,
@@ -1240,9 +1338,12 @@ __global__ void KernelERI_dsss_flat(
     const double* __restrict__ pair_Py,
     const double* __restrict__ pair_Pz,
     const double* __restrict__ pair_cK,
-    double* __restrict__ eri_out) {
+    double* __restrict__ eri_out_f64,
+    float*  __restrict__ eri_out_f32) {
   const int t = static_cast<int>(blockIdx.x) * static_cast<int>(blockDim.x) + static_cast<int>(threadIdx.x);
   if (t >= ntasks) return;
+  using comp_t = typename std::conditional<kMixedPrec, float, double>::type;
+  using accum_t = typename std::conditional<kF32Accum, float, double>::type;
 
   const int spAB = static_cast<int>(task_spAB[t]);
   const int spCD = static_cast<int>(task_spCD[t]);
@@ -1254,7 +1355,7 @@ __global__ void KernelERI_dsss_flat(
   const int nAB = static_cast<int>(sp_npair[spAB]);
   const int nCD = static_cast<int>(sp_npair[spCD]);
 
-  double s_xx=0, s_xy=0, s_xz=0, s_yy=0, s_yz=0, s_zz=0;
+  accum_t s_xx=0, s_xy=0, s_xz=0, s_yy=0, s_yz=0, s_zz=0;
   for (int i = 0; i < nAB; ++i) {
     const int ki = baseAB + i;
     const double p = pair_eta[ki];
@@ -1275,34 +1376,54 @@ __global__ void KernelERI_dsss_flat(
       const double base = pref * cKi * pair_cK[kj];
       double F0, F1, F2;
       boys_f0_f1_f2(T, F0, F1, F2);
-      const double I = base * F0;
-      const double omega_over_p = omega / p;
-      const double Jx = -omega_over_p * base * F1 * dx;
-      const double Jy = -omega_over_p * base * F1 * dy;
-      const double Jz = -omega_over_p * base * F1 * dz;
-      const double inv4p2 = 1.0 / (4.0 * p * p);
-      const double w2 = omega * omega;
-      const double t4 = 4.0 * w2 * F2;
-      const double t2 = 2.0 * omega * F1;
-      const double Kxx = (base * (t4*dx*dx - t2) + 2.0*p*I) * inv4p2;
-      const double Kyy = (base * (t4*dy*dy - t2) + 2.0*p*I) * inv4p2;
-      const double Kzz = (base * (t4*dz*dz - t2) + 2.0*p*I) * inv4p2;
-      const double Kxy = (base * (t4*dx*dy)) * inv4p2;
-      const double Kxz = (base * (t4*dx*dz)) * inv4p2;
-      const double Kyz = (base * (t4*dy*dz)) * inv4p2;
-      s_xx += Kxx + 2.0*PAx*Jx + PAx*PAx*I;
-      s_xy += Kxy + PAx*Jy + PAy*Jx + PAx*PAy*I;
-      s_xz += Kxz + PAx*Jz + PAz*Jx + PAx*PAz*I;
-      s_yy += Kyy + 2.0*PAy*Jy + PAy*PAy*I;
-      s_yz += Kyz + PAy*Jz + PAz*Jy + PAy*PAz*I;
-      s_zz += Kzz + 2.0*PAz*Jz + PAz*PAz*I;
+      // Cast to comp_t for component evaluation (FP32 when kMixedPrec)
+      const comp_t base_c = static_cast<comp_t>(base);
+      const comp_t F0_c = static_cast<comp_t>(F0);
+      const comp_t F1_c = static_cast<comp_t>(F1);
+      const comp_t F2_c = static_cast<comp_t>(F2);
+      const comp_t p_c = static_cast<comp_t>(p);
+      const comp_t omega_c = static_cast<comp_t>(omega);
+      const comp_t oop_c = static_cast<comp_t>(omega / p);
+      const comp_t dx_c = static_cast<comp_t>(dx);
+      const comp_t dy_c = static_cast<comp_t>(dy);
+      const comp_t dz_c = static_cast<comp_t>(dz);
+      const comp_t PAx_c = static_cast<comp_t>(PAx);
+      const comp_t PAy_c = static_cast<comp_t>(PAy);
+      const comp_t PAz_c = static_cast<comp_t>(PAz);
+      const comp_t I_c = base_c * F0_c;
+      const comp_t Jx_c = -oop_c * base_c * F1_c * dx_c;
+      const comp_t Jy_c = -oop_c * base_c * F1_c * dy_c;
+      const comp_t Jz_c = -oop_c * base_c * F1_c * dz_c;
+      const comp_t inv4p2_c = static_cast<comp_t>(1.0) / (static_cast<comp_t>(4.0) * p_c * p_c);
+      const comp_t w2_c = omega_c * omega_c;
+      const comp_t t4_c = static_cast<comp_t>(4.0) * w2_c * F2_c;
+      const comp_t t2_c = static_cast<comp_t>(2.0) * omega_c * F1_c;
+      const comp_t Kxx_c = (base_c * (t4_c*dx_c*dx_c - t2_c) + static_cast<comp_t>(2.0)*p_c*I_c) * inv4p2_c;
+      const comp_t Kyy_c = (base_c * (t4_c*dy_c*dy_c - t2_c) + static_cast<comp_t>(2.0)*p_c*I_c) * inv4p2_c;
+      const comp_t Kzz_c = (base_c * (t4_c*dz_c*dz_c - t2_c) + static_cast<comp_t>(2.0)*p_c*I_c) * inv4p2_c;
+      const comp_t Kxy_c = (base_c * (t4_c*dx_c*dy_c)) * inv4p2_c;
+      const comp_t Kxz_c = (base_c * (t4_c*dx_c*dz_c)) * inv4p2_c;
+      const comp_t Kyz_c = (base_c * (t4_c*dy_c*dz_c)) * inv4p2_c;
+      s_xx += static_cast<accum_t>(Kxx_c + static_cast<comp_t>(2.0)*PAx_c*Jx_c + PAx_c*PAx_c*I_c);
+      s_xy += static_cast<accum_t>(Kxy_c + PAx_c*Jy_c + PAy_c*Jx_c + PAx_c*PAy_c*I_c);
+      s_xz += static_cast<accum_t>(Kxz_c + PAx_c*Jz_c + PAz_c*Jx_c + PAx_c*PAz_c*I_c);
+      s_yy += static_cast<accum_t>(Kyy_c + static_cast<comp_t>(2.0)*PAy_c*Jy_c + PAy_c*PAy_c*I_c);
+      s_yz += static_cast<accum_t>(Kyz_c + PAy_c*Jz_c + PAz_c*Jy_c + PAy_c*PAz_c*I_c);
+      s_zz += static_cast<accum_t>(Kzz_c + static_cast<comp_t>(2.0)*PAz_c*Jz_c + PAz_c*PAz_c*I_c);
     }
   }
-  const int out = t * 6;
-  eri_out[out+0]=s_xx; eri_out[out+1]=s_xy; eri_out[out+2]=s_xz;
-  eri_out[out+3]=s_yy; eri_out[out+4]=s_yz; eri_out[out+5]=s_zz;
+  if constexpr (kTileF32) {
+    const int out = t * 6;
+    eri_out_f32[out+0]=static_cast<float>(s_xx); eri_out_f32[out+1]=static_cast<float>(s_xy); eri_out_f32[out+2]=static_cast<float>(s_xz);
+    eri_out_f32[out+3]=static_cast<float>(s_yy); eri_out_f32[out+4]=static_cast<float>(s_yz); eri_out_f32[out+5]=static_cast<float>(s_zz);
+  } else {
+    const int out = t * 6;
+    eri_out_f64[out+0]=static_cast<double>(s_xx); eri_out_f64[out+1]=static_cast<double>(s_xy); eri_out_f64[out+2]=static_cast<double>(s_xz);
+    eri_out_f64[out+3]=static_cast<double>(s_yy); eri_out_f64[out+4]=static_cast<double>(s_yz); eri_out_f64[out+5]=static_cast<double>(s_zz);
+  }
 }
 
+template <bool kTileF32 = false, bool kMixedPrec = false, bool kF32Accum = false>
 __global__ void KernelERI_ppps_flat(
     const int32_t* __restrict__ task_spAB,
     const int32_t* __restrict__ task_spCD,
@@ -1319,9 +1440,12 @@ __global__ void KernelERI_ppps_flat(
     const double* __restrict__ pair_Py,
     const double* __restrict__ pair_Pz,
     const double* __restrict__ pair_cK,
-    double* __restrict__ eri_out) {
+    double* __restrict__ eri_out_f64,
+    float*  __restrict__ eri_out_f32) {
   const int t = static_cast<int>(blockIdx.x) * static_cast<int>(blockDim.x) + static_cast<int>(threadIdx.x);
   if (t >= ntasks) return;
+  using comp_t = typename std::conditional<kMixedPrec, float, double>::type;
+  using accum_t = typename std::conditional<kF32Accum, float, double>::type;
 
   const int spAB = static_cast<int>(task_spAB[t]);
   const int spCD = static_cast<int>(task_spCD[t]);
@@ -1337,7 +1461,7 @@ __global__ void KernelERI_ppps_flat(
   const int nAB = static_cast<int>(sp_npair[spAB]);
   const int nCD = static_cast<int>(sp_npair[spCD]);
 
-  double s[27];
+  accum_t s[27];
 #pragma unroll
   for (int i = 0; i < 27; ++i) s[i] = 0.0;
 
@@ -1363,55 +1487,73 @@ __global__ void KernelERI_ppps_flat(
       double F0, F1, F2, F3, F4;
       boys_f0_f1_f2_f3_f4(T, F0, F1, F2, F3, F4);
       (void)F4;
-      const double I = base * F0;
-      const double omega_over_p = omega / p;
-      const double omega_over_q = omega / q;
-      const double Jp[3] = {-omega_over_p*base*F1*dx, -omega_over_p*base*F1*dy, -omega_over_p*base*F1*dz};
-      const double Jq[3] = {omega_over_q*base*F1*dx, omega_over_q*base*F1*dy, omega_over_q*base*F1*dz};
-      const double w2 = omega * omega;
-      const double w3 = w2 * omega;
-      const double inv4p2 = 1.0 / (4.0 * p * p);
-      const double inv4pq = 1.0 / (4.0 * p * q);
-      const double t4 = 4.0 * w2 * F2;
-      const double t2 = 2.0 * omega * F1;
-      double H[3][3], Kp[3][3], L[3][3];
+      // Cast to comp_t for component evaluation (FP32 when kMixedPrec)
+      const comp_t base_c = static_cast<comp_t>(base);
+      const comp_t F0_c = static_cast<comp_t>(F0);
+      const comp_t F1_c = static_cast<comp_t>(F1);
+      const comp_t F2_c = static_cast<comp_t>(F2);
+      const comp_t p_c = static_cast<comp_t>(p);
+      const comp_t q_c = static_cast<comp_t>(q);
+      const comp_t omega_c = static_cast<comp_t>(omega);
+      const comp_t oop_c = static_cast<comp_t>(omega / p);
+      const comp_t ooq_c = static_cast<comp_t>(omega / q);
+      const comp_t d_c[3] = {static_cast<comp_t>(dx), static_cast<comp_t>(dy), static_cast<comp_t>(dz)};
+      const comp_t I_c = base_c * F0_c;
+      const comp_t Jp_c[3] = {-oop_c*base_c*F1_c*d_c[0], -oop_c*base_c*F1_c*d_c[1], -oop_c*base_c*F1_c*d_c[2]};
+      const comp_t Jq_c[3] = {ooq_c*base_c*F1_c*d_c[0], ooq_c*base_c*F1_c*d_c[1], ooq_c*base_c*F1_c*d_c[2]};
+      const comp_t w2_c = omega_c * omega_c;
+      const comp_t inv4p2_c = static_cast<comp_t>(1.0) / (static_cast<comp_t>(4.0) * p_c * p_c);
+      const comp_t inv4pq_c = static_cast<comp_t>(1.0) / (static_cast<comp_t>(4.0) * p_c * q_c);
+      const comp_t t4_c = static_cast<comp_t>(4.0) * w2_c * F2_c;
+      const comp_t t2_c = static_cast<comp_t>(2.0) * omega_c * F1_c;
+      comp_t Kp_c[3][3], L_c[3][3];
 #pragma unroll
       for (int a = 0; a < 3; ++a) {
 #pragma unroll
         for (int b = 0; b < 3; ++b) {
-          const double dij = (a == b) ? 1.0 : 0.0;
-          H[a][b] = base * (t4 * dvec[a] * dvec[b] - (a == b ? t2 : 0.0));
-          Kp[a][b] = (H[a][b] + 2.0 * p * I * dij) * inv4p2;
-          L[a][b] = -(H[a][b]) * inv4pq;
+          const comp_t dij_c = (a == b) ? static_cast<comp_t>(1.0) : static_cast<comp_t>(0.0);
+          const comp_t H_c = base_c * (t4_c * d_c[a] * d_c[b] - (a == b ? t2_c : static_cast<comp_t>(0.0)));
+          Kp_c[a][b] = (H_c + static_cast<comp_t>(2.0) * p_c * I_c * dij_c) * inv4p2_c;
+          L_c[a][b] = -H_c * inv4pq_c;
         }
       }
-      const double QC[3] = {Qx - Cx, Qy - Cy, Qz - Cz};
-      const double term_t3_f2 = 4.0 * w2 * base * F2;
-      const double term_t3_f3 = -8.0 * w3 * base * F3;
+      const comp_t PA_c[3] = {static_cast<comp_t>(PA[0]), static_cast<comp_t>(PA[1]), static_cast<comp_t>(PA[2])};
+      const comp_t PB_c[3] = {static_cast<comp_t>(PB[0]), static_cast<comp_t>(PB[1]), static_cast<comp_t>(PB[2])};
+      const comp_t QC_c[3] = {static_cast<comp_t>(Qx - Cx), static_cast<comp_t>(Qy - Cy), static_cast<comp_t>(Qz - Cz)};
+      // Keep FP64 args for t3_component call, cast result to comp_t
+      const double term_t3_f2 = 4.0 * omega * omega * base * F2;
+      const double term_t3_f3 = -8.0 * omega * omega * omega * base * F3;
 #pragma unroll
       for (int ia = 0; ia < 3; ++ia) {
 #pragma unroll
         for (int ib = 0; ib < 3; ++ib) {
-          const double a_ = PA[ia], b_ = PB[ib];
-          const double dij = (ia == ib) ? 1.0 : 0.0;
-          const double Kp_ij = Kp[ia][ib];
+          const comp_t a_c = PA_c[ia], b_c = PB_c[ib];
+          const comp_t dij_c = (ia == ib) ? static_cast<comp_t>(1.0) : static_cast<comp_t>(0.0);
+          const comp_t Kp_ij_c = Kp_c[ia][ib];
 #pragma unroll
           for (int ic = 0; ic < 3; ++ic) {
-            const double c_ = QC[ic];
-            const double T3_ijk = t3_component(ia, ib, ic, dvec, term_t3_f2, term_t3_f3);
-            const double M_ijk = (-T3_ijk + 4.0*p*q*dij*Jq[ic]) / (8.0*p*p*q);
-            s[ia*9 + ib*3 + ic] += M_ijk + c_*Kp_ij + b_*L[ia][ic] + b_*c_*Jp[ia]
-                                 + a_*L[ib][ic] + a_*c_*Jp[ib] + a_*b_*Jq[ic] + a_*b_*c_*I;
+            const comp_t c_c = QC_c[ic];
+            const comp_t T3_c = static_cast<comp_t>(t3_component(ia, ib, ic, dvec, term_t3_f2, term_t3_f3));
+            const comp_t M_c = (-T3_c + static_cast<comp_t>(4.0)*p_c*q_c*dij_c*Jq_c[ic]) / (static_cast<comp_t>(8.0)*p_c*p_c*q_c);
+            s[ia*9 + ib*3 + ic] += static_cast<accum_t>(M_c + c_c*Kp_ij_c + b_c*L_c[ia][ic] + b_c*c_c*Jp_c[ia]
+                                 + a_c*L_c[ib][ic] + a_c*c_c*Jp_c[ib] + a_c*b_c*Jq_c[ic] + a_c*b_c*c_c*I_c);
           }
         }
       }
     }
   }
-  const int out = t * 27;
+  if constexpr (kTileF32) {
+    const int out = t * 27;
 #pragma unroll
-  for (int i = 0; i < 27; ++i) eri_out[out + i] = s[i];
+    for (int i = 0; i < 27; ++i) eri_out_f32[out + i] = static_cast<float>(s[i]);
+  } else {
+    const int out = t * 27;
+#pragma unroll
+    for (int i = 0; i < 27; ++i) eri_out_f64[out + i] = static_cast<double>(s[i]);
+  }
 }
 
+template <bool kTileF32 = false, bool kMixedPrec = false, bool kF32Accum = false>
 __global__ void KernelERI_pppp_warp(
     const int32_t* task_spAB,
     const int32_t* task_spCD,
@@ -1428,7 +1570,10 @@ __global__ void KernelERI_pppp_warp(
     const double* pair_Py,
     const double* pair_Pz,
     const double* pair_cK,
-    double* eri_out) {
+    double* eri_out_f64,
+    float*  eri_out_f32) {
+  using comp_t = typename std::conditional<kMixedPrec, float, double>::type;
+  using accum_t = typename std::conditional<kF32Accum, float, double>::type;
   const int lane = static_cast<int>(threadIdx.x) & 31;
   const int warp_id = static_cast<int>(threadIdx.x) >> 5;
   const int warps_per_block = static_cast<int>(blockDim.x) >> 5;
@@ -1482,75 +1627,80 @@ __global__ void KernelERI_pppp_warp(
 
     double F0, F1, F2, F3, F4;
     boys_f0_f1_f2_f3_f4(T, F0, F1, F2, F3, F4);
-
-    const double I = base * F0;
-
-    const double omega_over_p = omega / p;
-    const double omega_over_q = omega / q;
-    const double Jp[3] = {-omega_over_p*base*F1*dx, -omega_over_p*base*F1*dy, -omega_over_p*base*F1*dz};
-    const double Jq[3] = {omega_over_q*base*F1*dx, omega_over_q*base*F1*dy, omega_over_q*base*F1*dz};
-
-    const double w2 = omega * omega;
-    const double w3 = w2 * omega;
-    const double w4 = w2 * w2;
-    const double inv4p2 = 1.0 / (4.0 * p * p);
-    const double inv4q2 = 1.0 / (4.0 * q * q);
-    const double inv4pq = 1.0 / (4.0 * p * q);
-
-    const double t4 = 4.0 * w2 * F2;
-    const double t2 = 2.0 * omega * F1;
-    double H[3][3], Kp[3][3], Kq[3][3], L[3][3];
+    // Cast to comp_t for component evaluation (FP32 when kMixedPrec)
+    const comp_t base_c = static_cast<comp_t>(base);
+    const comp_t F0_c = static_cast<comp_t>(F0);
+    const comp_t F1_c = static_cast<comp_t>(F1);
+    const comp_t F2_c = static_cast<comp_t>(F2);
+    const comp_t p_c = static_cast<comp_t>(p);
+    const comp_t q_c = static_cast<comp_t>(q);
+    const comp_t omega_c = static_cast<comp_t>(omega);
+    const comp_t oop_c = static_cast<comp_t>(omega / p);
+    const comp_t ooq_c = static_cast<comp_t>(omega / q);
+    const comp_t d_c[3] = {static_cast<comp_t>(dx), static_cast<comp_t>(dy), static_cast<comp_t>(dz)};
+    const comp_t I_c = base_c * F0_c;
+    const comp_t Jp_c[3] = {-oop_c*base_c*F1_c*d_c[0], -oop_c*base_c*F1_c*d_c[1], -oop_c*base_c*F1_c*d_c[2]};
+    const comp_t Jq_c[3] = {ooq_c*base_c*F1_c*d_c[0], ooq_c*base_c*F1_c*d_c[1], ooq_c*base_c*F1_c*d_c[2]};
+    const comp_t w2_c = omega_c * omega_c;
+    const comp_t inv4p2_c = static_cast<comp_t>(1.0) / (static_cast<comp_t>(4.0) * p_c * p_c);
+    const comp_t inv4q2_c = static_cast<comp_t>(1.0) / (static_cast<comp_t>(4.0) * q_c * q_c);
+    const comp_t inv4pq_c = static_cast<comp_t>(1.0) / (static_cast<comp_t>(4.0) * p_c * q_c);
+    const comp_t t4_c = static_cast<comp_t>(4.0) * w2_c * F2_c;
+    const comp_t t2_c = static_cast<comp_t>(2.0) * omega_c * F1_c;
+    comp_t Kp_c[3][3], Kq_c[3][3], L_c[3][3];
 #pragma unroll
     for (int a = 0; a < 3; ++a) {
 #pragma unroll
       for (int b = 0; b < 3; ++b) {
-        const double dij = (a == b) ? 1.0 : 0.0;
-        H[a][b] = base * (t4 * dvec[a] * dvec[b] - (a == b ? t2 : 0.0));
-        Kp[a][b] = (H[a][b] + 2.0 * p * I * dij) * inv4p2;
-        Kq[a][b] = (H[a][b] + 2.0 * q * I * dij) * inv4q2;
-        L[a][b] = -(H[a][b]) * inv4pq;
+        const comp_t dij_c = (a == b) ? static_cast<comp_t>(1.0) : static_cast<comp_t>(0.0);
+        const comp_t H_c = base_c * (t4_c * d_c[a] * d_c[b] - (a == b ? t2_c : static_cast<comp_t>(0.0)));
+        Kp_c[a][b] = (H_c + static_cast<comp_t>(2.0) * p_c * I_c * dij_c) * inv4p2_c;
+        Kq_c[a][b] = (H_c + static_cast<comp_t>(2.0) * q_c * I_c * dij_c) * inv4q2_c;
+        L_c[a][b] = -H_c * inv4pq_c;
       }
     }
-
-    const double PA[3] = {Pxi - Ax, Pyi - Ay, Pzi - Az};
-    const double PB[3] = {Pxi - Bx, Pyi - By, Pzi - Bz};
-    const double QC[3] = {Qx - Cx, Qy - Cy, Qz - Cz};
-    const double QD[3] = {Qx - Dx, Qy - Dy, Qz - Dz};
-
+    const comp_t PA_c[3] = {static_cast<comp_t>(Pxi - Ax), static_cast<comp_t>(Pyi - Ay), static_cast<comp_t>(Pzi - Az)};
+    const comp_t PB_c[3] = {static_cast<comp_t>(Pxi - Bx), static_cast<comp_t>(Pyi - By), static_cast<comp_t>(Pzi - Bz)};
+    const comp_t QC_c[3] = {static_cast<comp_t>(Qx - Cx), static_cast<comp_t>(Qy - Cy), static_cast<comp_t>(Qz - Cz)};
+    const comp_t QD_c[3] = {static_cast<comp_t>(Qx - Dx), static_cast<comp_t>(Qy - Dy), static_cast<comp_t>(Qz - Dz)};
+    // Keep FP64 args for t3/t4_component calls, cast results to comp_t
+    const double w2 = omega * omega;
+    const double w3 = w2 * omega;
+    const double w4 = w2 * w2;
     const double term_t3_f2 = 4.0 * w2 * base * F2;
     const double term_t3_f3 = -8.0 * w3 * base * F3;
-    const double term_t4_f2 = 4.0 * w2 * base * F2;
-    const double term_t4_f3 = -8.0 * w3 * base * F3;
+    const double term_t4_f2 = term_t3_f2;
+    const double term_t4_f3 = term_t3_f3;
     const double term_t4_f4 = 16.0 * w4 * base * F4;
 
 #pragma unroll
     for (int ia = 0; ia < 3; ++ia) {
 #pragma unroll
       for (int ib = 0; ib < 3; ++ib) {
-        const double a_ = PA[ia], b_ = PB[ib];
-        const double dij = (ia == ib) ? 1.0 : 0.0;
-        const double Kp_ij = Kp[ia][ib];
+        const comp_t a_c = PA_c[ia], b_c = PB_c[ib];
+        const comp_t dij_c = (ia == ib) ? static_cast<comp_t>(1.0) : static_cast<comp_t>(0.0);
+        const comp_t Kp_ij_c = Kp_c[ia][ib];
 #pragma unroll
         for (int ic = 0; ic < 3; ++ic) {
 #pragma unroll
           for (int id = 0; id < 3; ++id) {
-            const double c_ = QC[ic], d_ = QD[id];
-            const double dkl = (ic == id) ? 1.0 : 0.0;
-            const double Kq_kl = Kq[ic][id];
-            const double T3_ijk = t3_component(ia, ib, ic, dvec, term_t3_f2, term_t3_f3);
-            const double T3_ijl = t3_component(ia, ib, id, dvec, term_t3_f2, term_t3_f3);
-            const double T3_i_kl = t3_component(ia, ic, id, dvec, term_t3_f2, term_t3_f3);
-            const double T3_j_kl = t3_component(ib, ic, id, dvec, term_t3_f2, term_t3_f3);
-            const double M_ijk = (-T3_ijk + 4.0*p*q*dij*Jq[ic]) / (8.0*p*p*q);
-            const double M_ijl = (-T3_ijl + 4.0*p*q*dij*Jq[id]) / (8.0*p*p*q);
-            const double N_i_kl = (T3_i_kl + 4.0*p*q*dkl*Jp[ia]) / (8.0*p*q*q);
-            const double N_j_kl = (T3_j_kl + 4.0*p*q*dkl*Jp[ib]) / (8.0*p*q*q);
-            const double T4_ijkl = t4_component(ia, ib, ic, id, dvec, term_t4_f2, term_t4_f3, term_t4_f4);
-            const double M4_ij_kl = (T4_ijkl + 8.0*p*p*q*dkl*Kp_ij + 8.0*p*q*q*dij*Kq_kl - 4.0*p*q*dij*dkl*I) / (16.0*p*p*q*q);
-            s[ia*27 + ib*9 + ic*3 + id] += M4_ij_kl + d_*M_ijk + c_*M_ijl + c_*d_*Kp_ij
-              + b_*N_i_kl + b_*d_*L[ia][ic] + b_*c_*L[ia][id] + b_*c_*d_*Jp[ia]
-              + a_*N_j_kl + a_*d_*L[ib][ic] + a_*c_*L[ib][id] + a_*c_*d_*Jp[ib]
-              + a_*b_*Kq_kl + a_*b_*d_*Jq[ic] + a_*b_*c_*Jq[id] + a_*b_*c_*d_*I;
+            const comp_t c_c = QC_c[ic], d_cc = QD_c[id];
+            const comp_t dkl_c = (ic == id) ? static_cast<comp_t>(1.0) : static_cast<comp_t>(0.0);
+            const comp_t Kq_kl_c = Kq_c[ic][id];
+            const comp_t T3_ijk_c = static_cast<comp_t>(t3_component(ia, ib, ic, dvec, term_t3_f2, term_t3_f3));
+            const comp_t T3_ijl_c = static_cast<comp_t>(t3_component(ia, ib, id, dvec, term_t3_f2, term_t3_f3));
+            const comp_t T3_ikl_c = static_cast<comp_t>(t3_component(ia, ic, id, dvec, term_t3_f2, term_t3_f3));
+            const comp_t T3_jkl_c = static_cast<comp_t>(t3_component(ib, ic, id, dvec, term_t3_f2, term_t3_f3));
+            const comp_t M_ijk_c = (-T3_ijk_c + static_cast<comp_t>(4.0)*p_c*q_c*dij_c*Jq_c[ic]) / (static_cast<comp_t>(8.0)*p_c*p_c*q_c);
+            const comp_t M_ijl_c = (-T3_ijl_c + static_cast<comp_t>(4.0)*p_c*q_c*dij_c*Jq_c[id]) / (static_cast<comp_t>(8.0)*p_c*p_c*q_c);
+            const comp_t N_ikl_c = (T3_ikl_c + static_cast<comp_t>(4.0)*p_c*q_c*dkl_c*Jp_c[ia]) / (static_cast<comp_t>(8.0)*p_c*q_c*q_c);
+            const comp_t N_jkl_c = (T3_jkl_c + static_cast<comp_t>(4.0)*p_c*q_c*dkl_c*Jp_c[ib]) / (static_cast<comp_t>(8.0)*p_c*q_c*q_c);
+            const comp_t T4_c = static_cast<comp_t>(t4_component(ia, ib, ic, id, dvec, term_t4_f2, term_t4_f3, term_t4_f4));
+            const comp_t M4_c = (T4_c + static_cast<comp_t>(8.0)*p_c*p_c*q_c*dkl_c*Kp_ij_c + static_cast<comp_t>(8.0)*p_c*q_c*q_c*dij_c*Kq_kl_c - static_cast<comp_t>(4.0)*p_c*q_c*dij_c*dkl_c*I_c) / (static_cast<comp_t>(16.0)*p_c*p_c*q_c*q_c);
+            s[ia*27 + ib*9 + ic*3 + id] += static_cast<double>(M4_c + d_cc*M_ijk_c + c_c*M_ijl_c + c_c*d_cc*Kp_ij_c
+              + b_c*N_ikl_c + b_c*d_cc*L_c[ia][ic] + b_c*c_c*L_c[ia][id] + b_c*c_c*d_cc*Jp_c[ia]
+              + a_c*N_jkl_c + a_c*d_cc*L_c[ib][ic] + a_c*c_c*L_c[ib][id] + a_c*c_c*d_cc*Jp_c[ib]
+              + a_c*b_c*Kq_kl_c + a_c*b_c*d_cc*Jq_c[ic] + a_c*b_c*c_c*Jq_c[id] + a_c*b_c*c_c*d_cc*I_c);
           }
         }
       }
@@ -1560,12 +1710,19 @@ __global__ void KernelERI_pppp_warp(
 #pragma unroll
   for (int i = 0; i < 81; ++i) s[i] = warp_reduce_sum(s[i]);
   if (lane == 0) {
-    const int out = t * 81;
+    if constexpr (kTileF32) {
+      const int out = t * 81;
 #pragma unroll
-    for (int i = 0; i < 81; ++i) eri_out[out + i] = s[i];
+      for (int i = 0; i < 81; ++i) eri_out_f32[out + i] = __double2float_rn(s[i]);
+    } else {
+      const int out = t * 81;
+#pragma unroll
+      for (int i = 0; i < 81; ++i) eri_out_f64[out + i] = s[i];
+    }
   }
 }
 
+template <bool kTileF32 = false, bool kMixedPrec = false, bool kF32Accum = false>
 __global__ void KernelERI_pppp_flat(
     const int32_t* __restrict__ task_spAB,
     const int32_t* __restrict__ task_spCD,
@@ -1582,9 +1739,12 @@ __global__ void KernelERI_pppp_flat(
     const double* __restrict__ pair_Py,
     const double* __restrict__ pair_Pz,
     const double* __restrict__ pair_cK,
-    double* __restrict__ eri_out) {
+    double* __restrict__ eri_out_f64,
+    float*  __restrict__ eri_out_f32) {
   const int t = static_cast<int>(blockIdx.x) * static_cast<int>(blockDim.x) + static_cast<int>(threadIdx.x);
   if (t >= ntasks) return;
+  using comp_t = typename std::conditional<kMixedPrec, float, double>::type;
+  using accum_t = typename std::conditional<kF32Accum, float, double>::type;
 
   const int spAB = static_cast<int>(task_spAB[t]);
   const int spCD = static_cast<int>(task_spCD[t]);
@@ -1602,7 +1762,7 @@ __global__ void KernelERI_pppp_flat(
   const int nAB = static_cast<int>(sp_npair[spAB]);
   const int nCD = static_cast<int>(sp_npair[spCD]);
 
-  double s[81];
+  accum_t s[81];
 #pragma unroll 1
   for (int i = 0; i < 81; ++i) s[i] = 0.0;
 
@@ -1627,75 +1787,94 @@ __global__ void KernelERI_pppp_flat(
       const double base = pref * cKi * pair_cK[kj];
       double F0, F1, F2, F3, F4;
       boys_f0_f1_f2_f3_f4(T, F0, F1, F2, F3, F4);
-      const double I = base * F0;
-      const double omega_over_p = omega / p;
-      const double omega_over_q = omega / q;
-      const double Jp[3] = {-omega_over_p*base*F1*dx, -omega_over_p*base*F1*dy, -omega_over_p*base*F1*dz};
-      const double Jq[3] = {omega_over_q*base*F1*dx, omega_over_q*base*F1*dy, omega_over_q*base*F1*dz};
-      const double w2 = omega * omega;
-      const double w3 = w2 * omega;
-      const double w4 = w2 * w2;
-      const double inv4p2 = 1.0 / (4.0 * p * p);
-      const double inv4q2 = 1.0 / (4.0 * q * q);
-      const double inv4pq = 1.0 / (4.0 * p * q);
-      const double t4 = 4.0 * w2 * F2;
-      const double t2 = 2.0 * omega * F1;
-      double H[3][3], Kp[3][3], Kq[3][3], L[3][3];
+      // Cast to comp_t for component evaluation (FP32 when kMixedPrec)
+      const comp_t base_c = static_cast<comp_t>(base);
+      const comp_t F0_c = static_cast<comp_t>(F0);
+      const comp_t F1_c = static_cast<comp_t>(F1);
+      const comp_t F2_c = static_cast<comp_t>(F2);
+      const comp_t p_c = static_cast<comp_t>(p);
+      const comp_t q_c = static_cast<comp_t>(q);
+      const comp_t omega_c = static_cast<comp_t>(omega);
+      const comp_t oop_c = static_cast<comp_t>(omega / p);
+      const comp_t ooq_c = static_cast<comp_t>(omega / q);
+      const comp_t d_c[3] = {static_cast<comp_t>(dx), static_cast<comp_t>(dy), static_cast<comp_t>(dz)};
+      const comp_t I_c = base_c * F0_c;
+      const comp_t Jp_c[3] = {-oop_c*base_c*F1_c*d_c[0], -oop_c*base_c*F1_c*d_c[1], -oop_c*base_c*F1_c*d_c[2]};
+      const comp_t Jq_c[3] = {ooq_c*base_c*F1_c*d_c[0], ooq_c*base_c*F1_c*d_c[1], ooq_c*base_c*F1_c*d_c[2]};
+      const comp_t w2_c = omega_c * omega_c;
+      const comp_t inv4p2_c = static_cast<comp_t>(1.0) / (static_cast<comp_t>(4.0) * p_c * p_c);
+      const comp_t inv4q2_c = static_cast<comp_t>(1.0) / (static_cast<comp_t>(4.0) * q_c * q_c);
+      const comp_t inv4pq_c = static_cast<comp_t>(1.0) / (static_cast<comp_t>(4.0) * p_c * q_c);
+      const comp_t t4_c = static_cast<comp_t>(4.0) * w2_c * F2_c;
+      const comp_t t2_c = static_cast<comp_t>(2.0) * omega_c * F1_c;
+      comp_t Kp_c[3][3], Kq_c[3][3], L_c[3][3];
 #pragma unroll
       for (int a = 0; a < 3; ++a) {
 #pragma unroll
         for (int b = 0; b < 3; ++b) {
-          const double dij = (a == b) ? 1.0 : 0.0;
-          H[a][b] = base * (t4 * dvec[a] * dvec[b] - (a == b ? t2 : 0.0));
-          Kp[a][b] = (H[a][b] + 2.0 * p * I * dij) * inv4p2;
-          Kq[a][b] = (H[a][b] + 2.0 * q * I * dij) * inv4q2;
-          L[a][b] = -(H[a][b]) * inv4pq;
+          const comp_t dij_c = (a == b) ? static_cast<comp_t>(1.0) : static_cast<comp_t>(0.0);
+          const comp_t H_c = base_c * (t4_c * d_c[a] * d_c[b] - (a == b ? t2_c : static_cast<comp_t>(0.0)));
+          Kp_c[a][b] = (H_c + static_cast<comp_t>(2.0) * p_c * I_c * dij_c) * inv4p2_c;
+          Kq_c[a][b] = (H_c + static_cast<comp_t>(2.0) * q_c * I_c * dij_c) * inv4q2_c;
+          L_c[a][b] = -H_c * inv4pq_c;
         }
       }
-      const double QC[3] = {Qx - Cx, Qy - Cy, Qz - Cz};
-      const double QD[3] = {Qx - Dx, Qy - Dy, Qz - Dz};
+      const comp_t PA_c[3] = {static_cast<comp_t>(PA[0]), static_cast<comp_t>(PA[1]), static_cast<comp_t>(PA[2])};
+      const comp_t PB_c[3] = {static_cast<comp_t>(PB[0]), static_cast<comp_t>(PB[1]), static_cast<comp_t>(PB[2])};
+      const comp_t QC_c[3] = {static_cast<comp_t>(Qx - Cx), static_cast<comp_t>(Qy - Cy), static_cast<comp_t>(Qz - Cz)};
+      const comp_t QD_c[3] = {static_cast<comp_t>(Qx - Dx), static_cast<comp_t>(Qy - Dy), static_cast<comp_t>(Qz - Dz)};
+      // Keep FP64 args for t3/t4_component calls, cast results to comp_t
+      const double w2 = omega * omega;
+      const double w3 = w2 * omega;
+      const double w4 = w2 * w2;
       const double term_t3_f2 = 4.0 * w2 * base * F2;
       const double term_t3_f3 = -8.0 * w3 * base * F3;
-      const double term_t4_f2 = 4.0 * w2 * base * F2;
-      const double term_t4_f3 = -8.0 * w3 * base * F3;
+      const double term_t4_f2 = term_t3_f2;
+      const double term_t4_f3 = term_t3_f3;
       const double term_t4_f4 = 16.0 * w4 * base * F4;
 #pragma unroll 1
       for (int ia = 0; ia < 3; ++ia) {
 #pragma unroll 1
         for (int ib = 0; ib < 3; ++ib) {
-          const double a_ = PA[ia], b_ = PB[ib];
-          const double dij = (ia == ib) ? 1.0 : 0.0;
-          const double Kp_ij = Kp[ia][ib];
+          const comp_t a_c = PA_c[ia], b_c = PB_c[ib];
+          const comp_t dij_c = (ia == ib) ? static_cast<comp_t>(1.0) : static_cast<comp_t>(0.0);
+          const comp_t Kp_ij_c = Kp_c[ia][ib];
 #pragma unroll 1
           for (int ic = 0; ic < 3; ++ic) {
 #pragma unroll 1
             for (int id = 0; id < 3; ++id) {
-              const double c_ = QC[ic], d_ = QD[id];
-              const double dkl = (ic == id) ? 1.0 : 0.0;
-              const double Kq_kl = Kq[ic][id];
-              const double T3_ijk = t3_component(ia, ib, ic, dvec, term_t3_f2, term_t3_f3);
-              const double T3_ijl = t3_component(ia, ib, id, dvec, term_t3_f2, term_t3_f3);
-              const double T3_i_kl = t3_component(ia, ic, id, dvec, term_t3_f2, term_t3_f3);
-              const double T3_j_kl = t3_component(ib, ic, id, dvec, term_t3_f2, term_t3_f3);
-              const double M_ijk = (-T3_ijk + 4.0*p*q*dij*Jq[ic]) / (8.0*p*p*q);
-              const double M_ijl = (-T3_ijl + 4.0*p*q*dij*Jq[id]) / (8.0*p*p*q);
-              const double N_i_kl = (T3_i_kl + 4.0*p*q*dkl*Jp[ia]) / (8.0*p*q*q);
-              const double N_j_kl = (T3_j_kl + 4.0*p*q*dkl*Jp[ib]) / (8.0*p*q*q);
-              const double T4_ijkl = t4_component(ia, ib, ic, id, dvec, term_t4_f2, term_t4_f3, term_t4_f4);
-              const double M4_ij_kl = (T4_ijkl + 8.0*p*p*q*dkl*Kp_ij + 8.0*p*q*q*dij*Kq_kl - 4.0*p*q*dij*dkl*I) / (16.0*p*p*q*q);
-              s[ia*27 + ib*9 + ic*3 + id] += M4_ij_kl + d_*M_ijk + c_*M_ijl + c_*d_*Kp_ij
-                + b_*N_i_kl + b_*d_*L[ia][ic] + b_*c_*L[ia][id] + b_*c_*d_*Jp[ia]
-                + a_*N_j_kl + a_*d_*L[ib][ic] + a_*c_*L[ib][id] + a_*c_*d_*Jp[ib]
-                + a_*b_*Kq_kl + a_*b_*d_*Jq[ic] + a_*b_*c_*Jq[id] + a_*b_*c_*d_*I;
+              const comp_t c_c = QC_c[ic], d_cc = QD_c[id];
+              const comp_t dkl_c = (ic == id) ? static_cast<comp_t>(1.0) : static_cast<comp_t>(0.0);
+              const comp_t Kq_kl_c = Kq_c[ic][id];
+              const comp_t T3_ijk_c = static_cast<comp_t>(t3_component(ia, ib, ic, dvec, term_t3_f2, term_t3_f3));
+              const comp_t T3_ijl_c = static_cast<comp_t>(t3_component(ia, ib, id, dvec, term_t3_f2, term_t3_f3));
+              const comp_t T3_ikl_c = static_cast<comp_t>(t3_component(ia, ic, id, dvec, term_t3_f2, term_t3_f3));
+              const comp_t T3_jkl_c = static_cast<comp_t>(t3_component(ib, ic, id, dvec, term_t3_f2, term_t3_f3));
+              const comp_t M_ijk_c = (-T3_ijk_c + static_cast<comp_t>(4.0)*p_c*q_c*dij_c*Jq_c[ic]) / (static_cast<comp_t>(8.0)*p_c*p_c*q_c);
+              const comp_t M_ijl_c = (-T3_ijl_c + static_cast<comp_t>(4.0)*p_c*q_c*dij_c*Jq_c[id]) / (static_cast<comp_t>(8.0)*p_c*p_c*q_c);
+              const comp_t N_ikl_c = (T3_ikl_c + static_cast<comp_t>(4.0)*p_c*q_c*dkl_c*Jp_c[ia]) / (static_cast<comp_t>(8.0)*p_c*q_c*q_c);
+              const comp_t N_jkl_c = (T3_jkl_c + static_cast<comp_t>(4.0)*p_c*q_c*dkl_c*Jp_c[ib]) / (static_cast<comp_t>(8.0)*p_c*q_c*q_c);
+              const comp_t T4_c = static_cast<comp_t>(t4_component(ia, ib, ic, id, dvec, term_t4_f2, term_t4_f3, term_t4_f4));
+              const comp_t M4_c = (T4_c + static_cast<comp_t>(8.0)*p_c*p_c*q_c*dkl_c*Kp_ij_c + static_cast<comp_t>(8.0)*p_c*q_c*q_c*dij_c*Kq_kl_c - static_cast<comp_t>(4.0)*p_c*q_c*dij_c*dkl_c*I_c) / (static_cast<comp_t>(16.0)*p_c*p_c*q_c*q_c);
+              s[ia*27 + ib*9 + ic*3 + id] += static_cast<accum_t>(M4_c + d_cc*M_ijk_c + c_c*M_ijl_c + c_c*d_cc*Kp_ij_c
+                + b_c*N_ikl_c + b_c*d_cc*L_c[ia][ic] + b_c*c_c*L_c[ia][id] + b_c*c_c*d_cc*Jp_c[ia]
+                + a_c*N_jkl_c + a_c*d_cc*L_c[ib][ic] + a_c*c_c*L_c[ib][id] + a_c*c_c*d_cc*Jp_c[ib]
+                + a_c*b_c*Kq_kl_c + a_c*b_c*d_cc*Jq_c[ic] + a_c*b_c*c_c*Jq_c[id] + a_c*b_c*c_c*d_cc*I_c);
             }
           }
         }
       }
     }
   }
-  const int out = t * 81;
+  if constexpr (kTileF32) {
+    const int out = t * 81;
 #pragma unroll 1
-  for (int i = 0; i < 81; ++i) eri_out[out + i] = s[i];
+    for (int i = 0; i < 81; ++i) eri_out_f32[out + i] = static_cast<float>(s[i]);
+  } else {
+    const int out = t * 81;
+#pragma unroll 1
+    for (int i = 0; i < 81; ++i) eri_out_f64[out + i] = static_cast<double>(s[i]);
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -2051,9 +2230,9 @@ extern "C" cudaError_t cueri_eri_psss_launch_stream(
   (void)sp_B;
   if (ntasks <= 0) return ntasks == 0 ? cudaSuccess : cudaErrorInvalidValue;
   const int blocks = (ntasks + threads - 1) / threads;
-  KernelERI_psss_flat<<<static_cast<unsigned int>(blocks), threads, 0, stream>>>(
+  KernelERI_psss_flat<false, false><<<static_cast<unsigned int>(blocks), threads, 0, stream>>>(
       task_spAB, task_spCD, ntasks, sp_A, sp_pair_start, sp_npair,
-      shell_cx, shell_cy, shell_cz, pair_eta, pair_Px, pair_Py, pair_Pz, pair_cK, eri_out);
+      shell_cx, shell_cy, shell_cz, pair_eta, pair_Px, pair_Py, pair_Pz, pair_cK, eri_out, nullptr);
   return cudaGetLastError();
 }
 
@@ -2105,9 +2284,9 @@ extern "C" cudaError_t cueri_eri_ppss_launch_stream(
     int threads) {
   if (ntasks <= 0) return ntasks == 0 ? cudaSuccess : cudaErrorInvalidValue;
   const int blocks = (ntasks + threads - 1) / threads;
-  KernelERI_ppss_flat<<<static_cast<unsigned int>(blocks), threads, 0, stream>>>(
+  KernelERI_ppss_flat<false, false><<<static_cast<unsigned int>(blocks), threads, 0, stream>>>(
       task_spAB, task_spCD, ntasks, sp_A, sp_B, sp_pair_start, sp_npair,
-      shell_cx, shell_cy, shell_cz, pair_eta, pair_Px, pair_Py, pair_Pz, pair_cK, eri_out);
+      shell_cx, shell_cy, shell_cz, pair_eta, pair_Px, pair_Py, pair_Pz, pair_cK, eri_out, nullptr);
   return cudaGetLastError();
 }
 
@@ -2159,9 +2338,9 @@ extern "C" cudaError_t cueri_eri_psps_launch_stream(
     int threads) {
   if (ntasks <= 0) return ntasks == 0 ? cudaSuccess : cudaErrorInvalidValue;
   const int blocks = (ntasks + threads - 1) / threads;
-  KernelERI_psps_flat<<<static_cast<unsigned int>(blocks), threads, 0, stream>>>(
+  KernelERI_psps_flat<false, false><<<static_cast<unsigned int>(blocks), threads, 0, stream>>>(
       task_spAB, task_spCD, ntasks, sp_A, sp_B, sp_pair_start, sp_npair,
-      shell_cx, shell_cy, shell_cz, pair_eta, pair_Px, pair_Py, pair_Pz, pair_cK, eri_out);
+      shell_cx, shell_cy, shell_cz, pair_eta, pair_Px, pair_Py, pair_Pz, pair_cK, eri_out, nullptr);
   return cudaGetLastError();
 }
 
@@ -2214,9 +2393,9 @@ extern "C" cudaError_t cueri_eri_dsss_launch_stream(
   (void)sp_B;
   if (ntasks <= 0) return ntasks == 0 ? cudaSuccess : cudaErrorInvalidValue;
   const int blocks = (ntasks + threads - 1) / threads;
-  KernelERI_dsss_flat<<<static_cast<unsigned int>(blocks), threads, 0, stream>>>(
+  KernelERI_dsss_flat<false, false><<<static_cast<unsigned int>(blocks), threads, 0, stream>>>(
       task_spAB, task_spCD, ntasks, sp_A, sp_pair_start, sp_npair,
-      shell_cx, shell_cy, shell_cz, pair_eta, pair_Px, pair_Py, pair_Pz, pair_cK, eri_out);
+      shell_cx, shell_cy, shell_cz, pair_eta, pair_Px, pair_Py, pair_Pz, pair_cK, eri_out, nullptr);
   return cudaGetLastError();
 }
 
@@ -2268,9 +2447,9 @@ extern "C" cudaError_t cueri_eri_ppps_launch_stream(
     int threads) {
   if (ntasks <= 0) return cudaSuccess;
   const int blocks = (ntasks + threads - 1) / threads;
-  KernelERI_ppps_flat<<<blocks, threads, 0, stream>>>(
+  KernelERI_ppps_flat<false, false><<<blocks, threads, 0, stream>>>(
       task_spAB, task_spCD, ntasks, sp_A, sp_B, sp_pair_start, sp_npair,
-      shell_cx, shell_cy, shell_cz, pair_eta, pair_Px, pair_Py, pair_Pz, pair_cK, eri_out);
+      shell_cx, shell_cy, shell_cz, pair_eta, pair_Px, pair_Py, pair_Pz, pair_cK, eri_out, nullptr);
   return cudaGetLastError();
 }
 
@@ -2346,9 +2525,511 @@ extern "C" cudaError_t cueri_eri_pppp_launch_stream(
     int threads) {
   if (ntasks <= 0) return cudaSuccess;
   const int blocks = (ntasks + threads - 1) / threads;
-  KernelERI_pppp_flat<<<blocks, threads, 0, stream>>>(
+  KernelERI_pppp_flat<false, false><<<blocks, threads, 0, stream>>>(
       task_spAB, task_spCD, ntasks, sp_A, sp_B, sp_pair_start, sp_npair,
-      shell_cx, shell_cy, shell_cz, pair_eta, pair_Px, pair_Py, pair_Pz, pair_cK, eri_out);
+      shell_cx, shell_cy, shell_cz, pair_eta, pair_Px, pair_Py, pair_Pz, pair_cK, eri_out, nullptr);
+  return cudaGetLastError();
+}
+
+// ---------------------------------------------------------------------------
+// Mixed-precision / f32-output ERI launchers (Phase 1c + 2c)
+// ---------------------------------------------------------------------------
+
+// --- psss ---
+extern "C" cudaError_t cueri_eri_psss_f32_launch_stream(
+    const int32_t* task_spAB, const int32_t* task_spCD, int ntasks,
+    const int32_t* sp_A, const int32_t* sp_B,
+    const int32_t* sp_pair_start, const int32_t* sp_npair,
+    const double* shell_cx, const double* shell_cy, const double* shell_cz,
+    const double* pair_eta, const double* pair_Px, const double* pair_Py, const double* pair_Pz,
+    const double* pair_cK, float* eri_out,
+    cudaStream_t stream, int threads) {
+  (void)sp_B;
+  if (ntasks <= 0) return ntasks == 0 ? cudaSuccess : cudaErrorInvalidValue;
+  const int blocks = (ntasks + threads - 1) / threads;
+  KernelERI_psss_flat<true, false><<<static_cast<unsigned int>(blocks), threads, 0, stream>>>(
+      task_spAB, task_spCD, ntasks, sp_A, sp_pair_start, sp_npair,
+      shell_cx, shell_cy, shell_cz, pair_eta, pair_Px, pair_Py, pair_Pz, pair_cK, nullptr, eri_out);
+  return cudaGetLastError();
+}
+
+extern "C" cudaError_t cueri_eri_psss_mixed_launch_stream(
+    const int32_t* task_spAB, const int32_t* task_spCD, int ntasks,
+    const int32_t* sp_A, const int32_t* sp_B,
+    const int32_t* sp_pair_start, const int32_t* sp_npair,
+    const double* shell_cx, const double* shell_cy, const double* shell_cz,
+    const double* pair_eta, const double* pair_Px, const double* pair_Py, const double* pair_Pz,
+    const double* pair_cK, double* eri_out,
+    cudaStream_t stream, int threads) {
+  (void)sp_B;
+  if (ntasks <= 0) return ntasks == 0 ? cudaSuccess : cudaErrorInvalidValue;
+  const int blocks = (ntasks + threads - 1) / threads;
+  KernelERI_psss_flat<false, true><<<static_cast<unsigned int>(blocks), threads, 0, stream>>>(
+      task_spAB, task_spCD, ntasks, sp_A, sp_pair_start, sp_npair,
+      shell_cx, shell_cy, shell_cz, pair_eta, pair_Px, pair_Py, pair_Pz, pair_cK, eri_out, nullptr);
+  return cudaGetLastError();
+}
+
+extern "C" cudaError_t cueri_eri_psss_mixed_f32_launch_stream(
+    const int32_t* task_spAB, const int32_t* task_spCD, int ntasks,
+    const int32_t* sp_A, const int32_t* sp_B,
+    const int32_t* sp_pair_start, const int32_t* sp_npair,
+    const double* shell_cx, const double* shell_cy, const double* shell_cz,
+    const double* pair_eta, const double* pair_Px, const double* pair_Py, const double* pair_Pz,
+    const double* pair_cK, float* eri_out,
+    cudaStream_t stream, int threads) {
+  (void)sp_B;
+  if (ntasks <= 0) return ntasks == 0 ? cudaSuccess : cudaErrorInvalidValue;
+  const int blocks = (ntasks + threads - 1) / threads;
+  KernelERI_psss_flat<true, true><<<static_cast<unsigned int>(blocks), threads, 0, stream>>>(
+      task_spAB, task_spCD, ntasks, sp_A, sp_pair_start, sp_npair,
+      shell_cx, shell_cy, shell_cz, pair_eta, pair_Px, pair_Py, pair_Pz, pair_cK, nullptr, eri_out);
+  return cudaGetLastError();
+}
+
+// --- ppss ---
+extern "C" cudaError_t cueri_eri_ppss_f32_launch_stream(
+    const int32_t* task_spAB, const int32_t* task_spCD, int ntasks,
+    const int32_t* sp_A, const int32_t* sp_B,
+    const int32_t* sp_pair_start, const int32_t* sp_npair,
+    const double* shell_cx, const double* shell_cy, const double* shell_cz,
+    const double* pair_eta, const double* pair_Px, const double* pair_Py, const double* pair_Pz,
+    const double* pair_cK, float* eri_out,
+    cudaStream_t stream, int threads) {
+  if (ntasks <= 0) return ntasks == 0 ? cudaSuccess : cudaErrorInvalidValue;
+  const int blocks = (ntasks + threads - 1) / threads;
+  KernelERI_ppss_flat<true, false><<<static_cast<unsigned int>(blocks), threads, 0, stream>>>(
+      task_spAB, task_spCD, ntasks, sp_A, sp_B, sp_pair_start, sp_npair,
+      shell_cx, shell_cy, shell_cz, pair_eta, pair_Px, pair_Py, pair_Pz, pair_cK, nullptr, eri_out);
+  return cudaGetLastError();
+}
+
+extern "C" cudaError_t cueri_eri_ppss_mixed_launch_stream(
+    const int32_t* task_spAB, const int32_t* task_spCD, int ntasks,
+    const int32_t* sp_A, const int32_t* sp_B,
+    const int32_t* sp_pair_start, const int32_t* sp_npair,
+    const double* shell_cx, const double* shell_cy, const double* shell_cz,
+    const double* pair_eta, const double* pair_Px, const double* pair_Py, const double* pair_Pz,
+    const double* pair_cK, double* eri_out,
+    cudaStream_t stream, int threads) {
+  if (ntasks <= 0) return ntasks == 0 ? cudaSuccess : cudaErrorInvalidValue;
+  const int blocks = (ntasks + threads - 1) / threads;
+  KernelERI_ppss_flat<false, true><<<static_cast<unsigned int>(blocks), threads, 0, stream>>>(
+      task_spAB, task_spCD, ntasks, sp_A, sp_B, sp_pair_start, sp_npair,
+      shell_cx, shell_cy, shell_cz, pair_eta, pair_Px, pair_Py, pair_Pz, pair_cK, eri_out, nullptr);
+  return cudaGetLastError();
+}
+
+extern "C" cudaError_t cueri_eri_ppss_mixed_f32_launch_stream(
+    const int32_t* task_spAB, const int32_t* task_spCD, int ntasks,
+    const int32_t* sp_A, const int32_t* sp_B,
+    const int32_t* sp_pair_start, const int32_t* sp_npair,
+    const double* shell_cx, const double* shell_cy, const double* shell_cz,
+    const double* pair_eta, const double* pair_Px, const double* pair_Py, const double* pair_Pz,
+    const double* pair_cK, float* eri_out,
+    cudaStream_t stream, int threads) {
+  if (ntasks <= 0) return ntasks == 0 ? cudaSuccess : cudaErrorInvalidValue;
+  const int blocks = (ntasks + threads - 1) / threads;
+  KernelERI_ppss_flat<true, true><<<static_cast<unsigned int>(blocks), threads, 0, stream>>>(
+      task_spAB, task_spCD, ntasks, sp_A, sp_B, sp_pair_start, sp_npair,
+      shell_cx, shell_cy, shell_cz, pair_eta, pair_Px, pair_Py, pair_Pz, pair_cK, nullptr, eri_out);
+  return cudaGetLastError();
+}
+
+// --- psps ---
+extern "C" cudaError_t cueri_eri_psps_f32_launch_stream(
+    const int32_t* task_spAB, const int32_t* task_spCD, int ntasks,
+    const int32_t* sp_A, const int32_t* sp_B,
+    const int32_t* sp_pair_start, const int32_t* sp_npair,
+    const double* shell_cx, const double* shell_cy, const double* shell_cz,
+    const double* pair_eta, const double* pair_Px, const double* pair_Py, const double* pair_Pz,
+    const double* pair_cK, float* eri_out,
+    cudaStream_t stream, int threads) {
+  if (ntasks <= 0) return ntasks == 0 ? cudaSuccess : cudaErrorInvalidValue;
+  const int blocks = (ntasks + threads - 1) / threads;
+  KernelERI_psps_flat<true, false><<<static_cast<unsigned int>(blocks), threads, 0, stream>>>(
+      task_spAB, task_spCD, ntasks, sp_A, sp_B, sp_pair_start, sp_npair,
+      shell_cx, shell_cy, shell_cz, pair_eta, pair_Px, pair_Py, pair_Pz, pair_cK, nullptr, eri_out);
+  return cudaGetLastError();
+}
+
+extern "C" cudaError_t cueri_eri_psps_mixed_launch_stream(
+    const int32_t* task_spAB, const int32_t* task_spCD, int ntasks,
+    const int32_t* sp_A, const int32_t* sp_B,
+    const int32_t* sp_pair_start, const int32_t* sp_npair,
+    const double* shell_cx, const double* shell_cy, const double* shell_cz,
+    const double* pair_eta, const double* pair_Px, const double* pair_Py, const double* pair_Pz,
+    const double* pair_cK, double* eri_out,
+    cudaStream_t stream, int threads) {
+  if (ntasks <= 0) return ntasks == 0 ? cudaSuccess : cudaErrorInvalidValue;
+  const int blocks = (ntasks + threads - 1) / threads;
+  KernelERI_psps_flat<false, true><<<static_cast<unsigned int>(blocks), threads, 0, stream>>>(
+      task_spAB, task_spCD, ntasks, sp_A, sp_B, sp_pair_start, sp_npair,
+      shell_cx, shell_cy, shell_cz, pair_eta, pair_Px, pair_Py, pair_Pz, pair_cK, eri_out, nullptr);
+  return cudaGetLastError();
+}
+
+extern "C" cudaError_t cueri_eri_psps_mixed_f32_launch_stream(
+    const int32_t* task_spAB, const int32_t* task_spCD, int ntasks,
+    const int32_t* sp_A, const int32_t* sp_B,
+    const int32_t* sp_pair_start, const int32_t* sp_npair,
+    const double* shell_cx, const double* shell_cy, const double* shell_cz,
+    const double* pair_eta, const double* pair_Px, const double* pair_Py, const double* pair_Pz,
+    const double* pair_cK, float* eri_out,
+    cudaStream_t stream, int threads) {
+  if (ntasks <= 0) return ntasks == 0 ? cudaSuccess : cudaErrorInvalidValue;
+  const int blocks = (ntasks + threads - 1) / threads;
+  KernelERI_psps_flat<true, true><<<static_cast<unsigned int>(blocks), threads, 0, stream>>>(
+      task_spAB, task_spCD, ntasks, sp_A, sp_B, sp_pair_start, sp_npair,
+      shell_cx, shell_cy, shell_cz, pair_eta, pair_Px, pair_Py, pair_Pz, pair_cK, nullptr, eri_out);
+  return cudaGetLastError();
+}
+
+// --- dsss ---
+extern "C" cudaError_t cueri_eri_dsss_f32_launch_stream(
+    const int32_t* task_spAB, const int32_t* task_spCD, int ntasks,
+    const int32_t* sp_A, const int32_t* sp_B,
+    const int32_t* sp_pair_start, const int32_t* sp_npair,
+    const double* shell_cx, const double* shell_cy, const double* shell_cz,
+    const double* pair_eta, const double* pair_Px, const double* pair_Py, const double* pair_Pz,
+    const double* pair_cK, float* eri_out,
+    cudaStream_t stream, int threads) {
+  (void)sp_B;
+  if (ntasks <= 0) return ntasks == 0 ? cudaSuccess : cudaErrorInvalidValue;
+  const int blocks = (ntasks + threads - 1) / threads;
+  KernelERI_dsss_flat<true, false><<<static_cast<unsigned int>(blocks), threads, 0, stream>>>(
+      task_spAB, task_spCD, ntasks, sp_A, sp_pair_start, sp_npair,
+      shell_cx, shell_cy, shell_cz, pair_eta, pair_Px, pair_Py, pair_Pz, pair_cK, nullptr, eri_out);
+  return cudaGetLastError();
+}
+
+extern "C" cudaError_t cueri_eri_dsss_mixed_launch_stream(
+    const int32_t* task_spAB, const int32_t* task_spCD, int ntasks,
+    const int32_t* sp_A, const int32_t* sp_B,
+    const int32_t* sp_pair_start, const int32_t* sp_npair,
+    const double* shell_cx, const double* shell_cy, const double* shell_cz,
+    const double* pair_eta, const double* pair_Px, const double* pair_Py, const double* pair_Pz,
+    const double* pair_cK, double* eri_out,
+    cudaStream_t stream, int threads) {
+  (void)sp_B;
+  if (ntasks <= 0) return ntasks == 0 ? cudaSuccess : cudaErrorInvalidValue;
+  const int blocks = (ntasks + threads - 1) / threads;
+  KernelERI_dsss_flat<false, true><<<static_cast<unsigned int>(blocks), threads, 0, stream>>>(
+      task_spAB, task_spCD, ntasks, sp_A, sp_pair_start, sp_npair,
+      shell_cx, shell_cy, shell_cz, pair_eta, pair_Px, pair_Py, pair_Pz, pair_cK, eri_out, nullptr);
+  return cudaGetLastError();
+}
+
+extern "C" cudaError_t cueri_eri_dsss_mixed_f32_launch_stream(
+    const int32_t* task_spAB, const int32_t* task_spCD, int ntasks,
+    const int32_t* sp_A, const int32_t* sp_B,
+    const int32_t* sp_pair_start, const int32_t* sp_npair,
+    const double* shell_cx, const double* shell_cy, const double* shell_cz,
+    const double* pair_eta, const double* pair_Px, const double* pair_Py, const double* pair_Pz,
+    const double* pair_cK, float* eri_out,
+    cudaStream_t stream, int threads) {
+  (void)sp_B;
+  if (ntasks <= 0) return ntasks == 0 ? cudaSuccess : cudaErrorInvalidValue;
+  const int blocks = (ntasks + threads - 1) / threads;
+  KernelERI_dsss_flat<true, true><<<static_cast<unsigned int>(blocks), threads, 0, stream>>>(
+      task_spAB, task_spCD, ntasks, sp_A, sp_pair_start, sp_npair,
+      shell_cx, shell_cy, shell_cz, pair_eta, pair_Px, pair_Py, pair_Pz, pair_cK, nullptr, eri_out);
+  return cudaGetLastError();
+}
+
+// --- ppps ---
+extern "C" cudaError_t cueri_eri_ppps_f32_launch_stream(
+    const int32_t* task_spAB, const int32_t* task_spCD, int ntasks,
+    const int32_t* sp_A, const int32_t* sp_B,
+    const int32_t* sp_pair_start, const int32_t* sp_npair,
+    const double* shell_cx, const double* shell_cy, const double* shell_cz,
+    const double* pair_eta, const double* pair_Px, const double* pair_Py, const double* pair_Pz,
+    const double* pair_cK, float* eri_out,
+    cudaStream_t stream, int threads) {
+  if (ntasks <= 0) return cudaSuccess;
+  const int blocks = (ntasks + threads - 1) / threads;
+  KernelERI_ppps_flat<true, false><<<blocks, threads, 0, stream>>>(
+      task_spAB, task_spCD, ntasks, sp_A, sp_B, sp_pair_start, sp_npair,
+      shell_cx, shell_cy, shell_cz, pair_eta, pair_Px, pair_Py, pair_Pz, pair_cK, nullptr, eri_out);
+  return cudaGetLastError();
+}
+
+extern "C" cudaError_t cueri_eri_ppps_mixed_launch_stream(
+    const int32_t* task_spAB, const int32_t* task_spCD, int ntasks,
+    const int32_t* sp_A, const int32_t* sp_B,
+    const int32_t* sp_pair_start, const int32_t* sp_npair,
+    const double* shell_cx, const double* shell_cy, const double* shell_cz,
+    const double* pair_eta, const double* pair_Px, const double* pair_Py, const double* pair_Pz,
+    const double* pair_cK, double* eri_out,
+    cudaStream_t stream, int threads) {
+  if (ntasks <= 0) return cudaSuccess;
+  const int blocks = (ntasks + threads - 1) / threads;
+  KernelERI_ppps_flat<false, true><<<blocks, threads, 0, stream>>>(
+      task_spAB, task_spCD, ntasks, sp_A, sp_B, sp_pair_start, sp_npair,
+      shell_cx, shell_cy, shell_cz, pair_eta, pair_Px, pair_Py, pair_Pz, pair_cK, eri_out, nullptr);
+  return cudaGetLastError();
+}
+
+extern "C" cudaError_t cueri_eri_ppps_mixed_f32_launch_stream(
+    const int32_t* task_spAB, const int32_t* task_spCD, int ntasks,
+    const int32_t* sp_A, const int32_t* sp_B,
+    const int32_t* sp_pair_start, const int32_t* sp_npair,
+    const double* shell_cx, const double* shell_cy, const double* shell_cz,
+    const double* pair_eta, const double* pair_Px, const double* pair_Py, const double* pair_Pz,
+    const double* pair_cK, float* eri_out,
+    cudaStream_t stream, int threads) {
+  if (ntasks <= 0) return cudaSuccess;
+  const int blocks = (ntasks + threads - 1) / threads;
+  KernelERI_ppps_flat<true, true><<<blocks, threads, 0, stream>>>(
+      task_spAB, task_spCD, ntasks, sp_A, sp_B, sp_pair_start, sp_npair,
+      shell_cx, shell_cy, shell_cz, pair_eta, pair_Px, pair_Py, pair_Pz, pair_cK, nullptr, eri_out);
+  return cudaGetLastError();
+}
+
+// --- pppp ---
+extern "C" cudaError_t cueri_eri_pppp_f32_launch_stream(
+    const int32_t* task_spAB, const int32_t* task_spCD, int ntasks,
+    const int32_t* sp_A, const int32_t* sp_B,
+    const int32_t* sp_pair_start, const int32_t* sp_npair,
+    const double* shell_cx, const double* shell_cy, const double* shell_cz,
+    const double* pair_eta, const double* pair_Px, const double* pair_Py, const double* pair_Pz,
+    const double* pair_cK, float* eri_out,
+    cudaStream_t stream, int threads) {
+  if (ntasks <= 0) return cudaSuccess;
+  const int blocks = (ntasks + threads - 1) / threads;
+  KernelERI_pppp_flat<true, false><<<blocks, threads, 0, stream>>>(
+      task_spAB, task_spCD, ntasks, sp_A, sp_B, sp_pair_start, sp_npair,
+      shell_cx, shell_cy, shell_cz, pair_eta, pair_Px, pair_Py, pair_Pz, pair_cK, nullptr, eri_out);
+  return cudaGetLastError();
+}
+
+extern "C" cudaError_t cueri_eri_pppp_mixed_launch_stream(
+    const int32_t* task_spAB, const int32_t* task_spCD, int ntasks,
+    const int32_t* sp_A, const int32_t* sp_B,
+    const int32_t* sp_pair_start, const int32_t* sp_npair,
+    const double* shell_cx, const double* shell_cy, const double* shell_cz,
+    const double* pair_eta, const double* pair_Px, const double* pair_Py, const double* pair_Pz,
+    const double* pair_cK, double* eri_out,
+    cudaStream_t stream, int threads) {
+  if (ntasks <= 0) return cudaSuccess;
+  const int blocks = (ntasks + threads - 1) / threads;
+  KernelERI_pppp_flat<false, true><<<blocks, threads, 0, stream>>>(
+      task_spAB, task_spCD, ntasks, sp_A, sp_B, sp_pair_start, sp_npair,
+      shell_cx, shell_cy, shell_cz, pair_eta, pair_Px, pair_Py, pair_Pz, pair_cK, eri_out, nullptr);
+  return cudaGetLastError();
+}
+
+extern "C" cudaError_t cueri_eri_pppp_mixed_f32_launch_stream(
+    const int32_t* task_spAB, const int32_t* task_spCD, int ntasks,
+    const int32_t* sp_A, const int32_t* sp_B,
+    const int32_t* sp_pair_start, const int32_t* sp_npair,
+    const double* shell_cx, const double* shell_cy, const double* shell_cz,
+    const double* pair_eta, const double* pair_Px, const double* pair_Py, const double* pair_Pz,
+    const double* pair_cK, float* eri_out,
+    cudaStream_t stream, int threads) {
+  if (ntasks <= 0) return cudaSuccess;
+  const int blocks = (ntasks + threads - 1) / threads;
+  KernelERI_pppp_flat<true, true><<<blocks, threads, 0, stream>>>(
+      task_spAB, task_spCD, ntasks, sp_A, sp_B, sp_pair_start, sp_npair,
+      shell_cx, shell_cy, shell_cz, pair_eta, pair_Px, pair_Py, pair_Pz, pair_cK, nullptr, eri_out);
+  return cudaGetLastError();
+}
+
+// --- FP32 accumulator launchers (precision_mode 6 = mixed+f32accum+fp64out, 7 = mixed+f32accum+f32out) ---
+
+// psss f32accum
+extern "C" cudaError_t cueri_eri_psss_f32accum_launch_stream(
+    const int32_t* task_spAB, const int32_t* task_spCD, int ntasks,
+    const int32_t* sp_A, const int32_t* sp_B,
+    const int32_t* sp_pair_start, const int32_t* sp_npair,
+    const double* shell_cx, const double* shell_cy, const double* shell_cz,
+    const double* pair_eta, const double* pair_Px, const double* pair_Py, const double* pair_Pz,
+    const double* pair_cK, double* eri_out,
+    cudaStream_t stream, int threads) {
+  (void)sp_B;
+  if (ntasks <= 0) return ntasks == 0 ? cudaSuccess : cudaErrorInvalidValue;
+  const int blocks = (ntasks + threads - 1) / threads;
+  KernelERI_psss_flat<false, true, true><<<static_cast<unsigned int>(blocks), threads, 0, stream>>>(
+      task_spAB, task_spCD, ntasks, sp_A, sp_pair_start, sp_npair,
+      shell_cx, shell_cy, shell_cz, pair_eta, pair_Px, pair_Py, pair_Pz, pair_cK, eri_out, nullptr);
+  return cudaGetLastError();
+}
+extern "C" cudaError_t cueri_eri_psss_f32accum_f32_launch_stream(
+    const int32_t* task_spAB, const int32_t* task_spCD, int ntasks,
+    const int32_t* sp_A, const int32_t* sp_B,
+    const int32_t* sp_pair_start, const int32_t* sp_npair,
+    const double* shell_cx, const double* shell_cy, const double* shell_cz,
+    const double* pair_eta, const double* pair_Px, const double* pair_Py, const double* pair_Pz,
+    const double* pair_cK, float* eri_out,
+    cudaStream_t stream, int threads) {
+  (void)sp_B;
+  if (ntasks <= 0) return ntasks == 0 ? cudaSuccess : cudaErrorInvalidValue;
+  const int blocks = (ntasks + threads - 1) / threads;
+  KernelERI_psss_flat<true, true, true><<<static_cast<unsigned int>(blocks), threads, 0, stream>>>(
+      task_spAB, task_spCD, ntasks, sp_A, sp_pair_start, sp_npair,
+      shell_cx, shell_cy, shell_cz, pair_eta, pair_Px, pair_Py, pair_Pz, pair_cK, nullptr, eri_out);
+  return cudaGetLastError();
+}
+
+// ppss f32accum
+extern "C" cudaError_t cueri_eri_ppss_f32accum_launch_stream(
+    const int32_t* task_spAB, const int32_t* task_spCD, int ntasks,
+    const int32_t* sp_A, const int32_t* sp_B,
+    const int32_t* sp_pair_start, const int32_t* sp_npair,
+    const double* shell_cx, const double* shell_cy, const double* shell_cz,
+    const double* pair_eta, const double* pair_Px, const double* pair_Py, const double* pair_Pz,
+    const double* pair_cK, double* eri_out,
+    cudaStream_t stream, int threads) {
+  if (ntasks <= 0) return ntasks == 0 ? cudaSuccess : cudaErrorInvalidValue;
+  const int blocks = (ntasks + threads - 1) / threads;
+  KernelERI_ppss_flat<false, true, true><<<static_cast<unsigned int>(blocks), threads, 0, stream>>>(
+      task_spAB, task_spCD, ntasks, sp_A, sp_B, sp_pair_start, sp_npair,
+      shell_cx, shell_cy, shell_cz, pair_eta, pair_Px, pair_Py, pair_Pz, pair_cK, eri_out, nullptr);
+  return cudaGetLastError();
+}
+extern "C" cudaError_t cueri_eri_ppss_f32accum_f32_launch_stream(
+    const int32_t* task_spAB, const int32_t* task_spCD, int ntasks,
+    const int32_t* sp_A, const int32_t* sp_B,
+    const int32_t* sp_pair_start, const int32_t* sp_npair,
+    const double* shell_cx, const double* shell_cy, const double* shell_cz,
+    const double* pair_eta, const double* pair_Px, const double* pair_Py, const double* pair_Pz,
+    const double* pair_cK, float* eri_out,
+    cudaStream_t stream, int threads) {
+  if (ntasks <= 0) return ntasks == 0 ? cudaSuccess : cudaErrorInvalidValue;
+  const int blocks = (ntasks + threads - 1) / threads;
+  KernelERI_ppss_flat<true, true, true><<<static_cast<unsigned int>(blocks), threads, 0, stream>>>(
+      task_spAB, task_spCD, ntasks, sp_A, sp_B, sp_pair_start, sp_npair,
+      shell_cx, shell_cy, shell_cz, pair_eta, pair_Px, pair_Py, pair_Pz, pair_cK, nullptr, eri_out);
+  return cudaGetLastError();
+}
+
+// psps f32accum
+extern "C" cudaError_t cueri_eri_psps_f32accum_launch_stream(
+    const int32_t* task_spAB, const int32_t* task_spCD, int ntasks,
+    const int32_t* sp_A, const int32_t* sp_B,
+    const int32_t* sp_pair_start, const int32_t* sp_npair,
+    const double* shell_cx, const double* shell_cy, const double* shell_cz,
+    const double* pair_eta, const double* pair_Px, const double* pair_Py, const double* pair_Pz,
+    const double* pair_cK, double* eri_out,
+    cudaStream_t stream, int threads) {
+  if (ntasks <= 0) return ntasks == 0 ? cudaSuccess : cudaErrorInvalidValue;
+  const int blocks = (ntasks + threads - 1) / threads;
+  KernelERI_psps_flat<false, true, true><<<static_cast<unsigned int>(blocks), threads, 0, stream>>>(
+      task_spAB, task_spCD, ntasks, sp_A, sp_B, sp_pair_start, sp_npair,
+      shell_cx, shell_cy, shell_cz, pair_eta, pair_Px, pair_Py, pair_Pz, pair_cK, eri_out, nullptr);
+  return cudaGetLastError();
+}
+extern "C" cudaError_t cueri_eri_psps_f32accum_f32_launch_stream(
+    const int32_t* task_spAB, const int32_t* task_spCD, int ntasks,
+    const int32_t* sp_A, const int32_t* sp_B,
+    const int32_t* sp_pair_start, const int32_t* sp_npair,
+    const double* shell_cx, const double* shell_cy, const double* shell_cz,
+    const double* pair_eta, const double* pair_Px, const double* pair_Py, const double* pair_Pz,
+    const double* pair_cK, float* eri_out,
+    cudaStream_t stream, int threads) {
+  if (ntasks <= 0) return ntasks == 0 ? cudaSuccess : cudaErrorInvalidValue;
+  const int blocks = (ntasks + threads - 1) / threads;
+  KernelERI_psps_flat<true, true, true><<<static_cast<unsigned int>(blocks), threads, 0, stream>>>(
+      task_spAB, task_spCD, ntasks, sp_A, sp_B, sp_pair_start, sp_npair,
+      shell_cx, shell_cy, shell_cz, pair_eta, pair_Px, pair_Py, pair_Pz, pair_cK, nullptr, eri_out);
+  return cudaGetLastError();
+}
+
+// dsss f32accum
+extern "C" cudaError_t cueri_eri_dsss_f32accum_launch_stream(
+    const int32_t* task_spAB, const int32_t* task_spCD, int ntasks,
+    const int32_t* sp_A, const int32_t* sp_B,
+    const int32_t* sp_pair_start, const int32_t* sp_npair,
+    const double* shell_cx, const double* shell_cy, const double* shell_cz,
+    const double* pair_eta, const double* pair_Px, const double* pair_Py, const double* pair_Pz,
+    const double* pair_cK, double* eri_out,
+    cudaStream_t stream, int threads) {
+  (void)sp_B;
+  if (ntasks <= 0) return ntasks == 0 ? cudaSuccess : cudaErrorInvalidValue;
+  const int blocks = (ntasks + threads - 1) / threads;
+  KernelERI_dsss_flat<false, true, true><<<static_cast<unsigned int>(blocks), threads, 0, stream>>>(
+      task_spAB, task_spCD, ntasks, sp_A, sp_pair_start, sp_npair,
+      shell_cx, shell_cy, shell_cz, pair_eta, pair_Px, pair_Py, pair_Pz, pair_cK, eri_out, nullptr);
+  return cudaGetLastError();
+}
+extern "C" cudaError_t cueri_eri_dsss_f32accum_f32_launch_stream(
+    const int32_t* task_spAB, const int32_t* task_spCD, int ntasks,
+    const int32_t* sp_A, const int32_t* sp_B,
+    const int32_t* sp_pair_start, const int32_t* sp_npair,
+    const double* shell_cx, const double* shell_cy, const double* shell_cz,
+    const double* pair_eta, const double* pair_Px, const double* pair_Py, const double* pair_Pz,
+    const double* pair_cK, float* eri_out,
+    cudaStream_t stream, int threads) {
+  (void)sp_B;
+  if (ntasks <= 0) return ntasks == 0 ? cudaSuccess : cudaErrorInvalidValue;
+  const int blocks = (ntasks + threads - 1) / threads;
+  KernelERI_dsss_flat<true, true, true><<<static_cast<unsigned int>(blocks), threads, 0, stream>>>(
+      task_spAB, task_spCD, ntasks, sp_A, sp_pair_start, sp_npair,
+      shell_cx, shell_cy, shell_cz, pair_eta, pair_Px, pair_Py, pair_Pz, pair_cK, nullptr, eri_out);
+  return cudaGetLastError();
+}
+
+// ppps f32accum
+extern "C" cudaError_t cueri_eri_ppps_f32accum_launch_stream(
+    const int32_t* task_spAB, const int32_t* task_spCD, int ntasks,
+    const int32_t* sp_A, const int32_t* sp_B,
+    const int32_t* sp_pair_start, const int32_t* sp_npair,
+    const double* shell_cx, const double* shell_cy, const double* shell_cz,
+    const double* pair_eta, const double* pair_Px, const double* pair_Py, const double* pair_Pz,
+    const double* pair_cK, double* eri_out,
+    cudaStream_t stream, int threads) {
+  if (ntasks <= 0) return ntasks == 0 ? cudaSuccess : cudaErrorInvalidValue;
+  const int blocks = (ntasks + threads - 1) / threads;
+  KernelERI_ppps_flat<false, true, true><<<static_cast<unsigned int>(blocks), threads, 0, stream>>>(
+      task_spAB, task_spCD, ntasks, sp_A, sp_B, sp_pair_start, sp_npair,
+      shell_cx, shell_cy, shell_cz, pair_eta, pair_Px, pair_Py, pair_Pz, pair_cK, eri_out, nullptr);
+  return cudaGetLastError();
+}
+extern "C" cudaError_t cueri_eri_ppps_f32accum_f32_launch_stream(
+    const int32_t* task_spAB, const int32_t* task_spCD, int ntasks,
+    const int32_t* sp_A, const int32_t* sp_B,
+    const int32_t* sp_pair_start, const int32_t* sp_npair,
+    const double* shell_cx, const double* shell_cy, const double* shell_cz,
+    const double* pair_eta, const double* pair_Px, const double* pair_Py, const double* pair_Pz,
+    const double* pair_cK, float* eri_out,
+    cudaStream_t stream, int threads) {
+  if (ntasks <= 0) return ntasks == 0 ? cudaSuccess : cudaErrorInvalidValue;
+  const int blocks = (ntasks + threads - 1) / threads;
+  KernelERI_ppps_flat<true, true, true><<<static_cast<unsigned int>(blocks), threads, 0, stream>>>(
+      task_spAB, task_spCD, ntasks, sp_A, sp_B, sp_pair_start, sp_npair,
+      shell_cx, shell_cy, shell_cz, pair_eta, pair_Px, pair_Py, pair_Pz, pair_cK, nullptr, eri_out);
+  return cudaGetLastError();
+}
+
+// pppp f32accum
+extern "C" cudaError_t cueri_eri_pppp_f32accum_launch_stream(
+    const int32_t* task_spAB, const int32_t* task_spCD, int ntasks,
+    const int32_t* sp_A, const int32_t* sp_B,
+    const int32_t* sp_pair_start, const int32_t* sp_npair,
+    const double* shell_cx, const double* shell_cy, const double* shell_cz,
+    const double* pair_eta, const double* pair_Px, const double* pair_Py, const double* pair_Pz,
+    const double* pair_cK, double* eri_out,
+    cudaStream_t stream, int threads) {
+  if (ntasks <= 0) return cudaSuccess;
+  const int blocks = (ntasks + threads - 1) / threads;
+  KernelERI_pppp_flat<false, true, true><<<blocks, threads, 0, stream>>>(
+      task_spAB, task_spCD, ntasks, sp_A, sp_B, sp_pair_start, sp_npair,
+      shell_cx, shell_cy, shell_cz, pair_eta, pair_Px, pair_Py, pair_Pz, pair_cK, eri_out, nullptr);
+  return cudaGetLastError();
+}
+extern "C" cudaError_t cueri_eri_pppp_f32accum_f32_launch_stream(
+    const int32_t* task_spAB, const int32_t* task_spCD, int ntasks,
+    const int32_t* sp_A, const int32_t* sp_B,
+    const int32_t* sp_pair_start, const int32_t* sp_npair,
+    const double* shell_cx, const double* shell_cy, const double* shell_cz,
+    const double* pair_eta, const double* pair_Px, const double* pair_Py, const double* pair_Pz,
+    const double* pair_cK, float* eri_out,
+    cudaStream_t stream, int threads) {
+  if (ntasks <= 0) return cudaSuccess;
+  const int blocks = (ntasks + threads - 1) / threads;
+  KernelERI_pppp_flat<true, true, true><<<blocks, threads, 0, stream>>>(
+      task_spAB, task_spCD, ntasks, sp_A, sp_B, sp_pair_start, sp_npair,
+      shell_cx, shell_cy, shell_cz, pair_eta, pair_Px, pair_Py, pair_Pz, pair_cK, nullptr, eri_out);
   return cudaGetLastError();
 }
 
@@ -2375,7 +3056,9 @@ extern "C" cudaError_t cueri_fused_jk_dsss_launch_stream(
     double* K_mat,
     cudaStream_t stream,
     int threads,
-    int n_bufs) {
+    int n_bufs,
+    bool mixed_prec) {
+  (void)mixed_prec;  // ignored for hand-written kernels
   if (ntasks < 0 || nao <= 0) return cudaErrorInvalidValue;
   if (ntasks == 0) return cudaSuccess;
   if (threads < 32 || (threads & 31) != 0) return cudaErrorInvalidValue;
@@ -2414,7 +3097,9 @@ extern "C" cudaError_t cueri_fused_fock_ppss_launch_stream(
     double* F_mat,
     cudaStream_t stream,
     int threads,
-    int n_bufs) {
+    int n_bufs,
+    bool mixed_prec) {
+  (void)mixed_prec;  // ignored for hand-written kernels
   if (ntasks < 0 || nao <= 0) return cudaErrorInvalidValue;
   if (ntasks == 0) return cudaSuccess;
   if (threads < 32 || (threads & 31) != 0) return cudaErrorInvalidValue;
@@ -2454,7 +3139,9 @@ extern "C" cudaError_t cueri_fused_jk_ppss_launch_stream(
     double* K_mat,
     cudaStream_t stream,
     int threads,
-    int n_bufs) {
+    int n_bufs,
+    bool mixed_prec) {
+  (void)mixed_prec;  // ignored for hand-written kernels
   if (ntasks < 0 || nao <= 0) return cudaErrorInvalidValue;
   if (ntasks == 0) return cudaSuccess;
   if (threads < 32 || (threads & 31) != 0) return cudaErrorInvalidValue;
@@ -2493,7 +3180,9 @@ extern "C" cudaError_t cueri_fused_fock_psps_launch_stream(
     double* F_mat,
     cudaStream_t stream,
     int threads,
-    int n_bufs) {
+    int n_bufs,
+    bool mixed_prec) {
+  (void)mixed_prec;  // ignored for hand-written kernels
   if (ntasks < 0 || nao <= 0) return cudaErrorInvalidValue;
   if (ntasks == 0) return cudaSuccess;
   if (threads < 32 || (threads & 31) != 0) return cudaErrorInvalidValue;
@@ -2534,7 +3223,9 @@ extern "C" cudaError_t cueri_fused_jk_psps_launch_stream(
     double* K_mat,
     cudaStream_t stream,
     int threads,
-    int n_bufs) {
+    int n_bufs,
+    bool mixed_prec) {
+  (void)mixed_prec;  // ignored for hand-written kernels
   if (ntasks < 0 || nao <= 0) return cudaErrorInvalidValue;
   if (ntasks == 0) return cudaSuccess;
   if (threads < 32 || (threads & 31) != 0) return cudaErrorInvalidValue;

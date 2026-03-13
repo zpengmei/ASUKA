@@ -375,6 +375,60 @@ Environment variables for the CUDA build:
 | `ASUKA_SKIP_CUDA_EXT=1` | Skip all CUDA extension builds |
 | `ASUKA_REQUIRE_CUDA_EXT=1` | Fail if nvcc is not found |
 
+Runtime environment variables:
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `ASUKA_ERI_MIXED_PRECISION` | `1` (on) | FP32 component evaluation in ERI kernels (Boys/Rys roots stay FP64). Set `0` for pure FP64. |
+| `ASUKA_ERI_TILE_F32` | `0` (off) | Store ERI tiles in FP32 (halves memory bandwidth). |
+| `ASUKA_ERI_F32_ACCUM` | `0` (off) | FP32 tile accumulators for light shell quartets (s/p). Requires `MIXED_PRECISION=1`. |
+| `ASUKA_DIRECT_JK_EPS_DENSITY` | = eps_schwarz | CSAM density prescreening threshold for integral-direct SCF. |
+
+### Mixed-precision ERI acceleration
+
+ASUKA's integral-direct SCF kernels support three independent precision knobs
+that trade negligible accuracy for throughput and bandwidth. Each knob controls
+a different stage of the ERI pipeline:
+
+```
+┌──────────────────────────────────────────────────────────────────────┐
+│  Boys / Rys roots & weights          always FP64 (no knob)         │
+│  G-array recurrence                  always FP64 (no knob)         │
+│  Component evaluation (Ix·Iy·Iz)     ← ASUKA_ERI_MIXED_PRECISION  │
+│  Tile accumulation (Σ over prims)    ← ASUKA_ERI_F32_ACCUM        │
+│  Tile output (write to GMEM)         ← ASUKA_ERI_TILE_F32         │
+└──────────────────────────────────────────────────────────────────────┘
+```
+
+**Precision modes and accuracy (H2O / 6-31G, direct backend):**
+
+| Mode | Env vars | |ΔE| vs FP64 | Notes |
+|---|---|---|---|
+| FP64 (reference) | `MIXED_PRECISION=0` | 0 | Baseline |
+| Mixed compute | `MIXED_PRECISION=1` | ~3e-8 | Default. FP32 for Ix·Iy·Iz products only. |
+| Mixed + FP32 tiles | `MIXED_PRECISION=1 TILE_F32=1` | ~3e-7 | Halves tile bandwidth. |
+| Mixed + FP32 accum | `MIXED_PRECISION=1 F32_ACCUM=1` | ~1e-7 | FP32 accumulators for s/p quartets. |
+| All aggressive | `MIXED_PRECISION=1 TILE_F32=1 F32_ACCUM=1` | ~1e-7 | Maximum throughput. |
+
+All modes produce total energies within **2 microHartree** of the FP64 reference.
+Mixed precision only affects the `direct` and `direct_df` two-electron backends;
+the `dense` and `df` backends are unaffected.
+
+**Recommended configurations:**
+
+```bash
+# Default (mixed compute on, others off) — safe for all workflows
+export ASUKA_ERI_MIXED_PRECISION=1
+
+# Maximum throughput — safe for SCF energies and geometry optimization
+export ASUKA_ERI_MIXED_PRECISION=1
+export ASUKA_ERI_TILE_F32=1
+export ASUKA_ERI_F32_ACCUM=1
+
+# Pure FP64 — for gradient validation or reference calculations
+export ASUKA_ERI_MIXED_PRECISION=0
+```
+
 If CUDA libraries were installed via pip wheels (`nvidia-*`), you may need to expose them to the dynamic linker:
 
 ```bash

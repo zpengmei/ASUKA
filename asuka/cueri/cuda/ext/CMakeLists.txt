@@ -8,9 +8,10 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CUDA_STANDARD 17)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
-option(CUERI_FAST_BOYS "Enable fast Boys moments for small-root Rys (NROOTS<=3)" OFF)
+option(CUERI_FAST_BOYS "Enable fast Boys moments for small-root Rys (NROOTS<=3)" ON)
 option(CUERI_FAST_DEV_DIRECT_JK "Build a reduced direct-J/K-focused extension without derivative/DF-heavy CUDA sources" OFF)
 option(CUERI_FAST_DEV_STEP2_ONLY "Build a minimal step2-only extension for specialized ERI/J/K kernel work" OFF)
+option(CUERI_BOYS_LUT "Enable Chebyshev lookup table for Boys function evaluation" ON)
 
 if (CUERI_FAST_DEV_DIRECT_JK AND CUERI_FAST_DEV_STEP2_ONLY)
   message(FATAL_ERROR "CUERI_FAST_DEV_DIRECT_JK and CUERI_FAST_DEV_STEP2_ONLY are mutually exclusive")
@@ -130,11 +131,14 @@ target_compile_options(
   _cueri_cuda_ext
   PRIVATE
     $<$<COMPILE_LANGUAGE:CXX>:-O3>
-    $<$<COMPILE_LANGUAGE:CUDA>:-O3>
+    $<$<COMPILE_LANGUAGE:CUDA>:-O3;-lineinfo>
 )
 
 if (CUERI_FAST_BOYS)
   target_compile_definitions(_cueri_cuda_ext PRIVATE CUERI_FAST_BOYS=1)
+endif()
+if (CUERI_BOYS_LUT)
+  target_compile_definitions(_cueri_cuda_ext PRIVATE CUERI_BOYS_LUT=1)
 endif()
 if (CUERI_FAST_DEV_DIRECT_JK)
   target_compile_definitions(_cueri_cuda_ext PRIVATE CUERI_FAST_DEV_DIRECT_JK=1)

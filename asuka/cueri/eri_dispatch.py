@@ -69,6 +69,96 @@ from .stream import stream_ctx
 from .tasks import TaskList, decode_eri_class_id, eri_class_id, with_task_class_id
 
 
+# Mixed-precision ERI kernel classes that have _f32/_mixed/_mixed_f32 launchers.
+# Hand-written s/p kernels + all generated d/f/g-shell classes.
+_MIXED_PREC_CLASSES = frozenset({
+    # Hand-written (step2_part3.cu)
+    "psss", "ppss", "psps", "dsss", "ppps", "pppp",
+    # Generated wave1/wave2 (d/f/g shells)
+    "ssdp", "psds", "psdp", "psdd",
+    "ppds", "ppdp", "ppdd",
+    "dsds", "dsdp", "dsdd",
+    "dpdp", "dpdd", "dddd", "ddss",
+    "fpss", "fdss", "ffss",
+    "fpps", "fdps", "ffps",
+    "fpds", "fdds", "ffds",
+    "ssfs", "psfs", "ppfs", "dsfs", "fsfs",
+    "dpfs", "fpfs", "ddfs", "fdfs", "fffs",
+    "ssgs", "psgs", "ppgs", "dsgs", "fsgs",
+    "dpgs", "fpgs", "ddgs", "fdgs", "ffgs",
+})
+
+
+def _mixed_precision_mode(tile_dtype: str, mixed_precision: bool, f32_accum: bool = False) -> int:
+    """Convert tile_dtype/mixed_precision/f32_accum to pybind11 precision_mode int.
+
+    Bitmask: bit0=f32_output, bit1=mixed_compute, bit2=f32_accum.
+    f32_accum requires mixed_precision (modes 6,7 only).
+    """
+    f32 = str(tile_dtype).strip().lower() in ("float32", "f32", "fp32")
+    mode = 0
+    if f32:
+        mode |= 1
+    if mixed_precision:
+        mode |= 2
+    if f32_accum and mixed_precision:
+        mode |= 4
+    return mode
+
+
+def _run_native_mixed(
+    name: str,
+    ncomp: int,
+    batch,
+    *,
+    dbasis,
+    dsp,
+    pt,
+    stream,
+    threads: int,
+    tile_dtype: str,
+    mixed_precision: bool,
+    f32_accum: bool = False,
+):
+    """Call the mixed-precision pybind11 binding for a native s/p kernel class."""
+    import cupy as cp
+    from .gpu import _require_cuda_ext, _ext, _task_arrays_device_cached, _stream_ptr
+
+    _require_cuda_ext()
+    prec_mode = _mixed_precision_mode(tile_dtype, mixed_precision, f32_accum=f32_accum)
+    out_f32 = prec_mode in (1, 3, 7)
+    out_dtype = cp.float32 if out_f32 else cp.float64
+
+    task_ab, task_cd = _task_arrays_device_cached(batch.kernel_tasks)
+    out = cp.empty(int(batch.kernel_tasks.ntasks) * ncomp, dtype=out_dtype)
+    if batch.kernel_tasks.ntasks == 0:
+        return out
+
+    fn = getattr(_ext, f"eri_{name}_mixed_inplace_device")
+    fn(
+        task_ab,
+        task_cd,
+        dsp.sp_A,
+        dsp.sp_B,
+        dsp.sp_pair_start,
+        dsp.sp_npair,
+        dbasis.shell_cx,
+        dbasis.shell_cy,
+        dbasis.shell_cz,
+        pt.pair_eta,
+        pt.pair_Px,
+        pt.pair_Py,
+        pt.pair_Pz,
+        pt.pair_cK,
+        out,
+        prec_mode,
+        int(threads),
+        int(_stream_ptr(stream)),
+        False,
+    )
+    return out
+
+
 def _env_bool(name: str, default: bool) -> bool:
     raw = os.environ.get(name, None)
     if raw is None:
@@ -321,6 +411,9 @@ def run_kernel_batch_spd(
     boys: str = "ref",
     profile: dict | None = None,
     skip_transpose: bool = False,
+    tile_dtype: str = "float64",
+    mixed_precision: bool = False,
+    f32_accum: bool = False,
 ):
     """Execute a single kernel batch on the GPU.
 
@@ -359,11 +452,19 @@ def run_kernel_batch_spd(
     profile : dict | None, optional
         Optional profile dictionary. When provided, records per-class kernel
         timing and task counts in this dict.
+    tile_dtype : str, default='float64'
+        Output tile dtype: ``'float64'`` (default) or ``'float32'`` for
+        FP32 tile output (halves bandwidth, ~1e-7 relative error per ERI).
+    mixed_precision : bool, default=False
+        When True, use FP32 for component evaluation (Ux/Uy/Uz) while keeping
+        FP64 for Boys/Rys/G-array and tile accumulation. Gets FP32 throughput
+        on ~50% of kernel compute.
 
     Returns
     -------
     cupy.ndarray
         The computed integrals as a CuPy array of shape `(ntasks, nAB, nCD)`.
+        dtype is float64 when tile_dtype='float64', float32 when 'float32'.
     """
 
     import cupy as cp
@@ -379,6 +480,42 @@ def run_kernel_batch_spd(
         s0 = cp.cuda.get_current_stream() if profile is not None else None
         if evt0 is not None and s0 is not None:
             evt0.record(s0)
+
+        # Early dispatch: route ALL native classes through mixed-precision
+        # binding when tile_dtype or mixed_precision is non-default.
+        prec = _mixed_precision_mode(tile_dtype, mixed_precision, f32_accum=f32_accum)
+        if prec != 0:
+            cls_name = (
+                f"{_am_label(int(la))}{_am_label(int(lb))}"
+                f"{_am_label(int(lc))}{_am_label(int(ld))}"
+            )
+            if cls_name in _MIXED_PREC_CLASSES:
+                dispatch_path = f"native_{cls_name}_mp{prec}"
+                raw = _run_native_mixed(
+                    cls_name, nAB * nCD, batch,
+                    dbasis=dbasis, dsp=dsp, pt=pt, stream=stream,
+                    threads=threads, tile_dtype=tile_dtype,
+                    mixed_precision=mixed_precision,
+                    f32_accum=f32_accum,
+                )
+                tile = raw.reshape((-1, nAB, nCD))
+                if batch.transpose and not skip_transpose:
+                    tile = tile.transpose((0, 2, 1))
+                    tile = cp.ascontiguousarray(tile)
+                if evt0 is not None and evt1 is not None and s0 is not None:
+                    evt1.record(s0)
+                    evt1.synchronize()
+                    dt_ms = float(cp.cuda.get_elapsed_time(evt0, evt1))
+                    profile["kernel_ms"] = float(profile.get("kernel_ms", 0.0)) + dt_ms
+                    key = (
+                        f"{cls_name}|la={int(la)}|lb={int(lb)}|lc={int(lc)}|ld={int(ld)}|"
+                        f"tr={int(batch.transpose)}|path={dispatch_path}|nAB={int(nAB)}|nCD={int(nCD)}"
+                    )
+                    row = profile.setdefault("classes", {}).setdefault(key, {"ms": 0.0, "calls": 0, "ntasks": 0})
+                    row["ms"] = float(row.get("ms", 0.0)) + dt_ms
+                    row["calls"] = int(row.get("calls", 0)) + 1
+                    row["ntasks"] = int(row.get("ntasks", 0)) + int(tile.shape[0])
+                return tile
 
         def _run_generic_raw():
             nonlocal dispatch_path

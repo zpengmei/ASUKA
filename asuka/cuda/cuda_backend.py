@@ -5273,6 +5273,7 @@ def cas36_hb_screen_and_apply_u64_inplace_device(
     selected_idx_sorted_u64=None,
     target_mode: str | int = "external_only",
     overflow=None,
+    sym_pq_allowed=None,
     threads: int = 256,
     stream=None,
     sync: bool = True,
@@ -5359,6 +5360,7 @@ def cas36_hb_screen_and_apply_u64_inplace_device(
         selected_idx_sorted_u64 if selected_idx_sorted_u64 is not None else None,
         int(target_mode_i),
         overflow,
+        sym_pq_allowed if sym_pq_allowed is not None else None,
         int(threads),
         int(stream_ptr),
         bool(sync),
@@ -5393,6 +5395,7 @@ def cas36_hb_emit_tuples_u64_inplace_device(
     target_mode: str | int = "external_only",
     out_n=None,
     overflow=None,
+    sym_pq_allowed=None,
     threads: int = 256,
     stream=None,
     sync: bool = True,
@@ -5486,6 +5489,7 @@ def cas36_hb_emit_tuples_u64_inplace_device(
         int(target_mode_i),
         out_n,
         overflow,
+        sym_pq_allowed if sym_pq_allowed is not None else None,
         int(threads),
         int(stream_ptr),
         bool(sync),
@@ -5594,6 +5598,34 @@ def cas36_exact_selected_emit_tuples_u64_inplace_device(
     return out_keys_u64, out_src, out_hij, out_n, overflow
 
 
+def build_selected_membership_hash(sorted_keys_d, cp):
+    """Build a GPU hash table for O(1) membership lookup from sorted u64 keys.
+
+    Returns (hash_keys_d, hash_cap) where hash_keys_d is a CuPy uint64 array
+    filled with 0xFF (empty sentinel) and populated via the CUDA build kernel.
+    """
+    if _ext is None or not hasattr(_ext, "cas36_sci_build_membership_hash_u64_inplace_device"):
+        return None, 0
+    nkeys = int(sorted_keys_d.size)
+    if nkeys <= 0:
+        return None, 0
+    # Power-of-2 capacity at ~50% load factor
+    cap = 1
+    while cap < 2 * nkeys:
+        cap <<= 1
+    hash_keys_d = cp.full((cap,), 0xFFFFFFFFFFFFFFFF, dtype=cp.uint64)
+    stream_ptr = int(cp.cuda.get_current_stream().ptr)
+    _ext.cas36_sci_build_membership_hash_u64_inplace_device(
+        sorted_keys_d,
+        nkeys,
+        hash_keys_d,
+        cap,
+        stream_ptr,
+        False,
+    )
+    return hash_keys_d, cap
+
+
 def cas36_exact_selected_emit_tuples_dense_u64_inplace_device(
     drt: DRT,
     drt_dev,
@@ -5607,11 +5639,12 @@ def cas36_exact_selected_emit_tuples_dense_u64_inplace_device(
     out_src,
     out_hij,
     cap: int,
-    selected_idx_sorted_u64,
+    membership_hash_keys=None,
+    membership_hash_cap: int = 0,
     out_diag=None,
     out_n=None,
     overflow=None,
-    threads: int = 128,
+    threads: int = 256,
     stream=None,
     sync: bool = True,
 ):
@@ -5633,7 +5666,6 @@ def cas36_exact_selected_emit_tuples_dense_u64_inplace_device(
     out_keys_u64 = cp.ascontiguousarray(cp.asarray(out_keys_u64, dtype=cp.uint64).ravel())
     out_src = cp.ascontiguousarray(cp.asarray(out_src, dtype=cp.int32).ravel())
     out_hij = cp.ascontiguousarray(cp.asarray(out_hij, dtype=cp.float64).ravel())
-    selected_idx_sorted_u64 = cp.ascontiguousarray(cp.asarray(selected_idx_sorted_u64, dtype=cp.uint64).ravel())
     if out_diag is not None:
         out_diag = cp.ascontiguousarray(cp.asarray(out_diag, dtype=cp.float64).ravel())
         if int(out_diag.size) < int(nsel):
@@ -5670,7 +5702,8 @@ def cas36_exact_selected_emit_tuples_dense_u64_inplace_device(
         out_src,
         out_hij,
         int(cap),
-        selected_idx_sorted_u64,
+        membership_hash_keys,
+        int(membership_hash_cap),
         out_diag,
         out_n,
         overflow,
@@ -5679,6 +5712,299 @@ def cas36_exact_selected_emit_tuples_dense_u64_inplace_device(
         bool(sync),
     )
     return out_keys_u64, out_src, out_hij, out_diag, out_n, overflow
+
+
+def has_pairwise_hij_u64_device() -> bool:
+    """Return True if the CUDA extension exposes the pair-wise H[i,j] kernels."""
+    return _ext is not None and hasattr(_ext, "pairwise_hij_u64_inplace_device")
+
+
+def pairwise_materialize_u64_device(
+    drt,
+    drt_dev,
+    sel_idx_u64,
+    nsel: int,
+    cp,
+    *,
+    threads: int = 256,
+    stream=None,
+    sync: bool = True,
+):
+    """Materialize step vectors, nodes, occ, b-values for selected CSFs.
+
+    Returns (steps_all, nodes_all, occ_all, b_all) as cupy device arrays.
+    """
+    if _ext is None or not hasattr(_ext, "pairwise_materialize_u64_inplace_device"):
+        raise RuntimeError(
+            "CUDA extension is missing pairwise materialize kernel; rebuild with python -m asuka.build.guga_cuda_ext"
+        )
+
+    norb = int(drt.norb)
+    sel_idx_u64 = cp.ascontiguousarray(cp.asarray(sel_idx_u64, dtype=cp.uint64).ravel())
+
+    steps_all = cp.zeros((nsel, norb), dtype=cp.int8)
+    nodes_all = cp.zeros((nsel, norb + 1), dtype=cp.int32)
+    occ_all = cp.zeros((nsel, norb), dtype=cp.int8)
+    b_all = cp.zeros((nsel, norb), dtype=cp.int16)
+    overflow = cp.zeros((1,), dtype=cp.int32)
+
+    if stream is None:
+        stream_ptr = int(cp.cuda.get_current_stream().ptr)
+    else:
+        stream_ptr = int(getattr(stream, "ptr", stream))
+
+    _ext.pairwise_materialize_u64_inplace_device(
+        drt_dev,
+        int(drt.ncsf),
+        sel_idx_u64,
+        int(nsel),
+        steps_all.ravel(),
+        nodes_all.ravel(),
+        occ_all.ravel(),
+        b_all.ravel(),
+        overflow,
+        int(threads),
+        int(stream_ptr),
+        bool(sync),
+    )
+
+    if int(overflow.item()) != 0:
+        raise RuntimeError("pairwise_materialize_u64 overflow")
+
+    return steps_all, nodes_all, occ_all, b_all
+
+
+def pairwise_hij_u64_device(
+    drt,
+    drt_dev,
+    sel_idx_u64,
+    nsel: int,
+    h_base,
+    eri4,
+    materialized,
+    cp,
+    *,
+    threads: int = 256,
+    stream=None,
+    sync: bool = True,
+):
+    """Build the dense H[nsel, nsel] matrix using pair-wise evaluation.
+
+    Parameters
+    ----------
+    materialized : tuple
+        (steps_all, nodes_all, occ_all, b_all) from pairwise_materialize_u64_device.
+
+    Returns
+    -------
+    H_d : cupy array, shape (nsel, nsel), dtype float64
+        Dense Hamiltonian matrix (symmetrized).
+    diag_d : cupy array, shape (nsel,), dtype float64
+        Diagonal elements.
+    """
+    if _ext is None or not hasattr(_ext, "pairwise_hij_u64_inplace_device"):
+        raise RuntimeError(
+            "CUDA extension is missing pairwise hij kernel; rebuild with python -m asuka.build.guga_cuda_ext"
+        )
+
+    sel_idx_u64 = cp.ascontiguousarray(cp.asarray(sel_idx_u64, dtype=cp.uint64).ravel())
+    h_base = cp.ascontiguousarray(cp.asarray(h_base, dtype=cp.float64).ravel())
+    eri4 = cp.ascontiguousarray(cp.asarray(eri4, dtype=cp.float64).ravel())
+
+    steps_all, nodes_all, occ_all, b_all = materialized
+
+    H_d = cp.zeros((nsel, nsel), dtype=cp.float64)
+    overflow = cp.zeros((1,), dtype=cp.int32)
+
+    if stream is None:
+        stream_ptr = int(cp.cuda.get_current_stream().ptr)
+    else:
+        stream_ptr = int(getattr(stream, "ptr", stream))
+
+    _ext.pairwise_hij_u64_inplace_device(
+        drt_dev,
+        int(drt.ncsf),
+        sel_idx_u64,
+        int(nsel),
+        h_base,
+        eri4,
+        steps_all.ravel(),
+        nodes_all.ravel(),
+        occ_all.ravel(),
+        b_all.ravel(),
+        H_d.ravel(),
+        overflow,
+        int(threads),
+        int(stream_ptr),
+        bool(sync),
+    )
+
+    if int(overflow.item()) != 0:
+        raise RuntimeError("pairwise_hij_u64 overflow")
+
+    # Kernel computes upper triangle and mirrors to lower in-place (no temp allocation).
+    diag_d = cp.ascontiguousarray(cp.diag(H_d))
+
+    return H_d, diag_d
+
+
+def pairwise_compute_occ_keys(occ_all, norb: int, cp):
+    """Pack occupation vectors into uint64 keys (2 bits per orbital).
+
+    Parameters
+    ----------
+    occ_all : cupy array, shape (nsel, norb), dtype int8
+        Occupation numbers (0, 1, 2) from pairwise_materialize_u64_device.
+    norb : int
+        Number of orbitals (must be <= 32 for uint64 packing).
+    cp : cupy module
+
+    Returns
+    -------
+    keys : cupy array, shape (nsel,), dtype uint64
+        Packed occupation keys.
+    """
+    assert norb <= 32, f"occ key packing requires norb <= 32, got {norb}"
+    shifts = cp.arange(norb, dtype=cp.uint64) * 2  # [norb]
+    occ_u64 = occ_all.astype(cp.uint64)  # [nsel, norb]
+    keys = (occ_u64 << shifts[None, :]).sum(axis=1)  # [nsel]
+    return keys
+
+
+def pairwise_build_occ_buckets(occ_keys, cp):
+    """Sort CSFs by occupation key and compute bucket boundaries.
+
+    Parameters
+    ----------
+    occ_keys : cupy array, shape (nsel,), dtype uint64
+        Packed occupation keys from pairwise_compute_occ_keys.
+
+    Returns
+    -------
+    sort_perm : cupy array, shape (nsel,), dtype int64
+        Permutation that sorts CSFs by occupation key.
+    sorted_keys : cupy array, shape (nsel,), dtype uint64
+        Sorted occupation keys.
+    bucket_starts : cupy array, shape (nbuckets,), dtype int64
+        Start index of each bucket in the sorted order.
+    bucket_keys : cupy array, shape (nbuckets,), dtype uint64
+        Unique occupation key for each bucket.
+    """
+    sort_perm = cp.argsort(occ_keys)
+    sorted_keys = occ_keys[sort_perm]
+
+    # Find bucket boundaries: where sorted_keys changes value
+    if len(sorted_keys) == 0:
+        return sort_perm, sorted_keys, cp.zeros((0,), dtype=cp.int64), cp.zeros((0,), dtype=cp.uint64)
+
+    changes = cp.concatenate([
+        cp.array([True]),
+        sorted_keys[1:] != sorted_keys[:-1],
+    ])
+    bucket_starts = cp.nonzero(changes)[0].astype(cp.int64)
+    bucket_keys = sorted_keys[bucket_starts]
+
+    return sort_perm, sorted_keys, bucket_starts, bucket_keys
+
+
+def pairwise_build_neighbor_csr(bucket_keys, norb, cp, *, max_occ_diff=4):
+    """Build CSR neighbor list: for each bucket, which other buckets are within max_occ_diff.
+
+    Parameters
+    ----------
+    bucket_keys : cupy array, shape (nbuckets,), dtype uint64
+        Unique occupation keys (from pairwise_build_occ_buckets).
+    norb : int
+        Number of orbitals.
+    max_occ_diff : int
+        Maximum number of occupation positions that can differ (4 for two-body).
+
+    Returns
+    -------
+    neighbor_offsets : cupy array, shape (nbuckets+1,), dtype int32
+        CSR offsets: bucket b's neighbors are neighbor_list[offsets[b]:offsets[b+1]].
+    neighbor_list : cupy array, shape (total_neighbors,), dtype int32
+        Flat list of neighbor bucket indices.
+    """
+    import numpy as np
+
+    nbuckets = len(bucket_keys)
+    if nbuckets == 0:
+        return cp.zeros((1,), dtype=cp.int32), cp.zeros((0,), dtype=cp.int32)
+
+    bucket_keys_h = cp.asnumpy(bucket_keys)
+
+    # Decode all bucket keys into occupation vectors (vectorized)
+    shifts = np.arange(norb, dtype=np.uint64) * 2
+    bucket_occs = ((bucket_keys_h[:, None] >> shifts[None, :]) & 3).astype(np.int8)
+
+    # Compute full pairwise diff matrix (vectorized)
+    # diff_matrix[i,j] = number of positions where occ[i] != occ[j]
+    diff_matrix = np.sum(
+        bucket_occs[:, None, :] != bucket_occs[None, :, :], axis=2
+    ).astype(np.int32)  # [nbuckets, nbuckets]
+
+    # Build CSR from diff_matrix
+    mask = diff_matrix <= max_occ_diff  # [nbuckets, nbuckets]
+    counts = mask.sum(axis=1).astype(np.int32)
+    offsets = np.zeros(nbuckets + 1, dtype=np.int32)
+    np.cumsum(counts, out=offsets[1:])
+
+    # Extract neighbor indices row by row
+    neighbor_list = np.zeros(int(offsets[-1]), dtype=np.int32)
+    for b in range(nbuckets):
+        s = offsets[b]
+        e = offsets[b + 1]
+        neighbor_list[s:e] = np.nonzero(mask[b])[0]
+
+    return cp.asarray(offsets), cp.asarray(neighbor_list)
+
+
+def pairwise_build_bucket_data(occ_all, norb, cp):
+    """Full pipeline: occ keys → buckets → neighbor CSR → reordered arrays.
+
+    Returns a dict with all data needed for bucketed kernel dispatch.
+    """
+    import numpy as np
+
+    nsel = occ_all.shape[0]
+
+    keys = pairwise_compute_occ_keys(occ_all, norb, cp)
+    sort_perm, sorted_keys, bucket_starts, bucket_keys = pairwise_build_occ_buckets(keys, cp)
+
+    # Build neighbor CSR
+    neighbor_offsets, neighbor_list = pairwise_build_neighbor_csr(bucket_keys, norb, cp)
+
+    # Compute bucket sizes
+    nbuckets = len(bucket_keys)
+    bucket_starts_ext = cp.concatenate([bucket_starts, cp.array([nsel], dtype=cp.int64)])
+    bucket_sizes = (bucket_starts_ext[1:] - bucket_starts_ext[:-1]).astype(cp.int32)
+
+    # Build inverse permutation: inv_perm[original_idx] = sorted_position
+    inv_perm = cp.zeros(nsel, dtype=cp.int32)
+    inv_perm[sort_perm] = cp.arange(nsel, dtype=cp.int32)
+
+    # Map each CSF to its bucket index
+    csf_to_bucket = cp.zeros(nsel, dtype=cp.int32)
+    bucket_starts_h = cp.asnumpy(bucket_starts)
+    bucket_sizes_h = cp.asnumpy(bucket_sizes)
+    for b in range(nbuckets):
+        s = int(bucket_starts_h[b])
+        sz = int(bucket_sizes_h[b])
+        csf_to_bucket[s:s + sz] = b
+
+    return {
+        "sort_perm": sort_perm.astype(cp.int32),
+        "inv_perm": inv_perm,
+        "bucket_starts": bucket_starts.astype(cp.int32),
+        "bucket_sizes": bucket_sizes,
+        "bucket_keys": bucket_keys,
+        "nbuckets": nbuckets,
+        "neighbor_offsets": neighbor_offsets,
+        "neighbor_list": neighbor_list,
+        "csf_to_bucket": csf_to_bucket,
+        "occ_keys": keys,
+    }
 
 
 def cas36_diag_guess_candidates_u64_dense_inplace_device(
@@ -5850,6 +6176,7 @@ def hb_screen_and_apply_inplace_device(
     hash_vals,
     selected_mask=None,
     overflow=None,
+    sym_pq_allowed=None,
     threads: int = 256,
     stream=None,
     sync: bool = True,
@@ -5901,6 +6228,7 @@ def hb_screen_and_apply_inplace_device(
         hash_vals,
         selected_mask if selected_mask is not None else None,
         overflow,
+        sym_pq_allowed if sym_pq_allowed is not None else None,
         int(threads),
         int(stream_ptr),
         bool(sync),
@@ -5930,6 +6258,7 @@ def hb_screen_and_apply_many_roots_inplace_device(
     hash_vals,
     selected_mask=None,
     overflow=None,
+    sym_pq_allowed=None,
     threads: int = 256,
     stream=None,
     sync: bool = True,
@@ -5984,6 +6313,7 @@ def hb_screen_and_apply_many_roots_inplace_device(
         hash_vals,
         selected_mask if selected_mask is not None else None,
         overflow,
+        sym_pq_allowed if sym_pq_allowed is not None else None,
         int(threads),
         int(stream_ptr),
         bool(sync),

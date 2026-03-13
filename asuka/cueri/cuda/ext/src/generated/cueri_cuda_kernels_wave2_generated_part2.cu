@@ -8,6 +8,7 @@
 
 #include <cmath>
 #include <cstdint>
+#include <type_traits>
 
 #include "cueri_cuda_kernels_api.h"
 #include "cueri_cuda_contract_fock_warp.cuh"
@@ -9295,8 +9296,8 @@ __device__ __forceinline__ double eval_dddd_z(
 
 // Bridge: device helpers from previous part (needed here).
 
-template <int NROOTS>
-__global__ void KernelERI_psdp_flat(
+template <int NROOTS, bool kTileF32 = false, bool kMixedPrec = false>
+__global__ void __launch_bounds__(128) KernelERI_psdp_flat(
     const int32_t* __restrict__ task_spAB,
     const int32_t* __restrict__ task_spCD,
     int ntasks,
@@ -9312,7 +9313,8 @@ __global__ void KernelERI_psdp_flat(
     const double* __restrict__ pair_Py,
     const double* __restrict__ pair_Pz,
     const double* __restrict__ pair_cK,
-    double* __restrict__ eri_out) {
+    double* __restrict__ eri_out_f64,
+    float*  __restrict__ eri_out_f32) {
   const int t = static_cast<int>(blockIdx.x) * static_cast<int>(blockDim.x) + static_cast<int>(threadIdx.x);
   if (t >= ntasks) return;
 
@@ -9363,9 +9365,11 @@ __global__ void KernelERI_psdp_flat(
   double Gx[8];
   double Gy[8];
   double Gz[8];
-  double Ux[12];
-  double Uy[12];
-  double Uz[12];
+  // Component type: FP32 when kMixedPrec, else FP64.
+  using comp_t = typename std::conditional<kMixedPrec, float, double>::type;
+  comp_t Ux[12];
+  comp_t Uy[12];
+  comp_t Uz[12];
   double tile[54];
   tile[0] = 0.0;
   tile[1] = 0.0;
@@ -9464,156 +9468,214 @@ __global__ void KernelERI_psdp_flat(
         compute_G_stride_fixed<kFlatStride, kNMax, kMMax>(Gy, Cy_, Cpy_, B0, B1, B1p);
         compute_G_stride_fixed<kFlatStride, kNMax, kMMax>(Gz, Cz_, Cpz_, B0, B1, B1p);
         const double sc = base * w;
-        Ux[0] = Gx[6] * xkl + Gx[7];
-        Ux[1] = Gx[6];
-        Ux[2] = Gx[5] * xkl + Gx[6];
-        Ux[3] = Gx[5];
-        Ux[4] = Gx[4] * xkl + Gx[5];
-        Ux[5] = Gx[4];
-        Ux[6] = Gx[2] * xkl + Gx[3];
-        Ux[7] = Gx[2];
-        Ux[8] = Gx[1] * xkl + Gx[2];
-        Ux[9] = Gx[1];
-        Ux[10] = Gx[0] * xkl + Gx[1];
-        Ux[11] = Gx[0];
-        Uy[0] = Gy[0];
-        Uy[1] = Gy[0] * ykl + Gy[1];
-        Uy[2] = Gy[1];
-        Uy[3] = Gy[1] * ykl + Gy[2];
-        Uy[4] = Gy[2];
-        Uy[5] = Gy[2] * ykl + Gy[3];
-        Uy[6] = Gy[4];
-        Uy[7] = Gy[4] * ykl + Gy[5];
-        Uy[8] = Gy[5];
-        Uy[9] = Gy[5] * ykl + Gy[6];
-        Uy[10] = Gy[6];
-        Uy[11] = Gy[6] * ykl + Gy[7];
-        Uz[0] = Gz[0];
-        Uz[1] = Gz[0] * zkl + Gz[1];
-        Uz[2] = Gz[1];
-        Uz[3] = Gz[1] * zkl + Gz[2];
-        Uz[4] = Gz[2];
-        Uz[5] = Gz[2] * zkl + Gz[3];
-        Uz[6] = Gz[4];
-        Uz[7] = Gz[4] * zkl + Gz[5];
-        Uz[8] = Gz[5];
-        Uz[9] = Gz[5] * zkl + Gz[6];
-        Uz[10] = Gz[6];
-        Uz[11] = Gz[6] * zkl + Gz[7];
-        tile[0] += sc * Ux[0] * Uy[0] * Uz[0];
-        tile[1] += sc * Ux[1] * Uy[1] * Uz[0];
-        tile[2] += sc * Ux[1] * Uy[0] * Uz[1];
-        tile[3] += sc * Ux[2] * Uy[2] * Uz[0];
-        tile[4] += sc * Ux[3] * Uy[3] * Uz[0];
-        tile[5] += sc * Ux[3] * Uy[2] * Uz[1];
-        tile[6] += sc * Ux[2] * Uy[0] * Uz[2];
-        tile[7] += sc * Ux[3] * Uy[1] * Uz[2];
-        tile[8] += sc * Ux[3] * Uy[0] * Uz[3];
-        tile[9] += sc * Ux[4] * Uy[4] * Uz[0];
-        tile[10] += sc * Ux[5] * Uy[5] * Uz[0];
-        tile[11] += sc * Ux[5] * Uy[4] * Uz[1];
-        tile[12] += sc * Ux[4] * Uy[2] * Uz[2];
-        tile[13] += sc * Ux[5] * Uy[3] * Uz[2];
-        tile[14] += sc * Ux[5] * Uy[2] * Uz[3];
-        tile[15] += sc * Ux[4] * Uy[0] * Uz[4];
-        tile[16] += sc * Ux[5] * Uy[1] * Uz[4];
-        tile[17] += sc * Ux[5] * Uy[0] * Uz[5];
-        tile[18] += sc * Ux[6] * Uy[6] * Uz[0];
-        tile[19] += sc * Ux[7] * Uy[7] * Uz[0];
-        tile[20] += sc * Ux[7] * Uy[6] * Uz[1];
-        tile[21] += sc * Ux[8] * Uy[8] * Uz[0];
-        tile[22] += sc * Ux[9] * Uy[9] * Uz[0];
-        tile[23] += sc * Ux[9] * Uy[8] * Uz[1];
-        tile[24] += sc * Ux[8] * Uy[6] * Uz[2];
-        tile[25] += sc * Ux[9] * Uy[7] * Uz[2];
-        tile[26] += sc * Ux[9] * Uy[6] * Uz[3];
-        tile[27] += sc * Ux[10] * Uy[10] * Uz[0];
-        tile[28] += sc * Ux[11] * Uy[11] * Uz[0];
-        tile[29] += sc * Ux[11] * Uy[10] * Uz[1];
-        tile[30] += sc * Ux[10] * Uy[8] * Uz[2];
-        tile[31] += sc * Ux[11] * Uy[9] * Uz[2];
-        tile[32] += sc * Ux[11] * Uy[8] * Uz[3];
-        tile[33] += sc * Ux[10] * Uy[6] * Uz[4];
-        tile[34] += sc * Ux[11] * Uy[7] * Uz[4];
-        tile[35] += sc * Ux[11] * Uy[6] * Uz[5];
-        tile[36] += sc * Ux[6] * Uy[0] * Uz[6];
-        tile[37] += sc * Ux[7] * Uy[1] * Uz[6];
-        tile[38] += sc * Ux[7] * Uy[0] * Uz[7];
-        tile[39] += sc * Ux[8] * Uy[2] * Uz[6];
-        tile[40] += sc * Ux[9] * Uy[3] * Uz[6];
-        tile[41] += sc * Ux[9] * Uy[2] * Uz[7];
-        tile[42] += sc * Ux[8] * Uy[0] * Uz[8];
-        tile[43] += sc * Ux[9] * Uy[1] * Uz[8];
-        tile[44] += sc * Ux[9] * Uy[0] * Uz[9];
-        tile[45] += sc * Ux[10] * Uy[4] * Uz[6];
-        tile[46] += sc * Ux[11] * Uy[5] * Uz[6];
-        tile[47] += sc * Ux[11] * Uy[4] * Uz[7];
-        tile[48] += sc * Ux[10] * Uy[2] * Uz[8];
-        tile[49] += sc * Ux[11] * Uy[3] * Uz[8];
-        tile[50] += sc * Ux[11] * Uy[2] * Uz[9];
-        tile[51] += sc * Ux[10] * Uy[0] * Uz[10];
-        tile[52] += sc * Ux[11] * Uy[1] * Uz[10];
-        tile[53] += sc * Ux[11] * Uy[0] * Uz[11];
+        Ux[0] = static_cast<comp_t>(Gx[6] * xkl + Gx[7]);
+        Ux[1] = static_cast<comp_t>(Gx[6]);
+        Ux[2] = static_cast<comp_t>(Gx[5] * xkl + Gx[6]);
+        Ux[3] = static_cast<comp_t>(Gx[5]);
+        Ux[4] = static_cast<comp_t>(Gx[4] * xkl + Gx[5]);
+        Ux[5] = static_cast<comp_t>(Gx[4]);
+        Ux[6] = static_cast<comp_t>(Gx[2] * xkl + Gx[3]);
+        Ux[7] = static_cast<comp_t>(Gx[2]);
+        Ux[8] = static_cast<comp_t>(Gx[1] * xkl + Gx[2]);
+        Ux[9] = static_cast<comp_t>(Gx[1]);
+        Ux[10] = static_cast<comp_t>(Gx[0] * xkl + Gx[1]);
+        Ux[11] = static_cast<comp_t>(Gx[0]);
+        Uy[0] = static_cast<comp_t>(Gy[0]);
+        Uy[1] = static_cast<comp_t>(Gy[0] * ykl + Gy[1]);
+        Uy[2] = static_cast<comp_t>(Gy[1]);
+        Uy[3] = static_cast<comp_t>(Gy[1] * ykl + Gy[2]);
+        Uy[4] = static_cast<comp_t>(Gy[2]);
+        Uy[5] = static_cast<comp_t>(Gy[2] * ykl + Gy[3]);
+        Uy[6] = static_cast<comp_t>(Gy[4]);
+        Uy[7] = static_cast<comp_t>(Gy[4] * ykl + Gy[5]);
+        Uy[8] = static_cast<comp_t>(Gy[5]);
+        Uy[9] = static_cast<comp_t>(Gy[5] * ykl + Gy[6]);
+        Uy[10] = static_cast<comp_t>(Gy[6]);
+        Uy[11] = static_cast<comp_t>(Gy[6] * ykl + Gy[7]);
+        Uz[0] = static_cast<comp_t>(Gz[0]);
+        Uz[1] = static_cast<comp_t>(Gz[0] * zkl + Gz[1]);
+        Uz[2] = static_cast<comp_t>(Gz[1]);
+        Uz[3] = static_cast<comp_t>(Gz[1] * zkl + Gz[2]);
+        Uz[4] = static_cast<comp_t>(Gz[2]);
+        Uz[5] = static_cast<comp_t>(Gz[2] * zkl + Gz[3]);
+        Uz[6] = static_cast<comp_t>(Gz[4]);
+        Uz[7] = static_cast<comp_t>(Gz[4] * zkl + Gz[5]);
+        Uz[8] = static_cast<comp_t>(Gz[5]);
+        Uz[9] = static_cast<comp_t>(Gz[5] * zkl + Gz[6]);
+        Uz[10] = static_cast<comp_t>(Gz[6]);
+        Uz[11] = static_cast<comp_t>(Gz[6] * zkl + Gz[7]);
+        tile[0] += sc * static_cast<double>(Ux[0] * Uy[0]) * static_cast<double>(Uz[0]);
+        tile[1] += sc * static_cast<double>(Ux[1] * Uy[1]) * static_cast<double>(Uz[0]);
+        tile[2] += sc * static_cast<double>(Ux[1] * Uy[0]) * static_cast<double>(Uz[1]);
+        tile[3] += sc * static_cast<double>(Ux[2] * Uy[2]) * static_cast<double>(Uz[0]);
+        tile[4] += sc * static_cast<double>(Ux[3] * Uy[3]) * static_cast<double>(Uz[0]);
+        tile[5] += sc * static_cast<double>(Ux[3] * Uy[2]) * static_cast<double>(Uz[1]);
+        tile[6] += sc * static_cast<double>(Ux[2] * Uy[0]) * static_cast<double>(Uz[2]);
+        tile[7] += sc * static_cast<double>(Ux[3] * Uy[1]) * static_cast<double>(Uz[2]);
+        tile[8] += sc * static_cast<double>(Ux[3] * Uy[0]) * static_cast<double>(Uz[3]);
+        tile[9] += sc * static_cast<double>(Ux[4] * Uy[4]) * static_cast<double>(Uz[0]);
+        tile[10] += sc * static_cast<double>(Ux[5] * Uy[5]) * static_cast<double>(Uz[0]);
+        tile[11] += sc * static_cast<double>(Ux[5] * Uy[4]) * static_cast<double>(Uz[1]);
+        tile[12] += sc * static_cast<double>(Ux[4] * Uy[2]) * static_cast<double>(Uz[2]);
+        tile[13] += sc * static_cast<double>(Ux[5] * Uy[3]) * static_cast<double>(Uz[2]);
+        tile[14] += sc * static_cast<double>(Ux[5] * Uy[2]) * static_cast<double>(Uz[3]);
+        tile[15] += sc * static_cast<double>(Ux[4] * Uy[0]) * static_cast<double>(Uz[4]);
+        tile[16] += sc * static_cast<double>(Ux[5] * Uy[1]) * static_cast<double>(Uz[4]);
+        tile[17] += sc * static_cast<double>(Ux[5] * Uy[0]) * static_cast<double>(Uz[5]);
+        tile[18] += sc * static_cast<double>(Ux[6] * Uy[6]) * static_cast<double>(Uz[0]);
+        tile[19] += sc * static_cast<double>(Ux[7] * Uy[7]) * static_cast<double>(Uz[0]);
+        tile[20] += sc * static_cast<double>(Ux[7] * Uy[6]) * static_cast<double>(Uz[1]);
+        tile[21] += sc * static_cast<double>(Ux[8] * Uy[8]) * static_cast<double>(Uz[0]);
+        tile[22] += sc * static_cast<double>(Ux[9] * Uy[9]) * static_cast<double>(Uz[0]);
+        tile[23] += sc * static_cast<double>(Ux[9] * Uy[8]) * static_cast<double>(Uz[1]);
+        tile[24] += sc * static_cast<double>(Ux[8] * Uy[6]) * static_cast<double>(Uz[2]);
+        tile[25] += sc * static_cast<double>(Ux[9] * Uy[7]) * static_cast<double>(Uz[2]);
+        tile[26] += sc * static_cast<double>(Ux[9] * Uy[6]) * static_cast<double>(Uz[3]);
+        tile[27] += sc * static_cast<double>(Ux[10] * Uy[10]) * static_cast<double>(Uz[0]);
+        tile[28] += sc * static_cast<double>(Ux[11] * Uy[11]) * static_cast<double>(Uz[0]);
+        tile[29] += sc * static_cast<double>(Ux[11] * Uy[10]) * static_cast<double>(Uz[1]);
+        tile[30] += sc * static_cast<double>(Ux[10] * Uy[8]) * static_cast<double>(Uz[2]);
+        tile[31] += sc * static_cast<double>(Ux[11] * Uy[9]) * static_cast<double>(Uz[2]);
+        tile[32] += sc * static_cast<double>(Ux[11] * Uy[8]) * static_cast<double>(Uz[3]);
+        tile[33] += sc * static_cast<double>(Ux[10] * Uy[6]) * static_cast<double>(Uz[4]);
+        tile[34] += sc * static_cast<double>(Ux[11] * Uy[7]) * static_cast<double>(Uz[4]);
+        tile[35] += sc * static_cast<double>(Ux[11] * Uy[6]) * static_cast<double>(Uz[5]);
+        tile[36] += sc * static_cast<double>(Ux[6] * Uy[0]) * static_cast<double>(Uz[6]);
+        tile[37] += sc * static_cast<double>(Ux[7] * Uy[1]) * static_cast<double>(Uz[6]);
+        tile[38] += sc * static_cast<double>(Ux[7] * Uy[0]) * static_cast<double>(Uz[7]);
+        tile[39] += sc * static_cast<double>(Ux[8] * Uy[2]) * static_cast<double>(Uz[6]);
+        tile[40] += sc * static_cast<double>(Ux[9] * Uy[3]) * static_cast<double>(Uz[6]);
+        tile[41] += sc * static_cast<double>(Ux[9] * Uy[2]) * static_cast<double>(Uz[7]);
+        tile[42] += sc * static_cast<double>(Ux[8] * Uy[0]) * static_cast<double>(Uz[8]);
+        tile[43] += sc * static_cast<double>(Ux[9] * Uy[1]) * static_cast<double>(Uz[8]);
+        tile[44] += sc * static_cast<double>(Ux[9] * Uy[0]) * static_cast<double>(Uz[9]);
+        tile[45] += sc * static_cast<double>(Ux[10] * Uy[4]) * static_cast<double>(Uz[6]);
+        tile[46] += sc * static_cast<double>(Ux[11] * Uy[5]) * static_cast<double>(Uz[6]);
+        tile[47] += sc * static_cast<double>(Ux[11] * Uy[4]) * static_cast<double>(Uz[7]);
+        tile[48] += sc * static_cast<double>(Ux[10] * Uy[2]) * static_cast<double>(Uz[8]);
+        tile[49] += sc * static_cast<double>(Ux[11] * Uy[3]) * static_cast<double>(Uz[8]);
+        tile[50] += sc * static_cast<double>(Ux[11] * Uy[2]) * static_cast<double>(Uz[9]);
+        tile[51] += sc * static_cast<double>(Ux[10] * Uy[0]) * static_cast<double>(Uz[10]);
+        tile[52] += sc * static_cast<double>(Ux[11] * Uy[1]) * static_cast<double>(Uz[10]);
+        tile[53] += sc * static_cast<double>(Ux[11] * Uy[0]) * static_cast<double>(Uz[11]);
       }
     }
   }
 
-  // Write output tile.
-  double* out = eri_out + static_cast<int64_t>(t) * static_cast<int64_t>(54);
-  out[0] = tile[0];
-  out[1] = tile[1];
-  out[2] = tile[2];
-  out[3] = tile[3];
-  out[4] = tile[4];
-  out[5] = tile[5];
-  out[6] = tile[6];
-  out[7] = tile[7];
-  out[8] = tile[8];
-  out[9] = tile[9];
-  out[10] = tile[10];
-  out[11] = tile[11];
-  out[12] = tile[12];
-  out[13] = tile[13];
-  out[14] = tile[14];
-  out[15] = tile[15];
-  out[16] = tile[16];
-  out[17] = tile[17];
-  out[18] = tile[18];
-  out[19] = tile[19];
-  out[20] = tile[20];
-  out[21] = tile[21];
-  out[22] = tile[22];
-  out[23] = tile[23];
-  out[24] = tile[24];
-  out[25] = tile[25];
-  out[26] = tile[26];
-  out[27] = tile[27];
-  out[28] = tile[28];
-  out[29] = tile[29];
-  out[30] = tile[30];
-  out[31] = tile[31];
-  out[32] = tile[32];
-  out[33] = tile[33];
-  out[34] = tile[34];
-  out[35] = tile[35];
-  out[36] = tile[36];
-  out[37] = tile[37];
-  out[38] = tile[38];
-  out[39] = tile[39];
-  out[40] = tile[40];
-  out[41] = tile[41];
-  out[42] = tile[42];
-  out[43] = tile[43];
-  out[44] = tile[44];
-  out[45] = tile[45];
-  out[46] = tile[46];
-  out[47] = tile[47];
-  out[48] = tile[48];
-  out[49] = tile[49];
-  out[50] = tile[50];
-  out[51] = tile[51];
-  out[52] = tile[52];
-  out[53] = tile[53];
+  // Write output tile: FP32 or FP64 depending on kTileF32.
+  if constexpr (kTileF32) {
+    float* out = eri_out_f32 + static_cast<int64_t>(t) * static_cast<int64_t>(54);
+    out[0] = __double2float_rn(tile[0]);
+    out[1] = __double2float_rn(tile[1]);
+    out[2] = __double2float_rn(tile[2]);
+    out[3] = __double2float_rn(tile[3]);
+    out[4] = __double2float_rn(tile[4]);
+    out[5] = __double2float_rn(tile[5]);
+    out[6] = __double2float_rn(tile[6]);
+    out[7] = __double2float_rn(tile[7]);
+    out[8] = __double2float_rn(tile[8]);
+    out[9] = __double2float_rn(tile[9]);
+    out[10] = __double2float_rn(tile[10]);
+    out[11] = __double2float_rn(tile[11]);
+    out[12] = __double2float_rn(tile[12]);
+    out[13] = __double2float_rn(tile[13]);
+    out[14] = __double2float_rn(tile[14]);
+    out[15] = __double2float_rn(tile[15]);
+    out[16] = __double2float_rn(tile[16]);
+    out[17] = __double2float_rn(tile[17]);
+    out[18] = __double2float_rn(tile[18]);
+    out[19] = __double2float_rn(tile[19]);
+    out[20] = __double2float_rn(tile[20]);
+    out[21] = __double2float_rn(tile[21]);
+    out[22] = __double2float_rn(tile[22]);
+    out[23] = __double2float_rn(tile[23]);
+    out[24] = __double2float_rn(tile[24]);
+    out[25] = __double2float_rn(tile[25]);
+    out[26] = __double2float_rn(tile[26]);
+    out[27] = __double2float_rn(tile[27]);
+    out[28] = __double2float_rn(tile[28]);
+    out[29] = __double2float_rn(tile[29]);
+    out[30] = __double2float_rn(tile[30]);
+    out[31] = __double2float_rn(tile[31]);
+    out[32] = __double2float_rn(tile[32]);
+    out[33] = __double2float_rn(tile[33]);
+    out[34] = __double2float_rn(tile[34]);
+    out[35] = __double2float_rn(tile[35]);
+    out[36] = __double2float_rn(tile[36]);
+    out[37] = __double2float_rn(tile[37]);
+    out[38] = __double2float_rn(tile[38]);
+    out[39] = __double2float_rn(tile[39]);
+    out[40] = __double2float_rn(tile[40]);
+    out[41] = __double2float_rn(tile[41]);
+    out[42] = __double2float_rn(tile[42]);
+    out[43] = __double2float_rn(tile[43]);
+    out[44] = __double2float_rn(tile[44]);
+    out[45] = __double2float_rn(tile[45]);
+    out[46] = __double2float_rn(tile[46]);
+    out[47] = __double2float_rn(tile[47]);
+    out[48] = __double2float_rn(tile[48]);
+    out[49] = __double2float_rn(tile[49]);
+    out[50] = __double2float_rn(tile[50]);
+    out[51] = __double2float_rn(tile[51]);
+    out[52] = __double2float_rn(tile[52]);
+    out[53] = __double2float_rn(tile[53]);
+  } else {
+    double* out = eri_out_f64 + static_cast<int64_t>(t) * static_cast<int64_t>(54);
+    out[0] = tile[0];
+    out[1] = tile[1];
+    out[2] = tile[2];
+    out[3] = tile[3];
+    out[4] = tile[4];
+    out[5] = tile[5];
+    out[6] = tile[6];
+    out[7] = tile[7];
+    out[8] = tile[8];
+    out[9] = tile[9];
+    out[10] = tile[10];
+    out[11] = tile[11];
+    out[12] = tile[12];
+    out[13] = tile[13];
+    out[14] = tile[14];
+    out[15] = tile[15];
+    out[16] = tile[16];
+    out[17] = tile[17];
+    out[18] = tile[18];
+    out[19] = tile[19];
+    out[20] = tile[20];
+    out[21] = tile[21];
+    out[22] = tile[22];
+    out[23] = tile[23];
+    out[24] = tile[24];
+    out[25] = tile[25];
+    out[26] = tile[26];
+    out[27] = tile[27];
+    out[28] = tile[28];
+    out[29] = tile[29];
+    out[30] = tile[30];
+    out[31] = tile[31];
+    out[32] = tile[32];
+    out[33] = tile[33];
+    out[34] = tile[34];
+    out[35] = tile[35];
+    out[36] = tile[36];
+    out[37] = tile[37];
+    out[38] = tile[38];
+    out[39] = tile[39];
+    out[40] = tile[40];
+    out[41] = tile[41];
+    out[42] = tile[42];
+    out[43] = tile[43];
+    out[44] = tile[44];
+    out[45] = tile[45];
+    out[46] = tile[46];
+    out[47] = tile[47];
+    out[48] = tile[48];
+    out[49] = tile[49];
+    out[50] = tile[50];
+    out[51] = tile[51];
+    out[52] = tile[52];
+    out[53] = tile[53];
+  }
 }
 
 template <int NROOTS>
@@ -9821,8 +9883,8 @@ __global__ void KernelERI_psdp_warp_true(
   }
 }
 
-template <int NROOTS>
-__global__ void KernelFusedFock_psdp_fixed(
+template <int NROOTS, bool kMixedPrec = false>
+__global__ void __launch_bounds__(64) KernelFusedFock_psdp_fixed(
     const int32_t* task_spAB,
     const int32_t* task_spCD,
     int ntasks,
@@ -9904,6 +9966,8 @@ __global__ void KernelFusedFock_psdp_fixed(
   const int nPairAB = static_cast<int>(sp_npair[spAB]);
   const int nPairCD = static_cast<int>(sp_npair[spCD]);
 
+  using comp_t = typename std::conditional<kMixedPrec, float, double>::type;
+
   for (int ebase = 0; ebase < kNComp; ebase += 32) {
     const int e = ebase + lane;
     const bool active = (e < kNComp);
@@ -9955,10 +10019,10 @@ __global__ void KernelFusedFock_psdp_fixed(
           }
           __syncwarp();
           if (active) {
-            const double Ix = eval_psdp_x(e, Gx, xij, xij2, xkl, xkl2);
-            const double Iy = eval_psdp_y(e, Gy, yij, yij2, ykl, ykl2);
-            const double Iz = eval_psdp_z(e, Gz, zij, zij2, zkl, zkl2);
-            val += sh_sc[0] * (Ix * Iy * Iz);
+            const comp_t Ix = static_cast<comp_t>(eval_psdp_x(e, Gx, xij, xij2, xkl, xkl2));
+            const comp_t Iy = static_cast<comp_t>(eval_psdp_y(e, Gy, yij, yij2, ykl, ykl2));
+            const comp_t Iz = static_cast<comp_t>(eval_psdp_z(e, Gz, zij, zij2, zkl, zkl2));
+            val += sh_sc[0] * static_cast<double>(Ix * Iy) * static_cast<double>(Iz);
           }
           __syncwarp();
         }
@@ -9991,8 +10055,8 @@ __global__ void KernelFusedFock_psdp_fixed(
   }
 }
 
-template <int NROOTS>
-__global__ void KernelFusedJK_psdp_fixed(
+template <int NROOTS, bool kMixedPrec = false>
+__global__ void __launch_bounds__(64) KernelFusedJK_psdp_fixed(
     const int32_t* task_spAB,
     const int32_t* task_spCD,
     int ntasks,
@@ -10075,6 +10139,8 @@ __global__ void KernelFusedJK_psdp_fixed(
   const int nPairAB = static_cast<int>(sp_npair[spAB]);
   const int nPairCD = static_cast<int>(sp_npair[spCD]);
 
+  using comp_t = typename std::conditional<kMixedPrec, float, double>::type;
+
   for (int ebase = 0; ebase < kNComp; ebase += 32) {
     const int e = ebase + lane;
     const bool active = (e < kNComp);
@@ -10126,10 +10192,10 @@ __global__ void KernelFusedJK_psdp_fixed(
           }
           __syncwarp();
           if (active) {
-            const double Ix = eval_psdp_x(e, Gx, xij, xij2, xkl, xkl2);
-            const double Iy = eval_psdp_y(e, Gy, yij, yij2, ykl, ykl2);
-            const double Iz = eval_psdp_z(e, Gz, zij, zij2, zkl, zkl2);
-            val += sh_sc[0] * (Ix * Iy * Iz);
+            const comp_t Ix = static_cast<comp_t>(eval_psdp_x(e, Gx, xij, xij2, xkl, xkl2));
+            const comp_t Iy = static_cast<comp_t>(eval_psdp_y(e, Gy, yij, yij2, ykl, ykl2));
+            const comp_t Iz = static_cast<comp_t>(eval_psdp_z(e, Gz, zij, zij2, zkl, zkl2));
+            val += sh_sc[0] * static_cast<double>(Ix * Iy) * static_cast<double>(Iz);
           }
           __syncwarp();
         }
@@ -10187,9 +10253,93 @@ extern "C" cudaError_t cueri_eri_psdp_launch_stream(
   // Flat kernel: one thread per task, 100% utilization.
   constexpr int kFlatThreads = 128;
   const int blocks = (ntasks + kFlatThreads - 1) / kFlatThreads;
-  KernelERI_psdp_flat<3><<<blocks, kFlatThreads, 0, stream>>>(
+  KernelERI_psdp_flat<3, false, false><<<blocks, kFlatThreads, 0, stream>>>(
       task_spAB, task_spCD, ntasks, sp_A, sp_B, sp_pair_start, sp_npair, shell_cx, shell_cy, shell_cz,
-      pair_eta, pair_Px, pair_Py, pair_Pz, pair_cK, eri_out);
+      pair_eta, pair_Px, pair_Py, pair_Pz, pair_cK, eri_out, nullptr);
+  return cudaGetLastError();
+}
+
+extern "C" cudaError_t cueri_eri_psdp_f32_launch_stream(
+    const int32_t* task_spAB,
+    const int32_t* task_spCD,
+    int ntasks,
+    const int32_t* sp_A,
+    const int32_t* sp_B,
+    const int32_t* sp_pair_start,
+    const int32_t* sp_npair,
+    const double* shell_cx,
+    const double* shell_cy,
+    const double* shell_cz,
+    const double* pair_eta,
+    const double* pair_Px,
+    const double* pair_Py,
+    const double* pair_Pz,
+    const double* pair_cK,
+    float* eri_out_f32,
+    cudaStream_t stream,
+    int threads) {
+  if (ntasks <= 0) return (ntasks == 0) ? cudaSuccess : cudaErrorInvalidValue;
+  constexpr int kFlatThreads = 128;
+  const int blocks = (ntasks + kFlatThreads - 1) / kFlatThreads;
+  KernelERI_psdp_flat<3, true, false><<<blocks, kFlatThreads, 0, stream>>>(
+      task_spAB, task_spCD, ntasks, sp_A, sp_B, sp_pair_start, sp_npair, shell_cx, shell_cy, shell_cz,
+      pair_eta, pair_Px, pair_Py, pair_Pz, pair_cK, nullptr, eri_out_f32);
+  return cudaGetLastError();
+}
+
+extern "C" cudaError_t cueri_eri_psdp_mixed_launch_stream(
+    const int32_t* task_spAB,
+    const int32_t* task_spCD,
+    int ntasks,
+    const int32_t* sp_A,
+    const int32_t* sp_B,
+    const int32_t* sp_pair_start,
+    const int32_t* sp_npair,
+    const double* shell_cx,
+    const double* shell_cy,
+    const double* shell_cz,
+    const double* pair_eta,
+    const double* pair_Px,
+    const double* pair_Py,
+    const double* pair_Pz,
+    const double* pair_cK,
+    double* eri_out,
+    cudaStream_t stream,
+    int threads) {
+  if (ntasks <= 0) return (ntasks == 0) ? cudaSuccess : cudaErrorInvalidValue;
+  constexpr int kFlatThreads = 128;
+  const int blocks = (ntasks + kFlatThreads - 1) / kFlatThreads;
+  KernelERI_psdp_flat<3, false, true><<<blocks, kFlatThreads, 0, stream>>>(
+      task_spAB, task_spCD, ntasks, sp_A, sp_B, sp_pair_start, sp_npair, shell_cx, shell_cy, shell_cz,
+      pair_eta, pair_Px, pair_Py, pair_Pz, pair_cK, eri_out, nullptr);
+  return cudaGetLastError();
+}
+
+extern "C" cudaError_t cueri_eri_psdp_mixed_f32_launch_stream(
+    const int32_t* task_spAB,
+    const int32_t* task_spCD,
+    int ntasks,
+    const int32_t* sp_A,
+    const int32_t* sp_B,
+    const int32_t* sp_pair_start,
+    const int32_t* sp_npair,
+    const double* shell_cx,
+    const double* shell_cy,
+    const double* shell_cz,
+    const double* pair_eta,
+    const double* pair_Px,
+    const double* pair_Py,
+    const double* pair_Pz,
+    const double* pair_cK,
+    float* eri_out_f32,
+    cudaStream_t stream,
+    int threads) {
+  if (ntasks <= 0) return (ntasks == 0) ? cudaSuccess : cudaErrorInvalidValue;
+  constexpr int kFlatThreads = 128;
+  const int blocks = (ntasks + kFlatThreads - 1) / kFlatThreads;
+  KernelERI_psdp_flat<3, true, true><<<blocks, kFlatThreads, 0, stream>>>(
+      task_spAB, task_spCD, ntasks, sp_A, sp_B, sp_pair_start, sp_npair, shell_cx, shell_cy, shell_cz,
+      pair_eta, pair_Px, pair_Py, pair_Pz, pair_cK, nullptr, eri_out_f32);
   return cudaGetLastError();
 }
 
@@ -10266,7 +10416,8 @@ extern "C" cudaError_t cueri_fused_fock_psdp_launch_stream(
     double* F_mat,
     cudaStream_t stream,
     int threads,
-    int n_bufs) {
+    int n_bufs,
+    bool mixed_prec) {
   if (ntasks < 0 || nao <= 0) return cudaErrorInvalidValue;
   if (ntasks == 0) return cudaSuccess;
   constexpr int kDefaultThreads = 64;
@@ -10275,21 +10426,29 @@ extern "C" cudaError_t cueri_fused_fock_psdp_launch_stream(
   constexpr int kGSize_psdp = 5 * 5;
   constexpr int kWarpDoubles_psdp = 3 * kGSize_psdp + 2 * 3 + 11 + 54;
   size_t shmem_psdp = 0;
-  const cudaError_t prep_psdp = cueri_prepare_fused_fock_warp_launch(
-      KernelFusedFock_psdp_fixed<3>,
-      threads,
-      kDefaultThreads,
-      ntasks,
-      kWarpDoubles_psdp,
-      &launch_threads,
-      &blocks,
-      &shmem_psdp);
-  if (prep_psdp != cudaSuccess) return prep_psdp;
-  KernelFusedFock_psdp_fixed<3><<<blocks, launch_threads, shmem_psdp, stream>>>(
-      task_spAB, task_spCD, ntasks, sp_A, sp_B, sp_pair_start, sp_npair,
-      shell_cx, shell_cy, shell_cz,
-      pair_eta, pair_Px, pair_Py, pair_Pz, pair_cK,
-      shell_ao_start, nao, D_mat, F_mat, n_bufs);
+  if (mixed_prec) {
+    const cudaError_t prep_psdp = cueri_prepare_fused_fock_warp_launch(
+        KernelFusedFock_psdp_fixed<3, true>,
+        threads, kDefaultThreads, ntasks,
+        kWarpDoubles_psdp, &launch_threads, &blocks, &shmem_psdp);
+    if (prep_psdp != cudaSuccess) return prep_psdp;
+    KernelFusedFock_psdp_fixed<3, true><<<blocks, launch_threads, shmem_psdp, stream>>>(
+        task_spAB, task_spCD, ntasks, sp_A, sp_B, sp_pair_start, sp_npair,
+        shell_cx, shell_cy, shell_cz,
+        pair_eta, pair_Px, pair_Py, pair_Pz, pair_cK,
+        shell_ao_start, nao, D_mat, F_mat, n_bufs);
+  } else {
+    const cudaError_t prep_psdp = cueri_prepare_fused_fock_warp_launch(
+        KernelFusedFock_psdp_fixed<3, false>,
+        threads, kDefaultThreads, ntasks,
+        kWarpDoubles_psdp, &launch_threads, &blocks, &shmem_psdp);
+    if (prep_psdp != cudaSuccess) return prep_psdp;
+    KernelFusedFock_psdp_fixed<3, false><<<blocks, launch_threads, shmem_psdp, stream>>>(
+        task_spAB, task_spCD, ntasks, sp_A, sp_B, sp_pair_start, sp_npair,
+        shell_cx, shell_cy, shell_cz,
+        pair_eta, pair_Px, pair_Py, pair_Pz, pair_cK,
+        shell_ao_start, nao, D_mat, F_mat, n_bufs);
+  }
   return cudaGetLastError();
 }
 
@@ -10316,7 +10475,8 @@ extern "C" cudaError_t cueri_fused_jk_psdp_launch_stream(
     double* K_mat,
     cudaStream_t stream,
     int threads,
-    int n_bufs) {
+    int n_bufs,
+    bool mixed_prec) {
   if (ntasks < 0 || nao <= 0) return cudaErrorInvalidValue;
   if (ntasks == 0) return cudaSuccess;
   constexpr int kDefaultThreads = 64;
@@ -10325,21 +10485,29 @@ extern "C" cudaError_t cueri_fused_jk_psdp_launch_stream(
   constexpr int kGSize_psdp = 5 * 5;
   constexpr int kWarpDoubles_psdp = 3 * kGSize_psdp + 2 * 3 + 11 + 54;
   size_t shmem_psdp = 0;
-  const cudaError_t prep_psdp = cueri_prepare_fused_fock_warp_launch(
-      KernelFusedJK_psdp_fixed<3>,
-      threads,
-      kDefaultThreads,
-      ntasks,
-      kWarpDoubles_psdp,
-      &launch_threads,
-      &blocks,
-      &shmem_psdp);
-  if (prep_psdp != cudaSuccess) return prep_psdp;
-  KernelFusedJK_psdp_fixed<3><<<blocks, launch_threads, shmem_psdp, stream>>>(
-      task_spAB, task_spCD, ntasks, sp_A, sp_B, sp_pair_start, sp_npair,
-      shell_cx, shell_cy, shell_cz,
-      pair_eta, pair_Px, pair_Py, pair_Pz, pair_cK,
-      shell_ao_start, nao, D_mat, J_mat, K_mat, n_bufs);
+  if (mixed_prec) {
+    const cudaError_t prep_psdp = cueri_prepare_fused_fock_warp_launch(
+        KernelFusedJK_psdp_fixed<3, true>,
+        threads, kDefaultThreads, ntasks,
+        kWarpDoubles_psdp, &launch_threads, &blocks, &shmem_psdp);
+    if (prep_psdp != cudaSuccess) return prep_psdp;
+    KernelFusedJK_psdp_fixed<3, true><<<blocks, launch_threads, shmem_psdp, stream>>>(
+        task_spAB, task_spCD, ntasks, sp_A, sp_B, sp_pair_start, sp_npair,
+        shell_cx, shell_cy, shell_cz,
+        pair_eta, pair_Px, pair_Py, pair_Pz, pair_cK,
+        shell_ao_start, nao, D_mat, J_mat, K_mat, n_bufs);
+  } else {
+    const cudaError_t prep_psdp = cueri_prepare_fused_fock_warp_launch(
+        KernelFusedJK_psdp_fixed<3, false>,
+        threads, kDefaultThreads, ntasks,
+        kWarpDoubles_psdp, &launch_threads, &blocks, &shmem_psdp);
+    if (prep_psdp != cudaSuccess) return prep_psdp;
+    KernelFusedJK_psdp_fixed<3, false><<<blocks, launch_threads, shmem_psdp, stream>>>(
+        task_spAB, task_spCD, ntasks, sp_A, sp_B, sp_pair_start, sp_npair,
+        shell_cx, shell_cy, shell_cz,
+        pair_eta, pair_Px, pair_Py, pair_Pz, pair_cK,
+        shell_ao_start, nao, D_mat, J_mat, K_mat, n_bufs);
+  }
   return cudaGetLastError();
 }
 

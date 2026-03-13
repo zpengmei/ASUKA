@@ -9,6 +9,9 @@
 #include "cueri_cuda_kernels_api.h"
 #include "cueri_cuda_contract_fock_warp.cuh"
 #include "cueri_cuda_contract_jk_warp.cuh"
+#ifdef CUERI_BOYS_LUT
+#include "cueri_cuda_rys_device.cuh"
+#endif
 
 namespace {
 
@@ -123,6 +126,12 @@ __device__ __forceinline__ void accumulate_fock_single_value(
 }
 
 __device__ __forceinline__ void boys_f0_f1_f2(double T, double& F0, double& F1, double& F2) {
+#ifdef CUERI_BOYS_LUT
+  double F[3];
+  cueri_rys::boys_fm_lut<2>(T, F);
+  F0 = F[0]; F1 = F[1]; F2 = F[2];
+  return;
+#endif
   // Robust for small T: evaluate F2 by series, then get F1/F0 by downward recursion:
   //   F_{m-1} = (2T*F_m + exp(-T)) / (2m-1)
   if (T < 1.0) {
@@ -150,6 +159,12 @@ __device__ __forceinline__ void boys_f0_f1_f2(double T, double& F0, double& F1, 
 }
 
 __device__ __forceinline__ void boys_f0_f1_f2_f3_f4(double T, double& F0, double& F1, double& F2, double& F3, double& F4) {
+#ifdef CUERI_BOYS_LUT
+  double F[5];
+  cueri_rys::boys_fm_lut<4>(T, F);
+  F0 = F[0]; F1 = F[1]; F2 = F[2]; F3 = F[3]; F4 = F[4];
+  return;
+#endif
   // Robust for small T: evaluate F4 by series, then get F3..F0 by downward recursion:
   //   F_{m-1} = (2T*F_m + exp(-T)) / (2m-1)
   if (T < 1.0) {
@@ -181,6 +196,12 @@ __device__ __forceinline__ void boys_f0_f1_f2_f3_f4(double T, double& F0, double
 }
 
 __device__ __forceinline__ void boys_f0_f1(double T, double& F0, double& F1) {
+#ifdef CUERI_BOYS_LUT
+  double F[2];
+  cueri_rys::boys_fm_lut<1>(T, F);
+  F0 = F[0]; F1 = F[1];
+  return;
+#endif
   if (T < 1.0) {
     double term = 1.0;
     double f1 = 0.0;
@@ -1793,8 +1814,8 @@ __global__ void KernelFused_psss_subwarp8(
     accumulate_fock_single_value(sy, D_mat, F_mat, a0 + 1, b0, c0, d0, ab_neq, cd_neq, bk_swap, f_ab, f_cd, N);
     accumulate_fock_single_value(sz, D_mat, F_mat, a0 + 2, b0, c0, d0, ab_neq, cd_neq, bk_swap, f_ab, f_cd, N);
   } else {
-    double* J_mat = out0_mat + buf_off;
-    double* K_mat = out1_mat + buf_off;
+    double* J_mat = (out0_mat != nullptr) ? out0_mat + buf_off : nullptr;
+    double* K_mat = (out1_mat != nullptr) ? out1_mat + buf_off : nullptr;
     accumulate_jk_single_value(sx, D_mat, J_mat, K_mat, a0 + 0, b0, c0, d0, ab_neq, cd_neq, bk_swap, f_ab, f_cd, N);
     accumulate_jk_single_value(sy, D_mat, J_mat, K_mat, a0 + 1, b0, c0, d0, ab_neq, cd_neq, bk_swap, f_ab, f_cd, N);
     accumulate_jk_single_value(sz, D_mat, J_mat, K_mat, a0 + 2, b0, c0, d0, ab_neq, cd_neq, bk_swap, f_ab, f_cd, N);
@@ -2075,7 +2096,9 @@ extern "C" cudaError_t cueri_fused_fock_psss_launch_stream(
     double* F_mat,
     cudaStream_t stream,
     int threads,
-    int n_bufs) {
+    int n_bufs,
+    bool mixed_prec) {
+  (void)mixed_prec;  // ignored for hand-written kernels
   if (ntasks < 0 || nao <= 0) return cudaErrorInvalidValue;
   if (ntasks == 0) return cudaSuccess;
   if (threads < 32 || (threads & 31) != 0) return cudaErrorInvalidValue;
@@ -2116,7 +2139,9 @@ extern "C" cudaError_t cueri_fused_jk_psss_launch_stream(
     double* K_mat,
     cudaStream_t stream,
     int threads,
-    int n_bufs) {
+    int n_bufs,
+    bool mixed_prec) {
+  (void)mixed_prec;  // ignored for hand-written kernels
   if (ntasks < 0 || nao <= 0) return cudaErrorInvalidValue;
   if (ntasks == 0) return cudaSuccess;
   if (threads < 32 || (threads & 31) != 0) return cudaErrorInvalidValue;
@@ -2156,7 +2181,9 @@ extern "C" cudaError_t cueri_fused_fock_dsss_launch_stream(
     double* F_mat,
     cudaStream_t stream,
     int threads,
-    int n_bufs) {
+    int n_bufs,
+    bool mixed_prec) {
+  (void)mixed_prec;  // ignored for hand-written kernels
   if (ntasks < 0 || nao <= 0) return cudaErrorInvalidValue;
   if (ntasks == 0) return cudaSuccess;
   if (threads < 32 || (threads & 31) != 0) return cudaErrorInvalidValue;

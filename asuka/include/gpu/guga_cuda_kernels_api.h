@@ -2422,7 +2422,8 @@ extern "C" cudaError_t guga_hb_screen_and_apply_launch_stream(
     const uint8_t* selected_mask,
     int* overflow_flag,
     cudaStream_t stream,
-    int threads);
+    int threads,
+    const int8_t* sym_pq_allowed);
 
 extern "C" cudaError_t guga_hb_screen_and_apply_many_roots_launch_stream(
     const int32_t* sel_idx,
@@ -2453,7 +2454,8 @@ extern "C" cudaError_t guga_hb_screen_and_apply_many_roots_launch_stream(
     const uint8_t* selected_mask,
     int* overflow_flag,
     cudaStream_t stream,
-    int threads);
+    int threads,
+    const int8_t* sym_pq_allowed);
 
 extern "C" cudaError_t cas36_diag_guess_candidates_u64_dense_launch_stream(
     const int32_t* child,
@@ -2517,7 +2519,8 @@ extern "C" cudaError_t cas36_hb_screen_and_apply_u64_launch_stream(
     int target_mode,
     int* overflow_flag,
     cudaStream_t stream,
-    int threads);
+    int threads,
+    const int8_t* sym_pq_allowed);
 
 extern "C" cudaError_t cas36_hb_emit_tuples_u64_launch_stream(
     const uint64_t* sel_idx_u64,
@@ -2550,7 +2553,8 @@ extern "C" cudaError_t cas36_hb_emit_tuples_u64_launch_stream(
     int* out_n,
     int* overflow_flag,
     cudaStream_t stream,
-    int threads);
+    int threads,
+    const int8_t* sym_pq_allowed);
 
 extern "C" cudaError_t cas36_exact_selected_emit_tuples_u64_launch_stream(
     const uint64_t* sel_idx_u64,
@@ -2596,12 +2600,58 @@ extern "C" cudaError_t cas36_exact_selected_emit_tuples_dense_u64_launch_stream(
     int* out_src,
     double* out_hij,
     int cap,
-    const uint64_t* selected_idx_sorted_u64,
-    int nselected,
+    const uint64_t* membership_hash_keys,
+    int membership_hash_cap,
     double* out_diag,
     int* out_n,
     int* overflow_flag,
     cudaStream_t stream,
     int threads);
 
-#endif  // CUGUGA_GPU_GUGA_CUDA_KERNELS_API_H
+extern "C" cudaError_t cas36_sci_build_membership_hash_u64_launch_stream(
+    const uint64_t* sorted_keys,
+    int nkeys,
+    uint64_t* hash_keys,
+    int cap,
+    cudaStream_t stream);
+
+// ---------------------------------------------------------------------------
+// Pair-wise H[i,j] evaluation kernels
+// ---------------------------------------------------------------------------
+
+extern "C" cudaError_t pairwise_materialize_u64_launch_stream(
+    const uint64_t* sel_idx_u64,
+    int nsel,
+    int norb,
+    uint64_t ncsf,
+    const int32_t* child_table,
+    const int16_t* node_twos,
+    const int64_t* child_prefix,
+    int8_t*  steps_all,
+    int32_t* nodes_all,
+    int8_t*  occ_all,
+    int16_t* b_all,
+    int* overflow_flag,
+    cudaStream_t stream,
+    int threads);
+
+extern "C" cudaError_t pairwise_hij_u64_launch_stream(
+    const uint64_t* sel_idx_u64,
+    int nsel,
+    int norb,
+    uint64_t ncsf,
+    const double* h_base,
+    const double* eri4,
+    const int32_t* child_table,
+    const int16_t* node_twos,
+    const int64_t* child_prefix,
+    const int8_t*  steps_all,
+    const int32_t* nodes_all,
+    const int8_t*  occ_all,
+    const int16_t* b_all,
+    double* H_out,
+    int* overflow_flag,
+    cudaStream_t stream,
+    int threads);
+
+#endif  // CUGUGU_GPU_GUGA_CUDA_KERNELS_API_H

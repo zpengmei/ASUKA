@@ -8,6 +8,7 @@
 
 #include <cmath>
 #include <cstdint>
+#include <type_traits>
 
 #include "cueri_cuda_kernels_api.h"
 #include "cueri_cuda_contract_fock_warp.cuh"
@@ -9293,8 +9294,8 @@ __device__ __forceinline__ double eval_dddd_z(
   }
 }
 
-template <int NROOTS>
-__global__ void KernelERI_ssdp_flat(
+template <int NROOTS, bool kTileF32 = false, bool kMixedPrec = false>
+__global__ void __launch_bounds__(128) KernelERI_ssdp_flat(
     const int32_t* __restrict__ task_spAB,
     const int32_t* __restrict__ task_spCD,
     int ntasks,
@@ -9310,7 +9311,8 @@ __global__ void KernelERI_ssdp_flat(
     const double* __restrict__ pair_Py,
     const double* __restrict__ pair_Pz,
     const double* __restrict__ pair_cK,
-    double* __restrict__ eri_out) {
+    double* __restrict__ eri_out_f64,
+    float*  __restrict__ eri_out_f32) {
   const int t = static_cast<int>(blockIdx.x) * static_cast<int>(blockDim.x) + static_cast<int>(threadIdx.x);
   if (t >= ntasks) return;
 
@@ -9361,9 +9363,11 @@ __global__ void KernelERI_ssdp_flat(
   double Gx[4];
   double Gy[4];
   double Gz[4];
-  double Ux[6];
-  double Uy[6];
-  double Uz[6];
+  // Component type: FP32 when kMixedPrec, else FP64.
+  using comp_t = typename std::conditional<kMixedPrec, float, double>::type;
+  comp_t Ux[6];
+  comp_t Uy[6];
+  comp_t Uz[6];
   double tile[18];
   tile[0] = 0.0;
   tile[1] = 0.0;
@@ -9426,66 +9430,88 @@ __global__ void KernelERI_ssdp_flat(
         compute_G_stride_fixed<kFlatStride, kNMax, kMMax>(Gy, Cy_, Cpy_, B0, B1, B1p);
         compute_G_stride_fixed<kFlatStride, kNMax, kMMax>(Gz, Cz_, Cpz_, B0, B1, B1p);
         const double sc = base * w;
-        Ux[0] = Gx[2] * xkl + Gx[3];
-        Ux[1] = Gx[2];
-        Ux[2] = Gx[1] * xkl + Gx[2];
-        Ux[3] = Gx[1];
-        Ux[4] = Gx[0] * xkl + Gx[1];
-        Ux[5] = Gx[0];
-        Uy[0] = Gy[0];
-        Uy[1] = Gy[0] * ykl + Gy[1];
-        Uy[2] = Gy[1];
-        Uy[3] = Gy[1] * ykl + Gy[2];
-        Uy[4] = Gy[2];
-        Uy[5] = Gy[2] * ykl + Gy[3];
-        Uz[0] = Gz[0];
-        Uz[1] = Gz[0] * zkl + Gz[1];
-        Uz[2] = Gz[1];
-        Uz[3] = Gz[1] * zkl + Gz[2];
-        Uz[4] = Gz[2];
-        Uz[5] = Gz[2] * zkl + Gz[3];
-        tile[0] += sc * Ux[0] * Uy[0] * Uz[0];
-        tile[1] += sc * Ux[1] * Uy[1] * Uz[0];
-        tile[2] += sc * Ux[1] * Uy[0] * Uz[1];
-        tile[3] += sc * Ux[2] * Uy[2] * Uz[0];
-        tile[4] += sc * Ux[3] * Uy[3] * Uz[0];
-        tile[5] += sc * Ux[3] * Uy[2] * Uz[1];
-        tile[6] += sc * Ux[2] * Uy[0] * Uz[2];
-        tile[7] += sc * Ux[3] * Uy[1] * Uz[2];
-        tile[8] += sc * Ux[3] * Uy[0] * Uz[3];
-        tile[9] += sc * Ux[4] * Uy[4] * Uz[0];
-        tile[10] += sc * Ux[5] * Uy[5] * Uz[0];
-        tile[11] += sc * Ux[5] * Uy[4] * Uz[1];
-        tile[12] += sc * Ux[4] * Uy[2] * Uz[2];
-        tile[13] += sc * Ux[5] * Uy[3] * Uz[2];
-        tile[14] += sc * Ux[5] * Uy[2] * Uz[3];
-        tile[15] += sc * Ux[4] * Uy[0] * Uz[4];
-        tile[16] += sc * Ux[5] * Uy[1] * Uz[4];
-        tile[17] += sc * Ux[5] * Uy[0] * Uz[5];
+        Ux[0] = static_cast<comp_t>(Gx[2] * xkl + Gx[3]);
+        Ux[1] = static_cast<comp_t>(Gx[2]);
+        Ux[2] = static_cast<comp_t>(Gx[1] * xkl + Gx[2]);
+        Ux[3] = static_cast<comp_t>(Gx[1]);
+        Ux[4] = static_cast<comp_t>(Gx[0] * xkl + Gx[1]);
+        Ux[5] = static_cast<comp_t>(Gx[0]);
+        Uy[0] = static_cast<comp_t>(Gy[0]);
+        Uy[1] = static_cast<comp_t>(Gy[0] * ykl + Gy[1]);
+        Uy[2] = static_cast<comp_t>(Gy[1]);
+        Uy[3] = static_cast<comp_t>(Gy[1] * ykl + Gy[2]);
+        Uy[4] = static_cast<comp_t>(Gy[2]);
+        Uy[5] = static_cast<comp_t>(Gy[2] * ykl + Gy[3]);
+        Uz[0] = static_cast<comp_t>(Gz[0]);
+        Uz[1] = static_cast<comp_t>(Gz[0] * zkl + Gz[1]);
+        Uz[2] = static_cast<comp_t>(Gz[1]);
+        Uz[3] = static_cast<comp_t>(Gz[1] * zkl + Gz[2]);
+        Uz[4] = static_cast<comp_t>(Gz[2]);
+        Uz[5] = static_cast<comp_t>(Gz[2] * zkl + Gz[3]);
+        tile[0] += sc * static_cast<double>(Ux[0] * Uy[0]) * static_cast<double>(Uz[0]);
+        tile[1] += sc * static_cast<double>(Ux[1] * Uy[1]) * static_cast<double>(Uz[0]);
+        tile[2] += sc * static_cast<double>(Ux[1] * Uy[0]) * static_cast<double>(Uz[1]);
+        tile[3] += sc * static_cast<double>(Ux[2] * Uy[2]) * static_cast<double>(Uz[0]);
+        tile[4] += sc * static_cast<double>(Ux[3] * Uy[3]) * static_cast<double>(Uz[0]);
+        tile[5] += sc * static_cast<double>(Ux[3] * Uy[2]) * static_cast<double>(Uz[1]);
+        tile[6] += sc * static_cast<double>(Ux[2] * Uy[0]) * static_cast<double>(Uz[2]);
+        tile[7] += sc * static_cast<double>(Ux[3] * Uy[1]) * static_cast<double>(Uz[2]);
+        tile[8] += sc * static_cast<double>(Ux[3] * Uy[0]) * static_cast<double>(Uz[3]);
+        tile[9] += sc * static_cast<double>(Ux[4] * Uy[4]) * static_cast<double>(Uz[0]);
+        tile[10] += sc * static_cast<double>(Ux[5] * Uy[5]) * static_cast<double>(Uz[0]);
+        tile[11] += sc * static_cast<double>(Ux[5] * Uy[4]) * static_cast<double>(Uz[1]);
+        tile[12] += sc * static_cast<double>(Ux[4] * Uy[2]) * static_cast<double>(Uz[2]);
+        tile[13] += sc * static_cast<double>(Ux[5] * Uy[3]) * static_cast<double>(Uz[2]);
+        tile[14] += sc * static_cast<double>(Ux[5] * Uy[2]) * static_cast<double>(Uz[3]);
+        tile[15] += sc * static_cast<double>(Ux[4] * Uy[0]) * static_cast<double>(Uz[4]);
+        tile[16] += sc * static_cast<double>(Ux[5] * Uy[1]) * static_cast<double>(Uz[4]);
+        tile[17] += sc * static_cast<double>(Ux[5] * Uy[0]) * static_cast<double>(Uz[5]);
       }
     }
   }
 
-  // Write output tile.
-  double* out = eri_out + static_cast<int64_t>(t) * static_cast<int64_t>(18);
-  out[0] = tile[0];
-  out[1] = tile[1];
-  out[2] = tile[2];
-  out[3] = tile[3];
-  out[4] = tile[4];
-  out[5] = tile[5];
-  out[6] = tile[6];
-  out[7] = tile[7];
-  out[8] = tile[8];
-  out[9] = tile[9];
-  out[10] = tile[10];
-  out[11] = tile[11];
-  out[12] = tile[12];
-  out[13] = tile[13];
-  out[14] = tile[14];
-  out[15] = tile[15];
-  out[16] = tile[16];
-  out[17] = tile[17];
+  // Write output tile: FP32 or FP64 depending on kTileF32.
+  if constexpr (kTileF32) {
+    float* out = eri_out_f32 + static_cast<int64_t>(t) * static_cast<int64_t>(18);
+    out[0] = __double2float_rn(tile[0]);
+    out[1] = __double2float_rn(tile[1]);
+    out[2] = __double2float_rn(tile[2]);
+    out[3] = __double2float_rn(tile[3]);
+    out[4] = __double2float_rn(tile[4]);
+    out[5] = __double2float_rn(tile[5]);
+    out[6] = __double2float_rn(tile[6]);
+    out[7] = __double2float_rn(tile[7]);
+    out[8] = __double2float_rn(tile[8]);
+    out[9] = __double2float_rn(tile[9]);
+    out[10] = __double2float_rn(tile[10]);
+    out[11] = __double2float_rn(tile[11]);
+    out[12] = __double2float_rn(tile[12]);
+    out[13] = __double2float_rn(tile[13]);
+    out[14] = __double2float_rn(tile[14]);
+    out[15] = __double2float_rn(tile[15]);
+    out[16] = __double2float_rn(tile[16]);
+    out[17] = __double2float_rn(tile[17]);
+  } else {
+    double* out = eri_out_f64 + static_cast<int64_t>(t) * static_cast<int64_t>(18);
+    out[0] = tile[0];
+    out[1] = tile[1];
+    out[2] = tile[2];
+    out[3] = tile[3];
+    out[4] = tile[4];
+    out[5] = tile[5];
+    out[6] = tile[6];
+    out[7] = tile[7];
+    out[8] = tile[8];
+    out[9] = tile[9];
+    out[10] = tile[10];
+    out[11] = tile[11];
+    out[12] = tile[12];
+    out[13] = tile[13];
+    out[14] = tile[14];
+    out[15] = tile[15];
+    out[16] = tile[16];
+    out[17] = tile[17];
+  }
 }
 
 template <int NROOTS>
@@ -9509,10 +9535,7 @@ __global__ void KernelERI_ssdp_warp_true(
   const int lane = static_cast<int>(threadIdx.x) & 31;
   const int warp_id = static_cast<int>(threadIdx.x) >> 5;
   const int warps_per_block = static_cast<int>(blockDim.x) >> 5;
-  const int warp_global = static_cast<int>(blockIdx.x) * warps_per_block + warp_id;
-  const int subwarp = lane >> 3;
-  const int lane8 = lane & 7;
-  const int t = warp_global * 4 + subwarp;
+  const int t = static_cast<int>(blockIdx.x) * warps_per_block + warp_id;
   if (t >= ntasks) return;
 
   const int spAB = static_cast<int>(task_spAB[t]);
@@ -9565,8 +9588,8 @@ __global__ void KernelERI_ssdp_warp_true(
   #pragma unroll
   for (int i = 0; i < kNComp; ++i) acc[i] = 0.0;
 
-  // Subwarp-parallel primitive pair loop.
-  for (int pair = lane8; pair < totalPairs; pair += 8) {
+  // Lane-parallel primitive pair loop.
+  for (int pair = lane; pair < totalPairs; pair += 32) {
     const int ip = pair / nPairCD;
     const int jp = pair - ip * nPairCD;
     const int ki = baseAB + ip;
@@ -9643,23 +9666,25 @@ __global__ void KernelERI_ssdp_warp_true(
     }  // for u (Rys roots)
   }  // for pair
 
-  // Subwarp reduction: sum across 8 lanes for this task.
+  // Warp reduction: sum across lanes.
   #pragma unroll
   for (int i = 0; i < kNComp; ++i) {
-    acc[i] += __shfl_down_sync(0xFFFFFFFF, acc[i], 4, 8);
-    acc[i] += __shfl_down_sync(0xFFFFFFFF, acc[i], 2, 8);
-    acc[i] += __shfl_down_sync(0xFFFFFFFF, acc[i], 1, 8);
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+      acc[i] += __shfl_down_sync(0xFFFFFFFF, acc[i], offset);
+    }
   }
 
-  if (lane8 == 0) {
+  // Lane 0 writes output.
+  if (lane == 0) {
     double* out = eri_out + static_cast<int64_t>(t) * static_cast<int64_t>(kNComp);
     #pragma unroll
     for (int i = 0; i < kNComp; ++i) out[i] = acc[i];
   }
 }
 
-template <int NROOTS>
-__global__ void KernelFusedFock_ssdp_fixed(
+template <int NROOTS, bool kMixedPrec = false>
+__global__ void __launch_bounds__(64) KernelFusedFock_ssdp_fixed(
     const int32_t* task_spAB,
     const int32_t* task_spCD,
     int ntasks,
@@ -9741,6 +9766,8 @@ __global__ void KernelFusedFock_ssdp_fixed(
   const int nPairAB = static_cast<int>(sp_npair[spAB]);
   const int nPairCD = static_cast<int>(sp_npair[spCD]);
 
+  using comp_t = typename std::conditional<kMixedPrec, float, double>::type;
+
   for (int ebase = 0; ebase < kNComp; ebase += 32) {
     const int e = ebase + lane;
     const bool active = (e < kNComp);
@@ -9792,10 +9819,10 @@ __global__ void KernelFusedFock_ssdp_fixed(
           }
           __syncwarp();
           if (active) {
-            const double Ix = eval_ssdp_x(e, Gx, xij, xij2, xkl, xkl2);
-            const double Iy = eval_ssdp_y(e, Gy, yij, yij2, ykl, ykl2);
-            const double Iz = eval_ssdp_z(e, Gz, zij, zij2, zkl, zkl2);
-            val += sh_sc[0] * (Ix * Iy * Iz);
+            const comp_t Ix = static_cast<comp_t>(eval_ssdp_x(e, Gx, xij, xij2, xkl, xkl2));
+            const comp_t Iy = static_cast<comp_t>(eval_ssdp_y(e, Gy, yij, yij2, ykl, ykl2));
+            const comp_t Iz = static_cast<comp_t>(eval_ssdp_z(e, Gz, zij, zij2, zkl, zkl2));
+            val += sh_sc[0] * static_cast<double>(Ix * Iy) * static_cast<double>(Iz);
           }
           __syncwarp();
         }
@@ -9828,8 +9855,8 @@ __global__ void KernelFusedFock_ssdp_fixed(
   }
 }
 
-template <int NROOTS>
-__global__ void KernelFusedJK_ssdp_fixed(
+template <int NROOTS, bool kMixedPrec = false>
+__global__ void __launch_bounds__(64) KernelFusedJK_ssdp_fixed(
     const int32_t* task_spAB,
     const int32_t* task_spCD,
     int ntasks,
@@ -9912,6 +9939,8 @@ __global__ void KernelFusedJK_ssdp_fixed(
   const int nPairAB = static_cast<int>(sp_npair[spAB]);
   const int nPairCD = static_cast<int>(sp_npair[spCD]);
 
+  using comp_t = typename std::conditional<kMixedPrec, float, double>::type;
+
   for (int ebase = 0; ebase < kNComp; ebase += 32) {
     const int e = ebase + lane;
     const bool active = (e < kNComp);
@@ -9963,10 +9992,10 @@ __global__ void KernelFusedJK_ssdp_fixed(
           }
           __syncwarp();
           if (active) {
-            const double Ix = eval_ssdp_x(e, Gx, xij, xij2, xkl, xkl2);
-            const double Iy = eval_ssdp_y(e, Gy, yij, yij2, ykl, ykl2);
-            const double Iz = eval_ssdp_z(e, Gz, zij, zij2, zkl, zkl2);
-            val += sh_sc[0] * (Ix * Iy * Iz);
+            const comp_t Ix = static_cast<comp_t>(eval_ssdp_x(e, Gx, xij, xij2, xkl, xkl2));
+            const comp_t Iy = static_cast<comp_t>(eval_ssdp_y(e, Gy, yij, yij2, ykl, ykl2));
+            const comp_t Iz = static_cast<comp_t>(eval_ssdp_z(e, Gz, zij, zij2, zkl, zkl2));
+            val += sh_sc[0] * static_cast<double>(Ix * Iy) * static_cast<double>(Iz);
           }
           __syncwarp();
         }
@@ -10024,9 +10053,93 @@ extern "C" cudaError_t cueri_eri_ssdp_launch_stream(
   // Flat kernel: one thread per task, 100% utilization.
   constexpr int kFlatThreads = 128;
   const int blocks = (ntasks + kFlatThreads - 1) / kFlatThreads;
-  KernelERI_ssdp_flat<2><<<blocks, kFlatThreads, 0, stream>>>(
+  KernelERI_ssdp_flat<2, false, false><<<blocks, kFlatThreads, 0, stream>>>(
       task_spAB, task_spCD, ntasks, sp_A, sp_B, sp_pair_start, sp_npair, shell_cx, shell_cy, shell_cz,
-      pair_eta, pair_Px, pair_Py, pair_Pz, pair_cK, eri_out);
+      pair_eta, pair_Px, pair_Py, pair_Pz, pair_cK, eri_out, nullptr);
+  return cudaGetLastError();
+}
+
+extern "C" cudaError_t cueri_eri_ssdp_f32_launch_stream(
+    const int32_t* task_spAB,
+    const int32_t* task_spCD,
+    int ntasks,
+    const int32_t* sp_A,
+    const int32_t* sp_B,
+    const int32_t* sp_pair_start,
+    const int32_t* sp_npair,
+    const double* shell_cx,
+    const double* shell_cy,
+    const double* shell_cz,
+    const double* pair_eta,
+    const double* pair_Px,
+    const double* pair_Py,
+    const double* pair_Pz,
+    const double* pair_cK,
+    float* eri_out_f32,
+    cudaStream_t stream,
+    int threads) {
+  if (ntasks <= 0) return (ntasks == 0) ? cudaSuccess : cudaErrorInvalidValue;
+  constexpr int kFlatThreads = 128;
+  const int blocks = (ntasks + kFlatThreads - 1) / kFlatThreads;
+  KernelERI_ssdp_flat<2, true, false><<<blocks, kFlatThreads, 0, stream>>>(
+      task_spAB, task_spCD, ntasks, sp_A, sp_B, sp_pair_start, sp_npair, shell_cx, shell_cy, shell_cz,
+      pair_eta, pair_Px, pair_Py, pair_Pz, pair_cK, nullptr, eri_out_f32);
+  return cudaGetLastError();
+}
+
+extern "C" cudaError_t cueri_eri_ssdp_mixed_launch_stream(
+    const int32_t* task_spAB,
+    const int32_t* task_spCD,
+    int ntasks,
+    const int32_t* sp_A,
+    const int32_t* sp_B,
+    const int32_t* sp_pair_start,
+    const int32_t* sp_npair,
+    const double* shell_cx,
+    const double* shell_cy,
+    const double* shell_cz,
+    const double* pair_eta,
+    const double* pair_Px,
+    const double* pair_Py,
+    const double* pair_Pz,
+    const double* pair_cK,
+    double* eri_out,
+    cudaStream_t stream,
+    int threads) {
+  if (ntasks <= 0) return (ntasks == 0) ? cudaSuccess : cudaErrorInvalidValue;
+  constexpr int kFlatThreads = 128;
+  const int blocks = (ntasks + kFlatThreads - 1) / kFlatThreads;
+  KernelERI_ssdp_flat<2, false, true><<<blocks, kFlatThreads, 0, stream>>>(
+      task_spAB, task_spCD, ntasks, sp_A, sp_B, sp_pair_start, sp_npair, shell_cx, shell_cy, shell_cz,
+      pair_eta, pair_Px, pair_Py, pair_Pz, pair_cK, eri_out, nullptr);
+  return cudaGetLastError();
+}
+
+extern "C" cudaError_t cueri_eri_ssdp_mixed_f32_launch_stream(
+    const int32_t* task_spAB,
+    const int32_t* task_spCD,
+    int ntasks,
+    const int32_t* sp_A,
+    const int32_t* sp_B,
+    const int32_t* sp_pair_start,
+    const int32_t* sp_npair,
+    const double* shell_cx,
+    const double* shell_cy,
+    const double* shell_cz,
+    const double* pair_eta,
+    const double* pair_Px,
+    const double* pair_Py,
+    const double* pair_Pz,
+    const double* pair_cK,
+    float* eri_out_f32,
+    cudaStream_t stream,
+    int threads) {
+  if (ntasks <= 0) return (ntasks == 0) ? cudaSuccess : cudaErrorInvalidValue;
+  constexpr int kFlatThreads = 128;
+  const int blocks = (ntasks + kFlatThreads - 1) / kFlatThreads;
+  KernelERI_ssdp_flat<2, true, true><<<blocks, kFlatThreads, 0, stream>>>(
+      task_spAB, task_spCD, ntasks, sp_A, sp_B, sp_pair_start, sp_npair, shell_cx, shell_cy, shell_cz,
+      pair_eta, pair_Px, pair_Py, pair_Pz, pair_cK, nullptr, eri_out_f32);
   return cudaGetLastError();
 }
 
@@ -10049,17 +10162,9 @@ extern "C" cudaError_t cueri_eri_ssdp_warp_launch_stream(
     double* eri_out,
     cudaStream_t stream,
     int threads) {
-  if (ntasks <= 0) return (ntasks == 0) ? cudaSuccess : cudaErrorInvalidValue;
-  int launch_threads = threads > 0 ? threads : 32;
-  launch_threads = (launch_threads / 32) * 32;
-  if (launch_threads < 32) launch_threads = 32;
-  const int warps_per_block = launch_threads >> 5;
-  const int tasks_per_block = warps_per_block << 2;
-  const int blocks = (ntasks + tasks_per_block - 1) / tasks_per_block;
-  KernelERI_ssdp_warp_true<2><<<blocks, launch_threads, 0, stream>>>(
+  return cueri_eri_ssdp_launch_stream(
       task_spAB, task_spCD, ntasks, sp_A, sp_B, sp_pair_start, sp_npair, shell_cx, shell_cy, shell_cz,
-      pair_eta, pair_Px, pair_Py, pair_Pz, pair_cK, eri_out);
-  return cudaGetLastError();
+      pair_eta, pair_Px, pair_Py, pair_Pz, pair_cK, eri_out, stream, threads);
 }
 
 extern "C" cudaError_t cueri_eri_ssdp_multiblock_launch_stream(
@@ -10111,7 +10216,8 @@ extern "C" cudaError_t cueri_fused_fock_ssdp_launch_stream(
     double* F_mat,
     cudaStream_t stream,
     int threads,
-    int n_bufs) {
+    int n_bufs,
+    bool mixed_prec) {
   if (ntasks < 0 || nao <= 0) return cudaErrorInvalidValue;
   if (ntasks == 0) return cudaSuccess;
   constexpr int kDefaultThreads = 64;
@@ -10120,21 +10226,29 @@ extern "C" cudaError_t cueri_fused_fock_ssdp_launch_stream(
   constexpr int kGSize_ssdp = 5 * 5;
   constexpr int kWarpDoubles_ssdp = 3 * kGSize_ssdp + 2 * 2 + 11 + 18;
   size_t shmem_ssdp = 0;
-  const cudaError_t prep_ssdp = cueri_prepare_fused_fock_warp_launch(
-      KernelFusedFock_ssdp_fixed<2>,
-      threads,
-      kDefaultThreads,
-      ntasks,
-      kWarpDoubles_ssdp,
-      &launch_threads,
-      &blocks,
-      &shmem_ssdp);
-  if (prep_ssdp != cudaSuccess) return prep_ssdp;
-  KernelFusedFock_ssdp_fixed<2><<<blocks, launch_threads, shmem_ssdp, stream>>>(
-      task_spAB, task_spCD, ntasks, sp_A, sp_B, sp_pair_start, sp_npair,
-      shell_cx, shell_cy, shell_cz,
-      pair_eta, pair_Px, pair_Py, pair_Pz, pair_cK,
-      shell_ao_start, nao, D_mat, F_mat, n_bufs);
+  if (mixed_prec) {
+    const cudaError_t prep_ssdp = cueri_prepare_fused_fock_warp_launch(
+        KernelFusedFock_ssdp_fixed<2, true>,
+        threads, kDefaultThreads, ntasks,
+        kWarpDoubles_ssdp, &launch_threads, &blocks, &shmem_ssdp);
+    if (prep_ssdp != cudaSuccess) return prep_ssdp;
+    KernelFusedFock_ssdp_fixed<2, true><<<blocks, launch_threads, shmem_ssdp, stream>>>(
+        task_spAB, task_spCD, ntasks, sp_A, sp_B, sp_pair_start, sp_npair,
+        shell_cx, shell_cy, shell_cz,
+        pair_eta, pair_Px, pair_Py, pair_Pz, pair_cK,
+        shell_ao_start, nao, D_mat, F_mat, n_bufs);
+  } else {
+    const cudaError_t prep_ssdp = cueri_prepare_fused_fock_warp_launch(
+        KernelFusedFock_ssdp_fixed<2, false>,
+        threads, kDefaultThreads, ntasks,
+        kWarpDoubles_ssdp, &launch_threads, &blocks, &shmem_ssdp);
+    if (prep_ssdp != cudaSuccess) return prep_ssdp;
+    KernelFusedFock_ssdp_fixed<2, false><<<blocks, launch_threads, shmem_ssdp, stream>>>(
+        task_spAB, task_spCD, ntasks, sp_A, sp_B, sp_pair_start, sp_npair,
+        shell_cx, shell_cy, shell_cz,
+        pair_eta, pair_Px, pair_Py, pair_Pz, pair_cK,
+        shell_ao_start, nao, D_mat, F_mat, n_bufs);
+  }
   return cudaGetLastError();
 }
 
@@ -10161,7 +10275,8 @@ extern "C" cudaError_t cueri_fused_jk_ssdp_launch_stream(
     double* K_mat,
     cudaStream_t stream,
     int threads,
-    int n_bufs) {
+    int n_bufs,
+    bool mixed_prec) {
   if (ntasks < 0 || nao <= 0) return cudaErrorInvalidValue;
   if (ntasks == 0) return cudaSuccess;
   constexpr int kDefaultThreads = 64;
@@ -10170,21 +10285,29 @@ extern "C" cudaError_t cueri_fused_jk_ssdp_launch_stream(
   constexpr int kGSize_ssdp = 5 * 5;
   constexpr int kWarpDoubles_ssdp = 3 * kGSize_ssdp + 2 * 2 + 11 + 18;
   size_t shmem_ssdp = 0;
-  const cudaError_t prep_ssdp = cueri_prepare_fused_fock_warp_launch(
-      KernelFusedJK_ssdp_fixed<2>,
-      threads,
-      kDefaultThreads,
-      ntasks,
-      kWarpDoubles_ssdp,
-      &launch_threads,
-      &blocks,
-      &shmem_ssdp);
-  if (prep_ssdp != cudaSuccess) return prep_ssdp;
-  KernelFusedJK_ssdp_fixed<2><<<blocks, launch_threads, shmem_ssdp, stream>>>(
-      task_spAB, task_spCD, ntasks, sp_A, sp_B, sp_pair_start, sp_npair,
-      shell_cx, shell_cy, shell_cz,
-      pair_eta, pair_Px, pair_Py, pair_Pz, pair_cK,
-      shell_ao_start, nao, D_mat, J_mat, K_mat, n_bufs);
+  if (mixed_prec) {
+    const cudaError_t prep_ssdp = cueri_prepare_fused_fock_warp_launch(
+        KernelFusedJK_ssdp_fixed<2, true>,
+        threads, kDefaultThreads, ntasks,
+        kWarpDoubles_ssdp, &launch_threads, &blocks, &shmem_ssdp);
+    if (prep_ssdp != cudaSuccess) return prep_ssdp;
+    KernelFusedJK_ssdp_fixed<2, true><<<blocks, launch_threads, shmem_ssdp, stream>>>(
+        task_spAB, task_spCD, ntasks, sp_A, sp_B, sp_pair_start, sp_npair,
+        shell_cx, shell_cy, shell_cz,
+        pair_eta, pair_Px, pair_Py, pair_Pz, pair_cK,
+        shell_ao_start, nao, D_mat, J_mat, K_mat, n_bufs);
+  } else {
+    const cudaError_t prep_ssdp = cueri_prepare_fused_fock_warp_launch(
+        KernelFusedJK_ssdp_fixed<2, false>,
+        threads, kDefaultThreads, ntasks,
+        kWarpDoubles_ssdp, &launch_threads, &blocks, &shmem_ssdp);
+    if (prep_ssdp != cudaSuccess) return prep_ssdp;
+    KernelFusedJK_ssdp_fixed<2, false><<<blocks, launch_threads, shmem_ssdp, stream>>>(
+        task_spAB, task_spCD, ntasks, sp_A, sp_B, sp_pair_start, sp_npair,
+        shell_cx, shell_cy, shell_cz,
+        pair_eta, pair_Px, pair_Py, pair_Pz, pair_cK,
+        shell_ao_start, nao, D_mat, J_mat, K_mat, n_bufs);
+  }
   return cudaGetLastError();
 }
 

@@ -41,6 +41,18 @@ import numpy as np
 import time
 
 
+def _asnumpy_f64(a: Any) -> np.ndarray:
+    """Convert numpy/cupy arrays to numpy.float64 without implicit device casts."""
+
+    try:
+        import cupy as cp  # type: ignore
+    except Exception:
+        cp = None  # type: ignore
+    if cp is not None and isinstance(a, cp.ndarray):  # type: ignore[attr-defined]
+        a = cp.asnumpy(a)
+    return np.asarray(a, dtype=np.float64)
+
+
 @dataclass(frozen=True)
 class MCSCFZVectorResult:
     """Container for a solved MCSCF/CASSCF Z-vector.
@@ -220,11 +232,11 @@ def _flatten_ci(ci: Any) -> tuple[np.ndarray, Callable[[np.ndarray], Any]]:
     """
 
     if isinstance(ci, np.ndarray):
-        arr = np.asarray(ci, dtype=np.float64)
+        arr = _asnumpy_f64(ci)
         shape = arr.shape
         if arr.ndim == 1:
             def _unflatten(v: np.ndarray) -> np.ndarray:
-                vv = np.asarray(v, dtype=np.float64).ravel()
+                vv = _asnumpy_f64(v).ravel()
                 if vv.size != arr.size:
                     raise ValueError("CI size mismatch")
                 return vv.reshape(shape)
@@ -233,7 +245,7 @@ def _flatten_ci(ci: Any) -> tuple[np.ndarray, Callable[[np.ndarray], Any]]:
         if arr.ndim == 2:
             # Accept PySCF's occasional (1,ncsf) wrappers.
             def _unflatten(v: np.ndarray) -> np.ndarray:
-                vv = np.asarray(v, dtype=np.float64).ravel()
+                vv = _asnumpy_f64(v).ravel()
                 if vv.size != arr.size:
                     raise ValueError("CI size mismatch")
                 return vv.reshape(shape)
@@ -242,7 +254,7 @@ def _flatten_ci(ci: Any) -> tuple[np.ndarray, Callable[[np.ndarray], Any]]:
         raise ValueError("Unsupported CI ndarray ndim")
 
     if isinstance(ci, (list, tuple)):
-        vecs = [np.asarray(v, dtype=np.float64).ravel() for v in ci]
+        vecs = [_asnumpy_f64(v).ravel() for v in ci]
         sizes = [int(v.size) for v in vecs]
         total = int(sum(sizes))
         if total == 0:
@@ -251,7 +263,7 @@ def _flatten_ci(ci: Any) -> tuple[np.ndarray, Callable[[np.ndarray], Any]]:
         flat = np.concatenate(vecs)
 
         def _unflatten(v: np.ndarray) -> list[np.ndarray]:
-            vv = np.asarray(v, dtype=np.float64).ravel()
+            vv = _asnumpy_f64(v).ravel()
             if vv.size != total:
                 raise ValueError("CI size mismatch")
             out: list[np.ndarray] = []
@@ -330,7 +342,7 @@ def project_ci_rhs_normalized(ci0: Any, rhs_ci: Any) -> Any:
         if not isinstance(rhs_ci, (list, tuple)) or len(rhs_ci) != len(ci0):
             raise ValueError("rhs_ci must have the same list/tuple structure as ci0")
 
-        c_list = [np.asarray(c, dtype=np.float64).ravel() for c in ci0]
+        c_list = [_asnumpy_f64(c).ravel() for c in ci0]
         sizes = {int(c.size) for c in c_list}
         if len(sizes) != 1:
             # Fallback: inconsistent CI sizes (should not happen in SA-CASSCF); project root-by-root.
@@ -344,7 +356,7 @@ def project_ci_rhs_normalized(ci0: Any, rhs_ci: Any) -> Any:
         except np.linalg.LinAlgError:  # pragma: no cover
             gram_inv = np.linalg.pinv(gram)
 
-        g_list = [np.asarray(g, dtype=np.float64) for g in rhs_ci]
+        g_list = [_asnumpy_f64(g) for g in rhs_ci]
         shapes = [g.shape for g in g_list]
         gmat = np.stack([g.ravel() for g in g_list], axis=1)  # (nci, nvec)
         if int(gmat.shape[0]) != int(cmat.shape[0]):
@@ -353,8 +365,8 @@ def project_ci_rhs_normalized(ci0: Any, rhs_ci: Any) -> Any:
         gmat = gmat - cmat @ (gram_inv @ coeff)
         return [np.ascontiguousarray(gmat[:, i].reshape(shapes[i])) for i in range(int(gmat.shape[1]))]
 
-    c0 = np.asarray(ci0, dtype=np.float64).ravel()
-    g0 = np.asarray(rhs_ci, dtype=np.float64)
+    c0 = _asnumpy_f64(ci0).ravel()
+    g0 = _asnumpy_f64(rhs_ci)
     shape = g0.shape
     g = g0.ravel().copy()
     if c0.size != g.size:
@@ -2192,8 +2204,8 @@ def build_ci_gradient_from_effective_integrals(
             )
         return out
 
-    c0 = np.asarray(ci0, dtype=np.float64).ravel()
-    hc = np.asarray(fcisolver.contract_2e(h2_eff, c0, int(norb), nelec, h1e=h1_eff), dtype=np.float64).ravel()
+    c0 = _asnumpy_f64(ci0).ravel()
+    hc = _asnumpy_f64(fcisolver.contract_2e(h2_eff, c0, int(norb), nelec, h1e=h1_eff)).ravel()
     if hc.size != c0.size:
         raise ValueError("contract_2e returned unexpected CI vector length")
 
@@ -2201,8 +2213,8 @@ def build_ci_gradient_from_effective_integrals(
     # induced CI-space operator contributes to a real energy functional. Use (F + F†)|ci>.
     h1_dag = h1_eff.T
     h2_dag = h2_eff.transpose(3, 2, 1, 0)
-    hc_dag = np.asarray(
-        fcisolver.contract_2e(h2_dag, c0, int(norb), nelec, h1e=h1_dag), dtype=np.float64
+    hc_dag = _asnumpy_f64(
+        fcisolver.contract_2e(h2_dag, c0, int(norb), nelec, h1e=h1_dag)
     ).ravel()
     if hc_dag.size != c0.size:
         raise ValueError("contract_2e returned unexpected CI vector length (dagger path)")
@@ -2298,15 +2310,15 @@ def effective_active_rdms_from_ci_zvector(
         dm1_acc = np.zeros((int(norb), int(norb)), dtype=np.float64)
         dm2_acc = np.zeros((int(norb), int(norb), int(norb), int(norb)), dtype=np.float64)
         for w, c0_i, z_i in zip(weights, ci0, z_ci):
-            c0 = np.asarray(c0_i, dtype=np.float64).ravel()
-            z = np.asarray(z_i, dtype=np.float64).ravel()
+            c0 = _asnumpy_f64(c0_i).ravel()
+            z = _asnumpy_f64(z_i).ravel()
             dm1_t, dm2_t = _trans_rdm12_single(z, c0)
             dm1_acc += float(w) * (2.0 * np.asarray(dm1_t, dtype=np.float64))
             dm2_acc += float(w) * (2.0 * np.asarray(dm2_t, dtype=np.float64))
         return dm1_acc, dm2_acc
 
-    c0 = np.asarray(ci0, dtype=np.float64).ravel()
-    z = np.asarray(z_ci, dtype=np.float64).ravel()
+    c0 = _asnumpy_f64(ci0).ravel()
+    z = _asnumpy_f64(z_ci).ravel()
 
     dm1_t, dm2_t = _trans_rdm12_single(z, c0)
     dm1_t = np.asarray(dm1_t, dtype=np.float64)

@@ -332,6 +332,7 @@ class CuERIActiveSpaceDFBuilder:
         want_eri_mat: bool = True,
         want_j_ps: bool = True,
         want_pair_norm: bool = True,
+        eri_precision: str | None = None,
         out: DeviceActiveDF | None = None,
         profile: dict | None = None,
         cached_b_whitened: Any | None = None,
@@ -503,7 +504,24 @@ class CuERIActiveSpaceDFBuilder:
 
         eri_mat = None
         if bool(want_eri_mat):
-            if out is not None:
+            _eri_prec = eri_precision
+            if _eri_prec is None:
+                try:
+                    from asuka.cuda.mixed_precision_policy import PrecisionPolicy
+                    _eri_prec = PrecisionPolicy.from_env().eri_matrix
+                except Exception:
+                    _eri_prec = "fp64"
+            if _eri_prec is not None and _eri_prec != "fp64":
+                from asuka.cuda.mixed_precision import gemm_dispatched
+                eri_mat = gemm_dispatched(
+                    l_full, l_full.T, precision=_eri_prec,
+                    out=out.eri_mat if out is not None else None,
+                )
+                if out is not None:
+                    eri_mat = out.eri_mat
+                else:
+                    eri_mat = cp.ascontiguousarray(eri_mat)
+            elif out is not None:
                 assert out.eri_mat is not None
                 cp.dot(l_full, l_full.T, out=out.eri_mat)
                 eri_mat = out.eri_mat

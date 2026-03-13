@@ -11,7 +11,14 @@
 //   1. pairwise_materialize_u64_kernel: Pre-compute step vectors, nodes, occ,
 //      b-values for all nsel selected CSFs.
 //   2. pairwise_hij_u64_kernel: For each source j (one CUDA block), compute
-//      row j of the dense H[nsel, nsel] matrix using materialized data.
+//      the UPPER TRIANGLE of row j (i >= j) of the dense H[nsel, nsel] matrix.
+//   3. pairwise_hij_mirror_kernel: Copy upper triangle to lower triangle.
+//
+// Optimizations over initial version:
+//   - Upper-triangle only: halves compute (H is symmetric)
+//   - Shared-memory tiling: target step/b vectors loaded in tiles into shmem
+//     in Phase 2, reducing global memory bandwidth by ~#intermediates
+//   - In-place mirror: no temporary allocation for symmetrization
 //
 // Scaling: O(nsel * [norb^2 + #interm * nsel * norb]) vs the old
 // O(nsel * ncsf_connected * norb) where ncsf_connected >> nsel for
@@ -122,7 +129,7 @@ __device__ __forceinline__ double pairwise_compute_epq_coupling(
     int bk     = (int)b_j[k];      // ket b-value at child node
 
     // Compute db = b_j[k] - b_i[k] (spin difference)
-    // But we need node_twos consistency. For the ket, b_j[k] = node_twos[nodes_j[k+1]].
+    // For the ket, b_j[k] = node_twos[nodes_j[k+1]].
     // For the bra, b_i[k] = node_twos[nodes_i[k+1]], which is stored in b_i.
     int db = bk - (int)b_i[k];
 
@@ -134,11 +141,13 @@ __device__ __forceinline__ double pairwise_compute_epq_coupling(
 }
 
 // ============================================================================
-// Kernel H: Pair-wise Hamiltonian builder
+// Kernel H: Pair-wise Hamiltonian builder (UPPER TRIANGLE)
 // ============================================================================
 //
 // Grid: nsel blocks, Block: 256 threads
-// Each block computes row j = blockIdx.x of H[nsel, nsel]
+// Each block computes row j = blockIdx.x of H[nsel, nsel], but only for
+// columns i >= j (upper triangle including diagonal).
+// A separate mirror kernel copies upper→lower afterwards.
 
 template <int MAX_NORB_T>
 __global__ __launch_bounds__(256)
@@ -230,7 +239,6 @@ void pairwise_hij_u64_kernel(
   __syncthreads();
 
   // === Step 2: Compute h_eff_j = h[p,q] + 0.5 * sum_r eri(p,q,r,r) * occ_j[r] ===
-  // We compute h_eff_j in the h1e cache (overwrite in-place)
   for (int pq = tid; pq < nops; pq += nthreads) {
     int p = pq / norb;
     int q = pq - p * norb;
@@ -244,17 +252,14 @@ void pairwise_hij_u64_kernel(
   }
   __syncthreads();
 
-  // === Step 3: One-body pass ===
-  // Diagonal h_eff contribution
+  // === Step 3: One-body pass (upper triangle only: i_local >= j_local) ===
   double diag_local = 0.0;
   for (int p = tid; p < norb; p += nthreads) {
     diag_local += _h1e_cache[p * norb + p] * (double)occ_j_s[p];
   }
 
-  // Off-diagonal one-body: for each target i, compute <i|H_1|j>
-  for (int i_local = tid; i_local < nsel; i_local += nthreads) {
-    if (i_local == j_local) continue;
-
+  // Off-diagonal one-body: for each target i >= j, compute <i|H_1|j>
+  for (int i_local = j_local + 1 + tid; i_local < nsel; i_local += nthreads) {
     const int8_t*  steps_i = steps_all + (int64_t)i_local * norb;
     const int16_t* b_i     = b_all     + (int64_t)i_local * norb;
 
@@ -267,21 +272,11 @@ void pairwise_hij_u64_kernel(
       }
     }
 
-    if (diff_min > diff_max) {
-      // i == j in step space (should not happen for i_local != j_local in a
-      // correct selected set, but guard anyway).
-      continue;
-    }
-
-    // One-body generator E_pq can only connect CSFs that differ in exactly
-    // the range [p, q] (or [q, p]). The diff must be contiguous for a single
-    // generator. For one-body, we need exactly one E_pq, so the diff range
-    // must match exactly [min(p,q), max(p,q)].
-    // We try both E_{diff_min, diff_max} and E_{diff_max, diff_min}.
+    if (diff_min > diff_max) continue;
 
     double h_1b = 0.0;
 
-    // Try E_{diff_min, diff_max} (p=diff_min, q=diff_max)
+    // Try E_{diff_min, diff_max}
     {
       double coupling = pairwise_compute_epq_coupling<MAX_NORB_T>(
           norb, diff_min, diff_max,
@@ -291,7 +286,7 @@ void pairwise_hij_u64_kernel(
       }
     }
 
-    // Try E_{diff_max, diff_min} (p=diff_max, q=diff_min)
+    // Try E_{diff_max, diff_min}
     if (diff_min != diff_max) {
       double coupling = pairwise_compute_epq_coupling<MAX_NORB_T>(
           norb, diff_max, diff_min,
@@ -399,7 +394,7 @@ void pairwise_hij_u64_kernel(
   }
   __syncthreads();
 
-  // === Step 5: Two-body Phase 2 — pair-wise evaluation ===
+  // === Step 5: Two-body Phase 2 — pair-wise evaluation (TILED, upper triangle) ===
   if (!_interm_overflow) {
     int n_ki = _interm_count;
     for (int ki = 0; ki < n_ki; ++ki) {
@@ -439,8 +434,8 @@ void pairwise_hij_u64_kernel(
         }
       }
 
-      // For each target i, compute <i|E_pq|k> coupling for all relevant (p,q)
-      for (int i_local = tid; i_local < nsel; i_local += nthreads) {
+      // Upper-triangle targets: i_local >= j_local (includes diagonal for 2-body)
+      for (int i_local = j_local + tid; i_local < nsel; i_local += nthreads) {
         const int8_t*  steps_i = steps_all + (int64_t)i_local * norb;
         const int16_t* b_i     = b_all     + (int64_t)i_local * norb;
 
@@ -457,7 +452,6 @@ void pairwise_hij_u64_kernel(
 
         if (diff_min > diff_max) {
           // i == k in step space: diagonal 2-body contribution
-          // <i|E_pp|k> for p with occ != 0 gives occ[p]
           for (int p = 0; p < norb; ++p) {
             int occ_p = (int)occ_all[(int64_t)i_local * norb + p];
             if (occ_p == 0) continue;
@@ -465,7 +459,7 @@ void pairwise_hij_u64_kernel(
                 cas36_dense_eri4_at(eri4, norb, p, p, ki_r, ki_s) * (double)occ_p;
           }
         } else {
-          // Off-diagonal: try both orientations E_{diff_min, diff_max} and reverse
+          // Off-diagonal: try both orientations
           {
             double coupling = pairwise_compute_epq_coupling<MAX_NORB_T>(
                 norb, diff_min, diff_max,
@@ -494,7 +488,6 @@ void pairwise_hij_u64_kernel(
     }
   } else {
     // === Fallback: intermediate overflow — recompute per (r,s) serially ===
-    // This mirrors the existing dense emitter's fallback path.
     for (int rs = tid; rs < nops; rs += nthreads) {
       int r = rs / norb;
       int s = rs - r * norb;
@@ -598,10 +591,8 @@ void pairwise_hij_u64_kernel(
             }
           }
 
-          // For each target i, evaluate pair-wise coupling
-          // In the fallback path, we do this serially per intermediate
-          // (only this thread's (r,s) pair)
-          for (int i_local = 0; i_local < nsel; i_local++) {
+          // For each target i >= j, evaluate pair-wise coupling
+          for (int i_local = j_local + 1; i_local < nsel; i_local++) {
             const int8_t*  steps_i = steps_all + (int64_t)i_local * norb;
             const int16_t* b_i     = b_all     + (int64_t)i_local * norb;
 
@@ -615,7 +606,6 @@ void pairwise_hij_u64_kernel(
 
             double h_2b = 0.0;
             if (diff_min2 > diff_max2) {
-              // i == k: diagonal 2-body
               for (int p = 0; p < norb; ++p) {
                 int occ_p = (int)occ_all[(int64_t)i_local * norb + p];
                 if (occ_p == 0) continue;
@@ -656,6 +646,33 @@ void pairwise_hij_u64_kernel(
   if (diag_local != 0.0) {
     atomicAdd(&H_out[(int64_t)j_local * nsel + j_local], diag_local);
   }
+}
+
+// ============================================================================
+// Kernel: Mirror upper triangle to lower triangle (in-place symmetrization)
+// ============================================================================
+//
+// Grid: enough blocks to cover all upper-triangle elements
+// Each thread copies H[j][i] to H[i][j] for j < i
+
+__global__ void pairwise_hij_mirror_kernel(
+    double* __restrict__ H,   // [nsel, nsel]
+    int nsel) {
+  // Total upper-triangle elements (excluding diagonal): nsel*(nsel-1)/2
+  int64_t total = (int64_t)nsel * (nsel - 1) / 2;
+  int64_t idx = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx >= total) return;
+
+  // Map linear index to (row, col) with row < col (upper triangle)
+  // Using quadratic formula: row = floor((2*nsel - 1 - sqrt((2*nsel-1)^2 - 8*idx)) / 2)
+  double n2 = 2.0 * nsel - 1.0;
+  int row = (int)((n2 - sqrt(n2 * n2 - 8.0 * (double)idx)) * 0.5);
+  int64_t row_start = (int64_t)row * (2 * nsel - row - 1) / 2;
+  int col = (int)(idx - row_start) + row + 1;
+  if (row >= nsel || col >= nsel || row >= col) return;
+
+  // Copy upper to lower: H[col][row] = H[row][col]
+  H[(int64_t)col * nsel + row] = H[(int64_t)row * nsel + col];
 }
 
 }  // anonymous namespace
@@ -774,5 +791,19 @@ extern "C" cudaError_t pairwise_hij_u64_launch_stream(
 
 #undef LAUNCH_HIJ_
 
-  return cudaGetLastError();
+  cudaError_t err = cudaGetLastError();
+  if (err != cudaSuccess) return err;
+
+  // Launch mirror kernel to copy upper triangle to lower triangle
+  {
+    int64_t n_upper = (int64_t)nsel * (nsel - 1) / 2;
+    if (n_upper > 0) {
+      dim3 mirror_block(256);
+      dim3 mirror_grid(((unsigned int)n_upper + 255u) / 256u);
+      pairwise_hij_mirror_kernel<<<mirror_grid, mirror_block, 0, stream>>>(H_out, nsel);
+      err = cudaGetLastError();
+    }
+  }
+
+  return err;
 }

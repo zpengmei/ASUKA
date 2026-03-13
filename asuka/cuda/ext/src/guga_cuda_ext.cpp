@@ -10498,6 +10498,7 @@ void cas36_hb_screen_and_apply_u64_inplace_device(
     py::object selected_idx_sorted_u64_obj,
     int target_mode,
     py::object overflow_obj,
+    py::object sym_pq_allowed_obj,
     int threads,
     uint64_t stream,
     bool sync) {
@@ -10718,6 +10719,12 @@ void cas36_hb_screen_and_apply_u64_inplace_device(
     selected_stream = selected_dev.stream;
   }
 
+  const int8_t* d_sym_pq = nullptr;
+  if (!sym_pq_allowed_obj.is_none()) {
+    auto sym_view = cuda_array_view_from_object(sym_pq_allowed_obj, "sym_pq_allowed");
+    d_sym_pq = reinterpret_cast<const int8_t*>(sym_view.ptr);
+  }
+
   uint64_t stream_u = stream;
   if (stream_u == 0) {
     if (hash_vals_dev.stream) stream_u = hash_vals_dev.stream;
@@ -10759,7 +10766,8 @@ void cas36_hb_screen_and_apply_u64_inplace_device(
           int(target_mode),
           reinterpret_cast<int*>(overflow_dev.ptr),
           stream_t,
-          int(threads)),
+          int(threads),
+          d_sym_pq),
       "cas36_hb_screen_and_apply_u64_launch_stream");
   if (sync) {
     throw_on_cuda_error(cudaStreamSynchronize(stream_t), "cudaStreamSynchronize(cas36_hb_screen_and_apply_u64)");
@@ -10792,6 +10800,7 @@ void cas36_hb_emit_tuples_u64_inplace_device(
     int target_mode,
     py::object out_n_obj,
     py::object overflow_obj,
+    py::object sym_pq_allowed_obj,
     int threads,
     uint64_t stream,
     bool sync) {
@@ -10886,6 +10895,12 @@ void cas36_hb_emit_tuples_u64_inplace_device(
     selected_stream = selected_dev.stream;
   }
 
+  const int8_t* d_sym_pq = nullptr;
+  if (!sym_pq_allowed_obj.is_none()) {
+    auto sym_view = cuda_array_view_from_object(sym_pq_allowed_obj, "sym_pq_allowed");
+    d_sym_pq = reinterpret_cast<const int8_t*>(sym_view.ptr);
+  }
+
   uint64_t stream_u = stream;
   if (stream_u == 0) {
     if (out_hij_dev.stream) stream_u = out_hij_dev.stream;
@@ -10928,7 +10943,8 @@ void cas36_hb_emit_tuples_u64_inplace_device(
           reinterpret_cast<int*>(out_n_dev.ptr),
           reinterpret_cast<int*>(overflow_dev.ptr),
           stream_t,
-          int(threads)),
+          int(threads),
+          d_sym_pq),
       "cas36_hb_emit_tuples_u64_launch_stream");
   if (sync) {
     throw_on_cuda_error(cudaStreamSynchronize(stream_t), "cudaStreamSynchronize(cas36_hb_emit_tuples_u64)");
@@ -10989,6 +11005,7 @@ void cas36_exact_selected_emit_tuples_u64_inplace_device(
       1,
       std::move(out_n_obj),
       std::move(overflow_obj),
+      py::none(),
       int(threads),
       stream,
       bool(sync));
@@ -11006,16 +11023,14 @@ void cas36_exact_selected_emit_tuples_dense_u64_inplace_device(
     py::object out_src_obj,
     py::object out_hij_obj,
     int cap,
-    py::object selected_idx_sorted_u64_obj,
+    py::object membership_hash_keys_obj,
+    int membership_hash_cap,
     py::object out_diag_obj,
     py::object out_n_obj,
     py::object overflow_obj,
     int threads,
     uint64_t stream,
     bool sync) {
-  if (selected_idx_sorted_u64_obj.is_none()) {
-    throw std::invalid_argument("selected_idx_sorted_u64 must be provided for exact selected dense tuple emission");
-  }
   if (sel_idx_u64_obj.is_none() || c_bound_obj.is_none() || h_base_obj.is_none() || eri4_obj.is_none() ||
       out_keys_u64_obj.is_none() || out_src_obj.is_none() || out_hij_obj.is_none() || out_n_obj.is_none() ||
       overflow_obj.is_none()) {
@@ -11041,7 +11056,10 @@ void cas36_exact_selected_emit_tuples_dense_u64_inplace_device(
   auto out_hij_dev = cuda_array_view_from_object(out_hij_obj, "out_hij");
   auto out_n_dev = cuda_array_view_from_object(out_n_obj, "out_n");
   auto overflow_dev = cuda_array_view_from_object(overflow_obj, "overflow");
-  auto selected_dev = cuda_array_view_from_object(selected_idx_sorted_u64_obj, "selected_idx_sorted_u64");
+  std::optional<CudaArrayView> membership_hash_dev;
+  if (!membership_hash_keys_obj.is_none()) {
+    membership_hash_dev = cuda_array_view_from_object(membership_hash_keys_obj, "membership_hash_keys");
+  }
   std::optional<CudaArrayView> out_diag_dev;
   if (!out_diag_obj.is_none()) {
     out_diag_dev = cuda_array_view_from_object(out_diag_obj, "out_diag");
@@ -11056,12 +11074,14 @@ void cas36_exact_selected_emit_tuples_dense_u64_inplace_device(
   require_typestr(out_hij_dev, "out_hij", "<f8");
   require_typestr(out_n_dev, "out_n", "<i4");
   require_typestr(overflow_dev, "overflow", "<i4");
-  require_typestr(selected_dev, "selected_idx_sorted_u64", "<u8");
+  if (membership_hash_dev.has_value()) {
+    require_typestr(*membership_hash_dev, "membership_hash_keys", "<u8");
+  }
   if (out_diag_dev.has_value()) {
     require_typestr(*out_diag_dev, "out_diag", "<f8");
   }
 
-  if (sel_idx_dev.read_only || c_bound_dev.read_only || h_base_dev.read_only || eri4_dev.read_only || selected_dev.read_only) {
+  if (sel_idx_dev.read_only || c_bound_dev.read_only || h_base_dev.read_only || eri4_dev.read_only) {
     // inputs are fine if read-only; only outputs must be writable
   }
   if (out_keys_dev.read_only || out_src_dev.read_only || out_hij_dev.read_only || out_n_dev.read_only || overflow_dev.read_only ||
@@ -11070,7 +11090,7 @@ void cas36_exact_selected_emit_tuples_dense_u64_inplace_device(
   }
   if (sel_idx_dev.shape.size() != 1 || c_bound_dev.shape.size() != 1 || h_base_dev.shape.size() != 1 || eri4_dev.shape.size() != 1 ||
       out_keys_dev.shape.size() != 1 || out_src_dev.shape.size() != 1 || out_hij_dev.shape.size() != 1 ||
-      out_n_dev.shape.size() != 1 || overflow_dev.shape.size() != 1 || selected_dev.shape.size() != 1) {
+      out_n_dev.shape.size() != 1 || overflow_dev.shape.size() != 1) {
     throw std::invalid_argument("all exact selected dense tuple emitter arrays must be 1D");
   }
   if (out_diag_dev.has_value() && out_diag_dev->shape.size() != 1) {
@@ -11102,7 +11122,6 @@ void cas36_exact_selected_emit_tuples_dense_u64_inplace_device(
     else if (out_keys_dev.stream) stream_u = out_keys_dev.stream;
     else if (sel_idx_dev.stream) stream_u = sel_idx_dev.stream;
     else if (eri4_dev.stream) stream_u = eri4_dev.stream;
-    else if (selected_dev.stream) stream_u = selected_dev.stream;
   }
   cudaStream_t stream_t = reinterpret_cast<cudaStream_t>(stream_u);
 
@@ -11122,8 +11141,8 @@ void cas36_exact_selected_emit_tuples_dense_u64_inplace_device(
           reinterpret_cast<int*>(out_src_dev.ptr),
           reinterpret_cast<double*>(out_hij_dev.ptr),
           int(cap),
-          reinterpret_cast<const uint64_t*>(selected_dev.ptr),
-          (int)selected_dev.shape[0],
+          membership_hash_dev.has_value() ? reinterpret_cast<const uint64_t*>(membership_hash_dev->ptr) : nullptr,
+          membership_hash_dev.has_value() ? int(membership_hash_cap) : 0,
           out_diag_dev.has_value() ? reinterpret_cast<double*>(out_diag_dev->ptr) : nullptr,
           reinterpret_cast<int*>(out_n_dev.ptr),
           reinterpret_cast<int*>(overflow_dev.ptr),
@@ -11133,6 +11152,209 @@ void cas36_exact_selected_emit_tuples_dense_u64_inplace_device(
   if (sync) {
     throw_on_cuda_error(
         cudaStreamSynchronize(stream_t), "cudaStreamSynchronize(cas36_exact_selected_emit_tuples_dense_u64)");
+  }
+}
+
+void cas36_sci_build_membership_hash_u64_inplace_device(
+    py::object sorted_keys_obj,
+    int nkeys,
+    py::object hash_keys_obj,
+    int cap,
+    uint64_t stream,
+    bool sync) {
+  if (sorted_keys_obj.is_none() || hash_keys_obj.is_none()) {
+    throw std::invalid_argument("sorted_keys and hash_keys must not be None");
+  }
+  if (nkeys <= 0 || cap <= 0) return;
+  auto sorted_dev = cuda_array_view_from_object(sorted_keys_obj, "sorted_keys");
+  auto hash_dev = cuda_array_view_from_object(hash_keys_obj, "hash_keys");
+  require_typestr(sorted_dev, "sorted_keys", "<u8");
+  require_typestr(hash_dev, "hash_keys", "<u8");
+  if (sorted_dev.shape.size() != 1 || hash_dev.shape.size() != 1) {
+    throw std::invalid_argument("sorted_keys and hash_keys must be 1D");
+  }
+  if (sorted_dev.shape[0] < (int64_t)nkeys) {
+    throw std::invalid_argument("sorted_keys length must be >= nkeys");
+  }
+  if (hash_dev.shape[0] < (int64_t)cap) {
+    throw std::invalid_argument("hash_keys length must be >= cap");
+  }
+  uint64_t stream_u = stream;
+  if (stream_u == 0) {
+    if (sorted_dev.stream) stream_u = sorted_dev.stream;
+    else if (hash_dev.stream) stream_u = hash_dev.stream;
+  }
+  cudaStream_t stream_t = reinterpret_cast<cudaStream_t>(stream_u);
+  throw_on_cuda_error(
+      cas36_sci_build_membership_hash_u64_launch_stream(
+          reinterpret_cast<const uint64_t*>(sorted_dev.ptr),
+          int(nkeys),
+          reinterpret_cast<uint64_t*>(hash_dev.ptr),
+          int(cap),
+          stream_t),
+      "cas36_sci_build_membership_hash_u64_launch_stream");
+  if (sync) {
+    throw_on_cuda_error(
+        cudaStreamSynchronize(stream_t), "cudaStreamSynchronize(build_membership_hash)");
+  }
+}
+
+void pairwise_materialize_u64_inplace_device(
+    const DeviceDRT& drt,
+    uint64_t ncsf_u64,
+    py::object sel_idx_u64_obj,
+    int nsel,
+    py::object steps_all_obj,
+    py::object nodes_all_obj,
+    py::object occ_all_obj,
+    py::object b_all_obj,
+    py::object overflow_obj,
+    int threads,
+    uint64_t stream,
+    bool sync) {
+  if (sel_idx_u64_obj.is_none() || steps_all_obj.is_none() || nodes_all_obj.is_none() ||
+      occ_all_obj.is_none() || b_all_obj.is_none() || overflow_obj.is_none()) {
+    throw std::invalid_argument("required array arguments must not be None");
+  }
+  if (threads <= 0 || threads > 1024) throw std::invalid_argument("threads must be in 1..1024");
+  if (nsel <= 0) return;
+  if (drt.norb <= 0 || drt.norb > 64) throw std::invalid_argument("norb must be in 1..64");
+
+  auto sel_dev = cuda_array_view_from_object(sel_idx_u64_obj, "sel_idx_u64");
+  auto steps_dev = cuda_array_view_from_object(steps_all_obj, "steps_all");
+  auto nodes_dev = cuda_array_view_from_object(nodes_all_obj, "nodes_all");
+  auto occ_dev = cuda_array_view_from_object(occ_all_obj, "occ_all");
+  auto b_dev = cuda_array_view_from_object(b_all_obj, "b_all");
+  auto overflow_dev = cuda_array_view_from_object(overflow_obj, "overflow");
+
+  require_typestr(sel_dev, "sel_idx_u64", "<u8");
+  require_typestr(steps_dev, "steps_all", "|i1");
+  require_typestr(nodes_dev, "nodes_all", "<i4");
+  require_typestr(occ_dev, "occ_all", "|i1");
+  require_typestr(b_dev, "b_all", "<i2");
+  require_typestr(overflow_dev, "overflow", "<i4");
+
+  if (sel_dev.shape.size() != 1 || sel_dev.shape[0] < (int64_t)nsel)
+    throw std::invalid_argument("sel_idx_u64 length must be >= nsel");
+  if (overflow_dev.shape.size() != 1 || overflow_dev.shape[0] != 1)
+    throw std::invalid_argument("overflow must have shape (1,)");
+
+  uint64_t stream_u = stream;
+  if (stream_u == 0) {
+    if (steps_dev.stream) stream_u = steps_dev.stream;
+    else if (sel_dev.stream) stream_u = sel_dev.stream;
+  }
+  cudaStream_t stream_t = reinterpret_cast<cudaStream_t>(stream_u);
+
+  throw_on_cuda_error(
+      pairwise_materialize_u64_launch_stream(
+          reinterpret_cast<const uint64_t*>(sel_dev.ptr),
+          int(nsel),
+          int(drt.norb),
+          ncsf_u64,
+          drt.child,
+          drt.node_twos,
+          drt.child_prefix,
+          reinterpret_cast<int8_t*>(steps_dev.ptr),
+          reinterpret_cast<int32_t*>(nodes_dev.ptr),
+          reinterpret_cast<int8_t*>(occ_dev.ptr),
+          reinterpret_cast<int16_t*>(b_dev.ptr),
+          reinterpret_cast<int*>(overflow_dev.ptr),
+          stream_t,
+          int(threads)),
+      "pairwise_materialize_u64_launch_stream");
+  if (sync) {
+    throw_on_cuda_error(cudaStreamSynchronize(stream_t), "cudaStreamSynchronize(pairwise_materialize)");
+  }
+}
+
+void pairwise_hij_u64_inplace_device(
+    const DeviceDRT& drt,
+    uint64_t ncsf_u64,
+    py::object sel_idx_u64_obj,
+    int nsel,
+    py::object h_base_obj,
+    py::object eri4_obj,
+    py::object steps_all_obj,
+    py::object nodes_all_obj,
+    py::object occ_all_obj,
+    py::object b_all_obj,
+    py::object H_out_obj,
+    py::object overflow_obj,
+    int threads,
+    uint64_t stream,
+    bool sync) {
+  if (sel_idx_u64_obj.is_none() || h_base_obj.is_none() || eri4_obj.is_none() ||
+      steps_all_obj.is_none() || nodes_all_obj.is_none() || occ_all_obj.is_none() ||
+      b_all_obj.is_none() || H_out_obj.is_none() || overflow_obj.is_none()) {
+    throw std::invalid_argument("required array arguments must not be None");
+  }
+  if (threads <= 0 || threads > 1024) throw std::invalid_argument("threads must be in 1..1024");
+  if (nsel <= 0) return;
+  if (drt.norb <= 0 || drt.norb > 64) throw std::invalid_argument("norb must be in 1..64");
+
+  auto sel_dev = cuda_array_view_from_object(sel_idx_u64_obj, "sel_idx_u64");
+  auto h_base_dev = cuda_array_view_from_object(h_base_obj, "h_base");
+  auto eri4_dev = cuda_array_view_from_object(eri4_obj, "eri4");
+  auto steps_dev = cuda_array_view_from_object(steps_all_obj, "steps_all");
+  auto nodes_dev = cuda_array_view_from_object(nodes_all_obj, "nodes_all");
+  auto occ_dev = cuda_array_view_from_object(occ_all_obj, "occ_all");
+  auto b_dev = cuda_array_view_from_object(b_all_obj, "b_all");
+  auto H_out_dev = cuda_array_view_from_object(H_out_obj, "H_out");
+  auto overflow_dev = cuda_array_view_from_object(overflow_obj, "overflow");
+
+  require_typestr(sel_dev, "sel_idx_u64", "<u8");
+  require_typestr(h_base_dev, "h_base", "<f8");
+  require_typestr(eri4_dev, "eri4", "<f8");
+  require_typestr(steps_dev, "steps_all", "|i1");
+  require_typestr(nodes_dev, "nodes_all", "<i4");
+  require_typestr(occ_dev, "occ_all", "|i1");
+  require_typestr(b_dev, "b_all", "<i2");
+  require_typestr(H_out_dev, "H_out", "<f8");
+  require_typestr(overflow_dev, "overflow", "<i4");
+
+  if (sel_dev.shape.size() != 1 || sel_dev.shape[0] < (int64_t)nsel)
+    throw std::invalid_argument("sel_idx_u64 length must be >= nsel");
+  int64_t nops = (int64_t)drt.norb * (int64_t)drt.norb;
+  if (h_base_dev.shape.size() != 1 || h_base_dev.shape[0] < nops)
+    throw std::invalid_argument("h_base length must be >= norb*norb");
+  int64_t eri4_n = nops * nops;
+  if (eri4_dev.shape.size() != 1 || eri4_dev.shape[0] < eri4_n)
+    throw std::invalid_argument("eri4 length must be >= norb^4");
+  if (H_out_dev.shape.size() != 1 || H_out_dev.shape[0] < (int64_t)nsel * (int64_t)nsel)
+    throw std::invalid_argument("H_out length must be >= nsel*nsel");
+  if (overflow_dev.shape.size() != 1 || overflow_dev.shape[0] != 1)
+    throw std::invalid_argument("overflow must have shape (1,)");
+
+  uint64_t stream_u = stream;
+  if (stream_u == 0) {
+    if (H_out_dev.stream) stream_u = H_out_dev.stream;
+    else if (sel_dev.stream) stream_u = sel_dev.stream;
+  }
+  cudaStream_t stream_t = reinterpret_cast<cudaStream_t>(stream_u);
+
+  throw_on_cuda_error(
+      pairwise_hij_u64_launch_stream(
+          reinterpret_cast<const uint64_t*>(sel_dev.ptr),
+          int(nsel),
+          int(drt.norb),
+          ncsf_u64,
+          reinterpret_cast<const double*>(h_base_dev.ptr),
+          reinterpret_cast<const double*>(eri4_dev.ptr),
+          drt.child,
+          drt.node_twos,
+          drt.child_prefix,
+          reinterpret_cast<const int8_t*>(steps_dev.ptr),
+          reinterpret_cast<const int32_t*>(nodes_dev.ptr),
+          reinterpret_cast<const int8_t*>(occ_dev.ptr),
+          reinterpret_cast<const int16_t*>(b_dev.ptr),
+          reinterpret_cast<double*>(H_out_dev.ptr),
+          reinterpret_cast<int*>(overflow_dev.ptr),
+          stream_t,
+          int(threads)),
+      "pairwise_hij_u64_launch_stream");
+  if (sync) {
+    throw_on_cuda_error(cudaStreamSynchronize(stream_t), "cudaStreamSynchronize(pairwise_hij)");
   }
 }
 
@@ -11158,6 +11380,7 @@ void hb_screen_and_apply_inplace_device(
     py::object hash_vals_obj,
     py::object selected_mask_obj,
     py::object overflow_obj,
+    py::object sym_pq_allowed_obj,
     int threads,
     uint64_t stream,
     bool sync) {
@@ -11223,6 +11446,12 @@ void hb_screen_and_apply_inplace_device(
     selected_stream = sel_dev.stream;
   }
 
+  const int8_t* d_sym_pq = nullptr;
+  if (!sym_pq_allowed_obj.is_none()) {
+    auto sym_view = cuda_array_view_from_object(sym_pq_allowed_obj, "sym_pq_allowed");
+    d_sym_pq = reinterpret_cast<const int8_t*>(sym_view.ptr);
+  }
+
   uint64_t stream_u = stream;
   if (stream_u == 0) {
     if (sel_idx_dev.stream) stream_u = sel_idx_dev.stream;
@@ -11255,7 +11484,8 @@ void hb_screen_and_apply_inplace_device(
           d_selected_mask,
           reinterpret_cast<int*>(overflow_dev.ptr),
           stream_t,
-          threads),
+          threads,
+          d_sym_pq),
       "guga_hb_screen_and_apply_launch_stream");
   if (sync) {
     throw_on_cuda_error(cudaStreamSynchronize(stream_t), "cudaStreamSynchronize(hb_screen_and_apply)");
@@ -11283,6 +11513,7 @@ void hb_screen_and_apply_many_roots_inplace_device(
     py::object hash_vals_obj,
     py::object selected_mask_obj,
     py::object overflow_obj,
+    py::object sym_pq_allowed_obj,
     int threads,
     uint64_t stream,
     bool sync) {
@@ -11354,6 +11585,12 @@ void hb_screen_and_apply_many_roots_inplace_device(
     selected_stream = sel_dev.stream;
   }
 
+  const int8_t* d_sym_pq = nullptr;
+  if (!sym_pq_allowed_obj.is_none()) {
+    auto sym_view = cuda_array_view_from_object(sym_pq_allowed_obj, "sym_pq_allowed");
+    d_sym_pq = reinterpret_cast<const int8_t*>(sym_view.ptr);
+  }
+
   uint64_t stream_u = stream;
   if (stream_u == 0) {
     if (sel_idx_dev.stream) stream_u = sel_idx_dev.stream;
@@ -11392,7 +11629,8 @@ void hb_screen_and_apply_many_roots_inplace_device(
           d_selected_mask,
           reinterpret_cast<int*>(overflow_dev.ptr),
           stream_t,
-          threads),
+          threads,
+          d_sym_pq),
       "guga_hb_screen_and_apply_many_roots_launch_stream");
   if (sync) {
     throw_on_cuda_error(cudaStreamSynchronize(stream_t), "cudaStreamSynchronize(hb_screen_and_apply_many_roots)");
@@ -22784,6 +23022,7 @@ PYBIND11_MODULE(_guga_cuda_ext, m) {
       py::arg("selected_idx_sorted_u64") = py::none(),
       py::arg("target_mode") = 0,
       py::arg("overflow"),
+      py::arg("sym_pq_allowed") = py::none(),
       py::arg("threads") = 256,
       py::arg("stream") = 0,
       py::arg("sync") = true);
@@ -22816,6 +23055,7 @@ PYBIND11_MODULE(_guga_cuda_ext, m) {
       py::arg("target_mode") = 0,
       py::arg("out_n"),
       py::arg("overflow"),
+      py::arg("sym_pq_allowed") = py::none(),
       py::arg("threads") = 256,
       py::arg("stream") = 0,
       py::arg("sync") = true);
@@ -22862,11 +23102,57 @@ PYBIND11_MODULE(_guga_cuda_ext, m) {
       py::arg("out_src"),
       py::arg("out_hij"),
       py::arg("cap"),
-      py::arg("selected_idx_sorted_u64"),
+      py::arg("membership_hash_keys") = py::none(),
+      py::arg("membership_hash_cap") = 0,
       py::arg("out_diag") = py::none(),
       py::arg("out_n"),
       py::arg("overflow"),
-      py::arg("threads") = 128,
+      py::arg("threads") = 256,
+      py::arg("stream") = 0,
+      py::arg("sync") = true);
+
+  m.def(
+      "cas36_sci_build_membership_hash_u64_inplace_device",
+      &cas36_sci_build_membership_hash_u64_inplace_device,
+      py::arg("sorted_keys"),
+      py::arg("nkeys"),
+      py::arg("hash_keys"),
+      py::arg("cap"),
+      py::arg("stream") = 0,
+      py::arg("sync") = true);
+
+  m.def(
+      "pairwise_materialize_u64_inplace_device",
+      &pairwise_materialize_u64_inplace_device,
+      py::arg("drt"),
+      py::arg("ncsf"),
+      py::arg("sel_idx_u64"),
+      py::arg("nsel"),
+      py::arg("steps_all"),
+      py::arg("nodes_all"),
+      py::arg("occ_all"),
+      py::arg("b_all"),
+      py::arg("overflow"),
+      py::arg("threads") = 256,
+      py::arg("stream") = 0,
+      py::arg("sync") = true);
+
+  m.def(
+      "pairwise_hij_u64_inplace_device",
+      &pairwise_hij_u64_inplace_device,
+      py::arg("drt"),
+      py::arg("ncsf"),
+      py::arg("sel_idx_u64"),
+      py::arg("nsel"),
+      py::arg("h_base"),
+      py::arg("eri4"),
+      py::arg("steps_all"),
+      py::arg("nodes_all"),
+      py::arg("occ_all"),
+      py::arg("b_all"),
+      py::arg("H_out"),
+      py::arg("overflow"),
+      py::arg("threads") = 256,
       py::arg("stream") = 0,
       py::arg("sync") = true);
 
@@ -22894,6 +23180,7 @@ PYBIND11_MODULE(_guga_cuda_ext, m) {
       py::arg("hash_vals"),
       py::arg("selected_mask") = py::none(),
       py::arg("overflow"),
+      py::arg("sym_pq_allowed") = py::none(),
       py::arg("threads") = 256,
       py::arg("stream") = 0,
       py::arg("sync") = true);
@@ -22921,6 +23208,7 @@ PYBIND11_MODULE(_guga_cuda_ext, m) {
       py::arg("hash_vals"),
       py::arg("selected_mask") = py::none(),
       py::arg("overflow"),
+      py::arg("sym_pq_allowed") = py::none(),
       py::arg("threads") = 256,
       py::arg("stream") = 0,
       py::arg("sync") = true);

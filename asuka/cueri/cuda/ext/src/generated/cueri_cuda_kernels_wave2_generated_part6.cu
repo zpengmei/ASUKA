@@ -8,6 +8,7 @@
 
 #include <cmath>
 #include <cstdint>
+#include <type_traits>
 
 #include "cueri_cuda_kernels_api.h"
 #include "cueri_cuda_contract_fock_warp.cuh"
@@ -9295,8 +9296,8 @@ __device__ __forceinline__ double eval_dddd_z(
 
 // Bridge: device helpers from previous part (needed here).
 
-template <int NROOTS>
-__global__ void KernelERI_ddss_flat(
+template <int NROOTS, bool kTileF32 = false, bool kMixedPrec = false>
+__global__ void __launch_bounds__(128) KernelERI_ddss_flat(
     const int32_t* __restrict__ task_spAB,
     const int32_t* __restrict__ task_spCD,
     int ntasks,
@@ -9312,7 +9313,8 @@ __global__ void KernelERI_ddss_flat(
     const double* __restrict__ pair_Py,
     const double* __restrict__ pair_Pz,
     const double* __restrict__ pair_cK,
-    double* __restrict__ eri_out) {
+    double* __restrict__ eri_out_f64,
+    float*  __restrict__ eri_out_f32) {
   const int t = static_cast<int>(blockIdx.x) * static_cast<int>(blockDim.x) + static_cast<int>(threadIdx.x);
   if (t >= ntasks) return;
 
@@ -9363,9 +9365,11 @@ __global__ void KernelERI_ddss_flat(
   double Gx[5];
   double Gy[5];
   double Gz[5];
-  double Ux[9];
-  double Uy[9];
-  double Uz[9];
+  // Component type: FP32 when kMixedPrec, else FP64.
+  using comp_t = typename std::conditional<kMixedPrec, float, double>::type;
+  comp_t Ux[9];
+  comp_t Uy[9];
+  comp_t Uz[9];
   double tile[36];
   tile[0] = 0.0;
   tile[1] = 0.0;
@@ -9446,111 +9450,151 @@ __global__ void KernelERI_ddss_flat(
         compute_G_stride_fixed<kFlatStride, kNMax, kMMax>(Gy, Cy_, Cpy_, B0, B1, B1p);
         compute_G_stride_fixed<kFlatStride, kNMax, kMMax>(Gz, Cz_, Cpz_, B0, B1, B1p);
         const double sc = base * w;
-        Ux[0] = Gx[2] * xij2 + 2.0 * (Gx[3] * xij) + Gx[4];
-        Ux[1] = Gx[2] * xij + Gx[3];
-        Ux[2] = Gx[2];
-        Ux[3] = Gx[1] * xij2 + 2.0 * (Gx[2] * xij) + Gx[3];
-        Ux[4] = Gx[1] * xij + Gx[2];
-        Ux[5] = Gx[1];
-        Ux[6] = Gx[0] * xij2 + 2.0 * (Gx[1] * xij) + Gx[2];
-        Ux[7] = Gx[0] * xij + Gx[1];
-        Ux[8] = Gx[0];
-        Uy[0] = Gy[0];
-        Uy[1] = Gy[0] * yij + Gy[1];
-        Uy[2] = Gy[0] * yij2 + 2.0 * (Gy[1] * yij) + Gy[2];
-        Uy[3] = Gy[1];
-        Uy[4] = Gy[1] * yij + Gy[2];
-        Uy[5] = Gy[1] * yij2 + 2.0 * (Gy[2] * yij) + Gy[3];
-        Uy[6] = Gy[2];
-        Uy[7] = Gy[2] * yij + Gy[3];
-        Uy[8] = Gy[2] * yij2 + 2.0 * (Gy[3] * yij) + Gy[4];
-        Uz[0] = Gz[0];
-        Uz[1] = Gz[0] * zij + Gz[1];
-        Uz[2] = Gz[0] * zij2 + 2.0 * (Gz[1] * zij) + Gz[2];
-        Uz[3] = Gz[1];
-        Uz[4] = Gz[1] * zij + Gz[2];
-        Uz[5] = Gz[1] * zij2 + 2.0 * (Gz[2] * zij) + Gz[3];
-        Uz[6] = Gz[2];
-        Uz[7] = Gz[2] * zij + Gz[3];
-        Uz[8] = Gz[2] * zij2 + 2.0 * (Gz[3] * zij) + Gz[4];
-        tile[0] += sc * Ux[0] * Uy[0] * Uz[0];
-        tile[1] += sc * Ux[1] * Uy[1] * Uz[0];
-        tile[2] += sc * Ux[1] * Uy[0] * Uz[1];
-        tile[3] += sc * Ux[2] * Uy[2] * Uz[0];
-        tile[4] += sc * Ux[2] * Uy[1] * Uz[1];
-        tile[5] += sc * Ux[2] * Uy[0] * Uz[2];
-        tile[6] += sc * Ux[3] * Uy[3] * Uz[0];
-        tile[7] += sc * Ux[4] * Uy[4] * Uz[0];
-        tile[8] += sc * Ux[4] * Uy[3] * Uz[1];
-        tile[9] += sc * Ux[5] * Uy[5] * Uz[0];
-        tile[10] += sc * Ux[5] * Uy[4] * Uz[1];
-        tile[11] += sc * Ux[5] * Uy[3] * Uz[2];
-        tile[12] += sc * Ux[3] * Uy[0] * Uz[3];
-        tile[13] += sc * Ux[4] * Uy[1] * Uz[3];
-        tile[14] += sc * Ux[4] * Uy[0] * Uz[4];
-        tile[15] += sc * Ux[5] * Uy[2] * Uz[3];
-        tile[16] += sc * Ux[5] * Uy[1] * Uz[4];
-        tile[17] += sc * Ux[5] * Uy[0] * Uz[5];
-        tile[18] += sc * Ux[6] * Uy[6] * Uz[0];
-        tile[19] += sc * Ux[7] * Uy[7] * Uz[0];
-        tile[20] += sc * Ux[7] * Uy[6] * Uz[1];
-        tile[21] += sc * Ux[8] * Uy[8] * Uz[0];
-        tile[22] += sc * Ux[8] * Uy[7] * Uz[1];
-        tile[23] += sc * Ux[8] * Uy[6] * Uz[2];
-        tile[24] += sc * Ux[6] * Uy[3] * Uz[3];
-        tile[25] += sc * Ux[7] * Uy[4] * Uz[3];
-        tile[26] += sc * Ux[7] * Uy[3] * Uz[4];
-        tile[27] += sc * Ux[8] * Uy[5] * Uz[3];
-        tile[28] += sc * Ux[8] * Uy[4] * Uz[4];
-        tile[29] += sc * Ux[8] * Uy[3] * Uz[5];
-        tile[30] += sc * Ux[6] * Uy[0] * Uz[6];
-        tile[31] += sc * Ux[7] * Uy[1] * Uz[6];
-        tile[32] += sc * Ux[7] * Uy[0] * Uz[7];
-        tile[33] += sc * Ux[8] * Uy[2] * Uz[6];
-        tile[34] += sc * Ux[8] * Uy[1] * Uz[7];
-        tile[35] += sc * Ux[8] * Uy[0] * Uz[8];
+        Ux[0] = static_cast<comp_t>(Gx[2] * xij2 + 2.0 * (Gx[3] * xij) + Gx[4]);
+        Ux[1] = static_cast<comp_t>(Gx[2] * xij + Gx[3]);
+        Ux[2] = static_cast<comp_t>(Gx[2]);
+        Ux[3] = static_cast<comp_t>(Gx[1] * xij2 + 2.0 * (Gx[2] * xij) + Gx[3]);
+        Ux[4] = static_cast<comp_t>(Gx[1] * xij + Gx[2]);
+        Ux[5] = static_cast<comp_t>(Gx[1]);
+        Ux[6] = static_cast<comp_t>(Gx[0] * xij2 + 2.0 * (Gx[1] * xij) + Gx[2]);
+        Ux[7] = static_cast<comp_t>(Gx[0] * xij + Gx[1]);
+        Ux[8] = static_cast<comp_t>(Gx[0]);
+        Uy[0] = static_cast<comp_t>(Gy[0]);
+        Uy[1] = static_cast<comp_t>(Gy[0] * yij + Gy[1]);
+        Uy[2] = static_cast<comp_t>(Gy[0] * yij2 + 2.0 * (Gy[1] * yij) + Gy[2]);
+        Uy[3] = static_cast<comp_t>(Gy[1]);
+        Uy[4] = static_cast<comp_t>(Gy[1] * yij + Gy[2]);
+        Uy[5] = static_cast<comp_t>(Gy[1] * yij2 + 2.0 * (Gy[2] * yij) + Gy[3]);
+        Uy[6] = static_cast<comp_t>(Gy[2]);
+        Uy[7] = static_cast<comp_t>(Gy[2] * yij + Gy[3]);
+        Uy[8] = static_cast<comp_t>(Gy[2] * yij2 + 2.0 * (Gy[3] * yij) + Gy[4]);
+        Uz[0] = static_cast<comp_t>(Gz[0]);
+        Uz[1] = static_cast<comp_t>(Gz[0] * zij + Gz[1]);
+        Uz[2] = static_cast<comp_t>(Gz[0] * zij2 + 2.0 * (Gz[1] * zij) + Gz[2]);
+        Uz[3] = static_cast<comp_t>(Gz[1]);
+        Uz[4] = static_cast<comp_t>(Gz[1] * zij + Gz[2]);
+        Uz[5] = static_cast<comp_t>(Gz[1] * zij2 + 2.0 * (Gz[2] * zij) + Gz[3]);
+        Uz[6] = static_cast<comp_t>(Gz[2]);
+        Uz[7] = static_cast<comp_t>(Gz[2] * zij + Gz[3]);
+        Uz[8] = static_cast<comp_t>(Gz[2] * zij2 + 2.0 * (Gz[3] * zij) + Gz[4]);
+        tile[0] += sc * static_cast<double>(Ux[0] * Uy[0]) * static_cast<double>(Uz[0]);
+        tile[1] += sc * static_cast<double>(Ux[1] * Uy[1]) * static_cast<double>(Uz[0]);
+        tile[2] += sc * static_cast<double>(Ux[1] * Uy[0]) * static_cast<double>(Uz[1]);
+        tile[3] += sc * static_cast<double>(Ux[2] * Uy[2]) * static_cast<double>(Uz[0]);
+        tile[4] += sc * static_cast<double>(Ux[2] * Uy[1]) * static_cast<double>(Uz[1]);
+        tile[5] += sc * static_cast<double>(Ux[2] * Uy[0]) * static_cast<double>(Uz[2]);
+        tile[6] += sc * static_cast<double>(Ux[3] * Uy[3]) * static_cast<double>(Uz[0]);
+        tile[7] += sc * static_cast<double>(Ux[4] * Uy[4]) * static_cast<double>(Uz[0]);
+        tile[8] += sc * static_cast<double>(Ux[4] * Uy[3]) * static_cast<double>(Uz[1]);
+        tile[9] += sc * static_cast<double>(Ux[5] * Uy[5]) * static_cast<double>(Uz[0]);
+        tile[10] += sc * static_cast<double>(Ux[5] * Uy[4]) * static_cast<double>(Uz[1]);
+        tile[11] += sc * static_cast<double>(Ux[5] * Uy[3]) * static_cast<double>(Uz[2]);
+        tile[12] += sc * static_cast<double>(Ux[3] * Uy[0]) * static_cast<double>(Uz[3]);
+        tile[13] += sc * static_cast<double>(Ux[4] * Uy[1]) * static_cast<double>(Uz[3]);
+        tile[14] += sc * static_cast<double>(Ux[4] * Uy[0]) * static_cast<double>(Uz[4]);
+        tile[15] += sc * static_cast<double>(Ux[5] * Uy[2]) * static_cast<double>(Uz[3]);
+        tile[16] += sc * static_cast<double>(Ux[5] * Uy[1]) * static_cast<double>(Uz[4]);
+        tile[17] += sc * static_cast<double>(Ux[5] * Uy[0]) * static_cast<double>(Uz[5]);
+        tile[18] += sc * static_cast<double>(Ux[6] * Uy[6]) * static_cast<double>(Uz[0]);
+        tile[19] += sc * static_cast<double>(Ux[7] * Uy[7]) * static_cast<double>(Uz[0]);
+        tile[20] += sc * static_cast<double>(Ux[7] * Uy[6]) * static_cast<double>(Uz[1]);
+        tile[21] += sc * static_cast<double>(Ux[8] * Uy[8]) * static_cast<double>(Uz[0]);
+        tile[22] += sc * static_cast<double>(Ux[8] * Uy[7]) * static_cast<double>(Uz[1]);
+        tile[23] += sc * static_cast<double>(Ux[8] * Uy[6]) * static_cast<double>(Uz[2]);
+        tile[24] += sc * static_cast<double>(Ux[6] * Uy[3]) * static_cast<double>(Uz[3]);
+        tile[25] += sc * static_cast<double>(Ux[7] * Uy[4]) * static_cast<double>(Uz[3]);
+        tile[26] += sc * static_cast<double>(Ux[7] * Uy[3]) * static_cast<double>(Uz[4]);
+        tile[27] += sc * static_cast<double>(Ux[8] * Uy[5]) * static_cast<double>(Uz[3]);
+        tile[28] += sc * static_cast<double>(Ux[8] * Uy[4]) * static_cast<double>(Uz[4]);
+        tile[29] += sc * static_cast<double>(Ux[8] * Uy[3]) * static_cast<double>(Uz[5]);
+        tile[30] += sc * static_cast<double>(Ux[6] * Uy[0]) * static_cast<double>(Uz[6]);
+        tile[31] += sc * static_cast<double>(Ux[7] * Uy[1]) * static_cast<double>(Uz[6]);
+        tile[32] += sc * static_cast<double>(Ux[7] * Uy[0]) * static_cast<double>(Uz[7]);
+        tile[33] += sc * static_cast<double>(Ux[8] * Uy[2]) * static_cast<double>(Uz[6]);
+        tile[34] += sc * static_cast<double>(Ux[8] * Uy[1]) * static_cast<double>(Uz[7]);
+        tile[35] += sc * static_cast<double>(Ux[8] * Uy[0]) * static_cast<double>(Uz[8]);
       }
     }
   }
 
-  // Write output tile.
-  double* out = eri_out + static_cast<int64_t>(t) * static_cast<int64_t>(36);
-  out[0] = tile[0];
-  out[1] = tile[1];
-  out[2] = tile[2];
-  out[3] = tile[3];
-  out[4] = tile[4];
-  out[5] = tile[5];
-  out[6] = tile[6];
-  out[7] = tile[7];
-  out[8] = tile[8];
-  out[9] = tile[9];
-  out[10] = tile[10];
-  out[11] = tile[11];
-  out[12] = tile[12];
-  out[13] = tile[13];
-  out[14] = tile[14];
-  out[15] = tile[15];
-  out[16] = tile[16];
-  out[17] = tile[17];
-  out[18] = tile[18];
-  out[19] = tile[19];
-  out[20] = tile[20];
-  out[21] = tile[21];
-  out[22] = tile[22];
-  out[23] = tile[23];
-  out[24] = tile[24];
-  out[25] = tile[25];
-  out[26] = tile[26];
-  out[27] = tile[27];
-  out[28] = tile[28];
-  out[29] = tile[29];
-  out[30] = tile[30];
-  out[31] = tile[31];
-  out[32] = tile[32];
-  out[33] = tile[33];
-  out[34] = tile[34];
-  out[35] = tile[35];
+  // Write output tile: FP32 or FP64 depending on kTileF32.
+  if constexpr (kTileF32) {
+    float* out = eri_out_f32 + static_cast<int64_t>(t) * static_cast<int64_t>(36);
+    out[0] = __double2float_rn(tile[0]);
+    out[1] = __double2float_rn(tile[1]);
+    out[2] = __double2float_rn(tile[2]);
+    out[3] = __double2float_rn(tile[3]);
+    out[4] = __double2float_rn(tile[4]);
+    out[5] = __double2float_rn(tile[5]);
+    out[6] = __double2float_rn(tile[6]);
+    out[7] = __double2float_rn(tile[7]);
+    out[8] = __double2float_rn(tile[8]);
+    out[9] = __double2float_rn(tile[9]);
+    out[10] = __double2float_rn(tile[10]);
+    out[11] = __double2float_rn(tile[11]);
+    out[12] = __double2float_rn(tile[12]);
+    out[13] = __double2float_rn(tile[13]);
+    out[14] = __double2float_rn(tile[14]);
+    out[15] = __double2float_rn(tile[15]);
+    out[16] = __double2float_rn(tile[16]);
+    out[17] = __double2float_rn(tile[17]);
+    out[18] = __double2float_rn(tile[18]);
+    out[19] = __double2float_rn(tile[19]);
+    out[20] = __double2float_rn(tile[20]);
+    out[21] = __double2float_rn(tile[21]);
+    out[22] = __double2float_rn(tile[22]);
+    out[23] = __double2float_rn(tile[23]);
+    out[24] = __double2float_rn(tile[24]);
+    out[25] = __double2float_rn(tile[25]);
+    out[26] = __double2float_rn(tile[26]);
+    out[27] = __double2float_rn(tile[27]);
+    out[28] = __double2float_rn(tile[28]);
+    out[29] = __double2float_rn(tile[29]);
+    out[30] = __double2float_rn(tile[30]);
+    out[31] = __double2float_rn(tile[31]);
+    out[32] = __double2float_rn(tile[32]);
+    out[33] = __double2float_rn(tile[33]);
+    out[34] = __double2float_rn(tile[34]);
+    out[35] = __double2float_rn(tile[35]);
+  } else {
+    double* out = eri_out_f64 + static_cast<int64_t>(t) * static_cast<int64_t>(36);
+    out[0] = tile[0];
+    out[1] = tile[1];
+    out[2] = tile[2];
+    out[3] = tile[3];
+    out[4] = tile[4];
+    out[5] = tile[5];
+    out[6] = tile[6];
+    out[7] = tile[7];
+    out[8] = tile[8];
+    out[9] = tile[9];
+    out[10] = tile[10];
+    out[11] = tile[11];
+    out[12] = tile[12];
+    out[13] = tile[13];
+    out[14] = tile[14];
+    out[15] = tile[15];
+    out[16] = tile[16];
+    out[17] = tile[17];
+    out[18] = tile[18];
+    out[19] = tile[19];
+    out[20] = tile[20];
+    out[21] = tile[21];
+    out[22] = tile[22];
+    out[23] = tile[23];
+    out[24] = tile[24];
+    out[25] = tile[25];
+    out[26] = tile[26];
+    out[27] = tile[27];
+    out[28] = tile[28];
+    out[29] = tile[29];
+    out[30] = tile[30];
+    out[31] = tile[31];
+    out[32] = tile[32];
+    out[33] = tile[33];
+    out[34] = tile[34];
+    out[35] = tile[35];
+  }
 }
 
 template <int NROOTS>
@@ -9740,8 +9784,8 @@ __global__ void KernelERI_ddss_warp_true(
   }
 }
 
-template <int NROOTS>
-__global__ void KernelFusedFock_ddss_fixed(
+template <int NROOTS, bool kMixedPrec = false>
+__global__ void __launch_bounds__(64) KernelFusedFock_ddss_fixed(
     const int32_t* task_spAB,
     const int32_t* task_spCD,
     int ntasks,
@@ -9823,6 +9867,8 @@ __global__ void KernelFusedFock_ddss_fixed(
   const int nPairAB = static_cast<int>(sp_npair[spAB]);
   const int nPairCD = static_cast<int>(sp_npair[spCD]);
 
+  using comp_t = typename std::conditional<kMixedPrec, float, double>::type;
+
   for (int ebase = 0; ebase < kNComp; ebase += 32) {
     const int e = ebase + lane;
     const bool active = (e < kNComp);
@@ -9874,10 +9920,10 @@ __global__ void KernelFusedFock_ddss_fixed(
           }
           __syncwarp();
           if (active) {
-            const double Ix = eval_ddss_x(e, Gx, xij, xij2, xkl, xkl2);
-            const double Iy = eval_ddss_y(e, Gy, yij, yij2, ykl, ykl2);
-            const double Iz = eval_ddss_z(e, Gz, zij, zij2, zkl, zkl2);
-            val += sh_sc[0] * (Ix * Iy * Iz);
+            const comp_t Ix = static_cast<comp_t>(eval_ddss_x(e, Gx, xij, xij2, xkl, xkl2));
+            const comp_t Iy = static_cast<comp_t>(eval_ddss_y(e, Gy, yij, yij2, ykl, ykl2));
+            const comp_t Iz = static_cast<comp_t>(eval_ddss_z(e, Gz, zij, zij2, zkl, zkl2));
+            val += sh_sc[0] * static_cast<double>(Ix * Iy) * static_cast<double>(Iz);
           }
           __syncwarp();
         }
@@ -9910,8 +9956,8 @@ __global__ void KernelFusedFock_ddss_fixed(
   }
 }
 
-template <int NROOTS>
-__global__ void KernelFusedJK_ddss_fixed(
+template <int NROOTS, bool kMixedPrec = false>
+__global__ void __launch_bounds__(64) KernelFusedJK_ddss_fixed(
     const int32_t* task_spAB,
     const int32_t* task_spCD,
     int ntasks,
@@ -9994,6 +10040,8 @@ __global__ void KernelFusedJK_ddss_fixed(
   const int nPairAB = static_cast<int>(sp_npair[spAB]);
   const int nPairCD = static_cast<int>(sp_npair[spCD]);
 
+  using comp_t = typename std::conditional<kMixedPrec, float, double>::type;
+
   for (int ebase = 0; ebase < kNComp; ebase += 32) {
     const int e = ebase + lane;
     const bool active = (e < kNComp);
@@ -10045,10 +10093,10 @@ __global__ void KernelFusedJK_ddss_fixed(
           }
           __syncwarp();
           if (active) {
-            const double Ix = eval_ddss_x(e, Gx, xij, xij2, xkl, xkl2);
-            const double Iy = eval_ddss_y(e, Gy, yij, yij2, ykl, ykl2);
-            const double Iz = eval_ddss_z(e, Gz, zij, zij2, zkl, zkl2);
-            val += sh_sc[0] * (Ix * Iy * Iz);
+            const comp_t Ix = static_cast<comp_t>(eval_ddss_x(e, Gx, xij, xij2, xkl, xkl2));
+            const comp_t Iy = static_cast<comp_t>(eval_ddss_y(e, Gy, yij, yij2, ykl, ykl2));
+            const comp_t Iz = static_cast<comp_t>(eval_ddss_z(e, Gz, zij, zij2, zkl, zkl2));
+            val += sh_sc[0] * static_cast<double>(Ix * Iy) * static_cast<double>(Iz);
           }
           __syncwarp();
         }
@@ -10106,9 +10154,93 @@ extern "C" cudaError_t cueri_eri_ddss_launch_stream(
   // Flat kernel: one thread per task, 100% utilization.
   constexpr int kFlatThreads = 128;
   const int blocks = (ntasks + kFlatThreads - 1) / kFlatThreads;
-  KernelERI_ddss_flat<3><<<blocks, kFlatThreads, 0, stream>>>(
+  KernelERI_ddss_flat<3, false, false><<<blocks, kFlatThreads, 0, stream>>>(
       task_spAB, task_spCD, ntasks, sp_A, sp_B, sp_pair_start, sp_npair, shell_cx, shell_cy, shell_cz,
-      pair_eta, pair_Px, pair_Py, pair_Pz, pair_cK, eri_out);
+      pair_eta, pair_Px, pair_Py, pair_Pz, pair_cK, eri_out, nullptr);
+  return cudaGetLastError();
+}
+
+extern "C" cudaError_t cueri_eri_ddss_f32_launch_stream(
+    const int32_t* task_spAB,
+    const int32_t* task_spCD,
+    int ntasks,
+    const int32_t* sp_A,
+    const int32_t* sp_B,
+    const int32_t* sp_pair_start,
+    const int32_t* sp_npair,
+    const double* shell_cx,
+    const double* shell_cy,
+    const double* shell_cz,
+    const double* pair_eta,
+    const double* pair_Px,
+    const double* pair_Py,
+    const double* pair_Pz,
+    const double* pair_cK,
+    float* eri_out_f32,
+    cudaStream_t stream,
+    int threads) {
+  if (ntasks <= 0) return (ntasks == 0) ? cudaSuccess : cudaErrorInvalidValue;
+  constexpr int kFlatThreads = 128;
+  const int blocks = (ntasks + kFlatThreads - 1) / kFlatThreads;
+  KernelERI_ddss_flat<3, true, false><<<blocks, kFlatThreads, 0, stream>>>(
+      task_spAB, task_spCD, ntasks, sp_A, sp_B, sp_pair_start, sp_npair, shell_cx, shell_cy, shell_cz,
+      pair_eta, pair_Px, pair_Py, pair_Pz, pair_cK, nullptr, eri_out_f32);
+  return cudaGetLastError();
+}
+
+extern "C" cudaError_t cueri_eri_ddss_mixed_launch_stream(
+    const int32_t* task_spAB,
+    const int32_t* task_spCD,
+    int ntasks,
+    const int32_t* sp_A,
+    const int32_t* sp_B,
+    const int32_t* sp_pair_start,
+    const int32_t* sp_npair,
+    const double* shell_cx,
+    const double* shell_cy,
+    const double* shell_cz,
+    const double* pair_eta,
+    const double* pair_Px,
+    const double* pair_Py,
+    const double* pair_Pz,
+    const double* pair_cK,
+    double* eri_out,
+    cudaStream_t stream,
+    int threads) {
+  if (ntasks <= 0) return (ntasks == 0) ? cudaSuccess : cudaErrorInvalidValue;
+  constexpr int kFlatThreads = 128;
+  const int blocks = (ntasks + kFlatThreads - 1) / kFlatThreads;
+  KernelERI_ddss_flat<3, false, true><<<blocks, kFlatThreads, 0, stream>>>(
+      task_spAB, task_spCD, ntasks, sp_A, sp_B, sp_pair_start, sp_npair, shell_cx, shell_cy, shell_cz,
+      pair_eta, pair_Px, pair_Py, pair_Pz, pair_cK, eri_out, nullptr);
+  return cudaGetLastError();
+}
+
+extern "C" cudaError_t cueri_eri_ddss_mixed_f32_launch_stream(
+    const int32_t* task_spAB,
+    const int32_t* task_spCD,
+    int ntasks,
+    const int32_t* sp_A,
+    const int32_t* sp_B,
+    const int32_t* sp_pair_start,
+    const int32_t* sp_npair,
+    const double* shell_cx,
+    const double* shell_cy,
+    const double* shell_cz,
+    const double* pair_eta,
+    const double* pair_Px,
+    const double* pair_Py,
+    const double* pair_Pz,
+    const double* pair_cK,
+    float* eri_out_f32,
+    cudaStream_t stream,
+    int threads) {
+  if (ntasks <= 0) return (ntasks == 0) ? cudaSuccess : cudaErrorInvalidValue;
+  constexpr int kFlatThreads = 128;
+  const int blocks = (ntasks + kFlatThreads - 1) / kFlatThreads;
+  KernelERI_ddss_flat<3, true, true><<<blocks, kFlatThreads, 0, stream>>>(
+      task_spAB, task_spCD, ntasks, sp_A, sp_B, sp_pair_start, sp_npair, shell_cx, shell_cy, shell_cz,
+      pair_eta, pair_Px, pair_Py, pair_Pz, pair_cK, nullptr, eri_out_f32);
   return cudaGetLastError();
 }
 
@@ -10185,7 +10317,8 @@ extern "C" cudaError_t cueri_fused_fock_ddss_launch_stream(
     double* F_mat,
     cudaStream_t stream,
     int threads,
-    int n_bufs) {
+    int n_bufs,
+    bool mixed_prec) {
   if (ntasks < 0 || nao <= 0) return cudaErrorInvalidValue;
   if (ntasks == 0) return cudaSuccess;
   constexpr int kDefaultThreads = 64;
@@ -10194,21 +10327,29 @@ extern "C" cudaError_t cueri_fused_fock_ddss_launch_stream(
   constexpr int kGSize_ddss = 5 * 5;
   constexpr int kWarpDoubles_ddss = 3 * kGSize_ddss + 2 * 3 + 11 + 36;
   size_t shmem_ddss = 0;
-  const cudaError_t prep_ddss = cueri_prepare_fused_fock_warp_launch(
-      KernelFusedFock_ddss_fixed<3>,
-      threads,
-      kDefaultThreads,
-      ntasks,
-      kWarpDoubles_ddss,
-      &launch_threads,
-      &blocks,
-      &shmem_ddss);
-  if (prep_ddss != cudaSuccess) return prep_ddss;
-  KernelFusedFock_ddss_fixed<3><<<blocks, launch_threads, shmem_ddss, stream>>>(
-      task_spAB, task_spCD, ntasks, sp_A, sp_B, sp_pair_start, sp_npair,
-      shell_cx, shell_cy, shell_cz,
-      pair_eta, pair_Px, pair_Py, pair_Pz, pair_cK,
-      shell_ao_start, nao, D_mat, F_mat, n_bufs);
+  if (mixed_prec) {
+    const cudaError_t prep_ddss = cueri_prepare_fused_fock_warp_launch(
+        KernelFusedFock_ddss_fixed<3, true>,
+        threads, kDefaultThreads, ntasks,
+        kWarpDoubles_ddss, &launch_threads, &blocks, &shmem_ddss);
+    if (prep_ddss != cudaSuccess) return prep_ddss;
+    KernelFusedFock_ddss_fixed<3, true><<<blocks, launch_threads, shmem_ddss, stream>>>(
+        task_spAB, task_spCD, ntasks, sp_A, sp_B, sp_pair_start, sp_npair,
+        shell_cx, shell_cy, shell_cz,
+        pair_eta, pair_Px, pair_Py, pair_Pz, pair_cK,
+        shell_ao_start, nao, D_mat, F_mat, n_bufs);
+  } else {
+    const cudaError_t prep_ddss = cueri_prepare_fused_fock_warp_launch(
+        KernelFusedFock_ddss_fixed<3, false>,
+        threads, kDefaultThreads, ntasks,
+        kWarpDoubles_ddss, &launch_threads, &blocks, &shmem_ddss);
+    if (prep_ddss != cudaSuccess) return prep_ddss;
+    KernelFusedFock_ddss_fixed<3, false><<<blocks, launch_threads, shmem_ddss, stream>>>(
+        task_spAB, task_spCD, ntasks, sp_A, sp_B, sp_pair_start, sp_npair,
+        shell_cx, shell_cy, shell_cz,
+        pair_eta, pair_Px, pair_Py, pair_Pz, pair_cK,
+        shell_ao_start, nao, D_mat, F_mat, n_bufs);
+  }
   return cudaGetLastError();
 }
 
@@ -10235,7 +10376,8 @@ extern "C" cudaError_t cueri_fused_jk_ddss_launch_stream(
     double* K_mat,
     cudaStream_t stream,
     int threads,
-    int n_bufs) {
+    int n_bufs,
+    bool mixed_prec) {
   if (ntasks < 0 || nao <= 0) return cudaErrorInvalidValue;
   if (ntasks == 0) return cudaSuccess;
   constexpr int kDefaultThreads = 64;
@@ -10244,21 +10386,29 @@ extern "C" cudaError_t cueri_fused_jk_ddss_launch_stream(
   constexpr int kGSize_ddss = 5 * 5;
   constexpr int kWarpDoubles_ddss = 3 * kGSize_ddss + 2 * 3 + 11 + 36;
   size_t shmem_ddss = 0;
-  const cudaError_t prep_ddss = cueri_prepare_fused_fock_warp_launch(
-      KernelFusedJK_ddss_fixed<3>,
-      threads,
-      kDefaultThreads,
-      ntasks,
-      kWarpDoubles_ddss,
-      &launch_threads,
-      &blocks,
-      &shmem_ddss);
-  if (prep_ddss != cudaSuccess) return prep_ddss;
-  KernelFusedJK_ddss_fixed<3><<<blocks, launch_threads, shmem_ddss, stream>>>(
-      task_spAB, task_spCD, ntasks, sp_A, sp_B, sp_pair_start, sp_npair,
-      shell_cx, shell_cy, shell_cz,
-      pair_eta, pair_Px, pair_Py, pair_Pz, pair_cK,
-      shell_ao_start, nao, D_mat, J_mat, K_mat, n_bufs);
+  if (mixed_prec) {
+    const cudaError_t prep_ddss = cueri_prepare_fused_fock_warp_launch(
+        KernelFusedJK_ddss_fixed<3, true>,
+        threads, kDefaultThreads, ntasks,
+        kWarpDoubles_ddss, &launch_threads, &blocks, &shmem_ddss);
+    if (prep_ddss != cudaSuccess) return prep_ddss;
+    KernelFusedJK_ddss_fixed<3, true><<<blocks, launch_threads, shmem_ddss, stream>>>(
+        task_spAB, task_spCD, ntasks, sp_A, sp_B, sp_pair_start, sp_npair,
+        shell_cx, shell_cy, shell_cz,
+        pair_eta, pair_Px, pair_Py, pair_Pz, pair_cK,
+        shell_ao_start, nao, D_mat, J_mat, K_mat, n_bufs);
+  } else {
+    const cudaError_t prep_ddss = cueri_prepare_fused_fock_warp_launch(
+        KernelFusedJK_ddss_fixed<3, false>,
+        threads, kDefaultThreads, ntasks,
+        kWarpDoubles_ddss, &launch_threads, &blocks, &shmem_ddss);
+    if (prep_ddss != cudaSuccess) return prep_ddss;
+    KernelFusedJK_ddss_fixed<3, false><<<blocks, launch_threads, shmem_ddss, stream>>>(
+        task_spAB, task_spCD, ntasks, sp_A, sp_B, sp_pair_start, sp_npair,
+        shell_cx, shell_cy, shell_cz,
+        pair_eta, pair_Px, pair_Py, pair_Pz, pair_cK,
+        shell_ao_start, nao, D_mat, J_mat, K_mat, n_bufs);
+  }
   return cudaGetLastError();
 }
 

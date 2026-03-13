@@ -3301,8 +3301,8 @@ __global__ void KernelFused_psss_subwarp8(
     accumulate_fock_single_value(sy, D_mat, F_mat, a0 + 1, b0, c0, d0, ab_neq, cd_neq, bk_swap, f_ab, f_cd, N);
     accumulate_fock_single_value(sz, D_mat, F_mat, a0 + 2, b0, c0, d0, ab_neq, cd_neq, bk_swap, f_ab, f_cd, N);
   } else {
-    double* J_mat = out0_mat + buf_off;
-    double* K_mat = out1_mat + buf_off;
+    double* J_mat = (out0_mat != nullptr) ? out0_mat + buf_off : nullptr;
+    double* K_mat = (out1_mat != nullptr) ? out1_mat + buf_off : nullptr;
     accumulate_jk_single_value(sx, D_mat, J_mat, K_mat, a0 + 0, b0, c0, d0, ab_neq, cd_neq, bk_swap, f_ab, f_cd, N);
     accumulate_jk_single_value(sy, D_mat, J_mat, K_mat, a0 + 1, b0, c0, d0, ab_neq, cd_neq, bk_swap, f_ab, f_cd, N);
     accumulate_jk_single_value(sz, D_mat, J_mat, K_mat, a0 + 2, b0, c0, d0, ab_neq, cd_neq, bk_swap, f_ab, f_cd, N);
@@ -4181,8 +4181,8 @@ __global__ void KernelFused_psps_subwarp8(
     accumulate_fock_single_value(s21, D_mat, F_mat, a0 + 2, b0, c0 + 1, d0, ab_neq, cd_neq, bk_swap, f_ab, f_cd, N);
     accumulate_fock_single_value(s22, D_mat, F_mat, a0 + 2, b0, c0 + 2, d0, ab_neq, cd_neq, bk_swap, f_ab, f_cd, N);
   } else {
-    double* J_mat = out0_mat + buf_off;
-    double* K_mat = out1_mat + buf_off;
+    double* J_mat = (out0_mat != nullptr) ? out0_mat + buf_off : nullptr;
+    double* K_mat = (out1_mat != nullptr) ? out1_mat + buf_off : nullptr;
     accumulate_jk_single_value(s00, D_mat, J_mat, K_mat, a0 + 0, b0, c0 + 0, d0, ab_neq, cd_neq, bk_swap, f_ab, f_cd, N);
     accumulate_jk_single_value(s01, D_mat, J_mat, K_mat, a0 + 0, b0, c0 + 1, d0, ab_neq, cd_neq, bk_swap, f_ab, f_cd, N);
     accumulate_jk_single_value(s02, D_mat, J_mat, K_mat, a0 + 0, b0, c0 + 2, d0, ab_neq, cd_neq, bk_swap, f_ab, f_cd, N);
@@ -6221,8 +6221,8 @@ __global__ void KernelFused_ppps_warp_component(
       double* F_mat = out0_mat + buf_off;
       accumulate_fock_single_value(acc, D_mat, F_mat, a, b, c, d0, ab_neq, cd_neq, bk_swap, f_ab, f_cd, N);
     } else {
-      double* J_mat = out0_mat + buf_off;
-      double* K_mat = out1_mat + buf_off;
+      double* J_mat = (out0_mat != nullptr) ? out0_mat + buf_off : nullptr;
+      double* K_mat = (out1_mat != nullptr) ? out1_mat + buf_off : nullptr;
       accumulate_jk_single_value(acc, D_mat, J_mat, K_mat, a, b, c, d0, ab_neq, cd_neq, bk_swap, f_ab, f_cd, N);
     }
   }
@@ -8019,7 +8019,9 @@ extern "C" cudaError_t cueri_fused_fock_psss_launch_stream(
     double* F_mat,
     cudaStream_t stream,
     int threads,
-    int n_bufs) {
+    int n_bufs,
+    bool mixed_prec) {
+  (void)mixed_prec;  // ignored for hand-written kernels
   if (ntasks < 0 || nao <= 0) return cudaErrorInvalidValue;
   if (ntasks == 0) return cudaSuccess;
   if (threads < 32 || (threads & 31) != 0) return cudaErrorInvalidValue;
@@ -8060,7 +8062,9 @@ extern "C" cudaError_t cueri_fused_jk_psss_launch_stream(
     double* K_mat,
     cudaStream_t stream,
     int threads,
-    int n_bufs) {
+    int n_bufs,
+    bool mixed_prec) {
+  (void)mixed_prec;  // ignored for hand-written kernels
   if (ntasks < 0 || nao <= 0) return cudaErrorInvalidValue;
   if (ntasks == 0) return cudaSuccess;
   if (threads < 32 || (threads & 31) != 0) return cudaErrorInvalidValue;
@@ -8100,7 +8104,9 @@ extern "C" cudaError_t cueri_fused_fock_dsss_launch_stream(
     double* F_mat,
     cudaStream_t stream,
     int threads,
-    int n_bufs) {
+    int n_bufs,
+    bool mixed_prec) {
+  (void)mixed_prec;  // ignored for hand-written kernels
   if (ntasks < 0 || nao <= 0) return cudaErrorInvalidValue;
   if (ntasks == 0) return cudaSuccess;
   if (threads < 32 || (threads & 31) != 0) return cudaErrorInvalidValue;
@@ -8140,7 +8146,9 @@ extern "C" cudaError_t cueri_fused_jk_dsss_launch_stream(
     double* K_mat,
     cudaStream_t stream,
     int threads,
-    int n_bufs) {
+    int n_bufs,
+    bool mixed_prec) {
+  (void)mixed_prec;  // ignored for hand-written kernels
   if (ntasks < 0 || nao <= 0) return cudaErrorInvalidValue;
   if (ntasks == 0) return cudaSuccess;
   if (threads < 32 || (threads & 31) != 0) return cudaErrorInvalidValue;
@@ -8179,7 +8187,9 @@ extern "C" cudaError_t cueri_fused_fock_ppss_launch_stream(
     double* F_mat,
     cudaStream_t stream,
     int threads,
-    int n_bufs) {
+    int n_bufs,
+    bool mixed_prec) {
+  (void)mixed_prec;  // ignored for hand-written kernels
   if (ntasks < 0 || nao <= 0) return cudaErrorInvalidValue;
   if (ntasks == 0) return cudaSuccess;
   if (threads < 32 || (threads & 31) != 0) return cudaErrorInvalidValue;
@@ -8219,7 +8229,9 @@ extern "C" cudaError_t cueri_fused_jk_ppss_launch_stream(
     double* K_mat,
     cudaStream_t stream,
     int threads,
-    int n_bufs) {
+    int n_bufs,
+    bool mixed_prec) {
+  (void)mixed_prec;  // ignored for hand-written kernels
   if (ntasks < 0 || nao <= 0) return cudaErrorInvalidValue;
   if (ntasks == 0) return cudaSuccess;
   if (threads < 32 || (threads & 31) != 0) return cudaErrorInvalidValue;
@@ -8258,7 +8270,9 @@ extern "C" cudaError_t cueri_fused_fock_psps_launch_stream(
     double* F_mat,
     cudaStream_t stream,
     int threads,
-    int n_bufs) {
+    int n_bufs,
+    bool mixed_prec) {
+  (void)mixed_prec;  // ignored for hand-written kernels
   if (ntasks < 0 || nao <= 0) return cudaErrorInvalidValue;
   if (ntasks == 0) return cudaSuccess;
   if (threads < 32 || (threads & 31) != 0) return cudaErrorInvalidValue;
@@ -8299,7 +8313,9 @@ extern "C" cudaError_t cueri_fused_jk_psps_launch_stream(
     double* K_mat,
     cudaStream_t stream,
     int threads,
-    int n_bufs) {
+    int n_bufs,
+    bool mixed_prec) {
+  (void)mixed_prec;  // ignored for hand-written kernels
   if (ntasks < 0 || nao <= 0) return cudaErrorInvalidValue;
   if (ntasks == 0) return cudaSuccess;
   if (threads < 32 || (threads & 31) != 0) return cudaErrorInvalidValue;
@@ -8339,7 +8355,9 @@ extern "C" cudaError_t cueri_fused_fock_ppps_launch_stream(
     double* F_mat,
     cudaStream_t stream,
     int threads,
-    int n_bufs) {
+    int n_bufs,
+    bool mixed_prec) {
+  (void)mixed_prec;  // ignored for hand-written kernels
   if (ntasks < 0 || nao <= 0) return cudaErrorInvalidValue;
   if (ntasks == 0) return cudaSuccess;
   if (threads < 32 || (threads & 31) != 0) return cudaErrorInvalidValue;
@@ -8423,7 +8441,9 @@ extern "C" cudaError_t cueri_fused_jk_ppps_launch_stream(
     double* K_mat,
     cudaStream_t stream,
     int threads,
-    int n_bufs) {
+    int n_bufs,
+    bool mixed_prec) {
+  (void)mixed_prec;  // ignored for hand-written kernels
   if (ntasks < 0 || nao <= 0) return cudaErrorInvalidValue;
   if (ntasks == 0) return cudaSuccess;
   if (threads < 32 || (threads & 31) != 0) return cudaErrorInvalidValue;

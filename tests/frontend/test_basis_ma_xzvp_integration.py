@@ -45,6 +45,26 @@ def test_ma_basis_loader_returns_defensive_copies() -> None:
     assert not np.isclose(s2["H"][0][2][0, 0], 123.456)
 
 
+def test_bse_loader_matches_pyscf_style_shell_order_for_li_631g() -> None:
+    pytest.importorskip("basis_set_exchange")
+
+    shells = load_basis_shells("6-31g", elements=["Li"])["Li"]
+    ang_mom = [int(l) for l, _exps, _coefs in shells]
+    assert ang_mom == [0, 0, 0, 1, 1]
+
+    exps0 = np.asarray(shells[0][1], dtype=np.float64)
+    exps1 = np.asarray(shells[1][1], dtype=np.float64)
+    exps2 = np.asarray(shells[2][1], dtype=np.float64)
+    exps3 = np.asarray(shells[3][1], dtype=np.float64)
+    exps4 = np.asarray(shells[4][1], dtype=np.float64)
+
+    assert np.allclose(exps0, np.asarray([642.418915, 96.7985153, 22.0911212, 6.20107025, 1.93511768, 0.636735789]))
+    assert np.allclose(exps1, np.asarray([2.32491841, 0.632430356, 0.0790534347]))
+    assert np.allclose(exps2, np.asarray([0.0359619718]))
+    assert np.allclose(exps3, np.asarray([2.32491841, 0.632430356, 0.0790534347]))
+    assert np.allclose(exps4, np.asarray([0.0359619718]))
+
+
 def test_ma_basis_autoaux_fallback_and_df_builder_smoke() -> None:
     pytest.importorskip("basis_set_exchange")
 
