@@ -27,6 +27,8 @@ def build_device_dfmo_integrals_cueri_df(
     profile: dict | None = None,
     cached_b_whitened: Any | None = None,
     cache_out: dict | None = None,
+    tile_dtype: str | None = None,
+    mixed_precision: bool | None = None,
 ) -> DeviceDFMOIntegrals:
     """Build active-space DF integrals (approximate) via cuERI streamed DF.
 
@@ -102,6 +104,8 @@ def build_device_dfmo_integrals_cueri_df(
         backend=str(backend),
         aux_block_naux=int(aux_block_naux),
         max_tile_bytes=int(max_tile_bytes),
+        tile_dtype=tile_dtype,
+        mixed_precision=mixed_precision,
     )
     t0 = time.perf_counter()
     dev = builder.build(

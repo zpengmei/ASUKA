@@ -2110,6 +2110,7 @@ def df_metric_2c2e_rys_device(
     work_small_max: int = 512,
     work_large_min: int = 200_000,
     blocks_per_task: int = 4,
+    mixed_precision: bool = False,
 ):
     """Compute DF metric V(P,Q) = (P|Q) on GPU for Cartesian auxiliary bases (general-l, reference-oriented).
 
@@ -2167,6 +2168,7 @@ def df_metric_2c2e_rys_device(
                 work_small_max=work_small_max,
                 work_large_min=work_large_min,
                 blocks_per_task=blocks_per_task,
+                mixed_precision=mixed_precision,
             )
             nP = int(tile.shape[1])
             nQ = int(tile.shape[2])
@@ -2268,6 +2270,7 @@ def df_int3c2e_rys_device(
     ao_contract_mode: str = "auto",
     ao_rep: str = "cart",
     profile: dict | None = None,
+    mixed_precision: bool = False,
 ):
     """Compute 3c2e integrals X(μ,ν,P) = (μν|P) on GPU for Cartesian AO+aux bases (general-l, reference-oriented).
 
@@ -2291,6 +2294,7 @@ def df_int3c2e_rys_device(
         ao_contract_mode=ao_contract_mode,
         ao_rep=ao_rep,
         profile=profile,
+        mixed_precision=mixed_precision,
     )
 
 
@@ -2750,6 +2754,7 @@ def df_int3c2e_rys_device_block(
     plan_policy: str = "auto",
     ao_contract_mode: str = "auto",
     ao_rep: str = "cart",
+    mixed_precision: bool = False,
     profile: dict | None = None,
 ):
     """Compute 3c2e integrals X(μ,ν,P) = (μν|P) on GPU for AO+aux bases (general-l, reference-oriented).
@@ -2989,6 +2994,7 @@ def df_int3c2e_rys_device_block(
                     work_large_min=work_large_min,
                     blocks_per_task=blocks_per_task,
                     profile=dispatch_profile,
+                    mixed_precision=mixed_precision,
                 )
                 if start_k is not None and end_k is not None:
                     end_k.record(s0)

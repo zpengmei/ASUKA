@@ -24,6 +24,7 @@ class CuERIDFConfig:
     int3c_work_large_min: int = 200_000
     int3c_blocks_per_task: int = 4
     int3c_plan_policy: str = "auto"
+    mixed_precision: bool | None = None
 
 
 def build_df_B_from_cueri_packed_bases(
@@ -57,12 +58,20 @@ def build_df_B_from_cueri_packed_bases(
 
     cfg = CuERIDFConfig() if config is None else config
 
+    # Mixed-precision for DF 3-center: OFF by default.
+    # DF factors are computed once and reused — accuracy matters more than
+    # in direct SCF where errors are transient.  Only enable when the caller
+    # explicitly sets cfg.mixed_precision = True.
+    _mp = bool(cfg.mixed_precision) if cfg.mixed_precision is not None else False
+
     t0 = None
     if profile is not None:
         import time
 
         t0 = time.perf_counter()
 
+    # Note: metric (2-center) always uses FP64 — accuracy is critical for
+    # Cholesky whitening and the computation is small (naux×naux).
     V = cueri_df.metric_2c2e_basis(
         aux_basis,
         stream=cfg.stream,
@@ -91,6 +100,7 @@ def build_df_B_from_cueri_packed_bases(
         plan_policy=str(cfg.int3c_plan_policy),
         ao_rep=str(ao_rep),
         profile=profile,
+        mixed_precision=_mp,
     )
     B = cueri_df.whiten_3c2e(X, L)
 

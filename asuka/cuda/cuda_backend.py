@@ -5848,6 +5848,88 @@ def pairwise_hij_u64_device(
     return H_d, diag_d
 
 
+def pairwise_hij_bucketed_u64_device(
+    drt,
+    drt_dev,
+    sel_idx_u64,
+    nsel: int,
+    h_base,
+    eri4,
+    materialized,
+    bucket_data,
+    cp,
+    *,
+    threads: int = 256,
+    stream=None,
+    sync: bool = True,
+):
+    """Build dense H[nsel, nsel] using bucketed pair-wise evaluation.
+
+    The materialized arrays and sel_idx_u64 must be pre-sorted by occupation key
+    (using bucket_data["sort_perm"]). Output H is in sorted order.
+
+    Parameters
+    ----------
+    materialized : tuple
+        (steps_all, nodes_all, occ_all, b_all) — already sorted by sort_perm.
+    bucket_data : dict
+        From pairwise_build_bucket_data(). Must contain: csf_to_bucket,
+        bucket_starts, bucket_sizes, neighbor_offsets, neighbor_list.
+
+    Returns
+    -------
+    H_d : cupy array, shape (nsel, nsel), dtype float64
+        Dense H in SORTED order. Caller must unpermute if original order needed.
+    diag_d : cupy array, shape (nsel,), dtype float64
+        Diagonal in sorted order.
+    """
+    if _ext is None or not hasattr(_ext, "pairwise_hij_bucketed_u64_inplace_device"):
+        raise RuntimeError(
+            "CUDA extension missing bucketed pairwise kernel; rebuild with python -m asuka.build.guga_cuda_ext"
+        )
+
+    sel_idx_u64 = cp.ascontiguousarray(cp.asarray(sel_idx_u64, dtype=cp.uint64).ravel())
+    h_base = cp.ascontiguousarray(cp.asarray(h_base, dtype=cp.float64).ravel())
+    eri4 = cp.ascontiguousarray(cp.asarray(eri4, dtype=cp.float64).ravel())
+
+    steps_all, nodes_all, occ_all, b_all = materialized
+
+    H_d = cp.zeros((nsel, nsel), dtype=cp.float64)
+    overflow = cp.zeros((1,), dtype=cp.int32)
+
+    if stream is None:
+        stream_ptr = int(cp.cuda.get_current_stream().ptr)
+    else:
+        stream_ptr = int(getattr(stream, "ptr", stream))
+
+    _ext.pairwise_hij_bucketed_u64_inplace_device(
+        drt_dev,
+        int(drt.ncsf),
+        sel_idx_u64,
+        int(nsel),
+        h_base,
+        eri4,
+        steps_all.ravel(),
+        nodes_all.ravel(),
+        occ_all.ravel(),
+        b_all.ravel(),
+        cp.ascontiguousarray(bucket_data["csf_to_bucket"]),
+        cp.ascontiguousarray(bucket_data["target_offsets"]),
+        cp.ascontiguousarray(bucket_data["target_list"]),
+        H_d.ravel(),
+        overflow,
+        int(threads),
+        int(stream_ptr),
+        bool(sync),
+    )
+
+    if int(overflow.item()) != 0:
+        raise RuntimeError("pairwise_hij_bucketed_u64 overflow")
+
+    diag_d = cp.ascontiguousarray(cp.diag(H_d))
+    return H_d, diag_d
+
+
 def pairwise_compute_occ_keys(occ_all, norb: int, cp):
     """Pack occupation vectors into uint64 keys (2 bits per orbital).
 
@@ -5961,9 +6043,12 @@ def pairwise_build_neighbor_csr(bucket_keys, norb, cp, *, max_occ_diff=4):
 
 
 def pairwise_build_bucket_data(occ_all, norb, cp):
-    """Full pipeline: occ keys → buckets → neighbor CSR → reordered arrays.
+    """Full pipeline: occ keys → buckets → neighbor CSR → flat target lists.
 
     Returns a dict with all data needed for bucketed kernel dispatch.
+    The key output is (target_offsets, target_list): for each bucket b,
+    target_list[target_offsets[b]:target_offsets[b+1]] is the sorted list
+    of all CSF indices (in sorted order) that are in neighbor buckets of b.
     """
     import numpy as np
 
@@ -5984,7 +6069,7 @@ def pairwise_build_bucket_data(occ_all, norb, cp):
     inv_perm = cp.zeros(nsel, dtype=cp.int32)
     inv_perm[sort_perm] = cp.arange(nsel, dtype=cp.int32)
 
-    # Map each CSF to its bucket index
+    # Map each sorted CSF to its bucket index
     csf_to_bucket = cp.zeros(nsel, dtype=cp.int32)
     bucket_starts_h = cp.asnumpy(bucket_starts)
     bucket_sizes_h = cp.asnumpy(bucket_sizes)
@@ -5992,6 +6077,37 @@ def pairwise_build_bucket_data(occ_all, norb, cp):
         s = int(bucket_starts_h[b])
         sz = int(bucket_sizes_h[b])
         csf_to_bucket[s:s + sz] = b
+
+    # Build flat target lists: for each bucket, the sorted union of
+    # CSF indices from all neighbor buckets.
+    neighbor_offsets_h = cp.asnumpy(neighbor_offsets)
+    neighbor_list_h = cp.asnumpy(neighbor_list)
+
+    target_offsets_list = [0]
+    target_list_parts = []
+    for b in range(nbuckets):
+        nb_s = neighbor_offsets_h[b]
+        nb_e = neighbor_offsets_h[b + 1]
+        # Collect all CSF indices from neighbor buckets
+        ranges = []
+        for nb_idx in range(nb_s, nb_e):
+            tb = neighbor_list_h[nb_idx]
+            ts = int(bucket_starts_h[tb])
+            sz = int(bucket_sizes_h[tb])
+            if sz > 0:
+                ranges.append(np.arange(ts, ts + sz, dtype=np.int32))
+        if ranges:
+            targets = np.sort(np.concatenate(ranges))
+        else:
+            targets = np.zeros(0, dtype=np.int32)
+        target_list_parts.append(targets)
+        target_offsets_list.append(target_offsets_list[-1] + len(targets))
+
+    target_offsets = np.array(target_offsets_list, dtype=np.int32)
+    if target_list_parts:
+        target_list = np.concatenate(target_list_parts).astype(np.int32)
+    else:
+        target_list = np.zeros(0, dtype=np.int32)
 
     return {
         "sort_perm": sort_perm.astype(cp.int32),
@@ -6004,6 +6120,8 @@ def pairwise_build_bucket_data(occ_all, norb, cp):
         "neighbor_list": neighbor_list,
         "csf_to_bucket": csf_to_bucket,
         "occ_keys": keys,
+        "target_offsets": cp.asarray(target_offsets),
+        "target_list": cp.asarray(target_list),
     }
 
 

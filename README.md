@@ -122,6 +122,75 @@ print(f"CASSCF energy: {out.e_tot:.10f}  ({out.niter} iterations)")
 
 No tuning needed — defaults use the augmented Hessian orbital optimizer with TF32-accelerated Krylov solver and cuBLAS-based sigma vectors.
 
+### Two-electron backends
+
+`run_hf_df` supports four two-electron integral backends via `two_e_backend=`:
+
+```python
+from asuka.frontend.scf import run_hf_df
+
+# DF (default) — precomputed density-fitted B[μ,ν,Q] factors
+scf = run_hf_df(mol, two_e_backend="df")
+
+# Dense — exact 4-center AO ERIs (small basis sets only)
+scf = run_hf_df(mol, two_e_backend="dense")
+
+# Direct — on-the-fly 4-center ERIs, no stored integrals (GPU-only)
+scf = run_hf_df(mol, two_e_backend="direct")
+
+# Direct-DF — streamed DF with no materialized B tensor (GPU-only)
+scf = run_hf_df(mol, two_e_backend="direct_df")
+```
+
+| Backend | J/K build | Memory | Best for |
+|---|---|---|---|
+| `df` | DF factors `B[μ,ν,Q]` | O(N²·N_aux) | Default; good balance of speed and accuracy |
+| `dense` | Exact 4-center ERIs | O(N⁴) | Small molecules, reference calculations |
+| `direct` | On-the-fly 4-center | O(N²) | Large basis sets where ERIs don't fit in memory |
+| `direct_df` | Streamed DF | O(N²) | Large systems with DF accuracy, minimal memory |
+
+The `direct` and `direct_df` backends benefit from [mixed-precision acceleration](#mixed-precision-eri-acceleration).
+
+### CASSCF backends
+
+`run_casscf` accepts `backend=` and `df=` to control how two-electron integrals
+are built and where sigma vectors (CI Hamiltonian) are evaluated:
+
+```python
+from asuka.mcscf import run_casscf
+
+cas_kw = dict(ncore=2, ncas=10, nelecas=10, nroots=1)
+
+# GPU + DF (default) — fastest for most systems
+out = run_casscf(scf_out, **cas_kw, backend="cuda", df=True)
+
+# GPU + dense — exact 4-center integrals, no DF approximation
+out = run_casscf(scf_out, **cas_kw, backend="cuda", df=False)
+
+# CPU + DF
+out = run_casscf(scf_out, **cas_kw, backend="cpu", df=True)
+
+# CPU + dense
+out = run_casscf(scf_out, **cas_kw, backend="cpu", df=False)
+
+# Integral-direct — on-the-fly ERIs (requires direct SCF output)
+scf_direct = run_hf_df(mol, two_e_backend="direct")
+out = run_casscf(scf_direct, **cas_kw, backend="cuda")
+
+# Direct-DF — streamed DF with no materialized B tensor
+scf_ddf = run_hf_df(mol, two_e_backend="direct_df")
+out = run_casscf(scf_ddf, **cas_kw, backend="cuda")
+```
+
+| `backend` | `df` | Two-electron integrals | Sigma vectors | Best for |
+|---|---|---|---|---|
+| `cuda` | `True` | DF factors on GPU | cuBLAS | Default; fast GPU path |
+| `cuda` | `False` | Exact 4-center on GPU | cuBLAS | Reference; no DF error |
+| `cpu` | `True` | DF factors on CPU | NumPy | No GPU available |
+| `cpu` | `False` | Exact 4-center on CPU | NumPy | Small reference calcs |
+| `cuda` | (direct SCF) | On-the-fly 4-center | CUDA direct | Large basis, low memory |
+| `cuda` | (direct-DF SCF) | Streamed DF | CUDA DF | Large systems, minimal memory |
+
 ## State-averaged CASSCF
 
 ```python
@@ -411,8 +480,12 @@ a different stage of the ERI pipeline:
 | All aggressive | `MIXED_PRECISION=1 TILE_F32=1 F32_ACCUM=1` | \~1e-7 | Maximum throughput. |
 
 All modes produce total energies within **2 microHartree** of the FP64 reference.
-Mixed precision only affects the `direct` and `direct_df` two-electron backends;
-the `dense` and `df` backends are unaffected.
+
+`ASUKA_ERI_MIXED_PRECISION` and `ASUKA_ERI_TILE_F32` apply globally to all Rys-quadrature
+ERI kernels — this includes integral-direct SCF (`direct`/`direct_df` backends) and the
+DF 3-center integral build used by CASSCF and CASPT2. `ASUKA_ERI_F32_ACCUM` only applies
+to the integral-direct SCF path. The precomputed `dense` and `df` SCF backends are unaffected
+(they don't evaluate ERIs at SCF time).
 
 **Recommended configurations:**
 

@@ -5,6 +5,7 @@
 
 #include <cmath>
 #include <cstdint>
+#include <type_traits>
 
 #include "cueri_cuda_kernels_api.h"
 #include "cueri_cuda_contract_fock_warp.cuh"

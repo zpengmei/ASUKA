@@ -309,6 +309,8 @@ def _build_casci_df_integrals(
     cached_b_whitened: Any | None = None,
     cache_out: dict | None = None,
     two_e_provider: Any | None = None,
+    tile_dtype: str | None = None,
+    mixed_precision: bool | None = None,
 ) -> _CASCIDFIntegrals:
     """Build effective 1-electron, 2-electron integrals, and core energy for DF-CASCI.
 
@@ -505,6 +507,8 @@ def _build_casci_df_integrals(
         profile=eri_prof,
         cached_b_whitened=cached_b_for_eri,
         cache_out=cache_out,
+        tile_dtype=tile_dtype,
+        mixed_precision=mixed_precision,
     )
 
     return _CASCIDFIntegrals(h1eff=h1eff, eri=eri, ecore=ecore, mo_coeff=C, C_cas=C_cas)

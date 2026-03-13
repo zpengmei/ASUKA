@@ -800,7 +800,7 @@ def recommended_auxbasis(mol, *, xc: str = "HF", mp2fit: bool = False):
     return infer_jkfit_auxbasis(orbital_basis, elements)
 
 
-def metric_2c2e_basis(aux_basis, *, stream=None, backend: str = "gpu_rys", mode: str = "warp", threads: int = 256):
+def metric_2c2e_basis(aux_basis, *, stream=None, backend: str = "gpu_rys", mode: str = "warp", threads: int = 256, mixed_precision: bool = False):
     """Compute the aux Coulomb metric V(P,Q) = (P|Q) from packed basis objects (GPU).
 
     This is a lower-level entrypoint that avoids any PySCF objects. It is
@@ -851,6 +851,7 @@ def metric_2c2e_basis(aux_basis, *, stream=None, backend: str = "gpu_rys", mode:
                 stream=stream,
                 threads=int(threads),
                 mode=str(mode),
+                mixed_precision=bool(mixed_precision),
             )
         )
 
@@ -870,6 +871,7 @@ def int3c2e_basis(
     ao_contract_mode: str = "auto",
     ao_rep: str = "cart",
     profile: dict | None = None,
+    mixed_precision: bool = False,
 ):
     """Compute 3-center Coulomb integrals X(μ,ν,P) = (μν|P) from packed bases (GPU).
 
@@ -936,6 +938,7 @@ def int3c2e_basis(
                 ao_contract_mode=str(ao_contract_mode),
                 ao_rep=str(ao_rep),
                 profile=profile,
+                mixed_precision=bool(mixed_precision),
             )
         )
 
@@ -1443,6 +1446,7 @@ def _active_YT_streamed_rys_basis(
                     work_large_min=work_large_min,
                     blocks_per_task=blocks_per_task,
                     ao_contract_mode=ao_contract_mode,
+                    mixed_precision=bool(mixed_precision),
                 )
                 if start is not None and end is not None:
                     end.record(s0)

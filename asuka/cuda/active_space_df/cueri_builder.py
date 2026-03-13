@@ -186,6 +186,8 @@ class CuERIActiveSpaceDFBuilder:
     ao_contract_mode: str = "auto"
     graph_capture: bool = False
     stream: Any | None = None
+    tile_dtype: str | None = None
+    mixed_precision: bool | None = None
 
     def __post_init__(self) -> None:
         try:
@@ -429,6 +431,7 @@ class CuERIActiveSpaceDFBuilder:
             cache_hit = True
         elif cache_out is not None:
             try:
+                _mp = bool(self.mixed_precision) if self.mixed_precision is not None else False
                 V = cueri_df.metric_2c2e_basis(
                     getattr(self, "_aux_basis"),
                     stream=self.stream,
@@ -444,6 +447,7 @@ class CuERIActiveSpaceDFBuilder:
                     backend=str(self.backend),
                     mode=str(self.mode),
                     threads=int(self.threads),
+                    mixed_precision=_mp,
                 )
                 B_whitened = cueri_df.whiten_3c2e(X, L)
                 B_whitened = cp.ascontiguousarray(B_whitened)
@@ -470,6 +474,8 @@ class CuERIActiveSpaceDFBuilder:
                     graph_capture=bool(self.graph_capture),
                     profile=df_prof,
                     out=None if out is None else out.l_full,
+                    tile_dtype=self.tile_dtype,
+                    mixed_precision=self.mixed_precision,
                 )
                 l_full = _as_l_full(l_full)
         else:
@@ -491,6 +497,8 @@ class CuERIActiveSpaceDFBuilder:
                 graph_capture=bool(self.graph_capture),
                 profile=df_prof,
                 out=None if out is None else out.l_full,
+                tile_dtype=self.tile_dtype,
+                mixed_precision=self.mixed_precision,
             )
             l_full = _as_l_full(l_full)
 

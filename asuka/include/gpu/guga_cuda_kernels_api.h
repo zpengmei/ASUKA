@@ -2654,4 +2654,26 @@ extern "C" cudaError_t pairwise_hij_u64_launch_stream(
     cudaStream_t stream,
     int threads);
 
+extern "C" cudaError_t pairwise_hij_bucketed_u64_launch_stream(
+    const uint64_t* sel_idx_u64,
+    int nsel,
+    int norb,
+    uint64_t ncsf,
+    const double* h_base,
+    const double* eri4,
+    const int32_t* child_table,
+    const int16_t* node_twos,
+    const int64_t* child_prefix,
+    const int8_t*  steps_all,
+    const int32_t* nodes_all,
+    const int8_t*  occ_all,
+    const int16_t* b_all,
+    const int32_t* csf_to_bucket,
+    const int32_t* target_offsets,
+    const int32_t* target_list,
+    double* H_out,
+    int* overflow_flag,
+    cudaStream_t stream,
+    int threads);
+
 #endif  // CUGUGU_GPU_GUGA_CUDA_KERNELS_API_H

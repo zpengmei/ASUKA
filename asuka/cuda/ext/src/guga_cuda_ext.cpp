@@ -11358,6 +11358,110 @@ void pairwise_hij_u64_inplace_device(
   }
 }
 
+void pairwise_hij_bucketed_u64_inplace_device(
+    const DeviceDRT& drt,
+    uint64_t ncsf_u64,
+    py::object sel_idx_u64_obj,
+    int nsel,
+    py::object h_base_obj,
+    py::object eri4_obj,
+    py::object steps_all_obj,
+    py::object nodes_all_obj,
+    py::object occ_all_obj,
+    py::object b_all_obj,
+    py::object csf_to_bucket_obj,
+    py::object target_offsets_obj,
+    py::object target_list_obj,
+    py::object H_out_obj,
+    py::object overflow_obj,
+    int threads,
+    uint64_t stream,
+    bool sync) {
+  if (sel_idx_u64_obj.is_none() || h_base_obj.is_none() || eri4_obj.is_none() ||
+      steps_all_obj.is_none() || nodes_all_obj.is_none() || occ_all_obj.is_none() ||
+      b_all_obj.is_none() || H_out_obj.is_none() || overflow_obj.is_none() ||
+      csf_to_bucket_obj.is_none() || target_offsets_obj.is_none() ||
+      target_list_obj.is_none()) {
+    throw std::invalid_argument("required array arguments must not be None");
+  }
+  if (threads <= 0 || threads > 1024) throw std::invalid_argument("threads must be in 1..1024");
+  if (nsel <= 0) return;
+  if (drt.norb <= 0 || drt.norb > 64) throw std::invalid_argument("norb must be in 1..64");
+
+  auto sel_dev = cuda_array_view_from_object(sel_idx_u64_obj, "sel_idx_u64");
+  auto h_base_dev = cuda_array_view_from_object(h_base_obj, "h_base");
+  auto eri4_dev = cuda_array_view_from_object(eri4_obj, "eri4");
+  auto steps_dev = cuda_array_view_from_object(steps_all_obj, "steps_all");
+  auto nodes_dev = cuda_array_view_from_object(nodes_all_obj, "nodes_all");
+  auto occ_dev = cuda_array_view_from_object(occ_all_obj, "occ_all");
+  auto b_dev = cuda_array_view_from_object(b_all_obj, "b_all");
+  auto csf_to_bucket_dev = cuda_array_view_from_object(csf_to_bucket_obj, "csf_to_bucket");
+  auto target_offsets_dev = cuda_array_view_from_object(target_offsets_obj, "target_offsets");
+  auto target_list_dev = cuda_array_view_from_object(target_list_obj, "target_list");
+  auto H_out_dev = cuda_array_view_from_object(H_out_obj, "H_out");
+  auto overflow_dev = cuda_array_view_from_object(overflow_obj, "overflow");
+
+  require_typestr(sel_dev, "sel_idx_u64", "<u8");
+  require_typestr(h_base_dev, "h_base", "<f8");
+  require_typestr(eri4_dev, "eri4", "<f8");
+  require_typestr(steps_dev, "steps_all", "|i1");
+  require_typestr(nodes_dev, "nodes_all", "<i4");
+  require_typestr(occ_dev, "occ_all", "|i1");
+  require_typestr(b_dev, "b_all", "<i2");
+  require_typestr(csf_to_bucket_dev, "csf_to_bucket", "<i4");
+  require_typestr(target_offsets_dev, "target_offsets", "<i4");
+  require_typestr(target_list_dev, "target_list", "<i4");
+  require_typestr(H_out_dev, "H_out", "<f8");
+  require_typestr(overflow_dev, "overflow", "<i4");
+
+  if (sel_dev.shape.size() != 1 || sel_dev.shape[0] < (int64_t)nsel)
+    throw std::invalid_argument("sel_idx_u64 length must be >= nsel");
+  int64_t nops = (int64_t)drt.norb * (int64_t)drt.norb;
+  if (h_base_dev.shape.size() != 1 || h_base_dev.shape[0] < nops)
+    throw std::invalid_argument("h_base length must be >= norb*norb");
+  int64_t eri4_n = nops * nops;
+  if (eri4_dev.shape.size() != 1 || eri4_dev.shape[0] < eri4_n)
+    throw std::invalid_argument("eri4 length must be >= norb^4");
+  if (H_out_dev.shape.size() != 1 || H_out_dev.shape[0] < (int64_t)nsel * (int64_t)nsel)
+    throw std::invalid_argument("H_out length must be >= nsel*nsel");
+  if (overflow_dev.shape.size() != 1 || overflow_dev.shape[0] != 1)
+    throw std::invalid_argument("overflow must have shape (1,)");
+
+  uint64_t stream_u = stream;
+  if (stream_u == 0) {
+    if (H_out_dev.stream) stream_u = H_out_dev.stream;
+    else if (sel_dev.stream) stream_u = sel_dev.stream;
+  }
+  cudaStream_t stream_t = reinterpret_cast<cudaStream_t>(stream_u);
+
+  throw_on_cuda_error(
+      pairwise_hij_bucketed_u64_launch_stream(
+          reinterpret_cast<const uint64_t*>(sel_dev.ptr),
+          int(nsel),
+          int(drt.norb),
+          ncsf_u64,
+          reinterpret_cast<const double*>(h_base_dev.ptr),
+          reinterpret_cast<const double*>(eri4_dev.ptr),
+          drt.child,
+          drt.node_twos,
+          drt.child_prefix,
+          reinterpret_cast<const int8_t*>(steps_dev.ptr),
+          reinterpret_cast<const int32_t*>(nodes_dev.ptr),
+          reinterpret_cast<const int8_t*>(occ_dev.ptr),
+          reinterpret_cast<const int16_t*>(b_dev.ptr),
+          reinterpret_cast<const int32_t*>(csf_to_bucket_dev.ptr),
+          reinterpret_cast<const int32_t*>(target_offsets_dev.ptr),
+          reinterpret_cast<const int32_t*>(target_list_dev.ptr),
+          reinterpret_cast<double*>(H_out_dev.ptr),
+          reinterpret_cast<int*>(overflow_dev.ptr),
+          stream_t,
+          int(threads)),
+      "pairwise_hij_bucketed_u64_launch_stream");
+  if (sync) {
+    throw_on_cuda_error(cudaStreamSynchronize(stream_t), "cudaStreamSynchronize(pairwise_hij_bucketed)");
+  }
+}
+
 void hb_screen_and_apply_inplace_device(
     const DeviceDRT& drt,
     const DeviceStateCache& state,
@@ -23150,6 +23254,28 @@ PYBIND11_MODULE(_guga_cuda_ext, m) {
       py::arg("nodes_all"),
       py::arg("occ_all"),
       py::arg("b_all"),
+      py::arg("H_out"),
+      py::arg("overflow"),
+      py::arg("threads") = 256,
+      py::arg("stream") = 0,
+      py::arg("sync") = true);
+
+  m.def(
+      "pairwise_hij_bucketed_u64_inplace_device",
+      &pairwise_hij_bucketed_u64_inplace_device,
+      py::arg("drt"),
+      py::arg("ncsf"),
+      py::arg("sel_idx_u64"),
+      py::arg("nsel"),
+      py::arg("h_base"),
+      py::arg("eri4"),
+      py::arg("steps_all"),
+      py::arg("nodes_all"),
+      py::arg("occ_all"),
+      py::arg("b_all"),
+      py::arg("csf_to_bucket"),
+      py::arg("target_offsets"),
+      py::arg("target_list"),
       py::arg("H_out"),
       py::arg("overflow"),
       py::arg("threads") = 256,

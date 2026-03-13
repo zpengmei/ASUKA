@@ -54,6 +54,7 @@ def resolve_df_config_overrides(
         mode=str(cfg0.mode if mode is None else mode),
         threads=int(cfg0.threads if threads is None else threads),
         stream=cfg0.stream,
+        mixed_precision=cfg0.mixed_precision,
     )
 
 
@@ -120,4 +121,5 @@ def resolve_cueri_df_config(
         int3c_work_large_min=max(2, int(work_large_min)),
         int3c_blocks_per_task=max(1, int(blocks_per_task)),
         int3c_plan_policy=str(plan_policy),
+        mixed_precision=cfg_get(cfg_in, "mixed_precision", defaults.mixed_precision),
     )
