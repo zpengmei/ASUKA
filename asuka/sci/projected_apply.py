@@ -473,6 +473,42 @@ class ExactSelectedTupleProjectedHop:
 
 
 @dataclass
+class DenseMatrixProjectedHop:
+    """Dense matrix projected hop backed by a full H[nsel, nsel] matrix on device.
+
+    This operator stores the full selected-space Hamiltonian as a dense matrix
+    and applies `P_S H P_S` via cuBLAS dense matvec. Drop-in replacement for
+    ExactSelectedTupleProjectedHop when the selected space is small enough to
+    fit in GPU memory as a dense matrix (nsel <= ~25K on 24GB GPU).
+
+    Built by the pair-wise H[i,j] evaluation kernel which directly computes
+    matrix elements between selected CSFs without DFS-walking the full space.
+    """
+
+    sel_idx: np.ndarray
+    H_d: Any           # cupy [nsel, nsel] float64
+    hdiag_d: Any        # cupy [nsel] float64
+
+    def hop_gpu(self, x_d):
+        try:
+            import cupy as cp  # type: ignore[import-not-found]
+        except Exception as e:  # pragma: no cover
+            raise RuntimeError("cupy is required for DenseMatrixProjectedHop") from e
+
+        nsel = int(self.sel_idx.size)
+        x_d = cp.asarray(x_d, dtype=cp.float64)
+        if int(getattr(x_d, "ndim", 1)) == 1:
+            if int(x_d.size) != nsel:
+                raise ValueError("gpu projected-hop input has wrong length")
+            return cp.ascontiguousarray(self.H_d @ x_d)
+        if int(x_d.ndim) != 2:
+            raise ValueError("gpu projected-hop input must be 1D or 2D")
+        if int(x_d.shape[0]) != nsel:
+            raise ValueError("gpu projected-hop input has wrong leading dimension")
+        return cp.ascontiguousarray(self.H_d @ x_d)
+
+
+@dataclass
 class ExactExternalProjectedApply:
     """Exact external projected apply `P_X H P_S C`.
 

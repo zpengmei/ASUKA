@@ -43,6 +43,9 @@ class HeatBathIntegralIndex:
 
     norb: int
 
+    # Symmetry mask: 1 if (p,q) pair is symmetry-allowed, None for C1
+    sym_pq_allowed: np.ndarray | None = None  # int8 [norb^2]
+
     @property
     def n_h1(self) -> int:
         return int(self.h1_abs.shape[0])
@@ -56,7 +59,13 @@ class HeatBathIntegralIndex:
         return int(self.rs_flat.shape[0])
 
 
-def build_hb_index(h1e_eff: np.ndarray, eri_4d: np.ndarray, norb: int) -> HeatBathIntegralIndex:
+def build_hb_index(
+    h1e_eff: np.ndarray,
+    eri_4d: np.ndarray,
+    norb: int,
+    *,
+    orbsym: np.ndarray | None = None,
+) -> HeatBathIntegralIndex:
     """Build sorted integral tables from pre-materialized integrals.
 
     Uses vectorized NumPy argsort — no Python loops over integral entries.
@@ -69,12 +78,37 @@ def build_hb_index(h1e_eff: np.ndarray, eri_4d: np.ndarray, norb: int) -> HeatBa
         Full 4-index ERI in chemist notation (pq|rs).
     norb : int
         Number of active orbitals.
+    orbsym : ndarray or None
+        int32 array of orbital irrep labels (shape [norb]).  When provided,
+        symmetry-forbidden integrals are zeroed before sorting so they are
+        excluded by the existing ``> 0.0`` mask.
     """
     norb = int(norb)
     nops = norb * norb
 
     h1e_eff = np.asarray(h1e_eff, dtype=np.float64).reshape(norb, norb)
     eri_4d = np.asarray(eri_4d, dtype=np.float64).reshape(norb, norb, norb, norb)
+
+    # --- Symmetry pre-filter ---
+    sym_pq_allowed: np.ndarray | None = None
+    if orbsym is not None:
+        orbsym = np.asarray(orbsym, dtype=np.int32).ravel()
+        if orbsym.size != norb:
+            raise ValueError(f"orbsym size {orbsym.size} != norb {norb}")
+        # One-body: zero out h1[p,q] where orbsym[p] ^ orbsym[q] != 0
+        sym_pq_2d = orbsym[:, None] ^ orbsym[None, :]  # (norb, norb)
+        h1e_eff = h1e_eff.copy()
+        h1e_eff[sym_pq_2d != 0] = 0.0
+        # Two-body: zero out eri[pq,rs] where sym_pq[pq] ^ sym_pq[rs] != 0
+        sym_pq_flat = sym_pq_2d.ravel()  # (nops,)
+        allowed_2e = sym_pq_flat[:, None] == sym_pq_flat[None, :]  # (nops, nops)
+        eri_2d_view = eri_4d.reshape(nops, nops)
+        eri_2d_view = eri_2d_view * allowed_2e
+        eri_4d = eri_2d_view.reshape(norb, norb, norb, norb)
+        # Build sym_pq_allowed mask
+        sym_pq_allowed = (sym_pq_flat == 0).astype(np.int8)  # 1 if p,q same irrep (pq has sym 0)
+        # More precise: sym_pq_allowed[pq] = 1 iff orbsym[p]^orbsym[q]==0
+        sym_pq_allowed = (sym_pq_2d.ravel() == 0).astype(np.int8)
 
     # --- One-body sort ---
     h1_flat = h1e_eff.ravel()
@@ -145,10 +179,17 @@ def build_hb_index(h1e_eff: np.ndarray, eri_4d: np.ndarray, norb: int) -> HeatBa
         rs_max_v=rs_max_v,
         eri_diag_t=eri_diag_t,
         norb=norb,
+        sym_pq_allowed=sym_pq_allowed,
     )
 
 
-def build_hb_index_from_df(h1e_eff: np.ndarray, l_full: np.ndarray, norb: int) -> HeatBathIntegralIndex:
+def build_hb_index_from_df(
+    h1e_eff: np.ndarray,
+    l_full: np.ndarray,
+    norb: int,
+    *,
+    orbsym: np.ndarray | None = None,
+) -> HeatBathIntegralIndex:
     """Build HB index from DF 3-index integrals by materializing the ERI.
 
     Parameters
@@ -159,6 +200,8 @@ def build_hb_index_from_df(h1e_eff: np.ndarray, l_full: np.ndarray, norb: int) -
         DF 3-index integrals (Cholesky vectors).
     norb : int
         Number of active orbitals.
+    orbsym : ndarray or None
+        Orbital irrep labels; forwarded to :func:`build_hb_index`.
     """
     norb = int(norb)
     nops = norb * norb
@@ -168,7 +211,7 @@ def build_hb_index_from_df(h1e_eff: np.ndarray, l_full: np.ndarray, norb: int) -
     # Materialize (pq|rs) = L_pq^P L_rs^P  (nops × nops GEMM)
     eri_2d = l_full @ l_full.T  # [nops, nops]
     eri_4d = eri_2d.reshape(norb, norb, norb, norb)
-    return build_hb_index(h1e_eff, eri_4d, norb)
+    return build_hb_index(h1e_eff, eri_4d, norb, orbsym=orbsym)
 
 
 def build_g_base(
@@ -237,7 +280,7 @@ def build_g_base(
 
 def upload_hb_index(hb_index: HeatBathIntegralIndex, cp: Any) -> dict:
     """Upload all HB index arrays to GPU as CuPy arrays."""
-    return {
+    d = {
         "h1_pq": cp.asarray(hb_index.h1_pq, dtype=cp.int32),
         "h1_abs": cp.asarray(hb_index.h1_abs, dtype=cp.float64),
         "h1_signed": cp.asarray(hb_index.h1_signed, dtype=cp.float64),
@@ -251,6 +294,11 @@ def upload_hb_index(hb_index: HeatBathIntegralIndex, cp: Any) -> dict:
         "eri_diag_t": cp.asarray(hb_index.eri_diag_t, dtype=cp.float64),
         "norb": int(hb_index.norb),
     }
+    if hb_index.sym_pq_allowed is not None:
+        d["sym_pq_allowed"] = cp.asarray(hb_index.sym_pq_allowed, dtype=cp.int8)
+    else:
+        d["sym_pq_allowed"] = None
+    return d
 
 
 def build_g_base_gpu(hb_dev: dict, cutoff: float, norb: int, cp: Any) -> Any:

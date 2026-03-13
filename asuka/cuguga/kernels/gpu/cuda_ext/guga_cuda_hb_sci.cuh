@@ -69,7 +69,8 @@ void hb_screen_and_apply_kernel(
     double*  __restrict__ hash_vals,
     int cap,
     const uint8_t* __restrict__ selected_mask,  // [ncsf] or NULL
-    int* __restrict__ overflow_flag)
+    int* __restrict__ overflow_flag,
+    const int8_t* __restrict__ sym_pq_allowed)  // [norb^2] or NULL
 {
     // One block per source CSF
     int j_local = blockIdx.x;
@@ -202,6 +203,7 @@ void hb_screen_and_apply_kernel(
 
     // Two-body: for each (p,q), scan sorted v entries
     for (int pq = tid; pq < nops; pq += nthreads) {
+        if (sym_pq_allowed != nullptr && !sym_pq_allowed[pq]) continue;
         if (pq_max_v[pq] < cutoff) continue;
 
         int64_t lo = pq_ptr[pq];
@@ -365,7 +367,8 @@ void hb_fused_dfs_kernel(
     double*  __restrict__ hash_vals,
     int cap,
     const uint8_t* __restrict__ selected_mask,
-    int* __restrict__ overflow_flag)
+    int* __restrict__ overflow_flag,
+    const int8_t* __restrict__ sym_pq_allowed)  // [norb^2] or NULL
 {
     int j_local = blockIdx.x;
     if (j_local >= nsel) return;
@@ -471,6 +474,7 @@ void hb_fused_dfs_kernel(
         int p = pq / norb;
         int q = pq - p * norb;
         if (p == q) continue;
+        if (sym_pq_allowed != nullptr && !sym_pq_allowed[pq]) continue;
 
         int occ_p = (int)occ_s[p];
         int occ_q = (int)occ_s[q];
@@ -665,7 +669,8 @@ extern "C" cudaError_t guga_hb_screen_and_apply_launch_stream(
     const uint8_t* selected_mask,
     int* overflow_flag,
     cudaStream_t stream,
-    int threads)
+    int threads,
+    const int8_t* sym_pq_allowed)  // [norb^2] or NULL
 {
     if (!sel_idx || !c_root) return cudaErrorInvalidValue;
     if (nsel <= 0) return cudaSuccess;
@@ -681,7 +686,8 @@ extern "C" cudaError_t guga_hb_screen_and_apply_launch_stream(
             h1_pq, h1_abs, h1_signed, n_h1,
             pq_ptr, rs_idx, v_abs, v_signed, pq_max_v, eps,
             child_table, node_twos, child_prefix, nnodes,
-            hash_keys, hash_vals, cap, selected_mask, overflow_flag);
+            hash_keys, hash_vals, cap, selected_mask, overflow_flag,
+            sym_pq_allowed);
     } else if (norb <= 24) {
         hb_fused_dfs_kernel<24><<<nsel, threads, 0, stream>>>(
             sel_idx, c_root, /*c_root_stride=*/1, nsel, root,
@@ -689,7 +695,8 @@ extern "C" cudaError_t guga_hb_screen_and_apply_launch_stream(
             h1_pq, h1_abs, h1_signed, n_h1,
             pq_ptr, rs_idx, v_abs, v_signed, pq_max_v, eps,
             child_table, node_twos, child_prefix, nnodes,
-            hash_keys, hash_vals, cap, selected_mask, overflow_flag);
+            hash_keys, hash_vals, cap, selected_mask, overflow_flag,
+            sym_pq_allowed);
     } else if (norb <= 32) {
         hb_fused_dfs_kernel<32><<<nsel, threads, 0, stream>>>(
             sel_idx, c_root, /*c_root_stride=*/1, nsel, root,
@@ -697,7 +704,8 @@ extern "C" cudaError_t guga_hb_screen_and_apply_launch_stream(
             h1_pq, h1_abs, h1_signed, n_h1,
             pq_ptr, rs_idx, v_abs, v_signed, pq_max_v, eps,
             child_table, node_twos, child_prefix, nnodes,
-            hash_keys, hash_vals, cap, selected_mask, overflow_flag);
+            hash_keys, hash_vals, cap, selected_mask, overflow_flag,
+            sym_pq_allowed);
     } else if (norb <= 48) {
         hb_fused_dfs_kernel<48><<<nsel, threads, 0, stream>>>(
             sel_idx, c_root, /*c_root_stride=*/1, nsel, root,
@@ -705,7 +713,8 @@ extern "C" cudaError_t guga_hb_screen_and_apply_launch_stream(
             h1_pq, h1_abs, h1_signed, n_h1,
             pq_ptr, rs_idx, v_abs, v_signed, pq_max_v, eps,
             child_table, node_twos, child_prefix, nnodes,
-            hash_keys, hash_vals, cap, selected_mask, overflow_flag);
+            hash_keys, hash_vals, cap, selected_mask, overflow_flag,
+            sym_pq_allowed);
     } else {
         hb_fused_dfs_kernel<64><<<nsel, threads, 0, stream>>>(
             sel_idx, c_root, /*c_root_stride=*/1, nsel, root,
@@ -713,7 +722,8 @@ extern "C" cudaError_t guga_hb_screen_and_apply_launch_stream(
             h1_pq, h1_abs, h1_signed, n_h1,
             pq_ptr, rs_idx, v_abs, v_signed, pq_max_v, eps,
             child_table, node_twos, child_prefix, nnodes,
-            hash_keys, hash_vals, cap, selected_mask, overflow_flag);
+            hash_keys, hash_vals, cap, selected_mask, overflow_flag,
+            sym_pq_allowed);
     }
     return cudaGetLastError();
 }
@@ -747,7 +757,8 @@ extern "C" cudaError_t guga_hb_screen_and_apply_many_roots_launch_stream(
     const uint8_t* selected_mask,
     int* overflow_flag,
     cudaStream_t stream,
-    int threads)
+    int threads,
+    const int8_t* sym_pq_allowed)  // [norb^2] or NULL
 {
     if (!sel_idx || !c_sel_row_major) return cudaErrorInvalidValue;
     if (nsel <= 0 || nroots <= 0) return cudaSuccess;
@@ -763,7 +774,8 @@ extern "C" cudaError_t guga_hb_screen_and_apply_many_roots_launch_stream(
                 h1_pq, h1_abs, h1_signed, n_h1,
                 pq_ptr, rs_idx, v_abs, v_signed, pq_max_v, eps,
                 child_table, node_twos, child_prefix, nnodes,
-                hash_keys, hash_vals, cap, selected_mask, overflow_flag);
+                hash_keys, hash_vals, cap, selected_mask, overflow_flag,
+                sym_pq_allowed);
         } else if (norb <= 24) {
             hb_fused_dfs_kernel<24><<<nsel, threads, 0, stream>>>(
                 sel_idx, c_root, /*c_root_stride=*/nroots, nsel, root,
@@ -771,7 +783,8 @@ extern "C" cudaError_t guga_hb_screen_and_apply_many_roots_launch_stream(
                 h1_pq, h1_abs, h1_signed, n_h1,
                 pq_ptr, rs_idx, v_abs, v_signed, pq_max_v, eps,
                 child_table, node_twos, child_prefix, nnodes,
-                hash_keys, hash_vals, cap, selected_mask, overflow_flag);
+                hash_keys, hash_vals, cap, selected_mask, overflow_flag,
+                sym_pq_allowed);
         } else if (norb <= 32) {
             hb_fused_dfs_kernel<32><<<nsel, threads, 0, stream>>>(
                 sel_idx, c_root, /*c_root_stride=*/nroots, nsel, root,
@@ -779,7 +792,8 @@ extern "C" cudaError_t guga_hb_screen_and_apply_many_roots_launch_stream(
                 h1_pq, h1_abs, h1_signed, n_h1,
                 pq_ptr, rs_idx, v_abs, v_signed, pq_max_v, eps,
                 child_table, node_twos, child_prefix, nnodes,
-                hash_keys, hash_vals, cap, selected_mask, overflow_flag);
+                hash_keys, hash_vals, cap, selected_mask, overflow_flag,
+                sym_pq_allowed);
         } else if (norb <= 48) {
             hb_fused_dfs_kernel<48><<<nsel, threads, 0, stream>>>(
                 sel_idx, c_root, /*c_root_stride=*/nroots, nsel, root,
@@ -787,7 +801,8 @@ extern "C" cudaError_t guga_hb_screen_and_apply_many_roots_launch_stream(
                 h1_pq, h1_abs, h1_signed, n_h1,
                 pq_ptr, rs_idx, v_abs, v_signed, pq_max_v, eps,
                 child_table, node_twos, child_prefix, nnodes,
-                hash_keys, hash_vals, cap, selected_mask, overflow_flag);
+                hash_keys, hash_vals, cap, selected_mask, overflow_flag,
+                sym_pq_allowed);
         } else {
             hb_fused_dfs_kernel<64><<<nsel, threads, 0, stream>>>(
                 sel_idx, c_root, /*c_root_stride=*/nroots, nsel, root,
@@ -795,7 +810,8 @@ extern "C" cudaError_t guga_hb_screen_and_apply_many_roots_launch_stream(
                 h1_pq, h1_abs, h1_signed, n_h1,
                 pq_ptr, rs_idx, v_abs, v_signed, pq_max_v, eps,
                 child_table, node_twos, child_prefix, nnodes,
-                hash_keys, hash_vals, cap, selected_mask, overflow_flag);
+                hash_keys, hash_vals, cap, selected_mask, overflow_flag,
+                sym_pq_allowed);
         }
         cudaError_t err = cudaGetLastError();
         if (err != cudaSuccess) return err;

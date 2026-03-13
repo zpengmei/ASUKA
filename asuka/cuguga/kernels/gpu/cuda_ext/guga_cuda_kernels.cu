@@ -23,6 +23,7 @@
 #include "guga_cuda_hb_sci.cuh"
 #include "guga_cuda_cas36_idx64_qmc.cuh"
 #include "guga_cuda_cas36_idx64_sci.cuh"
+#include "guga_cuda_pairwise_hij.cuh"
 #include "guga_cuda_kernels_kernel25_ws.cuh"
 #include "guga_cuda_kernels_fused_hop.cuh"
 #include "guga_cuda_kernels_soc_triplet.cuh"

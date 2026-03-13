@@ -20,6 +20,7 @@ from asuka.qmc.sparse import SparseVector
 from asuka.sci.frontier_hash import SparseFrontierSelector
 from asuka.sci.hb_integrals import build_hb_index, build_hb_index_from_df, upload_hb_index
 from asuka.sci.hb_selection import heat_bath_select_and_pt2_sparse
+from asuka.sci.streaming_pt2 import StreamingPT2Result, semistochastic_pt2, streaming_pt2_deterministic
 from asuka.sci.sparse_support import (
     DiagonalGuessLookup,
     SELECTOR_BUCKET_EDGE_THRESHOLD,
@@ -321,6 +322,7 @@ def _build_hb_index_and_diag_inputs(
     h1e_f64 = np.asarray(h1e, dtype=np.float64, order="C")
     h1_diag = np.asarray(np.diag(h1e_f64), dtype=np.float64, order="C")
 
+    _orbsym = getattr(drt, "orbsym", None)
     if isinstance(eri, DeviceDFMOIntegrals):
         if eri.l_full is None:
             return None
@@ -329,19 +331,19 @@ def _build_hb_index_and_diag_inputs(
         if l_full.ndim != 2 or int(l_full.shape[0]) != norb * norb:
             return None
         h_eff = np.asarray(h1e_f64 - 0.5 * j_ps, dtype=np.float64, order="C")
-        hb_index = build_hb_index_from_df(h_eff, l_full, norb)
+        hb_index = build_hb_index_from_df(h_eff, l_full, norb, orbsym=_orbsym)
         eri_2d = np.asarray(l_full @ l_full.T, dtype=np.float64, order="C")
     elif isinstance(eri, DFMOIntegrals):
         l_full = np.asarray(eri.l_full, dtype=np.float64, order="C")
         if l_full.ndim != 2 or int(l_full.shape[0]) != norb * norb:
             return None
         h_eff = np.asarray(h1e_f64 - 0.5 * np.asarray(eri.j_ps, dtype=np.float64), dtype=np.float64, order="C")
-        hb_index = build_hb_index_from_df(h_eff, l_full, norb)
+        hb_index = build_hb_index_from_df(h_eff, l_full, norb, orbsym=_orbsym)
         eri_2d = np.asarray(l_full @ l_full.T, dtype=np.float64, order="C")
     else:
         eri_4d = np.asarray(_restore_eri_4d(eri, norb), dtype=np.float64, order="C")
         h_eff = np.asarray(h1e_f64 - 0.5 * np.einsum("pqqs->ps", eri_4d), dtype=np.float64, order="C")
-        hb_index = build_hb_index(h_eff, eri_4d, norb)
+        hb_index = build_hb_index(h_eff, eri_4d, norb, orbsym=_orbsym)
         eri_2d = np.asarray(eri_4d.reshape(norb * norb, norb * norb), dtype=np.float64, order="C")
 
     diag_ids = np.arange(norb, dtype=np.int64) * (norb + 1)
@@ -386,6 +388,12 @@ def run_cipsi_trials(
     backend: str = "auto",
     state_rep: str = "auto",
     verbose: int = 0,
+    pt2_mode: str = "exact",
+    pt2_bucket_size: int = 500_000,
+    pt2_n_det_sources: int | None = None,
+    pt2_n_stoch_samples: int = 1000,
+    pt2_n_stoch_batches: int = 10,
+    pt2_seed: int | None = None,
 ) -> CIPSITrialSpaceResult:
     nroots = int(nroots)
     if nroots < 1:
@@ -580,6 +588,8 @@ def run_cipsi_trials(
     _sel_dev_cache_labels: np.ndarray | None = None
     _sel_dev_cache_u64 = None
     _sel_dev_cache_sorted = None
+    _sel_dev_cache_hash_keys = None
+    _sel_dev_cache_hash_cap = 0
 
     dense_key64_fast_eligible = bool(
         projected_solver_gpu
@@ -653,6 +663,7 @@ def run_cipsi_trials(
 
     def _get_sel_u64_device_cache(sel_idx_arr: np.ndarray):
         nonlocal _sel_dev_cache_labels, _sel_dev_cache_u64, _sel_dev_cache_sorted
+        nonlocal _sel_dev_cache_hash_keys, _sel_dev_cache_hash_cap
         assert _cp is not None
         sel_idx_arr = np.asarray(sel_idx_arr, dtype=np.int64).ravel()
         if (
@@ -660,13 +671,16 @@ def run_cipsi_trials(
             and int(_sel_dev_cache_labels.size) == int(sel_idx_arr.size)
             and np.array_equal(_sel_dev_cache_labels, sel_idx_arr)
         ):
-            return _sel_dev_cache_u64, _sel_dev_cache_sorted
+            return _sel_dev_cache_u64, _sel_dev_cache_sorted, _sel_dev_cache_hash_keys, _sel_dev_cache_hash_cap
         sel_u64_d = _cp.ascontiguousarray(_cp.asarray(sel_idx_arr.astype(np.uint64, copy=False), dtype=_cp.uint64).ravel())
         sel_sorted_d = _cp.ascontiguousarray(_cp.sort(sel_u64_d))
         _sel_dev_cache_labels = np.asarray(sel_idx_arr, dtype=np.int64, order="C")
         _sel_dev_cache_u64 = sel_u64_d
         _sel_dev_cache_sorted = sel_sorted_d
-        return _sel_dev_cache_u64, _sel_dev_cache_sorted
+        # Build membership hash table for O(1) lookup (C1 optimization)
+        from asuka.cuda.cuda_backend import build_selected_membership_hash  # noqa: PLC0415
+        _sel_dev_cache_hash_keys, _sel_dev_cache_hash_cap = build_selected_membership_hash(sel_sorted_d, _cp)
+        return _sel_dev_cache_u64, _sel_dev_cache_sorted, _sel_dev_cache_hash_keys, _sel_dev_cache_hash_cap
 
     cuda_selector_enabled = False
     cuda_selector_reason = ""
@@ -833,7 +847,7 @@ def run_cipsi_trials(
                 _cp.zeros((0,), dtype=_cp.int32),
                 _cp.zeros((0,), dtype=_cp.float64),
             )
-        sel_idx_u64_d, sel_idx_sorted_d = _get_sel_u64_device_cache(sel_idx)
+        sel_idx_u64_d, sel_idx_sorted_d, _, _ = _get_sel_u64_device_cache(sel_idx)
         c_bound_h = np.asarray(np.max(np.abs(c_sel), axis=1), dtype=np.float64) if int(c_sel.shape[0]) > 0 else np.zeros((0,), dtype=np.float64)
         c_bound_d = _cp.ascontiguousarray(_cp.asarray(c_bound_h, dtype=_cp.float64).ravel())
         eps_val = 0.0 if selection_mode_s == "frontier_hash" else float(screen_contrib)
@@ -891,6 +905,7 @@ def run_cipsi_trials(
                         target_mode="external_only",
                         out_n=tuple_n_d,
                         overflow=overflow_d,
+                        sym_pq_allowed=_hb_dev.get("sym_pq_allowed"),
                         threads=int(_cuda_threads),
                         stream=int(stream_obj.ptr),
                         sync=False,
@@ -966,6 +981,7 @@ def run_cipsi_trials(
                 target_mode="external_only",
                 out_n=_tuple_n_d,
                 overflow=_overflow_d,
+                sym_pq_allowed=_hb_dev.get("sym_pq_allowed"),
                 threads=int(_cuda_threads),
                 stream=stream_u,
                 sync=False,
@@ -1046,6 +1062,7 @@ def run_cipsi_trials(
                 target_mode="selected_only",
                 out_n=_tuple_n_d,
                 overflow=_overflow_d,
+                sym_pq_allowed=_hb_dev.get("sym_pq_allowed"),
                 threads=int(_cuda_threads),
                 stream=stream_u,
                 sync=False,
@@ -1125,7 +1142,7 @@ def run_cipsi_trials(
                 return (*empty_ret, _cp.zeros((0,), dtype=_cp.float64))
             return empty_ret
         dense_dev = _ensure_exact_selected_dense_inputs()
-        sel_idx_u64_d, sel_idx_sorted_base_d = _get_sel_u64_device_cache(sel_idx)
+        sel_idx_u64_d, sel_idx_sorted_base_d, sel_hash_keys_d, sel_hash_cap = _get_sel_u64_device_cache(sel_idx)
         if selected_target_idx is None:
             sel_idx_sorted_d = sel_idx_sorted_base_d
         else:
@@ -1152,11 +1169,12 @@ def run_cipsi_trials(
                 out_src=_tuple_src_d,
                 out_hij=_tuple_hij_d,
                 cap=int(_tuple_cap),
-                selected_idx_sorted_u64=sel_idx_sorted_d,
                 out_diag=out_diag_d,
                 out_n=_tuple_n_d,
                 overflow=_overflow_d,
-                threads=min(128, int(_cuda_threads)),
+                threads=min(256, int(_cuda_threads)),
+                membership_hash_keys=sel_hash_keys_d,
+                membership_hash_cap=sel_hash_cap,
                 stream=stream_u,
                 sync=False,
             )
@@ -1258,7 +1276,7 @@ def run_cipsi_trials(
                     profile["timings_s"].get("exact_external_select_total", 0.0) + (time.perf_counter() - select_t0)
                 )
                 return [], np.zeros((int(nroots),), dtype=np.float64), stats
-            _, sel_idx_sorted_d = _get_sel_u64_device_cache(sel_idx_i64)
+            _, sel_idx_sorted_d, _, _ = _get_sel_u64_device_cache(sel_idx_i64)
             vals_root_major_d = _cp.ascontiguousarray(vals_ncand_root_d.T)
             e_var_d = _cp.ascontiguousarray(_cp.asarray(e_var_arr, dtype=_cp.float64).ravel())
             stream_u = int(_cp.cuda.get_current_stream().ptr)
@@ -1477,6 +1495,7 @@ def run_cipsi_trials(
                         label_hi=int(label_hi),
                         selected_idx_sorted_u64=sel_idx_sorted_d,
                         overflow=_overflow_d,
+                        sym_pq_allowed=_hb_dev.get("sym_pq_allowed"),
                         threads=int(_cuda_threads),
                         stream=stream_u,
                         sync=False,
@@ -1731,7 +1750,29 @@ def run_cipsi_trials(
                         and int(drt.norb) <= 32
                         and bool(has_cas36_exact_selected_emit_tuples_dense_u64_device())
                     )
-                    if use_dense_device_emitter:
+
+                    # Check if pair-wise H[i,j] kernel should be used instead.
+                    # Preferred for large half-filled active spaces where the DFS-based
+                    # dense emitter is prohibitively slow.
+                    use_pairwise_hij = False
+                    _pairwise_norb_threshold = int(os.environ.get("ASUKA_PAIRWISE_HIJ_NORB_THRESHOLD", "14"))
+                    _pairwise_nsel_max = int(os.environ.get("ASUKA_PAIRWISE_HIJ_NSEL_MAX", "25000"))
+                    if (
+                        backend_effective == "cuda_key64"
+                        and _cp is not None
+                        and isinstance(eri, np.ndarray)
+                        and int(drt.norb) >= _pairwise_norb_threshold
+                        and int(nsel_cur) <= _pairwise_nsel_max
+                    ):
+                        try:
+                            from asuka.cuda.cuda_backend import has_pairwise_hij_u64_device  # noqa: PLC0415
+
+                            if bool(has_pairwise_hij_u64_device()):
+                                use_pairwise_hij = True
+                        except Exception:
+                            pass
+
+                    if use_dense_device_emitter or use_pairwise_hij:
                         diag_sel_h = None
                     elif bool(dense_key64_fast_active):
                         _ensure_selected_diag(sel_labels)
@@ -1748,7 +1789,49 @@ def run_cipsi_trials(
                             diag_sel_h[pos] = float(hij[mask][0])
 
                     used_dense_device_emitter = False
-                    if use_dense_device_emitter:
+                    used_pairwise_hij = False
+                    if use_pairwise_hij:
+                        try:
+                            from asuka.cuda.cuda_backend import (  # noqa: PLC0415
+                                pairwise_materialize_u64_device,
+                                pairwise_hij_u64_device,
+                            )
+                            from asuka.sci.projected_apply import DenseMatrixProjectedHop  # noqa: PLC0415
+
+                            sel_idx_full = np.asarray(sel_idx_arr, dtype=np.int64, order="C")
+                            sel_u64_d = _cp.ascontiguousarray(
+                                _cp.asarray(sel_idx_full.astype(np.uint64, copy=False), dtype=_cp.uint64).ravel()
+                            )
+                            # Reuse the same h_base/eri4 cached inputs as the dense emitter
+                            dense_dev = _ensure_exact_selected_dense_inputs()
+                            h_base_d = dense_dev["h_base"]
+                            eri4_d = dense_dev["eri4"]
+
+                            materialized = pairwise_materialize_u64_device(
+                                drt, _drt_dev, sel_u64_d, int(nsel_cur), _cp,
+                            )
+                            H_d, diag_d = pairwise_hij_u64_device(
+                                drt, _drt_dev, sel_u64_d, int(nsel_cur),
+                                h_base_d, eri4_d, materialized, _cp,
+                            )
+                            diag_sel_h = np.asarray(_cp.asnumpy(diag_d), dtype=np.float64, order="C")
+                            for pos_diag, jj in enumerate(sel_idx_full.tolist()):
+                                selected_diag_cache[int(jj)] = float(diag_sel_h[int(pos_diag)])
+                            tuple_hop = DenseMatrixProjectedHop(
+                                sel_idx=np.asarray(sel_idx_full, dtype=np.int64, order="C"),
+                                H_d=H_d,
+                                hdiag_d=diag_d,
+                            )
+                            projected_tuple_hop_cache = None  # no incremental for dense matrix
+                            used_pairwise_hij = True
+                            used_dense_device_emitter = True
+                        except Exception as pairwise_e:
+                            profile["pairwise_hij_fallback_reason"] = (
+                                f"{type(pairwise_e).__name__}: {pairwise_e}"
+                            )
+                            use_pairwise_hij = False
+
+                    if not used_pairwise_hij and use_dense_device_emitter:
                         try:
                             sel_idx_full = np.asarray(sel_idx_arr, dtype=np.int64, order="C")
                             tuple_hop = None
@@ -1954,6 +2037,7 @@ def run_cipsi_trials(
                             "nsel": int(nsel_cur),
                             "dt_s": float(tuple_build_dt),
                             "dense_device": bool(used_dense_device_emitter),
+                            "pairwise_hij": bool(used_pairwise_hij),
                             "incremental": bool(incremental_tuple_build),
                         }
                     )
@@ -2358,22 +2442,46 @@ def run_cipsi_trials(
             )
             assert len(_new_idx) == 0
         else:
-            _new_idx, e_pt2_last = heat_bath_select_and_pt2_sparse(
-                drt,
-                h1e,
-                eri,
-                sel_idx=np.asarray(sel_idx, dtype=np.int64),
-                c_sel=c_sel_last,
-                e_var=e_var_last,
-                max_add=0,
-                epsilon=float(_compute_hb_eps_iter(sel_size=int(sel_idx.size))),
-                denom_floor=float(denom_floor),
-                hdiag_lookup=hdiag_lookup,
-                max_out=int(row_max_out),
-                screening=None,
-                state_cache=state_cache,
-                row_cache=persistent_row_cache,
-            )
+            if str(pt2_mode) in ("streaming", "semistochastic"):
+                _sel_set = {int(s) for s in np.asarray(sel_idx, dtype=np.int64).ravel().tolist()}
+                _pt2_func = streaming_pt2_deterministic if str(pt2_mode) == "streaming" else semistochastic_pt2
+                _pt2_kw: dict[str, Any] = dict(
+                    drt=drt, h1e=h1e, eri=eri,
+                    sel=np.asarray(sel_idx, dtype=np.int64).ravel().tolist(),
+                    selected_set=_sel_set,
+                    c_sel=c_sel_last,
+                    e_var=e_var_last,
+                    hdiag_lookup=hdiag_lookup,
+                    denom_floor=float(denom_floor),
+                    max_out=int(row_max_out),
+                    screening=None,
+                    state_cache=state_cache,
+                    row_cache=persistent_row_cache,
+                    bucket_size=int(pt2_bucket_size),
+                )
+                if str(pt2_mode) == "semistochastic":
+                    _pt2_kw.update(n_det_sources=pt2_n_det_sources, n_stoch_samples=pt2_n_stoch_samples,
+                                   n_stoch_batches=pt2_n_stoch_batches, seed=pt2_seed)
+                _pt2_res = _pt2_func(**_pt2_kw)
+                e_pt2_last = _pt2_res.e_pt2
+                _new_idx = []
+            else:
+                _new_idx, e_pt2_last = heat_bath_select_and_pt2_sparse(
+                    drt,
+                    h1e,
+                    eri,
+                    sel_idx=np.asarray(sel_idx, dtype=np.int64),
+                    c_sel=c_sel_last,
+                    e_var=e_var_last,
+                    max_add=0,
+                    epsilon=float(_compute_hb_eps_iter(sel_size=int(sel_idx.size))),
+                    denom_floor=float(denom_floor),
+                    hdiag_lookup=hdiag_lookup,
+                    max_out=int(row_max_out),
+                    screening=None,
+                    state_cache=state_cache,
+                    row_cache=persistent_row_cache,
+                )
             assert len(_new_idx) == 0
         return sel_idx, np.asarray(e_var_last, dtype=np.float64), np.asarray(c_sel_last, dtype=np.float64, order="C"), np.asarray(e_pt2_last, dtype=np.float64)
 
@@ -2744,23 +2852,46 @@ def run_cipsi_trials(
             )
             assert len(_new_idx) == 0
         else:
-            _eps_final = float(hb_eps_final) if str(hb_eps_schedule).lower() == "adaptive" else float(hb_epsilon)
-            _new_idx, e_pt2 = heat_bath_select_and_pt2_sparse(
-                drt,
-                h1e,
-                eri,
-                sel_idx=np.asarray(sel_idx, dtype=np.int64),
-                c_sel=c_sel,
-                e_var=e_var,
-                max_add=0,
-                epsilon=float(_eps_final),
-                denom_floor=float(denom_floor),
-                hdiag_lookup=hdiag_lookup,
-                max_out=int(row_max_out),
-                screening=None,
-                state_cache=state_cache,
-                row_cache=persistent_row_cache,
-            )
+            if str(pt2_mode) in ("streaming", "semistochastic"):
+                _sel_set = {int(s) for s in np.asarray(sel_idx, dtype=np.int64).ravel().tolist()}
+                _pt2_func = streaming_pt2_deterministic if str(pt2_mode) == "streaming" else semistochastic_pt2
+                _pt2_kw2: dict[str, Any] = dict(
+                    drt=drt, h1e=h1e, eri=eri,
+                    sel=np.asarray(sel_idx, dtype=np.int64).ravel().tolist(),
+                    selected_set=_sel_set,
+                    c_sel=c_sel,
+                    e_var=e_var,
+                    hdiag_lookup=hdiag_lookup,
+                    denom_floor=float(denom_floor),
+                    max_out=int(row_max_out),
+                    screening=None,
+                    state_cache=state_cache,
+                    row_cache=persistent_row_cache,
+                    bucket_size=int(pt2_bucket_size),
+                )
+                if str(pt2_mode) == "semistochastic":
+                    _pt2_kw2.update(n_det_sources=pt2_n_det_sources, n_stoch_samples=pt2_n_stoch_samples,
+                                    n_stoch_batches=pt2_n_stoch_batches, seed=pt2_seed)
+                _pt2_res2 = _pt2_func(**_pt2_kw2)
+                e_pt2 = _pt2_res2.e_pt2
+            else:
+                _eps_final = float(hb_eps_final) if str(hb_eps_schedule).lower() == "adaptive" else float(hb_epsilon)
+                _new_idx, e_pt2 = heat_bath_select_and_pt2_sparse(
+                    drt,
+                    h1e,
+                    eri,
+                    sel_idx=np.asarray(sel_idx, dtype=np.int64),
+                    c_sel=c_sel,
+                    e_var=e_var,
+                    max_add=0,
+                    epsilon=float(_eps_final),
+                    denom_floor=float(denom_floor),
+                    hdiag_lookup=hdiag_lookup,
+                    max_out=int(row_max_out),
+                    screening=None,
+                    state_cache=state_cache,
+                    row_cache=persistent_row_cache,
+                )
     roots = _sparse_roots_from_selected(sel_idx, c_sel)
     sel_key_u64 = None
     label_kind = "csf_idx"
@@ -2806,6 +2937,8 @@ def build_cipsi_trials_from_scf(
     epq_mode: str = "no_epq_support_aware",
     ci0: Any = None,
     twos: int | None = None,
+    orbsym: np.ndarray | None = None,
+    wfnsym: int | None = None,
     **kwargs,
 ) -> CIPSITrialSpaceResult:
     backend_s = _normalize_cipsi_backend(backend)
@@ -2819,7 +2952,7 @@ def build_cipsi_trials_from_scf(
                 twos = int(nelecas_i[0]) - int(nelecas_i[1])
             else:
                 twos = int(getattr(cas.mol, "spin", 0))
-        drt = build_drt(norb=norb, nelec=int(sum(nelecas_i)) if isinstance(nelecas_i, tuple) else int(nelecas_i), twos_target=int(twos))
+        drt = build_drt(norb=norb, nelec=int(sum(nelecas_i)) if isinstance(nelecas_i, tuple) else int(nelecas_i), twos_target=int(twos), orbsym=orbsym, wfnsym=wfnsym)
         return run_cipsi_trials(
             drt,
             cas.h1eff,
@@ -2859,6 +2992,8 @@ def build_cipsi_trials_from_scf(
         norb=int(ncas),
         nelec=int(sum(nelecas)) if isinstance(nelecas, tuple) else int(nelecas),
         twos_target=int(twos),
+        orbsym=orbsym,
+        wfnsym=wfnsym,
     )
     return run_cipsi_trials(
         drt,

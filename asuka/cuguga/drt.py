@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Iterable, Sequence
 
 import numpy as np
@@ -62,8 +62,13 @@ class DRT:
     root: int
     leaf: int
     ncsf: int
+    orbsym: np.ndarray | None = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
+        if self.orbsym is not None and len(self.orbsym) != self.norb:
+            raise ValueError(
+                f"orbsym length {len(self.orbsym)} != norb {self.norb}"
+            )
         if self.child.shape != (self.node_k.size, len(STEP_ORDER)):
             raise ValueError("child table has incompatible shape")
         if self.node_sym.shape != self.node_k.shape:
@@ -469,6 +474,7 @@ def build_drt(
             root=0,
             leaf=0,
             ncsf=0,
+            orbsym=orbsym_arr,
         )
 
     root_state = (0, 0, 0, 0)
@@ -534,6 +540,7 @@ def build_drt(
         root=0,
         leaf=int(leaf_id),
         ncsf=int(ncsf),
+        orbsym=orbsym_arr,
     )
 
 

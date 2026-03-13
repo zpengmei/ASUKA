@@ -171,9 +171,12 @@ def _collect_rs_terms_for_source(
 
     r_list: list[int] = []
     s_list: list[int] = []
+    _orbsym = getattr(drt, "orbsym", None)
     for s in src_occ:
         for r in dst_occ:
             if r == s:
+                continue
+            if _orbsym is not None and (int(_orbsym[r]) ^ int(_orbsym[s])) != 0:
                 continue
             r_list.append(int(r))
             s_list.append(int(s))
@@ -454,9 +457,12 @@ def connected_row_sparse(
     thresh_rs_coeff = float(screen.thresh_rs_coeff)
     thresh_gpq = float(screen.thresh_gpq)
     thresh_contrib = float(screen.thresh_contrib)
+    _orbsym = getattr(drt, "orbsym", None)
     for q in src1:
         for p in dst1:
             if p == q:
+                continue
+            if _orbsym is not None and (int(_orbsym[p]) ^ int(_orbsym[q])) != 0:
                 continue
             hpq = float(h_eff[int(p), int(q)])
             if hpq == 0.0 or abs(hpq) <= thresh_h1:
