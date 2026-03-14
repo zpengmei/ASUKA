@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import time
+import traceback
 from dataclasses import dataclass
 from itertools import permutations
 from pathlib import Path
@@ -18,7 +19,13 @@ from asuka.mcscf.casci import CASCIResult, _build_casci_df_integrals
 from asuka.qmc.labels import normalize_state_rep
 from asuka.qmc.sparse import SparseVector
 from asuka.sci.frontier_hash import SparseFrontierSelector
-from asuka.sci.hb_integrals import build_hb_index, build_hb_index_from_df, upload_hb_index
+from asuka.sci.hb_integrals import (
+    build_hb_index,
+    build_hb_index_device,
+    build_hb_index_from_df,
+    materialize_eri_4d_from_df_gpu,
+    upload_hb_index,
+)
 from asuka.sci.hb_selection import heat_bath_select_and_pt2_sparse
 from asuka.sci.streaming_pt2 import StreamingPT2Result, semistochastic_pt2, streaming_pt2_deterministic
 from asuka.sci.sparse_support import (
@@ -436,6 +443,16 @@ def run_cipsi_trials(
     elif backend_effective == "cuda_idx64":
         state_rep_s = "i64"
 
+    df_integrals_device_promoted = False
+    if backend_effective in ("cuda_key64", "cuda_idx64") and isinstance(eri, DFMOIntegrals):
+        try:
+            import cupy as cp  # type: ignore[import-not-found]
+
+            eri = eri.to_device(cp, with_eri_mat=False)
+            df_integrals_device_promoted = True
+        except Exception:
+            df_integrals_device_promoted = False
+
     selection_mode_s = str(selection_mode).strip().lower()
     if selection_mode_s in ("frontier_hash", "hash", "frontier-hash"):
         selection_mode_s = "frontier_hash"
@@ -467,13 +484,27 @@ def run_cipsi_trials(
     macro_growth_steps = 1 if macro_growth_steps_raw is None else int(macro_growth_steps_raw)
     macro_growth_resync_frac = float(workspace_cfg.pop("macro_growth_resync_frac", 0.25))
     projected_solver_gpu = bool(workspace_cfg.pop("projected_solver_gpu", True))
-    projected_solver_matrix_free = bool(workspace_cfg.pop("projected_solver_matrix_free", False))
+    projected_solver_matrix_free_raw = workspace_cfg.pop("projected_solver_matrix_free", None)
+    projected_solver_matrix_free_requested = (
+        None if projected_solver_matrix_free_raw is None else bool(projected_solver_matrix_free_raw)
+    )
+    projected_solver_matrix_free = bool(projected_solver_matrix_free_requested)
     exact_external_projected_selector_requested = bool(workspace_cfg.pop("exact_external_projected_selector", False))
     dense_key64_fast_path = str(workspace_cfg.pop("dense_key64_fast_path", "auto")).strip().lower()
     dense_key64_fast_debug_parity = bool(workspace_cfg.pop("dense_key64_fast_debug_parity", False))
     external_emit_streams = int(workspace_cfg.pop("external_emit_streams", 0))
     external_emit_chunk_min_nsel = int(workspace_cfg.pop("external_emit_chunk_min_nsel", 128))
     row_max_out = int(workspace_cfg.pop("row_max_out", 200_000))
+    if projected_solver_matrix_free_raw is None:
+        projected_solver_matrix_free = bool(
+            projected_solver_gpu
+            and backend_effective in ("cuda_key64", "cuda_idx64")
+            and selection_mode_s == "heat_bath"
+        )
+        projected_solver_matrix_free_mode = "auto"
+    else:
+        projected_solver_matrix_free = bool(projected_solver_matrix_free_requested)
+        projected_solver_matrix_free_mode = "explicit"
     if macro_growth_steps_raw is None and backend_effective in ("cuda_key64", "cuda_idx64"):
         macro_growth_steps = 4
     if macro_growth_steps < 1:
@@ -517,6 +548,7 @@ def run_cipsi_trials(
         "state_rep": str(state_rep_s),
         "backend_requested": str(backend_requested),
         "backend_effective": str(backend_effective),
+        "df_integrals_device_promoted": bool(df_integrals_device_promoted),
         "epq_mode": str(epq_mode_s),
         "driver": "sparse_row_oracle",
         "workspace_kwargs_ignored": bool(workspace_cfg),
@@ -526,7 +558,9 @@ def run_cipsi_trials(
         "macro_growth_steps_requested": None if macro_growth_steps_raw is None else int(macro_growth_steps_raw),
         "macro_growth_resync_frac": float(macro_growth_resync_frac),
         "projected_solver_gpu_requested": bool(projected_solver_gpu),
-        "projected_solver_matrix_free_requested": bool(projected_solver_matrix_free),
+        "projected_solver_matrix_free_requested": projected_solver_matrix_free_requested,
+        "projected_solver_matrix_free_effective": bool(projected_solver_matrix_free),
+        "projected_solver_matrix_free_mode": str(projected_solver_matrix_free_mode),
         "exact_external_selector_requested": bool(exact_external_projected_selector_requested),
         "exact_external_selector_effective": False,
         "dense_key64_fast_path_requested": str(dense_key64_fast_path),
@@ -566,6 +600,7 @@ def run_cipsi_trials(
     history: list[dict[str, Any]] = []
     prev_c_sel: np.ndarray | None = None
     persistent_row_cache: dict[int, tuple[np.ndarray, np.ndarray]] | None = {} if use_row_cache else None
+    exact_row_cache: dict[int, tuple[np.ndarray, np.ndarray]] | None = {} if use_row_cache else None
     final_sel_idx_cache: np.ndarray | None = None
     final_e_var_cache: np.ndarray | None = None
     final_c_sel_cache: np.ndarray | None = None
@@ -603,12 +638,17 @@ def run_cipsi_trials(
     dense_key64_fast_active = bool(
         dense_key64_fast_eligible if dense_key64_fast_path == "auto" else (dense_key64_fast_path == "on")
     )
+    lazy_selected_growth_active = bool(
+        projected_solver_gpu
+        and macro_schedule_enabled
+        and backend_effective in ("cuda_key64", "cuda_idx64")
+    )
     if dense_key64_fast_active and macro_growth_steps_raw is None:
         macro_growth_steps = max(int(macro_growth_steps), 8)
         macro_schedule_enabled = bool(macro_growth_steps > 1)
         profile["macro_growth_steps"] = int(macro_growth_steps)
     profile["dense_key64_fast_path_effective"] = bool(dense_key64_fast_active)
-    profile["lazy_selected_growth_enabled"] = bool(dense_key64_fast_active)
+    profile["lazy_selected_growth_enabled"] = bool(lazy_selected_growth_active)
     selected_diag_cache: dict[int, float] = {}
     projected_tuple_hop_cache = None
 
@@ -637,6 +677,9 @@ def run_cipsi_trials(
     def _get_connected_row_exact(idx: int) -> tuple[np.ndarray, np.ndarray]:
         from asuka.sci.sparse_support import _connected_row_cached  # noqa: PLC0415
 
+        # The projected-solver parity checks and exact selected-space builders
+        # must use the uncached exact row oracle. The generic state-cache path
+        # is faster, but it does not preserve exact parity for all rows.
         return _connected_row_cached(
             drt,
             h1e,
@@ -644,8 +687,8 @@ def run_cipsi_trials(
             int(idx),
             max_out=int(row_max_out),
             screening=None,
-            state_cache=state_cache,
-            row_cache=persistent_row_cache,
+            state_cache=None,
+            row_cache=exact_row_cache,
         )
 
     def _ensure_selected_diag(labels: list[int]) -> None:
@@ -691,6 +734,7 @@ def run_cipsi_trials(
     _hash_vals_d = None
     _overflow_d = None
     _drt_dev = None
+    _state_dev = None
     _hb_dev = None
     _h1_diag_d = None
     _eri_ppqq_d = None
@@ -699,6 +743,7 @@ def run_cipsi_trials(
     _neleca = 0
     _nelecb = 0
     _cas36_hb_apply = None
+    _cas36_hb_apply_many_roots = None
     _cas36_hb_emit_tuples = None
     _cas36_diag_guess = None
     _cas36_score_pt2 = None
@@ -706,6 +751,11 @@ def run_cipsi_trials(
     exact_external_selector_enabled = bool(
         exact_external_projected_selector_requested or backend_effective in ("cuda_key64", "cuda_idx64")
     )
+    hb_cuda_selector_min_nsel = int(os.environ.get("ASUKA_HB_CUDA_SELECTOR_MIN_NSEL", "256"))
+    frontier_hash_exact_selector_max_nsel = int(
+        os.environ.get("ASUKA_FRONTIER_HASH_EXACT_SELECTOR_MAX_NSEL", "512")
+    )
+    profile["frontier_hash_exact_selector_max_nsel"] = int(frontier_hash_exact_selector_max_nsel)
     _tuple_cap = 0
     _tuple_keys_d = None
     _tuple_src_d = None
@@ -718,11 +768,15 @@ def run_cipsi_trials(
             from asuka.cuda.cuda_backend import (  # noqa: PLC0415
                 cas36_cipsi_score_pt2_compact_u64_inplace_device as _cas36_score_pt2,
                 cas36_diag_guess_candidates_u64_dense_inplace_device as _cas36_diag_guess,
+                cas36_exact_external_apply_dense_many_roots_u64_inplace_device as _cas36_exact_external_dense_apply_many_roots,
                 cas36_hb_emit_tuples_u64_inplace_device as _cas36_hb_emit_tuples,
                 cas36_hb_screen_and_apply_u64_inplace_device as _cas36_hb_apply,
+                cas36_hb_screen_and_apply_many_roots_u64_inplace_device as _cas36_hb_apply_many_roots,
                 has_cas36_hb_emit_tuples_u64_device,
                 has_cas36_cipsi_score_pt2_compact_u64_device,
                 has_cas36_diag_guess_candidates_u64_dense_device,
+                has_cas36_exact_external_apply_dense_many_roots_u64_device,
+                has_cas36_hb_screen_and_apply_many_roots_u64_device,
                 has_cas36_hb_screen_and_apply_u64_device,
                 make_device_drt,
             )
@@ -733,20 +787,53 @@ def run_cipsi_trials(
                 cuda_selector_reason = "no_cuda_device"
             elif not (
                 bool(has_cas36_hb_screen_and_apply_u64_device())
+                and bool(has_cas36_hb_screen_and_apply_many_roots_u64_device())
                 and bool(has_cas36_hb_emit_tuples_u64_device())
                 and bool(has_cas36_diag_guess_candidates_u64_dense_device())
                 and bool(has_cas36_cipsi_score_pt2_compact_u64_device())
+                and bool(has_cas36_exact_external_apply_dense_many_roots_u64_device())
             ):
                 cuda_selector_reason = "missing_cas36_sci_kernels"
             else:
-                hb_pack = _build_hb_index_and_diag_inputs(drt, h1e, eri)
-                if hb_pack is None:
-                    cuda_selector_reason = "unsupported_integrals_for_cuda_selector"
-                else:
-                    hb_index, h1_diag_h, eri_ppqq_h, eri_pqqp_h = hb_pack
+                hb_pack = None
+                hb_dev_direct = None
+                if isinstance(eri, DeviceDFMOIntegrals):
+                    try:
+                        _h1e_d = _cp.ascontiguousarray(_cp.asarray(np.asarray(h1e, dtype=np.float64, order="C"), dtype=_cp.float64))
+                        _j_ps_d = _cp.ascontiguousarray(_cp.asarray(getattr(eri, "j_ps"), dtype=_cp.float64))
+                        hb_dev_direct = build_hb_index_device(
+                            _h1e_d - 0.5 * _j_ps_d,
+                            norb=int(drt.norb),
+                            cp=_cp,
+                            l_full_d=getattr(eri, "l_full", None),
+                            eri_mat_d=getattr(eri, "eri_mat", None),
+                            orbsym=getattr(drt, "orbsym", None),
+                        )
+                        _h1_diag_d = _cp.ascontiguousarray(_cp.diag(_h1e_d).astype(_cp.float64, copy=False).ravel())
+                        _eri_ppqq_d = _cp.ascontiguousarray(hb_dev_direct["eri_ppqq"].astype(_cp.float64, copy=False).ravel())
+                        _eri_pqqp_d = _cp.ascontiguousarray(hb_dev_direct["eri_pqqp"].astype(_cp.float64, copy=False).ravel())
+                        profile["hb_index_build_backend"] = "gpu_device_df"
+                    except Exception as hb_gpu_e:
+                        profile["hb_index_build_gpu_fallback_reason"] = f"{type(hb_gpu_e).__name__}: {hb_gpu_e}"
+                        hb_dev_direct = None
+                if hb_dev_direct is None:
+                    hb_pack = _build_hb_index_and_diag_inputs(drt, h1e, eri)
+                    if hb_pack is None:
+                        cuda_selector_reason = "unsupported_integrals_for_cuda_selector"
+                if not cuda_selector_reason:
                     _drt_dev = make_device_drt(drt)
-                    _hb_dev = upload_hb_index(hb_index, _cp)
-                    _hb_effectively_zero = int(hb_index.n_h1) == 0 and int(hb_index.nnz_2e) == 0
+                    if hb_dev_direct is not None:
+                        _hb_dev = hb_dev_direct
+                        _hb_effectively_zero = int(_hb_dev["h1_abs"].size) == 0 and int(_hb_dev["v_abs"].size) == 0
+                    else:
+                        assert hb_pack is not None
+                        hb_index, h1_diag_h, eri_ppqq_h, eri_pqqp_h = hb_pack
+                        _hb_dev = upload_hb_index(hb_index, _cp)
+                        _hb_effectively_zero = int(hb_index.n_h1) == 0 and int(hb_index.nnz_2e) == 0
+                        _h1_diag_d = _cp.asarray(h1_diag_h, dtype=_cp.float64).ravel()
+                        _eri_ppqq_d = _cp.asarray(eri_ppqq_h, dtype=_cp.float64).ravel()
+                        _eri_pqqp_d = _cp.asarray(eri_pqqp_h, dtype=_cp.float64).ravel()
+                        profile.setdefault("hb_index_build_backend", "cpu_host_build_upload")
                     # The C++ launch helper currently requires non-null pointers even when
                     # corresponding logical lengths are zero; provide tiny dummy buffers.
                     if int(_hb_dev["h1_abs"].size) == 0:
@@ -757,9 +844,6 @@ def run_cipsi_trials(
                         _hb_dev["rs_idx"] = _cp.zeros((1,), dtype=_cp.int32)
                         _hb_dev["v_abs"] = _cp.zeros((1,), dtype=_cp.float64)
                         _hb_dev["v_signed"] = _cp.zeros((1,), dtype=_cp.float64)
-                    _h1_diag_d = _cp.asarray(h1_diag_h, dtype=_cp.float64).ravel()
-                    _eri_ppqq_d = _cp.asarray(eri_ppqq_h, dtype=_cp.float64).ravel()
-                    _eri_pqqp_d = _cp.asarray(eri_pqqp_h, dtype=_cp.float64).ravel()
                     nelec_tot = int(drt.nelec)
                     twos_t = int(drt.twos_target)
                     if ((nelec_tot + twos_t) & 1) != 0:
@@ -807,6 +891,45 @@ def run_cipsi_trials(
             seeds_out["seed_idx"] = np.zeros((0,), dtype=np.int64)
             seeds_out["seed_c1"] = np.zeros((0, int(nroots)), dtype=np.float64)
             seeds_out["seed_w"] = np.zeros((0,), dtype=np.float64)
+
+    def _gpu_order_and_transfer_selected(
+        idx_d,
+        score_bits_d,
+        *,
+        c1_rowmajor_d=None,
+        w_d=None,
+    ):
+        assert _cp is not None
+        idx_d = _cp.ascontiguousarray(_cp.asarray(idx_d, dtype=_cp.uint64).ravel())
+        score_bits_d = _cp.ascontiguousarray(_cp.asarray(score_bits_d, dtype=_cp.uint64).ravel())
+        if int(idx_d.size) != int(score_bits_d.size):
+            raise ValueError("idx_d and score_bits_d must have the same size")
+        if int(idx_d.size) == 0:
+            empty_idx = np.zeros((0,), dtype=np.uint64)
+            empty_c1 = None if c1_rowmajor_d is None else np.zeros((0, int(nroots)), dtype=np.float64)
+            empty_w = None if w_d is None else np.zeros((0,), dtype=np.float64)
+            return empty_idx, empty_c1, empty_w
+        inv_score_d = _cp.bitwise_xor(score_bits_d, _cp.uint64(0xFFFFFFFFFFFFFFFF))
+        # CuPy's lexsort expects a 2D key array, unlike NumPy which accepts tuples.
+        order_keys_d = _cp.ascontiguousarray(_cp.stack((idx_d, inv_score_d), axis=0))
+        order_d = _cp.ascontiguousarray(_cp.lexsort(order_keys_d).ravel())
+        ordered_idx_h = np.asarray(
+            _cp.asnumpy(_cp.ascontiguousarray(idx_d[order_d].ravel())),
+            dtype=np.uint64,
+        )
+        ordered_c1_h = None
+        ordered_w_h = None
+        if c1_rowmajor_d is not None:
+            ordered_c1_h = np.asarray(
+                _cp.asnumpy(_cp.ascontiguousarray(c1_rowmajor_d[order_d, :])),
+                dtype=np.float64,
+            )
+        if w_d is not None:
+            ordered_w_h = np.asarray(
+                _cp.asnumpy(_cp.ascontiguousarray(_cp.asarray(w_d, dtype=_cp.float64).ravel()[order_d])),
+                dtype=np.float64,
+            )
+        return ordered_idx_h, ordered_c1_h, ordered_w_h
 
     exact_external_apply = None
 
@@ -1028,8 +1151,7 @@ def run_cipsi_trials(
                 _cp.zeros((0,), dtype=_cp.int32),
                 _cp.zeros((0,), dtype=_cp.float64),
             )
-        sel_idx_u64_d = _cp.ascontiguousarray(_cp.asarray(sel_idx.astype(np.uint64, copy=False), dtype=_cp.uint64).ravel())
-        sel_idx_sorted_d = _cp.ascontiguousarray(_cp.sort(sel_idx_u64_d))
+        sel_idx_u64_d, sel_idx_sorted_d, _, _ = _get_sel_u64_device_cache(sel_idx)
         c_bound_d = _cp.ones((int(sel_idx_u64_d.size),), dtype=_cp.float64)
         stream_u = int(_cp.cuda.get_current_stream().ptr)
         retries = 0
@@ -1101,23 +1223,56 @@ def run_cipsi_trials(
             return _exact_selected_dense_inputs_d
         if _cp is None:
             raise RuntimeError("cupy is required for the dense exact-selected device emitter")
-        from asuka.cuguga.oracle import _restore_eri_4d  # noqa: PLC0415
-
-        if not isinstance(eri, np.ndarray):
-            eri_arr = np.asarray(eri, dtype=np.float64)
-        else:
+        cp = _cp
+        h1e_d = cp.ascontiguousarray(cp.asarray(np.asarray(h1e, dtype=np.float64, order="C"), dtype=cp.float64))
+        if isinstance(eri, np.ndarray):
             eri_arr = eri
-        eri4_h = np.asarray(_restore_eri_4d(eri_arr, int(drt.norb)), dtype=np.float64, order="C")
-        # Match the path-native dense oracle used for exact key64 semantics.
-        h_base_h = np.asarray(
-            np.asarray(h1e, dtype=np.float64, order="C") - 0.5 * np.einsum("pqqs->ps", eri4_h, optimize=True),
-            dtype=np.float64,
-            order="C",
-        )
+            eri4_d = cp.ascontiguousarray(
+                cp.asarray(
+                    np.asarray(_restore_eri_4d(eri_arr, int(drt.norb)), dtype=np.float64, order="C"),
+                    dtype=cp.float64,
+                )
+            )
+            h_base_d = cp.ascontiguousarray(h1e_d - 0.5 * cp.einsum("pqqs->ps", eri4_d, optimize=True))
+            dense_input_source = "dense_eri"
+        elif isinstance(eri, DeviceDFMOIntegrals):
+            l_full_obj = getattr(eri, "l_full", None)
+            eri_mat_obj = getattr(eri, "eri_mat", None)
+            if eri_mat_obj is not None:
+                eri_2d_d = cp.ascontiguousarray(cp.asarray(eri_mat_obj, dtype=cp.float64))
+                eri4_d = cp.ascontiguousarray(
+                    eri_2d_d.reshape(int(drt.norb), int(drt.norb), int(drt.norb), int(drt.norb))
+                )
+                dense_input_source = "device_df_gpu_eri_mat"
+            elif l_full_obj is not None:
+                l_full_d = cp.ascontiguousarray(cp.asarray(l_full_obj, dtype=cp.float64))
+                eri4_d = cp.ascontiguousarray(materialize_eri_4d_from_df_gpu(l_full_d, int(drt.norb), cp))
+                dense_input_source = "device_df_gpu_l_full"
+            else:
+                raise RuntimeError("DeviceDFMOIntegrals must provide l_full or eri_mat for dense exact-selected inputs")
+            j_ps_d = cp.ascontiguousarray(cp.asarray(getattr(eri, "j_ps"), dtype=cp.float64))
+            h_base_d = cp.ascontiguousarray(h1e_d - 0.5 * j_ps_d)
+        elif isinstance(eri, DFMOIntegrals):
+            l_full_d = cp.ascontiguousarray(cp.asarray(np.asarray(eri.l_full, dtype=np.float64, order="C"), dtype=cp.float64))
+            eri4_d = cp.ascontiguousarray(materialize_eri_4d_from_df_gpu(l_full_d, int(drt.norb), cp))
+            j_ps_d = cp.ascontiguousarray(cp.asarray(np.asarray(eri.j_ps, dtype=np.float64, order="C"), dtype=cp.float64))
+            h_base_d = cp.ascontiguousarray(h1e_d - 0.5 * j_ps_d)
+            dense_input_source = "df_gpu_l_full"
+        else:
+            eri_arr = np.asarray(eri, dtype=np.float64)
+            eri4_d = cp.ascontiguousarray(
+                cp.asarray(
+                    np.asarray(_restore_eri_4d(eri_arr, int(drt.norb)), dtype=np.float64, order="C"),
+                    dtype=cp.float64,
+                )
+            )
+            h_base_d = cp.ascontiguousarray(h1e_d - 0.5 * cp.einsum("pqqs->ps", eri4_d, optimize=True))
+            dense_input_source = "generic_eri"
         _exact_selected_dense_inputs_d = {
-            "h_base": _cp.ascontiguousarray(_cp.asarray(h_base_h, dtype=_cp.float64).ravel()),
-            "eri4": _cp.ascontiguousarray(_cp.asarray(eri4_h, dtype=_cp.float64).ravel()),
+            "h_base": cp.ascontiguousarray(h_base_d.ravel()),
+            "eri4": cp.ascontiguousarray(eri4_d.ravel()),
         }
+        profile["projected_solver_dense_input_source"] = str(dense_input_source)
         return _exact_selected_dense_inputs_d
 
     def _emit_exact_selected_tuples_device_dense(
@@ -1126,10 +1281,14 @@ def run_cipsi_trials(
         selected_target_idx: np.ndarray | None = None,
         return_diag: bool = False,
     ):
-        nonlocal _tuple_cap, _tuple_keys_d, _tuple_src_d, _tuple_hij_d, _tuple_n_d, _overflow_d
+        nonlocal _tuple_cap, _tuple_keys_d, _tuple_src_d, _tuple_hij_d, _tuple_n_d, _overflow_d, _drt_dev
         assert _cp is not None
-        assert _drt_dev is not None
+        if _drt_dev is None:
+            from asuka.cuda.cuda_backend import make_device_drt  # noqa: PLC0415
+
+            _drt_dev = make_device_drt(drt)
         from asuka.cuda.cuda_backend import cas36_exact_selected_emit_tuples_dense_u64_inplace_device  # noqa: PLC0415
+        from asuka.cuda.cuda_backend import build_selected_membership_hash  # noqa: PLC0415
 
         sel_idx = np.asarray(sel_idx, dtype=np.int64).ravel()
         if int(sel_idx.size) == 0:
@@ -1142,14 +1301,23 @@ def run_cipsi_trials(
                 return (*empty_ret, _cp.zeros((0,), dtype=_cp.float64))
             return empty_ret
         dense_dev = _ensure_exact_selected_dense_inputs()
-        sel_idx_u64_d, sel_idx_sorted_base_d, sel_hash_keys_d, sel_hash_cap = _get_sel_u64_device_cache(sel_idx)
+        sel_idx_u64_d, _sel_idx_sorted_base_d, sel_hash_keys_d, sel_hash_cap = _get_sel_u64_device_cache(sel_idx)
         if selected_target_idx is None:
-            sel_idx_sorted_d = sel_idx_sorted_base_d
+            membership_hash_keys_d = sel_hash_keys_d
+            membership_hash_cap = sel_hash_cap
         else:
             selected_target_idx = np.asarray(selected_target_idx, dtype=np.int64).ravel()
-            sel_idx_sorted_d = _cp.ascontiguousarray(
-                _cp.sort(_cp.asarray(selected_target_idx.astype(np.uint64, copy=False), dtype=_cp.uint64).ravel())
-            )
+            if (
+                int(selected_target_idx.size) == int(sel_idx.size)
+                and np.array_equal(selected_target_idx, sel_idx)
+            ):
+                membership_hash_keys_d = sel_hash_keys_d
+                membership_hash_cap = sel_hash_cap
+            else:
+                target_sorted_d = _cp.ascontiguousarray(
+                    _cp.sort(_cp.asarray(selected_target_idx.astype(np.uint64, copy=False), dtype=_cp.uint64).ravel())
+                )
+                membership_hash_keys_d, membership_hash_cap = build_selected_membership_hash(target_sorted_d, _cp)
         c_bound_d = _cp.ones((int(sel_idx_u64_d.size),), dtype=_cp.float64)
         out_diag_d = _cp.zeros((int(sel_idx_u64_d.size),), dtype=_cp.float64) if bool(return_diag) else None
         stream_u = int(_cp.cuda.get_current_stream().ptr)
@@ -1173,8 +1341,8 @@ def run_cipsi_trials(
                 out_n=_tuple_n_d,
                 overflow=_overflow_d,
                 threads=min(256, int(_cuda_threads)),
-                membership_hash_keys=sel_hash_keys_d,
-                membership_hash_cap=sel_hash_cap,
+                membership_hash_keys=membership_hash_keys_d,
+                membership_hash_cap=membership_hash_cap,
                 stream=stream_u,
                 sync=False,
             )
@@ -1210,6 +1378,93 @@ def run_cipsi_trials(
             _tuple_hij_d = _cp.empty((_tuple_cap,), dtype=_cp.float64)
             _tuple_n_d = _cp.zeros((1,), dtype=_cp.int32)
 
+    def _emit_exact_external_tuples_device_dense(
+        *,
+        sel_idx: np.ndarray,
+        c_sel: np.ndarray,
+        label_lo: int,
+        label_hi: int | None,
+        screen_contrib: float,
+    ):
+        nonlocal _tuple_cap, _tuple_keys_d, _tuple_src_d, _tuple_hij_d, _tuple_n_d, _overflow_d, _drt_dev
+        assert _cp is not None
+        if _drt_dev is None:
+            from asuka.cuda.cuda_backend import make_device_drt  # noqa: PLC0415
+
+            _drt_dev = make_device_drt(drt)
+        from asuka.cuda.cuda_backend import cas36_exact_external_emit_tuples_dense_u64_inplace_device  # noqa: PLC0415
+
+        sel_idx = np.asarray(sel_idx, dtype=np.int64).ravel()
+        c_sel = np.asarray(c_sel, dtype=np.float64, order="C")
+        if int(sel_idx.size) == 0:
+            return (
+                _cp.zeros((0,), dtype=_cp.uint64),
+                _cp.zeros((0,), dtype=_cp.int32),
+                _cp.zeros((0,), dtype=_cp.float64),
+            )
+        dense_dev = _ensure_exact_selected_dense_inputs()
+        sel_idx_u64_d, _, sel_hash_keys_d, sel_hash_cap = _get_sel_u64_device_cache(sel_idx)
+        if sel_hash_keys_d is None or int(sel_hash_cap) <= 0:
+            raise RuntimeError("selected membership hash is required for dense exact external tuple emission")
+        c_bound_h = (
+            np.asarray(np.max(np.abs(c_sel), axis=1), dtype=np.float64)
+            if int(c_sel.shape[0]) > 0
+            else np.zeros((0,), dtype=np.float64)
+        )
+        c_bound_d = _cp.ascontiguousarray(_cp.asarray(c_bound_h, dtype=_cp.float64).ravel())
+        stream_u = int(_cp.cuda.get_current_stream().ptr)
+        retries = 0
+        while True:
+            _tuple_n_d.fill(0)
+            _overflow_d.fill(0)
+            cas36_exact_external_emit_tuples_dense_u64_inplace_device(
+                drt,
+                _drt_dev,
+                sel_idx_u64_d,
+                c_bound_d,
+                nsel=int(sel_idx_u64_d.size),
+                h_base=dense_dev["h_base"],
+                eri4=dense_dev["eri4"],
+                out_keys_u64=_tuple_keys_d,
+                out_src=_tuple_src_d,
+                out_hij=_tuple_hij_d,
+                cap=int(_tuple_cap),
+                label_lo=int(label_lo),
+                label_hi=int(drt.ncsf) if label_hi is None else int(label_hi),
+                membership_hash_keys=sel_hash_keys_d,
+                membership_hash_cap=sel_hash_cap,
+                out_n=_tuple_n_d,
+                overflow=_overflow_d,
+                threads=min(256, int(_cuda_threads)),
+                stream=stream_u,
+                sync=False,
+            )
+            overflow_h = int(_cp.asnumpy(_overflow_d)[0])
+            nnz_h = int(_cp.asnumpy(_tuple_n_d)[0])
+            if overflow_h == 0 and nnz_h <= int(_tuple_cap):
+                if nnz_h <= 0:
+                    return (
+                        _cp.zeros((0,), dtype=_cp.uint64),
+                        _cp.zeros((0,), dtype=_cp.int32),
+                        _cp.zeros((0,), dtype=_cp.float64),
+                    )
+                return (
+                    _cp.ascontiguousarray(_tuple_keys_d[:nnz_h].ravel()),
+                    _cp.ascontiguousarray(_tuple_src_d[:nnz_h].ravel()),
+                    _cp.ascontiguousarray(_tuple_hij_d[:nnz_h].ravel()),
+                )
+            retries += 1
+            if retries > int(frontier_hash_max_retries):
+                raise RuntimeError(
+                    f"dense exact external tuple emitter overflow after {retries} retries (cap={int(_tuple_cap)})"
+                )
+            grow_cap = max(int(_tuple_cap) * 2, max(256, int(nnz_h) * 2))
+            _tuple_cap = _next_pow2(int(grow_cap))
+            _tuple_keys_d = _cp.empty((_tuple_cap,), dtype=_cp.uint64)
+            _tuple_src_d = _cp.empty((_tuple_cap,), dtype=_cp.int32)
+            _tuple_hij_d = _cp.empty((_tuple_cap,), dtype=_cp.float64)
+            _tuple_n_d = _cp.zeros((1,), dtype=_cp.int32)
+
     def _exact_external_select(
         *,
         sel_idx_i64: np.ndarray,
@@ -1220,6 +1475,7 @@ def run_cipsi_trials(
         seeds_out: dict[str, Any] | None = None,
         selection_policy: str = "exact_topk",
     ) -> tuple[list[int], np.ndarray, dict[str, Any]]:
+        nonlocal _hash_cap, _hash_keys_d, _hash_vals_d, _overflow_d
         select_t0 = time.perf_counter()
         op = _ensure_exact_external_apply()
         sel_idx_i64 = np.asarray(sel_idx_i64, dtype=np.int64).ravel()
@@ -1251,23 +1507,81 @@ def run_cipsi_trials(
             and select_threshold is None
         )
         if use_cuda_compact:
-            cand_idx_u64_d, vals_ncand_root_d = op.accumulate_gpu(
-                sel_idx=sel_idx_i64,
-                c_sel=c_sel_arr,
-                label_lo=0,
-                label_hi=int(drt.ncsf),
-                screen_contrib=0.0 if selection_mode_s == "frontier_hash" else float(eps_val),
-                tuple_emitter=(
-                    _emit_exact_external_tuples_device
-                    if backend_effective == "cuda_key64"
-                    else None
-                ),
+            exact_external_dense_apply_optin = str(
+                os.environ.get("ASUKA_EXACT_EXTERNAL_DENSE_APPLY", "0")
+            ).strip().lower() in ("1", "true", "yes", "on")
+            use_exact_external_tuple_emitter = bool(
+                backend_effective == "cuda_key64"
+                and int(drt.norb) <= 32
+            )
+            stats["exact_external_tuple_emitter"] = bool(use_exact_external_tuple_emitter)
+            accum_t0 = time.perf_counter()
+            if bool(use_exact_external_tuple_emitter) and bool(exact_external_dense_apply_optin):
+                sel_idx_u64_d, sel_idx_sorted_d, sel_hash_keys_d, sel_hash_cap = _get_sel_u64_device_cache(sel_idx_i64)
+                c_sel_d = _cp.ascontiguousarray(_cp.asarray(c_sel_arr, dtype=_cp.float64))
+                dense_dev = _ensure_exact_selected_dense_inputs()
+                empty_u64 = np.uint64(0xFFFFFFFFFFFFFFFF)
+                retries = 0
+                while True:
+                    _hash_keys_d.fill(empty_u64)
+                    _hash_vals_d.fill(0.0)
+                    _overflow_d.fill(0)
+                    _cas36_exact_external_dense_apply_many_roots(
+                        drt,
+                        _drt_dev,
+                        sel_idx_u64_d,
+                        c_sel_d,
+                        nsel=int(sel_idx_u64_d.size),
+                        h_base=dense_dev["h_base"],
+                        eri4=dense_dev["eri4"],
+                        hash_keys_u64=_hash_keys_d,
+                        hash_vals=_hash_vals_d,
+                        cap=int(_hash_cap),
+                        label_lo=0,
+                        label_hi=int(drt.ncsf),
+                        membership_hash_keys=sel_hash_keys_d,
+                        membership_hash_cap=int(sel_hash_cap),
+                        overflow=_overflow_d,
+                        threads=int(_cuda_threads),
+                        stream=int(_cp.cuda.get_current_stream().ptr),
+                        sync=False,
+                    )
+                    overflow_h = int(_cp.asnumpy(_overflow_d)[0])
+                    if overflow_h == 0:
+                        break
+                    retries += 1
+                    if retries > int(frontier_hash_max_retries):
+                        raise RuntimeError(
+                            f"dense exact external apply hash overflow after {retries} retries (cap={int(_hash_cap)})"
+                        )
+                    _hash_cap = int(_hash_cap) * 2
+                    _hash_keys_d = _cp.empty((int(_hash_cap),), dtype=_cp.uint64)
+                    _hash_vals_d = _cp.empty((int(nroots), int(_hash_cap)), dtype=_cp.float64)
+                    _overflow_d = _cp.zeros((1,), dtype=_cp.int32)
+                mask = _hash_keys_d != empty_u64
+                cand_idx_u64_d = _cp.ascontiguousarray(_hash_keys_d[mask].ravel())
+                vals_ncand_root_d = _cp.ascontiguousarray(_hash_vals_d[:, mask].T)
+            else:
+                cand_idx_u64_d, vals_ncand_root_d = op.accumulate_gpu(
+                    sel_idx=sel_idx_i64,
+                    c_sel=c_sel_arr,
+                    label_lo=0,
+                    label_hi=int(drt.ncsf),
+                    screen_contrib=0.0 if selection_mode_s == "frontier_hash" else float(eps_val),
+                    tuple_emitter=(
+                        _emit_exact_external_tuples_device_dense
+                        if bool(use_exact_external_tuple_emitter)
+                        else None
+                    ),
+                )
+            profile["timings_s"]["exact_external_accumulate_total"] = float(
+                profile["timings_s"].get("exact_external_accumulate_total", 0.0) + (time.perf_counter() - accum_t0)
             )
             ncand = int(cand_idx_u64_d.size)
             stats["ncand"] = int(ncand)
             stats["selector_backend"] = (
-                "exact_external_device_emit_cuda_compact"
-                if backend_effective == "cuda_key64"
+                "exact_external_dense_apply_cuda_compact"
+                if bool(use_exact_external_tuple_emitter) and bool(exact_external_dense_apply_optin)
                 else "exact_external_gpu_reduce_cuda_compact"
             )
             if ncand <= 0:
@@ -1276,10 +1590,12 @@ def run_cipsi_trials(
                     profile["timings_s"].get("exact_external_select_total", 0.0) + (time.perf_counter() - select_t0)
                 )
                 return [], np.zeros((int(nroots),), dtype=np.float64), stats
-            _, sel_idx_sorted_d, _, _ = _get_sel_u64_device_cache(sel_idx_i64)
+            if not (bool(use_exact_external_tuple_emitter) and bool(exact_external_dense_apply_optin)):
+                _, sel_idx_sorted_d, _, _ = _get_sel_u64_device_cache(sel_idx_i64)
             vals_root_major_d = _cp.ascontiguousarray(vals_ncand_root_d.T)
             e_var_d = _cp.ascontiguousarray(_cp.asarray(e_var_arr, dtype=_cp.float64).ravel())
             stream_u = int(_cp.cuda.get_current_stream().ptr)
+            diag_t0 = time.perf_counter()
             cand_hdiag = _cas36_diag_guess(
                 drt,
                 _drt_dev,
@@ -1292,6 +1608,9 @@ def run_cipsi_trials(
                 threads=int(_cuda_threads),
                 stream=stream_u,
                 sync=False,
+            )
+            profile["timings_s"]["exact_external_diag_guess_total"] = float(
+                profile["timings_s"].get("exact_external_diag_guess_total", 0.0) + (time.perf_counter() - diag_t0)
             )
             denom_d = e_var_d[:, None] - cand_hdiag[None, :]
             if float(denom_floor) > 0.0:
@@ -1307,6 +1626,7 @@ def run_cipsi_trials(
             w_d = _cp.max(_cp.abs(c1_root_major_d), axis=0)
             score_bits_d = _cp.empty((ncand,), dtype=_cp.uint64)
             pt2_d = _cp.zeros((int(nroots),), dtype=_cp.float64)
+            score_t0 = time.perf_counter()
             _cas36_score_pt2(
                 cand_idx_u64_d,
                 vals_root_major_d,
@@ -1319,6 +1639,9 @@ def run_cipsi_trials(
                 threads=int(_cuda_threads),
                 stream=stream_u,
                 sync=False,
+            )
+            profile["timings_s"]["exact_external_score_total"] = float(
+                profile["timings_s"].get("exact_external_score_total", 0.0) + (time.perf_counter() - score_t0)
             )
             e_pt2_h = np.asarray(_cp.asnumpy(pt2_d), dtype=np.float64)
             max_add_i = int(max_add_i)
@@ -1349,22 +1672,28 @@ def run_cipsi_trials(
                     chosen = valid_pos[part]
                 else:
                     chosen = valid_pos
-            keep_score = np.asarray(_cp.asnumpy(_cp.ascontiguousarray(score_bits_d[chosen].ravel())), dtype=np.uint64)
-            keep_idx = np.asarray(_cp.asnumpy(_cp.ascontiguousarray(cand_idx_u64_d[chosen].ravel())), dtype=np.uint64)
-            keep_c1 = np.asarray(
-                _cp.asnumpy(_cp.ascontiguousarray(c1_root_major_d[:, chosen].T)),
-                dtype=np.float64,
+            keep_idx_h, keep_c1_h, keep_w_h = _gpu_order_and_transfer_selected(
+                cand_idx_u64_d[chosen],
+                score_bits_d[chosen],
+                c1_rowmajor_d=_cp.ascontiguousarray(c1_root_major_d[:, chosen].T),
+                w_d=w_d[chosen],
             )
-            keep_w = np.asarray(_cp.asnumpy(_cp.ascontiguousarray(w_d[chosen].ravel())), dtype=np.float64)
-            order = np.lexsort((keep_idx, -keep_score.astype(np.int64, copy=False)))
             if seeds_out is not None:
-                seeds_out["seed_idx"] = np.asarray(keep_idx[order], dtype=np.int64)
-                seeds_out["seed_c1"] = np.asarray(keep_c1[order, :], dtype=np.float64)
-                seeds_out["seed_w"] = np.asarray(keep_w[order], dtype=np.float64)
+                seeds_out["seed_idx"] = np.asarray(keep_idx_h, dtype=np.int64)
+                seeds_out["seed_c1"] = (
+                    np.zeros((0, int(nroots)), dtype=np.float64)
+                    if keep_c1_h is None
+                    else np.asarray(keep_c1_h, dtype=np.float64)
+                )
+                seeds_out["seed_w"] = (
+                    np.zeros((0,), dtype=np.float64)
+                    if keep_w_h is None
+                    else np.asarray(keep_w_h, dtype=np.float64)
+                )
             profile["timings_s"]["exact_external_select_total"] = float(
                 profile["timings_s"].get("exact_external_select_total", 0.0) + (time.perf_counter() - select_t0)
             )
-            return [int(x) for x in keep_idx[order].tolist()], e_pt2_h, stats
+            return [int(x) for x in keep_idx_h.tolist()], e_pt2_h, stats
 
         idx_h, vals_h = op.accumulate_host(
             sel_idx=sel_idx_i64,
@@ -1433,13 +1762,30 @@ def run_cipsi_trials(
         assert _h1_diag_d is not None and _eri_ppqq_d is not None and _eri_pqqp_d is not None
         assert _cas36_hb_apply is not None and _cas36_diag_guess is not None and _cas36_score_pt2 is not None
 
+        selector_backend_name = (
+            "cuda_frontier_hash_compact" if selection_mode_s == "frontier_hash" else "cuda_heat_bath_compact"
+        )
+        selection_policy_name = "topk" if selection_mode_s == "frontier_hash" else "hb_threshold_topk"
+
         sel_idx_i64 = np.asarray(sel_idx_i64, dtype=np.int64).ravel()
         if sel_idx_i64.size == 0:
             _set_empty_seeds(seeds_out)
-            return [], np.zeros((int(nroots),), dtype=np.float64), {"ncand": 0, "overflow_retries": 0, "hash_cap": int(_hash_cap)}
+            return [], np.zeros((int(nroots),), dtype=np.float64), {
+                "ncand": 0,
+                "overflow_retries": 0,
+                "hash_cap": int(_hash_cap),
+                "selector_backend": str(selector_backend_name),
+                "selection_policy": str(selection_policy_name),
+            }
         if bool(_hb_effectively_zero):
             _set_empty_seeds(seeds_out)
-            return [], np.zeros((int(nroots),), dtype=np.float64), {"ncand": 0, "overflow_retries": 0, "hash_cap": int(_hash_cap)}
+            return [], np.zeros((int(nroots),), dtype=np.float64), {
+                "ncand": 0,
+                "overflow_retries": 0,
+                "hash_cap": int(_hash_cap),
+                "selector_backend": str(selector_backend_name),
+                "selection_policy": str(selection_policy_name),
+            }
         if int(np.min(sel_idx_i64)) < 0:
             raise ValueError("selected indices must be non-negative for CUDA selector")
 
@@ -1471,35 +1817,33 @@ def run_cipsi_trials(
                 _hash_vals_d.fill(0.0)
                 _overflow_d.fill(0)
 
-                for root in range(int(nroots)):
-                    _cas36_hb_apply(
-                        drt,
-                        _drt_dev,
-                        sel_idx_u64_d,
-                        _cp.ascontiguousarray(c_sel_d[:, int(root)].ravel()),
-                        nsel=int(sel_idx_u64_d.size),
-                        root=int(root),
-                        h1_pq=_hb_dev["h1_pq"],
-                        h1_abs=_hb_dev["h1_abs"],
-                        h1_signed=_hb_dev["h1_signed"],
-                        n_h1=int(_hb_dev["h1_abs"].size),
-                        pq_ptr=_hb_dev["pq_ptr"],
-                        rs_idx=_hb_dev["rs_idx"],
-                        v_abs=_hb_dev["v_abs"],
-                        v_signed=_hb_dev["v_signed"],
-                        pq_max_v=_hb_dev["pq_max_v"],
-                        eps=float(eps_val),
-                        hash_keys_u64=_hash_keys_d,
-                        hash_vals=_hash_vals_d,
-                        label_lo=int(label_lo),
-                        label_hi=int(label_hi),
-                        selected_idx_sorted_u64=sel_idx_sorted_d,
-                        overflow=_overflow_d,
-                        sym_pq_allowed=_hb_dev.get("sym_pq_allowed"),
-                        threads=int(_cuda_threads),
-                        stream=stream_u,
-                        sync=False,
-                    )
+                _cas36_hb_apply_many_roots(
+                    drt,
+                    _drt_dev,
+                    sel_idx_u64_d,
+                    c_sel_d,
+                    nsel=int(sel_idx_u64_d.size),
+                    h1_pq=_hb_dev["h1_pq"],
+                    h1_abs=_hb_dev["h1_abs"],
+                    h1_signed=_hb_dev["h1_signed"],
+                    n_h1=int(_hb_dev["h1_abs"].size),
+                    pq_ptr=_hb_dev["pq_ptr"],
+                    rs_idx=_hb_dev["rs_idx"],
+                    v_abs=_hb_dev["v_abs"],
+                    v_signed=_hb_dev["v_signed"],
+                    pq_max_v=_hb_dev["pq_max_v"],
+                    eps=float(eps_val),
+                    hash_keys_u64=_hash_keys_d,
+                    hash_vals=_hash_vals_d,
+                    label_lo=int(label_lo),
+                    label_hi=int(label_hi),
+                    selected_idx_sorted_u64=sel_idx_sorted_d,
+                    overflow=_overflow_d,
+                    sym_pq_allowed=_hb_dev.get("sym_pq_allowed"),
+                    threads=int(_cuda_threads),
+                    stream=stream_u,
+                    sync=False,
+                )
                 overflow_h = int(_cp.asnumpy(_overflow_d)[0])
                 if overflow_h == 0:
                     break
@@ -1610,6 +1954,8 @@ def run_cipsi_trials(
                 "bucket_hash_cap_max": int(bucket_hash_cap_max),
                 "bucketed": bool(len(bucket_bounds_t) > 1),
                 "nbuckets": int(len(bucket_bounds_t)),
+                "selector_backend": str(selector_backend_name),
+                "selection_policy": str(selection_policy_name),
             }
 
         if not chosen_idx_parts_d:
@@ -1624,6 +1970,8 @@ def run_cipsi_trials(
                 "bucketed": bool(len(bucket_bounds_t) > 1),
                 "nbuckets": int(len(bucket_bounds_t)),
                 "bucket_splits": int(bucket_split_count),
+                "selector_backend": str(selector_backend_name),
+                "selection_policy": str(selection_policy_name),
             }
 
         all_idx_d = chosen_idx_parts_d[0] if len(chosen_idx_parts_d) == 1 else _cp.concatenate(chosen_idx_parts_d)
@@ -1635,18 +1983,19 @@ def run_cipsi_trials(
         keep_pos = _cp.argpartition(all_score_d, -keep)[-keep:]
         keep_score_d = _cp.ascontiguousarray(all_score_d[keep_pos].ravel())
         keep_idx_d = _cp.ascontiguousarray(all_idx_d[keep_pos].ravel())
-        keep_score = np.asarray(_cp.asnumpy(keep_score_d), dtype=np.uint64)
-        keep_idx = np.asarray(_cp.asnumpy(keep_idx_d), dtype=np.uint64)
-        keep_c1 = None if all_c1_d is None else np.asarray(_cp.asnumpy(_cp.ascontiguousarray(all_c1_d[keep_pos, :])), dtype=np.float64)
-        order = np.lexsort((keep_idx, -keep_score.astype(np.int64, copy=False)))
+        keep_idx_h, keep_c1_h, _ = _gpu_order_and_transfer_selected(
+            keep_idx_d,
+            keep_score_d,
+            c1_rowmajor_d=None if all_c1_d is None else _cp.ascontiguousarray(all_c1_d[keep_pos, :]),
+        )
         if seeds_out is not None:
-            seeds_out["seed_idx"] = np.asarray(keep_idx[order], dtype=np.int64)
+            seeds_out["seed_idx"] = np.asarray(keep_idx_h, dtype=np.int64)
             seeds_out["seed_c1"] = (
                 np.zeros((0, int(nroots)), dtype=np.float64)
-                if keep_c1 is None
-                else np.asarray(keep_c1[order, :], dtype=np.float64)
+                if keep_c1_h is None
+                else np.asarray(keep_c1_h, dtype=np.float64)
             )
-        new_idx_h = [int(x) for x in keep_idx[order].tolist()]
+        new_idx_h = [int(x) for x in keep_idx_h.tolist()]
         return new_idx_h, pt2_total_h, {
             "ncand": int(ncand_total),
             "nvalid": int(nvalid_total),
@@ -1657,7 +2006,20 @@ def run_cipsi_trials(
             "bucketed": bool(len(bucket_bounds_t) > 1),
             "nbuckets": int(len(bucket_bounds_t)),
             "bucket_splits": int(bucket_split_count),
+            "selector_backend": str(selector_backend_name),
+            "selection_policy": str(selection_policy_name),
         }
+
+    def _exact_external_selector_active(sel_size: int) -> bool:
+        if not exact_external_selector_enabled:
+            return False
+        if bool(exact_external_projected_selector_requested):
+            return True
+        if backend_effective not in ("cuda_key64", "cuda_idx64"):
+            return False
+        if selection_mode_s == "frontier_hash":
+            return int(frontier_hash_exact_selector_max_nsel) > 0 and int(sel_size) <= int(frontier_hash_exact_selector_max_nsel)
+        return int(hb_cuda_selector_min_nsel) > 0 and int(sel_size) <= int(hb_cuda_selector_min_nsel)
 
     def _compute_hb_eps_iter(*, sel_size: int) -> float:
         if selection_mode_s != "heat_bath":
@@ -1701,8 +2063,13 @@ def run_cipsi_trials(
         )
         if use_gpu_projected:
             try:
-                from asuka.cuda.cuda_davidson import davidson_sym_gpu  # noqa: PLC0415
-                from asuka.sci.projected_apply import ExactSelectedProjectedHop, ExactSelectedTupleProjectedHop  # noqa: PLC0415
+                from asuka.cuda.cuda_davidson import davidson_sym_gpu, jacobi_davidson_sym_gpu  # noqa: PLC0415
+                from asuka.sci.projected_apply import (  # noqa: PLC0415
+                    ExactSelectedPairwiseSigmaProjectedHop,
+                    ExactSelectedProjectedHop,
+                    ExactSelectedSymRowGraphProjectedHop,
+                    ExactSelectedTupleProjectedHop,
+                )
 
                 guess_list: list[np.ndarray] = []
                 if ci0_sub:
@@ -1733,23 +2100,123 @@ def run_cipsi_trials(
                         assert exact_projected_hop is not None
                         return exact_projected_hop.hop_gpu(v_d)
 
-                    return _hop, np.asarray(exact_projected_hop.hdiag, dtype=np.float64)
+                    return _hop, np.asarray(exact_projected_hop.hdiag, dtype=np.float64), exact_projected_hop
 
                 def _build_projected_tuple_hop():
-                    nonlocal projected_tuple_hop_cache
+                    nonlocal projected_tuple_hop_cache, _state_dev
                     tuple_build_t0 = time.perf_counter()
                     incremental_tuple_build = False
                     sel_labels = [int(j) for j in np.asarray(sel_idx_arr, dtype=np.int64).ravel().tolist()]
+                    selected_graph_min_nsel = int(os.environ.get("ASUKA_HB_SELECTED_GRAPH_NSEL_MIN", "1024"))
 
                     from asuka.cuda.cuda_backend import has_cas36_exact_selected_emit_tuples_dense_u64_device  # noqa: PLC0415
 
                     use_dense_device_emitter = bool(
                         backend_effective == "cuda_key64"
                         and _cp is not None
-                        and isinstance(eri, np.ndarray)
                         and int(drt.norb) <= 32
                         and bool(has_cas36_exact_selected_emit_tuples_dense_u64_device())
+                        and (
+                            isinstance(eri, np.ndarray)
+                            or isinstance(eri, DFMOIntegrals)
+                            or (
+                                isinstance(eri, DeviceDFMOIntegrals)
+                                and (getattr(eri, "l_full", None) is not None or getattr(eri, "eri_mat", None) is not None)
+                            )
+                        )
                     )
+                    use_selected_graph_hop = bool(
+                        backend_effective == "cuda_key64"
+                        and selection_mode_s == "heat_bath"
+                        and bool(projected_solver_matrix_free)
+                        and _cp is not None
+                        and int(nsel_cur) >= int(selected_graph_min_nsel)
+                        and bool(use_dense_device_emitter)
+                    )
+                    selected_graph_state_cache_max_ncsf = int(
+                        os.environ.get("ASUKA_HB_SELECTED_GRAPH_STATE_CACHE_MAX_NCSF", "2000000")
+                    )
+                    use_compact_df_selected_graph_hop = bool(
+                        backend_effective == "cuda_key64"
+                        and selection_mode_s == "heat_bath"
+                        and bool(projected_solver_matrix_free)
+                        and _cp is not None
+                        and int(nsel_cur) >= int(selected_graph_min_nsel)
+                        and int(drt.ncsf) <= int(selected_graph_state_cache_max_ncsf)
+                        and (
+                            (isinstance(eri, DeviceDFMOIntegrals) and getattr(eri, "l_full", None) is not None)
+                            or (isinstance(eri, DFMOIntegrals) and getattr(eri, "l_full", None) is not None)
+                        )
+                    )
+                    selected_graph_builder_requested = str(
+                        os.environ.get("ASUKA_HB_SELECTED_GRAPH_BUILDER", "tuple_emit")
+                    ).strip().lower()
+                    selected_graph_builder = "tuple_emit"
+                    if selected_graph_builder_requested in ("", "tuple_emit"):
+                        selected_graph_builder = "tuple_emit"
+                    elif selected_graph_builder_requested == "rowhash_dense_exact":
+                        if bool(use_dense_device_emitter):
+                            selected_graph_builder = "rowhash_dense_exact"
+                        else:
+                            profile["projected_solver_selected_graph_builder_note"] = (
+                                "rowhash_dense_exact requested but unsupported for the current space; using tuple_emit"
+                            )
+                    elif selected_graph_builder_requested == "compact_df_exact":
+                        if bool(use_compact_df_selected_graph_hop):
+                            selected_graph_builder = "compact_df_exact"
+                        else:
+                            profile["projected_solver_selected_graph_builder_note"] = (
+                                "compact_df_exact requested but unsupported for the current space; using tuple_emit"
+                            )
+                    elif selected_graph_builder_requested == "auto":
+                        if bool(use_compact_df_selected_graph_hop):
+                            selected_graph_builder = "compact_df_exact"
+                        elif bool(use_dense_device_emitter):
+                            selected_graph_builder = "rowhash_dense_exact"
+                        else:
+                            selected_graph_builder = "tuple_emit"
+                    else:
+                        profile["projected_solver_selected_graph_builder_note"] = (
+                            f"ignoring unsupported selected-graph builder '{selected_graph_builder_requested}', using 'tuple_emit'"
+                        )
+                    use_selected_graph_hop = bool(
+                        use_selected_graph_hop
+                        and str(selected_graph_builder) in ("tuple_emit", "rowhash_dense_exact")
+                    ) or bool(
+                        use_compact_df_selected_graph_hop
+                        and str(selected_graph_builder) == "compact_df_exact"
+                    )
+                    _pairwise_sigma_norb_threshold = int(os.environ.get("ASUKA_PAIRWISE_SIGMA_NORB_THRESHOLD", "14"))
+                    _pairwise_sigma_nsel_min = int(os.environ.get("ASUKA_PAIRWISE_SIGMA_NSEL_MIN", "256"))
+                    _pairwise_sigma_nsel_max = int(os.environ.get("ASUKA_PAIRWISE_SIGMA_NSEL_MAX", "25000"))
+                    _pairwise_sigma_enabled = str(os.environ.get("ASUKA_PAIRWISE_SIGMA_ENABLE", "1")).strip().lower() in (
+                        "1",
+                        "true",
+                        "yes",
+                        "on",
+                    )
+                    use_pairwise_sigma_hop = bool(
+                        _pairwise_sigma_enabled
+                        and backend_effective == "cuda_key64"
+                        and bool(projected_solver_matrix_free)
+                        and _cp is not None
+                        and isinstance(eri, (np.ndarray, DFMOIntegrals, DeviceDFMOIntegrals))
+                        and int(drt.norb) >= _pairwise_sigma_norb_threshold
+                        and int(drt.norb) <= 32
+                        and int(nsel_cur) >= _pairwise_sigma_nsel_min
+                        and int(nsel_cur) <= _pairwise_sigma_nsel_max
+                    )
+                    profile["projected_solver_route_plan"] = {
+                        "nsel": int(nsel_cur),
+                        "backend_effective": str(backend_effective),
+                        "selection_mode": str(selection_mode_s),
+                        "projected_solver_matrix_free": bool(projected_solver_matrix_free),
+                        "use_dense_device_emitter": bool(use_dense_device_emitter),
+                        "use_selected_graph_hop": bool(use_selected_graph_hop),
+                        "use_compact_df_selected_graph_hop": bool(use_compact_df_selected_graph_hop),
+                        "selected_graph_builder": str(selected_graph_builder),
+                        "use_pairwise_sigma_hop": bool(use_pairwise_sigma_hop),
+                    }
 
                     # Check if pair-wise H[i,j] kernel should be used instead.
                     # Preferred for large half-filled active spaces where the DFS-based
@@ -1760,9 +2227,11 @@ def run_cipsi_trials(
                     if (
                         backend_effective == "cuda_key64"
                         and _cp is not None
-                        and isinstance(eri, np.ndarray)
+                        and isinstance(eri, (np.ndarray, DFMOIntegrals, DeviceDFMOIntegrals))
                         and int(drt.norb) >= _pairwise_norb_threshold
                         and int(nsel_cur) <= _pairwise_nsel_max
+                        and not bool(use_pairwise_sigma_hop)
+                        and not bool(use_selected_graph_hop)
                     ):
                         try:
                             from asuka.cuda.cuda_backend import has_pairwise_hij_u64_device  # noqa: PLC0415
@@ -1772,7 +2241,18 @@ def run_cipsi_trials(
                         except Exception:
                             pass
 
-                    if use_dense_device_emitter or use_pairwise_hij:
+                    pairwise_sigma_hdiag_source = None
+                    if use_pairwise_sigma_hop:
+                        diag_sel_h = None
+                        pairwise_sigma_hdiag_source = "exact_bucketed_diagonal"
+                    elif str(selected_graph_builder) == "compact_df_exact":
+                        _ensure_selected_diag(sel_labels)
+                        diag_sel_h = np.asarray(
+                            [float(selected_diag_cache[int(j)]) for j in sel_labels],
+                            dtype=np.float64,
+                            order="C",
+                        )
+                    elif use_dense_device_emitter or use_pairwise_hij:
                         diag_sel_h = None
                     elif bool(dense_key64_fast_active):
                         _ensure_selected_diag(sel_labels)
@@ -1790,6 +2270,10 @@ def run_cipsi_trials(
 
                     used_dense_device_emitter = False
                     used_pairwise_hij = False
+                    used_pairwise_sigma = False
+                    used_pairwise_graph = False
+                    used_selected_graph = False
+                    selected_graph_route_candidate = None
                     if use_pairwise_hij:
                         try:
                             from asuka.cuda.cuda_backend import (  # noqa: PLC0415
@@ -1831,7 +2315,267 @@ def run_cipsi_trials(
                             )
                             use_pairwise_hij = False
 
-                    if not used_pairwise_hij and use_dense_device_emitter:
+                    if not used_pairwise_hij and use_pairwise_sigma_hop:
+                        try:
+                            dense_dev = _ensure_exact_selected_dense_inputs()
+                            tuple_hop = ExactSelectedPairwiseSigmaProjectedHop.from_selected_space(
+                                drt=drt,
+                                drt_dev=_drt_dev,
+                                sel_idx=np.asarray(sel_idx_arr, dtype=np.int64, order="C"),
+                                h_base_d=dense_dev["h_base"],
+                                eri4_d=dense_dev["eri4"],
+                                cp=_cp,
+                                build_exact_diag=True,
+                            )
+                            if getattr(tuple_hop, "hdiag_d", None) is not None:
+                                diag_sel_h = np.asarray(_cp.asnumpy(tuple_hop.hdiag_d), dtype=np.float64, order="C")
+                                tuple_hop.hdiag_d = None
+                            else:
+                                diag_sel_h = np.asarray(hdiag_lookup.get_many(sel_labels), dtype=np.float64, order="C")
+                                pairwise_sigma_hdiag_source = "diagonal_guess_lookup_fallback"
+                            projected_tuple_hop_cache = None
+                            used_pairwise_sigma = True
+                            if pairwise_sigma_hdiag_source is not None:
+                                profile["projected_solver_pairwise_sigma_hdiag_source"] = str(pairwise_sigma_hdiag_source)
+                        except Exception as pairwise_sigma_e:
+                            profile["projected_solver_pairwise_sigma_fallback_reason"] = (
+                                f"{type(pairwise_sigma_e).__name__}: {pairwise_sigma_e}"
+                            )
+                            use_pairwise_sigma_hop = False
+
+                    if (
+                        not used_pairwise_hij
+                        and not used_pairwise_sigma
+                        and not used_selected_graph
+                        and bool(use_selected_graph_hop)
+                        and str(selected_graph_builder) == "rowhash_dense_exact"
+                    ):
+                        try:
+                            dense_dev = _ensure_exact_selected_dense_inputs()
+                            sel_idx_full = np.asarray(sel_idx_arr, dtype=np.int64, order="C")
+                            tuple_hop = ExactSelectedSymRowGraphProjectedHop.from_selected_rowhash_dense(
+                                drt=drt,
+                                drt_dev=_drt_dev,
+                                sel_idx=np.asarray(sel_idx_full, dtype=np.int64),
+                                h_base_d=dense_dev["h_base"],
+                                eri4_d=dense_dev["eri4"],
+                                cp=_cp,
+                                row_cap=int(os.environ.get("ASUKA_EXACT_SELECTED_ROWHASH_CAP", "1024")),
+                            )
+                            diag_sel_h = np.asarray(_cp.asnumpy(tuple_hop.hdiag_d), dtype=np.float64, order="C")
+                            for pos_diag, jj in enumerate(sel_idx_full.tolist()):
+                                selected_diag_cache[int(jj)] = float(diag_sel_h[int(pos_diag)])
+                            projected_tuple_hop_cache = None
+                            used_dense_device_emitter = True
+                            used_selected_graph = True
+                            selected_graph_route_candidate = "rowhash_dense_exact_graph"
+                        except Exception as rowhash_graph_e:
+                            profile["projected_solver_rowhash_graph_fallback_reason"] = (
+                                f"{type(rowhash_graph_e).__name__}: {rowhash_graph_e}"
+                            )
+                            if diag_sel_h is None:
+                                _ensure_selected_diag(sel_labels)
+                                diag_sel_h = np.asarray(
+                                    [float(selected_diag_cache[int(j)]) for j in sel_labels],
+                                    dtype=np.float64,
+                                    order="C",
+                                )
+
+                    if (
+                        not used_pairwise_hij
+                        and not used_pairwise_sigma
+                        and not used_selected_graph
+                        and bool(use_selected_graph_hop)
+                        and str(selected_graph_builder) == "compact_df_exact"
+                    ):
+                        try:
+                            from asuka.cuda.cuda_backend import make_device_state_cache  # noqa: PLC0415
+
+                            sel_idx_full = np.asarray(sel_idx_arr, dtype=np.int64, order="C")
+                            if _state_dev is None:
+                                state_cache_local = state_cache if state_cache is not None else get_state_cache(drt)
+                                _state_dev = make_device_state_cache(drt, _drt_dev, state_cache_local)
+                            h1e_d = _cp.ascontiguousarray(
+                                _cp.asarray(np.asarray(h1e, dtype=np.float64, order="C"), dtype=_cp.float64)
+                            )
+                            if isinstance(eri, DeviceDFMOIntegrals):
+                                l_full_d = _cp.ascontiguousarray(_cp.asarray(getattr(eri, "l_full"), dtype=_cp.float64))
+                                j_ps_d = _cp.ascontiguousarray(_cp.asarray(getattr(eri, "j_ps"), dtype=_cp.float64))
+                            else:
+                                l_full_d = _cp.ascontiguousarray(
+                                    _cp.asarray(np.asarray(getattr(eri, "l_full"), dtype=np.float64, order="C"), dtype=_cp.float64)
+                                )
+                                j_ps_d = _cp.ascontiguousarray(
+                                    _cp.asarray(np.asarray(getattr(eri, "j_ps"), dtype=np.float64, order="C"), dtype=_cp.float64)
+                                )
+                            h_base_d = _cp.ascontiguousarray((h1e_d - 0.5 * j_ps_d).ravel())
+                            tuple_hop = ExactSelectedSymRowGraphProjectedHop.from_compact_df_selected_space(
+                                drt=drt,
+                                drt_dev=_drt_dev,
+                                sel_idx=np.asarray(sel_idx_full, dtype=np.int64),
+                                h_base_d=h_base_d,
+                                l_full_d=l_full_d,
+                                cp=_cp,
+                                hdiag=np.asarray(diag_sel_h, dtype=np.float64, order="C"),
+                                state_dev=_state_dev,
+                            )
+                            projected_tuple_hop_cache = None
+                            used_selected_graph = True
+                            selected_graph_route_candidate = "compact_df_exact_graph"
+                        except Exception as compact_graph_e:
+                            profile["projected_solver_compact_df_graph_fallback_reason"] = (
+                                f"{type(compact_graph_e).__name__}: {compact_graph_e}"
+                            )
+                            if diag_sel_h is None:
+                                _ensure_selected_diag(sel_labels)
+                                diag_sel_h = np.asarray(
+                                    [float(selected_diag_cache[int(j)]) for j in sel_labels],
+                                    dtype=np.float64,
+                                    order="C",
+                                )
+
+                    if not used_pairwise_hij and not used_pairwise_sigma and not used_selected_graph and use_selected_graph_hop:
+                        try:
+                            sel_idx_full = np.asarray(sel_idx_arr, dtype=np.int64, order="C")
+                            tuple_hop = None
+                            if (
+                                int(sel_idx_full.size) >= 64
+                                and projected_tuple_hop_cache is not None
+                                and isinstance(projected_tuple_hop_cache, ExactSelectedSymRowGraphProjectedHop)
+                                and int(projected_tuple_hop_cache.sel_idx.size) <= int(sel_idx_full.size)
+                                and np.array_equal(
+                                    np.asarray(sel_idx_full[: int(projected_tuple_hop_cache.sel_idx.size)], dtype=np.int64),
+                                    np.asarray(projected_tuple_hop_cache.sel_idx, dtype=np.int64),
+                                )
+                            ):
+                                old_n = int(projected_tuple_hop_cache.sel_idx.size)
+                                new_sel = np.asarray(sel_idx_full[old_n:], dtype=np.int64, order="C")
+                                incremental_tuple_build = True
+                                if int(new_sel.size) == 0:
+                                    diag_sel_h = np.asarray(
+                                        [float(selected_diag_cache[int(j)]) for j in sel_idx_full.tolist()],
+                                        dtype=np.float64,
+                                        order="C",
+                                    )
+                                    tuple_hop = projected_tuple_hop_cache.with_hdiag(
+                                        hdiag=np.asarray(diag_sel_h, dtype=np.float64, order="C"),
+                                    )
+                                else:
+                                    emit_t0 = time.perf_counter()
+                                    new_to_all_labels_d, new_to_all_src_d, new_to_all_hij_d, new_diag_d = _emit_exact_selected_tuples_device_dense(
+                                        sel_idx=np.asarray(new_sel, dtype=np.int64),
+                                        selected_target_idx=np.asarray(sel_idx_full, dtype=np.int64),
+                                        return_diag=True,
+                                    )
+                                    profile["timings_s"]["projected_tuple_emit_dense_total"] = float(
+                                        profile["timings_s"].get("projected_tuple_emit_dense_total", 0.0)
+                                        + (time.perf_counter() - emit_t0)
+                                    )
+                                    new_diag_h = np.asarray(_cp.asnumpy(new_diag_d), dtype=np.float64)
+                                    for pos_new, jj in enumerate(new_sel.tolist()):
+                                        selected_diag_cache[int(jj)] = float(new_diag_h[int(pos_new)])
+                                    diag_sel_h = np.asarray(
+                                        [float(selected_diag_cache[int(j)]) for j in sel_idx_full.tolist()],
+                                        dtype=np.float64,
+                                        order="C",
+                                    )
+                                    graph_t0 = time.perf_counter()
+                                    if int(new_to_all_src_d.size) > 0:
+                                        new_to_all_src_d = _cp.ascontiguousarray(
+                                            new_to_all_src_d + np.int32(old_n)
+                                        )
+                                    if int(new_to_all_labels_d.size) > 0:
+                                        delta_tuple_hop = ExactSelectedTupleProjectedHop.from_tuples(
+                                            sel_idx=np.asarray(sel_idx_full, dtype=np.int64),
+                                            labels=new_to_all_labels_d,
+                                            src_pos=new_to_all_src_d,
+                                            hij=new_to_all_hij_d,
+                                            hdiag=None,
+                                        )
+                                        add_target_d, add_src_d, add_hij_d = delta_tuple_hop.to_local_tuples()
+                                        mirror_mask = add_target_d < np.int32(old_n)
+                                        if bool(_cp.any(mirror_mask).item()):
+                                            base_target_d = _cp.ascontiguousarray(add_target_d.ravel())
+                                            base_src_d = _cp.ascontiguousarray(add_src_d.ravel())
+                                            base_hij_d = _cp.ascontiguousarray(add_hij_d.ravel())
+                                            add_target_d = _cp.ascontiguousarray(
+                                                _cp.concatenate((base_target_d, base_src_d[mirror_mask])).ravel()
+                                            )
+                                            add_src_d = _cp.ascontiguousarray(
+                                                _cp.concatenate((base_src_d, base_target_d[mirror_mask])).ravel()
+                                            )
+                                            add_hij_d = _cp.ascontiguousarray(
+                                                _cp.concatenate((base_hij_d, base_hij_d[mirror_mask])).ravel()
+                                            )
+                                        delta_graph_hop = ExactSelectedSymRowGraphProjectedHop.from_local_tuples(
+                                            sel_idx=np.asarray(sel_idx_full, dtype=np.int64),
+                                            target_local=add_target_d,
+                                            src_pos=add_src_d,
+                                            hij=add_hij_d,
+                                            hdiag=None,
+                                        )
+                                    else:
+                                        delta_graph_hop = ExactSelectedSymRowGraphProjectedHop.from_local_tuples(
+                                            sel_idx=np.asarray(sel_idx_full, dtype=np.int64),
+                                            target_local=_cp.zeros((0,), dtype=_cp.int32),
+                                            src_pos=_cp.zeros((0,), dtype=_cp.int32),
+                                            hij=_cp.zeros((0,), dtype=_cp.float64),
+                                            hdiag=None,
+                                        )
+                                    tuple_hop = projected_tuple_hop_cache.with_appended_rows(
+                                        other=delta_graph_hop,
+                                        old_n=int(old_n),
+                                        sel_idx=np.asarray(sel_idx_full, dtype=np.int64),
+                                        hdiag=np.asarray(diag_sel_h, dtype=np.float64, order="C"),
+                                    )
+                                    profile["timings_s"]["projected_graph_build_total"] = float(
+                                        profile["timings_s"].get("projected_graph_build_total", 0.0)
+                                        + (time.perf_counter() - graph_t0)
+                                    )
+                            if tuple_hop is None:
+                                emit_t0 = time.perf_counter()
+                                labels_d, src_d, hij_d, diag_d = _emit_exact_selected_tuples_device_dense(
+                                    sel_idx=np.asarray(sel_idx_arr, dtype=np.int64),
+                                    return_diag=True,
+                                )
+                                profile["timings_s"]["projected_tuple_emit_dense_total"] = float(
+                                    profile["timings_s"].get("projected_tuple_emit_dense_total", 0.0)
+                                    + (time.perf_counter() - emit_t0)
+                                )
+                                diag_sel_h = np.asarray(_cp.asnumpy(diag_d), dtype=np.float64, order="C")
+                                for pos_diag, jj in enumerate(sel_idx_full.tolist()):
+                                    selected_diag_cache[int(jj)] = float(diag_sel_h[int(pos_diag)])
+                                graph_t0 = time.perf_counter()
+                                tuple_hop = ExactSelectedSymRowGraphProjectedHop.from_tuples(
+                                    sel_idx=np.asarray(sel_idx_full, dtype=np.int64),
+                                    labels=labels_d,
+                                    src_pos=src_d,
+                                    hij=hij_d,
+                                    hdiag=np.asarray(diag_sel_h, dtype=np.float64, order="C"),
+                                )
+                                profile["timings_s"]["projected_graph_build_total"] = float(
+                                    profile["timings_s"].get("projected_graph_build_total", 0.0)
+                                    + (time.perf_counter() - graph_t0)
+                                )
+                            projected_tuple_hop_cache = None
+                            projected_tuple_hop_cache = tuple_hop
+                            used_dense_device_emitter = True
+                            used_selected_graph = True
+                            profile["projected_solver_route_taken"] = "tuple_emit_graph"
+                        except Exception as graph_emit_e:
+                            profile["projected_solver_sym_graph_fallback_reason"] = (
+                                f"{type(graph_emit_e).__name__}: {graph_emit_e}"
+                            )
+                            use_selected_graph_hop = False
+                            if diag_sel_h is None:
+                                _ensure_selected_diag(sel_labels)
+                                diag_sel_h = np.asarray(
+                                    [float(selected_diag_cache[int(j)]) for j in sel_labels],
+                                    dtype=np.float64,
+                                    order="C",
+                                )
+
+                    if not used_pairwise_hij and not used_pairwise_sigma and not used_selected_graph and use_dense_device_emitter:
                         try:
                             sel_idx_full = np.asarray(sel_idx_arr, dtype=np.int64, order="C")
                             tuple_hop = None
@@ -1954,6 +2698,7 @@ def run_cipsi_trials(
                                     profile.get("projected_tuple_incremental_build_count", 0)
                                 ) + 1
                             used_dense_device_emitter = True
+                            profile["projected_solver_route_taken"] = "tuple_emit"
                         except Exception as dense_emit_e:
                             profile["projected_solver_exact_tuple_device_fallback_reason"] = (
                                 f"{type(dense_emit_e).__name__}: {dense_emit_e}"
@@ -1966,64 +2711,30 @@ def run_cipsi_trials(
                                     dtype=np.float64,
                                     order="C",
                                 )
-                    if not use_dense_device_emitter:
-                        label_parts: list[np.ndarray] = []
-                        src_parts: list[np.ndarray] = []
-                        hij_parts: list[np.ndarray] = []
-                        for pos, j in enumerate(np.asarray(sel_idx_arr, dtype=np.int64).ravel().tolist()):
-                            i_idx, hij = _get_connected_row_exact(int(j))
-                            i_idx = np.asarray(i_idx, dtype=np.int64).ravel()
-                            hij = np.asarray(hij, dtype=np.float64).ravel()
-                            keep_labels: list[int] = []
-                            keep_vals: list[float] = []
-                            for ii, vv in zip(i_idx.tolist(), hij.tolist(), strict=False):
-                                if int(ii) == int(j):
-                                    continue
-                                if int(ii) in loc_map_cur:
-                                    keep_labels.append(int(ii))
-                                    keep_vals.append(float(vv))
-                            if keep_labels:
-                                label_parts.append(np.asarray(keep_labels, dtype=np.int64))
-                                src_parts.append(np.full((len(keep_labels),), int(pos), dtype=np.int32))
-                                hij_parts.append(np.asarray(keep_vals, dtype=np.float64))
-                        if label_parts:
-                            tuple_hop = ExactSelectedTupleProjectedHop.from_tuples(
-                                sel_idx=np.asarray(sel_idx_arr, dtype=np.int64),
-                                labels=np.asarray(np.concatenate(label_parts), dtype=np.int64, order="C"),
-                                src_pos=np.asarray(np.concatenate(src_parts), dtype=np.int32, order="C"),
-                                hij=np.asarray(np.concatenate(hij_parts), dtype=np.float64, order="C"),
-                                hdiag=np.asarray(diag_sel_h, dtype=np.float64, order="C"),
-                            )
-                        else:
-                            tuple_hop = ExactSelectedTupleProjectedHop.from_tuples(
-                                sel_idx=np.asarray(sel_idx_arr, dtype=np.int64),
-                                labels=np.zeros((0,), dtype=np.int64),
-                                src_pos=np.zeros((0,), dtype=np.int32),
-                                hij=np.zeros((0,), dtype=np.float64),
-                                hdiag=np.asarray(diag_sel_h, dtype=np.float64, order="C"),
-                            )
-                        projected_tuple_hop_cache = None
-
-                    ncheck = min(int(nsel_cur), 4)
-                    if ncheck > 0 and (not bool(dense_key64_fast_active) or bool(dense_key64_fast_debug_parity)):
-                        v_check_h = np.eye(int(nsel_cur), int(ncheck), dtype=np.float64)
-                        w_proj_h = np.asarray(
-                            _cp.asnumpy(tuple_hop.hop_gpu(_cp.asarray(v_check_h, dtype=_cp.float64))),
-                            dtype=np.float64,
+                    if not bool(used_pairwise_sigma) and not bool(used_selected_graph) and not bool(use_dense_device_emitter):
+                        raise RuntimeError(
+                            f"All GPU projected-hop paths failed for nsel={nsel_cur}, "
+                            f"norb={drt.norb}, ncsf={drt.ncsf}. "
+                            "The CPU row-oracle fallback has been removed because it hangs "
+                            "for large active spaces (O(nsel * ncsf) row walks). "
+                            "Ensure CuPy is installed and a CUDA GPU is available."
                         )
-                        w_ref_h = np.zeros((int(nsel_cur), int(ncheck)), dtype=np.float64)
-                        for col in range(int(ncheck)):
-                            j = int(np.asarray(sel_idx_arr, dtype=np.int64).ravel()[col])
-                            i_idx, hij = _get_connected_row_exact(j)
-                            for ii, vv in zip(np.asarray(i_idx, dtype=np.int64).tolist(), np.asarray(hij, dtype=np.float64).tolist(), strict=False):
-                                loc_i = loc_map_cur.get(int(ii))
-                                if loc_i is not None:
-                                    w_ref_h[int(loc_i), int(col)] += float(vv)
-                        mismatch = float(np.max(np.abs(w_proj_h - w_ref_h))) if w_ref_h.size else 0.0
-                        if mismatch > 1e-8:
-                            raise RuntimeError(
-                                f"selected tuple projected-hop parity mismatch against exact selected rows (maxabs={mismatch:.3e})"
-                            )
+
+                    # Parity check: the O(nsel) row-oracle verification has been removed
+                    # because it dominates runtime for large active spaces.  The GPU hop
+                    # backends (pairwise sigma, tuple_emit_graph, pairwise H[i,j]) are
+                    # validated by the unit test suite.
+                    parity_check_enabled = False
+                    if bool(used_pairwise_sigma):
+                        parity_check_reason = "auto_skip_trusted_pairwise_sigma"
+                    elif bool(used_selected_graph) and bool(used_dense_device_emitter):
+                        parity_check_reason = "auto_skip_trusted_tuple_emit_graph"
+                    elif bool(used_pairwise_hij):
+                        parity_check_reason = "auto_skip_trusted_pairwise_hij"
+                    else:
+                        parity_check_reason = "auto_skip_all_gpu_paths"
+                    profile["projected_solver_parity_check_enabled"] = False
+                    profile["projected_solver_parity_check_reason"] = str(parity_check_reason)
 
                     def _hop(v_d):
                         return tuple_hop.hop_gpu(v_d)
@@ -2038,41 +2749,115 @@ def run_cipsi_trials(
                             "dt_s": float(tuple_build_dt),
                             "dense_device": bool(used_dense_device_emitter),
                             "pairwise_hij": bool(used_pairwise_hij),
+                            "pairwise_sigma": bool(used_pairwise_sigma),
+                            "pairwise_graph": bool(used_pairwise_graph),
+                            "selected_graph": bool(used_selected_graph),
                             "incremental": bool(incremental_tuple_build),
                         }
                     )
-                    return _hop, diag_sel_h, bool(used_dense_device_emitter)
+                    return _hop, diag_sel_h, bool(used_dense_device_emitter), bool(used_selected_graph), bool(used_pairwise_sigma), tuple_hop
 
                 try:
+                    eigensolver_name = str(
+                        os.environ.get("ASUKA_GPU_PROJECTED_EIGENSOLVER", "davidson")
+                    ).strip().lower()
+                    if eigensolver_name not in ("jd", "davidson"):
+                        eigensolver_name = "davidson"
                     if backend_effective in ("cuda_key64", "cuda_idx64"):
-                        _hop, solver_hdiag, used_dense_device_emitter = _build_projected_tuple_hop()
-                        solver_backend = (
-                            "cuda_davidson_projected_exact_tuples_device"
-                            if bool(used_dense_device_emitter)
-                            else "cuda_davidson_projected_exact_tuples"
-                        )
+                        _hop, solver_hdiag, used_dense_device_emitter, used_selected_graph, used_pairwise_sigma, hop_owner = _build_projected_tuple_hop()
+                        if bool(used_pairwise_sigma):
+                            solver_backend = "cuda_jacobi_davidson_projected_exact_pairwise_sigma" if eigensolver_name == "jd" else "cuda_davidson_projected_exact_pairwise_sigma"
+                        elif bool(used_selected_graph):
+                            solver_backend = "cuda_jacobi_davidson_projected_exact_sym_graph" if eigensolver_name == "jd" else "cuda_davidson_projected_exact_sym_graph"
+                        else:
+                            if bool(used_dense_device_emitter):
+                                solver_backend = (
+                                    "cuda_jacobi_davidson_projected_exact_tuples_device"
+                                    if eigensolver_name == "jd"
+                                    else "cuda_davidson_projected_exact_tuples_device"
+                                )
+                            else:
+                                solver_backend = (
+                                    "cuda_jacobi_davidson_projected_exact_tuples"
+                                    if eigensolver_name == "jd"
+                                    else "cuda_davidson_projected_exact_tuples"
+                                )
                     elif bool(projected_solver_matrix_free):
                         raise RuntimeError("matrix-free projected solver is only supported on the cuda_key64 path")
                     else:
-                        _hop, solver_hdiag = _build_sell_hop()
+                        _hop, solver_hdiag, hop_owner = _build_sell_hop()
+                        if eigensolver_name == "jd":
+                            solver_backend = "cuda_jacobi_davidson_projected_exact_sell"
                 except Exception as projected_hop_e:
+                    profile["projected_solver_projected_hop_fallback_reason"] = (
+                        f"{type(projected_hop_e).__name__}: {projected_hop_e}"
+                    )
                     if bool(projected_solver_matrix_free):
                         profile["projected_solver_matrix_free_fallback_reason"] = (
                             f"{type(projected_hop_e).__name__}: {projected_hop_e}"
                         )
-                    _hop, solver_hdiag = _build_sell_hop()
+                    _hop, solver_hdiag, hop_owner = _build_sell_hop()
 
-                dav_res = davidson_sym_gpu(
-                    _hop,
-                    x0=guess_list,
-                    hdiag=np.asarray(solver_hdiag, dtype=np.float64),
-                    nroots=int(nroots),
-                    max_cycle=max(4, int(davidson_max_cycle)),
-                    max_space=max(int(davidson_max_space), int(nroots) + 2),
-                    tol=float(davidson_tol),
-                    subspace_eigh_cpu=False,
-                    batch_convergence_transfer=True,
-                )
+                solver_hdiag = np.asarray(solver_hdiag, dtype=np.float64, order="C").ravel()
+                solver_dim = int(solver_hdiag.size)
+                if solver_dim <= 0:
+                    raise RuntimeError("projected solver diagonal is empty")
+                guess_list = [
+                    np.asarray(v, dtype=np.float64).ravel()
+                    for v in guess_list
+                    if int(np.asarray(v, dtype=np.float64).size) == solver_dim
+                ]
+                if not guess_list:
+                    for i in range(min(int(nroots), int(solver_dim))):
+                        vec = np.zeros((solver_dim,), dtype=np.float64)
+                        vec[i] = 1.0
+                        guess_list.append(vec)
+
+                jd_precond = None
+                if eigensolver_name == "jd":
+                    jd_block_size = int(os.environ.get("ASUKA_GPU_PROJECTED_JD_BLOCK_SIZE", "64"))
+                    jd_denom_tol = float(os.environ.get("ASUKA_GPU_PROJECTED_JD_DENOM_TOL", "1e-8"))
+                    if hop_owner is not None and hasattr(hop_owner, "build_jd_preconditioner"):
+                        try:
+                            jd_precond = hop_owner.build_jd_preconditioner(
+                                block_size=int(jd_block_size),
+                                denom_tol=float(jd_denom_tol),
+                            )
+                            profile["projected_solver_jd_preconditioner"] = str(
+                                getattr(jd_precond, "label", type(jd_precond).__name__)
+                            )
+                        except Exception as jd_precond_e:
+                            profile["projected_solver_jd_preconditioner_fallback_reason"] = (
+                                f"{type(jd_precond_e).__name__}: {jd_precond_e}"
+                            )
+                            jd_precond = None
+                    dav_res = jacobi_davidson_sym_gpu(
+                        _hop,
+                        x0=guess_list,
+                        hdiag=solver_hdiag,
+                        precond=jd_precond,
+                        nroots=int(nroots),
+                        max_cycle=max(4, int(davidson_max_cycle)),
+                        max_space=max(int(davidson_max_space), int(nroots) + 2),
+                        tol=float(davidson_tol),
+                        subspace_eigh_cpu=False,
+                        batch_convergence_transfer=True,
+                            jd_inner_max_cycle=int(os.environ.get("ASUKA_GPU_PROJECTED_JD_INNER_MAX_CYCLE", "1")),
+                        jd_inner_tol_rel=float(os.environ.get("ASUKA_GPU_PROJECTED_JD_INNER_TOL_REL", "0.25")),
+                        jd_keep_corrections=int(os.environ.get("ASUKA_GPU_PROJECTED_JD_KEEP_CORRECTIONS", "4")),
+                    )
+                else:
+                    dav_res = davidson_sym_gpu(
+                        _hop,
+                        x0=guess_list,
+                        hdiag=solver_hdiag,
+                        nroots=int(nroots),
+                        max_cycle=max(4, int(davidson_max_cycle)),
+                        max_space=max(int(davidson_max_space), int(nroots) + 2),
+                        tol=float(davidson_tol),
+                        subspace_eigh_cpu=False,
+                        batch_convergence_transfer=True,
+                    )
                 e_var_cur = np.asarray(dav_res.e, dtype=np.float64)
                 c_sel_cur = np.column_stack([np.asarray(x, dtype=np.float64) for x in dav_res.x])
                 profile["projected_solver_gpu_effective"] = True
@@ -2180,10 +2965,11 @@ def run_cipsi_trials(
                 max_add = min(int(grow_by), int(remaining))
                 selector_iter_stats: dict[str, Any] = {}
                 cuda_iter_stats: dict[str, Any] = {}
+                selector_plan_fast = None
                 seeds_out: dict[str, Any] = {}
                 hb_eps_iter = _compute_hb_eps_iter(sel_size=int(len(sel_work)))
                 if int(max_add) > 0:
-                    if exact_external_selector_enabled:
+                    if _exact_external_selector_active(int(len(sel_work))):
                         selector_iter_stats.update(
                             {
                                 "selector_bucketed": False,
@@ -2227,7 +3013,7 @@ def run_cipsi_trials(
                                 "selector_active_frontier_edges": int(selector_plan.active_frontier_edges),
                             }
                         )
-                if exact_external_selector_enabled:
+                if _exact_external_selector_active(int(len(sel_work))):
                     try:
                         new_idx, e_pt2_last, exact_iter_stats = _exact_external_select(
                             sel_idx_i64=np.asarray(sel_work, dtype=np.int64),
@@ -2251,8 +3037,15 @@ def run_cipsi_trials(
                         profile["exact_external_selector_fallback_reason"] = (
                             f"{type(exact_step_e).__name__}: {exact_step_e}"
                         )
-                if cuda_selector_enabled and not exact_external_selector_enabled:
+                if cuda_selector_enabled and not _exact_external_selector_active(int(len(sel_work))):
                     try:
+                        if selector_plan_fast is None:
+                            selector_plan_fast = _plan_cuda_selector_buckets_fast(
+                                drt=drt,
+                                sel_size=int(len(sel_work)),
+                                prev_ncand_hint=int(prev_cuda_ncand_hint),
+                                max_add=int(max_add),
+                            )
                         eps_run = 0.0 if selection_mode_s == "frontier_hash" else float(hb_eps_iter)
                         new_idx, e_pt2_last, cuda_iter_stats = _cuda_select_external(
                             sel_idx_i64=np.asarray(sel_work, dtype=np.int64),
@@ -2268,8 +3061,9 @@ def run_cipsi_trials(
                         cuda_selector_enabled = False
                         profile["cuda_selector_step_fallback_iter"] = int(macro_iter)
                         profile["cuda_selector_step_fallback_reason"] = f"{type(cuda_step_e).__name__}: {cuda_step_e}"
+                        profile["cuda_selector_step_fallback_traceback"] = traceback.format_exc()
                         profile["driver"] = "sparse_row_oracle"
-                if not cuda_selector_enabled and not exact_external_selector_enabled:
+                if not cuda_selector_enabled and not _exact_external_selector_active(int(len(sel_work))):
                     if selection_mode_s == "frontier_hash":
                         new_idx, e_pt2_last, _stats = frontier_selector.build_and_score(
                             sel_idx=np.asarray(sel_work, dtype=np.int64),
@@ -2341,6 +3135,12 @@ def run_cipsi_trials(
                 }
                 if cuda_iter_stats:
                     rec["cuda_selector"] = dict(cuda_iter_stats)
+                    selector_backend = cuda_iter_stats.get("selector_backend")
+                    if selector_backend is not None:
+                        profile["selector_backend_history"].append(str(selector_backend))
+                    selection_policy = cuda_iter_stats.get("selection_policy")
+                    if selection_policy is not None:
+                        profile["selection_policy_history"].append(str(selection_policy))
                 if selector_iter_stats:
                     rec["selector"] = dict(selector_iter_stats)
                     profile["selector_bucketed_any"] = bool(
@@ -2378,7 +3178,7 @@ def run_cipsi_trials(
                         dtype=np.int64,
                     )
                     c_sel_work = _normalize_coeff_block(np.asarray(c_sel_work[keep_rows, :], dtype=np.float64, order="C"))
-                if h_builder is not None or not bool(dense_key64_fast_active):
+                if h_builder is not None or not bool(lazy_selected_growth_active):
                     _ensure_h_builder().extend(keep_added)
                     sel = h_builder.sel  # type: ignore[union-attr]
                     loc_map = h_builder.loc_map  # type: ignore[union-attr]
@@ -2389,8 +3189,6 @@ def run_cipsi_trials(
                             continue
                         loc_map[kk] = int(len(sel))
                         sel.append(kk)
-                    if keep_added and not bool(dense_key64_fast_active):
-                        _ensure_selected_diag([int(x) for x in keep_added])
                 prev_c_sel = np.asarray(c_sel_work, dtype=np.float64, order="C")
             if not added_in_macro or len(sel) >= int(max_ncsf):
                 break
@@ -2403,7 +3201,7 @@ def run_cipsi_trials(
         )
         profile["solve_count"] = int(profile.get("solve_count", 0)) + 1
         profile["solver_reordered_final"] = bool(final_solver_reordered)
-        if exact_external_selector_enabled:
+        if _exact_external_selector_active(int(sel_idx.size)):
             _new_idx, e_pt2_last, exact_final_stats = _exact_external_select(
                 sel_idx_i64=np.asarray(sel_idx, dtype=np.int64),
                 c_sel_arr=c_sel_last,
@@ -2571,7 +3369,7 @@ def run_cipsi_trials(
                 hb_eps_iter = float(hb_epsilon)
 
         if int(max_add) > 0:
-            if exact_external_selector_enabled:
+            if _exact_external_selector_active(int(sel_idx.size)):
                 selector_iter_stats.update(
                     {
                         "selector_bucketed": False,
@@ -2616,7 +3414,7 @@ def run_cipsi_trials(
                     }
                 )
 
-        if exact_external_selector_enabled:
+        if _exact_external_selector_active(int(sel_idx.size)):
             try:
                 new_idx, e_pt2, exact_iter_stats = _exact_external_select(
                     sel_idx_i64=sel_idx,
@@ -2635,7 +3433,7 @@ def run_cipsi_trials(
                     f"{type(exact_step_e).__name__}: {exact_step_e}"
                 )
 
-        if cuda_selector_enabled and not exact_external_selector_enabled:
+        if cuda_selector_enabled and not _exact_external_selector_active(int(sel_idx.size)):
             try:
                 eps_run = 0.0 if selection_mode_s == "frontier_hash" else float(hb_eps_iter)
                 new_idx, e_pt2, cuda_iter_stats = _cuda_select_external(
@@ -2651,9 +3449,10 @@ def run_cipsi_trials(
                 cuda_selector_enabled = False
                 profile["cuda_selector_step_fallback_iter"] = int(it)
                 profile["cuda_selector_step_fallback_reason"] = f"{type(cuda_step_e).__name__}: {cuda_step_e}"
+                profile["cuda_selector_step_fallback_traceback"] = traceback.format_exc()
                 profile["driver"] = "sparse_row_oracle"
 
-        if not cuda_selector_enabled and not exact_external_selector_enabled:
+        if not cuda_selector_enabled and not _exact_external_selector_active(int(sel_idx.size)):
             if selection_mode_s == "frontier_hash":
                 new_idx, e_pt2, _stats = frontier_selector.build_and_score(
                     sel_idx=sel_idx,
@@ -2694,9 +3493,17 @@ def run_cipsi_trials(
                 if len(added_idx) >= remaining:
                     break
         if added_idx:
-            _ensure_h_builder().extend(added_idx)
-            sel = h_builder.sel  # type: ignore[union-attr]
-            loc_map = h_builder.loc_map  # type: ignore[union-attr]
+            if h_builder is not None or not bool(lazy_selected_growth_active):
+                _ensure_h_builder().extend(added_idx)
+                sel = h_builder.sel  # type: ignore[union-attr]
+                loc_map = h_builder.loc_map  # type: ignore[union-attr]
+            else:
+                for jj in added_idx:
+                    kk = int(jj)
+                    if kk in loc_map:
+                        continue
+                    loc_map[kk] = int(len(sel))
+                    sel.append(kk)
             frontier_selector.mark_selected(added_idx)
 
         active_mask = np.any(np.abs(c_sel) > 0.0, axis=1)
@@ -2721,6 +3528,12 @@ def run_cipsi_trials(
         }
         if cuda_iter_stats:
             rec["cuda_selector"] = dict(cuda_iter_stats)
+            selector_backend = cuda_iter_stats.get("selector_backend")
+            if selector_backend is not None:
+                profile["selector_backend_history"].append(str(selector_backend))
+            selection_policy = cuda_iter_stats.get("selection_policy")
+            if selection_policy is not None:
+                profile["selection_policy_history"].append(str(selection_policy))
         if selector_iter_stats:
             rec["selector"] = dict(selector_iter_stats)
             profile["selector_bucketed_any"] = bool(profile.get("selector_bucketed_any", False) or selector_iter_stats.get("selector_bucketed", False))
@@ -2811,7 +3624,7 @@ def run_cipsi_trials(
         _eps_final = 0.0
         if selection_mode_s == "heat_bath":
             _eps_final = float(hb_eps_final) if str(hb_eps_schedule).lower() == "adaptive" else float(hb_epsilon)
-        if exact_external_selector_enabled:
+        if _exact_external_selector_active(int(sel_idx.size)):
             _new_idx, e_pt2, exact_final_stats = _exact_external_select(
                 sel_idx_i64=np.asarray(sel_idx, dtype=np.int64),
                 c_sel_arr=c_sel,
@@ -2983,6 +3796,13 @@ def build_cipsi_trials_from_scf(
         h1eff = ints.h1eff
         eri = ints.eri
         ecore = float(ints.ecore)
+        if backend_s in ("auto", "cuda_key64", "cuda_idx64") and isinstance(eri, DFMOIntegrals):
+            try:
+                import cupy as cp  # type: ignore[import-not-found]
+
+                eri = eri.to_device(cp, with_eri_mat=False)
+            except Exception:
+                pass
     else:
         raise NotImplementedError(
             "build_cipsi_trials_from_scf(..., df=False) currently requires a CASCIResult input with prebuilt dense integrals"

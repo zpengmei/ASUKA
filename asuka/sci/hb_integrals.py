@@ -301,6 +301,142 @@ def upload_hb_index(hb_index: HeatBathIntegralIndex, cp: Any) -> dict:
     return d
 
 
+def build_hb_index_device(
+    h1e_eff_d: Any,
+    *,
+    norb: int,
+    cp: Any,
+    l_full_d: Any | None = None,
+    eri_mat_d: Any | None = None,
+    orbsym: np.ndarray | None = None,
+) -> dict:
+    """Build the HB index directly on GPU and return the uploaded-device layout.
+
+    Parameters
+    ----------
+    h1e_eff_d
+        CuPy-compatible `(norb, norb)` effective one-body matrix.
+    norb
+        Number of active orbitals.
+    cp
+        CuPy module.
+    l_full_d
+        Optional DF/Cholesky vectors `(norb^2, naux)` on device.
+    eri_mat_d
+        Optional pair-space ERI matrix `(norb^2, norb^2)` on device.
+    orbsym
+        Optional host orbital symmetry labels. When present, the same symmetry
+        filtering as :func:`build_hb_index` is applied before sorting.
+
+    Returns
+    -------
+    dict
+        Same layout as :func:`upload_hb_index`, plus small device-side diagonal
+        slices `eri_ppqq` and `eri_pqqp` used by the CUDA diagonal-guess path.
+    """
+    norb = int(norb)
+    nops = norb * norb
+    h1e_eff_d = cp.ascontiguousarray(cp.asarray(h1e_eff_d, dtype=cp.float64).reshape(norb, norb))
+
+    if eri_mat_d is not None:
+        eri_2d_d = cp.ascontiguousarray(cp.asarray(eri_mat_d, dtype=cp.float64).reshape(nops, nops))
+    elif l_full_d is not None:
+        l_full_d = cp.ascontiguousarray(cp.asarray(l_full_d, dtype=cp.float64).reshape(nops, -1))
+        eri_2d_d = cp.ascontiguousarray(cp.dot(l_full_d, l_full_d.T))
+    else:
+        raise ValueError("build_hb_index_device requires either l_full_d or eri_mat_d")
+
+    sym_pq_allowed = None
+    if orbsym is not None:
+        orbsym_h = np.asarray(orbsym, dtype=np.int32).ravel()
+        if int(orbsym_h.size) != norb:
+            raise ValueError(f"orbsym size {orbsym_h.size} != norb {norb}")
+        orbsym_d = cp.ascontiguousarray(cp.asarray(orbsym_h, dtype=cp.int32))
+        sym_pq_2d = cp.bitwise_xor(orbsym_d[:, None], orbsym_d[None, :])
+        allowed_pq = sym_pq_2d == 0
+        h1e_eff_d = cp.where(allowed_pq, h1e_eff_d, 0.0)
+        sym_pq_flat = sym_pq_2d.ravel()
+        allowed_2e = sym_pq_flat[:, None] == sym_pq_flat[None, :]
+        eri_2d_d = cp.where(allowed_2e, eri_2d_d, 0.0)
+        sym_pq_allowed = cp.ascontiguousarray(allowed_pq.ravel().astype(cp.int8, copy=False))
+
+    h1_flat_d = h1e_eff_d.ravel()
+    h1_abs_all_d = cp.abs(h1_flat_d)
+    order_h1_d = cp.ascontiguousarray(cp.argsort(-h1_abs_all_d).ravel())
+    if int(order_h1_d.size) > 0:
+        mask_h1_d = h1_abs_all_d[order_h1_d] > 0.0
+        order_h1_d = cp.ascontiguousarray(order_h1_d[mask_h1_d].ravel())
+    if int(order_h1_d.size) > 0:
+        h1_pq_d = cp.ascontiguousarray(
+            cp.stack(
+                (
+                    (order_h1_d // norb).astype(cp.int32, copy=False),
+                    (order_h1_d % norb).astype(cp.int32, copy=False),
+                ),
+                axis=1,
+            )
+        )
+        h1_abs_d = cp.ascontiguousarray(h1_abs_all_d[order_h1_d].astype(cp.float64, copy=False).ravel())
+        h1_signed_d = cp.ascontiguousarray(h1_flat_d[order_h1_d].astype(cp.float64, copy=False).ravel())
+    else:
+        h1_pq_d = cp.zeros((0, 2), dtype=cp.int32)
+        h1_abs_d = cp.zeros((0,), dtype=cp.float64)
+        h1_signed_d = cp.zeros((0,), dtype=cp.float64)
+
+    abs_eri_d = cp.abs(eri_2d_d)
+    order_2d_d = cp.ascontiguousarray(cp.argsort(-abs_eri_d, axis=1))
+    row_idx_d = cp.arange(nops, dtype=cp.int64)[:, None]
+    v_abs_sorted_d = cp.ascontiguousarray(abs_eri_d[row_idx_d, order_2d_d])
+    v_signed_sorted_d = cp.ascontiguousarray(eri_2d_d[row_idx_d, order_2d_d])
+    pq_max_v_d = cp.ascontiguousarray(v_abs_sorted_d[:, 0].astype(cp.float64, copy=False).ravel())
+
+    nonzero_mask_d = v_abs_sorted_d > 0.0
+    nnz_per_row_d = cp.count_nonzero(nonzero_mask_d, axis=1).astype(cp.int64, copy=False)
+    pq_ptr_d = cp.zeros((nops + 1,), dtype=cp.int64)
+    if nops > 0:
+        pq_ptr_d[1:] = cp.cumsum(nnz_per_row_d, dtype=cp.int64)
+    if int(pq_ptr_d[-1].item()) > 0:
+        rs_idx_d = cp.ascontiguousarray(order_2d_d[nonzero_mask_d].astype(cp.int32, copy=False).ravel())
+        v_abs_d = cp.ascontiguousarray(v_abs_sorted_d[nonzero_mask_d].astype(cp.float64, copy=False).ravel())
+        v_signed_d = cp.ascontiguousarray(v_signed_sorted_d[nonzero_mask_d].astype(cp.float64, copy=False).ravel())
+    else:
+        rs_idx_d = cp.zeros((0,), dtype=cp.int32)
+        v_abs_d = cp.zeros((0,), dtype=cp.float64)
+        v_signed_d = cp.zeros((0,), dtype=cp.float64)
+
+    rs_max_all_d = cp.max(abs_eri_d, axis=0)
+    order_rs_d = cp.ascontiguousarray(cp.argsort(-rs_max_all_d).ravel())
+    if int(order_rs_d.size) > 0:
+        mask_rs_d = rs_max_all_d[order_rs_d] > 0.0
+        order_rs_d = cp.ascontiguousarray(order_rs_d[mask_rs_d].ravel())
+    if int(order_rs_d.size) > 0:
+        rs_flat_d = cp.ascontiguousarray(order_rs_d.astype(cp.int32, copy=False).ravel())
+        rs_max_v_d = cp.ascontiguousarray(rs_max_all_d[order_rs_d].astype(cp.float64, copy=False).ravel())
+    else:
+        rs_flat_d = cp.zeros((0,), dtype=cp.int32)
+        rs_max_v_d = cp.zeros((0,), dtype=cp.float64)
+
+    diag_ids_d = cp.arange(norb, dtype=cp.int64) * (norb + 1)
+    pq_ids_d = cp.arange(nops, dtype=cp.int64).reshape(norb, norb)
+    return {
+        "h1_pq": h1_pq_d,
+        "h1_abs": h1_abs_d,
+        "h1_signed": h1_signed_d,
+        "pq_ptr": cp.ascontiguousarray(pq_ptr_d.ravel()),
+        "rs_idx": rs_idx_d,
+        "v_abs": v_abs_d,
+        "v_signed": v_signed_d,
+        "pq_max_v": pq_max_v_d,
+        "rs_flat": rs_flat_d,
+        "rs_max_v": rs_max_v_d,
+        "eri_diag_t": cp.ascontiguousarray(eri_2d_d[:, diag_ids_d].T.astype(cp.float64, copy=False)),
+        "eri_ppqq": cp.ascontiguousarray(eri_2d_d[diag_ids_d[:, None], diag_ids_d[None, :]].astype(cp.float64, copy=False)),
+        "eri_pqqp": cp.ascontiguousarray(eri_2d_d[pq_ids_d, pq_ids_d.T].astype(cp.float64, copy=False)),
+        "sym_pq_allowed": sym_pq_allowed,
+        "norb": norb,
+    }
+
+
 def build_g_base_gpu(hb_dev: dict, cutoff: float, norb: int, cp: Any) -> Any:
     """GPU equivalent of build_g_base using CuPy.
 

@@ -107,6 +107,32 @@ __device__ __forceinline__ void cas36_exact_emit_tuple_u64(
   out_hij[slot] = hij;
 }
 
+template <int MAX_PROBES_T = 256>
+__device__ __forceinline__ void cas36_rowhash_insert_add_f64_u64(
+    uint64_t* __restrict__ row_hash_keys,
+    double* __restrict__ row_hash_vals,
+    int row_cap,
+    uint64_t key,
+    double value,
+    int* __restrict__ overflow_flag) {
+  if (value == 0.0) return;
+  constexpr uint64_t EMPTY = 0xFFFFFFFFFFFFFFFFull;
+  uint64_t mask = (uint64_t)(row_cap - 1);
+  uint64_t slot = cas36_sci_hash_u64(key) & mask;
+  for (int probe = 0; probe < MAX_PROBES_T; ++probe) {
+    unsigned long long prev = atomicCAS(
+        reinterpret_cast<unsigned long long*>(&row_hash_keys[slot]),
+        (unsigned long long)EMPTY,
+        (unsigned long long)key);
+    if (prev == (unsigned long long)EMPTY || prev == (unsigned long long)key) {
+      atomicAdd(&row_hash_vals[slot], value);
+      return;
+    }
+    slot = (slot + 1ull) & mask;
+  }
+  if (overflow_flag) atomicExch(overflow_flag, 1);
+}
+
 __device__ __forceinline__ double cas36_dense_eri4_at(
     const double* __restrict__ eri4,
     int norb,
@@ -157,6 +183,17 @@ extern "C" cudaError_t cas36_sci_build_membership_hash_u64_launch_stream(
   return cudaGetLastError();
 }
 
+template <int MAX_PROBES_T = 256>
+__device__ __forceinline__ void cas36_frontier_hash_insert_add_many_f64_u64(
+    uint64_t* __restrict__ hash_keys,
+    double* __restrict__ hash_vals_root_major,
+    int cap,
+    const double* __restrict__ c_row,
+    int nroots,
+    uint64_t key,
+    double scale,
+    int* __restrict__ overflow_flag);
+
 template <int MAX_NORB_T>
 __device__ __forceinline__ bool cas36_sci_reconstruct_path_from_index_u64(
     const int32_t* __restrict__ child,
@@ -197,7 +234,7 @@ __device__ __forceinline__ bool cas36_sci_reconstruct_path_from_index_u64(
 }
 
 template <int MAX_NORB_T>
-__device__ __forceinline__ void cas36_exact_emit_weighted_epq_selected_u64(
+__device__ __forceinline__ void cas36_exact_emit_weighted_epq_target_u64(
     uint64_t source_global_exclude,
     int source_local,
     uint64_t state_global,
@@ -214,8 +251,11 @@ __device__ __forceinline__ void cas36_exact_emit_weighted_epq_selected_u64(
     const int32_t* __restrict__ child_table,
     const int16_t* __restrict__ node_twos,
     const int64_t* __restrict__ child_prefix,
+    uint64_t label_lo,
+    uint64_t label_hi,
     const uint64_t* __restrict__ membership_hash_keys,
     int membership_hash_cap,
+    int target_mode,
     uint64_t* __restrict__ out_keys,
     int* __restrict__ out_src,
     double* __restrict__ out_hij,
@@ -294,12 +334,273 @@ __device__ __forceinline__ void cas36_exact_emit_weighted_epq_selected_u64(
           if (overflow_flag) atomicExch(overflow_flag, 1);
           continue;
         }
+        if (csf_i < label_lo || csf_i >= label_hi) continue;
         if (csf_i == source_global_exclude) continue;
-        if (!cas36_sci_contains_u64(membership_hash_keys, membership_hash_cap, csf_i)) {
+        bool in_selected = false;
+        if (membership_hash_keys && membership_hash_cap > 0) {
+          in_selected = cas36_sci_contains_u64(membership_hash_keys, membership_hash_cap, csf_i);
+        }
+        if (target_mode == 0) {
+          if (in_selected) continue;
+        } else {
+          if (!in_selected) continue;
+        }
+        if (w2 == 0.0) {
           continue;
         }
         cas36_exact_emit_tuple_u64(
             out_keys, out_src, out_hij, cap, csf_i, source_local, weight * w2, out_n, overflow_flag);
+      } else {
+        if (top >= MAX_NORB_T) {
+          if (overflow_flag) atomicExch(overflow_flag, 1);
+          continue;
+        }
+        st_k[top] = (int8_t)k_next;
+        st_node[top] = child_k;
+        st_w[top] = w2;
+        st_seg[top] = seg_idx2;
+        ++top;
+      }
+    }
+  }
+}
+
+template <int MAX_NORB_T>
+__device__ __forceinline__ void cas36_exact_emit_weighted_epq_target_rowhash_u64(
+    uint64_t source_global_exclude,
+    uint64_t state_global,
+    int norb,
+    uint64_t ncsf,
+    const int8_t* __restrict__ steps_s,
+    const int32_t* __restrict__ nodes_s,
+    const int8_t* __restrict__ occ_s,
+    const int16_t* __restrict__ b_s,
+    const uint64_t* __restrict__ idx_prefix_s,
+    int p,
+    int q,
+    double weight,
+    const int32_t* __restrict__ child_table,
+    const int16_t* __restrict__ node_twos,
+    const int64_t* __restrict__ child_prefix,
+    uint64_t label_lo,
+    uint64_t label_hi,
+    const uint64_t* __restrict__ membership_hash_keys,
+    int membership_hash_cap,
+    int target_mode,
+    uint64_t* __restrict__ row_hash_keys,
+    double* __restrict__ row_hash_vals,
+    int row_cap,
+    int* __restrict__ overflow_flag) {
+  if (weight == 0.0) return;
+  int occ_p = (int)occ_s[p];
+  int occ_q = (int)occ_s[q];
+  if (occ_q <= 0 || occ_p >= 2) return;
+
+  int start, end, q_start, q_mid, q_end;
+  if (p < q) {
+    start = p;
+    end = q;
+    q_start = Q_uR;
+    q_mid = Q_R;
+    q_end = Q_oR;
+  } else {
+    start = q;
+    end = p;
+    q_start = Q_uL;
+    q_mid = Q_L;
+    q_end = Q_oL;
+  }
+
+  int32_t node_start = nodes_s[start];
+  int32_t node_end_target = nodes_s[end + 1];
+  uint64_t prefix_offset = idx_prefix_s[start];
+  uint64_t prefix_endplus1 = idx_prefix_s[end + 1];
+  if (state_global < prefix_endplus1) return;
+  uint64_t suffix_offset = state_global - prefix_endplus1;
+
+  int8_t st_k[MAX_NORB_T];
+  int32_t st_node[MAX_NORB_T];
+  double st_w[MAX_NORB_T];
+  uint64_t st_seg[MAX_NORB_T];
+  int top = 0;
+  st_k[top] = (int8_t)start;
+  st_node[top] = node_start;
+  st_w[top] = 1.0;
+  st_seg[top] = 0ull;
+  ++top;
+
+  while (top) {
+    --top;
+    double w = st_w[top];
+    int kpos = (int)st_k[top];
+    int node_k = st_node[top];
+    uint64_t seg_idx = st_seg[top];
+
+    int qk = (kpos == start) ? q_start : ((kpos == end) ? q_end : q_mid);
+    int dk = (int)steps_s[kpos];
+    int bk = (int)b_s[kpos];
+    int k_next = kpos + 1;
+
+    int dp0 = 0;
+    int dp1 = 0;
+    int ndp = candidate_dprimes(qk, dk, &dp0, &dp1);
+    if (ndp == 0) continue;
+
+    for (int which = 0; which < ndp; ++which) {
+      int dprime = (which == 0) ? dp0 : dp1;
+      int child_k = child_table[node_k * 4 + dprime];
+      if (child_k < 0) continue;
+      int bprime = (int)node_twos[child_k];
+      int db = bk - bprime;
+      double seg = (double)segment_value_int(qk, dprime, dk, db, bk);
+      if (seg == 0.0) continue;
+      double w2 = w * seg;
+      uint64_t seg_idx2 = seg_idx + (uint64_t)child_prefix[node_k * 5 + dprime];
+      if (kpos == end) {
+        if (child_k != node_end_target) continue;
+        uint64_t csf_i = prefix_offset + seg_idx2 + suffix_offset;
+        if (csf_i >= ncsf) {
+          if (overflow_flag) atomicExch(overflow_flag, 1);
+          continue;
+        }
+        if (csf_i < label_lo || csf_i >= label_hi) continue;
+        if (csf_i == source_global_exclude) continue;
+        bool in_selected = false;
+        if (membership_hash_keys && membership_hash_cap > 0) {
+          in_selected = cas36_sci_contains_u64(membership_hash_keys, membership_hash_cap, csf_i);
+        }
+        if (target_mode == 0) {
+          if (in_selected) continue;
+        } else {
+          if (!in_selected) continue;
+        }
+        if (w2 == 0.0) continue;
+        cas36_rowhash_insert_add_f64_u64(
+            row_hash_keys, row_hash_vals, row_cap, csf_i, weight * w2, overflow_flag);
+      } else {
+        if (top >= MAX_NORB_T) {
+          if (overflow_flag) atomicExch(overflow_flag, 1);
+          continue;
+        }
+        st_k[top] = (int8_t)k_next;
+        st_node[top] = child_k;
+        st_w[top] = w2;
+        st_seg[top] = seg_idx2;
+        ++top;
+      }
+    }
+  }
+}
+
+template <int MAX_NORB_T>
+__device__ __forceinline__ void cas36_exact_apply_weighted_epq_target_hash_many_u64(
+    uint64_t source_global_exclude,
+    uint64_t state_global,
+    int norb,
+    uint64_t ncsf,
+    const int8_t* __restrict__ steps_s,
+    const int32_t* __restrict__ nodes_s,
+    const int8_t* __restrict__ occ_s,
+    const int16_t* __restrict__ b_s,
+    const uint64_t* __restrict__ idx_prefix_s,
+    int p,
+    int q,
+    double weight,
+    const int32_t* __restrict__ child_table,
+    const int16_t* __restrict__ node_twos,
+    const int64_t* __restrict__ child_prefix,
+    uint64_t label_lo,
+    uint64_t label_hi,
+    const uint64_t* __restrict__ membership_hash_keys,
+    int membership_hash_cap,
+    const double* __restrict__ c_row,
+    int nroots,
+    uint64_t* __restrict__ hash_keys,
+    double* __restrict__ hash_vals_root_major,
+    int cap,
+    int* __restrict__ overflow_flag) {
+  if (weight == 0.0) return;
+  int occ_p = (int)occ_s[p];
+  int occ_q = (int)occ_s[q];
+  if (occ_q <= 0 || occ_p >= 2) return;
+
+  int start, end, q_start, q_mid, q_end;
+  if (p < q) {
+    start = p;
+    end = q;
+    q_start = Q_uR;
+    q_mid = Q_R;
+    q_end = Q_oR;
+  } else {
+    start = q;
+    end = p;
+    q_start = Q_uL;
+    q_mid = Q_L;
+    q_end = Q_oL;
+  }
+
+  int32_t node_start = nodes_s[start];
+  int32_t node_end_target = nodes_s[end + 1];
+  uint64_t prefix_offset = idx_prefix_s[start];
+  uint64_t prefix_endplus1 = idx_prefix_s[end + 1];
+  if (state_global < prefix_endplus1) return;
+  uint64_t suffix_offset = state_global - prefix_endplus1;
+
+  int8_t st_k[MAX_NORB_T];
+  int32_t st_node[MAX_NORB_T];
+  double st_w[MAX_NORB_T];
+  uint64_t st_seg[MAX_NORB_T];
+  int top = 0;
+  st_k[top] = (int8_t)start;
+  st_node[top] = node_start;
+  st_w[top] = 1.0;
+  st_seg[top] = 0ull;
+  ++top;
+
+  while (top) {
+    --top;
+    double w = st_w[top];
+    int kpos = (int)st_k[top];
+    int node_k = st_node[top];
+    uint64_t seg_idx = st_seg[top];
+
+    int qk = (kpos == start) ? q_start : ((kpos == end) ? q_end : q_mid);
+    int dk = (int)steps_s[kpos];
+    int bk = (int)b_s[kpos];
+    int k_next = kpos + 1;
+
+    int dp0 = 0;
+    int dp1 = 0;
+    int ndp = candidate_dprimes(qk, dk, &dp0, &dp1);
+    if (ndp == 0) continue;
+
+    for (int which = 0; which < ndp; ++which) {
+      int dprime = (which == 0) ? dp0 : dp1;
+      int child_k = child_table[node_k * 4 + dprime];
+      if (child_k < 0) continue;
+      int bprime = (int)node_twos[child_k];
+      int db = bk - bprime;
+      double seg = (double)segment_value_int(qk, dprime, dk, db, bk);
+      if (seg == 0.0) continue;
+      double w2 = w * seg;
+      uint64_t seg_idx2 = seg_idx + (uint64_t)child_prefix[node_k * 5 + dprime];
+      if (kpos == end) {
+        if (child_k != node_end_target) continue;
+        uint64_t csf_i = prefix_offset + seg_idx2 + suffix_offset;
+        if (csf_i >= ncsf) {
+          if (overflow_flag) atomicExch(overflow_flag, 1);
+          continue;
+        }
+        if (csf_i < label_lo || csf_i >= label_hi) continue;
+        if (csf_i == source_global_exclude) continue;
+        bool in_selected = false;
+        if (membership_hash_keys && membership_hash_cap > 0) {
+          in_selected = cas36_sci_contains_u64(membership_hash_keys, membership_hash_cap, csf_i);
+        }
+        if (in_selected) continue;
+        if (w2 == 0.0) continue;
+        cas36_frontier_hash_insert_add_many_f64_u64(
+            hash_keys, hash_vals_root_major, cap, c_row, nroots, csf_i, weight * w2, overflow_flag);
       } else {
         if (top >= MAX_NORB_T) {
           if (overflow_flag) atomicExch(overflow_flag, 1);
@@ -446,6 +747,56 @@ __device__ __forceinline__ void cas36_frontier_hash_insert_add_f64_u64(
       unsigned long long prev = atomicCAS(ptr, (unsigned long long)EMPTY, (unsigned long long)idx_u64);
       if (prev == (unsigned long long)EMPTY || prev == (unsigned long long)idx_u64) {
         atomicAdd(&vals_root_major[(int64_t)root * (int64_t)cap + (int64_t)slot], v);
+        return;
+      }
+    }
+    slot = (slot + 1ull) & mask;
+  }
+
+  if (overflow_flag) atomicExch(overflow_flag, 1);
+}
+
+template <int MAX_PROBES_T>
+__device__ __forceinline__ void cas36_frontier_hash_insert_add_many_f64_u64(
+    uint64_t* __restrict__ keys,
+    double* __restrict__ vals_root_major,
+    int cap,
+    const double* __restrict__ c_row,
+    int nroots,
+    uint64_t idx_u64,
+    double hij,
+    int* __restrict__ overflow_flag) {
+  if (hij == 0.0 || nroots <= 0) return;
+  if (!keys || !vals_root_major || !c_row || cap <= 0) {
+    if (overflow_flag) atomicExch(overflow_flag, 1);
+    return;
+  }
+
+  uint64_t mask = (uint64_t)(cap - 1);
+  uint64_t slot = cas36_sci_hash_u64(idx_u64) & mask;
+  constexpr uint64_t EMPTY = 0xffffffffffffffffull;
+
+  for (int probe = 0; probe < MAX_PROBES_T; ++probe) {
+    uint64_t cur = keys[slot];
+    if (cur == idx_u64) {
+      for (int root = 0; root < nroots; ++root) {
+        double v = c_row[root] * hij;
+        if (v != 0.0) {
+          atomicAdd(&vals_root_major[(int64_t)root * (int64_t)cap + (int64_t)slot], v);
+        }
+      }
+      return;
+    }
+    if (cur == EMPTY) {
+      unsigned long long* ptr = reinterpret_cast<unsigned long long*>(&keys[slot]);
+      unsigned long long prev = atomicCAS(ptr, (unsigned long long)EMPTY, (unsigned long long)idx_u64);
+      if (prev == (unsigned long long)EMPTY || prev == (unsigned long long)idx_u64) {
+        for (int root = 0; root < nroots; ++root) {
+          double v = c_row[root] * hij;
+          if (v != 0.0) {
+            atomicAdd(&vals_root_major[(int64_t)root * (int64_t)cap + (int64_t)slot], v);
+          }
+        }
         return;
       }
     }
@@ -905,6 +1256,259 @@ void cas36_hb_screen_and_apply_u64_kernel(
 
           cas36_frontier_hash_insert_add_f64_u64(
               hash_keys, hash_vals, cap, root, csf_i, cj * wgt * w2, overflow_flag);
+        } else {
+          if (top >= MAX_NORB_T) {
+            if (overflow_flag) atomicExch(overflow_flag, 1);
+            continue;
+          }
+          st_k[top] = (int8_t)k_next;
+          st_node[top] = child_k;
+          st_w[top] = w2;
+          st_seg[top] = seg_idx2;
+          ++top;
+        }
+      }
+    }
+  }
+}
+
+template <int MAX_NORB_T>
+__global__ __launch_bounds__(256, 2)
+void cas36_hb_screen_and_apply_many_roots_u64_kernel(
+    const uint64_t* __restrict__ sel_idx_u64,   // [nsel]
+    const double* __restrict__ c_sel_row_major, // [nsel, nroots]
+    int nsel,
+    int nroots,
+    int norb,
+    uint64_t ncsf,
+    const int32_t* __restrict__ h1_pq,
+    const double* __restrict__ h1_abs,
+    const double* __restrict__ h1_signed,
+    int n_h1,
+    const int64_t* __restrict__ pq_ptr,
+    const int32_t* __restrict__ rs_idx,
+    const double* __restrict__ v_abs,
+    const double* __restrict__ v_signed,
+    const double* __restrict__ pq_max_v,
+    double eps,
+    const int32_t* __restrict__ child_table,
+    const int16_t* __restrict__ node_twos,
+    const int64_t* __restrict__ child_prefix,
+    uint64_t* __restrict__ hash_keys,
+    double* __restrict__ hash_vals_root_major,
+    int cap,
+    uint64_t label_lo,
+    uint64_t label_hi,
+    const uint64_t* __restrict__ selected_idx_sorted_u64,
+    int nselected,
+    int target_mode,
+    int* __restrict__ overflow_flag,
+    const int8_t* __restrict__ sym_pq_allowed) {  // [norb^2] or NULL
+  int j_local = blockIdx.x;
+  if (j_local >= nsel) return;
+  if (nroots <= 0) return;
+  if (norb > MAX_NORB_T) {
+    if (threadIdx.x == 0) atomicExch(overflow_flag, 1);
+    return;
+  }
+
+  uint64_t j_global = sel_idx_u64[j_local];
+  if (j_global >= ncsf) {
+    if (threadIdx.x == 0) atomicExch(overflow_flag, 1);
+    return;
+  }
+  const double* c_row = c_sel_row_major + (int64_t)j_local * (int64_t)nroots;
+  double max_abs_cj = 0.0;
+  for (int root = 0; root < nroots; ++root) {
+    double a = fabs(c_row[root]);
+    if (a > max_abs_cj) max_abs_cj = a;
+  }
+  if (max_abs_cj == 0.0) return;
+
+  double cutoff = eps / max_abs_cj;
+  int tid = threadIdx.x;
+  int nthreads = blockDim.x;
+  int nops = norb * norb;
+
+  extern __shared__ char smem_raw[];
+  auto align_up_ptr = [](uintptr_t x, uintptr_t a) -> uintptr_t {
+    return (x + (a - 1u)) & ~(a - 1u);
+  };
+  char* smem_p = smem_raw;
+
+  smem_p = reinterpret_cast<char*>(align_up_ptr((uintptr_t)smem_p, (uintptr_t)alignof(double)));
+  double* g_flat_s = reinterpret_cast<double*>(smem_p);
+  smem_p += (size_t)nops * sizeof(double);
+
+  smem_p = reinterpret_cast<char*>(align_up_ptr((uintptr_t)smem_p, (uintptr_t)alignof(int8_t)));
+  int8_t* steps_s = reinterpret_cast<int8_t*>(smem_p);
+  smem_p += (size_t)norb * sizeof(int8_t);
+
+  smem_p = reinterpret_cast<char*>(align_up_ptr((uintptr_t)smem_p, (uintptr_t)alignof(int32_t)));
+  int32_t* nodes_s = reinterpret_cast<int32_t*>(smem_p);
+  smem_p += (size_t)(norb + 1) * sizeof(int32_t);
+
+  smem_p = reinterpret_cast<char*>(align_up_ptr((uintptr_t)smem_p, (uintptr_t)alignof(int8_t)));
+  int8_t* occ_s = reinterpret_cast<int8_t*>(smem_p);
+  smem_p += (size_t)norb * sizeof(int8_t);
+
+  smem_p = reinterpret_cast<char*>(align_up_ptr((uintptr_t)smem_p, (uintptr_t)alignof(int16_t)));
+  int16_t* b_s = reinterpret_cast<int16_t*>(smem_p);
+  smem_p += (size_t)norb * sizeof(int16_t);
+
+  smem_p = reinterpret_cast<char*>(align_up_ptr((uintptr_t)smem_p, (uintptr_t)alignof(uint64_t)));
+  uint64_t* idx_prefix_s = reinterpret_cast<uint64_t*>(smem_p);
+
+  bool ok = cas36_sci_reconstruct_path_from_index_u64<MAX_NORB_T>(
+      child_table, child_prefix, norb, ncsf, j_global, steps_s, nodes_s);
+  if (!ok) {
+    if (tid == 0) atomicExch(overflow_flag, 1);
+    return;
+  }
+
+  for (int k = tid; k < norb; k += nthreads) {
+    int8_t st = steps_s[k];
+    occ_s[k] = (int8_t)step_to_occ(st);
+    b_s[k] = node_twos[nodes_s[k + 1]];
+  }
+  __syncthreads();
+
+  if (tid == 0) {
+    idx_prefix_s[0] = 0ull;
+    for (int k = 0; k < norb; ++k) {
+      int node_k = nodes_s[k];
+      int step_k = (int)steps_s[k];
+      idx_prefix_s[k + 1] = idx_prefix_s[k] + (uint64_t)child_prefix[node_k * 5 + step_k];
+    }
+  }
+  __syncthreads();
+
+  for (int i = tid; i < nops; i += nthreads) g_flat_s[i] = 0.0;
+  __syncthreads();
+
+  for (int k = tid; k < n_h1; k += nthreads) {
+    if (h1_abs[k] < cutoff) break;
+    int p = h1_pq[k * 2];
+    int q = h1_pq[k * 2 + 1];
+    g_flat_s[p * norb + q] = h1_signed[k];
+  }
+  __syncthreads();
+
+  for (int pq = tid; pq < nops; pq += nthreads) {
+    if (sym_pq_allowed != nullptr && !sym_pq_allowed[pq]) continue;
+    if (pq_max_v[pq] < cutoff) continue;
+    int64_t lo = pq_ptr[pq];
+    int64_t hi = pq_ptr[pq + 1];
+    if (lo >= hi) continue;
+
+    double g_acc = 0.0;
+    for (int64_t k = lo; k < hi; ++k) {
+      if (v_abs[k] < cutoff) break;
+      int rs_flat = rs_idx[k];
+      int r = rs_flat / norb;
+      int s = rs_flat - r * norb;
+      double v = v_signed[k];
+      if (r == s) {
+        g_acc += 0.5 * (double)occ_s[r] * v;
+      } else {
+        g_acc += 0.5 * v;
+      }
+    }
+    g_flat_s[pq] += g_acc;
+  }
+  __syncthreads();
+
+  for (int pq = tid; pq < nops; pq += nthreads) {
+    int p = pq / norb;
+    int q = pq - p * norb;
+    if (p == q) continue;
+    if (sym_pq_allowed != nullptr && !sym_pq_allowed[pq]) continue;
+
+    double wgt = g_flat_s[pq];
+    if (wgt == 0.0) continue;
+
+    int occ_p = (int)occ_s[p];
+    int occ_q = (int)occ_s[q];
+    if (occ_q <= 0 || occ_p >= 2) continue;
+
+    int start, end, q_start, q_mid, q_end;
+    if (p < q) {
+      start = p; end = q;
+      q_start = Q_uR; q_mid = Q_R; q_end = Q_oR;
+    } else {
+      start = q; end = p;
+      q_start = Q_uL; q_mid = Q_L; q_end = Q_oL;
+    }
+
+    int32_t node_start = nodes_s[start];
+    int32_t node_end_target = nodes_s[end + 1];
+    uint64_t prefix_offset = idx_prefix_s[start];
+    uint64_t prefix_endplus1 = idx_prefix_s[end + 1];
+    if (j_global < prefix_endplus1) continue;
+    uint64_t suffix_offset = j_global - prefix_endplus1;
+
+    int8_t st_k[MAX_NORB_T];
+    int32_t st_node[MAX_NORB_T];
+    double st_w[MAX_NORB_T];
+    uint64_t st_seg[MAX_NORB_T];
+    int top = 0;
+
+    st_k[top] = (int8_t)start;
+    st_node[top] = node_start;
+    st_w[top] = 1.0;
+    st_seg[top] = 0ull;
+    ++top;
+
+    while (top) {
+      --top;
+      double w = st_w[top];
+      int kpos = (int)st_k[top];
+      int node_k = st_node[top];
+      uint64_t seg_idx = st_seg[top];
+
+      int qk = (kpos == start) ? q_start : ((kpos == end) ? q_end : q_mid);
+      int dk = (int)steps_s[kpos];
+      int bk = (int)b_s[kpos];
+      int k_next = kpos + 1;
+
+      int dp0 = 0;
+      int dp1 = 0;
+      int ndp = candidate_dprimes(qk, dk, &dp0, &dp1);
+      if (ndp == 0) continue;
+
+      for (int which = 0; which < ndp; ++which) {
+        int dprime = (which == 0) ? dp0 : dp1;
+        int child_k = child_table[node_k * 4 + dprime];
+        if (child_k < 0) continue;
+        int bprime = (int)node_twos[child_k];
+        int db = bk - bprime;
+        double seg = (double)segment_value_int(qk, dprime, dk, db, bk);
+        if (seg == 0.0) continue;
+        double w2 = w * seg;
+        uint64_t seg_idx2 = seg_idx + (uint64_t)child_prefix[node_k * 5 + dprime];
+
+        if (kpos == end) {
+          if (child_k != node_end_target) continue;
+          uint64_t csf_i = prefix_offset + seg_idx2 + suffix_offset;
+          if (csf_i >= ncsf) {
+            if (overflow_flag) atomicExch(overflow_flag, 1);
+            continue;
+          }
+          if (csf_i < label_lo || csf_i >= label_hi) continue;
+          if (target_mode == 0 && csf_i == j_global) continue;
+          bool in_selected = false;
+          if (selected_idx_sorted_u64) {
+            in_selected = cas36_sci_contains_sorted_u64(selected_idx_sorted_u64, nselected, csf_i);
+          }
+          if (target_mode == 0) {
+            if (in_selected) continue;
+          } else if (target_mode == 1) {
+            if (!in_selected) continue;
+          }
+          if (w2 == 0.0) continue;
+
+          cas36_frontier_hash_insert_add_many_f64_u64(
+              hash_keys, hash_vals_root_major, cap, c_row, nroots, csf_i, wgt * w2, overflow_flag);
         } else {
           if (top >= MAX_NORB_T) {
             if (overflow_flag) atomicExch(overflow_flag, 1);
@@ -1632,6 +2236,108 @@ extern "C" cudaError_t cas36_hb_screen_and_apply_u64_launch_stream(
   return cudaGetLastError();
 }
 
+extern "C" cudaError_t cas36_hb_screen_and_apply_many_roots_u64_launch_stream(
+    const uint64_t* sel_idx_u64,
+    const double* c_sel_row_major,
+    int nsel,
+    int nroots,
+    int norb,
+    uint64_t ncsf,
+    const int32_t* h1_pq,
+    const double* h1_abs,
+    const double* h1_signed,
+    int n_h1,
+    const int64_t* pq_ptr,
+    const int32_t* rs_idx,
+    const double* v_abs,
+    const double* v_signed,
+    const double* pq_max_v,
+    double eps,
+    const int32_t* child_table,
+    const int16_t* node_twos,
+    const int64_t* child_prefix,
+    uint64_t* hash_keys,
+    double* hash_vals_root_major,
+    int cap,
+    uint64_t label_lo,
+    uint64_t label_hi,
+    const uint64_t* selected_idx_sorted_u64,
+    int nselected,
+    int target_mode,
+    int* overflow_flag,
+    cudaStream_t stream,
+    int threads,
+    const int8_t* sym_pq_allowed) {
+  if (!sel_idx_u64 || !c_sel_row_major || !h1_pq || !h1_abs || !h1_signed || !pq_ptr || !rs_idx || !v_abs ||
+      !v_signed || !pq_max_v || !child_table || !node_twos || !child_prefix || !hash_keys ||
+      !hash_vals_root_major || !overflow_flag) {
+    return cudaErrorInvalidValue;
+  }
+  if (nsel < 0 || nroots <= 0 || norb <= 0 || norb > 64 || n_h1 < 0 || cap <= 0 || threads <= 0 || threads > 1024) {
+    return cudaErrorInvalidValue;
+  }
+  if (target_mode < 0 || target_mode > 1) {
+    return cudaErrorInvalidValue;
+  }
+  if ((cap & (cap - 1)) != 0) {
+    return cudaErrorInvalidValue;
+  }
+  if (nsel == 0) {
+    return cudaSuccess;
+  }
+  if (label_hi <= label_lo) {
+    return cudaSuccess;
+  }
+
+  auto align_up = [](size_t x, size_t a) -> size_t {
+    return (x + (a - 1u)) & ~(a - 1u);
+  };
+  const int nops = norb * norb;
+  size_t smem_bytes = 0u;
+  smem_bytes = align_up(smem_bytes, alignof(double));
+  smem_bytes += (size_t)nops * sizeof(double);
+  smem_bytes = align_up(smem_bytes, alignof(int8_t));
+  smem_bytes += (size_t)norb * sizeof(int8_t);
+  smem_bytes = align_up(smem_bytes, alignof(int32_t));
+  smem_bytes += (size_t)(norb + 1) * sizeof(int32_t);
+  smem_bytes = align_up(smem_bytes, alignof(int8_t));
+  smem_bytes += (size_t)norb * sizeof(int8_t);
+  smem_bytes = align_up(smem_bytes, alignof(int16_t));
+  smem_bytes += (size_t)norb * sizeof(int16_t);
+  smem_bytes = align_up(smem_bytes, alignof(uint64_t));
+  smem_bytes += (size_t)(norb + 1) * sizeof(uint64_t);
+
+  dim3 grid((unsigned)nsel);
+  dim3 block((unsigned)threads);
+  if (norb <= 16) {
+    cas36_hb_screen_and_apply_many_roots_u64_kernel<16><<<grid, block, smem_bytes, stream>>>(
+        sel_idx_u64, c_sel_row_major, nsel, nroots, norb, ncsf, h1_pq, h1_abs, h1_signed, n_h1, pq_ptr, rs_idx,
+        v_abs, v_signed, pq_max_v, eps, child_table, node_twos, child_prefix, hash_keys, hash_vals_root_major, cap,
+        label_lo, label_hi, selected_idx_sorted_u64, nselected, target_mode, overflow_flag, sym_pq_allowed);
+  } else if (norb <= 24) {
+    cas36_hb_screen_and_apply_many_roots_u64_kernel<24><<<grid, block, smem_bytes, stream>>>(
+        sel_idx_u64, c_sel_row_major, nsel, nroots, norb, ncsf, h1_pq, h1_abs, h1_signed, n_h1, pq_ptr, rs_idx,
+        v_abs, v_signed, pq_max_v, eps, child_table, node_twos, child_prefix, hash_keys, hash_vals_root_major, cap,
+        label_lo, label_hi, selected_idx_sorted_u64, nselected, target_mode, overflow_flag, sym_pq_allowed);
+  } else if (norb <= 32) {
+    cas36_hb_screen_and_apply_many_roots_u64_kernel<32><<<grid, block, smem_bytes, stream>>>(
+        sel_idx_u64, c_sel_row_major, nsel, nroots, norb, ncsf, h1_pq, h1_abs, h1_signed, n_h1, pq_ptr, rs_idx,
+        v_abs, v_signed, pq_max_v, eps, child_table, node_twos, child_prefix, hash_keys, hash_vals_root_major, cap,
+        label_lo, label_hi, selected_idx_sorted_u64, nselected, target_mode, overflow_flag, sym_pq_allowed);
+  } else if (norb <= 48) {
+    cas36_hb_screen_and_apply_many_roots_u64_kernel<48><<<grid, block, smem_bytes, stream>>>(
+        sel_idx_u64, c_sel_row_major, nsel, nroots, norb, ncsf, h1_pq, h1_abs, h1_signed, n_h1, pq_ptr, rs_idx,
+        v_abs, v_signed, pq_max_v, eps, child_table, node_twos, child_prefix, hash_keys, hash_vals_root_major, cap,
+        label_lo, label_hi, selected_idx_sorted_u64, nselected, target_mode, overflow_flag, sym_pq_allowed);
+  } else {
+    cas36_hb_screen_and_apply_many_roots_u64_kernel<64><<<grid, block, smem_bytes, stream>>>(
+        sel_idx_u64, c_sel_row_major, nsel, nroots, norb, ncsf, h1_pq, h1_abs, h1_signed, n_h1, pq_ptr, rs_idx,
+        v_abs, v_signed, pq_max_v, eps, child_table, node_twos, child_prefix, hash_keys, hash_vals_root_major, cap,
+        label_lo, label_hi, selected_idx_sorted_u64, nselected, target_mode, overflow_flag, sym_pq_allowed);
+  }
+  return cudaGetLastError();
+}
+
 extern "C" cudaError_t cas36_hb_emit_tuples_u64_launch_stream(
     const uint64_t* sel_idx_u64,
     const double* c_bound,
@@ -1833,7 +2539,7 @@ extern "C" cudaError_t cas36_exact_selected_emit_tuples_u64_launch_stream(
 
 template <int MAX_NORB_T>
 __global__ __launch_bounds__(256)
-void cas36_exact_selected_emit_tuples_dense_u64_kernel(
+void cas36_exact_emit_tuples_dense_u64_kernel(
     const uint64_t* __restrict__ sel_idx_u64,
     const double* __restrict__ c_bound,
     int nsel,
@@ -1848,8 +2554,11 @@ void cas36_exact_selected_emit_tuples_dense_u64_kernel(
     int* __restrict__ out_src,
     double* __restrict__ out_hij,
     int cap,
+    uint64_t label_lo,
+    uint64_t label_hi,
     const uint64_t* __restrict__ membership_hash_keys,
     int membership_hash_cap,
+    int target_mode,
     double* __restrict__ out_diag,
     int* __restrict__ out_n,
     int* __restrict__ overflow_flag) {
@@ -1924,7 +2633,7 @@ void cas36_exact_selected_emit_tuples_dense_u64_kernel(
       diag_local += hpq * (double)occ_j_s[p];
       continue;
     }
-    cas36_exact_emit_weighted_epq_selected_u64<MAX_NORB_T>(
+    cas36_exact_emit_weighted_epq_target_u64<MAX_NORB_T>(
         j_global,
         j_local,
         j_global,
@@ -1941,8 +2650,11 @@ void cas36_exact_selected_emit_tuples_dense_u64_kernel(
         child_table,
         node_twos,
         child_prefix,
+        label_lo,
+        label_hi,
         membership_hash_keys,
         membership_hash_cap,
+        target_mode,
         out_keys,
         out_src,
         out_hij,
@@ -2109,8 +2821,17 @@ void cas36_exact_selected_emit_tuples_dense_u64_kernel(
           diag_contrib += 0.5 * ki_crs *
               cas36_dense_eri4_at(eri4, norb, p, p, ki_r, ki_s) * (double)occ_p;
         }
-        if (diag_contrib != 0.0 && ki_global != j_global &&
-            cas36_sci_contains_u64(membership_hash_keys, membership_hash_cap, ki_global)) {
+        bool in_selected = false;
+        if (membership_hash_keys && membership_hash_cap > 0) {
+          in_selected = cas36_sci_contains_u64(membership_hash_keys, membership_hash_cap, ki_global);
+        }
+        bool emit_diag = diag_contrib != 0.0 && ki_global != j_global && ki_global >= label_lo && ki_global < label_hi;
+        if (target_mode == 0) {
+          emit_diag = emit_diag && !in_selected;
+        } else {
+          emit_diag = emit_diag && in_selected;
+        }
+        if (emit_diag) {
           cas36_exact_emit_tuple_u64(
               out_keys, out_src, out_hij, cap, ki_global, j_local, diag_contrib, out_n, overflow_flag);
         }
@@ -2128,12 +2849,13 @@ void cas36_exact_selected_emit_tuples_dense_u64_kernel(
             _p2_steps, _p2_nodes, _p2_occ, _p2_b, _p2_idx_prefix,
             p, q, gpq,
             child_table, node_twos, child_prefix);
-        cas36_exact_emit_weighted_epq_selected_u64<MAX_NORB_T>(
+        cas36_exact_emit_weighted_epq_target_u64<MAX_NORB_T>(
             j_global, j_local, ki_global, norb, ncsf,
             _p2_steps, _p2_nodes, _p2_occ, _p2_b, _p2_idx_prefix,
             p, q, gpq,
             child_table, node_twos, child_prefix,
-            membership_hash_keys, membership_hash_cap,
+            label_lo, label_hi,
+            membership_hash_keys, membership_hash_cap, target_mode,
             out_keys, out_src, out_hij, cap, out_n, overflow_flag);
       }
       __syncthreads();
@@ -2243,8 +2965,17 @@ void cas36_exact_selected_emit_tuples_dense_u64_kernel(
             diag_contrib += 0.5 * c_rs *
                 cas36_dense_eri4_at(eri4, norb, p, p, r, s) * (double)occ_p;
           }
-          if (diag_contrib != 0.0 && k_global != j_global &&
-              cas36_sci_contains_u64(membership_hash_keys, membership_hash_cap, k_global)) {
+          bool in_selected = false;
+          if (membership_hash_keys && membership_hash_cap > 0) {
+            in_selected = cas36_sci_contains_u64(membership_hash_keys, membership_hash_cap, k_global);
+          }
+          bool emit_diag = diag_contrib != 0.0 && k_global != j_global && k_global >= label_lo && k_global < label_hi;
+          if (target_mode == 0) {
+            emit_diag = emit_diag && !in_selected;
+          } else {
+            emit_diag = emit_diag && in_selected;
+          }
+          if (emit_diag) {
             cas36_exact_emit_tuple_u64(
                 out_keys, out_src, out_hij, cap, k_global, j_local, diag_contrib, out_n, overflow_flag);
           }
@@ -2260,12 +2991,13 @@ void cas36_exact_selected_emit_tuples_dense_u64_kernel(
                 steps_k, nodes_k, occ_k, b_k, idx_prefix_k,
                 p, q, gpq,
                 child_table, node_twos, child_prefix);
-            cas36_exact_emit_weighted_epq_selected_u64<MAX_NORB_T>(
+            cas36_exact_emit_weighted_epq_target_u64<MAX_NORB_T>(
                 j_global, j_local, k_global, norb, ncsf,
                 steps_k, nodes_k, occ_k, b_k, idx_prefix_k,
                 p, q, gpq,
                 child_table, node_twos, child_prefix,
-                membership_hash_keys, membership_hash_cap,
+                label_lo, label_hi,
+                membership_hash_keys, membership_hash_cap, target_mode,
                 out_keys, out_src, out_hij, cap, out_n, overflow_flag);
           }
         }
@@ -2273,6 +3005,948 @@ void cas36_exact_selected_emit_tuples_dense_u64_kernel(
     }
   }
   if (out_diag && diag_local != 0.0) atomicAdd(&out_diag[j_local], diag_local);
+}
+
+template <int MAX_NORB_T>
+__global__ __launch_bounds__(256)
+void cas36_exact_emit_rowhash_dense_u64_kernel(
+    const uint64_t* __restrict__ sel_idx_u64,
+    const double* __restrict__ c_bound,
+    int nsel,
+    int norb,
+    uint64_t ncsf,
+    const double* __restrict__ h_base,
+    const double* __restrict__ eri4,
+    const int32_t* __restrict__ child_table,
+    const int16_t* __restrict__ node_twos,
+    const int64_t* __restrict__ child_prefix,
+    uint64_t* __restrict__ row_hash_keys,
+    double* __restrict__ row_hash_vals,
+    int row_cap,
+    uint64_t label_lo,
+    uint64_t label_hi,
+    const uint64_t* __restrict__ membership_hash_keys,
+    int membership_hash_cap,
+    int target_mode,
+    double* __restrict__ out_diag,
+    int* __restrict__ overflow_flag) {
+  int j_local = blockIdx.x;
+  if (j_local >= nsel) return;
+  if (norb > MAX_NORB_T) {
+    if (threadIdx.x == 0) atomicExch(overflow_flag, 1);
+    return;
+  }
+  uint64_t j_global = sel_idx_u64[j_local];
+  if (j_global >= ncsf) {
+    if (threadIdx.x == 0) atomicExch(overflow_flag, 1);
+    return;
+  }
+  if (c_bound && c_bound[j_local] == 0.0) return;
+
+  constexpr uint64_t EMPTY = 0xFFFFFFFFFFFFFFFFull;
+  int tid = threadIdx.x;
+  int nthreads = blockDim.x;
+  int nops = norb * norb;
+  uint64_t* row_keys = row_hash_keys + (int64_t)j_local * (int64_t)row_cap;
+  double* row_vals = row_hash_vals + (int64_t)j_local * (int64_t)row_cap;
+  for (int slot = tid; slot < row_cap; slot += nthreads) {
+    row_keys[slot] = EMPTY;
+    row_vals[slot] = 0.0;
+  }
+
+  __shared__ int8_t steps_j_s[MAX_NORB_T];
+  __shared__ int32_t nodes_j_s[MAX_NORB_T + 1];
+  __shared__ int8_t occ_j_s[MAX_NORB_T];
+  __shared__ int16_t b_j_s[MAX_NORB_T];
+  __shared__ uint64_t idx_prefix_j_s[MAX_NORB_T + 1];
+  extern __shared__ char _dyn_smem_rowhash[];
+  double* _h1e_cache = (double*)_dyn_smem_rowhash;
+
+  bool ok = cas36_sci_reconstruct_path_from_index_u64<MAX_NORB_T>(
+      child_table, child_prefix, norb, ncsf, j_global, steps_j_s, nodes_j_s);
+  if (!ok) {
+    if (tid == 0) atomicExch(overflow_flag, 1);
+    return;
+  }
+
+  for (int k = tid; k < norb; k += nthreads) {
+    int8_t st = steps_j_s[k];
+    occ_j_s[k] = (int8_t)step_to_occ(st);
+    b_j_s[k] = node_twos[nodes_j_s[k + 1]];
+  }
+  __syncthreads();
+
+  if (tid == 0) {
+    idx_prefix_j_s[0] = 0ull;
+    for (int k = 0; k < norb; ++k) {
+      int node_k = nodes_j_s[k];
+      int step_k = (int)steps_j_s[k];
+      idx_prefix_j_s[k + 1] = idx_prefix_j_s[k] + (uint64_t)child_prefix[node_k * 5 + step_k];
+    }
+    if (out_diag) out_diag[j_local] = 0.0;
+  }
+  __syncthreads();
+
+  for (int i = tid; i < nops; i += nthreads) _h1e_cache[i] = h_base[i];
+  __syncthreads();
+  double diag_local = 0.0;
+
+  for (int pq = tid; pq < nops; pq += nthreads) {
+    int p = pq / norb;
+    int q = pq - p * norb;
+    double hpq = _h1e_cache[pq];
+    for (int r = 0; r < norb; ++r) {
+      int occ_r = (int)occ_j_s[r];
+      if (occ_r == 0) continue;
+      hpq += 0.5 * cas36_dense_eri4_at(eri4, norb, p, q, r, r) * (double)occ_r;
+    }
+    if (hpq == 0.0) continue;
+    if (p == q) {
+      diag_local += hpq * (double)occ_j_s[p];
+      continue;
+    }
+    cas36_exact_emit_weighted_epq_target_rowhash_u64<MAX_NORB_T>(
+        j_global,
+        j_global,
+        norb,
+        ncsf,
+        steps_j_s,
+        nodes_j_s,
+        occ_j_s,
+        b_j_s,
+        idx_prefix_j_s,
+        p,
+        q,
+        hpq,
+        child_table,
+        node_twos,
+        child_prefix,
+        label_lo,
+        label_hi,
+        membership_hash_keys,
+        membership_hash_cap,
+        target_mode,
+        row_keys,
+        row_vals,
+        row_cap,
+        overflow_flag);
+  }
+
+  enum { EMIT_ROWHASH_MAX_INTERMEDIATES = 2048 };
+  __shared__ uint64_t _interm_k_global[EMIT_ROWHASH_MAX_INTERMEDIATES];
+  __shared__ int8_t   _interm_r[EMIT_ROWHASH_MAX_INTERMEDIATES];
+  __shared__ int8_t   _interm_s[EMIT_ROWHASH_MAX_INTERMEDIATES];
+  __shared__ double   _interm_crs[EMIT_ROWHASH_MAX_INTERMEDIATES];
+  __shared__ int      _interm_count;
+  __shared__ int      _interm_overflow;
+  __shared__ int8_t   _p2_steps[MAX_NORB_T];
+  __shared__ int32_t  _p2_nodes[MAX_NORB_T + 1];
+  __shared__ int8_t   _p2_occ[MAX_NORB_T];
+  __shared__ int16_t  _p2_b[MAX_NORB_T];
+  __shared__ uint64_t _p2_idx_prefix[MAX_NORB_T + 1];
+
+  if (tid == 0) { _interm_count = 0; _interm_overflow = 0; }
+  __syncthreads();
+
+  for (int rs = tid; rs < nops; rs += nthreads) {
+    int r = rs / norb;
+    int s = rs - r * norb;
+    if (r == s) continue;
+    if ((int)occ_j_s[s] <= 0 || (int)occ_j_s[r] >= 2) continue;
+
+    int start_p1, end_p1, q_start_p1, q_mid_p1, q_end_p1;
+    if (r < s) {
+      start_p1 = r; end_p1 = s;
+      q_start_p1 = Q_uR; q_mid_p1 = Q_R; q_end_p1 = Q_oR;
+    } else {
+      start_p1 = s; end_p1 = r;
+      q_start_p1 = Q_uL; q_mid_p1 = Q_L; q_end_p1 = Q_oL;
+    }
+
+    int32_t node_start_p1 = nodes_j_s[start_p1];
+    int32_t node_end_target_p1 = nodes_j_s[end_p1 + 1];
+    uint64_t prefix_offset_p1 = idx_prefix_j_s[start_p1];
+    uint64_t prefix_endplus1_p1 = idx_prefix_j_s[end_p1 + 1];
+    if (j_global < prefix_endplus1_p1) continue;
+    uint64_t suffix_offset_p1 = j_global - prefix_endplus1_p1;
+
+    int8_t st_k_p1[MAX_NORB_T];
+    int32_t st_node_p1[MAX_NORB_T];
+    double st_w_p1[MAX_NORB_T];
+    uint64_t st_seg_p1[MAX_NORB_T];
+    int top_p1 = 0;
+    st_k_p1[top_p1] = (int8_t)start_p1;
+    st_node_p1[top_p1] = node_start_p1;
+    st_w_p1[top_p1] = 1.0;
+    st_seg_p1[top_p1] = 0ull;
+    ++top_p1;
+
+    while (top_p1) {
+      --top_p1;
+      double w_p1 = st_w_p1[top_p1];
+      int kpos_p1 = (int)st_k_p1[top_p1];
+      int node_k_p1 = st_node_p1[top_p1];
+      uint64_t seg_idx_p1 = st_seg_p1[top_p1];
+      int qk_p1 = (kpos_p1 == start_p1) ? q_start_p1 : ((kpos_p1 == end_p1) ? q_end_p1 : q_mid_p1);
+      int dk_p1 = (int)steps_j_s[kpos_p1];
+      int bk_p1 = (int)b_j_s[kpos_p1];
+      int k_next_p1 = kpos_p1 + 1;
+
+      int dp0_p1 = 0, dp1_p1 = 0;
+      int ndp_p1 = candidate_dprimes(qk_p1, dk_p1, &dp0_p1, &dp1_p1);
+      if (ndp_p1 == 0) continue;
+      for (int which_p1 = 0; which_p1 < ndp_p1; ++which_p1) {
+        int dprime_p1 = (which_p1 == 0) ? dp0_p1 : dp1_p1;
+        int child_k_p1 = child_table[node_k_p1 * 4 + dprime_p1];
+        if (child_k_p1 < 0) continue;
+        int bprime_p1 = (int)node_twos[child_k_p1];
+        int db_p1 = bk_p1 - bprime_p1;
+        double seg_p1 = (double)segment_value_int(qk_p1, dprime_p1, dk_p1, db_p1, bk_p1);
+        if (seg_p1 == 0.0) continue;
+        double c_rs_p1 = w_p1 * seg_p1;
+        uint64_t seg_idx2_p1 = seg_idx_p1 + (uint64_t)child_prefix[node_k_p1 * 5 + dprime_p1];
+        if (kpos_p1 != end_p1) {
+          if (top_p1 >= MAX_NORB_T) {
+            if (overflow_flag) atomicExch(overflow_flag, 1);
+            continue;
+          }
+          st_k_p1[top_p1] = (int8_t)k_next_p1;
+          st_node_p1[top_p1] = child_k_p1;
+          st_w_p1[top_p1] = c_rs_p1;
+          st_seg_p1[top_p1] = seg_idx2_p1;
+          ++top_p1;
+          continue;
+        }
+        if (child_k_p1 != node_end_target_p1) continue;
+        uint64_t k_global_p1 = prefix_offset_p1 + seg_idx2_p1 + suffix_offset_p1;
+        if (k_global_p1 >= ncsf) {
+          if (overflow_flag) atomicExch(overflow_flag, 1);
+          continue;
+        }
+        int slot = atomicAdd(&_interm_count, 1);
+        if (slot < EMIT_ROWHASH_MAX_INTERMEDIATES) {
+          _interm_k_global[slot] = k_global_p1;
+          _interm_r[slot] = (int8_t)r;
+          _interm_s[slot] = (int8_t)s;
+          _interm_crs[slot] = c_rs_p1;
+        } else {
+          atomicExch(&_interm_overflow, 1);
+        }
+      }
+    }
+  }
+  __syncthreads();
+
+  if (!_interm_overflow) {
+    int n_ki = _interm_count;
+    for (int ki = 0; ki < n_ki; ++ki) {
+      uint64_t ki_global = _interm_k_global[ki];
+      int ki_r = (int)_interm_r[ki];
+      int ki_s = (int)_interm_s[ki];
+      double ki_crs = _interm_crs[ki];
+
+      if (tid == 0) {
+        bool ok_p2 = cas36_sci_reconstruct_path_from_index_u64<MAX_NORB_T>(
+            child_table, child_prefix, norb, ncsf, ki_global, _p2_steps, _p2_nodes);
+        if (!ok_p2) {
+          _p2_nodes[0] = -1;
+        } else {
+          _p2_idx_prefix[0] = 0ull;
+          for (int kk = 0; kk < norb; ++kk) {
+            _p2_occ[kk] = (int8_t)step_to_occ(_p2_steps[kk]);
+            _p2_b[kk] = node_twos[_p2_nodes[kk + 1]];
+            _p2_idx_prefix[kk + 1] = _p2_idx_prefix[kk] +
+                (uint64_t)child_prefix[_p2_nodes[kk] * 5 + (int)_p2_steps[kk]];
+          }
+        }
+      }
+      __syncthreads();
+
+      if (_p2_nodes[0] < 0) {
+        if (tid == 0 && overflow_flag) atomicExch(overflow_flag, 1);
+        __syncthreads();
+        continue;
+      }
+
+      if (tid == 0) {
+        double diag_contrib = 0.0;
+        for (int p = 0; p < norb; ++p) {
+          int occ_p = (int)_p2_occ[p];
+          if (occ_p == 0) continue;
+          diag_contrib += 0.5 * ki_crs *
+              cas36_dense_eri4_at(eri4, norb, p, p, ki_r, ki_s) * (double)occ_p;
+        }
+        bool in_selected = false;
+        if (membership_hash_keys && membership_hash_cap > 0) {
+          in_selected = cas36_sci_contains_u64(membership_hash_keys, membership_hash_cap, ki_global);
+        }
+        bool emit_diag = diag_contrib != 0.0 && ki_global != j_global && ki_global >= label_lo && ki_global < label_hi;
+        if (target_mode == 0) {
+          emit_diag = emit_diag && !in_selected;
+        } else {
+          emit_diag = emit_diag && in_selected;
+        }
+        if (emit_diag) {
+          cas36_rowhash_insert_add_f64_u64(
+              row_keys, row_vals, row_cap, ki_global, diag_contrib, overflow_flag);
+        }
+      }
+
+      for (int pq2 = tid; pq2 < nops; pq2 += nthreads) {
+        int p = pq2 / norb;
+        int q = pq2 - p * norb;
+        if (p == q) continue;
+        double gpq = 0.5 * ki_crs * cas36_dense_eri4_at(eri4, norb, p, q, ki_r, ki_s);
+        if (gpq == 0.0) continue;
+        diag_local += cas36_exact_accumulate_weighted_epq_self_u64<MAX_NORB_T>(
+            j_global, ki_global, norb, ncsf,
+            _p2_steps, _p2_nodes, _p2_occ, _p2_b, _p2_idx_prefix,
+            p, q, gpq,
+            child_table, node_twos, child_prefix);
+        cas36_exact_emit_weighted_epq_target_rowhash_u64<MAX_NORB_T>(
+            j_global, ki_global, norb, ncsf,
+            _p2_steps, _p2_nodes, _p2_occ, _p2_b, _p2_idx_prefix,
+            p, q, gpq,
+            child_table, node_twos, child_prefix,
+            label_lo, label_hi,
+            membership_hash_keys, membership_hash_cap, target_mode,
+            row_keys, row_vals, row_cap, overflow_flag);
+      }
+      __syncthreads();
+    }
+  } else {
+    if (tid == 0 && overflow_flag) atomicExch(overflow_flag, 1);
+  }
+
+  if (out_diag && diag_local != 0.0) atomicAdd(&out_diag[j_local], diag_local);
+}
+
+extern "C" cudaError_t cas36_exact_emit_rowhash_dense_u64_launch_stream(
+    const uint64_t* sel_idx_u64,
+    const double* c_bound,
+    int nsel,
+    int norb,
+    uint64_t ncsf,
+    const double* h_base,
+    const double* eri4,
+    const int32_t* child_table,
+    const int16_t* node_twos,
+    const int64_t* child_prefix,
+    uint64_t* row_hash_keys,
+    double* row_hash_vals,
+    int row_cap,
+    uint64_t label_lo,
+    uint64_t label_hi,
+    const uint64_t* membership_hash_keys,
+    int membership_hash_cap,
+    int target_mode,
+    double* out_diag,
+    int* overflow_flag,
+    cudaStream_t stream,
+    int threads) {
+  if (!sel_idx_u64 || !c_bound || !h_base || !eri4 || !child_table || !node_twos || !child_prefix ||
+      !row_hash_keys || !row_hash_vals || !overflow_flag || nsel < 0 || norb <= 0 || row_cap <= 0) {
+    return cudaErrorInvalidValue;
+  }
+  if ((row_cap & (row_cap - 1)) != 0) {
+    return cudaErrorInvalidValue;
+  }
+  if (nsel == 0) return cudaSuccess;
+  dim3 block((unsigned int)threads);
+  dim3 grid((unsigned int)nsel);
+  size_t smem_bytes = (size_t)norb * (size_t)norb * sizeof(double);
+
+#define LAUNCH_DENSE_EMIT_ROWHASH_KERNEL_(NORB_T) \
+    do { \
+      auto _kfn = cas36_exact_emit_rowhash_dense_u64_kernel<NORB_T>; \
+      if (smem_bytes > 48u * 1024u) { \
+        cudaFuncSetAttribute(_kfn, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem_bytes); \
+      } \
+      _kfn<<<grid, block, smem_bytes, stream>>>( \
+          sel_idx_u64, c_bound, nsel, norb, ncsf, h_base, eri4, child_table, node_twos, child_prefix, \
+          row_hash_keys, row_hash_vals, row_cap, label_lo, label_hi, membership_hash_keys, membership_hash_cap, \
+          target_mode, out_diag, overflow_flag); \
+    } while(0)
+
+  if (norb <= 8) {
+    LAUNCH_DENSE_EMIT_ROWHASH_KERNEL_(8);
+  } else if (norb <= 16) {
+    LAUNCH_DENSE_EMIT_ROWHASH_KERNEL_(16);
+  } else if (norb <= 24) {
+    LAUNCH_DENSE_EMIT_ROWHASH_KERNEL_(24);
+  } else {
+    LAUNCH_DENSE_EMIT_ROWHASH_KERNEL_(32);
+  }
+
+#undef LAUNCH_DENSE_EMIT_ROWHASH_KERNEL_
+  return cudaGetLastError();
+}
+
+template <int MAX_NORB_T>
+__global__ __launch_bounds__(256)
+void cas36_exact_external_apply_dense_many_roots_u64_kernel(
+    const uint64_t* __restrict__ sel_idx_u64,
+    const double* __restrict__ c_sel_row_major,
+    int nsel,
+    int nroots,
+    int norb,
+    uint64_t ncsf,
+    const double* __restrict__ h_base,
+    const double* __restrict__ eri4,
+    const int32_t* __restrict__ child_table,
+    const int16_t* __restrict__ node_twos,
+    const int64_t* __restrict__ child_prefix,
+    uint64_t* __restrict__ hash_keys,
+    double* __restrict__ hash_vals_root_major,
+    int cap,
+    uint64_t label_lo,
+    uint64_t label_hi,
+    const uint64_t* __restrict__ membership_hash_keys,
+    int membership_hash_cap,
+    int* __restrict__ overflow_flag) {
+  int j_local = blockIdx.x;
+  if (j_local >= nsel) return;
+  if (nroots <= 0) return;
+  if (norb > MAX_NORB_T) {
+    if (threadIdx.x == 0) atomicExch(overflow_flag, 1);
+    return;
+  }
+  uint64_t j_global = sel_idx_u64[j_local];
+  if (j_global >= ncsf) {
+    if (threadIdx.x == 0) atomicExch(overflow_flag, 1);
+    return;
+  }
+
+  const double* c_row = c_sel_row_major + (int64_t)j_local * (int64_t)nroots;
+  double max_abs_cj = 0.0;
+  for (int root = 0; root < nroots; ++root) {
+    double a = fabs(c_row[root]);
+    if (a > max_abs_cj) max_abs_cj = a;
+  }
+  if (max_abs_cj == 0.0) return;
+
+  int tid = threadIdx.x;
+  int nthreads = blockDim.x;
+  int nops = norb * norb;
+
+  __shared__ int8_t steps_j_s[MAX_NORB_T];
+  __shared__ int32_t nodes_j_s[MAX_NORB_T + 1];
+  __shared__ int8_t occ_j_s[MAX_NORB_T];
+  __shared__ int16_t b_j_s[MAX_NORB_T];
+  __shared__ uint64_t idx_prefix_j_s[MAX_NORB_T + 1];
+  extern __shared__ char _dyn_smem_apply[];
+  double* _h1e_cache = (double*)_dyn_smem_apply;
+
+  bool ok = cas36_sci_reconstruct_path_from_index_u64<MAX_NORB_T>(
+      child_table, child_prefix, norb, ncsf, j_global, steps_j_s, nodes_j_s);
+  if (!ok) {
+    if (tid == 0) atomicExch(overflow_flag, 1);
+    return;
+  }
+
+  for (int k = tid; k < norb; k += nthreads) {
+    int8_t st = steps_j_s[k];
+    occ_j_s[k] = (int8_t)step_to_occ(st);
+    b_j_s[k] = node_twos[nodes_j_s[k + 1]];
+  }
+  __syncthreads();
+
+  if (tid == 0) {
+    idx_prefix_j_s[0] = 0ull;
+    for (int k = 0; k < norb; ++k) {
+      int node_k = nodes_j_s[k];
+      int step_k = (int)steps_j_s[k];
+      idx_prefix_j_s[k + 1] = idx_prefix_j_s[k] + (uint64_t)child_prefix[node_k * 5 + step_k];
+    }
+  }
+  __syncthreads();
+
+  for (int i = tid; i < nops; i += nthreads) _h1e_cache[i] = h_base[i];
+  __syncthreads();
+
+  for (int pq = tid; pq < nops; pq += nthreads) {
+    int p = pq / norb;
+    int q = pq - p * norb;
+    double hpq = _h1e_cache[pq];
+    for (int r = 0; r < norb; ++r) {
+      int occ_r = (int)occ_j_s[r];
+      if (occ_r == 0) continue;
+      hpq += 0.5 * cas36_dense_eri4_at(eri4, norb, p, q, r, r) * (double)occ_r;
+    }
+    if (hpq == 0.0 || p == q) continue;
+    cas36_exact_apply_weighted_epq_target_hash_many_u64<MAX_NORB_T>(
+        j_global,
+        j_global,
+        norb,
+        ncsf,
+        steps_j_s,
+        nodes_j_s,
+        occ_j_s,
+        b_j_s,
+        idx_prefix_j_s,
+        p,
+        q,
+        hpq,
+        child_table,
+        node_twos,
+        child_prefix,
+        label_lo,
+        label_hi,
+        membership_hash_keys,
+        membership_hash_cap,
+        c_row,
+        nroots,
+        hash_keys,
+        hash_vals_root_major,
+        cap,
+        overflow_flag);
+  }
+
+  enum { APPLY_DENSE_MAX_INTERMEDIATES = 2048 };
+  __shared__ uint64_t _interm_k_global[APPLY_DENSE_MAX_INTERMEDIATES];
+  __shared__ int8_t   _interm_r[APPLY_DENSE_MAX_INTERMEDIATES];
+  __shared__ int8_t   _interm_s[APPLY_DENSE_MAX_INTERMEDIATES];
+  __shared__ double   _interm_crs[APPLY_DENSE_MAX_INTERMEDIATES];
+  __shared__ int      _interm_count;
+  __shared__ int      _interm_overflow;
+  __shared__ int8_t   _p2_steps[MAX_NORB_T];
+  __shared__ int32_t  _p2_nodes[MAX_NORB_T + 1];
+  __shared__ int8_t   _p2_occ[MAX_NORB_T];
+  __shared__ int16_t  _p2_b[MAX_NORB_T];
+  __shared__ uint64_t _p2_idx_prefix[MAX_NORB_T + 1];
+
+  if (tid == 0) { _interm_count = 0; _interm_overflow = 0; }
+  __syncthreads();
+
+  for (int rs = tid; rs < nops; rs += nthreads) {
+    int r = rs / norb;
+    int s = rs - r * norb;
+    if (r == s) continue;
+    if ((int)occ_j_s[s] <= 0 || (int)occ_j_s[r] >= 2) continue;
+
+    int start_p1, end_p1, q_start_p1, q_mid_p1, q_end_p1;
+    if (r < s) {
+      start_p1 = r; end_p1 = s;
+      q_start_p1 = Q_uR; q_mid_p1 = Q_R; q_end_p1 = Q_oR;
+    } else {
+      start_p1 = s; end_p1 = r;
+      q_start_p1 = Q_uL; q_mid_p1 = Q_L; q_end_p1 = Q_oL;
+    }
+
+    int32_t node_start_p1 = nodes_j_s[start_p1];
+    int32_t node_end_target_p1 = nodes_j_s[end_p1 + 1];
+    uint64_t prefix_offset_p1 = idx_prefix_j_s[start_p1];
+    uint64_t prefix_endplus1_p1 = idx_prefix_j_s[end_p1 + 1];
+    if (j_global < prefix_endplus1_p1) continue;
+    uint64_t suffix_offset_p1 = j_global - prefix_endplus1_p1;
+
+    int8_t st_k_p1[MAX_NORB_T];
+    int32_t st_node_p1[MAX_NORB_T];
+    double st_w_p1[MAX_NORB_T];
+    uint64_t st_seg_p1[MAX_NORB_T];
+    int top_p1 = 0;
+    st_k_p1[top_p1] = (int8_t)start_p1;
+    st_node_p1[top_p1] = node_start_p1;
+    st_w_p1[top_p1] = 1.0;
+    st_seg_p1[top_p1] = 0ull;
+    ++top_p1;
+
+    while (top_p1) {
+      --top_p1;
+      double w_p1 = st_w_p1[top_p1];
+      int kpos_p1 = (int)st_k_p1[top_p1];
+      int node_k_p1 = st_node_p1[top_p1];
+      uint64_t seg_idx_p1 = st_seg_p1[top_p1];
+      int qk_p1 = (kpos_p1 == start_p1) ? q_start_p1 : ((kpos_p1 == end_p1) ? q_end_p1 : q_mid_p1);
+      int dk_p1 = (int)steps_j_s[kpos_p1];
+      int bk_p1 = (int)b_j_s[kpos_p1];
+      int k_next_p1 = kpos_p1 + 1;
+
+      int dp0_p1 = 0, dp1_p1 = 0;
+      int ndp_p1 = candidate_dprimes(qk_p1, dk_p1, &dp0_p1, &dp1_p1);
+      if (ndp_p1 == 0) continue;
+      for (int which_p1 = 0; which_p1 < ndp_p1; ++which_p1) {
+        int dprime_p1 = (which_p1 == 0) ? dp0_p1 : dp1_p1;
+        int child_k_p1 = child_table[node_k_p1 * 4 + dprime_p1];
+        if (child_k_p1 < 0) continue;
+        int bprime_p1 = (int)node_twos[child_k_p1];
+        int db_p1 = bk_p1 - bprime_p1;
+        double seg_p1 = (double)segment_value_int(qk_p1, dprime_p1, dk_p1, db_p1, bk_p1);
+        if (seg_p1 == 0.0) continue;
+        double c_rs_p1 = w_p1 * seg_p1;
+        uint64_t seg_idx2_p1 = seg_idx_p1 + (uint64_t)child_prefix[node_k_p1 * 5 + dprime_p1];
+        if (kpos_p1 != end_p1) {
+          if (top_p1 >= MAX_NORB_T) {
+            if (overflow_flag) atomicExch(overflow_flag, 1);
+            continue;
+          }
+          st_k_p1[top_p1] = (int8_t)k_next_p1;
+          st_node_p1[top_p1] = child_k_p1;
+          st_w_p1[top_p1] = c_rs_p1;
+          st_seg_p1[top_p1] = seg_idx2_p1;
+          ++top_p1;
+          continue;
+        }
+        if (child_k_p1 != node_end_target_p1) continue;
+        uint64_t k_global_p1 = prefix_offset_p1 + seg_idx2_p1 + suffix_offset_p1;
+        if (k_global_p1 >= ncsf) {
+          if (overflow_flag) atomicExch(overflow_flag, 1);
+          continue;
+        }
+        int slot = atomicAdd(&_interm_count, 1);
+        if (slot < APPLY_DENSE_MAX_INTERMEDIATES) {
+          _interm_k_global[slot] = k_global_p1;
+          _interm_r[slot] = (int8_t)r;
+          _interm_s[slot] = (int8_t)s;
+          _interm_crs[slot] = c_rs_p1;
+        } else {
+          atomicExch(&_interm_overflow, 1);
+        }
+      }
+    }
+  }
+  __syncthreads();
+
+  if (!_interm_overflow) {
+    int n_ki = _interm_count;
+    for (int ki = 0; ki < n_ki; ++ki) {
+      uint64_t ki_global = _interm_k_global[ki];
+      int ki_r = (int)_interm_r[ki];
+      int ki_s = (int)_interm_s[ki];
+      double ki_crs = _interm_crs[ki];
+
+      if (tid == 0) {
+        bool ok_p2 = cas36_sci_reconstruct_path_from_index_u64<MAX_NORB_T>(
+            child_table, child_prefix, norb, ncsf, ki_global, _p2_steps, _p2_nodes);
+        if (!ok_p2) {
+          _p2_nodes[0] = -1;
+        } else {
+          _p2_idx_prefix[0] = 0ull;
+          for (int kk = 0; kk < norb; ++kk) {
+            _p2_occ[kk] = (int8_t)step_to_occ(_p2_steps[kk]);
+            _p2_b[kk] = node_twos[_p2_nodes[kk + 1]];
+            _p2_idx_prefix[kk + 1] = _p2_idx_prefix[kk] +
+                (uint64_t)child_prefix[_p2_nodes[kk] * 5 + (int)_p2_steps[kk]];
+          }
+        }
+      }
+      __syncthreads();
+
+      if (_p2_nodes[0] < 0) {
+        if (tid == 0 && overflow_flag) atomicExch(overflow_flag, 1);
+        __syncthreads();
+        continue;
+      }
+
+      if (tid == 0) {
+        double diag_contrib = 0.0;
+        for (int p = 0; p < norb; ++p) {
+          int occ_p = (int)_p2_occ[p];
+          if (occ_p == 0) continue;
+          diag_contrib += 0.5 * ki_crs *
+              cas36_dense_eri4_at(eri4, norb, p, p, ki_r, ki_s) * (double)occ_p;
+        }
+        bool in_selected = false;
+        if (membership_hash_keys && membership_hash_cap > 0) {
+          in_selected = cas36_sci_contains_u64(membership_hash_keys, membership_hash_cap, ki_global);
+        }
+        bool emit_diag = diag_contrib != 0.0 && ki_global != j_global && ki_global >= label_lo && ki_global < label_hi && !in_selected;
+        if (emit_diag) {
+          cas36_frontier_hash_insert_add_many_f64_u64(
+              hash_keys, hash_vals_root_major, cap, c_row, nroots, ki_global, diag_contrib, overflow_flag);
+        }
+      }
+
+      for (int pq2 = tid; pq2 < nops; pq2 += nthreads) {
+        int p = pq2 / norb;
+        int q = pq2 - p * norb;
+        if (p == q) continue;
+        double gpq = 0.5 * ki_crs * cas36_dense_eri4_at(eri4, norb, p, q, ki_r, ki_s);
+        if (gpq == 0.0) continue;
+        cas36_exact_apply_weighted_epq_target_hash_many_u64<MAX_NORB_T>(
+            j_global, ki_global, norb, ncsf,
+            _p2_steps, _p2_nodes, _p2_occ, _p2_b, _p2_idx_prefix,
+            p, q, gpq,
+            child_table, node_twos, child_prefix,
+            label_lo, label_hi,
+            membership_hash_keys, membership_hash_cap,
+            c_row, nroots,
+            hash_keys, hash_vals_root_major, cap, overflow_flag);
+      }
+      __syncthreads();
+    }
+  } else {
+    for (int rs = tid; rs < nops; rs += nthreads) {
+      int r = rs / norb;
+      int s = rs - r * norb;
+      if (r == s) continue;
+      if ((int)occ_j_s[s] <= 0 || (int)occ_j_s[r] >= 2) continue;
+
+      int start, end, q_start, q_mid, q_end;
+      if (r < s) {
+        start = r; end = s;
+        q_start = Q_uR; q_mid = Q_R; q_end = Q_oR;
+      } else {
+        start = s; end = r;
+        q_start = Q_uL; q_mid = Q_L; q_end = Q_oL;
+      }
+
+      int32_t node_start = nodes_j_s[start];
+      int32_t node_end_target = nodes_j_s[end + 1];
+      uint64_t prefix_offset = idx_prefix_j_s[start];
+      uint64_t prefix_endplus1 = idx_prefix_j_s[end + 1];
+      if (j_global < prefix_endplus1) continue;
+      uint64_t suffix_offset = j_global - prefix_endplus1;
+
+      int8_t st_k[MAX_NORB_T];
+      int32_t st_node[MAX_NORB_T];
+      double st_w[MAX_NORB_T];
+      uint64_t st_seg[MAX_NORB_T];
+      int top = 0;
+      st_k[top] = (int8_t)start;
+      st_node[top] = node_start;
+      st_w[top] = 1.0;
+      st_seg[top] = 0ull;
+      ++top;
+
+      while (top) {
+        --top;
+        double w = st_w[top];
+        int kpos = (int)st_k[top];
+        int node_k = st_node[top];
+        uint64_t seg_idx = st_seg[top];
+        int qk = (kpos == start) ? q_start : ((kpos == end) ? q_end : q_mid);
+        int dk = (int)steps_j_s[kpos];
+        int bk = (int)b_j_s[kpos];
+        int k_next = kpos + 1;
+
+        int dp0 = 0, dp1 = 0;
+        int ndp = candidate_dprimes(qk, dk, &dp0, &dp1);
+        if (ndp == 0) continue;
+        for (int which = 0; which < ndp; ++which) {
+          int dprime = (which == 0) ? dp0 : dp1;
+          int child_k = child_table[node_k * 4 + dprime];
+          if (child_k < 0) continue;
+          int bprime = (int)node_twos[child_k];
+          int db = bk - bprime;
+          double seg = (double)segment_value_int(qk, dprime, dk, db, bk);
+          if (seg == 0.0) continue;
+          double c_rs = w * seg;
+          uint64_t seg_idx2 = seg_idx + (uint64_t)child_prefix[node_k * 5 + dprime];
+          if (kpos != end) {
+            if (top >= MAX_NORB_T) {
+              if (overflow_flag) atomicExch(overflow_flag, 1);
+              continue;
+            }
+            st_k[top] = (int8_t)k_next;
+            st_node[top] = child_k;
+            st_w[top] = c_rs;
+            st_seg[top] = seg_idx2;
+            ++top;
+            continue;
+          }
+          if (child_k != node_end_target) continue;
+
+          uint64_t k_global = prefix_offset + seg_idx2 + suffix_offset;
+          if (k_global >= ncsf) {
+            if (overflow_flag) atomicExch(overflow_flag, 1);
+            continue;
+          }
+
+          int8_t steps_k[MAX_NORB_T];
+          int32_t nodes_k[MAX_NORB_T + 1];
+          int8_t occ_k[MAX_NORB_T];
+          int16_t b_k[MAX_NORB_T];
+          uint64_t idx_prefix_k[MAX_NORB_T + 1];
+          bool ok_k = cas36_sci_reconstruct_path_from_index_u64<MAX_NORB_T>(
+              child_table, child_prefix, norb, ncsf, k_global, steps_k, nodes_k);
+          if (!ok_k) {
+            if (overflow_flag) atomicExch(overflow_flag, 1);
+            continue;
+          }
+          idx_prefix_k[0] = 0ull;
+          for (int kk = 0; kk < norb; ++kk) {
+            occ_k[kk] = (int8_t)step_to_occ(steps_k[kk]);
+            b_k[kk] = node_twos[nodes_k[kk + 1]];
+            idx_prefix_k[kk + 1] = idx_prefix_k[kk] +
+                (uint64_t)child_prefix[nodes_k[kk] * 5 + (int)steps_k[kk]];
+          }
+
+          double diag_contrib = 0.0;
+          for (int p = 0; p < norb; ++p) {
+            int occ_p = (int)occ_k[p];
+            if (occ_p == 0) continue;
+            diag_contrib += 0.5 * c_rs *
+                cas36_dense_eri4_at(eri4, norb, p, p, r, s) * (double)occ_p;
+          }
+          bool in_selected = false;
+          if (membership_hash_keys && membership_hash_cap > 0) {
+            in_selected = cas36_sci_contains_u64(membership_hash_keys, membership_hash_cap, k_global);
+          }
+          bool emit_diag = diag_contrib != 0.0 && k_global != j_global && k_global >= label_lo && k_global < label_hi && !in_selected;
+          if (emit_diag) {
+            cas36_frontier_hash_insert_add_many_f64_u64(
+                hash_keys, hash_vals_root_major, cap, c_row, nroots, k_global, diag_contrib, overflow_flag);
+          }
+
+          for (int pq2 = 0; pq2 < nops; ++pq2) {
+            int p = pq2 / norb;
+            int q = pq2 - p * norb;
+            if (p == q) continue;
+            double gpq = 0.5 * c_rs * cas36_dense_eri4_at(eri4, norb, p, q, r, s);
+            if (gpq == 0.0) continue;
+            cas36_exact_apply_weighted_epq_target_hash_many_u64<MAX_NORB_T>(
+                j_global, k_global, norb, ncsf,
+                steps_k, nodes_k, occ_k, b_k, idx_prefix_k,
+                p, q, gpq,
+                child_table, node_twos, child_prefix,
+                label_lo, label_hi,
+                membership_hash_keys, membership_hash_cap,
+                c_row, nroots,
+                hash_keys, hash_vals_root_major, cap, overflow_flag);
+          }
+        }
+      }
+    }
+  }
+}
+
+extern "C" cudaError_t cas36_exact_emit_tuples_dense_u64_launch_stream(
+    const uint64_t* sel_idx_u64,
+    const double* c_bound,
+    int nsel,
+    int norb,
+    uint64_t ncsf,
+    const double* h_base,
+    const double* eri4,
+    const int32_t* child_table,
+    const int16_t* node_twos,
+    const int64_t* child_prefix,
+    uint64_t* out_keys,
+    int* out_src,
+    double* out_hij,
+    int cap,
+    uint64_t label_lo,
+    uint64_t label_hi,
+    const uint64_t* membership_hash_keys,
+    int membership_hash_cap,
+    int target_mode,
+    double* out_diag,
+    int* out_n,
+    int* overflow_flag,
+    cudaStream_t stream,
+    int threads) {
+  if (!sel_idx_u64 || !c_bound || !h_base || !eri4 || !child_table || !node_twos || !child_prefix || !out_keys ||
+      !out_src || !out_hij || !out_n || !overflow_flag) {
+    return cudaErrorInvalidValue;
+  }
+  if (nsel < 0 || norb <= 0 || norb > 32 || cap <= 0 || threads <= 0 || threads > 1024) {
+    return cudaErrorInvalidValue;
+  }
+  if (nsel == 0 || label_hi <= label_lo) {
+    return cudaSuccess;
+  }
+  if (target_mode < 0 || target_mode > 1) {
+    return cudaErrorInvalidValue;
+  }
+
+  dim3 block((unsigned int)threads);
+  dim3 grid((unsigned int)nsel);
+  // Dynamic shared memory for h1e cache (norb^2 doubles)
+  size_t dyn_smem_bytes = (size_t)norb * (size_t)norb * sizeof(double);
+
+#define LAUNCH_DENSE_EMIT_KERNEL_(NORB_T) \
+    do { \
+      auto _kfn = cas36_exact_emit_tuples_dense_u64_kernel<NORB_T>; \
+      if (dyn_smem_bytes > 48u * 1024u) { \
+        cudaFuncSetAttribute(_kfn, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)dyn_smem_bytes); \
+      } \
+      _kfn<<<grid, block, dyn_smem_bytes, stream>>>( \
+          sel_idx_u64, c_bound, nsel, norb, ncsf, h_base, eri4, \
+          child_table, node_twos, child_prefix, \
+          out_keys, out_src, out_hij, cap, \
+          label_lo, label_hi, membership_hash_keys, membership_hash_cap, target_mode, \
+          out_diag, out_n, overflow_flag); \
+    } while(0)
+
+  if (norb <= 8) {
+    LAUNCH_DENSE_EMIT_KERNEL_(8);
+  } else if (norb <= 16) {
+    LAUNCH_DENSE_EMIT_KERNEL_(16);
+  } else if (norb <= 24) {
+    LAUNCH_DENSE_EMIT_KERNEL_(24);
+  } else {
+    LAUNCH_DENSE_EMIT_KERNEL_(32);
+  }
+
+#undef LAUNCH_DENSE_EMIT_KERNEL_
+
+  return cudaGetLastError();
+}
+
+extern "C" cudaError_t cas36_exact_external_apply_dense_many_roots_u64_launch_stream(
+    const uint64_t* sel_idx_u64,
+    const double* c_sel_row_major,
+    int nsel,
+    int nroots,
+    int norb,
+    uint64_t ncsf,
+    const double* h_base,
+    const double* eri4,
+    const int32_t* child_table,
+    const int16_t* node_twos,
+    const int64_t* child_prefix,
+    uint64_t* hash_keys,
+    double* hash_vals_root_major,
+    int cap,
+    uint64_t label_lo,
+    uint64_t label_hi,
+    const uint64_t* membership_hash_keys,
+    int membership_hash_cap,
+    int* overflow_flag,
+    cudaStream_t stream,
+    int threads) {
+  if (!sel_idx_u64 || !c_sel_row_major || !h_base || !eri4 || !child_table || !node_twos || !child_prefix ||
+      !hash_keys || !hash_vals_root_major || !overflow_flag || !membership_hash_keys) {
+    return cudaErrorInvalidValue;
+  }
+  if (nsel < 0 || nroots <= 0 || norb <= 0 || norb > 32 || cap <= 0 || threads <= 0 || threads > 1024) {
+    return cudaErrorInvalidValue;
+  }
+  if (nsel == 0 || label_hi <= label_lo) {
+    return cudaSuccess;
+  }
+
+  auto align_up = [](size_t x, size_t a) -> size_t {
+    return (x + (a - 1u)) & ~(a - 1u);
+  };
+  const int nops = norb * norb;
+  size_t smem_bytes = 0u;
+  smem_bytes = align_up(smem_bytes, alignof(double));
+  smem_bytes += (size_t)nops * sizeof(double);
+
+  dim3 grid((unsigned)nsel);
+  dim3 block((unsigned)threads);
+
+#define ASUKA_LAUNCH_EXACT_EXTERNAL_DENSE_APPLY(NORB_T) \
+  do { \
+    auto _kfn = cas36_exact_external_apply_dense_many_roots_u64_kernel<NORB_T>; \
+    _kfn<<<grid, block, smem_bytes, stream>>>( \
+        sel_idx_u64, c_sel_row_major, nsel, nroots, norb, ncsf, h_base, eri4, \
+        child_table, node_twos, child_prefix, hash_keys, hash_vals_root_major, cap, \
+        label_lo, label_hi, membership_hash_keys, membership_hash_cap, overflow_flag); \
+  } while (0)
+
+  if (norb <= 16) {
+    ASUKA_LAUNCH_EXACT_EXTERNAL_DENSE_APPLY(16);
+  } else if (norb <= 24) {
+    ASUKA_LAUNCH_EXACT_EXTERNAL_DENSE_APPLY(24);
+  } else {
+    ASUKA_LAUNCH_EXACT_EXTERNAL_DENSE_APPLY(32);
+  }
+
+#undef ASUKA_LAUNCH_EXACT_EXTERNAL_DENSE_APPLY
+  return cudaGetLastError();
 }
 
 extern "C" cudaError_t cas36_exact_selected_emit_tuples_dense_u64_launch_stream(
@@ -2297,47 +3971,103 @@ extern "C" cudaError_t cas36_exact_selected_emit_tuples_dense_u64_launch_stream(
     int* overflow_flag,
     cudaStream_t stream,
     int threads) {
-  if (!sel_idx_u64 || !c_bound || !h_base || !eri4 || !child_table || !node_twos || !child_prefix || !out_keys ||
-      !out_src || !out_hij || !out_n || !overflow_flag) {
+  return cas36_exact_emit_tuples_dense_u64_launch_stream(
+      sel_idx_u64,
+      c_bound,
+      nsel,
+      norb,
+      ncsf,
+      h_base,
+      eri4,
+      child_table,
+      node_twos,
+      child_prefix,
+      out_keys,
+      out_src,
+      out_hij,
+      cap,
+      0ull,
+      ncsf,
+      membership_hash_keys,
+      membership_hash_cap,
+      1,
+      out_diag,
+      out_n,
+      overflow_flag,
+      stream,
+      threads);
+}
+
+__global__ void cas36_sym_row_graph_spmm_kernel(
+    const int64_t* __restrict__ row_ptr,
+    const int32_t* __restrict__ col_idx,
+    const double* __restrict__ hij,
+    const double* __restrict__ diag,
+    int nrows,
+    const double* __restrict__ x,
+    int64_t x_row_stride,
+    int nvec,
+    double* __restrict__ y,
+    int64_t y_row_stride) {
+  int row = (int)blockIdx.x;
+  if (row >= nrows) return;
+  int tid = (int)threadIdx.x;
+
+  if (tid < nvec) {
+    double d = diag ? diag[row] : 0.0;
+    double xv = x[(int64_t)row * x_row_stride + (int64_t)tid];
+    if (d != 0.0 && xv != 0.0) {
+      atomicAdd(&y[(int64_t)row * y_row_stride + (int64_t)tid], d * xv);
+    }
+  }
+
+  int64_t lo = row_ptr[row];
+  int64_t hi = row_ptr[row + 1];
+  const double* x_row = x + (int64_t)row * x_row_stride;
+  double* y_row = y + (int64_t)row * y_row_stride;
+
+  for (int64_t e = lo + (int64_t)tid; e < hi; e += (int64_t)blockDim.x) {
+    int col = col_idx[e];
+    if (col < 0 || col >= row) continue;
+    double h = hij[e];
+    if (h == 0.0) continue;
+    const double* x_col = x + (int64_t)col * x_row_stride;
+    double* y_col = y + (int64_t)col * y_row_stride;
+    for (int vec = 0; vec < nvec; ++vec) {
+      double xv_row = x_row[vec];
+      double xv_col = x_col[vec];
+      if (xv_row != 0.0) atomicAdd(&y_col[vec], h * xv_row);
+      if (xv_col != 0.0) atomicAdd(&y_row[vec], h * xv_col);
+    }
+  }
+}
+
+extern "C" cudaError_t cas36_sym_row_graph_spmm_launch_stream(
+    const int64_t* row_ptr,
+    const int32_t* col_idx,
+    const double* hij,
+    const double* diag,
+    int nrows,
+    const double* x,
+    int64_t x_row_stride,
+    int nvec,
+    double* y,
+    int64_t y_row_stride,
+    cudaStream_t stream,
+    int threads) {
+  if (!row_ptr || !col_idx || !hij || !diag || !x || !y) {
     return cudaErrorInvalidValue;
   }
-  if (nsel < 0 || norb <= 0 || norb > 32 || cap <= 0 || threads <= 0 || threads > 1024) {
+  if (nrows < 0 || nvec <= 0 || x_row_stride < nvec || y_row_stride < nvec || threads <= 0 || threads > 1024) {
     return cudaErrorInvalidValue;
   }
-  if (nsel == 0) {
+  if (nrows == 0) {
     return cudaSuccess;
   }
 
+  dim3 grid((unsigned int)nrows);
   dim3 block((unsigned int)threads);
-  dim3 grid((unsigned int)nsel);
-  // Dynamic shared memory for h1e cache (norb^2 doubles)
-  size_t dyn_smem_bytes = (size_t)norb * (size_t)norb * sizeof(double);
-
-#define LAUNCH_DENSE_EMIT_KERNEL_(NORB_T) \
-    do { \
-      auto _kfn = cas36_exact_selected_emit_tuples_dense_u64_kernel<NORB_T>; \
-      if (dyn_smem_bytes > 48u * 1024u) { \
-        cudaFuncSetAttribute(_kfn, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)dyn_smem_bytes); \
-      } \
-      _kfn<<<grid, block, dyn_smem_bytes, stream>>>( \
-          sel_idx_u64, c_bound, nsel, norb, ncsf, h_base, eri4, \
-          child_table, node_twos, child_prefix, \
-          out_keys, out_src, out_hij, cap, \
-          membership_hash_keys, membership_hash_cap, \
-          out_diag, out_n, overflow_flag); \
-    } while(0)
-
-  if (norb <= 8) {
-    LAUNCH_DENSE_EMIT_KERNEL_(8);
-  } else if (norb <= 16) {
-    LAUNCH_DENSE_EMIT_KERNEL_(16);
-  } else if (norb <= 24) {
-    LAUNCH_DENSE_EMIT_KERNEL_(24);
-  } else {
-    LAUNCH_DENSE_EMIT_KERNEL_(32);
-  }
-
-#undef LAUNCH_DENSE_EMIT_KERNEL_
-
+  cas36_sym_row_graph_spmm_kernel<<<grid, block, 0, stream>>>(
+      row_ptr, col_idx, hij, diag, nrows, x, x_row_stride, nvec, y, y_row_stride);
   return cudaGetLastError();
 }

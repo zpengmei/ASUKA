@@ -211,6 +211,81 @@ def transform_csf_ci_for_orbital_transform(
     return ci_out
 
 
+def transform_csf_ci_traci_rpt2(
+    drt: DRT,
+    ci: np.ndarray,
+    xmat: np.ndarray,
+    *,
+    istart: int = 0,
+    tol: float = 1e-14,
+) -> np.ndarray:
+    """Exact Molcas TRACI_RPT2-style CSF transform for one active block.
+
+    Parameters
+    ----------
+    drt
+        Active-space DRT defining the CSF basis.
+    ci
+        CI-like vector in the DRT ordering.
+    xmat
+        Orbital transformation block as passed to Molcas `TRACI_RPT2`.
+    istart
+        0-based starting active orbital for this block.
+    tol
+        Small pivot threshold.
+    """
+
+    ncsf = int(drt.ncsf)
+    ci_out = np.asarray(ci, dtype=np.float64).ravel().copy()
+    if ci_out.size != ncsf:
+        raise ValueError("ci has wrong length for drt")
+    xwork = np.asarray(xmat, dtype=np.float64).copy()
+    if xwork.ndim != 2 or xwork.shape[0] != xwork.shape[1]:
+        raise ValueError("xmat must be square")
+    ndim = int(xwork.shape[0])
+    istart = int(istart)
+    if istart < 0 or istart + ndim > int(drt.norb):
+        raise ValueError("TRACI_RPT2 block exceeds active-space dimension")
+
+    cache = _get_epq_action_cache(drt)
+    tvec = np.empty(ndim, dtype=np.float64)
+    sgm = np.empty(ncsf, dtype=np.float64)
+    work = np.empty(ncsf, dtype=np.float64)
+    tol = float(max(0.0, tol))
+
+    for j in range(ndim):
+        piv = float(xwork[j, j])
+        if abs(piv) <= tol:
+            raise ValueError("singular TRACI_RPT2 pivot")
+        fact = 1.0 / piv
+        tvec[:] = -fact * xwork[:, j]
+        xwork[:, j] = 0.0
+        tvec[j] = fact
+        xwork[j, j] = 1.0
+
+        for m in range(j + 1, ndim):
+            xjm = float(xwork[j, m])
+            xwork[:, m] += tvec * xjm
+            xwork[j, m] = tvec[j] * xjm
+
+        sgm[:] = (1.5 - 0.5 * float(tvec[j])) * ci_out
+        q = istart + j
+        for i in range(ndim):
+            p = istart + i
+            scl = 0.5 * float(tvec[i])
+            if i == j:
+                scl -= 0.5
+            _sigma1_add(drt, cache, q, p, scl, ci_out, sgm, work)
+        for i in range(ndim):
+            p = istart + i
+            scl = float(tvec[i])
+            if i == j:
+                scl -= 1.0
+            _sigma1_add(drt, cache, q, p, scl, sgm, ci_out, work)
+
+    return ci_out
+
+
 def _unpack_nelecas(nelecas: int | tuple[int, int], *, twos: int) -> tuple[int, int]:
     if isinstance(nelecas, (tuple, list, np.ndarray)):
         if len(nelecas) != 2:

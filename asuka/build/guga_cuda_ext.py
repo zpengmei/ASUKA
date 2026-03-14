@@ -171,8 +171,14 @@ def main() -> None:
             shutil.rmtree(build_dir, ignore_errors=True)
             os.makedirs(build_dir, exist_ok=True)
 
-    # Enable ccache if available (speeds up incremental rebuilds)
-    _ccache = shutil.which("ccache")
+    # Enable ccache if available (speeds up incremental rebuilds) unless explicitly disabled.
+    disable_ccache = os.getenv("GUGA_CUDA_DISABLE_CCACHE", "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+    _ccache = None if disable_ccache else shutil.which("ccache")
     env = os.environ.copy()
     if _ccache:
         cmake_args += [

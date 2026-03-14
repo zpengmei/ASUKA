@@ -251,6 +251,29 @@ class DFMOIntegrals:
         out = self.contract_cols(rr_ids, occ, half=float(half), eri_mat_max_bytes=int(eri_mat_max_bytes))
         return out.reshape(norb, norb)
 
+    def to_device(self, cp: Any | None = None, *, with_eri_mat: bool = False) -> "DeviceDFMOIntegrals":
+        """Upload the DF active-space representation to the GPU."""
+
+        if cp is None:
+            try:
+                import cupy as cp  # type: ignore[import-not-found]
+            except Exception as e:  # pragma: no cover
+                raise RuntimeError("CuPy is required to move DFMOIntegrals to the GPU") from e
+
+        eri_mat = None
+        if bool(with_eri_mat):
+            eri_mat = self._eri_mat if self._eri_mat is not None else self.l_full @ self.l_full.T
+
+        return DeviceDFMOIntegrals(
+            norb=int(self.norb),
+            l_full=cp.ascontiguousarray(cp.asarray(self.l_full, dtype=cp.float64)),
+            j_ps=cp.ascontiguousarray(cp.asarray(self.j_ps, dtype=cp.float64)),
+            pair_norm=cp.ascontiguousarray(cp.asarray(self.pair_norm, dtype=cp.float64)),
+            eri_mat=None if eri_mat is None else cp.ascontiguousarray(cp.asarray(eri_mat, dtype=cp.float64)),
+            representation=str(getattr(self, "representation", "df")),
+            source=self,
+        )
+
 
 @dataclass(frozen=True)
 class DeviceDFMOIntegrals:
