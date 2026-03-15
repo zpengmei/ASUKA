@@ -84,28 +84,64 @@ def update_shift(
     dt: float,
     damping: float,
     log_clip: float | None = None,
+    prev_population: float | None = None,
+    shift_stride: int = 1,
 ) -> float:
-    """Simple population-control shift update."""
+    """Population-control shift update (NECI-style derivative controller).
+
+    Uses the growth rate ``ln(N(t) / N(t-A))`` rather than the deviation from
+    target ``ln(N / N_target)``.  This avoids the catastrophic overshoot that
+    proportional-to-target control suffers in large active spaces where spawn
+    rates are high and population can swing by 10×+ between shift updates.
+
+    The standard NECI formula is::
+
+        S(t) = S(t-A) - ζ / (A·δτ) · ln(N(t) / N(t-A))
+
+    Parameters
+    ----------
+    shift : float
+        Current shift value.
+    population : float
+        Current L1 walker population N(t).
+    target_population : float
+        Target population (used only for the min-pop gate in ``_maybe_update_shift``).
+    dt : float
+        Imaginary-time step δτ.
+    damping : float
+        Damping parameter ζ.  Typical range 0.01–0.10.
+    log_clip : float or None
+        Maximum absolute value of the log-ratio (prevents extreme jumps).
+    prev_population : float or None
+        Population at the previous shift-update point N(t-A).
+        If None, falls back to proportional control ``ln(N / N_target)``.
+    shift_stride : int
+        Number of iterations between shift updates (A).
+    """
 
     shift = float(shift)
     pop = float(population)
     tgt = float(target_population)
     dt = float(dt)
     damp = float(damping)
+    stride = max(1, int(shift_stride))
     if dt <= 0.0:
         raise ValueError("dt must be > 0")
     if damp <= 0.0:
         return shift
     if pop <= 0.0 or tgt <= 0.0:
         raise ValueError("population and target_population must be > 0")
-    log_ratio = float(np.log(pop / tgt))
+    if prev_population is not None and float(prev_population) > 0.0:
+        log_ratio = float(np.log(pop / float(prev_population)))
+    else:
+        log_ratio = float(np.log(pop / tgt))
     if log_clip is not None:
         clip = abs(float(log_clip))
         if clip == 0.0:
             log_ratio = 0.0
         else:
             log_ratio = float(np.clip(log_ratio, -clip, clip))
-    return shift - (damp / dt) * log_ratio
+    return shift - (damp / (stride * dt)) * log_ratio
 
 
 def _validate_trial_inputs(
@@ -370,6 +406,7 @@ def _maybe_update_shift(
     shift_start: int,
     shift_warmup_iters: int,
     shift_log_clip: float | None,
+    prev_population: float | None = None,
 ) -> float:
     if float(shift_damping) <= 0.0:
         return float(shift)
@@ -386,6 +423,8 @@ def _maybe_update_shift(
         dt=float(dt),
         damping=float(shift_damping),
         log_clip=shift_log_clip,
+        prev_population=prev_population,
+        shift_stride=int(shift_stride),
     )
 
 
@@ -747,6 +786,7 @@ def _run_fciqmc_cuda_key64(
     ctx.nnz = nnz0
 
     sample_pos = 1
+    prev_pop_at_shift_update = float(pops[0])
     try:
         pops_dev = cp.empty(int(niter) + 1, dtype=cp.float64)
         pops_dev[0] = float(pops[0])
@@ -778,7 +818,9 @@ def _run_fciqmc_cuda_key64(
                     shift_start=shift_start,
                     shift_warmup_iters=shift_warmup_iters,
                     shift_log_clip=shift_log_clip,
+                    prev_population=prev_pop_at_shift_update,
                 )
+                prev_pop_at_shift_update = pop
 
             if it % int(energy_stride) == 0:
                 x_key_h = cp.asnumpy(ctx.x_key[:nnz_now]).astype(np.uint64, copy=False)
@@ -935,6 +977,7 @@ def _run_fciqmc_cuda_idx64(
     ctx.nnz = nnz0
 
     sample_pos = 1
+    prev_pop_at_shift_update = float(pops[0])
     try:
         pops_dev = cp.empty(int(niter) + 1, dtype=cp.float64)
         pops_dev[0] = float(pops[0])
@@ -966,7 +1009,9 @@ def _run_fciqmc_cuda_idx64(
                     shift_start=shift_start,
                     shift_warmup_iters=shift_warmup_iters,
                     shift_log_clip=shift_log_clip,
+                    prev_population=prev_pop_at_shift_update,
                 )
+                prev_pop_at_shift_update = pop
 
             if it % int(energy_stride) == 0:
                 x_key_h = cp.asnumpy(ctx.x_key[:nnz_now]).astype(np.uint64, copy=False)

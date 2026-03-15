@@ -864,6 +864,192 @@ def compute_df_gradient_contributions_analytic_from_bar_x_packed_bases(
 
     return grad
 
+
+def compute_df_gradient_contributions_analytic_from_bar_xv_packed_bases(
+    ao_basis,
+    aux_basis,
+    *,
+    atom_coords_bohr: np.ndarray,
+    bar_X_ao: np.ndarray,
+    bar_V: np.ndarray,
+    backend: str = "cpu",
+    df_threads: int = 0,
+    profile: dict | None = None,
+) -> np.ndarray:
+    """Contract analytic DF derivatives from explicit unwhitened adjoints.
+
+    This is a low-level diagnostic helper for lanes that already know both
+    adjoints of the unwhitened DF primitives:
+
+      - ``bar_X`` for ``X(mu,nu,Q) = (mu nu | Q)``
+      - ``bar_V`` for ``V(P,Q) = (P | Q)``
+
+    It bypasses whitening backprop entirely and contracts the 3-center and
+    2-center derivative kernels directly.
+    """
+
+    t0_total = time.perf_counter() if profile is not None else 0.0
+    backend_s = str(backend).strip().lower()
+    if backend_s != "cpu":
+        raise NotImplementedError(
+            "explicit (bar_X, bar_V) DF derivative contraction is currently implemented only for backend='cpu'"
+        )
+
+    atom_coords_bohr = np.asarray(atom_coords_bohr, dtype=np.float64)
+    if atom_coords_bohr.ndim != 2 or atom_coords_bohr.shape[1] != 3:
+        raise ValueError("atom_coords_bohr must have shape (natm, 3)")
+    natm = int(atom_coords_bohr.shape[0])
+    if natm <= 0:
+        return np.zeros((0, 3), dtype=np.float64)
+
+    from asuka.integrals.int1e_cart import shell_to_atom_map  # noqa: PLC0415
+    from asuka.integrals.cueri_df_cpu import _build_df_combined_basis_and_shell_pairs  # noqa: PLC0415
+    from asuka.cueri.pair_tables_cpu import build_pair_tables_cpu  # noqa: PLC0415
+
+    ao_shell_atom = shell_to_atom_map(ao_basis, atom_coords_bohr=atom_coords_bohr)
+    aux_shell_atom = shell_to_atom_map(aux_basis, atom_coords_bohr=atom_coords_bohr)
+
+    basis_all, sp_all, nsp_ao, _n_shell_ao, n_shell_aux = _build_df_combined_basis_and_shell_pairs(
+        ao_basis, aux_basis
+    )
+    aux_sp0 = int(nsp_ao)
+    pt = build_pair_tables_cpu(basis_all, sp_all, threads=int(df_threads), profile=None)
+
+    shell_cxyz_all = np.asarray(basis_all.shell_cxyz, dtype=np.float64, order="C")
+    shell_l_all = np.asarray(basis_all.shell_l, dtype=np.int32, order="C")
+    shell_prim_start_all = np.asarray(basis_all.shell_prim_start, dtype=np.int32, order="C")
+    shell_nprim_all = np.asarray(basis_all.shell_nprim, dtype=np.int32, order="C")
+    shell_ao_start_all = np.asarray(basis_all.shell_ao_start, dtype=np.int32, order="C")
+    prim_exp_all = np.asarray(basis_all.prim_exp, dtype=np.float64, order="C")
+
+    sp_A_all = np.asarray(sp_all.sp_A, dtype=np.int32, order="C")
+    sp_B_all = np.asarray(sp_all.sp_B, dtype=np.int32, order="C")
+    sp_pair_start_all = np.asarray(sp_all.sp_pair_start, dtype=np.int32, order="C")
+    sp_npair_all = np.asarray(sp_all.sp_npair, dtype=np.int32, order="C")
+
+    pair_eta_all = np.asarray(pt.pair_eta, dtype=np.float64, order="C")
+    pair_Px_all = np.asarray(pt.pair_Px, dtype=np.float64, order="C")
+    pair_Py_all = np.asarray(pt.pair_Py, dtype=np.float64, order="C")
+    pair_Pz_all = np.asarray(pt.pair_Pz, dtype=np.float64, order="C")
+    pair_cK_all = np.asarray(pt.pair_cK, dtype=np.float64, order="C")
+
+    aux_shell_l = np.asarray(aux_basis.shell_l, dtype=np.int32, order="C").ravel()
+    by_l: dict[int, list[int]] = {}
+    for sh in range(int(n_shell_aux)):
+        by_l.setdefault(int(aux_shell_l[sh]), []).append(int(sh))
+    spCD_by_l: dict[int, np.ndarray] = {}
+    shells_by_l: dict[int, np.ndarray] = {}
+    for lq, q_shells in by_l.items():
+        q_arr = np.asarray(q_shells, dtype=np.int32)
+        shells_by_l[int(lq)] = q_arr
+        spCD_by_l[int(lq)] = (aux_sp0 + q_arr).astype(np.int32, copy=False)
+
+    bar_X = np.asarray(bar_X_ao, dtype=np.float64)
+    if bar_X.ndim != 3:
+        raise ValueError("bar_X_ao must have shape (nao, nao, naux)")
+    nao0, nao1, naux = map(int, bar_X.shape)
+    if nao0 != nao1:
+        raise ValueError("bar_X_ao must have square AO dimensions")
+    bar_X = 0.5 * (bar_X + bar_X.transpose((1, 0, 2)))
+    bar_X = np.asarray(bar_X, dtype=np.float64, order="C")
+    bar_X_flat = bar_X.reshape((nao0 * nao0, naux))
+
+    bar_V_arr = np.asarray(bar_V, dtype=np.float64)
+    if bar_V_arr.shape != (naux, naux):
+        raise ValueError(f"bar_V shape mismatch: expected {(naux, naux)}, got {bar_V_arr.shape}")
+    bar_V_arr = np.asarray(0.5 * (bar_V_arr + bar_V_arr.T), dtype=np.float64, order="C")
+
+    try:
+        from asuka.cueri import _eri_rys_cpu as _ext  # noqa: PLC0415
+    except Exception as e:  # pragma: no cover
+        raise RuntimeError(
+            "CPU ERI extension is required for analytic DF (bar_X, bar_V) contraction on backend='cpu'"
+        ) from e
+
+    grad = np.zeros((natm, 3), dtype=np.float64)
+
+    for spAB in range(int(nsp_ao)):
+        shA = int(sp_A_all[int(spAB)])
+        shB = int(sp_B_all[int(spAB)])
+        fac = 2.0 if shA != shB else 1.0
+        atomA = int(ao_shell_atom[int(shA)])
+        atomB = int(ao_shell_atom[int(shB)])
+
+        for lq, spCD_batch in spCD_by_l.items():
+            q_shells = shells_by_l[int(lq)]
+            out_batch = _ext.df_int3c2e_deriv_contracted_cart_sp_batch_cy(
+                shell_cxyz_all,
+                shell_prim_start_all,
+                shell_nprim_all,
+                shell_l_all,
+                shell_ao_start_all,
+                prim_exp_all,
+                sp_A_all,
+                sp_B_all,
+                sp_pair_start_all,
+                sp_npair_all,
+                pair_eta_all,
+                pair_Px_all,
+                pair_Py_all,
+                pair_Pz_all,
+                pair_cK_all,
+                int(spAB),
+                spCD_batch,
+                int(nao0),
+                bar_X_flat,
+            )
+            for t, qsh in enumerate(q_shells):
+                atomC = int(aux_shell_atom[int(qsh)])
+                grad[atomA] += fac * out_batch[int(t), 0, :]
+                grad[atomB] += fac * out_batch[int(t), 1, :]
+                grad[atomC] += fac * out_batch[int(t), 2, :]
+
+    for psh in range(int(n_shell_aux)):
+        spAB = int(aux_sp0 + psh)
+        atomP = int(aux_shell_atom[int(psh)])
+        for lq, q_shells in shells_by_l.items():
+            q_list = [int(q) for q in q_shells if int(q) <= int(psh)]
+            if not q_list:
+                continue
+            spCD_batch = (aux_sp0 + np.asarray(q_list, dtype=np.int32)).astype(np.int32, copy=False)
+            out_batch = _ext.df_metric_2c2e_deriv_contracted_cart_sp_batch_cy(
+                shell_cxyz_all,
+                shell_prim_start_all,
+                shell_nprim_all,
+                shell_l_all,
+                shell_ao_start_all,
+                prim_exp_all,
+                sp_A_all,
+                sp_B_all,
+                sp_pair_start_all,
+                sp_npair_all,
+                pair_eta_all,
+                pair_Px_all,
+                pair_Py_all,
+                pair_Pz_all,
+                pair_cK_all,
+                int(spAB),
+                spCD_batch,
+                int(nao0),
+                bar_V_arr,
+            )
+            for t, qsh in enumerate(q_list):
+                fac = 2.0 if int(qsh) != int(psh) else 1.0
+                atomQ = int(aux_shell_atom[int(qsh)])
+                grad[atomP] += fac * out_batch[int(t), 0, :]
+                grad[atomQ] += fac * out_batch[int(t), 1, :]
+
+    if profile is not None:
+        profile.clear()
+        profile["backend"] = backend_s
+        profile["natm"] = int(natm)
+        profile["nao"] = int(nao0)
+        profile["naux"] = int(naux)
+        profile["t_total_s"] = float(time.perf_counter() - t0_total)
+
+    return grad
+
+
 def compute_df_gradient_contributions_analytic_sph(
     ao_basis,
     aux_basis,

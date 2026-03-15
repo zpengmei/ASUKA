@@ -409,6 +409,17 @@ class CudaProjectorContextKey64:
     nnz_u: Any | None = None
     nnz_out: Any | None = None
 
+    # Optional semi-stochastic deterministic subspace (uint64 labels).
+    det_idx_host: Any | None = None
+    det_key_dev: Any | None = None
+    det_cols: Any | None = None
+    det_hdd_csr_dev: Any | None = None
+    det_x_buf: Any | None = None
+    det_y_buf: Any | None = None
+    det_key_buf: Any | None = None
+    det_val_buf: Any | None = None
+    det_spawn_slot_offsets: Any | None = None
+
     def release(self) -> None:
         if self.ws is not None:
             self.ws.release()
@@ -679,6 +690,73 @@ def _build_det_subspace_cols_dense(
     return cols
 
 
+def _build_det_subspace_hdd_gpu(
+    *,
+    drt: Any,
+    drt_dev: Any,
+    det_idx: np.ndarray,
+    h_base_flat: np.ndarray,
+    eri4: np.ndarray,
+    cp: Any,
+    threads: int = 256,
+    stream: int | None = None,
+) -> Any:
+    """Build H_DD (deterministic subspace Hamiltonian) on GPU using pairwise_hij kernels.
+
+    Completely GPU-native: no CPU oracle calls.  Assigns one CUDA block per
+    source CSF, evaluates H[i,j] for all (i,j) pairs within the selected set,
+    and returns a cupyx sparse CSR matrix in GPU memory.
+
+    Notes
+    -----
+    ``det_idx`` must contain plain int64 CSF indices (not Key64 packed).
+    ``h_base_flat`` should equal ``(h1e - 0.5 * einsum("pqqs->ps", eri4)).ravel()``.
+    """
+    try:
+        import cupyx.scipy.sparse as cpx_sparse  # type: ignore
+    except Exception as e:  # pragma: no cover
+        raise RuntimeError("cupyx.scipy.sparse required for det subspace build") from e
+
+    from asuka.cuda.cuda_backend import (  # noqa: PLC0415
+        has_pairwise_hij_u64_device,
+        pairwise_materialize_u64_device,
+        pairwise_hij_u64_device,
+    )
+
+    det_idx_i64 = np.asarray(det_idx, dtype=np.int64).ravel()
+    ndet = int(det_idx_i64.size)
+    if ndet == 0:
+        return cpx_sparse.csr_matrix((0, 0), dtype=cp.float64)
+
+    if not has_pairwise_hij_u64_device():
+        raise RuntimeError(
+            "pairwise_hij_u64 kernel unavailable; rebuild CUDA extension: "
+            "python -m asuka.build.guga_cuda_ext"
+        )
+
+    # pairwise kernels take plain CSF indices cast to uint64 (NOT Key64 packed).
+    sel_idx_u64 = cp.ascontiguousarray(
+        cp.asarray(det_idx_i64.astype(np.uint64, copy=False), dtype=cp.uint64)
+    )
+
+    materialized = pairwise_materialize_u64_device(
+        drt, drt_dev, sel_idx_u64, ndet, cp,
+        threads=threads, stream=stream,
+    )
+
+    h_base_dev = cp.ascontiguousarray(cp.asarray(h_base_flat, dtype=cp.float64).ravel())
+    eri4_dev = cp.ascontiguousarray(cp.asarray(eri4, dtype=cp.float64).ravel())
+
+    H_d, _ = pairwise_hij_u64_device(
+        drt, drt_dev, sel_idx_u64, ndet,
+        h_base_dev, eri4_dev, materialized, cp,
+        threads=threads, stream=stream,
+    )
+
+    # Convert dense GPU matrix directly to CSR (cupyx handles sparsification).
+    return cpx_sparse.csr_matrix(H_d)
+
+
 def _det_subspace_matvec_cols(*, det_cols: list[tuple[np.ndarray, np.ndarray]], x_det: np.ndarray) -> np.ndarray:
     """Compute y = H_DD @ x in the deterministic subspace using prebuilt columns."""
 
@@ -900,6 +978,8 @@ def make_cuda_projector_context_key64(
     pair_sampling_mode: int = 0,
     label_mode: str = "key64",
     ncsf_u64: int | None = None,
+    det_idx: np.ndarray | None = None,
+    det_max_out: int = 10_000_000,
 ) -> CudaProjectorContextKey64:
     """Build a reusable CUDA projector context in Key64 walker space.
 
@@ -997,7 +1077,8 @@ def make_cuda_projector_context_key64(
 
     nspawn_total = nspawn_one + nspawn_two
     max_evt = m * nspawn_total
-    max_n = m * (1 + nspawn_total)
+    det_n = 0 if det_idx is None else int(np.unique(np.asarray(det_idx, dtype=np.int64).ravel()).size)
+    max_n = m * (1 + nspawn_total) + det_n
 
     ws = _guga_cuda_ext.QmcWorkspaceU64(int(max_n), int(m))
 
@@ -1035,6 +1116,42 @@ def make_cuda_projector_context_key64(
     ctx.val_u = cp.empty(max_n, dtype=cp.float64)
     ctx.nnz_u = cp.empty(1, dtype=cp.int32)
     ctx.nnz_out = cp.empty(1, dtype=cp.int32)
+
+    # Semi-stochastic deterministic subspace (optional).
+    if det_idx is not None:
+        det_idx_i64 = np.asarray(det_idx, dtype=np.int64).ravel()
+        if det_idx_i64.size:
+            det_idx_i64 = np.unique(det_idx_i64)
+            det_idx_i64.sort()
+            if det_idx_i64[0] < 0:
+                raise ValueError("det_idx entries must be non-negative")
+            if det_idx_i64[-1] >= int(ncsf_u64_eff):
+                raise ValueError("det_idx entries must be < ncsf")
+            from asuka.cuguga.state_cache import get_state_cache as _gsc  # noqa: PLC0415
+            cache = None if int(drt.ncsf) > np.iinfo(np.int32).max else _gsc(drt)
+            ctx.det_idx_host = det_idx_i64
+            if label_mode_s == "key64":
+                det_label_u64 = np.asarray(
+                    csf_idx_to_key64_host(drt, det_idx_i64, state_cache=cache),
+                    dtype=np.uint64, order="C",
+                )
+            else:
+                det_label_u64 = np.asarray(det_idx_i64, dtype=np.uint64, order="C")
+            ctx.det_key_dev = cp.asarray(det_label_u64, dtype=cp.uint64)
+            ctx.det_key_buf = cp.empty(int(det_idx_i64.size), dtype=cp.uint64)
+            ctx.det_val_buf = cp.empty(int(det_idx_i64.size), dtype=cp.float64)
+            ndet = int(det_idx_i64.size)
+            ctx.det_hdd_csr_dev = _build_det_subspace_hdd_gpu(
+                drt=drt, drt_dev=drt_dev,
+                det_idx=det_idx_i64,
+                h_base_flat=h_base_flat,
+                eri4=eri4,
+                cp=cp,
+            )
+            ctx.det_x_buf = cp.zeros(ndet, dtype=cp.float64)
+            ctx.det_y_buf = cp.zeros(ndet, dtype=cp.float64)
+            ctx.det_spawn_slot_offsets = cp.arange(int(nspawn_total), dtype=cp.int64)
+
     return ctx
 
 
@@ -1056,6 +1173,8 @@ def make_cuda_projector_context_idx64(
     pair_norm_sum: float = 0.0,
     pair_sampling_mode: int = 0,
     ncsf_u64: int | None = None,
+    det_idx: np.ndarray | None = None,
+    det_max_out: int = 10_000_000,
 ) -> CudaProjectorContextKey64:
     """Build a reusable CUDA projector context in idx64 walker space (uint64 CSF indices)."""
 
@@ -1077,6 +1196,8 @@ def make_cuda_projector_context_idx64(
         pair_sampling_mode=int(pair_sampling_mode),
         label_mode="idx64",
         ncsf_u64=int(int(drt.ncsf) if ncsf_u64 is None else int(ncsf_u64)),
+        det_idx=det_idx,
+        det_max_out=int(det_max_out),
     )
 
 
@@ -1203,35 +1324,14 @@ def make_cuda_block_projector_context(
             ctx.det_idx_dev = cp.asarray(det_idx_i32, dtype=cp.int32)
             ctx.det_idx_buf = cp.empty(int(det_idx_i32.size), dtype=cp.int32)
             ctx.det_val_buf = cp.empty(int(det_idx_i32.size), dtype=cp.float64)
-            ctx.det_cols = _build_det_subspace_cols_dense(
-                drt=drt,
-                h1e=np.asarray(h1e, dtype=np.float64),
-                eri=eri4,
-                det_idx=det_idx_i32,
-                max_out=int(det_max_out),
-                state_cache=cache,
-            )
-            # Build a device CSR once so runtime deterministic correction stays on GPU.
-            try:
-                import cupyx.scipy.sparse as cpx_sparse  # type: ignore
-            except Exception as e:  # pragma: no cover
-                raise RuntimeError("deterministic-subspace CUDA correction requires cupyx.scipy.sparse") from e
-            row_h, col_h, dat_h = _det_subspace_coo_from_cols(ctx.det_cols)
             ndet = int(det_idx_i32.size)
-            if int(dat_h.size) == 0:
-                ctx.det_hdd_csr_dev = cpx_sparse.csr_matrix((ndet, ndet), dtype=cp.float64)
-            else:
-                ctx.det_hdd_csr_dev = cpx_sparse.csr_matrix(
-                    (
-                        cp.asarray(dat_h, dtype=cp.float64),
-                        (
-                            cp.asarray(row_h, dtype=cp.int32),
-                            cp.asarray(col_h, dtype=cp.int32),
-                        ),
-                    ),
-                    shape=(ndet, ndet),
-                    dtype=cp.float64,
-                )
+            ctx.det_hdd_csr_dev = _build_det_subspace_hdd_gpu(
+                drt=drt, drt_dev=drt_dev,
+                det_idx=det_idx_i32,
+                h_base_flat=h_base_flat,
+                eri4=eri4,
+                cp=cp,
+            )
             ctx.det_x_buf = cp.zeros(ndet, dtype=cp.float64)
             ctx.det_y_buf = cp.zeros(ndet, dtype=cp.float64)
             ctx.det_spawn_slot_offsets = cp.arange(int(nspawn_total), dtype=cp.int64)
@@ -1399,16 +1499,41 @@ def cuda_projector_step_hamiltonian_u64_ws(
                 int(ctx.pair_sampling_mode),
             )
 
+    # Semi-stochastic deterministic subspace correction (before compaction
+    # so slot-based D→D zeroing works on the raw event layout).
+    nnz_det = 0
+    use_det = (
+        ctx.det_key_dev is not None
+        and ctx.det_hdd_csr_dev is not None
+        and ctx.det_x_buf is not None
+        and ctx.det_y_buf is not None
+        and ctx.det_key_buf is not None
+        and ctx.det_val_buf is not None
+    )
+    if use_det:
+        nnz_det = _apply_det_subspace_correction_gpu_u64(
+            ctx=ctx,
+            x_key=x_key,
+            x_val=x_val,
+            evt_key=evt_key,
+            evt_val=evt_val,
+            eps=float(eps),
+            nspawn_total=int(nspawn_total),
+        )
+
     # Compact spawn events before coalesce to reduce sort/reduce volume.
     evt_key_c, evt_val_c, n_evt = _compact_spawn_events_u64(evt_key, evt_val)
-    all_len_eff = int(nnz + n_evt)
+    all_len_eff = int(nnz + n_evt + nnz_det)
 
-    # Merge identity and (possibly compacted) events.
+    # Merge identity + compacted stochastic events + deterministic correction.
     key_all[:nnz] = x_key
     val_all[:nnz] = float(scale_identity) * x_val
     if n_evt > 0:
-        key_all[nnz:all_len_eff] = evt_key_c
-        val_all[nnz:all_len_eff] = evt_val_c
+        key_all[nnz:nnz + n_evt] = evt_key_c
+        val_all[nnz:nnz + n_evt] = evt_val_c
+    if nnz_det > 0:
+        key_all[nnz + n_evt:all_len_eff] = ctx.det_key_buf[:nnz_det]
+        val_all[nnz + n_evt:all_len_eff] = ctx.det_val_buf[:nnz_det]
 
     # Coalesce into (key_u, val_u) with out_nnz in nnz_u.
     ctx.ws.coalesce_coo_u64_f64_inplace_device(
@@ -3001,34 +3126,14 @@ def make_cuda_fciqmc_context(
             ctx.det_idx_dev = cp.asarray(det_idx_i32, dtype=cp.int32)
             ctx.det_idx_buf = cp.empty(int(det_idx_i32.size), dtype=cp.int32)
             ctx.det_val_buf = cp.empty(int(det_idx_i32.size), dtype=cp.float64)
-            ctx.det_cols = _build_det_subspace_cols_dense(
-                drt=drt,
-                h1e=np.asarray(h1e, dtype=np.float64),
-                eri=eri4,
-                det_idx=det_idx_i32,
-                max_out=int(det_max_out),
-                state_cache=cache,
-            )
-            try:
-                import cupyx.scipy.sparse as cpx_sparse  # type: ignore
-            except Exception as e:  # pragma: no cover
-                raise RuntimeError("deterministic-subspace CUDA correction requires cupyx.scipy.sparse") from e
-            row_h, col_h, dat_h = _det_subspace_coo_from_cols(ctx.det_cols)
             ndet = int(det_idx_i32.size)
-            if int(dat_h.size) == 0:
-                ctx.det_hdd_csr_dev = cpx_sparse.csr_matrix((ndet, ndet), dtype=cp.float64)
-            else:
-                ctx.det_hdd_csr_dev = cpx_sparse.csr_matrix(
-                    (
-                        cp.asarray(dat_h, dtype=cp.float64),
-                        (
-                            cp.asarray(row_h, dtype=cp.int32),
-                            cp.asarray(col_h, dtype=cp.int32),
-                        ),
-                    ),
-                    shape=(ndet, ndet),
-                    dtype=cp.float64,
-                )
+            ctx.det_hdd_csr_dev = _build_det_subspace_hdd_gpu(
+                drt=drt, drt_dev=drt_dev,
+                det_idx=det_idx_i32,
+                h_base_flat=h_base.ravel(order="C"),
+                eri4=eri4,
+                cp=cp,
+            )
             ctx.det_x_buf = cp.zeros(ndet, dtype=cp.float64)
             ctx.det_y_buf = cp.zeros(ndet, dtype=cp.float64)
             ctx.det_spawn_slot_offsets = cp.arange(int(nspawn_total), dtype=cp.int64)
@@ -3201,34 +3306,14 @@ def make_cuda_fciqmc_context_key64(
             ctx.det_key_dev = cp.asarray(det_label_u64, dtype=cp.uint64)
             ctx.det_key_buf = cp.empty(int(det_idx_i64.size), dtype=cp.uint64)
             ctx.det_val_buf = cp.empty(int(det_idx_i64.size), dtype=cp.float64)
-            ctx.det_cols = _build_det_subspace_cols_dense(
-                drt=drt,
-                h1e=np.asarray(h1e, dtype=np.float64),
-                eri=eri4,
-                det_idx=det_idx_i64,
-                max_out=int(det_max_out),
-                state_cache=cache,
-            )
-            try:
-                import cupyx.scipy.sparse as cpx_sparse  # type: ignore
-            except Exception as e:  # pragma: no cover
-                raise RuntimeError("deterministic-subspace CUDA correction requires cupyx.scipy.sparse") from e
-            row_h, col_h, dat_h = _det_subspace_coo_from_cols(ctx.det_cols)
             ndet = int(det_idx_i64.size)
-            if int(dat_h.size) == 0:
-                ctx.det_hdd_csr_dev = cpx_sparse.csr_matrix((ndet, ndet), dtype=cp.float64)
-            else:
-                ctx.det_hdd_csr_dev = cpx_sparse.csr_matrix(
-                    (
-                        cp.asarray(dat_h, dtype=cp.float64),
-                        (
-                            cp.asarray(row_h, dtype=cp.int32),
-                            cp.asarray(col_h, dtype=cp.int32),
-                        ),
-                    ),
-                    shape=(ndet, ndet),
-                    dtype=cp.float64,
-                )
+            ctx.det_hdd_csr_dev = _build_det_subspace_hdd_gpu(
+                drt=drt, drt_dev=drt_dev,
+                det_idx=det_idx_i64,
+                h_base_flat=h_base.ravel(order="C"),
+                eri4=eri4,
+                cp=cp,
+            )
             ctx.det_x_buf = cp.zeros(ndet, dtype=cp.float64)
             ctx.det_y_buf = cp.zeros(ndet, dtype=cp.float64)
             ctx.det_spawn_slot_offsets = cp.arange(int(nspawn_total), dtype=cp.int64)

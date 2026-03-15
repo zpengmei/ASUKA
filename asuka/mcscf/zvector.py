@@ -1430,6 +1430,11 @@ def build_mcscf_hessian_operator(
     if gen_newton is not None:
         try:
             g_all, _g_update, h_op, h_diag = gen_newton(mc, mo_coeff, ci, _eris, verbose=0)
+            # g_all may be CuPy if eris are on GPU; convert to numpy for size check.
+            try:
+                g_all = g_all.get()  # CuPy → numpy
+            except AttributeError:
+                pass
             g_all = np.asarray(g_all, dtype=np.float64).ravel()
             n_tot = int(g_all.size)
             n_orb = n_tot - n_ci

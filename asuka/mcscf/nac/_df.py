@@ -58,7 +58,12 @@ from asuka.mcscf.nuc_grad_df import (
 from asuka.mcscf.newton_df import DFNewtonCASSCFAdapter, DFNewtonERIs
 from asuka.mcscf import newton_casscf as _newton_casscf
 from asuka.mcscf.state_average import ci_as_list, make_state_averaged_rdms, normalize_weights
-from asuka.mcscf.zvector import build_mcscf_hessian_operator, solve_mcscf_zvector, _project_sa_ci_components
+from asuka.mcscf.zvector import (
+    build_mcscf_hessian_operator,
+    solve_mcscf_zvector,
+    solve_mcscf_zvector_batch,
+    _project_sa_ci_components,
+)
 from asuka.solver import GUGAFCISolver
 
 
@@ -216,11 +221,25 @@ def _eris_patch_active(eris: DFNewtonERIs, *, mo_coeff: np.ndarray, hcore_ao: np
     ncore = int(ncore)
     if ncore <= 0:
         return eris
-    mo = np.asarray(mo_coeff, dtype=np.float64)
+    xp, _ = _get_xp_arrays(mo_coeff, hcore_ao, getattr(eris, "vhf_c", None))
+    mo = xp.asarray(mo_coeff, dtype=xp.float64)
     moH = mo.T
-    vnocore = np.asarray(getattr(eris, "vhf_c"), dtype=np.float64).copy()
-    vnocore[:, :ncore] = -moH @ np.asarray(hcore_ao, dtype=np.float64) @ mo[:, :ncore]
-    return DFNewtonERIs(ppaa=eris.ppaa, papa=eris.papa, vhf_c=vnocore, j_pc=eris.j_pc, k_pc=eris.k_pc)
+    vnocore = xp.asarray(getattr(eris, "vhf_c"), dtype=xp.float64).copy()
+    vnocore[:, :ncore] = -moH @ xp.asarray(hcore_ao, dtype=xp.float64) @ mo[:, :ncore]
+    return DFNewtonERIs(
+        ppaa=eris.ppaa,
+        papa=eris.papa,
+        vhf_c=vnocore,
+        j_pc=eris.j_pc,
+        k_pc=eris.k_pc,
+        L_pu=getattr(eris, "L_pu", None),
+        L_pi=getattr(eris, "L_pi", None),
+        L_uv=getattr(eris, "L_uv", None),
+        L_pq=getattr(eris, "L_pq", None),
+        eri_provider=getattr(eris, "eri_provider", None),
+        mo_coeff=getattr(eris, "mo_coeff", None),
+        C_act=getattr(eris, "C_act", None),
+    )
 
 
 def _mol_coords_charges_bohr(mol: Any) -> tuple[np.ndarray, np.ndarray]:
@@ -890,6 +909,7 @@ def _grad_elec_active_df(
     df_grad_ctx: DFGradContractionContext | None = None,
     fd_delta_bohr: float = 1e-4,
     return_terms: bool = False,
+    core_cache: dict[str, Any] | None = None,
 ) -> np.ndarray | tuple[np.ndarray, dict[str, np.ndarray]]:
     """Return active-electron part of <dH/dR> using DF integrals (no nuclear term)."""
 
@@ -944,18 +964,57 @@ def _grad_elec_active_df(
         out_dtype=_barl_out_dtype,
         qblock=_barl_qblock,
     )
-    # Core-only RHF-like contribution (GPU).
-    D_core_only, dme_core = _core_energy_weighted_density(mo_coeff=C, hcore_ao=h_ao, B_ao=B_ao, ncore=int(ncore))
-    bar_L_core = _build_bar_L_df_cross(
-        B_ao,
-        D_left=D_core_only,
-        D_right=D_core_only,
-        coeff_J=0.5,
-        coeff_K=-0.25,
-        work_dtype=_barl_work_dtype,
-        out_dtype=_barl_out_dtype,
-        qblock=_barl_qblock,
-    )
+    cache = core_cache if isinstance(core_cache, dict) else None
+    D_core_only = dme_core = bar_L_core = de_h1_core = None
+    if cache is not None:
+        D_core_only = cache.get("D_core_only")
+        dme_core = cache.get("dme_core")
+        bar_L_core = cache.get("bar_L_core")
+        de_h1_core = cache.get("de_h1_core")
+
+    if D_core_only is None or dme_core is None or bar_L_core is None or de_h1_core is None:
+        # Core-only RHF-like contribution (GPU).
+        D_core_only, dme_core = _core_energy_weighted_density(
+            mo_coeff=C,
+            hcore_ao=h_ao,
+            B_ao=B_ao,
+            ncore=int(ncore),
+        )
+        bar_L_core = _build_bar_L_df_cross(
+            B_ao,
+            D_left=D_core_only,
+            D_right=D_core_only,
+            coeff_J=0.5,
+            coeff_K=-0.25,
+            work_dtype=_barl_work_dtype,
+            out_dtype=_barl_out_dtype,
+            qblock=_barl_qblock,
+        )
+        D_core_cpu_cache = _asnumpy_f64(D_core_only)
+        if _is_sph:
+            from asuka.integrals.int1e_sph import contract_dhcore_sph  # noqa: PLC0415
+
+            de_h1_core = contract_dhcore_sph(
+                ao_basis,
+                atom_coords_bohr=coords,
+                atom_charges=charges,
+                M_sph=D_core_cpu_cache,
+                shell_atom=shell_atom,
+            )
+        else:
+            de_h1_core = contract_dhcore_cart(
+                ao_basis,
+                atom_coords_bohr=coords,
+                atom_charges=charges,
+                M=D_core_cpu_cache,
+                shell_atom=shell_atom,
+            )
+        if cache is not None:
+            cache["D_core_only"] = D_core_only
+            cache["dme_core"] = dme_core
+            cache["bar_L_core"] = bar_L_core
+            cache["de_h1_core"] = np.asarray(de_h1_core, dtype=np.float64)
+    de_h1_core = np.asarray(de_h1_core, dtype=np.float64)
 
     if not bool(return_terms):
         # ── Fast path: single fused contract() call (bar_L_ao - bar_L_core) ──
@@ -1014,25 +1073,16 @@ def _grad_elec_active_df(
                 profile=None,
             )
         D_tot_cpu = _asnumpy_f64(D_tot_ao)
-        D_core_cpu = _asnumpy_f64(D_core_only)
         if _is_sph:
             from asuka.integrals.int1e_sph import contract_dhcore_sph  # noqa: PLC0415
             de_h1 = contract_dhcore_sph(
                 ao_basis, atom_coords_bohr=coords, atom_charges=charges,
                 M_sph=D_tot_cpu, shell_atom=shell_atom,
             )
-            de_h1_core = contract_dhcore_sph(
-                ao_basis, atom_coords_bohr=coords, atom_charges=charges,
-                M_sph=D_core_cpu, shell_atom=shell_atom,
-            )
         else:
             de_h1 = contract_dhcore_cart(
                 ao_basis, atom_coords_bohr=coords, atom_charges=charges,
                 M=D_tot_cpu, shell_atom=shell_atom,
-            )
-            de_h1_core = contract_dhcore_cart(
-                ao_basis, atom_coords_bohr=coords, atom_charges=charges,
-                M=D_core_cpu, shell_atom=shell_atom,
             )
         dme_tot_ao = C @ (0.5 * (gfock + gfock.T)) @ C.T
         dme_act_ao = dme_tot_ao - dme_core
@@ -1092,26 +1142,17 @@ def _grad_elec_active_df(
     de_df_core = _contract_df_2e(bar_L_core_contract, where_label="_grad_elec_active_df(df2e_core_sub)")
 
     D_tot_cpu = _asnumpy_f64(D_tot_ao)
-    D_core_cpu = _asnumpy_f64(D_core_only)
     if _is_sph:
         from asuka.integrals.int1e_sph import contract_dhcore_sph  # noqa: PLC0415
         de_h1 = contract_dhcore_sph(
             ao_basis, atom_coords_bohr=coords, atom_charges=charges,
             M_sph=D_tot_cpu, shell_atom=shell_atom,
         )
-        de_h1_core = contract_dhcore_sph(
-            ao_basis, atom_coords_bohr=coords, atom_charges=charges,
-            M_sph=D_core_cpu, shell_atom=shell_atom,
-        )
     else:
         de_h1 = contract_dhcore_cart(
             ao_basis, atom_coords_bohr=coords, atom_charges=charges,
             M=D_tot_cpu, shell_atom=shell_atom,
         )
-        de_h1_core = contract_dhcore_cart(
-            ao_basis, atom_coords_bohr=coords, atom_charges=charges,
-        M=D_core_cpu, shell_atom=shell_atom,
-    )
     dme_tot_ao = C @ (0.5 * (gfock + gfock.T)) @ C.T
     dme_act_ao = dme_tot_ao - dme_core
     if _is_sph:
@@ -1696,15 +1737,17 @@ def sacasscf_nonadiabatic_couplings_df(
             except Exception:
                 pass
 
-    C_ref = _asnumpy_f64(getattr(casscf, "mo_coeff"))
+    xp_ref, _ = _resolve_xp(str(df_backend))
+
+    C_ref = _as_xp_f64(xp_ref, getattr(casscf, "mo_coeff"))
     if C_ref.ndim != 2:
         raise ValueError("casscf.mo_coeff must be a 2D array (nao,nmo)")
     nao, nmo = map(int, C_ref.shape)
     if nocc > nmo:
         raise ValueError("ncore+ncas exceeds nmo")
 
-    B_ref = _asnumpy_f64(getattr(scf_out, "df_B"))
-    hcore_ref = _asnumpy_f64(getattr(getattr(scf_out, "int1e"), "hcore"))
+    B_ref = _as_xp_f64(xp_ref, getattr(scf_out, "df_B"))
+    hcore_ref = _as_xp_f64(xp_ref, getattr(getattr(scf_out, "int1e"), "hcore"))
     ao_basis_ref = getattr(scf_out, "ao_basis")
     aux_basis_ref = getattr(scf_out, "aux_basis")  # required for DF gradient contractions
 
@@ -1746,6 +1789,7 @@ def sacasscf_nonadiabatic_couplings_df(
             eris=eris_sa,
             use_newton_hessian=True,
         )
+    timing_payload["hessian_gpu_mode"] = bool(getattr(hess_op, "gpu_mode", False))
 
     response = str(response_term).strip().lower()
     # Keep "fd" as an alias for finite-difference Jacobian response.
@@ -1794,7 +1838,7 @@ def sacasscf_nonadiabatic_couplings_df(
 
             S0 = build_S_cart(ao_basis_ref)
         S0_sqrt = _symm_sqrt(S0, inv=False)
-        U = S0_sqrt @ C_ref  # orthonormal-AO representation
+        U = S0_sqrt @ _asnumpy_f64(C_ref)  # orthonormal-AO representation
 
         def _fd_build_arrays(mol_disp: Any) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
             if fd_integrals_builder is not None:
@@ -1893,14 +1937,24 @@ def sacasscf_nonadiabatic_couplings_df(
         return bra, ket
 
     pair_list: list[tuple[int, int]]
+    pair_fill_symmetric = False
     if pairs is None:
-        pair_list = [(bra, ket) for bra in range(nroots) for ket in range(nroots) if ket != bra]
+        pair_list = [(bra, ket) for bra in range(nroots) for ket in range(bra + 1, nroots)]
+        pair_fill_symmetric = True
+        timing_payload["pair_count"] = int(nroots * (nroots - 1))
     else:
         pair_list = [(int(bra), int(ket)) for (bra, ket) in pairs if int(ket) != int(bra)]
-    timing_payload["pair_count"] = int(len(pair_list))
+        timing_payload["pair_count"] = int(len(pair_list))
+    timing_payload["pair_eval_count"] = int(len(pair_list))
 
     # Cache AO mappings used by the CSF term.
     shell_atom_ref = shell_to_atom_map(ao_basis_ref, atom_coords_bohr=coords)
+    atmlst_idx = np.asarray(atmlst_use, dtype=np.int32)
+    mo_cas = _asnumpy_f64(C_ref[:, ncore:nocc])
+    trans_rdm12 = _base_fcisolver_method(fcisolver_use, "trans_rdm12")
+    trans_rdm1 = None if bool(use_etfs) else _base_fcisolver_method(fcisolver_use, "trans_rdm1")
+    eris_act = _eris_patch_active(eris_sa, mo_coeff=C_ref, hcore_ao=hcore_ref, ncore=int(ncore))
+    active_core_cache: dict[str, Any] = {}
 
     dm1_sa = None
     dm2_sa = None
@@ -1916,28 +1970,30 @@ def sacasscf_nonadiabatic_couplings_df(
     timing_payload["timings_s"]["setup_total"] = float(time.perf_counter() - t_setup_start)
     t_pair_loop_start = time.perf_counter()
     pair_timings: list[dict] = []
+    z_recycle_space: list[tuple[np.ndarray | None, np.ndarray]] = []
+    pair_records: list[dict[str, Any]] = []
+    rhs_orb_all: list[np.ndarray] = []
+    rhs_ci_all: list[list[np.ndarray]] = []
 
     for bra, ket in pair_list:
         bra, ket = _unpack_state((bra, ket))
         if ket == bra:
             continue
 
-        t_pair_start = time.perf_counter()
         pair_timing: dict = {"bra": bra, "ket": ket}
-
         ediff = float(e_states[bra] - e_states[ket])
 
         # Transition densities for pair (bra,ket)
-        trans_rdm12 = _base_fcisolver_method(fcisolver_use, "trans_rdm12")
+        t0 = time.perf_counter()
         dm1_t, dm2_t = trans_rdm12(fcisolver_use, ci_list[bra], ci_list[ket], int(ncas), nelecas)
         dm1_t = 0.5 * (np.asarray(dm1_t, dtype=np.float64) + np.asarray(dm1_t, dtype=np.float64).T)
         dm2_t = 0.5 * (
             np.asarray(dm2_t, dtype=np.float64) + np.asarray(dm2_t, dtype=np.float64).transpose(1, 0, 3, 2)
         )
-        pair_timing["trans_rdm"] = float(time.perf_counter() - t_pair_start)
-        t0 = time.perf_counter()
+        pair_timing["trans_rdm"] = float(time.perf_counter() - t0)
 
         # Hamiltonian response term (<bra|dH/dR|ket> without nuclear term)
+        t0 = time.perf_counter()
         ham = _grad_elec_active_df(
             scf_out=scf_out,
             mo_coeff=C_ref,
@@ -1950,19 +2006,21 @@ def sacasscf_nonadiabatic_couplings_df(
             df_threads=int(df_threads),
             df_grad_ctx=df_grad_ctx,
             fd_delta_bohr=float(fd_delta),
+            core_cache=active_core_cache,
         )
         pair_timing["ham_response"] = float(time.perf_counter() - t0)
-        t0 = time.perf_counter()
 
         # CSF / AO-overlap term (numerator form).
+        t0 = time.perf_counter()
         if not bool(use_etfs):
-            trans_rdm1 = _base_fcisolver_method(fcisolver_use, "trans_rdm1")
+            if trans_rdm1 is None:  # pragma: no cover
+                raise RuntimeError("internal error: missing trans_rdm1 builder")
             dm1 = trans_rdm1(fcisolver_use, ci_list[bra], ci_list[ket], int(ncas), nelecas)
             castm1 = np.asarray(dm1, dtype=np.float64).T - np.asarray(dm1, dtype=np.float64)
-            mo_cas = C_ref[:, ncore:nocc]
             tm1 = mo_cas @ castm1 @ mo_cas.T
             if _is_sph_nac:
                 from asuka.integrals.int1e_sph import contract_dS_ip_sph  # noqa: PLC0415
+
                 nac_csf = 0.5 * contract_dS_ip_sph(
                     ao_basis_ref,
                     atom_coords_bohr=coords,
@@ -1978,9 +2036,9 @@ def sacasscf_nonadiabatic_couplings_df(
                 )
             ham = np.asarray(ham, dtype=np.float64) + np.asarray(nac_csf * ediff, dtype=np.float64)
         pair_timing["csf_term"] = float(time.perf_counter() - t0)
-        t0 = time.perf_counter()
 
         # Pair-specific Z-vector RHS in SA parameter space.
+        t0 = time.perf_counter()
         fcisolver_fixed = _FixedRDMFcisolver(fcisolver_use, dm1=dm1_t, dm2=dm2_t)
         mc_trans = DFNewtonCASSCFAdapter(
             df_B=B_ref,
@@ -1994,9 +2052,6 @@ def sacasscf_nonadiabatic_couplings_df(
             internal_rotation=bool(getattr(casscf, "internal_rotation", False)),
             extrasym=getattr(casscf, "extrasym", None),
         )
-        # Match PySCF NAC RHS construction: remove core-orbital contributions from the Newton operator.
-        eris_act = _eris_patch_active(eris_sa, mo_coeff=C_ref, hcore_ao=hcore_ref, ncore=int(ncore))
-
         g_ket, _gupd, _hop, _hdiag = _newton_casscf.gen_g_hop(
             mc_trans,
             C_ref,
@@ -2005,7 +2060,7 @@ def sacasscf_nonadiabatic_couplings_df(
             verbose=0,
             implementation="internal",
         )
-        g_ket = np.asarray(g_ket, dtype=np.float64).ravel()
+        g_ket = _asnumpy_f64(g_ket).ravel()
         g_bra, _gupd, _hop, _hdiag = _newton_casscf.gen_g_hop(
             mc_trans,
             C_ref,
@@ -2014,7 +2069,7 @@ def sacasscf_nonadiabatic_couplings_df(
             verbose=0,
             implementation="internal",
         )
-        g_bra = np.asarray(g_bra, dtype=np.float64).ravel()
+        g_bra = _asnumpy_f64(g_bra).ravel()
 
         n_orb = int(hess_op.n_orb)
         g_orb = g_ket[:n_orb]
@@ -2035,19 +2090,89 @@ def sacasscf_nonadiabatic_couplings_df(
             rhs_ci_list.append(np.zeros_like(np.asarray(ci_list[r], dtype=np.float64).ravel()))
         rhs_ci_list[ket] = g_ci_ket[:ndet_ket]
         rhs_ci_list[bra] = g_ci_bra[:ndet_bra]
+        pair_timing["zvector_rhs_build"] = float(time.perf_counter() - t0)
 
-        z = solve_mcscf_zvector(
-            mc_sa,
-            rhs_orb=np.asarray(g_orb, dtype=np.float64),
-            rhs_ci=rhs_ci_list,
-            hessian_op=hess_op,
-            tol=float(z_tol),
-            maxiter=int(z_maxiter),
+        pair_records.append(
+            {
+                "bra": bra,
+                "ket": ket,
+                "ediff": ediff,
+                "ham": np.asarray(ham, dtype=np.float64),
+                "pair_timing": pair_timing,
+            }
         )
+        rhs_orb_all.append(np.asarray(g_orb, dtype=np.float64))
+        rhs_ci_all.append(rhs_ci_list)
+
+    z_results: list[Any] = []
+    if pair_records:
+        t_z_solve_start = time.perf_counter()
+        if len(pair_records) == 1:
+            z_single = solve_mcscf_zvector(
+                mc_sa,
+                rhs_orb=rhs_orb_all[0],
+                rhs_ci=rhs_ci_all[0],
+                hessian_op=hess_op,
+                tol=float(z_tol),
+                maxiter=int(z_maxiter),
+                recycle_space=z_recycle_space,
+            )
+            z_results = [z_single]
+            z_total_time = float(time.perf_counter() - t_z_solve_start)
+            pair_records[0]["pair_timing"]["zvector_solve"] = z_total_time
+            timing_payload["zvector_batch_info"] = {
+                "mode": "single",
+                "n_rhs": 1,
+                "solver": str(z_single.info.get("solver", "unknown")),
+                "backend": str(z_single.info.get("backend", "unknown")),
+                "total_matvec_calls": int(z_single.info.get("matvec_calls", 0) or 0),
+                "total_niter": int(z_single.info.get("niter", 0) or 0),
+            }
+        else:
+            z_batch = solve_mcscf_zvector_batch(
+                mc_sa,
+                rhs_orb_list=rhs_orb_all,
+                rhs_ci_list=rhs_ci_all,
+                hessian_op=hess_op,
+                tol=float(z_tol),
+                maxiter=int(z_maxiter),
+                recycle_space=z_recycle_space,
+                reorder="input",
+                shared_recycle=True,
+                chain_x0=True,
+            )
+            z_results = list(z_batch.results)
+            z_total_time = float(time.perf_counter() - t_z_solve_start)
+            share_weights = np.asarray(
+                [float(res.info.get("matvec_calls", 0) or 0) for res in z_results],
+                dtype=np.float64,
+            )
+            if not np.isfinite(share_weights).all() or float(share_weights.sum()) <= 0.0:
+                share_weights = np.asarray(
+                    [float(res.info.get("niter", 0) or 0) for res in z_results],
+                    dtype=np.float64,
+                )
+            if not np.isfinite(share_weights).all() or float(share_weights.sum()) <= 0.0:
+                share_weights = np.ones(len(z_results), dtype=np.float64)
+            share_weights = share_weights / float(share_weights.sum())
+            for rec, w in zip(pair_records, share_weights, strict=True):
+                rec["pair_timing"]["zvector_solve"] = 0.0
+                rec["pair_timing"]["zvector_solve_shared"] = float(z_total_time * float(w))
+            timing_payload["zvector_batch_info"] = dict(z_batch.info)
+            timing_payload["zvector_batch_info"]["mode"] = "batch"
+        timing_payload["timings_s"]["zvector_total"] = float(z_total_time)
+        timing_payload["timings_s"]["zvector_batch_total"] = float(z_total_time)
+
+    for rec, z in zip(pair_records, z_results, strict=True):
+        bra = int(rec["bra"])
+        ket = int(rec["ket"])
+        ediff = float(rec["ediff"])
+        ham = np.asarray(rec["ham"], dtype=np.float64)
+        pair_timing = rec["pair_timing"]
+
         Lvec = np.asarray(z.z_packed, dtype=np.float64).ravel()
         if int(Lvec.size) != int(hess_op.n_tot):
             raise RuntimeError("unexpected Z-vector packed length")
-        pair_timing["zvector_solve"] = float(time.perf_counter() - t0)
         t0 = time.perf_counter()
 
         resp_full = np.zeros((natm, 3), dtype=np.float64)
@@ -2070,7 +2195,6 @@ def sacasscf_nonadiabatic_couplings_df(
                 raise RuntimeError("unexpected CI unpack structure in Z-vector solution")
 
             # CI response: build (weighted) transition RDMs between Lci[root] and ci[root], then reuse the DF gradient.
-            trans_rdm12 = _base_fcisolver_method(fcisolver_use, "trans_rdm12")
             dm1_lci = np.zeros((int(ncas), int(ncas)), dtype=np.float64)
             dm2_lci = np.zeros((int(ncas), int(ncas), int(ncas), int(ncas)), dtype=np.float64)
             w_arr = np.asarray(weights, dtype=np.float64).ravel()
@@ -2104,6 +2228,7 @@ def sacasscf_nonadiabatic_couplings_df(
                 df_threads=int(df_threads),
                 df_grad_ctx=df_grad_ctx,
                 fd_delta_bohr=float(fd_delta),
+                core_cache=active_core_cache,
             )
             pair_timing["response_assemble"] = float(time.perf_counter() - t0)
             t0 = time.perf_counter()
@@ -2134,8 +2259,8 @@ def sacasscf_nonadiabatic_couplings_df(
             resp_full = np.asarray(de_lci, dtype=np.float64) + np.asarray(de_lorb, dtype=np.float64)
 
         nac_num = (
-            np.asarray(ham, dtype=np.float64)[np.asarray(atmlst_use, dtype=np.int32)]
-            + np.asarray(resp_full, dtype=np.float64)[np.asarray(atmlst_use, dtype=np.int32)]
+            np.asarray(ham, dtype=np.float64)[atmlst_idx]
+            + np.asarray(resp_full, dtype=np.float64)[atmlst_idx]
         )
 
         if not bool(mult_ediff):
@@ -2143,8 +2268,13 @@ def sacasscf_nonadiabatic_couplings_df(
                 raise ZeroDivisionError("E_bra - E_ket is too small; use mult_ediff=True for numerator mode")
             nac_num = nac_num / ediff
 
-        nac[bra, ket] = np.asarray(nac_num, dtype=np.float64)
-        pair_timing["total"] = float(time.perf_counter() - t_pair_start)
+        nac_num = np.asarray(nac_num, dtype=np.float64)
+        nac[bra, ket] = nac_num
+        if bool(pair_fill_symmetric):
+            nac[ket, bra] = nac_num if bool(mult_ediff) else -nac_num
+        pair_timing["total"] = float(
+            sum(float(v) for k, v in pair_timing.items() if k not in ("bra", "ket"))
+        )
         pair_timings.append(copy.copy(pair_timing))
 
     # Post-loop timing aggregation
@@ -2161,6 +2291,8 @@ def sacasscf_nonadiabatic_couplings_df(
         timing_payload["slowest_pair"] = {"bra": slowest_pair["bra"], "ket": slowest_pair["ket"],
                                            "total_s": float(slowest_pair.get("total", 0.0))}
     timing_payload["per_pair_timings"] = pair_timings
+    timing_payload["pair_timings_s"] = pair_timings
+    timing_payload["status"] = "ok"
 
     _set_last_nacv_timing(timing_payload)
     return nac
