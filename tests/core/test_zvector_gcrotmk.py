@@ -3,6 +3,7 @@ import pytest
 import scipy.sparse.linalg as spla
 
 from asuka.cuda.krylov_gcrotmk import gcrotmk_xp
+from asuka.mcscf.zvector import _flatten_ci
 
 
 def _random_system(n: int, seed: int) -> tuple[np.ndarray, np.ndarray]:
@@ -80,6 +81,28 @@ def test_gcrotmk_xp_recycle_space_oldest_truncation():
     for c, u in cu:
         assert isinstance(u, np.ndarray)
         assert (c is None) or isinstance(c, np.ndarray)
+
+
+def test_flatten_ci_accepts_cupy_list_when_available():
+    cp = pytest.importorskip("cupy")
+    ci = [
+        cp.asarray([1.0, 0.0, 2.0], dtype=cp.float64),
+        cp.asarray([0.5, -1.0], dtype=cp.float64),
+    ]
+
+    flat, unflatten = _flatten_ci(ci)
+
+    assert isinstance(flat, np.ndarray)
+    assert flat.dtype == np.float64
+    assert flat.shape == (5,)
+    assert np.allclose(flat, np.asarray([1.0, 0.0, 2.0, 0.5, -1.0], dtype=np.float64))
+
+    rebuilt = unflatten(np.asarray([3.0, 4.0, 5.0, 6.0, 7.0], dtype=np.float64))
+    assert isinstance(rebuilt, list)
+    assert len(rebuilt) == 2
+    assert all(isinstance(v, np.ndarray) for v in rebuilt)
+    assert np.allclose(rebuilt[0], np.asarray([3.0, 4.0, 5.0], dtype=np.float64))
+    assert np.allclose(rebuilt[1], np.asarray([6.0, 7.0], dtype=np.float64))
 
 
 @pytest.mark.cuda

@@ -522,7 +522,11 @@ def run_cipsi_trials(
     macro_schedule_enabled = bool(macro_growth_steps > 1)
 
     need_sparse_state = int(ncsf) > _INT32_MAX or state_rep_s in ("key64", "i64")
-    state_cache = None if need_sparse_state else get_state_cache(drt)
+    # Skip the O(ncsf) state cache for large CI spaces — it allocates
+    # (ncsf × norb) arrays and would OOM/hang for ncsf > ~10M.
+    # The CUDA backends (pairwise sigma, tuple emit, HB selector) do not use it.
+    _state_cache_ncsf_max = int(os.environ.get("ASUKA_STATE_CACHE_NCSF_MAX", "10000000"))
+    state_cache = None if (need_sparse_state or int(ncsf) > _state_cache_ncsf_max) else get_state_cache(drt)
     hdiag_lookup = DiagonalGuessLookup(drt, h1e, eri, hdiag=None if hdiag is None else np.asarray(hdiag, dtype=np.float64))
     ci0_sparse = _normalize_ci0_sparse(ci0, nroots=nroots, ncsf=ncsf)
     sel_seed = _initial_selection_sparse(

@@ -5223,6 +5223,11 @@ def has_cas36_hb_screen_and_apply_u64_device() -> bool:
     return _ext is not None and hasattr(_ext, "cas36_hb_screen_and_apply_u64_inplace_device")
 
 
+def has_cas36_hb_screen_and_apply_many_roots_u64_device() -> bool:
+    """Return True if the CUDA extension exposes the multiroot CAS(36,36) u64 HB-SCI builder."""
+    return _ext is not None and hasattr(_ext, "cas36_hb_screen_and_apply_many_roots_u64_inplace_device")
+
+
 def has_cas36_hb_emit_tuples_u64_device() -> bool:
     """Return True if the CUDA extension exposes CAS(36,36)-style u64 tuple emitters."""
     return _ext is not None and hasattr(_ext, "cas36_hb_emit_tuples_u64_inplace_device")
@@ -5236,6 +5241,21 @@ def has_cas36_exact_selected_emit_tuples_u64_device() -> bool:
 def has_cas36_exact_selected_emit_tuples_dense_u64_device() -> bool:
     """Return True if the CUDA extension exposes the dense exact-selected u64 tuple emitter."""
     return _ext is not None and hasattr(_ext, "cas36_exact_selected_emit_tuples_dense_u64_inplace_device")
+
+
+def has_cas36_exact_selected_build_rowhash_dense_u64_device() -> bool:
+    """Return True if the CUDA extension exposes the dense exact-selected rowhash emitter."""
+    return _ext is not None and hasattr(_ext, "cas36_exact_selected_build_rowhash_dense_u64_inplace_device")
+
+
+def has_cas36_exact_external_emit_tuples_dense_u64_device() -> bool:
+    """Return True if the CUDA extension exposes the dense exact-external u64 tuple emitter."""
+    return _ext is not None and hasattr(_ext, "cas36_exact_external_emit_tuples_dense_u64_inplace_device")
+
+
+def has_cas36_exact_external_apply_dense_many_roots_u64_device() -> bool:
+    """Return True if the CUDA extension exposes the dense exact-external multiroot apply kernel."""
+    return _ext is not None and hasattr(_ext, "cas36_exact_external_apply_dense_many_roots_u64_inplace_device")
 
 
 def has_cas36_diag_guess_candidates_u64_dense_device() -> bool:
@@ -5343,6 +5363,128 @@ def cas36_hb_screen_and_apply_u64_inplace_device(
         c_root,
         int(nsel),
         int(root),
+        h1_pq,
+        h1_abs,
+        h1_signed,
+        int(n_h1),
+        pq_ptr,
+        rs_idx,
+        v_abs,
+        v_signed,
+        pq_max_v,
+        float(eps),
+        hash_keys_u64,
+        hash_vals,
+        int(label_lo),
+        int(label_hi),
+        selected_idx_sorted_u64 if selected_idx_sorted_u64 is not None else None,
+        int(target_mode_i),
+        overflow,
+        sym_pq_allowed if sym_pq_allowed is not None else None,
+        int(threads),
+        int(stream_ptr),
+        bool(sync),
+    )
+    return hash_keys_u64, hash_vals, overflow
+
+
+def cas36_hb_screen_and_apply_many_roots_u64_inplace_device(
+    drt: DRT,
+    drt_dev,
+    sel_idx_u64,
+    c_sel,
+    *,
+    nsel: int,
+    h1_pq,
+    h1_abs,
+    h1_signed,
+    n_h1: int,
+    pq_ptr,
+    rs_idx,
+    v_abs,
+    v_signed,
+    pq_max_v,
+    eps: float,
+    hash_keys_u64,
+    hash_vals,
+    label_lo: int = 0,
+    label_hi: int | None = None,
+    selected_idx_sorted_u64=None,
+    target_mode: str | int = "external_only",
+    overflow=None,
+    sym_pq_allowed=None,
+    threads: int = 256,
+    stream=None,
+    sync: bool = True,
+):
+    """Launch the multiroot u64 heat-bath screen+apply kernel."""
+    if _ext is None or not hasattr(_ext, "cas36_hb_screen_and_apply_many_roots_u64_inplace_device"):
+        raise RuntimeError(
+            "CUDA extension is missing CAS36 HB-SCI multiroot u64 kernels; rebuild with python -m asuka.build.guga_cuda_ext"
+        )
+
+    try:
+        import cupy as cp
+    except Exception as e:  # pragma: no cover
+        raise RuntimeError("CuPy is required") from e
+
+    sel_idx_u64 = cp.ascontiguousarray(cp.asarray(sel_idx_u64, dtype=cp.uint64).ravel())
+    c_sel = cp.ascontiguousarray(cp.asarray(c_sel, dtype=cp.float64))
+    if c_sel.ndim != 2:
+        raise ValueError("c_sel must have shape (nsel, nroots)")
+    if int(c_sel.shape[0]) < int(nsel):
+        raise ValueError("c_sel must have leading dimension >= nsel")
+    h1_pq = cp.ascontiguousarray(cp.asarray(h1_pq, dtype=cp.int32))
+    h1_abs = cp.ascontiguousarray(cp.asarray(h1_abs, dtype=cp.float64).ravel())
+    h1_signed = cp.ascontiguousarray(cp.asarray(h1_signed, dtype=cp.float64).ravel())
+    pq_ptr = cp.ascontiguousarray(cp.asarray(pq_ptr, dtype=cp.int64).ravel())
+    rs_idx = cp.ascontiguousarray(cp.asarray(rs_idx, dtype=cp.int32).ravel())
+    v_abs = cp.ascontiguousarray(cp.asarray(v_abs, dtype=cp.float64).ravel())
+    v_signed = cp.ascontiguousarray(cp.asarray(v_signed, dtype=cp.float64).ravel())
+    pq_max_v = cp.ascontiguousarray(cp.asarray(pq_max_v, dtype=cp.float64).ravel())
+    hash_keys_u64 = cp.ascontiguousarray(cp.asarray(hash_keys_u64, dtype=cp.uint64).ravel())
+    hash_vals = cp.ascontiguousarray(cp.asarray(hash_vals, dtype=cp.float64))
+    if hash_vals.ndim != 2:
+        raise ValueError("hash_vals must have shape (nroots, cap)")
+    if int(hash_vals.shape[0]) != int(c_sel.shape[1]) or int(hash_vals.shape[1]) != int(hash_keys_u64.size):
+        raise ValueError("hash_vals must have shape (nroots, cap) matching c_sel and hash_keys_u64")
+    label_lo = int(label_lo)
+    label_hi = int(drt.ncsf) if label_hi is None else int(label_hi)
+    if label_lo < 0 or label_hi < label_lo or label_hi > int(drt.ncsf):
+        raise ValueError("label window must satisfy 0 <= label_lo <= label_hi <= drt.ncsf")
+    if isinstance(target_mode, str):
+        target_mode_s = str(target_mode).strip().lower()
+        if target_mode_s in ("external", "external_only", "exclude_selected"):
+            target_mode_i = 0
+        elif target_mode_s in ("selected", "selected_only", "keep_selected"):
+            target_mode_i = 1
+        else:
+            raise ValueError("target_mode must be 'external_only' or 'selected_only'")
+    else:
+        target_mode_i = int(target_mode)
+        if target_mode_i not in (0, 1):
+            raise ValueError("target_mode must be 0 or 1")
+
+    if selected_idx_sorted_u64 is not None:
+        selected_idx_sorted_u64 = cp.ascontiguousarray(cp.asarray(selected_idx_sorted_u64, dtype=cp.uint64).ravel())
+    if overflow is None:
+        overflow = cp.empty((1,), dtype=cp.int32)
+    else:
+        overflow = cp.ascontiguousarray(cp.asarray(overflow, dtype=cp.int32).ravel())
+        if overflow.shape != (1,):
+            raise ValueError("overflow must have shape (1,)")
+
+    if stream is None:
+        stream_ptr = int(cp.cuda.get_current_stream().ptr)
+    else:
+        stream_ptr = int(getattr(stream, "ptr", stream))
+
+    _ext.cas36_hb_screen_and_apply_many_roots_u64_inplace_device(
+        drt_dev,
+        int(drt.ncsf),
+        sel_idx_u64,
+        c_sel,
+        int(nsel),
         h1_pq,
         h1_abs,
         h1_signed,
@@ -5626,6 +5768,74 @@ def build_selected_membership_hash(sorted_keys_d, cp):
     return hash_keys_d, cap
 
 
+def has_cas36_sym_row_graph_spmm_device() -> bool:
+    """Return True if the CUDA extension exposes the selected symmetric row-graph SpMM kernel."""
+    return _ext is not None and hasattr(_ext, "cas36_sym_row_graph_spmm_inplace_device")
+
+
+def cas36_sym_row_graph_spmm_device(
+    row_ptr,
+    col_idx,
+    hij,
+    diag,
+    x,
+    cp,
+    *,
+    out=None,
+    threads: int = 256,
+    stream=None,
+    sync: bool = False,
+):
+    """Apply a strict-lower symmetric selected graph to one or more vectors."""
+    if _ext is None or not hasattr(_ext, "cas36_sym_row_graph_spmm_inplace_device"):
+        raise RuntimeError(
+            "CUDA extension is missing the selected symmetric row-graph SpMM kernel; rebuild with python -m asuka.build.guga_cuda_ext"
+        )
+
+    row_ptr = cp.ascontiguousarray(cp.asarray(row_ptr, dtype=cp.int64).ravel())
+    col_idx = cp.ascontiguousarray(cp.asarray(col_idx, dtype=cp.int32).ravel())
+    hij = cp.ascontiguousarray(cp.asarray(hij, dtype=cp.float64).ravel())
+    diag = cp.ascontiguousarray(cp.asarray(diag, dtype=cp.float64).ravel())
+    x_arr = cp.asarray(x, dtype=cp.float64)
+    squeeze_out = False
+    if int(getattr(x_arr, "ndim", 1)) == 1:
+        x_arr = cp.ascontiguousarray(x_arr.reshape((-1, 1)))
+        squeeze_out = True
+    else:
+        x_arr = cp.ascontiguousarray(x_arr)
+    if int(x_arr.ndim) != 2:
+        raise ValueError("x must be 1D or 2D")
+    if int(x_arr.shape[0]) != int(diag.size):
+        raise ValueError("x leading dimension must match diag length")
+    if out is None:
+        y_arr = cp.zeros_like(x_arr)
+    else:
+        y_arr = cp.ascontiguousarray(cp.asarray(out, dtype=cp.float64))
+        if y_arr.shape != x_arr.shape:
+            raise ValueError("out must have the same shape as x")
+        y_arr.fill(0.0)
+
+    if stream is None:
+        stream_ptr = int(cp.cuda.get_current_stream().ptr)
+    else:
+        stream_ptr = int(getattr(stream, "ptr", stream))
+
+    _ext.cas36_sym_row_graph_spmm_inplace_device(
+        row_ptr,
+        col_idx,
+        hij,
+        diag,
+        x_arr,
+        y_arr,
+        int(threads),
+        int(stream_ptr),
+        bool(sync),
+    )
+    if squeeze_out:
+        return cp.ascontiguousarray(y_arr[:, 0].ravel())
+    return y_arr
+
+
 def cas36_exact_selected_emit_tuples_dense_u64_inplace_device(
     drt: DRT,
     drt_dev,
@@ -5714,9 +5924,278 @@ def cas36_exact_selected_emit_tuples_dense_u64_inplace_device(
     return out_keys_u64, out_src, out_hij, out_diag, out_n, overflow
 
 
+def cas36_exact_external_emit_tuples_dense_u64_inplace_device(
+    drt: DRT,
+    drt_dev,
+    sel_idx_u64,
+    c_bound,
+    *,
+    nsel: int,
+    h_base,
+    eri4,
+    out_keys_u64,
+    out_src,
+    out_hij,
+    cap: int,
+    label_lo: int = 0,
+    label_hi: int | None = None,
+    membership_hash_keys=None,
+    membership_hash_cap: int = 0,
+    out_n=None,
+    overflow=None,
+    threads: int = 256,
+    stream=None,
+    sync: bool = True,
+):
+    """Launch the dense exact-external u64 tuple-emission surface."""
+    if _ext is None or not hasattr(_ext, "cas36_exact_external_emit_tuples_dense_u64_inplace_device"):
+        raise RuntimeError(
+            "CUDA extension is missing the dense exact-external CAS36 u64 tuple emitter; rebuild with python -m asuka.build.guga_cuda_ext"
+        )
+
+    try:
+        import cupy as cp
+    except Exception as e:  # pragma: no cover
+        raise RuntimeError("CuPy is required") from e
+
+    sel_idx_u64 = cp.ascontiguousarray(cp.asarray(sel_idx_u64, dtype=cp.uint64).ravel())
+    c_bound = cp.ascontiguousarray(cp.asarray(c_bound, dtype=cp.float64).ravel())
+    h_base = cp.ascontiguousarray(cp.asarray(h_base, dtype=cp.float64).ravel())
+    eri4 = cp.ascontiguousarray(cp.asarray(eri4, dtype=cp.float64).ravel())
+    out_keys_u64 = cp.ascontiguousarray(cp.asarray(out_keys_u64, dtype=cp.uint64).ravel())
+    out_src = cp.ascontiguousarray(cp.asarray(out_src, dtype=cp.int32).ravel())
+    out_hij = cp.ascontiguousarray(cp.asarray(out_hij, dtype=cp.float64).ravel())
+    if membership_hash_keys is None:
+        raise ValueError("membership_hash_keys must not be None for exact external dense tuple emission")
+    membership_hash_keys = cp.ascontiguousarray(cp.asarray(membership_hash_keys, dtype=cp.uint64).ravel())
+    if int(out_keys_u64.size) < int(cap) or int(out_src.size) < int(cap) or int(out_hij.size) < int(cap):
+        raise ValueError("out_keys_u64, out_src, and out_hij must have length >= cap")
+    if out_n is None:
+        out_n = cp.zeros((1,), dtype=cp.int32)
+    else:
+        out_n = cp.ascontiguousarray(cp.asarray(out_n, dtype=cp.int32).ravel())
+        if out_n.shape != (1,):
+            raise ValueError("out_n must have shape (1,)")
+    if overflow is None:
+        overflow = cp.zeros((1,), dtype=cp.int32)
+    else:
+        overflow = cp.ascontiguousarray(cp.asarray(overflow, dtype=cp.int32).ravel())
+        if overflow.shape != (1,):
+            raise ValueError("overflow must have shape (1,)")
+
+    if stream is None:
+        stream_ptr = int(cp.cuda.get_current_stream().ptr)
+    else:
+        stream_ptr = int(getattr(stream, "ptr", stream))
+
+    _ext.cas36_exact_external_emit_tuples_dense_u64_inplace_device(
+        drt_dev,
+        int(drt.ncsf),
+        sel_idx_u64,
+        c_bound,
+        int(nsel),
+        h_base,
+        eri4,
+        out_keys_u64,
+        out_src,
+        out_hij,
+        int(cap),
+        int(label_lo),
+        int(drt.ncsf) if label_hi is None else int(label_hi),
+        membership_hash_keys,
+        int(membership_hash_cap),
+        out_n,
+        overflow,
+        int(threads),
+        int(stream_ptr),
+        bool(sync),
+    )
+    return out_keys_u64, out_src, out_hij, out_n, overflow
+
+
+def cas36_exact_selected_build_rowhash_dense_u64_inplace_device(
+    drt: DRT,
+    drt_dev,
+    sel_idx_u64,
+    c_bound,
+    *,
+    nsel: int,
+    h_base,
+    eri4,
+    row_hash_keys,
+    row_hash_vals,
+    row_cap: int,
+    membership_hash_keys=None,
+    membership_hash_cap: int = 0,
+    out_diag=None,
+    overflow=None,
+    threads: int = 256,
+    stream=None,
+    sync: bool = True,
+):
+    """Launch the dense exact-selected rowhash emitter."""
+    if _ext is None or not hasattr(_ext, "cas36_exact_selected_build_rowhash_dense_u64_inplace_device"):
+        raise RuntimeError(
+            "CUDA extension is missing the dense exact-selected rowhash emitter; rebuild with python -m asuka.build.guga_cuda_ext"
+        )
+
+    try:
+        import cupy as cp
+    except Exception as e:  # pragma: no cover
+        raise RuntimeError("CuPy is required") from e
+
+    sel_idx_u64 = cp.ascontiguousarray(cp.asarray(sel_idx_u64, dtype=cp.uint64).ravel())
+    c_bound = cp.ascontiguousarray(cp.asarray(c_bound, dtype=cp.float64).ravel())
+    h_base = cp.ascontiguousarray(cp.asarray(h_base, dtype=cp.float64).ravel())
+    eri4 = cp.ascontiguousarray(cp.asarray(eri4, dtype=cp.float64).ravel())
+    row_hash_keys = cp.ascontiguousarray(cp.asarray(row_hash_keys, dtype=cp.uint64).ravel())
+    row_hash_vals = cp.ascontiguousarray(cp.asarray(row_hash_vals, dtype=cp.float64).ravel())
+    if out_diag is not None:
+        out_diag = cp.ascontiguousarray(cp.asarray(out_diag, dtype=cp.float64).ravel())
+        if int(out_diag.size) < int(nsel):
+            raise ValueError("out_diag must have length >= nsel")
+    if membership_hash_keys is not None:
+        membership_hash_keys = cp.ascontiguousarray(cp.asarray(membership_hash_keys, dtype=cp.uint64).ravel())
+    if overflow is None:
+        overflow = cp.zeros((1,), dtype=cp.int32)
+    else:
+        overflow = cp.ascontiguousarray(cp.asarray(overflow, dtype=cp.int32).ravel())
+        if overflow.shape != (1,):
+            raise ValueError("overflow must have shape (1,)")
+    total_cap = int(nsel) * int(row_cap)
+    if int(row_hash_keys.size) < total_cap or int(row_hash_vals.size) < total_cap:
+        raise ValueError("row_hash_keys/row_hash_vals must have length >= nsel * row_cap")
+
+    if stream is None:
+        stream_ptr = int(cp.cuda.get_current_stream().ptr)
+    else:
+        stream_ptr = int(getattr(stream, "ptr", stream))
+
+    _ext.cas36_exact_selected_build_rowhash_dense_u64_inplace_device(
+        drt_dev,
+        int(drt.ncsf),
+        sel_idx_u64,
+        c_bound,
+        int(nsel),
+        h_base,
+        eri4,
+        row_hash_keys,
+        row_hash_vals,
+        int(row_cap),
+        membership_hash_keys if membership_hash_keys is not None else None,
+        int(membership_hash_cap),
+        out_diag if out_diag is not None else None,
+        overflow,
+        int(threads),
+        int(stream_ptr),
+        bool(sync),
+    )
+    return row_hash_keys, row_hash_vals, out_diag, overflow
+
+
+def cas36_exact_external_apply_dense_many_roots_u64_inplace_device(
+    drt: DRT,
+    drt_dev,
+    sel_idx_u64,
+    c_sel,
+    *,
+    nsel: int,
+    h_base,
+    eri4,
+    hash_keys_u64,
+    hash_vals,
+    cap: int,
+    label_lo: int = 0,
+    label_hi: int | None = None,
+    membership_hash_keys=None,
+    membership_hash_cap: int = 0,
+    overflow=None,
+    threads: int = 256,
+    stream=None,
+    sync: bool = True,
+):
+    """Launch the dense exact-external multiroot apply surface into a frontier hash table."""
+    if _ext is None or not hasattr(_ext, "cas36_exact_external_apply_dense_many_roots_u64_inplace_device"):
+        raise RuntimeError(
+            "CUDA extension is missing the dense exact-external CAS36 u64 apply kernel; rebuild with python -m asuka.build.guga_cuda_ext"
+        )
+
+    try:
+        import cupy as cp
+    except Exception as e:  # pragma: no cover
+        raise RuntimeError("CuPy is required") from e
+
+    sel_idx_u64 = cp.ascontiguousarray(cp.asarray(sel_idx_u64, dtype=cp.uint64).ravel())
+    c_sel = cp.ascontiguousarray(cp.asarray(c_sel, dtype=cp.float64))
+    h_base = cp.ascontiguousarray(cp.asarray(h_base, dtype=cp.float64).ravel())
+    eri4 = cp.ascontiguousarray(cp.asarray(eri4, dtype=cp.float64).ravel())
+    hash_keys_u64 = cp.ascontiguousarray(cp.asarray(hash_keys_u64, dtype=cp.uint64).ravel())
+    hash_vals = cp.ascontiguousarray(cp.asarray(hash_vals, dtype=cp.float64))
+    if membership_hash_keys is None:
+        raise ValueError("membership_hash_keys must not be None for exact external dense apply")
+    membership_hash_keys = cp.ascontiguousarray(cp.asarray(membership_hash_keys, dtype=cp.uint64).ravel())
+    if hash_vals.ndim != 2:
+        raise ValueError("hash_vals must have shape (nroots, cap)")
+    if int(hash_vals.shape[1]) < int(cap) or int(hash_keys_u64.size) < int(cap):
+        raise ValueError("hash_keys_u64/hash_vals must have trailing dimension >= cap")
+    if overflow is None:
+        overflow = cp.zeros((1,), dtype=cp.int32)
+    else:
+        overflow = cp.ascontiguousarray(cp.asarray(overflow, dtype=cp.int32).ravel())
+        if overflow.shape != (1,):
+            raise ValueError("overflow must have shape (1,)")
+
+    if stream is None:
+        stream_ptr = int(cp.cuda.get_current_stream().ptr)
+    else:
+        stream_ptr = int(getattr(stream, "ptr", stream))
+
+    _ext.cas36_exact_external_apply_dense_many_roots_u64_inplace_device(
+        drt_dev,
+        int(drt.ncsf),
+        sel_idx_u64,
+        c_sel,
+        int(nsel),
+        h_base,
+        eri4,
+        hash_keys_u64,
+        hash_vals,
+        int(cap),
+        int(label_lo),
+        int(drt.ncsf) if label_hi is None else int(label_hi),
+        membership_hash_keys,
+        int(membership_hash_cap),
+        overflow,
+        int(threads),
+        int(stream_ptr),
+        bool(sync),
+    )
+    return hash_keys_u64, hash_vals, overflow
+
+
 def has_pairwise_hij_u64_device() -> bool:
     """Return True if the CUDA extension exposes the pair-wise H[i,j] kernels."""
     return _ext is not None and hasattr(_ext, "pairwise_hij_u64_inplace_device")
+
+
+def has_pairwise_materialize_u64_device() -> bool:
+    """Return True if the CUDA extension exposes the pairwise materialize kernel."""
+    return _ext is not None and hasattr(_ext, "pairwise_materialize_u64_inplace_device")
+
+
+def has_pairwise_hij_bucketed_u64_device() -> bool:
+    """Return True if the CUDA extension exposes the bucketed pairwise H builder."""
+    return _ext is not None and hasattr(_ext, "pairwise_hij_bucketed_u64_inplace_device")
+
+
+def has_pairwise_sigma_bucketed_u64_device() -> bool:
+    """Return True if the CUDA extension exposes the matrix-free bucketed sigma kernel."""
+    return _ext is not None and hasattr(_ext, "pairwise_sigma_bucketed_u64_inplace_device")
+
+
+def has_pairwise_count_bucketed_u64_device() -> bool:
+    """Return True if the CUDA extension exposes the bucketed sparse-count kernel."""
+    return _ext is not None and hasattr(_ext, "pairwise_count_bucketed_u64_inplace_device")
 
 
 def pairwise_materialize_u64_device(
@@ -5896,6 +6375,18 @@ def pairwise_hij_bucketed_u64_device(
 
     H_d = cp.zeros((nsel, nsel), dtype=cp.float64)
     overflow = cp.zeros((1,), dtype=cp.int32)
+    mean_bucket_size = float(nsel) / max(int(bucket_data["nbuckets"]), 1)
+    phase2_mode = os.environ.get("ASUKA_PAIRWISE_PHASE2_MODE", "flat").strip().lower()
+    if phase2_mode == "row_union":
+        phase2_mode_code = 2
+    elif phase2_mode == "compaction":
+        phase2_mode_code = 1
+    elif phase2_mode == "auto":
+        # Neither experimental Phase 2 variant currently beats the flat
+        # packed-key path on the large benchmark suite.
+        phase2_mode_code = 0
+    else:
+        phase2_mode_code = 0
 
     if stream is None:
         stream_ptr = int(cp.cuda.get_current_stream().ptr)
@@ -5913,9 +6404,18 @@ def pairwise_hij_bucketed_u64_device(
         nodes_all.ravel(),
         occ_all.ravel(),
         b_all.ravel(),
+        cp.ascontiguousarray(bucket_data["occ_keys_sorted"]),
+        cp.ascontiguousarray(bucket_data["bucket_keys"]),
+        cp.ascontiguousarray(bucket_data["bucket_starts"]),
+        cp.ascontiguousarray(bucket_data["bucket_sizes"]),
+        cp.ascontiguousarray(bucket_data["neighbor_offsets"]),
+        cp.ascontiguousarray(bucket_data["neighbor_list"]),
         cp.ascontiguousarray(bucket_data["csf_to_bucket"]),
         cp.ascontiguousarray(bucket_data["target_offsets"]),
         cp.ascontiguousarray(bucket_data["target_list"]),
+        cp.ascontiguousarray(bucket_data["target_offsets_1b"]),
+        cp.ascontiguousarray(bucket_data["target_list_1b"]),
+        int(phase2_mode_code),
         H_d.ravel(),
         overflow,
         int(threads),
@@ -5928,6 +6428,363 @@ def pairwise_hij_bucketed_u64_device(
 
     diag_d = cp.ascontiguousarray(cp.diag(H_d))
     return H_d, diag_d
+
+
+def pairwise_build_selected_graph_bucketed_u64_device(
+    drt,
+    drt_dev,
+    sel_idx_u64,
+    nsel: int,
+    h_base,
+    eri4,
+    materialized,
+    bucket_data,
+    cp,
+    *,
+    threads: int = 256,
+    grid_blocks: int | None = None,
+    table_cap: int | None = None,
+    stream=None,
+    sync: bool = True,
+):
+    """Build exact selected-space off-diagonal local tuples + diagonal via bucketed pairwise traversal.
+
+    This is the sparse/matrix-free companion to `pairwise_hij_bucketed_u64_device`.
+    It avoids materializing dense `H[nsel,nsel]` by accumulating unique `(target_local, src_local)`
+    edges per source row in a row-local hash table and returning compressed local COO tuples.
+    """
+    if _ext is None or not hasattr(_ext, "pairwise_count_bucketed_u64_inplace_device"):
+        raise RuntimeError(
+            "CUDA extension missing bucketed sparse pairwise graph builder; rebuild with python -m asuka.build.guga_cuda_ext"
+        )
+
+    sel_idx_u64 = cp.ascontiguousarray(cp.asarray(sel_idx_u64, dtype=cp.uint64).ravel())
+    h_base = cp.ascontiguousarray(cp.asarray(h_base, dtype=cp.float64).ravel())
+    eri4 = cp.ascontiguousarray(cp.asarray(eri4, dtype=cp.float64).ravel())
+    steps_all, nodes_all, occ_all, b_all = materialized
+
+    if grid_blocks is None:
+        grid_blocks = min(int(nsel), int(os.environ.get("ASUKA_PAIRWISE_GRAPH_BLOCKS", "120")))
+    grid_blocks = max(1, int(grid_blocks))
+
+    if table_cap is None:
+        tgt_offsets = cp.ascontiguousarray(bucket_data["target_offsets"]).astype(cp.int32, copy=False)
+        max_targets = int(cp.max(tgt_offsets[1:] - tgt_offsets[:-1]).item()) if int(tgt_offsets.size) > 1 else 0
+        cap = 1
+        need = max(256, 2 * max(1, max_targets))
+        while cap < need:
+            cap <<= 1
+        table_cap = cap
+    table_cap = int(table_cap)
+
+    workspace_keys = cp.full((grid_blocks * table_cap,), -1, dtype=cp.int32)
+    workspace_vals = cp.zeros((grid_blocks * table_cap,), dtype=cp.float64)
+    row_counts = cp.zeros((nsel,), dtype=cp.int32)
+    diag_d = cp.zeros((nsel,), dtype=cp.float64)
+    overflow = cp.zeros((1,), dtype=cp.int32)
+
+    if stream is None:
+        stream_ptr = int(cp.cuda.get_current_stream().ptr)
+    else:
+        stream_ptr = int(getattr(stream, "ptr", stream))
+
+    common_args = (
+        drt_dev,
+        int(drt.ncsf),
+        sel_idx_u64,
+        int(nsel),
+        h_base,
+        eri4,
+        steps_all.ravel(),
+        nodes_all.ravel(),
+        occ_all.ravel(),
+        b_all.ravel(),
+        cp.ascontiguousarray(bucket_data["occ_keys_sorted"]),
+        cp.ascontiguousarray(bucket_data["bucket_keys"]),
+        cp.ascontiguousarray(bucket_data["bucket_starts"]),
+        cp.ascontiguousarray(bucket_data["bucket_sizes"]),
+        cp.ascontiguousarray(bucket_data["neighbor_offsets"]),
+        cp.ascontiguousarray(bucket_data["neighbor_list"]),
+        cp.ascontiguousarray(bucket_data["csf_to_bucket"]),
+        cp.ascontiguousarray(bucket_data["target_offsets"]),
+        cp.ascontiguousarray(bucket_data["target_list"]),
+        cp.ascontiguousarray(bucket_data["target_offsets_1b"]),
+        cp.ascontiguousarray(bucket_data["target_list_1b"]),
+        int(table_cap),
+        workspace_keys,
+        workspace_vals,
+        int(grid_blocks),
+    )
+
+    _ext.pairwise_count_bucketed_u64_inplace_device(
+        *common_args,
+        row_counts,
+        diag_d,
+        overflow,
+        int(threads),
+        int(stream_ptr),
+        bool(sync),
+    )
+    if int(overflow.item()) != 0:
+        raise RuntimeError("pairwise_count_bucketed_u64 overflow")
+
+    row_offsets = cp.zeros((nsel + 1,), dtype=cp.int64)
+    if int(nsel) > 0:
+        row_offsets[1:] = cp.cumsum(row_counts.astype(cp.int64, copy=False), dtype=cp.int64)
+    nnz = int(row_offsets[-1].item())
+    if nnz == 0:
+        return (
+            cp.zeros((0,), dtype=cp.int32),
+            cp.zeros((0,), dtype=cp.int32),
+            cp.zeros((0,), dtype=cp.float64),
+            diag_d,
+            row_counts,
+        )
+
+    workspace_keys.fill(-1)
+    workspace_vals.fill(0.0)
+    overflow.fill(0)
+    out_target_local = cp.empty((nnz,), dtype=cp.int32)
+    out_src_pos = cp.empty((nnz,), dtype=cp.int32)
+    out_hij = cp.empty((nnz,), dtype=cp.float64)
+
+    _ext.pairwise_fill_bucketed_u64_inplace_device(
+        *common_args,
+        row_offsets,
+        row_counts,
+        out_target_local,
+        out_src_pos,
+        out_hij,
+        diag_d,
+        overflow,
+        int(threads),
+        int(stream_ptr),
+        bool(sync),
+    )
+    if int(overflow.item()) != 0:
+        raise RuntimeError("pairwise_fill_bucketed_u64 overflow")
+
+    return out_target_local, out_src_pos, out_hij, diag_d, row_counts
+
+
+def pairwise_diag_bucketed_u64_device(
+    drt,
+    drt_dev,
+    sel_idx_u64,
+    nsel: int,
+    h_base,
+    eri4,
+    materialized,
+    bucket_data,
+    cp,
+    *,
+    threads: int = 256,
+    grid_blocks: int | None = None,
+    table_cap: int | None = None,
+    stream=None,
+    sync: bool = True,
+):
+    """Build the exact selected-space diagonal via the matrix-free pairwise path.
+
+    Inputs must already be sorted consistently with the materialized arrays.
+    ``bucket_data`` is accepted for API symmetry with the sigma builder path,
+    but the exact diagonal kernel does not need the bucket metadata.
+    """
+    if _ext is None or not hasattr(_ext, "pairwise_diag_bucketed_u64_inplace_device"):
+        raise RuntimeError(
+            "CUDA extension missing bucketed pairwise diagonal kernel; rebuild with python -m asuka.build.guga_cuda_ext"
+        )
+
+    sel_idx_u64 = cp.ascontiguousarray(cp.asarray(sel_idx_u64, dtype=cp.uint64).ravel())
+    h_base = cp.ascontiguousarray(cp.asarray(h_base, dtype=cp.float64).ravel())
+    eri4 = cp.ascontiguousarray(cp.asarray(eri4, dtype=cp.float64).ravel())
+    steps_all, nodes_all, occ_all, b_all = materialized
+    diag_d = cp.zeros((nsel,), dtype=cp.float64)
+    overflow = cp.zeros((1,), dtype=cp.int32)
+
+    if stream is None:
+        stream_ptr = int(cp.cuda.get_current_stream().ptr)
+    else:
+        stream_ptr = int(getattr(stream, "ptr", stream))
+
+    _ext.pairwise_diag_bucketed_u64_inplace_device(
+        drt_dev,
+        int(drt.ncsf),
+        sel_idx_u64,
+        int(nsel),
+        h_base,
+        eri4,
+        steps_all.ravel(),
+        nodes_all.ravel(),
+        occ_all.ravel(),
+        b_all.ravel(),
+        diag_d,
+        overflow,
+        int(threads),
+        int(stream_ptr),
+        bool(sync),
+    )
+    if int(overflow.item()) != 0:
+        raise RuntimeError("pairwise_diag_bucketed_u64 overflow")
+    return diag_d
+
+
+def pairwise_sigma_bucketed_u64_device(
+    drt,
+    drt_dev,
+    sel_idx_u64,
+    nsel: int,
+    h_base,
+    eri4,
+    materialized,
+    bucket_data,
+    x,
+    cp,
+    *,
+    out=None,
+    threads: int = 256,
+    stream=None,
+    sync: bool = True,
+):
+    """Apply y = P_S H P_S x using the exact bucketed pairwise traversal.
+
+    This path is matrix-free: it reuses the bucketed pairwise traversal but
+    accumulates directly into y instead of materializing dense H.
+    Inputs must already be sorted by bucket_data["sort_perm"].
+    """
+    if _ext is None or not hasattr(_ext, "pairwise_sigma_bucketed_u64_inplace_device"):
+        raise RuntimeError(
+            "CUDA extension missing bucketed pairwise sigma kernel; rebuild with python -m asuka.build.guga_cuda_ext"
+        )
+
+    sel_idx_u64 = cp.ascontiguousarray(cp.asarray(sel_idx_u64, dtype=cp.uint64).ravel())
+    h_base = cp.ascontiguousarray(cp.asarray(h_base, dtype=cp.float64).ravel())
+    eri4 = cp.ascontiguousarray(cp.asarray(eri4, dtype=cp.float64).ravel())
+    steps_all, nodes_all, occ_all, b_all = materialized
+
+    x_arr = cp.asarray(x, dtype=cp.float64)
+    squeeze_out = False
+    if int(getattr(x_arr, "ndim", 1)) == 1:
+        x_arr = cp.ascontiguousarray(x_arr.reshape((int(nsel), 1)))
+        squeeze_out = True
+    else:
+        x_arr = cp.ascontiguousarray(x_arr)
+    if int(x_arr.ndim) != 2:
+        raise ValueError("x must be 1D or 2D")
+    if int(x_arr.shape[0]) != int(nsel):
+        raise ValueError("x leading dimension must match nsel")
+
+    if out is None:
+        y_arr = cp.zeros_like(x_arr)
+    else:
+        y_arr = cp.ascontiguousarray(cp.asarray(out, dtype=cp.float64))
+        if y_arr.shape != x_arr.shape:
+            raise ValueError("out must have the same shape as x")
+        y_arr.fill(0.0)
+
+    overflow = cp.zeros((1,), dtype=cp.int32)
+
+    if stream is None:
+        stream_ptr = int(cp.cuda.get_current_stream().ptr)
+    else:
+        stream_ptr = int(getattr(stream, "ptr", stream))
+
+    _ext.pairwise_sigma_bucketed_u64_inplace_device(
+        drt_dev,
+        int(drt.ncsf),
+        sel_idx_u64,
+        int(nsel),
+        h_base,
+        eri4,
+        steps_all.ravel(),
+        nodes_all.ravel(),
+        occ_all.ravel(),
+        b_all.ravel(),
+        cp.ascontiguousarray(bucket_data["occ_keys_sorted"]),
+        cp.ascontiguousarray(bucket_data["csf_to_bucket"]),
+        cp.ascontiguousarray(bucket_data["target_offsets"]),
+        cp.ascontiguousarray(bucket_data["target_list"]),
+        cp.ascontiguousarray(bucket_data["target_offsets_1b"]),
+        cp.ascontiguousarray(bucket_data["target_list_1b"]),
+        x_arr,
+        y_arr,
+        overflow,
+        int(threads),
+        int(stream_ptr),
+        bool(sync),
+    )
+
+    if int(overflow.item()) != 0:
+        raise RuntimeError("pairwise_sigma_bucketed_u64 overflow")
+    if squeeze_out:
+        return cp.ascontiguousarray(y_arr[:, 0].ravel())
+    return y_arr
+
+
+def pairwise_T_matrix_bucketed_u64_device(
+    drt,
+    drt_dev,
+    materialized_sorted,
+    bucket_data,
+    ci_sel,
+    nsel: int,
+    cp,
+    *,
+    threads: int = 256,
+    stream=None,
+    sync: bool = True,
+):
+    """Compute T[pq, i] = sum_j E_pq[i,j] * c[j] for all orbital pairs (p,q).
+
+    T has shape (norb*norb, nsel) on GPU. Use T @ c for dm1 and T @ T.T for dm2.
+    Inputs must already be sorted by bucket_data["sort_perm"].
+
+    Parameters
+    ----------
+    materialized_sorted : tuple
+        (steps_all, nodes_all, occ_all, b_all) sorted by occ key.
+    bucket_data : dict
+        Bucket data from pairwise_build_bucket_data (sorted version).
+    ci_sel : cupy array, shape (nsel,)
+        CI coefficients in sorted order.
+
+    Returns
+    -------
+    T_d : cupy array, shape (norb*norb, nsel), float64
+    """
+    if _ext is None or not hasattr(_ext, "pairwise_T_matrix_bucketed_u64_inplace_device"):
+        raise RuntimeError(
+            "CUDA extension missing T-matrix kernel; rebuild with python -m asuka.build.guga_cuda_ext"
+        )
+
+    norb = int(drt.norb)
+    steps_all, nodes_all, occ_all, b_all = materialized_sorted
+
+    ci_arr = cp.ascontiguousarray(cp.asarray(ci_sel, dtype=cp.float64).ravel())
+    T_d = cp.zeros((norb * norb, nsel), dtype=cp.float64)
+
+    if stream is None:
+        stream_ptr = int(cp.cuda.get_current_stream().ptr)
+    else:
+        stream_ptr = int(getattr(stream, "ptr", stream))
+
+    _ext.pairwise_T_matrix_bucketed_u64_inplace_device(
+        drt_dev,
+        steps_all.ravel(),
+        nodes_all.ravel(),
+        occ_all.ravel(),
+        b_all.ravel(),
+        cp.ascontiguousarray(bucket_data["csf_to_bucket"]),
+        cp.ascontiguousarray(bucket_data["target_offsets_1b"]),
+        cp.ascontiguousarray(bucket_data["target_list_1b"]),
+        ci_arr,
+        T_d.ravel(),
+        int(nsel),
+        int(threads),
+        int(stream_ptr),
+        bool(sync),
+    )
+    return T_d
 
 
 def pairwise_compute_occ_keys(occ_all, norb: int, cp):
@@ -6016,39 +6873,48 @@ def pairwise_build_neighbor_csr(bucket_keys, norb, cp, *, max_occ_diff=4):
 
     bucket_keys_h = cp.asnumpy(bucket_keys)
 
-    # Decode all bucket keys into occupation vectors (vectorized)
-    shifts = np.arange(norb, dtype=np.uint64) * 2
-    bucket_occs = ((bucket_keys_h[:, None] >> shifts[None, :]) & 3).astype(np.int8)
+    xor = np.bitwise_xor(bucket_keys_h[:, None], bucket_keys_h[None, :])
+    nonzero = np.bitwise_and(np.bitwise_or(xor, np.right_shift(xor, 1)), np.uint64(0x5555555555555555))
+    diff_matrix = np.bitwise_count(nonzero).astype(np.int32, copy=False)
 
-    # Compute full pairwise diff matrix (vectorized)
-    # diff_matrix[i,j] = number of positions where occ[i] != occ[j]
-    diff_matrix = np.sum(
-        bucket_occs[:, None, :] != bucket_occs[None, :, :], axis=2
-    ).astype(np.int32)  # [nbuckets, nbuckets]
-
-    # Build CSR from diff_matrix
-    mask = diff_matrix <= max_occ_diff  # [nbuckets, nbuckets]
-    counts = mask.sum(axis=1).astype(np.int32)
+    mask = diff_matrix <= max_occ_diff
+    counts = mask.sum(axis=1, dtype=np.int32)
     offsets = np.zeros(nbuckets + 1, dtype=np.int32)
     np.cumsum(counts, out=offsets[1:])
-
-    # Extract neighbor indices row by row
-    neighbor_list = np.zeros(int(offsets[-1]), dtype=np.int32)
-    for b in range(nbuckets):
-        s = offsets[b]
-        e = offsets[b + 1]
-        neighbor_list[s:e] = np.nonzero(mask[b])[0]
+    neighbor_list = np.nonzero(mask)[1].astype(np.int32, copy=False)
 
     return cp.asarray(offsets), cp.asarray(neighbor_list)
+
+
+def _build_flat_target_list(neighbor_offsets_h, neighbor_list_h, bucket_starts_h, bucket_sizes_h, nbuckets):
+    """Build flat target list from neighbor CSR. Returns (offsets, list) as numpy arrays."""
+    import numpy as np
+
+    if nbuckets == 0 or int(neighbor_list_h.size) == 0:
+        return np.zeros((nbuckets + 1,), dtype=np.int32), np.zeros((0,), dtype=np.int32)
+
+    pair_sizes = bucket_sizes_h[neighbor_list_h].astype(np.int64, copy=False)
+    pair_prefix = np.zeros((int(pair_sizes.size) + 1,), dtype=np.int64)
+    np.cumsum(pair_sizes, out=pair_prefix[1:])
+
+    offsets = pair_prefix[neighbor_offsets_h.astype(np.int64, copy=False)].astype(np.int32, copy=False)
+    total = int(pair_prefix[-1])
+    if total == 0:
+        return offsets, np.zeros((0,), dtype=np.int32)
+
+    pair_starts = bucket_starts_h[neighbor_list_h].astype(np.int64, copy=False)
+    pair_delta = pair_starts - pair_prefix[:-1]
+    tlist = (np.repeat(pair_delta, pair_sizes) + np.arange(total, dtype=np.int64)).astype(np.int32, copy=False)
+    return offsets, tlist
 
 
 def pairwise_build_bucket_data(occ_all, norb, cp):
     """Full pipeline: occ keys → buckets → neighbor CSR → flat target lists.
 
     Returns a dict with all data needed for bucketed kernel dispatch.
-    The key output is (target_offsets, target_list): for each bucket b,
-    target_list[target_offsets[b]:target_offsets[b+1]] is the sorted list
-    of all CSF indices (in sorted order) that are in neighbor buckets of b.
+    Builds two target lists:
+      - target_offsets/target_list: occ_diff <= 4 (two-body fallback)
+      - target_offsets_1b/target_list_1b: occ_diff <= 2 (one-body + k-relative)
     """
     import numpy as np
 
@@ -6057,11 +6923,34 @@ def pairwise_build_bucket_data(occ_all, norb, cp):
     keys = pairwise_compute_occ_keys(occ_all, norb, cp)
     sort_perm, sorted_keys, bucket_starts, bucket_keys = pairwise_build_occ_buckets(keys, cp)
 
-    # Build neighbor CSR
-    neighbor_offsets, neighbor_list = pairwise_build_neighbor_csr(bucket_keys, norb, cp)
+    # Build neighbor CSRs for both <=4 and <=2 (share diff_matrix computation)
+    nbuckets = len(bucket_keys)
+    if nbuckets > 0:
+        bucket_keys_h = cp.asnumpy(bucket_keys)
+        xor = np.bitwise_xor(bucket_keys_h[:, None], bucket_keys_h[None, :])
+        nonzero = np.bitwise_and(np.bitwise_or(xor, np.right_shift(xor, 1)), np.uint64(0x5555555555555555))
+        diff_matrix = np.bitwise_count(nonzero).astype(np.int32, copy=False)
+
+        def _diff_to_csr(max_diff):
+            mask = diff_matrix <= max_diff
+            counts = mask.sum(axis=1, dtype=np.int32)
+            off = np.zeros(nbuckets + 1, dtype=np.int32)
+            np.cumsum(counts, out=off[1:])
+            nlist = np.nonzero(mask)[1].astype(np.int32, copy=False)
+            return off, nlist
+
+        neighbor_offsets_h, neighbor_list_h = _diff_to_csr(4)
+        neighbor_offsets_1b_h, neighbor_list_1b_h = _diff_to_csr(2)
+    else:
+        neighbor_offsets_h = np.zeros((1,), dtype=np.int32)
+        neighbor_list_h = np.zeros((0,), dtype=np.int32)
+        neighbor_offsets_1b_h = np.zeros((1,), dtype=np.int32)
+        neighbor_list_1b_h = np.zeros((0,), dtype=np.int32)
+
+    neighbor_offsets = cp.asarray(neighbor_offsets_h)
+    neighbor_list = cp.asarray(neighbor_list_h)
 
     # Compute bucket sizes
-    nbuckets = len(bucket_keys)
     bucket_starts_ext = cp.concatenate([bucket_starts, cp.array([nsel], dtype=cp.int64)])
     bucket_sizes = (bucket_starts_ext[1:] - bucket_starts_ext[:-1]).astype(cp.int32)
 
@@ -6069,45 +6958,19 @@ def pairwise_build_bucket_data(occ_all, norb, cp):
     inv_perm = cp.zeros(nsel, dtype=cp.int32)
     inv_perm[sort_perm] = cp.arange(nsel, dtype=cp.int32)
 
-    # Map each sorted CSF to its bucket index
-    csf_to_bucket = cp.zeros(nsel, dtype=cp.int32)
     bucket_starts_h = cp.asnumpy(bucket_starts)
     bucket_sizes_h = cp.asnumpy(bucket_sizes)
-    for b in range(nbuckets):
-        s = int(bucket_starts_h[b])
-        sz = int(bucket_sizes_h[b])
-        csf_to_bucket[s:s + sz] = b
+    # Map each sorted CSF to its bucket index.
+    csf_to_bucket = cp.asarray(
+        np.repeat(np.arange(nbuckets, dtype=np.int32), bucket_sizes_h.astype(np.int64, copy=False)),
+        dtype=cp.int32,
+    ) if nbuckets > 0 else cp.zeros((0,), dtype=cp.int32)
 
-    # Build flat target lists: for each bucket, the sorted union of
-    # CSF indices from all neighbor buckets.
-    neighbor_offsets_h = cp.asnumpy(neighbor_offsets)
-    neighbor_list_h = cp.asnumpy(neighbor_list)
-
-    target_offsets_list = [0]
-    target_list_parts = []
-    for b in range(nbuckets):
-        nb_s = neighbor_offsets_h[b]
-        nb_e = neighbor_offsets_h[b + 1]
-        # Collect all CSF indices from neighbor buckets
-        ranges = []
-        for nb_idx in range(nb_s, nb_e):
-            tb = neighbor_list_h[nb_idx]
-            ts = int(bucket_starts_h[tb])
-            sz = int(bucket_sizes_h[tb])
-            if sz > 0:
-                ranges.append(np.arange(ts, ts + sz, dtype=np.int32))
-        if ranges:
-            targets = np.sort(np.concatenate(ranges))
-        else:
-            targets = np.zeros(0, dtype=np.int32)
-        target_list_parts.append(targets)
-        target_offsets_list.append(target_offsets_list[-1] + len(targets))
-
-    target_offsets = np.array(target_offsets_list, dtype=np.int32)
-    if target_list_parts:
-        target_list = np.concatenate(target_list_parts).astype(np.int32)
-    else:
-        target_list = np.zeros(0, dtype=np.int32)
+    # Build flat target lists for both <=4 and <=2
+    target_offsets, target_list = _build_flat_target_list(
+        neighbor_offsets_h, neighbor_list_h, bucket_starts_h, bucket_sizes_h, nbuckets)
+    target_offsets_1b, target_list_1b = _build_flat_target_list(
+        neighbor_offsets_1b_h, neighbor_list_1b_h, bucket_starts_h, bucket_sizes_h, nbuckets)
 
     return {
         "sort_perm": sort_perm.astype(cp.int32),
@@ -6120,8 +6983,11 @@ def pairwise_build_bucket_data(occ_all, norb, cp):
         "neighbor_list": neighbor_list,
         "csf_to_bucket": csf_to_bucket,
         "occ_keys": keys,
+        "occ_keys_sorted": sorted_keys,
         "target_offsets": cp.asarray(target_offsets),
         "target_list": cp.asarray(target_list),
+        "target_offsets_1b": cp.asarray(target_offsets_1b),
+        "target_list_1b": cp.asarray(target_list_1b),
     }
 
 
@@ -10093,7 +10959,10 @@ class GugaMatvecEriMatWorkspace:
                         profile["sym_pair_nops"] = float(int(self.nops))
 
             # Detect if fused pair-indexed kernels are available (avoids pack/unpack overhead).
-            use_pair_fused = bool(use_sym_pair and has_sym_pair_fused_kernels())
+            # build_w_diag_pair_from_steps_inplace_device requires float64; disable pair-fused
+            # when workspace dtype is float32 (approx_kernel micro-iteration path).
+            use_pair_fused = bool(use_sym_pair and has_sym_pair_fused_kernels()
+                                  and self._dtype == cp.float64)
             _ftp_dev = self._sym_pair_full_to_pair if use_pair_fused else None
 
             for k0 in range(0, int(self.ncsf), int(nrows_block_max)):
@@ -10221,7 +11090,7 @@ class GugaMatvecEriMatWorkspace:
                         gemm_flops = float(4.0 * float(k_count) * float(npair) * float(naux))
                     else:
                         sp_ws = self._sym_pair_gemm_ws
-                        if sp_ws is not None:
+                        if sp_ws is not None and self._dtype == cp.float64:
                             sp_ws.gemm_w_eri_mat_inplace_device(
                                 w_pair_buf, eri_pair, g_out=g_pair_buf,
                                 dtype=self._dtype, half=0.5, stream=stream, sync=False,
@@ -10269,7 +11138,7 @@ class GugaMatvecEriMatWorkspace:
                         gemm_flops = float(4.0 * float(k_count) * float(npair) * float(naux))
                     else:
                         sp_ws = self._sym_pair_gemm_ws
-                        if sp_ws is not None:
+                        if sp_ws is not None and self._dtype == cp.float64:
                             sp_ws.gemm_w_eri_mat_inplace_device(
                                 w_pair_buf, eri_pair, g_out=g_pair_buf,
                                 dtype=self._dtype, half=0.5, stream=stream, sync=False,

@@ -1302,36 +1302,36 @@ void cueri_bind_part1(py::module_& m) {
 
   // Mixed-precision ERI bindings for hand-written s/p kernels.
   bind_mixed_precision_eri(m, "psss", 3,
-      cueri_eri_psss_launch_stream, cueri_eri_psss_f32_launch_stream,
-      cueri_eri_psss_mixed_launch_stream, cueri_eri_psss_mixed_f32_launch_stream,
-      cueri_eri_psss_f32accum_launch_stream, cueri_eri_psss_f32accum_f32_launch_stream);
+      cueri_eri_psss_launch_stream, nullptr,
+      cueri_eri_psss_launch_stream, nullptr,
+      nullptr, nullptr);
   bind_mixed_precision_eri(m, "ppss", 9,
-      cueri_eri_ppss_launch_stream, cueri_eri_ppss_f32_launch_stream,
-      cueri_eri_ppss_mixed_launch_stream, cueri_eri_ppss_mixed_f32_launch_stream,
-      cueri_eri_ppss_f32accum_launch_stream, cueri_eri_ppss_f32accum_f32_launch_stream);
+      cueri_eri_ppss_launch_stream, nullptr,
+      cueri_eri_ppss_launch_stream, nullptr,
+      nullptr, nullptr);
   bind_mixed_precision_eri(m, "psps", 9,
-      cueri_eri_psps_launch_stream, cueri_eri_psps_f32_launch_stream,
-      cueri_eri_psps_mixed_launch_stream, cueri_eri_psps_mixed_f32_launch_stream,
-      cueri_eri_psps_f32accum_launch_stream, cueri_eri_psps_f32accum_f32_launch_stream);
+      cueri_eri_psps_launch_stream, nullptr,
+      cueri_eri_psps_launch_stream, nullptr,
+      nullptr, nullptr);
   bind_mixed_precision_eri(m, "dsss", 6,
-      cueri_eri_dsss_launch_stream, cueri_eri_dsss_f32_launch_stream,
-      cueri_eri_dsss_mixed_launch_stream, cueri_eri_dsss_mixed_f32_launch_stream,
-      cueri_eri_dsss_f32accum_launch_stream, cueri_eri_dsss_f32accum_f32_launch_stream);
+      cueri_eri_dsss_launch_stream, nullptr,
+      cueri_eri_dsss_launch_stream, nullptr,
+      nullptr, nullptr);
   bind_mixed_precision_eri(m, "ppps", 27,
-      cueri_eri_ppps_launch_stream, cueri_eri_ppps_f32_launch_stream,
-      cueri_eri_ppps_mixed_launch_stream, cueri_eri_ppps_mixed_f32_launch_stream,
-      cueri_eri_ppps_f32accum_launch_stream, cueri_eri_ppps_f32accum_f32_launch_stream);
+      cueri_eri_ppps_launch_stream, nullptr,
+      cueri_eri_ppps_launch_stream, nullptr,
+      nullptr, nullptr);
   bind_mixed_precision_eri(m, "pppp", 81,
-      cueri_eri_pppp_launch_stream, cueri_eri_pppp_f32_launch_stream,
-      cueri_eri_pppp_mixed_launch_stream, cueri_eri_pppp_mixed_f32_launch_stream,
-      cueri_eri_pppp_f32accum_launch_stream, cueri_eri_pppp_f32accum_f32_launch_stream);
+      cueri_eri_pppp_launch_stream, nullptr,
+      cueri_eri_pppp_launch_stream, nullptr,
+      nullptr, nullptr);
 
 #ifndef CUERI_FAST_DEV_STEP2_ONLY
   // Mixed-precision ERI bindings for generated d/f/g-shell kernels.
 #define BIND_MIXED_GEN(NAME, NC) \
   bind_mixed_precision_eri(m, #NAME, NC, \
-      cueri_eri_##NAME##_launch_stream, cueri_eri_##NAME##_f32_launch_stream, \
-      cueri_eri_##NAME##_mixed_launch_stream, cueri_eri_##NAME##_mixed_f32_launch_stream)
+      cueri_eri_##NAME##_launch_stream, nullptr, \
+      cueri_eri_##NAME##_launch_stream, nullptr)
 
   BIND_MIXED_GEN(ssdp, 18);
   BIND_MIXED_GEN(psds, 18);

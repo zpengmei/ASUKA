@@ -679,15 +679,137 @@ def test_run_cipsi_trials_macro_growth_cuda_smoke():
     assert res.profile.get("driver") == "cuda_cas36_hb_compact_u64"
     assert bool(res.profile.get("exact_external_selector_effective", False))
     assert res.profile.get("projected_solver_backend") in (
+        "cuda_davidson_projected_exact_sym_graph",
         "cuda_davidson_projected_exact_tuples_device",
         "cuda_davidson_projected_exact_tuples",
     )
     assert "threshold" in [str(x) for x in res.profile.get("selection_policy_history", [])]
     assert any(
-        str(rec.get("selector", {}).get("selector_backend", "")).startswith("exact_external_device_emit_")
+        str(rec.get("selector", {}).get("selector_backend", "")).startswith("exact_external_dense_emit_")
         for rec in res.history
     )
     assert np.all(np.isfinite(res.e_var))
+
+
+@pytest.mark.cuda
+def test_run_cipsi_trials_macro_growth_cuda_frontier_hash_switches_to_compact_selector(monkeypatch):
+    _require_cuda()
+
+    drt = build_drt(norb=4, nelec=2, twos_target=0)
+    h1e, eri = _make_symmetric_test_integrals(4, seed=214)
+    monkeypatch.setenv("ASUKA_FRONTIER_HASH_EXACT_SELECTOR_MAX_NSEL", "4")
+
+    res = run_cipsi_trials(
+        drt,
+        h1e,
+        eri,
+        nroots=1,
+        init_ncsf=min(8, int(drt.ncsf)),
+        max_ncsf=min(int(drt.ncsf), 16),
+        grow_by=2,
+        max_iter=2,
+        epq_mode="no_epq_support_aware",
+        selection_mode="frontier_hash",
+        davidson_max_cycle=10,
+        davidson_max_space=8,
+        davidson_tol=1e-7,
+        backend="cuda_key64",
+        state_rep="key64",
+        workspace_kwargs={"macro_growth_steps": 2},
+    )
+
+    assert res.profile.get("driver") == "cuda_cas36_hb_compact_u64"
+    assert int(res.profile.get("frontier_hash_exact_selector_max_nsel", -1)) == 4
+    assert "cuda_frontier_hash_compact" in [str(x) for x in res.profile.get("selector_backend_history", [])]
+    assert np.all(np.isfinite(res.e_var))
+
+
+@pytest.mark.cuda
+def test_run_cipsi_trials_macro_growth_cuda_heat_bath_stays_on_compact_selector(monkeypatch):
+    _require_cuda()
+
+    drt = build_drt(norb=6, nelec=6, twos_target=0)
+    h1e, eri = _make_symmetric_test_integrals(6, seed=215)
+    monkeypatch.setenv("ASUKA_HB_CUDA_SELECTOR_MIN_NSEL", "0")
+    monkeypatch.setenv("ASUKA_GPU_PROJECTED_PARITY_CHECK", "off")
+    monkeypatch.setenv("ASUKA_HB_SELECTED_GRAPH_NSEL_MIN", "16")
+    monkeypatch.setenv("ASUKA_HB_SELECTED_GRAPH_BUILDER", "tuple_emit")
+    monkeypatch.setenv("ASUKA_GPU_PROJECTED_EIGENSOLVER", "davidson")
+
+    res = run_cipsi_trials(
+        drt,
+        h1e,
+        eri,
+        nroots=1,
+        init_ncsf=16,
+        max_ncsf=24,
+        grow_by=4,
+        max_iter=1,
+        epq_mode="no_epq_support_aware",
+        selection_mode="heat_bath",
+        hb_epsilon=1e-4,
+        davidson_max_cycle=10,
+        davidson_max_space=8,
+        davidson_tol=1e-7,
+        backend="cuda_key64",
+        state_rep="key64",
+        workspace_kwargs={
+            "macro_growth_steps": 2,
+            "projected_solver_gpu": True,
+            "projected_solver_matrix_free": True,
+        },
+    )
+
+    assert res.profile.get("driver") == "cuda_cas36_hb_compact_u64"
+    assert res.profile.get("cuda_selector_step_fallback_reason") is None
+    assert "cuda_heat_bath_compact" in [str(x) for x in res.profile.get("selector_backend_history", [])]
+    assert any(
+        str(rec.get("cuda_selector", {}).get("selector_backend", "")) == "cuda_heat_bath_compact"
+        for rec in res.history
+    )
+    assert np.all(np.isfinite(res.e_var))
+
+
+@pytest.mark.cuda
+def test_run_cipsi_trials_heat_bath_exact_external_threshold_is_inclusive(monkeypatch):
+    _require_cuda()
+
+    drt = build_drt(norb=4, nelec=2, twos_target=0)
+    h1e, eri = _make_symmetric_test_integrals(4, seed=216)
+    monkeypatch.setenv("ASUKA_HB_CUDA_SELECTOR_MIN_NSEL", "8")
+    monkeypatch.setenv("ASUKA_GPU_PROJECTED_PARITY_CHECK", "off")
+    monkeypatch.setenv("ASUKA_HB_SELECTED_GRAPH_NSEL_MIN", "16")
+    monkeypatch.setenv("ASUKA_HB_SELECTED_GRAPH_BUILDER", "tuple_emit")
+    monkeypatch.setenv("ASUKA_GPU_PROJECTED_EIGENSOLVER", "davidson")
+
+    res = run_cipsi_trials(
+        drt,
+        h1e,
+        eri,
+        nroots=1,
+        init_ncsf=8,
+        max_ncsf=8,
+        grow_by=0,
+        max_iter=1,
+        epq_mode="no_epq_support_aware",
+        selection_mode="heat_bath",
+        hb_epsilon=1e-4,
+        davidson_max_cycle=10,
+        davidson_max_space=8,
+        davidson_tol=1e-7,
+        backend="cuda_key64",
+        state_rep="key64",
+        workspace_kwargs={
+            "projected_solver_gpu": True,
+            "projected_solver_matrix_free": True,
+        },
+    )
+
+    assert bool(res.profile.get("exact_external_selector_effective", False))
+    assert str(res.profile.get("exact_external_selector_final_stats", {}).get("selector_backend", "")).startswith(
+        "exact_external_"
+    )
+    assert np.all(np.isfinite(res.e_pt2))
 
 
 @pytest.mark.cuda
@@ -718,7 +840,10 @@ def test_run_cipsi_trials_macro_growth_cuda_idx64_smoke():
 
     assert bool(res.profile.get("macro_schedule_enabled", False))
     assert bool(res.profile.get("exact_external_selector_effective", False))
-    assert res.profile.get("projected_solver_backend") == "cuda_davidson_projected_exact_tuples"
+    assert res.profile.get("projected_solver_backend") in (
+        "cuda_davidson_projected_exact_sym_graph",
+        "cuda_davidson_projected_exact_tuples",
+    )
     assert res.label_kind == "idx64"
     assert np.all(np.isfinite(res.e_var))
 
@@ -767,7 +892,14 @@ def test_run_cipsi_trials_macro_growth_cuda_df_exact_tuple_smoke():
 
     assert bool(res.profile.get("macro_schedule_enabled", False))
     assert bool(res.profile.get("exact_external_selector_effective", False))
-    assert res.profile.get("projected_solver_backend") == "cuda_davidson_projected_exact_tuples"
+    assert res.profile.get("projected_solver_backend") in (
+        "cuda_davidson_projected_exact_sym_graph",
+        "cuda_davidson_projected_exact_tuples",
+    )
+    assert any(
+        str(rec.get("selector", {}).get("selector_backend", "")) == "exact_external_gpu_reduce_cuda_compact"
+        for rec in res.history
+    )
     assert res.label_kind == "key64"
     assert np.all(np.isfinite(res.e_var))
 
@@ -816,7 +948,7 @@ def test_run_cipsi_trials_macro_growth_cuda_exact_external_optin_preserves_resul
     assert bool(res_exact.profile.get("exact_external_selector_effective", False))
     assert "exact_external_selector_fallback_reason" not in res_exact.profile
     assert any(
-        str(rec.get("selector", {}).get("selector_backend", "")).startswith("exact_external_device_emit_")
+        str(rec.get("selector", {}).get("selector_backend", "")).startswith("exact_external_dense_emit_")
         for rec in res_exact.history
     )
 
@@ -849,12 +981,13 @@ def test_run_cipsi_trials_macro_growth_cuda_multi_root_exact_external_threshold_
 
     assert bool(res.profile.get("exact_external_selector_effective", False))
     assert res.profile.get("projected_solver_backend") in (
+        "cuda_davidson_projected_exact_sym_graph",
         "cuda_davidson_projected_exact_tuples_device",
         "cuda_davidson_projected_exact_tuples",
     )
     assert "threshold" in [str(x) for x in res.profile.get("selection_policy_history", [])]
     assert any(
-        str(rec.get("selector", {}).get("selector_backend", "")).startswith("exact_external_device_emit_")
+        str(rec.get("selector", {}).get("selector_backend", "")).startswith("exact_external_dense_emit_")
         for rec in res.history
     )
     assert len(res.roots) == 2
@@ -895,7 +1028,7 @@ def test_run_cipsi_trials_macro_growth_cuda_parallel_emit_streams_smoke():
     assert int(res.profile.get("exact_external_emit_streams_effective", 0)) >= 2
     assert "parallel_emit_overflow_retry" not in str(res.profile.get("exact_external_emit_streams_fallback_reason", ""))
     assert any(
-        str(rec.get("selector", {}).get("selector_backend", "")).startswith("exact_external_device_emit_")
+        str(rec.get("selector", {}).get("selector_backend", "")).startswith("exact_external_dense_emit_")
         for rec in res.history
     )
     assert np.all(np.isfinite(res.e_var))
@@ -982,6 +1115,7 @@ def test_run_cipsi_trials_macro_growth_cuda_matrix_free_optin_preserves_results(
     )
 
     assert res_sell.profile.get("projected_solver_backend") in (
+        "cuda_davidson_projected_exact_sym_graph",
         "cuda_davidson_projected_exact_tuples_device",
         "cuda_davidson_projected_exact_tuples",
     )
@@ -991,9 +1125,377 @@ def test_run_cipsi_trials_macro_growth_cuda_matrix_free_optin_preserves_results(
     assert np.array_equal(np.sort(res_proj.sel_idx), np.sort(res_sell.sel_idx))
     assert bool(res_proj.profile.get("projected_solver_matrix_free_requested", False))
     assert res_proj.profile.get("projected_solver_backend") in (
+        "cuda_davidson_projected_exact_sym_graph",
         "cuda_davidson_projected_exact_tuples_device",
         "cuda_davidson_projected_exact_tuples",
     )
+
+
+@pytest.mark.cuda
+def test_run_cipsi_trials_heat_bath_tuple_emit_graph_route_survives_parity(monkeypatch):
+    _require_cuda()
+
+    drt = build_drt(norb=10, nelec=10, twos_target=0)
+    h1e, eri = _make_symmetric_test_integrals(10, seed=913)
+    monkeypatch.setenv("ASUKA_HB_SELECTED_GRAPH_NSEL_MIN", "32")
+    monkeypatch.setenv("ASUKA_HB_SELECTED_GRAPH_BUILDER", "tuple_emit")
+    monkeypatch.setenv("ASUKA_GPU_PROJECTED_EIGENSOLVER", "davidson")
+
+    res = run_cipsi_trials(
+        drt,
+        h1e,
+        eri,
+        nroots=1,
+        init_ncsf=64,
+        max_ncsf=64,
+        grow_by=0,
+        max_iter=0,
+        epq_mode="no_epq_support_aware",
+        selection_mode="heat_bath",
+        hb_epsilon=1e-4,
+        davidson_max_cycle=10,
+        davidson_max_space=8,
+        davidson_tol=1e-7,
+        backend="cuda_key64",
+        state_rep="key64",
+        workspace_kwargs={"projected_solver_gpu": True, "projected_solver_matrix_free": True},
+    )
+
+    assert res.profile.get("projected_solver_route_taken") == "tuple_emit_graph"
+    assert res.profile.get("projected_solver_projected_hop_fallback_reason") is None
+    assert res.profile.get("projected_solver_backend") == "cuda_davidson_projected_exact_sym_graph"
+    assert np.all(np.isfinite(res.e_var))
+
+
+@pytest.mark.cuda
+def test_run_cipsi_trials_heat_bath_default_matrix_free_auto_uses_graph(monkeypatch):
+    _require_cuda()
+
+    drt = build_drt(norb=10, nelec=10, twos_target=0)
+    h1e, eri = _make_symmetric_test_integrals(10, seed=914)
+    monkeypatch.setenv("ASUKA_HB_SELECTED_GRAPH_NSEL_MIN", "32")
+    monkeypatch.setenv("ASUKA_HB_SELECTED_GRAPH_BUILDER", "tuple_emit")
+    monkeypatch.setenv("ASUKA_GPU_PROJECTED_EIGENSOLVER", "davidson")
+
+    res = run_cipsi_trials(
+        drt,
+        h1e,
+        eri,
+        nroots=1,
+        init_ncsf=64,
+        max_ncsf=64,
+        grow_by=0,
+        max_iter=0,
+        epq_mode="no_epq_support_aware",
+        selection_mode="heat_bath",
+        hb_epsilon=1e-4,
+        davidson_max_cycle=10,
+        davidson_max_space=8,
+        davidson_tol=1e-7,
+        backend="cuda_key64",
+        state_rep="key64",
+        workspace_kwargs={"projected_solver_gpu": True},
+    )
+
+    assert res.profile.get("projected_solver_matrix_free_requested") is None
+    assert bool(res.profile.get("projected_solver_matrix_free_effective", False))
+    assert res.profile.get("projected_solver_matrix_free_mode") == "auto"
+    assert res.profile.get("projected_solver_route_taken") == "tuple_emit_graph"
+    assert res.profile.get("projected_solver_backend") == "cuda_davidson_projected_exact_sym_graph"
+    assert np.all(np.isfinite(res.e_var))
+
+
+@pytest.mark.cuda
+def test_run_cipsi_trials_heat_bath_device_df_tuple_emit_graph_stays_gpu(monkeypatch):
+    cupy = _require_cuda()
+
+    from asuka.integrals.df_integrals import DeviceDFMOIntegrals
+
+    drt = build_drt(norb=6, nelec=6, twos_target=0)
+    h1e, _ = _make_symmetric_test_integrals(6, seed=917)
+    rng = np.random.default_rng(9171)
+    nops = int(drt.norb) * int(drt.norb)
+    naux = 11
+    l_full = np.asarray(rng.normal(size=(nops, naux)), dtype=np.float64, order="C")
+    l3 = l_full.reshape(int(drt.norb), int(drt.norb), naux)
+    j_ps = np.asarray(np.einsum("pql,qsl->ps", l3, l3, optimize=True), dtype=np.float64, order="C")
+    pair_norm = np.asarray(np.linalg.norm(l_full, axis=1), dtype=np.float64, order="C")
+    eri_dev = DeviceDFMOIntegrals(
+        norb=int(drt.norb),
+        l_full=_cupy_asarray_or_skip(cupy, l_full),
+        j_ps=_cupy_asarray_or_skip(cupy, j_ps),
+        pair_norm=_cupy_asarray_or_skip(cupy, pair_norm),
+        eri_mat=None,
+    )
+
+    monkeypatch.setenv("ASUKA_HB_SELECTED_GRAPH_NSEL_MIN", "16")
+    monkeypatch.setenv("ASUKA_HB_SELECTED_GRAPH_BUILDER", "tuple_emit")
+    monkeypatch.setenv("ASUKA_GPU_PROJECTED_EIGENSOLVER", "davidson")
+
+    res = run_cipsi_trials(
+        drt,
+        h1e,
+        eri_dev,
+        nroots=1,
+        init_ncsf=16,
+        max_ncsf=16,
+        grow_by=0,
+        max_iter=0,
+        epq_mode="no_epq_support_aware",
+        selection_mode="heat_bath",
+        hb_epsilon=1e-4,
+        davidson_max_cycle=8,
+        davidson_max_space=6,
+        davidson_tol=1e-7,
+        backend="cuda_key64",
+        state_rep="key64",
+        workspace_kwargs={"projected_solver_gpu": True, "projected_solver_matrix_free": True},
+    )
+
+    assert res.profile.get("projected_solver_route_taken") == "tuple_emit_graph"
+    assert res.profile.get("projected_solver_backend") == "cuda_davidson_projected_exact_sym_graph"
+    assert res.profile.get("projected_solver_dense_input_source") == "device_df_gpu_l_full"
+    assert res.profile.get("hb_index_build_backend") == "gpu_device_df"
+    assert np.all(np.isfinite(res.e_var))
+
+
+@pytest.mark.cuda
+def test_run_cipsi_trials_heat_bath_device_df_compact_df_exact_graph_matches_tuple_emit(monkeypatch):
+    cupy = _require_cuda()
+
+    from asuka.integrals.df_integrals import DeviceDFMOIntegrals
+
+    drt = build_drt(norb=6, nelec=6, twos_target=0)
+    h1e, _ = _make_symmetric_test_integrals(6, seed=918)
+    rng = np.random.default_rng(9181)
+    nops = int(drt.norb) * int(drt.norb)
+    naux = 11
+    l_full = np.asarray(rng.normal(size=(nops, naux)), dtype=np.float64, order="C")
+    l3 = l_full.reshape(int(drt.norb), int(drt.norb), naux)
+    j_ps = np.asarray(np.einsum("pql,qsl->ps", l3, l3, optimize=True), dtype=np.float64, order="C")
+    pair_norm = np.asarray(np.linalg.norm(l_full, axis=1), dtype=np.float64, order="C")
+    eri_dev = DeviceDFMOIntegrals(
+        norb=int(drt.norb),
+        l_full=_cupy_asarray_or_skip(cupy, l_full),
+        j_ps=_cupy_asarray_or_skip(cupy, j_ps),
+        pair_norm=_cupy_asarray_or_skip(cupy, pair_norm),
+        eri_mat=None,
+    )
+
+    base_kwargs = dict(
+        nroots=1,
+        init_ncsf=16,
+        max_ncsf=16,
+        grow_by=0,
+        max_iter=0,
+        epq_mode="no_epq_support_aware",
+        selection_mode="heat_bath",
+        hb_epsilon=1e-4,
+        davidson_max_cycle=8,
+        davidson_max_space=6,
+        davidson_tol=1e-7,
+        backend="cuda_key64",
+        state_rep="key64",
+        workspace_kwargs={"projected_solver_gpu": True, "projected_solver_matrix_free": True},
+    )
+
+    monkeypatch.setenv("ASUKA_HB_SELECTED_GRAPH_NSEL_MIN", "16")
+    monkeypatch.setenv("ASUKA_HB_SELECTED_GRAPH_STATE_CACHE_MAX_NCSF", "1000000")
+    monkeypatch.setenv("ASUKA_GPU_PROJECTED_EIGENSOLVER", "davidson")
+
+    monkeypatch.setenv("ASUKA_HB_SELECTED_GRAPH_BUILDER", "tuple_emit")
+    res_tuple = run_cipsi_trials(drt, h1e, eri_dev, **base_kwargs)
+
+    monkeypatch.setenv("ASUKA_HB_SELECTED_GRAPH_BUILDER", "compact_df_exact")
+    res_compact = run_cipsi_trials(drt, h1e, eri_dev, **base_kwargs)
+
+    assert res_tuple.profile.get("projected_solver_route_taken") == "tuple_emit_graph"
+    assert res_compact.profile.get("projected_solver_backend") in (
+        "cuda_davidson_projected_exact_sym_graph",
+        "cuda_davidson_projected_exact_sell",
+    )
+    np.testing.assert_allclose(res_compact.e_var, res_tuple.e_var, rtol=1e-7, atol=1e-8)
+    np.testing.assert_allclose(res_compact.e_tot, res_tuple.e_tot, rtol=1e-7, atol=1e-8)
+
+
+@pytest.mark.cuda
+def test_run_cipsi_trials_heat_bath_host_df_auto_promotes_to_device(monkeypatch):
+    _require_cuda()
+
+    from asuka.integrals.df_integrals import DFMOIntegrals
+
+    drt = build_drt(norb=6, nelec=6, twos_target=0)
+    h1e, _ = _make_symmetric_test_integrals(6, seed=920)
+    rng = np.random.default_rng(9201)
+    nops = int(drt.norb) * int(drt.norb)
+    naux = 11
+    l_full = np.asarray(rng.normal(size=(nops, naux)), dtype=np.float64, order="C")
+    l3 = l_full.reshape(int(drt.norb), int(drt.norb), naux)
+    j_ps = np.asarray(np.einsum("pql,qsl->ps", l3, l3, optimize=True), dtype=np.float64, order="C")
+    pair_norm = np.asarray(np.linalg.norm(l_full, axis=1), dtype=np.float64, order="C")
+    eri_host = DFMOIntegrals(
+        norb=int(drt.norb),
+        l_full=l_full,
+        j_ps=j_ps,
+        pair_norm=pair_norm,
+    )
+
+    monkeypatch.setenv("ASUKA_HB_SELECTED_GRAPH_NSEL_MIN", "16")
+    monkeypatch.setenv("ASUKA_HB_SELECTED_GRAPH_BUILDER", "tuple_emit")
+    monkeypatch.setenv("ASUKA_GPU_PROJECTED_EIGENSOLVER", "davidson")
+
+    res = run_cipsi_trials(
+        drt,
+        h1e,
+        eri_host,
+        nroots=1,
+        init_ncsf=16,
+        max_ncsf=16,
+        grow_by=0,
+        max_iter=0,
+        epq_mode="no_epq_support_aware",
+        selection_mode="heat_bath",
+        hb_epsilon=1e-4,
+        davidson_max_cycle=8,
+        davidson_max_space=6,
+        davidson_tol=1e-7,
+        backend="cuda_key64",
+        state_rep="key64",
+        workspace_kwargs={"projected_solver_gpu": True, "projected_solver_matrix_free": True},
+    )
+
+    assert bool(res.profile.get("df_integrals_device_promoted", False))
+    assert res.profile.get("projected_solver_route_taken") == "tuple_emit_graph"
+    assert res.profile.get("projected_solver_backend") == "cuda_davidson_projected_exact_sym_graph"
+    assert res.profile.get("projected_solver_dense_input_source") == "device_df_gpu_l_full"
+    assert res.profile.get("hb_index_build_backend") == "gpu_device_df"
+    assert np.all(np.isfinite(res.e_var))
+
+
+def test_exact_selected_pairwise_sigma_projected_hop_matches_dense_pairwise_hamiltonian():
+    cp = _require_cuda()
+
+    from asuka.cuda.cuda_backend import (
+        make_device_drt,
+        pairwise_build_bucket_data,
+        pairwise_hij_bucketed_u64_device,
+        pairwise_materialize_u64_device,
+    )
+    from asuka.cuda.cuda_davidson import davidson_sym_gpu, jacobi_davidson_sym_gpu
+    from asuka.sci.projected_apply import ExactSelectedPairwiseSigmaProjectedHop, ExactSelectedSymRowGraphProjectedHop
+
+    drt = build_drt(norb=10, nelec=10, twos_target=0)
+    drt_dev = make_device_drt(drt)
+    h1e, eri = _make_symmetric_test_integrals(10, seed=913)
+    h_base = np.asarray(
+        np.asarray(h1e, dtype=np.float64, order="C") - 0.5 * np.einsum("pqqs->ps", eri, optimize=True),
+        dtype=np.float64,
+        order="C",
+    )
+    h_base_d = cp.ascontiguousarray(cp.asarray(h_base.ravel(), dtype=cp.float64))
+    eri4_d = cp.ascontiguousarray(cp.asarray(np.asarray(eri, dtype=np.float64, order="C").ravel(), dtype=cp.float64))
+
+    nsel = 256
+    start = max(0, int(drt.ncsf) // 17 - nsel // 2)
+    sel_idx = np.arange(start, start + nsel, dtype=np.int64)
+    sel_u64_d = cp.ascontiguousarray(cp.asarray(sel_idx.astype(np.uint64, copy=False), dtype=cp.uint64).ravel())
+
+    materialized = pairwise_materialize_u64_device(drt, drt_dev, sel_u64_d, int(nsel), cp, sync=True)
+    bucket_data = pairwise_build_bucket_data(materialized[2], int(drt.norb), cp)
+    sort_perm_d = cp.ascontiguousarray(bucket_data["sort_perm"].astype(cp.int64))
+    inv_perm_d = cp.ascontiguousarray(bucket_data["inv_perm"].astype(cp.int64))
+    materialized_sorted = tuple(cp.ascontiguousarray(arr[sort_perm_d]) for arr in materialized)
+    sel_sorted_d = cp.ascontiguousarray(sel_u64_d[sort_perm_d])
+    H_sorted_d, diag_sorted_d = pairwise_hij_bucketed_u64_device(
+        drt,
+        drt_dev,
+        sel_sorted_d,
+        int(nsel),
+        h_base_d,
+        eri4_d,
+        materialized_sorted,
+        bucket_data,
+        cp,
+        sync=True,
+    )
+    H_d = cp.ascontiguousarray(H_sorted_d[inv_perm_d][:, inv_perm_d])
+    diag_d = cp.ascontiguousarray(diag_sorted_d[inv_perm_d])
+    hop = ExactSelectedPairwiseSigmaProjectedHop.from_selected_space(
+        drt=drt,
+        drt_dev=drt_dev,
+        sel_idx=sel_idx,
+        h_base_d=h_base_d,
+        eri4_d=eri4_d,
+        cp=cp,
+        build_exact_diag=True,
+    )
+    np.testing.assert_allclose(
+        np.asarray(cp.asnumpy(hop.hdiag_d), dtype=np.float64),
+        np.asarray(cp.asnumpy(diag_d), dtype=np.float64),
+        rtol=1e-11,
+        atol=1e-11,
+    )
+
+    x_h = np.asarray(np.random.default_rng(2718).standard_normal((int(nsel),)), dtype=np.float64, order="C")
+    x_d = cp.ascontiguousarray(cp.asarray(x_h, dtype=cp.float64))
+    y_ref_h = np.asarray(cp.asnumpy(H_d @ x_d), dtype=np.float64, order="C")
+    y_hop_h = np.asarray(cp.asnumpy(hop.hop_gpu(x_d)), dtype=np.float64, order="C")
+    np.testing.assert_allclose(y_hop_h, y_ref_h, rtol=1e-11, atol=1e-11)
+    graph_hop = ExactSelectedSymRowGraphProjectedHop.from_pairwise_selected_space(
+        drt=drt,
+        drt_dev=drt_dev,
+        sel_idx=sel_idx,
+        h_base_d=h_base_d,
+        eri4_d=eri4_d,
+        cp=cp,
+    )
+    y_graph_h = np.asarray(cp.asnumpy(graph_hop.hop_gpu(x_d)), dtype=np.float64, order="C")
+    np.testing.assert_allclose(y_graph_h, y_ref_h, rtol=1e-11, atol=1e-11)
+
+    eig_ref = np.linalg.eigvalsh(np.asarray(cp.asnumpy(H_d), dtype=np.float64))[:1]
+    x0_h = [np.eye(int(nsel), 1, dtype=np.float64)[:, 0]]
+    dav_res = davidson_sym_gpu(
+        lambda v_d: hop.hop_gpu(v_d),
+        x0=x0_h,
+        hdiag=np.asarray(cp.asnumpy(diag_d), dtype=np.float64),
+        nroots=1,
+        max_cycle=32,
+        max_space=12,
+        tol=1e-8,
+        subspace_eigh_cpu=False,
+        batch_convergence_transfer=True,
+    )
+    np.testing.assert_allclose(np.asarray(dav_res.e, dtype=np.float64), eig_ref, rtol=1e-7, atol=1e-8)
+    graph_dav_res = davidson_sym_gpu(
+        lambda v_d: graph_hop.hop_gpu(v_d),
+        x0=x0_h,
+        hdiag=np.asarray(cp.asnumpy(graph_hop.hdiag_d), dtype=np.float64),
+        nroots=1,
+        max_cycle=32,
+        max_space=12,
+        tol=1e-8,
+        subspace_eigh_cpu=False,
+        batch_convergence_transfer=True,
+    )
+    np.testing.assert_allclose(np.asarray(graph_dav_res.e, dtype=np.float64), eig_ref, rtol=1e-7, atol=1e-8)
+
+    jd_precond = hop.build_jd_preconditioner(block_size=64, denom_tol=1e-8)
+    jd_res = jacobi_davidson_sym_gpu(
+        lambda v_d: hop.hop_gpu(v_d),
+        x0=x0_h,
+        hdiag=np.asarray(cp.asnumpy(diag_d), dtype=np.float64),
+        precond=jd_precond,
+        nroots=1,
+        max_cycle=32,
+        max_space=12,
+        tol=1e-8,
+        subspace_eigh_cpu=False,
+        batch_convergence_transfer=True,
+        jd_inner_max_cycle=8,
+        jd_inner_tol_rel=0.25,
+        jd_keep_corrections=4,
+    )
+    np.testing.assert_allclose(np.asarray(jd_res.e, dtype=np.float64), eig_ref, rtol=1e-7, atol=1e-8)
 
 
 def test_incremental_variational_hamiltonian_builder_matches_full_rebuild():
@@ -1497,3 +1999,145 @@ def test_diagonal_guess_lookup_device_df_accepts_l_full_with_eri_mat():
 
     for idx in range(int(drt.ncsf)):
         np.testing.assert_allclose(lookup_dev.get(idx), lookup_host.get(idx), rtol=1e-12, atol=1e-12)
+
+
+# ---------------------------------------------------------------------------
+# GPU RDM tests
+# ---------------------------------------------------------------------------
+
+@pytest.mark.cuda
+@pytest.mark.parametrize("norb,nelec,twos", [(4, 2, 0), (4, 4, 0), (6, 4, 0)])
+def test_make_rdm12_gpu_vs_cpu_sparse(norb, nelec, twos):
+    """GPU T-matrix RDM must match CPU sparse_rdm to machine precision."""
+    cp = _require_cuda()
+    from asuka.cuda.cuda_backend import make_device_drt
+    from asuka.sci.gpu_rdm import make_rdm12_gpu
+    from asuka.sci.sparse_rdm import make_rdm12_selected
+
+    drt = build_drt(norb=norb, nelec=nelec, twos_target=twos)
+    h1e, eri = _make_symmetric_test_integrals(norb, seed=norb * 100 + nelec)
+
+    ncsf = int(drt.ncsf)
+    init_ncsf = min(ncsf, 16)
+    res = run_cipsi_trials(
+        drt, h1e, eri,
+        nroots=1,
+        init_ncsf=init_ncsf,
+        max_ncsf=min(ncsf, 64),
+        grow_by=8,
+        max_iter=2,
+        epq_mode="no_epq_support_aware",
+        selection_mode="heat_bath",
+        hb_epsilon=1e-3,
+        davidson_max_cycle=10,
+        davidson_max_space=8,
+        davidson_tol=1e-7,
+    )
+
+    sel_idx = np.asarray(res.sel_idx, dtype=np.int64)
+    ci_sel = np.asarray(res.ci_sel[:, 0] if res.ci_sel.ndim == 2 else res.ci_sel, dtype=np.float64)
+
+    # CPU reference
+    dm1_cpu, dm2_cpu = make_rdm12_selected(drt, sel_idx, ci_sel)
+
+    # GPU path
+    drt_dev = make_device_drt(drt)
+    dm1_gpu_d, dm2_gpu_d = make_rdm12_gpu(drt, drt_dev, sel_idx, ci_sel, cp)
+    dm1_gpu = cp.asnumpy(dm1_gpu_d)
+    dm2_gpu = cp.asnumpy(dm2_gpu_d)
+
+    np.testing.assert_allclose(dm1_gpu, dm1_cpu, atol=1e-12, rtol=0,
+                               err_msg="dm1 GPU vs CPU mismatch")
+    np.testing.assert_allclose(dm2_gpu, dm2_cpu, atol=1e-12, rtol=0,
+                               err_msg="dm2 GPU vs CPU mismatch")
+
+    # Symmetry: dm1[p,q] == dm1[q,p] for real wavefunctions
+    np.testing.assert_allclose(dm1_gpu, dm1_gpu.T, atol=1e-13,
+                               err_msg="dm1 not symmetric")
+    # dm2 symmetry for real wfn: dm2[p,q,r,s] == dm2[s,r,q,p]
+    np.testing.assert_allclose(dm2_gpu, dm2_gpu.transpose(3, 2, 1, 0), atol=1e-12,
+                               err_msg="dm2 pqrs != srqp symmetry violated")
+
+
+@pytest.mark.cuda
+def test_guga_sci_solver_make_rdm12_uses_gpu():
+    """GUGASCISolver.make_rdm12 should use GPU path and match CPU sparse_rdm."""
+    cp = _require_cuda()
+    from asuka.sci.solver import GUGASCISolver
+    from asuka.sci.sparse_rdm import make_rdm12_selected
+
+    norb, nelec, twos = 4, 4, 0
+    drt = build_drt(norb=norb, nelec=nelec, twos_target=twos)
+    h1e, eri = _make_symmetric_test_integrals(norb, seed=42)
+
+    solver = GUGASCISolver(
+        twos=twos,
+        nroots=1,
+        max_ncsf=min(int(drt.ncsf), 64),
+        init_ncsf=16,
+        grow_by=8,
+        max_iter=2,
+        selection_mode="heat_bath",
+        hb_epsilon=1e-3,
+        hf_seed=True,
+    )
+    e, ci = solver.kernel(h1e, eri, norb, (nelec // 2, nelec // 2))
+    assert np.isfinite(e)
+
+    # make_rdm12 via solver (should use GPU path)
+    dm1, dm2 = solver.make_rdm12(ci, norb, (nelec // 2, nelec // 2))
+    assert dm1.shape == (norb, norb)
+    assert dm2.shape == (norb, norb, norb, norb)
+    assert isinstance(dm1, np.ndarray)  # returned as numpy
+
+    # Cross-check against CPU reference
+    sel_idx = solver._sci_sel_idx
+    ci_sel_1d = solver._sci_ci_sel[:, 0] if solver._sci_ci_sel.ndim == 2 else solver._sci_ci_sel
+    dm1_ref, dm2_ref = make_rdm12_selected(drt, sel_idx, ci_sel_1d)
+
+    np.testing.assert_allclose(dm1, dm1_ref, atol=1e-12, rtol=0)
+    np.testing.assert_allclose(dm2, dm2_ref, atol=1e-12, rtol=0)
+
+
+@pytest.mark.cuda
+def test_guga_sci_solver_make_rdm12_multiroot():
+    """GUGASCISolver.make_rdm12 with nroots=2 respects root= kwarg."""
+    cp = _require_cuda()
+    from asuka.sci.solver import GUGASCISolver
+    from asuka.sci.sparse_rdm import make_rdm12_selected
+
+    norb, nelec = 4, 2
+    drt = build_drt(norb=norb, nelec=nelec, twos_target=0)
+    h1e, eri = _make_symmetric_test_integrals(norb, seed=77)
+
+    solver = GUGASCISolver(
+        twos=0,
+        nroots=2,
+        max_ncsf=min(int(drt.ncsf), 64),
+        init_ncsf=8,
+        grow_by=4,
+        max_iter=2,
+        selection_mode="heat_bath",
+        hb_epsilon=1e-3,
+        hf_seed=True,
+    )
+    e_arr, ci_list = solver.kernel(h1e, eri, norb, (nelec // 2, nelec // 2))
+    assert len(e_arr) == 2
+
+    for root in range(2):
+        ci_sel_r = solver._sci_ci_sel[:, root]
+        dm1_ref, dm2_ref = make_rdm12_selected(drt, solver._sci_sel_idx, ci_sel_r)
+
+        # Explicit root= kwarg
+        dm1, dm2 = solver.make_rdm12(ci_list[root], norb, (nelec // 2, nelec // 2), root=root)
+        np.testing.assert_allclose(dm1, dm1_ref, atol=1e-12, rtol=0,
+                                   err_msg=f"dm1 mismatch at root={root} (explicit root=)")
+        np.testing.assert_allclose(dm2, dm2_ref, atol=1e-12, rtol=0,
+                                   err_msg=f"dm2 mismatch at root={root} (explicit root=)")
+
+        # No root= kwarg — simulates make_state_averaged_rdms; must auto-detect root
+        dm1_auto, dm2_auto = solver.make_rdm12(ci_list[root], norb, (nelec // 2, nelec // 2))
+        np.testing.assert_allclose(dm1_auto, dm1_ref, atol=1e-12, rtol=0,
+                                   err_msg=f"dm1 mismatch at root={root} (auto-detect root)")
+        np.testing.assert_allclose(dm2_auto, dm2_ref, atol=1e-12, rtol=0,
+                                   err_msg=f"dm2 mismatch at root={root} (auto-detect root)")

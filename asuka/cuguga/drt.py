@@ -544,6 +544,237 @@ def build_drt(
     )
 
 
+def build_drt_boundary(
+    norb: int,
+    nelec: int,
+    twos_target: int,
+    *,
+    twos_start: int = 0,
+    orbsym: Sequence[int] | None = None,
+    wfnsym: int | None = None,
+    ne_constraints: dict[int, tuple[int, int]] | None = None,
+) -> DRT:
+    """Build a boundary-conditioned DRT starting from nonzero spin.
+
+    Like :func:`build_drt`, but the root node has ``twos=twos_start``
+    instead of ``twos=0``.  This allows fragments that carry boundary
+    spin from adjacent fragments in a large-site DMRG partition.
+
+    When ``twos_start=0``, this is identical to :func:`build_drt`.
+
+    Parameters
+    ----------
+    norb : int
+        Number of spatial orbitals.
+    nelec : int
+        Number of electrons.
+    twos_target : int
+        Target spin at the right boundary (2S at leaf node).
+    twos_start : int
+        Spin at the left boundary (2S at root node). Default 0.
+    orbsym, wfnsym, ne_constraints :
+        Same as :func:`build_drt`.
+
+    Returns
+    -------
+    DRT
+        The constructed Distinct Row Table.
+    """
+    twos_start = int(twos_start)
+    if twos_start == 0:
+        return build_drt(
+            norb, nelec, twos_target,
+            orbsym=orbsym, wfnsym=wfnsym, ne_constraints=ne_constraints,
+        )
+
+    norb = int(norb)
+    nelec = int(nelec)
+    twos_target = int(twos_target)
+
+    if norb < 0:
+        raise ValueError("norb must be >= 0")
+    if nelec < 0:
+        raise ValueError("nelec must be >= 0")
+    if nelec > 2 * norb:
+        raise ValueError("nelec must be <= 2*norb")
+    if twos_start < 0:
+        raise ValueError("twos_start must be >= 0")
+    if twos_target < 0:
+        raise ValueError("twos_target must be >= 0")
+
+    orbsym_arr = _normalize_orbsym(norb, orbsym)
+    use_sym = (orbsym_arr is not None) and (wfnsym is not None)
+    if not use_sym:
+        wfnsym_int = 0
+        nsym = 1
+        orbsym_arr = None
+    else:
+        wfnsym_int = int(wfnsym)
+        if wfnsym_int < 0:
+            raise ValueError("wfnsym must be >= 0")
+        nbits = _sym_nbits(orbsym_arr, wfnsym_int)
+        nsym = 1 << nbits
+        if wfnsym_int >= nsym:
+            raise ValueError(f"wfnsym={wfnsym_int} is out of range for nsym={nsym}")
+        if np.any(orbsym_arr >= nsym):
+            raise ValueError(f"orbsym entries must be < nsym={nsym}")
+
+    if ne_constraints is None:
+        ne_constraints_norm = None
+    else:
+        ne_constraints_norm: dict[int, tuple[int, int]] = {}
+        for k, bounds in dict(ne_constraints).items():
+            kk = int(k)
+            if kk < 0 or kk > norb:
+                raise ValueError(
+                    f"ne_constraints has invalid k={kk} (expected 0 <= k <= {norb})"
+                )
+            if bounds is None or len(bounds) != 2:
+                raise ValueError(
+                    f"ne_constraints[{kk}] must be a (ne_min, ne_max) tuple"
+                )
+            ne_min = int(bounds[0])
+            ne_max = int(bounds[1])
+            if ne_min < 0 or ne_max < 0:
+                raise ValueError(
+                    f"ne_constraints[{kk}] bounds must be >= 0"
+                )
+            if ne_min > ne_max:
+                raise ValueError(
+                    f"ne_constraints[{kk}] must satisfy ne_min <= ne_max"
+                )
+            if ne_max > nelec:
+                raise ValueError(
+                    f"ne_constraints[{kk}] ne_max={ne_max} exceeds nelec={nelec}"
+                )
+            ne_constraints_norm[kk] = (ne_min, ne_max)
+
+    # Max intermediate twos: from forward (twos_start + nelec) or
+    # backward (twos_target + norb).
+    max_twos = max(twos_start + nelec, twos_target + norb)
+
+    # Backward DP
+    b = np.zeros((norb + 1, nelec + 1, max_twos + 1, nsym), dtype=np.int64)
+    if twos_target <= max_twos:
+        b[norb, nelec, twos_target, wfnsym_int] = 1
+    if ne_constraints_norm is not None and norb in ne_constraints_norm:
+        ne_min_c, ne_max_c = ne_constraints_norm[norb]
+        if ne_min_c > 0:
+            b[norb, :ne_min_c, :, :] = 0
+        if ne_max_c < nelec:
+            b[norb, ne_max_c + 1 :, :, :] = 0
+
+    for k in range(norb - 1, -1, -1):
+        sym_orb = 0 if orbsym_arr is None else int(orbsym_arr[k])
+        for ne in range(nelec, -1, -1):
+            for twos in range(max_twos, -1, -1):
+                for sym in range(nsym):
+                    w = b[k + 1, ne, twos, sym]  # E
+                    if ne + 1 <= nelec and twos + 1 <= max_twos:
+                        w += b[k + 1, ne + 1, twos + 1, _sym_mul(sym, sym_orb)]  # U
+                    if ne + 1 <= nelec and twos >= 1:
+                        w += b[k + 1, ne + 1, twos - 1, _sym_mul(sym, sym_orb)]  # L
+                    if ne + 2 <= nelec:
+                        w += b[k + 1, ne + 2, twos, sym]  # D
+                    b[k, ne, twos, sym] = w
+        if ne_constraints_norm is not None and k in ne_constraints_norm:
+            ne_min_c, ne_max_c = ne_constraints_norm[k]
+            if ne_min_c > 0:
+                b[k, :ne_min_c, :, :] = 0
+            if ne_max_c < nelec:
+                b[k, ne_max_c + 1 :, :, :] = 0
+
+    ncsf = int(b[0, 0, twos_start, 0]) if twos_start <= max_twos else 0
+    if ncsf == 0:
+        node_k = np.asarray([0], dtype=np.int16)
+        node_ne = np.asarray([0], dtype=np.int16)
+        node_twos = np.asarray([twos_start], dtype=np.int16)
+        node_sym = np.asarray([0], dtype=np.int16)
+        nwalks_arr = np.asarray([0], dtype=np.int64)
+        child = np.full((1, len(STEP_ORDER)), -1, dtype=np.int32)
+        return DRT(
+            norb=norb,
+            nelec=nelec,
+            twos_target=twos_target,
+            node_k=node_k,
+            node_ne=node_ne,
+            node_twos=node_twos,
+            node_sym=node_sym,
+            nwalks=nwalks_arr,
+            child=child,
+            root=0,
+            leaf=0,
+            ncsf=0,
+            orbsym=orbsym_arr,
+        )
+
+    root_state = (0, 0, twos_start, 0)
+
+    state_to_id: dict[tuple[int, int, int, int], int] = {root_state: 0}
+    node_k_list: list[int] = [0]
+    node_ne_list: list[int] = [0]
+    node_twos_list: list[int] = [twos_start]
+    node_sym_list: list[int] = [0]
+    nwalks_list: list[int] = [ncsf]
+    child_rows: list[list[int]] = [[-1] * len(STEP_ORDER)]
+
+    queue: deque[tuple[int, int, int, int]] = deque([root_state])
+    while queue:
+        k, ne, twos, sym = queue.popleft()
+        node_id = state_to_id[(k, ne, twos, sym)]
+
+        sym_orb = 0 if (orbsym_arr is None or k >= norb) else int(orbsym_arr[k])
+
+        candidates: list[tuple[int, int, int, int]] = []
+        candidates.append((k + 1, ne, twos, sym))  # E
+        candidates.append((k + 1, ne + 1, twos + 1, _sym_mul(sym, sym_orb)))  # U
+        candidates.append((k + 1, ne + 1, twos - 1, _sym_mul(sym, sym_orb)))  # L
+        candidates.append((k + 1, ne + 2, twos, sym))  # D
+
+        for sidx, (ck, cne, ctwos, csym) in enumerate(candidates):
+            if ck > norb:
+                continue
+            if cne < 0 or cne > nelec:
+                continue
+            if ctwos < 0 or ctwos > max_twos:
+                continue
+            if csym < 0 or csym >= nsym:
+                continue
+            if b[ck, cne, ctwos, csym] == 0:
+                continue
+
+            child_id = state_to_id.get((ck, cne, ctwos, csym))
+            if child_id is None:
+                child_id = len(node_k_list)
+                state_to_id[(ck, cne, ctwos, csym)] = child_id
+                node_k_list.append(int(ck))
+                node_ne_list.append(int(cne))
+                node_twos_list.append(int(ctwos))
+                node_sym_list.append(int(csym))
+                nwalks_list.append(int(b[ck, cne, ctwos, csym]))
+                child_rows.append([-1] * len(STEP_ORDER))
+                queue.append((ck, cne, ctwos, csym))
+
+            child_rows[node_id][sidx] = int(child_id)
+
+    leaf_id = state_to_id[(norb, nelec, twos_target, wfnsym_int)]
+    return DRT(
+        norb=norb,
+        nelec=nelec,
+        twos_target=twos_target,
+        node_k=np.asarray(node_k_list, dtype=np.int16),
+        node_ne=np.asarray(node_ne_list, dtype=np.int16),
+        node_twos=np.asarray(node_twos_list, dtype=np.int16),
+        node_sym=np.asarray(node_sym_list, dtype=np.int16),
+        nwalks=np.asarray(nwalks_list, dtype=np.int64),
+        child=np.asarray(child_rows, dtype=np.int32),
+        root=0,
+        leaf=int(leaf_id),
+        ncsf=int(ncsf),
+        orbsym=orbsym_arr,
+    )
+
+
 def build_drt_symm(
     norb: int,
     nelec: int,

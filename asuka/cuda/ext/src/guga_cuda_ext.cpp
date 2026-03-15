@@ -10774,6 +10774,268 @@ void cas36_hb_screen_and_apply_u64_inplace_device(
   }
 }
 
+void cas36_hb_screen_and_apply_many_roots_u64_inplace_device(
+    const DeviceDRT& drt,
+    uint64_t ncsf_u64,
+    py::object sel_idx_u64_obj,
+    py::object c_sel_obj,
+    int nsel,
+    py::object h1_pq_obj,
+    py::object h1_abs_obj,
+    py::object h1_signed_obj,
+    int n_h1,
+    py::object pq_ptr_obj,
+    py::object rs_idx_obj,
+    py::object v_abs_obj,
+    py::object v_signed_obj,
+    py::object pq_max_v_obj,
+    double eps,
+    py::object hash_keys_u64_obj,
+    py::object hash_vals_obj,
+    uint64_t label_lo,
+    uint64_t label_hi,
+    py::object selected_idx_sorted_u64_obj,
+    int target_mode,
+    py::object overflow_obj,
+    py::object sym_pq_allowed_obj,
+    int threads,
+    uint64_t stream,
+    bool sync) {
+  if (drt.child == nullptr || drt.node_twos == nullptr || drt.child_prefix == nullptr) {
+    throw std::runtime_error("DeviceDRT is not initialized");
+  }
+  if (drt.norb <= 0 || drt.norb > 64) {
+    throw std::invalid_argument("cas36_hb_screen_and_apply_many_roots_u64 requires drt.norb in 1..64");
+  }
+  if (ncsf_u64 == 0ull) {
+    throw std::invalid_argument("ncsf must be > 0");
+  }
+  if (threads <= 0 || threads > 1024) {
+    throw std::invalid_argument("threads must be in 1..1024");
+  }
+  if (nsel < 0 || n_h1 < 0) {
+    throw std::invalid_argument("nsel and n_h1 must be >= 0");
+  }
+  if (sel_idx_u64_obj.is_none() || c_sel_obj.is_none() || h1_pq_obj.is_none() || h1_abs_obj.is_none() ||
+      h1_signed_obj.is_none() || pq_ptr_obj.is_none() || rs_idx_obj.is_none() || v_abs_obj.is_none() ||
+      v_signed_obj.is_none() || pq_max_v_obj.is_none() || hash_keys_u64_obj.is_none() || hash_vals_obj.is_none() ||
+      overflow_obj.is_none()) {
+    throw std::invalid_argument("cas36_hb_screen_and_apply_many_roots_u64 inputs must be device arrays (cannot be None)");
+  }
+
+  auto sel_idx_dev = cuda_array_view_from_object(sel_idx_u64_obj, "sel_idx_u64");
+  auto c_sel_dev = cuda_array_view_from_object(c_sel_obj, "c_sel");
+  auto h1_pq_dev = cuda_array_view_from_object(h1_pq_obj, "h1_pq");
+  auto h1_abs_dev = cuda_array_view_from_object(h1_abs_obj, "h1_abs");
+  auto h1_signed_dev = cuda_array_view_from_object(h1_signed_obj, "h1_signed");
+  auto pq_ptr_dev = cuda_array_view_from_object(pq_ptr_obj, "pq_ptr");
+  auto rs_idx_dev = cuda_array_view_from_object(rs_idx_obj, "rs_idx");
+  auto v_abs_dev = cuda_array_view_from_object(v_abs_obj, "v_abs");
+  auto v_signed_dev = cuda_array_view_from_object(v_signed_obj, "v_signed");
+  auto pq_max_v_dev = cuda_array_view_from_object(pq_max_v_obj, "pq_max_v");
+  auto hash_keys_dev = cuda_array_view_from_object(hash_keys_u64_obj, "hash_keys_u64");
+  auto hash_vals_dev = cuda_array_view_from_object(hash_vals_obj, "hash_vals");
+  auto overflow_dev = cuda_array_view_from_object(overflow_obj, "overflow");
+
+  require_typestr(sel_idx_dev, "sel_idx_u64", "<u8");
+  require_typestr(c_sel_dev, "c_sel", "<f8");
+  require_typestr(h1_pq_dev, "h1_pq", "<i4");
+  require_typestr(h1_abs_dev, "h1_abs", "<f8");
+  require_typestr(h1_signed_dev, "h1_signed", "<f8");
+  require_typestr(pq_ptr_dev, "pq_ptr", "<i8");
+  require_typestr(rs_idx_dev, "rs_idx", "<i4");
+  require_typestr(v_abs_dev, "v_abs", "<f8");
+  require_typestr(v_signed_dev, "v_signed", "<f8");
+  require_typestr(pq_max_v_dev, "pq_max_v", "<f8");
+  require_typestr(hash_keys_dev, "hash_keys_u64", "<u8");
+  require_typestr(hash_vals_dev, "hash_vals", "<f8");
+  require_typestr(overflow_dev, "overflow", "<i4");
+
+  if (overflow_dev.read_only || hash_keys_dev.read_only || hash_vals_dev.read_only) {
+    throw std::invalid_argument("hash_keys_u64/hash_vals/overflow must be writable");
+  }
+  if (sel_idx_dev.shape.size() != 1) {
+    throw std::invalid_argument("sel_idx_u64 must be 1D");
+  }
+  if (c_sel_dev.shape.size() != 2) {
+    throw std::invalid_argument("c_sel must have shape (nsel, nroots)");
+  }
+  if (pq_ptr_dev.shape.size() != 1 || rs_idx_dev.shape.size() != 1 || v_abs_dev.shape.size() != 1 ||
+      v_signed_dev.shape.size() != 1 || pq_max_v_dev.shape.size() != 1) {
+    throw std::invalid_argument("pq_ptr/rs_idx/v_abs/v_signed/pq_max_v must be 1D");
+  }
+  if (hash_keys_dev.shape.size() != 1) {
+    throw std::invalid_argument("hash_keys_u64 must be 1D");
+  }
+  if (hash_vals_dev.shape.size() != 2) {
+    throw std::invalid_argument("hash_vals must have shape (nroots, cap)");
+  }
+  if (overflow_dev.shape.size() != 1 || overflow_dev.shape[0] != 1) {
+    throw std::invalid_argument("overflow must have shape (1,)");
+  }
+
+  int norb = drt.norb;
+  int64_t nops64 = (int64_t)norb * (int64_t)norb;
+  if (pq_ptr_dev.shape[0] != nops64 + 1) {
+    throw std::invalid_argument("pq_ptr must have shape (norb*norb + 1)");
+  }
+  if (pq_max_v_dev.shape[0] != nops64) {
+    throw std::invalid_argument("pq_max_v must have shape (norb*norb,)");
+  }
+  if (rs_idx_dev.shape[0] != v_abs_dev.shape[0] || rs_idx_dev.shape[0] != v_signed_dev.shape[0]) {
+    throw std::invalid_argument("rs_idx/v_abs/v_signed must have matching lengths");
+  }
+  if (h1_abs_dev.shape.size() != 1 || h1_signed_dev.shape.size() != 1) {
+    throw std::invalid_argument("h1_abs and h1_signed must be 1D");
+  }
+  if (h1_abs_dev.shape[0] < (int64_t)n_h1 || h1_signed_dev.shape[0] < (int64_t)n_h1) {
+    throw std::invalid_argument("h1_abs/h1_signed lengths must be >= n_h1");
+  }
+  if (h1_pq_dev.shape.size() != 2 || h1_pq_dev.shape[1] != 2 || h1_pq_dev.shape[0] < (int64_t)n_h1) {
+    throw std::invalid_argument("h1_pq must have shape (>=n_h1, 2)");
+  }
+
+  if ((int)sel_idx_dev.shape[0] < nsel || c_sel_dev.shape[0] < (int64_t)nsel) {
+    throw std::invalid_argument("sel_idx_u64/c_sel leading dimension must be >= nsel");
+  }
+  int nroots = (int)c_sel_dev.shape[1];
+  if (nroots <= 0) {
+    throw std::invalid_argument("c_sel must have at least one root");
+  }
+
+  int cap = (int)hash_keys_dev.shape[0];
+  if ((int)hash_vals_dev.shape[0] != nroots || (int)hash_vals_dev.shape[1] != cap) {
+    throw std::invalid_argument("hash_vals must have shape (nroots, cap) matching c_sel and hash_keys_u64");
+  }
+  if (cap <= 0 || (cap & (cap - 1)) != 0) {
+    throw std::invalid_argument("hash capacity must be a positive power of two");
+  }
+  if (label_hi < label_lo || label_hi > ncsf_u64) {
+    throw std::invalid_argument("label window must satisfy 0 <= label_lo <= label_hi <= ncsf");
+  }
+  if (target_mode < 0 || target_mode > 1) {
+    throw std::invalid_argument("target_mode must be 0 (external_only) or 1 (selected_only)");
+  }
+
+  if (!sel_idx_dev.strides_bytes.empty()) {
+    if (sel_idx_dev.strides_bytes.size() != 1 || sel_idx_dev.strides_bytes[0] != (int64_t)sizeof(uint64_t)) {
+      throw std::invalid_argument("sel_idx_u64 must be contiguous");
+    }
+  }
+  if (!c_sel_dev.strides_bytes.empty()) {
+    if (c_sel_dev.strides_bytes.size() != 2 ||
+        c_sel_dev.strides_bytes[1] != (int64_t)sizeof(double) ||
+        c_sel_dev.strides_bytes[0] != (int64_t)nroots * (int64_t)sizeof(double)) {
+      throw std::invalid_argument("c_sel must be C-contiguous");
+    }
+  }
+  if (!h1_pq_dev.strides_bytes.empty()) {
+    if (h1_pq_dev.strides_bytes.size() != 2 || h1_pq_dev.strides_bytes[1] != (int64_t)sizeof(int32_t) ||
+        h1_pq_dev.strides_bytes[0] != (int64_t)2 * (int64_t)sizeof(int32_t)) {
+      throw std::invalid_argument("h1_pq must be C-contiguous");
+    }
+  }
+  if (!pq_ptr_dev.strides_bytes.empty() && (pq_ptr_dev.strides_bytes.size() != 1 || pq_ptr_dev.strides_bytes[0] != (int64_t)sizeof(int64_t))) {
+    throw std::invalid_argument("pq_ptr must be contiguous");
+  }
+  if (!rs_idx_dev.strides_bytes.empty() && (rs_idx_dev.strides_bytes.size() != 1 || rs_idx_dev.strides_bytes[0] != (int64_t)sizeof(int32_t))) {
+    throw std::invalid_argument("rs_idx must be contiguous");
+  }
+  if (!v_abs_dev.strides_bytes.empty() && (v_abs_dev.strides_bytes.size() != 1 || v_abs_dev.strides_bytes[0] != (int64_t)sizeof(double))) {
+    throw std::invalid_argument("v_abs must be contiguous");
+  }
+  if (!v_signed_dev.strides_bytes.empty() && (v_signed_dev.strides_bytes.size() != 1 || v_signed_dev.strides_bytes[0] != (int64_t)sizeof(double))) {
+    throw std::invalid_argument("v_signed must be contiguous");
+  }
+  if (!pq_max_v_dev.strides_bytes.empty() && (pq_max_v_dev.strides_bytes.size() != 1 || pq_max_v_dev.strides_bytes[0] != (int64_t)sizeof(double))) {
+    throw std::invalid_argument("pq_max_v must be contiguous");
+  }
+  if (!hash_keys_dev.strides_bytes.empty() && (hash_keys_dev.strides_bytes.size() != 1 || hash_keys_dev.strides_bytes[0] != (int64_t)sizeof(uint64_t))) {
+    throw std::invalid_argument("hash_keys_u64 must be contiguous");
+  }
+  if (!hash_vals_dev.strides_bytes.empty()) {
+    if (hash_vals_dev.strides_bytes.size() != 2 || hash_vals_dev.strides_bytes[1] != (int64_t)sizeof(double) ||
+        hash_vals_dev.strides_bytes[0] != (int64_t)cap * (int64_t)sizeof(double)) {
+      throw std::invalid_argument("hash_vals must be C-contiguous");
+    }
+  }
+  if (!overflow_dev.strides_bytes.empty() && (overflow_dev.strides_bytes.size() != 1 || overflow_dev.strides_bytes[0] != (int64_t)sizeof(int32_t))) {
+    throw std::invalid_argument("overflow must be contiguous");
+  }
+
+  const uint64_t* d_selected_idx = nullptr;
+  int nselected = 0;
+  uint64_t selected_stream = 0;
+  if (!selected_idx_sorted_u64_obj.is_none()) {
+    auto selected_dev = cuda_array_view_from_object(selected_idx_sorted_u64_obj, "selected_idx_sorted_u64");
+    require_typestr(selected_dev, "selected_idx_sorted_u64", "<u8");
+    if (selected_dev.shape.size() != 1) {
+      throw std::invalid_argument("selected_idx_sorted_u64 must be 1D");
+    }
+    if (!selected_dev.strides_bytes.empty() &&
+        (selected_dev.strides_bytes.size() != 1 || selected_dev.strides_bytes[0] != (int64_t)sizeof(uint64_t))) {
+      throw std::invalid_argument("selected_idx_sorted_u64 must be contiguous");
+    }
+    d_selected_idx = reinterpret_cast<const uint64_t*>(selected_dev.ptr);
+    nselected = (int)selected_dev.shape[0];
+    selected_stream = selected_dev.stream;
+  }
+
+  const int8_t* d_sym_pq = nullptr;
+  if (!sym_pq_allowed_obj.is_none()) {
+    auto sym_view = cuda_array_view_from_object(sym_pq_allowed_obj, "sym_pq_allowed");
+    d_sym_pq = reinterpret_cast<const int8_t*>(sym_view.ptr);
+  }
+
+  uint64_t stream_u = stream;
+  if (stream_u == 0) {
+    if (hash_vals_dev.stream) stream_u = hash_vals_dev.stream;
+    else if (hash_keys_dev.stream) stream_u = hash_keys_dev.stream;
+    else if (sel_idx_dev.stream) stream_u = sel_idx_dev.stream;
+    else if (c_sel_dev.stream) stream_u = c_sel_dev.stream;
+    else if (selected_stream) stream_u = selected_stream;
+  }
+  cudaStream_t stream_t = reinterpret_cast<cudaStream_t>(stream_u);
+
+  throw_on_cuda_error(
+      cas36_hb_screen_and_apply_many_roots_u64_launch_stream(
+          reinterpret_cast<const uint64_t*>(sel_idx_dev.ptr),
+          reinterpret_cast<const double*>(c_sel_dev.ptr),
+          int(nsel),
+          int(nroots),
+          int(norb),
+          ncsf_u64,
+          reinterpret_cast<const int32_t*>(h1_pq_dev.ptr),
+          reinterpret_cast<const double*>(h1_abs_dev.ptr),
+          reinterpret_cast<const double*>(h1_signed_dev.ptr),
+          int(n_h1),
+          reinterpret_cast<const int64_t*>(pq_ptr_dev.ptr),
+          reinterpret_cast<const int32_t*>(rs_idx_dev.ptr),
+          reinterpret_cast<const double*>(v_abs_dev.ptr),
+          reinterpret_cast<const double*>(v_signed_dev.ptr),
+          reinterpret_cast<const double*>(pq_max_v_dev.ptr),
+          double(eps),
+          drt.child,
+          drt.node_twos,
+          drt.child_prefix,
+          reinterpret_cast<uint64_t*>(hash_keys_dev.ptr),
+          reinterpret_cast<double*>(hash_vals_dev.ptr),
+          int(cap),
+          label_lo,
+          label_hi,
+          d_selected_idx,
+          int(nselected),
+          int(target_mode),
+          reinterpret_cast<int*>(overflow_dev.ptr),
+          stream_t,
+          int(threads),
+          d_sym_pq),
+      "cas36_hb_screen_and_apply_many_roots_u64_launch_stream");
+  if (sync) {
+    throw_on_cuda_error(cudaStreamSynchronize(stream_t), "cudaStreamSynchronize(cas36_hb_screen_and_apply_many_roots_u64)");
+  }
+}
+
 void cas36_hb_emit_tuples_u64_inplace_device(
     const DeviceDRT& drt,
     uint64_t ncsf_u64,
@@ -11155,6 +11417,412 @@ void cas36_exact_selected_emit_tuples_dense_u64_inplace_device(
   }
 }
 
+void cas36_exact_selected_build_rowhash_dense_u64_inplace_device(
+    const DeviceDRT& drt,
+    uint64_t ncsf_u64,
+    py::object sel_idx_u64_obj,
+    py::object c_bound_obj,
+    int nsel,
+    py::object h_base_obj,
+    py::object eri4_obj,
+    py::object row_hash_keys_obj,
+    py::object row_hash_vals_obj,
+    int row_cap,
+    py::object membership_hash_keys_obj,
+    int membership_hash_cap,
+    py::object out_diag_obj,
+    py::object overflow_obj,
+    int threads,
+    uint64_t stream,
+    bool sync) {
+  if (sel_idx_u64_obj.is_none() || c_bound_obj.is_none() || h_base_obj.is_none() || eri4_obj.is_none() ||
+      row_hash_keys_obj.is_none() || row_hash_vals_obj.is_none() || overflow_obj.is_none()) {
+    throw std::invalid_argument("required array arguments must not be None");
+  }
+  if (threads <= 0 || threads > 1024) {
+    throw std::invalid_argument("threads must be in 1..1024");
+  }
+  if (nsel < 0 || row_cap <= 0) {
+    throw std::invalid_argument("nsel must be >= 0 and row_cap must be > 0");
+  }
+  if ((row_cap & (row_cap - 1)) != 0) {
+    throw std::invalid_argument("row_cap must be a power of two");
+  }
+  if (drt.norb <= 0 || drt.norb > 32) {
+    throw std::invalid_argument("exact selected dense rowhash emitter currently supports 1 <= norb <= 32");
+  }
+  if (nsel == 0) return;
+
+  auto sel_idx_dev = cuda_array_view_from_object(sel_idx_u64_obj, "sel_idx_u64");
+  auto c_bound_dev = cuda_array_view_from_object(c_bound_obj, "c_bound");
+  auto h_base_dev = cuda_array_view_from_object(h_base_obj, "h_base");
+  auto eri4_dev = cuda_array_view_from_object(eri4_obj, "eri4");
+  auto row_hash_keys_dev = cuda_array_view_from_object(row_hash_keys_obj, "row_hash_keys");
+  auto row_hash_vals_dev = cuda_array_view_from_object(row_hash_vals_obj, "row_hash_vals");
+  auto overflow_dev = cuda_array_view_from_object(overflow_obj, "overflow");
+  std::optional<CudaArrayView> membership_hash_dev;
+  if (!membership_hash_keys_obj.is_none()) {
+    membership_hash_dev = cuda_array_view_from_object(membership_hash_keys_obj, "membership_hash_keys");
+  }
+  std::optional<CudaArrayView> out_diag_dev;
+  if (!out_diag_obj.is_none()) {
+    out_diag_dev = cuda_array_view_from_object(out_diag_obj, "out_diag");
+  }
+
+  require_typestr(sel_idx_dev, "sel_idx_u64", "<u8");
+  require_typestr(c_bound_dev, "c_bound", "<f8");
+  require_typestr(h_base_dev, "h_base", "<f8");
+  require_typestr(eri4_dev, "eri4", "<f8");
+  require_typestr(row_hash_keys_dev, "row_hash_keys", "<u8");
+  require_typestr(row_hash_vals_dev, "row_hash_vals", "<f8");
+  require_typestr(overflow_dev, "overflow", "<i4");
+  if (membership_hash_dev.has_value()) {
+    require_typestr(*membership_hash_dev, "membership_hash_keys", "<u8");
+  }
+  if (out_diag_dev.has_value()) {
+    require_typestr(*out_diag_dev, "out_diag", "<f8");
+  }
+
+  if (row_hash_keys_dev.read_only || row_hash_vals_dev.read_only || overflow_dev.read_only ||
+      (out_diag_dev.has_value() && out_diag_dev->read_only)) {
+    throw std::invalid_argument("row_hash_keys/row_hash_vals/overflow/out_diag must be writable");
+  }
+  if (sel_idx_dev.shape.size() != 1 || c_bound_dev.shape.size() != 1 || h_base_dev.shape.size() != 1 ||
+      eri4_dev.shape.size() != 1 || row_hash_keys_dev.shape.size() != 1 || row_hash_vals_dev.shape.size() != 1 ||
+      overflow_dev.shape.size() != 1) {
+    throw std::invalid_argument("all exact selected dense rowhash emitter arrays must be 1D");
+  }
+  if (out_diag_dev.has_value() && out_diag_dev->shape.size() != 1) {
+    throw std::invalid_argument("out_diag must be a 1D device array");
+  }
+  if (sel_idx_dev.shape[0] < (int64_t)nsel || c_bound_dev.shape[0] < (int64_t)nsel) {
+    throw std::invalid_argument("sel_idx_u64/c_bound length must be >= nsel");
+  }
+  int64_t nops = (int64_t)drt.norb * (int64_t)drt.norb;
+  int64_t eri4_n = nops * nops;
+  if (h_base_dev.shape[0] < nops) {
+    throw std::invalid_argument("h_base length is smaller than norb*norb");
+  }
+  if (eri4_dev.shape[0] < eri4_n) {
+    throw std::invalid_argument("eri4 length is smaller than norb^4");
+  }
+  int64_t total_cap = (int64_t)nsel * (int64_t)row_cap;
+  if (row_hash_keys_dev.shape[0] < total_cap || row_hash_vals_dev.shape[0] < total_cap) {
+    throw std::invalid_argument("row_hash_keys/row_hash_vals length must be >= nsel*row_cap");
+  }
+  if (overflow_dev.shape[0] != 1) {
+    throw std::invalid_argument("overflow must have shape (1,)");
+  }
+  if (out_diag_dev.has_value() && out_diag_dev->shape[0] < (int64_t)nsel) {
+    throw std::invalid_argument("out_diag length must be >= nsel");
+  }
+
+  uint64_t stream_u = stream;
+  if (stream_u == 0) {
+    if (row_hash_vals_dev.stream) stream_u = row_hash_vals_dev.stream;
+    else if (row_hash_keys_dev.stream) stream_u = row_hash_keys_dev.stream;
+    else if (sel_idx_dev.stream) stream_u = sel_idx_dev.stream;
+    else if (eri4_dev.stream) stream_u = eri4_dev.stream;
+  }
+  cudaStream_t stream_t = reinterpret_cast<cudaStream_t>(stream_u);
+
+  throw_on_cuda_error(
+      cas36_exact_emit_rowhash_dense_u64_launch_stream(
+          reinterpret_cast<const uint64_t*>(sel_idx_dev.ptr),
+          reinterpret_cast<const double*>(c_bound_dev.ptr),
+          int(nsel),
+          int(drt.norb),
+          ncsf_u64,
+          reinterpret_cast<const double*>(h_base_dev.ptr),
+          reinterpret_cast<const double*>(eri4_dev.ptr),
+          drt.child,
+          drt.node_twos,
+          drt.child_prefix,
+          reinterpret_cast<uint64_t*>(row_hash_keys_dev.ptr),
+          reinterpret_cast<double*>(row_hash_vals_dev.ptr),
+          int(row_cap),
+          0ull,
+          std::numeric_limits<uint64_t>::max(),
+          membership_hash_dev.has_value() ? reinterpret_cast<const uint64_t*>(membership_hash_dev->ptr) : nullptr,
+          membership_hash_dev.has_value() ? int(membership_hash_cap) : 0,
+          1,
+          out_diag_dev.has_value() ? reinterpret_cast<double*>(out_diag_dev->ptr) : nullptr,
+          reinterpret_cast<int*>(overflow_dev.ptr),
+          stream_t,
+          int(threads)),
+      "cas36_exact_emit_rowhash_dense_u64_launch_stream(selected)");
+  if (sync) {
+    throw_on_cuda_error(
+        cudaStreamSynchronize(stream_t), "cudaStreamSynchronize(cas36_exact_selected_build_rowhash_dense_u64)");
+  }
+}
+
+void cas36_exact_external_emit_tuples_dense_u64_inplace_device(
+    const DeviceDRT& drt,
+    uint64_t ncsf_u64,
+    py::object sel_idx_u64_obj,
+    py::object c_bound_obj,
+    int nsel,
+    py::object h_base_obj,
+    py::object eri4_obj,
+    py::object out_keys_u64_obj,
+    py::object out_src_obj,
+    py::object out_hij_obj,
+    int cap,
+    uint64_t label_lo,
+    uint64_t label_hi,
+    py::object membership_hash_keys_obj,
+    int membership_hash_cap,
+    py::object out_n_obj,
+    py::object overflow_obj,
+    int threads,
+    uint64_t stream,
+    bool sync) {
+  if (sel_idx_u64_obj.is_none() || c_bound_obj.is_none() || h_base_obj.is_none() || eri4_obj.is_none() ||
+      out_keys_u64_obj.is_none() || out_src_obj.is_none() || out_hij_obj.is_none() || out_n_obj.is_none() ||
+      overflow_obj.is_none()) {
+    throw std::invalid_argument("required array arguments must not be None");
+  }
+  if (membership_hash_keys_obj.is_none()) {
+    throw std::invalid_argument("membership_hash_keys must not be None for exact external dense tuple emission");
+  }
+  if (threads <= 0 || threads > 1024) {
+    throw std::invalid_argument("threads must be in 1..1024");
+  }
+  if (nsel < 0 || cap <= 0) {
+    throw std::invalid_argument("nsel must be >= 0 and cap must be > 0");
+  }
+  if (drt.norb <= 0 || drt.norb > 32) {
+    throw std::invalid_argument("exact external dense tuple emitter currently supports 1 <= norb <= 32");
+  }
+  if (label_hi < label_lo || label_hi > ncsf_u64) {
+    throw std::invalid_argument("label window must satisfy 0 <= label_lo <= label_hi <= ncsf");
+  }
+  if (nsel == 0) return;
+
+  auto sel_idx_dev = cuda_array_view_from_object(sel_idx_u64_obj, "sel_idx_u64");
+  auto c_bound_dev = cuda_array_view_from_object(c_bound_obj, "c_bound");
+  auto h_base_dev = cuda_array_view_from_object(h_base_obj, "h_base");
+  auto eri4_dev = cuda_array_view_from_object(eri4_obj, "eri4");
+  auto out_keys_dev = cuda_array_view_from_object(out_keys_u64_obj, "out_keys_u64");
+  auto out_src_dev = cuda_array_view_from_object(out_src_obj, "out_src");
+  auto out_hij_dev = cuda_array_view_from_object(out_hij_obj, "out_hij");
+  auto out_n_dev = cuda_array_view_from_object(out_n_obj, "out_n");
+  auto overflow_dev = cuda_array_view_from_object(overflow_obj, "overflow");
+  auto membership_hash_dev = cuda_array_view_from_object(membership_hash_keys_obj, "membership_hash_keys");
+
+  require_typestr(sel_idx_dev, "sel_idx_u64", "<u8");
+  require_typestr(c_bound_dev, "c_bound", "<f8");
+  require_typestr(h_base_dev, "h_base", "<f8");
+  require_typestr(eri4_dev, "eri4", "<f8");
+  require_typestr(out_keys_dev, "out_keys_u64", "<u8");
+  require_typestr(out_src_dev, "out_src", "<i4");
+  require_typestr(out_hij_dev, "out_hij", "<f8");
+  require_typestr(out_n_dev, "out_n", "<i4");
+  require_typestr(overflow_dev, "overflow", "<i4");
+  require_typestr(membership_hash_dev, "membership_hash_keys", "<u8");
+
+  if (out_keys_dev.read_only || out_src_dev.read_only || out_hij_dev.read_only || out_n_dev.read_only || overflow_dev.read_only) {
+    throw std::invalid_argument("out_keys_u64/out_src/out_hij/out_n/overflow must be writable");
+  }
+  if (sel_idx_dev.shape.size() != 1 || c_bound_dev.shape.size() != 1 || h_base_dev.shape.size() != 1 || eri4_dev.shape.size() != 1 ||
+      out_keys_dev.shape.size() != 1 || out_src_dev.shape.size() != 1 || out_hij_dev.shape.size() != 1 ||
+      out_n_dev.shape.size() != 1 || overflow_dev.shape.size() != 1 || membership_hash_dev.shape.size() != 1) {
+    throw std::invalid_argument("all exact external dense tuple emitter arrays must be 1D");
+  }
+  if (sel_idx_dev.shape[0] < (int64_t)nsel || c_bound_dev.shape[0] < (int64_t)nsel) {
+    throw std::invalid_argument("sel_idx_u64/c_bound length must be >= nsel");
+  }
+  int64_t nops = (int64_t)drt.norb * (int64_t)drt.norb;
+  int64_t eri4_n = nops * nops;
+  if (h_base_dev.shape[0] < nops) {
+    throw std::invalid_argument("h_base length is smaller than norb*norb");
+  }
+  if (eri4_dev.shape[0] < eri4_n) {
+    throw std::invalid_argument("eri4 length is smaller than norb^4");
+  }
+  if (out_keys_dev.shape[0] < (int64_t)cap || out_src_dev.shape[0] < (int64_t)cap || out_hij_dev.shape[0] < (int64_t)cap) {
+    throw std::invalid_argument("out_keys_u64, out_src, and out_hij length must be >= cap");
+  }
+  if (out_n_dev.shape[0] != 1 || overflow_dev.shape[0] != 1) {
+    throw std::invalid_argument("out_n and overflow must have shape (1,)");
+  }
+
+  uint64_t stream_u = stream;
+  if (stream_u == 0) {
+    if (out_hij_dev.stream) stream_u = out_hij_dev.stream;
+    else if (out_keys_dev.stream) stream_u = out_keys_dev.stream;
+    else if (sel_idx_dev.stream) stream_u = sel_idx_dev.stream;
+    else if (eri4_dev.stream) stream_u = eri4_dev.stream;
+  }
+  cudaStream_t stream_t = reinterpret_cast<cudaStream_t>(stream_u);
+
+  throw_on_cuda_error(
+      cas36_exact_emit_tuples_dense_u64_launch_stream(
+          reinterpret_cast<const uint64_t*>(sel_idx_dev.ptr),
+          reinterpret_cast<const double*>(c_bound_dev.ptr),
+          int(nsel),
+          int(drt.norb),
+          ncsf_u64,
+          reinterpret_cast<const double*>(h_base_dev.ptr),
+          reinterpret_cast<const double*>(eri4_dev.ptr),
+          drt.child,
+          drt.node_twos,
+          drt.child_prefix,
+          reinterpret_cast<uint64_t*>(out_keys_dev.ptr),
+          reinterpret_cast<int*>(out_src_dev.ptr),
+          reinterpret_cast<double*>(out_hij_dev.ptr),
+          int(cap),
+          label_lo,
+          label_hi,
+          reinterpret_cast<const uint64_t*>(membership_hash_dev.ptr),
+          int(membership_hash_cap),
+          0,
+          nullptr,
+          reinterpret_cast<int*>(out_n_dev.ptr),
+          reinterpret_cast<int*>(overflow_dev.ptr),
+          stream_t,
+          int(threads)),
+      "cas36_exact_emit_tuples_dense_u64_launch_stream(external)");
+  if (sync) {
+    throw_on_cuda_error(
+        cudaStreamSynchronize(stream_t), "cudaStreamSynchronize(cas36_exact_external_emit_tuples_dense_u64)");
+  }
+}
+
+void cas36_exact_external_apply_dense_many_roots_u64_inplace_device(
+    const DeviceDRT& drt,
+    uint64_t ncsf_u64,
+    py::object sel_idx_u64_obj,
+    py::object c_sel_obj,
+    int nsel,
+    py::object h_base_obj,
+    py::object eri4_obj,
+    py::object hash_keys_u64_obj,
+    py::object hash_vals_obj,
+    int cap,
+    uint64_t label_lo,
+    uint64_t label_hi,
+    py::object membership_hash_keys_obj,
+    int membership_hash_cap,
+    py::object overflow_obj,
+    int threads,
+    uint64_t stream,
+    bool sync) {
+  if (sel_idx_u64_obj.is_none() || c_sel_obj.is_none() || h_base_obj.is_none() || eri4_obj.is_none() ||
+      hash_keys_u64_obj.is_none() || hash_vals_obj.is_none() || overflow_obj.is_none() ||
+      membership_hash_keys_obj.is_none()) {
+    throw std::invalid_argument("exact external dense apply inputs must not be None");
+  }
+  if (threads <= 0 || threads > 1024) {
+    throw std::invalid_argument("threads must be in 1..1024");
+  }
+  if (nsel < 0 || cap <= 0) {
+    throw std::invalid_argument("nsel must be >= 0 and cap must be > 0");
+  }
+  if (drt.norb <= 0 || drt.norb > 32) {
+    throw std::invalid_argument("exact external dense apply currently supports 1 <= norb <= 32");
+  }
+  if (label_hi < label_lo || label_hi > ncsf_u64) {
+    throw std::invalid_argument("label window must satisfy 0 <= label_lo <= label_hi <= ncsf");
+  }
+  if (nsel == 0) return;
+
+  auto sel_idx_dev = cuda_array_view_from_object(sel_idx_u64_obj, "sel_idx_u64");
+  auto c_sel_dev = cuda_array_view_from_object(c_sel_obj, "c_sel");
+  auto h_base_dev = cuda_array_view_from_object(h_base_obj, "h_base");
+  auto eri4_dev = cuda_array_view_from_object(eri4_obj, "eri4");
+  auto hash_keys_dev = cuda_array_view_from_object(hash_keys_u64_obj, "hash_keys_u64");
+  auto hash_vals_dev = cuda_array_view_from_object(hash_vals_obj, "hash_vals");
+  auto membership_hash_dev = cuda_array_view_from_object(membership_hash_keys_obj, "membership_hash_keys");
+  auto overflow_dev = cuda_array_view_from_object(overflow_obj, "overflow");
+
+  require_typestr(sel_idx_dev, "sel_idx_u64", "<u8");
+  require_typestr(c_sel_dev, "c_sel", "<f8");
+  require_typestr(h_base_dev, "h_base", "<f8");
+  require_typestr(eri4_dev, "eri4", "<f8");
+  require_typestr(hash_keys_dev, "hash_keys_u64", "<u8");
+  require_typestr(hash_vals_dev, "hash_vals", "<f8");
+  require_typestr(membership_hash_dev, "membership_hash_keys", "<u8");
+  require_typestr(overflow_dev, "overflow", "<i4");
+
+  if (hash_keys_dev.read_only || hash_vals_dev.read_only || overflow_dev.read_only) {
+    throw std::invalid_argument("hash_keys_u64/hash_vals/overflow must be writable");
+  }
+  if (sel_idx_dev.shape.size() != 1 || h_base_dev.shape.size() != 1 || eri4_dev.shape.size() != 1 ||
+      hash_keys_dev.shape.size() != 1 || membership_hash_dev.shape.size() != 1 || overflow_dev.shape.size() != 1) {
+    throw std::invalid_argument("exact external dense apply requires 1D sel_idx_u64/h_base/eri4/hash_keys_u64/membership_hash_keys/overflow");
+  }
+  if (c_sel_dev.shape.size() != 2 || hash_vals_dev.shape.size() != 2) {
+    throw std::invalid_argument("c_sel and hash_vals must be 2D device arrays");
+  }
+  if (sel_idx_dev.shape[0] < (int64_t)nsel) {
+    throw std::invalid_argument("sel_idx_u64 length must be >= nsel");
+  }
+  if (c_sel_dev.shape[0] < (int64_t)nsel) {
+    throw std::invalid_argument("c_sel leading dimension must be >= nsel");
+  }
+  int nroots = (int)c_sel_dev.shape[1];
+  if (nroots <= 0) {
+    throw std::invalid_argument("c_sel must have positive nroots dimension");
+  }
+  if (hash_vals_dev.shape[0] != (int64_t)nroots || hash_vals_dev.shape[1] < (int64_t)cap) {
+    throw std::invalid_argument("hash_vals must have shape (nroots, cap) matching c_sel and cap");
+  }
+  int64_t nops = (int64_t)drt.norb * (int64_t)drt.norb;
+  int64_t eri4_n = nops * nops;
+  if (h_base_dev.shape[0] < nops) {
+    throw std::invalid_argument("h_base length is smaller than norb*norb");
+  }
+  if (eri4_dev.shape[0] < eri4_n) {
+    throw std::invalid_argument("eri4 length is smaller than norb^4");
+  }
+  if (hash_keys_dev.shape[0] < (int64_t)cap || membership_hash_dev.shape[0] < (int64_t)membership_hash_cap) {
+    throw std::invalid_argument("hash_keys_u64/membership_hash_keys length is smaller than cap/membership_hash_cap");
+  }
+  if (overflow_dev.shape[0] != 1) {
+    throw std::invalid_argument("overflow must have shape (1,)");
+  }
+
+  uint64_t stream_u = stream;
+  if (stream_u == 0) {
+    if (hash_vals_dev.stream) stream_u = hash_vals_dev.stream;
+    else if (hash_keys_dev.stream) stream_u = hash_keys_dev.stream;
+    else if (sel_idx_dev.stream) stream_u = sel_idx_dev.stream;
+    else if (eri4_dev.stream) stream_u = eri4_dev.stream;
+  }
+  cudaStream_t stream_t = reinterpret_cast<cudaStream_t>(stream_u);
+
+  throw_on_cuda_error(
+      cas36_exact_external_apply_dense_many_roots_u64_launch_stream(
+          reinterpret_cast<const uint64_t*>(sel_idx_dev.ptr),
+          reinterpret_cast<const double*>(c_sel_dev.ptr),
+          int(nsel),
+          int(nroots),
+          int(drt.norb),
+          ncsf_u64,
+          reinterpret_cast<const double*>(h_base_dev.ptr),
+          reinterpret_cast<const double*>(eri4_dev.ptr),
+          drt.child,
+          drt.node_twos,
+          drt.child_prefix,
+          reinterpret_cast<uint64_t*>(hash_keys_dev.ptr),
+          reinterpret_cast<double*>(hash_vals_dev.ptr),
+          int(cap),
+          label_lo,
+          label_hi,
+          reinterpret_cast<const uint64_t*>(membership_hash_dev.ptr),
+          int(membership_hash_cap),
+          reinterpret_cast<int*>(overflow_dev.ptr),
+          stream_t,
+          int(threads)),
+      "cas36_exact_external_apply_dense_many_roots_u64_launch_stream");
+  if (sync) {
+    throw_on_cuda_error(
+        cudaStreamSynchronize(stream_t), "cudaStreamSynchronize(cas36_exact_external_apply_dense_many_roots_u64)");
+  }
+}
+
 void cas36_sci_build_membership_hash_u64_inplace_device(
     py::object sorted_keys_obj,
     int nkeys,
@@ -11196,6 +11864,119 @@ void cas36_sci_build_membership_hash_u64_inplace_device(
   if (sync) {
     throw_on_cuda_error(
         cudaStreamSynchronize(stream_t), "cudaStreamSynchronize(build_membership_hash)");
+  }
+}
+
+void cas36_sym_row_graph_spmm_inplace_device(
+    py::object row_ptr_obj,
+    py::object col_idx_obj,
+    py::object hij_obj,
+    py::object diag_obj,
+    py::object x_obj,
+    py::object y_obj,
+    int threads,
+    uint64_t stream,
+    bool sync) {
+  if (row_ptr_obj.is_none() || col_idx_obj.is_none() || hij_obj.is_none() || diag_obj.is_none() ||
+      x_obj.is_none() || y_obj.is_none()) {
+    throw std::invalid_argument("row_ptr/col_idx/hij/diag/x/y must not be None");
+  }
+  if (threads <= 0 || threads > 1024) {
+    throw std::invalid_argument("threads must be in 1..1024");
+  }
+
+  auto row_ptr_dev = cuda_array_view_from_object(row_ptr_obj, "row_ptr");
+  auto col_idx_dev = cuda_array_view_from_object(col_idx_obj, "col_idx");
+  auto hij_dev = cuda_array_view_from_object(hij_obj, "hij");
+  auto diag_dev = cuda_array_view_from_object(diag_obj, "diag");
+  auto x_dev = cuda_array_view_from_object(x_obj, "x");
+  auto y_dev = cuda_array_view_from_object(y_obj, "y");
+
+  require_typestr(row_ptr_dev, "row_ptr", "<i8");
+  require_typestr(col_idx_dev, "col_idx", "<i4");
+  require_typestr(hij_dev, "hij", "<f8");
+  require_typestr(diag_dev, "diag", "<f8");
+  require_typestr(x_dev, "x", "<f8");
+  require_typestr(y_dev, "y", "<f8");
+
+  if (y_dev.read_only) {
+    throw std::invalid_argument("y must be writable");
+  }
+  if (row_ptr_dev.shape.size() != 1 || col_idx_dev.shape.size() != 1 || hij_dev.shape.size() != 1 || diag_dev.shape.size() != 1) {
+    throw std::invalid_argument("row_ptr/col_idx/hij/diag must be 1D");
+  }
+  if (x_dev.shape.size() != 2 || y_dev.shape.size() != 2) {
+    throw std::invalid_argument("x and y must be 2D row-major arrays");
+  }
+  int nrows = (int)diag_dev.shape[0];
+  if (nrows < 0 || row_ptr_dev.shape[0] != (int64_t)nrows + 1) {
+    throw std::invalid_argument("row_ptr must have shape (nrows + 1)");
+  }
+  if (col_idx_dev.shape[0] != hij_dev.shape[0]) {
+    throw std::invalid_argument("col_idx and hij must have matching lengths");
+  }
+  if ((int)x_dev.shape[0] != nrows || (int)y_dev.shape[0] != nrows || x_dev.shape[1] != y_dev.shape[1]) {
+    throw std::invalid_argument("x and y must have matching shape (nrows, nvec)");
+  }
+  int nvec = (int)x_dev.shape[1];
+  if (nvec <= 0) {
+    return;
+  }
+
+  if (!row_ptr_dev.strides_bytes.empty() &&
+      (row_ptr_dev.strides_bytes.size() != 1 || row_ptr_dev.strides_bytes[0] != (int64_t)sizeof(int64_t))) {
+    throw std::invalid_argument("row_ptr must be contiguous");
+  }
+  if (!col_idx_dev.strides_bytes.empty() &&
+      (col_idx_dev.strides_bytes.size() != 1 || col_idx_dev.strides_bytes[0] != (int64_t)sizeof(int32_t))) {
+    throw std::invalid_argument("col_idx must be contiguous");
+  }
+  if (!hij_dev.strides_bytes.empty() &&
+      (hij_dev.strides_bytes.size() != 1 || hij_dev.strides_bytes[0] != (int64_t)sizeof(double))) {
+    throw std::invalid_argument("hij must be contiguous");
+  }
+  if (!diag_dev.strides_bytes.empty() &&
+      (diag_dev.strides_bytes.size() != 1 || diag_dev.strides_bytes[0] != (int64_t)sizeof(double))) {
+    throw std::invalid_argument("diag must be contiguous");
+  }
+  if (!x_dev.strides_bytes.empty()) {
+    if (x_dev.strides_bytes.size() != 2 || x_dev.strides_bytes[1] != (int64_t)sizeof(double) ||
+        x_dev.strides_bytes[0] != (int64_t)nvec * (int64_t)sizeof(double)) {
+      throw std::invalid_argument("x must be C-contiguous");
+    }
+  }
+  if (!y_dev.strides_bytes.empty()) {
+    if (y_dev.strides_bytes.size() != 2 || y_dev.strides_bytes[1] != (int64_t)sizeof(double) ||
+        y_dev.strides_bytes[0] != (int64_t)nvec * (int64_t)sizeof(double)) {
+      throw std::invalid_argument("y must be C-contiguous");
+    }
+  }
+
+  uint64_t stream_u = stream;
+  if (stream_u == 0) {
+    if (y_dev.stream) stream_u = y_dev.stream;
+    else if (x_dev.stream) stream_u = x_dev.stream;
+    else if (hij_dev.stream) stream_u = hij_dev.stream;
+  }
+  cudaStream_t stream_t = reinterpret_cast<cudaStream_t>(stream_u);
+
+  throw_on_cuda_error(
+      cas36_sym_row_graph_spmm_launch_stream(
+          reinterpret_cast<const int64_t*>(row_ptr_dev.ptr),
+          reinterpret_cast<const int32_t*>(col_idx_dev.ptr),
+          reinterpret_cast<const double*>(hij_dev.ptr),
+          reinterpret_cast<const double*>(diag_dev.ptr),
+          nrows,
+          reinterpret_cast<const double*>(x_dev.ptr),
+          (int64_t)nvec,
+          nvec,
+          reinterpret_cast<double*>(y_dev.ptr),
+          (int64_t)nvec,
+          stream_t,
+          int(threads)),
+      "cas36_sym_row_graph_spmm_launch_stream");
+  if (sync) {
+    throw_on_cuda_error(cudaStreamSynchronize(stream_t), "cudaStreamSynchronize(cas36_sym_row_graph_spmm)");
   }
 }
 
@@ -11369,9 +12150,18 @@ void pairwise_hij_bucketed_u64_inplace_device(
     py::object nodes_all_obj,
     py::object occ_all_obj,
     py::object b_all_obj,
+    py::object occ_keys_sorted_obj,
+    py::object bucket_keys_obj,
+    py::object bucket_starts_obj,
+    py::object bucket_sizes_obj,
+    py::object neighbor_offsets_obj,
+    py::object neighbor_list_obj,
     py::object csf_to_bucket_obj,
     py::object target_offsets_obj,
     py::object target_list_obj,
+    py::object target_offsets_1b_obj,
+    py::object target_list_1b_obj,
+    int use_bucket_filter_phase2,
     py::object H_out_obj,
     py::object overflow_obj,
     int threads,
@@ -11379,9 +12169,13 @@ void pairwise_hij_bucketed_u64_inplace_device(
     bool sync) {
   if (sel_idx_u64_obj.is_none() || h_base_obj.is_none() || eri4_obj.is_none() ||
       steps_all_obj.is_none() || nodes_all_obj.is_none() || occ_all_obj.is_none() ||
-      b_all_obj.is_none() || H_out_obj.is_none() || overflow_obj.is_none() ||
+      b_all_obj.is_none() || occ_keys_sorted_obj.is_none() ||
+      bucket_keys_obj.is_none() || bucket_starts_obj.is_none() || bucket_sizes_obj.is_none() ||
+      neighbor_offsets_obj.is_none() || neighbor_list_obj.is_none() ||
+      H_out_obj.is_none() || overflow_obj.is_none() ||
       csf_to_bucket_obj.is_none() || target_offsets_obj.is_none() ||
-      target_list_obj.is_none()) {
+      target_list_obj.is_none() || target_offsets_1b_obj.is_none() ||
+      target_list_1b_obj.is_none()) {
     throw std::invalid_argument("required array arguments must not be None");
   }
   if (threads <= 0 || threads > 1024) throw std::invalid_argument("threads must be in 1..1024");
@@ -11395,9 +12189,17 @@ void pairwise_hij_bucketed_u64_inplace_device(
   auto nodes_dev = cuda_array_view_from_object(nodes_all_obj, "nodes_all");
   auto occ_dev = cuda_array_view_from_object(occ_all_obj, "occ_all");
   auto b_dev = cuda_array_view_from_object(b_all_obj, "b_all");
+  auto occ_keys_dev = cuda_array_view_from_object(occ_keys_sorted_obj, "occ_keys_sorted");
+  auto bucket_keys_dev = cuda_array_view_from_object(bucket_keys_obj, "bucket_keys");
+  auto bucket_starts_dev = cuda_array_view_from_object(bucket_starts_obj, "bucket_starts");
+  auto bucket_sizes_dev = cuda_array_view_from_object(bucket_sizes_obj, "bucket_sizes");
+  auto neighbor_offsets_dev = cuda_array_view_from_object(neighbor_offsets_obj, "neighbor_offsets");
+  auto neighbor_list_dev = cuda_array_view_from_object(neighbor_list_obj, "neighbor_list");
   auto csf_to_bucket_dev = cuda_array_view_from_object(csf_to_bucket_obj, "csf_to_bucket");
   auto target_offsets_dev = cuda_array_view_from_object(target_offsets_obj, "target_offsets");
   auto target_list_dev = cuda_array_view_from_object(target_list_obj, "target_list");
+  auto target_offsets_1b_dev = cuda_array_view_from_object(target_offsets_1b_obj, "target_offsets_1b");
+  auto target_list_1b_dev = cuda_array_view_from_object(target_list_1b_obj, "target_list_1b");
   auto H_out_dev = cuda_array_view_from_object(H_out_obj, "H_out");
   auto overflow_dev = cuda_array_view_from_object(overflow_obj, "overflow");
 
@@ -11408,9 +12210,17 @@ void pairwise_hij_bucketed_u64_inplace_device(
   require_typestr(nodes_dev, "nodes_all", "<i4");
   require_typestr(occ_dev, "occ_all", "|i1");
   require_typestr(b_dev, "b_all", "<i2");
+  require_typestr(occ_keys_dev, "occ_keys_sorted", "<u8");
+  require_typestr(bucket_keys_dev, "bucket_keys", "<u8");
+  require_typestr(bucket_starts_dev, "bucket_starts", "<i4");
+  require_typestr(bucket_sizes_dev, "bucket_sizes", "<i4");
+  require_typestr(neighbor_offsets_dev, "neighbor_offsets", "<i4");
+  require_typestr(neighbor_list_dev, "neighbor_list", "<i4");
   require_typestr(csf_to_bucket_dev, "csf_to_bucket", "<i4");
   require_typestr(target_offsets_dev, "target_offsets", "<i4");
   require_typestr(target_list_dev, "target_list", "<i4");
+  require_typestr(target_offsets_1b_dev, "target_offsets_1b", "<i4");
+  require_typestr(target_list_1b_dev, "target_list_1b", "<i4");
   require_typestr(H_out_dev, "H_out", "<f8");
   require_typestr(overflow_dev, "overflow", "<i4");
 
@@ -11449,9 +12259,18 @@ void pairwise_hij_bucketed_u64_inplace_device(
           reinterpret_cast<const int32_t*>(nodes_dev.ptr),
           reinterpret_cast<const int8_t*>(occ_dev.ptr),
           reinterpret_cast<const int16_t*>(b_dev.ptr),
+          reinterpret_cast<const uint64_t*>(occ_keys_dev.ptr),
+          reinterpret_cast<const uint64_t*>(bucket_keys_dev.ptr),
+          reinterpret_cast<const int32_t*>(bucket_starts_dev.ptr),
+          reinterpret_cast<const int32_t*>(bucket_sizes_dev.ptr),
+          reinterpret_cast<const int32_t*>(neighbor_offsets_dev.ptr),
+          reinterpret_cast<const int32_t*>(neighbor_list_dev.ptr),
           reinterpret_cast<const int32_t*>(csf_to_bucket_dev.ptr),
           reinterpret_cast<const int32_t*>(target_offsets_dev.ptr),
           reinterpret_cast<const int32_t*>(target_list_dev.ptr),
+          reinterpret_cast<const int32_t*>(target_offsets_1b_dev.ptr),
+          reinterpret_cast<const int32_t*>(target_list_1b_dev.ptr),
+          int(use_bucket_filter_phase2),
           reinterpret_cast<double*>(H_out_dev.ptr),
           reinterpret_cast<int*>(overflow_dev.ptr),
           stream_t,
@@ -11459,6 +12278,635 @@ void pairwise_hij_bucketed_u64_inplace_device(
       "pairwise_hij_bucketed_u64_launch_stream");
   if (sync) {
     throw_on_cuda_error(cudaStreamSynchronize(stream_t), "cudaStreamSynchronize(pairwise_hij_bucketed)");
+  }
+}
+
+void pairwise_count_bucketed_u64_inplace_device(
+    const DeviceDRT& drt,
+    uint64_t ncsf_u64,
+    py::object sel_idx_u64_obj,
+    int nsel,
+    py::object h_base_obj,
+    py::object eri4_obj,
+    py::object steps_all_obj,
+    py::object nodes_all_obj,
+    py::object occ_all_obj,
+    py::object b_all_obj,
+    py::object occ_keys_sorted_obj,
+    py::object bucket_keys_obj,
+    py::object bucket_starts_obj,
+    py::object bucket_sizes_obj,
+    py::object neighbor_offsets_obj,
+    py::object neighbor_list_obj,
+    py::object csf_to_bucket_obj,
+    py::object target_offsets_obj,
+    py::object target_list_obj,
+    py::object target_offsets_1b_obj,
+    py::object target_list_1b_obj,
+    int table_cap,
+    py::object workspace_keys_obj,
+    py::object workspace_vals_obj,
+    int grid_blocks,
+    py::object row_counts_obj,
+    py::object diag_out_obj,
+    py::object overflow_obj,
+    int threads,
+    uint64_t stream,
+    bool sync) {
+  if (sel_idx_u64_obj.is_none() || h_base_obj.is_none() || eri4_obj.is_none() ||
+      steps_all_obj.is_none() || nodes_all_obj.is_none() || occ_all_obj.is_none() ||
+      b_all_obj.is_none() || occ_keys_sorted_obj.is_none() || bucket_keys_obj.is_none() ||
+      bucket_starts_obj.is_none() || bucket_sizes_obj.is_none() || neighbor_offsets_obj.is_none() ||
+      neighbor_list_obj.is_none() || csf_to_bucket_obj.is_none() || target_offsets_obj.is_none() ||
+      target_list_obj.is_none() || target_offsets_1b_obj.is_none() || target_list_1b_obj.is_none() ||
+      workspace_keys_obj.is_none() || workspace_vals_obj.is_none() || row_counts_obj.is_none() ||
+      diag_out_obj.is_none() || overflow_obj.is_none()) {
+    throw std::invalid_argument("required array arguments must not be None");
+  }
+  if (threads <= 0 || threads > 1024) throw std::invalid_argument("threads must be in 1..1024");
+  if (nsel <= 0) return;
+  if (grid_blocks <= 0) throw std::invalid_argument("grid_blocks must be > 0");
+  if (table_cap <= 0 || (table_cap & (table_cap - 1)) != 0) {
+    throw std::invalid_argument("table_cap must be a positive power of two");
+  }
+
+  auto sel_dev = cuda_array_view_from_object(sel_idx_u64_obj, "sel_idx_u64");
+  auto h_base_dev = cuda_array_view_from_object(h_base_obj, "h_base");
+  auto eri4_dev = cuda_array_view_from_object(eri4_obj, "eri4");
+  auto steps_dev = cuda_array_view_from_object(steps_all_obj, "steps_all");
+  auto nodes_dev = cuda_array_view_from_object(nodes_all_obj, "nodes_all");
+  auto occ_dev = cuda_array_view_from_object(occ_all_obj, "occ_all");
+  auto b_dev = cuda_array_view_from_object(b_all_obj, "b_all");
+  auto occ_keys_dev = cuda_array_view_from_object(occ_keys_sorted_obj, "occ_keys_sorted");
+  auto bucket_keys_dev = cuda_array_view_from_object(bucket_keys_obj, "bucket_keys");
+  auto bucket_starts_dev = cuda_array_view_from_object(bucket_starts_obj, "bucket_starts");
+  auto bucket_sizes_dev = cuda_array_view_from_object(bucket_sizes_obj, "bucket_sizes");
+  auto neighbor_offsets_dev = cuda_array_view_from_object(neighbor_offsets_obj, "neighbor_offsets");
+  auto neighbor_list_dev = cuda_array_view_from_object(neighbor_list_obj, "neighbor_list");
+  auto csf_to_bucket_dev = cuda_array_view_from_object(csf_to_bucket_obj, "csf_to_bucket");
+  auto target_offsets_dev = cuda_array_view_from_object(target_offsets_obj, "target_offsets");
+  auto target_list_dev = cuda_array_view_from_object(target_list_obj, "target_list");
+  auto target_offsets_1b_dev = cuda_array_view_from_object(target_offsets_1b_obj, "target_offsets_1b");
+  auto target_list_1b_dev = cuda_array_view_from_object(target_list_1b_obj, "target_list_1b");
+  auto workspace_keys_dev = cuda_array_view_from_object(workspace_keys_obj, "workspace_keys");
+  auto workspace_vals_dev = cuda_array_view_from_object(workspace_vals_obj, "workspace_vals");
+  auto row_counts_dev = cuda_array_view_from_object(row_counts_obj, "row_counts");
+  auto diag_out_dev = cuda_array_view_from_object(diag_out_obj, "diag_out");
+  auto overflow_dev = cuda_array_view_from_object(overflow_obj, "overflow");
+
+  require_typestr(sel_dev, "sel_idx_u64", "<u8");
+  require_typestr(h_base_dev, "h_base", "<f8");
+  require_typestr(eri4_dev, "eri4", "<f8");
+  require_typestr(steps_dev, "steps_all", "|i1");
+  require_typestr(nodes_dev, "nodes_all", "<i4");
+  require_typestr(occ_dev, "occ_all", "|i1");
+  require_typestr(b_dev, "b_all", "<i2");
+  require_typestr(occ_keys_dev, "occ_keys_sorted", "<u8");
+  require_typestr(bucket_keys_dev, "bucket_keys", "<u8");
+  require_typestr(bucket_starts_dev, "bucket_starts", "<i4");
+  require_typestr(bucket_sizes_dev, "bucket_sizes", "<i4");
+  require_typestr(neighbor_offsets_dev, "neighbor_offsets", "<i4");
+  require_typestr(neighbor_list_dev, "neighbor_list", "<i4");
+  require_typestr(csf_to_bucket_dev, "csf_to_bucket", "<i4");
+  require_typestr(target_offsets_dev, "target_offsets", "<i4");
+  require_typestr(target_list_dev, "target_list", "<i4");
+  require_typestr(target_offsets_1b_dev, "target_offsets_1b", "<i4");
+  require_typestr(target_list_1b_dev, "target_list_1b", "<i4");
+  require_typestr(workspace_keys_dev, "workspace_keys", "<i4");
+  require_typestr(workspace_vals_dev, "workspace_vals", "<f8");
+  require_typestr(row_counts_dev, "row_counts", "<i4");
+  require_typestr(diag_out_dev, "diag_out", "<f8");
+  require_typestr(overflow_dev, "overflow", "<i4");
+
+  if (workspace_keys_dev.shape.size() != 1 || workspace_keys_dev.shape[0] < (int64_t)grid_blocks * (int64_t)table_cap)
+    throw std::invalid_argument("workspace_keys length must be >= grid_blocks*table_cap");
+  if (workspace_vals_dev.shape.size() != 1 || workspace_vals_dev.shape[0] < (int64_t)grid_blocks * (int64_t)table_cap)
+    throw std::invalid_argument("workspace_vals length must be >= grid_blocks*table_cap");
+  if (row_counts_dev.shape.size() != 1 || row_counts_dev.shape[0] < (int64_t)nsel)
+    throw std::invalid_argument("row_counts length must be >= nsel");
+  if (diag_out_dev.shape.size() != 1 || diag_out_dev.shape[0] < (int64_t)nsel)
+    throw std::invalid_argument("diag_out length must be >= nsel");
+  if (overflow_dev.shape.size() != 1 || overflow_dev.shape[0] != 1)
+    throw std::invalid_argument("overflow must have shape (1,)");
+
+  uint64_t stream_u = stream;
+  if (stream_u == 0) {
+    if (diag_out_dev.stream) stream_u = diag_out_dev.stream;
+    else if (sel_dev.stream) stream_u = sel_dev.stream;
+  }
+  cudaStream_t stream_t = reinterpret_cast<cudaStream_t>(stream_u);
+
+  throw_on_cuda_error(
+      pairwise_count_bucketed_u64_launch_stream(
+          reinterpret_cast<const uint64_t*>(sel_dev.ptr),
+          int(nsel),
+          int(drt.norb),
+          ncsf_u64,
+          reinterpret_cast<const double*>(h_base_dev.ptr),
+          reinterpret_cast<const double*>(eri4_dev.ptr),
+          drt.child,
+          drt.node_twos,
+          drt.child_prefix,
+          reinterpret_cast<const int8_t*>(steps_dev.ptr),
+          reinterpret_cast<const int32_t*>(nodes_dev.ptr),
+          reinterpret_cast<const int8_t*>(occ_dev.ptr),
+          reinterpret_cast<const int16_t*>(b_dev.ptr),
+          reinterpret_cast<const uint64_t*>(occ_keys_dev.ptr),
+          reinterpret_cast<const uint64_t*>(bucket_keys_dev.ptr),
+          reinterpret_cast<const int32_t*>(bucket_starts_dev.ptr),
+          reinterpret_cast<const int32_t*>(bucket_sizes_dev.ptr),
+          reinterpret_cast<const int32_t*>(neighbor_offsets_dev.ptr),
+          reinterpret_cast<const int32_t*>(neighbor_list_dev.ptr),
+          reinterpret_cast<const int32_t*>(csf_to_bucket_dev.ptr),
+          reinterpret_cast<const int32_t*>(target_offsets_dev.ptr),
+          reinterpret_cast<const int32_t*>(target_list_dev.ptr),
+          reinterpret_cast<const int32_t*>(target_offsets_1b_dev.ptr),
+          reinterpret_cast<const int32_t*>(target_list_1b_dev.ptr),
+          int(table_cap),
+          reinterpret_cast<int32_t*>(workspace_keys_dev.ptr),
+          reinterpret_cast<double*>(workspace_vals_dev.ptr),
+          int(grid_blocks),
+          reinterpret_cast<int32_t*>(row_counts_dev.ptr),
+          reinterpret_cast<double*>(diag_out_dev.ptr),
+          reinterpret_cast<int*>(overflow_dev.ptr),
+          stream_t,
+          int(threads)),
+      "pairwise_count_bucketed_u64_launch_stream");
+  if (sync) {
+    throw_on_cuda_error(cudaStreamSynchronize(stream_t), "cudaStreamSynchronize(pairwise_count_bucketed)");
+  }
+}
+
+void pairwise_fill_bucketed_u64_inplace_device(
+    const DeviceDRT& drt,
+    uint64_t ncsf_u64,
+    py::object sel_idx_u64_obj,
+    int nsel,
+    py::object h_base_obj,
+    py::object eri4_obj,
+    py::object steps_all_obj,
+    py::object nodes_all_obj,
+    py::object occ_all_obj,
+    py::object b_all_obj,
+    py::object occ_keys_sorted_obj,
+    py::object bucket_keys_obj,
+    py::object bucket_starts_obj,
+    py::object bucket_sizes_obj,
+    py::object neighbor_offsets_obj,
+    py::object neighbor_list_obj,
+    py::object csf_to_bucket_obj,
+    py::object target_offsets_obj,
+    py::object target_list_obj,
+    py::object target_offsets_1b_obj,
+    py::object target_list_1b_obj,
+    int table_cap,
+    py::object workspace_keys_obj,
+    py::object workspace_vals_obj,
+    int grid_blocks,
+    py::object row_offsets_obj,
+    py::object row_counts_obj,
+    py::object out_target_local_obj,
+    py::object out_src_pos_obj,
+    py::object out_hij_obj,
+    py::object diag_out_obj,
+    py::object overflow_obj,
+    int threads,
+    uint64_t stream,
+    bool sync) {
+  if (sel_idx_u64_obj.is_none() || h_base_obj.is_none() || eri4_obj.is_none() ||
+      steps_all_obj.is_none() || nodes_all_obj.is_none() || occ_all_obj.is_none() ||
+      b_all_obj.is_none() || occ_keys_sorted_obj.is_none() || bucket_keys_obj.is_none() ||
+      bucket_starts_obj.is_none() || bucket_sizes_obj.is_none() || neighbor_offsets_obj.is_none() ||
+      neighbor_list_obj.is_none() || csf_to_bucket_obj.is_none() || target_offsets_obj.is_none() ||
+      target_list_obj.is_none() || target_offsets_1b_obj.is_none() || target_list_1b_obj.is_none() ||
+      workspace_keys_obj.is_none() || workspace_vals_obj.is_none() || row_offsets_obj.is_none() ||
+      row_counts_obj.is_none() || out_target_local_obj.is_none() || out_src_pos_obj.is_none() ||
+      out_hij_obj.is_none() || diag_out_obj.is_none() || overflow_obj.is_none()) {
+    throw std::invalid_argument("required array arguments must not be None");
+  }
+  if (threads <= 0 || threads > 1024) throw std::invalid_argument("threads must be in 1..1024");
+  if (nsel <= 0) return;
+  if (grid_blocks <= 0) throw std::invalid_argument("grid_blocks must be > 0");
+  if (table_cap <= 0 || (table_cap & (table_cap - 1)) != 0) {
+    throw std::invalid_argument("table_cap must be a positive power of two");
+  }
+
+  auto sel_dev = cuda_array_view_from_object(sel_idx_u64_obj, "sel_idx_u64");
+  auto h_base_dev = cuda_array_view_from_object(h_base_obj, "h_base");
+  auto eri4_dev = cuda_array_view_from_object(eri4_obj, "eri4");
+  auto steps_dev = cuda_array_view_from_object(steps_all_obj, "steps_all");
+  auto nodes_dev = cuda_array_view_from_object(nodes_all_obj, "nodes_all");
+  auto occ_dev = cuda_array_view_from_object(occ_all_obj, "occ_all");
+  auto b_dev = cuda_array_view_from_object(b_all_obj, "b_all");
+  auto occ_keys_dev = cuda_array_view_from_object(occ_keys_sorted_obj, "occ_keys_sorted");
+  auto bucket_keys_dev = cuda_array_view_from_object(bucket_keys_obj, "bucket_keys");
+  auto bucket_starts_dev = cuda_array_view_from_object(bucket_starts_obj, "bucket_starts");
+  auto bucket_sizes_dev = cuda_array_view_from_object(bucket_sizes_obj, "bucket_sizes");
+  auto neighbor_offsets_dev = cuda_array_view_from_object(neighbor_offsets_obj, "neighbor_offsets");
+  auto neighbor_list_dev = cuda_array_view_from_object(neighbor_list_obj, "neighbor_list");
+  auto csf_to_bucket_dev = cuda_array_view_from_object(csf_to_bucket_obj, "csf_to_bucket");
+  auto target_offsets_dev = cuda_array_view_from_object(target_offsets_obj, "target_offsets");
+  auto target_list_dev = cuda_array_view_from_object(target_list_obj, "target_list");
+  auto target_offsets_1b_dev = cuda_array_view_from_object(target_offsets_1b_obj, "target_offsets_1b");
+  auto target_list_1b_dev = cuda_array_view_from_object(target_list_1b_obj, "target_list_1b");
+  auto workspace_keys_dev = cuda_array_view_from_object(workspace_keys_obj, "workspace_keys");
+  auto workspace_vals_dev = cuda_array_view_from_object(workspace_vals_obj, "workspace_vals");
+  auto row_offsets_dev = cuda_array_view_from_object(row_offsets_obj, "row_offsets");
+  auto row_counts_dev = cuda_array_view_from_object(row_counts_obj, "row_counts");
+  auto out_target_local_dev = cuda_array_view_from_object(out_target_local_obj, "out_target_local");
+  auto out_src_pos_dev = cuda_array_view_from_object(out_src_pos_obj, "out_src_pos");
+  auto out_hij_dev = cuda_array_view_from_object(out_hij_obj, "out_hij");
+  auto diag_out_dev = cuda_array_view_from_object(diag_out_obj, "diag_out");
+  auto overflow_dev = cuda_array_view_from_object(overflow_obj, "overflow");
+
+  require_typestr(sel_dev, "sel_idx_u64", "<u8");
+  require_typestr(h_base_dev, "h_base", "<f8");
+  require_typestr(eri4_dev, "eri4", "<f8");
+  require_typestr(steps_dev, "steps_all", "|i1");
+  require_typestr(nodes_dev, "nodes_all", "<i4");
+  require_typestr(occ_dev, "occ_all", "|i1");
+  require_typestr(b_dev, "b_all", "<i2");
+  require_typestr(occ_keys_dev, "occ_keys_sorted", "<u8");
+  require_typestr(bucket_keys_dev, "bucket_keys", "<u8");
+  require_typestr(bucket_starts_dev, "bucket_starts", "<i4");
+  require_typestr(bucket_sizes_dev, "bucket_sizes", "<i4");
+  require_typestr(neighbor_offsets_dev, "neighbor_offsets", "<i4");
+  require_typestr(neighbor_list_dev, "neighbor_list", "<i4");
+  require_typestr(csf_to_bucket_dev, "csf_to_bucket", "<i4");
+  require_typestr(target_offsets_dev, "target_offsets", "<i4");
+  require_typestr(target_list_dev, "target_list", "<i4");
+  require_typestr(target_offsets_1b_dev, "target_offsets_1b", "<i4");
+  require_typestr(target_list_1b_dev, "target_list_1b", "<i4");
+  require_typestr(workspace_keys_dev, "workspace_keys", "<i4");
+  require_typestr(workspace_vals_dev, "workspace_vals", "<f8");
+  require_typestr(row_offsets_dev, "row_offsets", "<i8");
+  require_typestr(row_counts_dev, "row_counts", "<i4");
+  require_typestr(out_target_local_dev, "out_target_local", "<i4");
+  require_typestr(out_src_pos_dev, "out_src_pos", "<i4");
+  require_typestr(out_hij_dev, "out_hij", "<f8");
+  require_typestr(diag_out_dev, "diag_out", "<f8");
+  require_typestr(overflow_dev, "overflow", "<i4");
+
+  uint64_t stream_u = stream;
+  if (stream_u == 0) {
+    if (out_hij_dev.stream) stream_u = out_hij_dev.stream;
+    else if (sel_dev.stream) stream_u = sel_dev.stream;
+  }
+  cudaStream_t stream_t = reinterpret_cast<cudaStream_t>(stream_u);
+
+  throw_on_cuda_error(
+      pairwise_fill_bucketed_u64_launch_stream(
+          reinterpret_cast<const uint64_t*>(sel_dev.ptr),
+          int(nsel),
+          int(drt.norb),
+          ncsf_u64,
+          reinterpret_cast<const double*>(h_base_dev.ptr),
+          reinterpret_cast<const double*>(eri4_dev.ptr),
+          drt.child,
+          drt.node_twos,
+          drt.child_prefix,
+          reinterpret_cast<const int8_t*>(steps_dev.ptr),
+          reinterpret_cast<const int32_t*>(nodes_dev.ptr),
+          reinterpret_cast<const int8_t*>(occ_dev.ptr),
+          reinterpret_cast<const int16_t*>(b_dev.ptr),
+          reinterpret_cast<const uint64_t*>(occ_keys_dev.ptr),
+          reinterpret_cast<const uint64_t*>(bucket_keys_dev.ptr),
+          reinterpret_cast<const int32_t*>(bucket_starts_dev.ptr),
+          reinterpret_cast<const int32_t*>(bucket_sizes_dev.ptr),
+          reinterpret_cast<const int32_t*>(neighbor_offsets_dev.ptr),
+          reinterpret_cast<const int32_t*>(neighbor_list_dev.ptr),
+          reinterpret_cast<const int32_t*>(csf_to_bucket_dev.ptr),
+          reinterpret_cast<const int32_t*>(target_offsets_dev.ptr),
+          reinterpret_cast<const int32_t*>(target_list_dev.ptr),
+          reinterpret_cast<const int32_t*>(target_offsets_1b_dev.ptr),
+          reinterpret_cast<const int32_t*>(target_list_1b_dev.ptr),
+          int(table_cap),
+          reinterpret_cast<int32_t*>(workspace_keys_dev.ptr),
+          reinterpret_cast<double*>(workspace_vals_dev.ptr),
+          int(grid_blocks),
+          reinterpret_cast<const int64_t*>(row_offsets_dev.ptr),
+          reinterpret_cast<const int32_t*>(row_counts_dev.ptr),
+          reinterpret_cast<int32_t*>(out_target_local_dev.ptr),
+          reinterpret_cast<int32_t*>(out_src_pos_dev.ptr),
+          reinterpret_cast<double*>(out_hij_dev.ptr),
+          reinterpret_cast<double*>(diag_out_dev.ptr),
+          reinterpret_cast<int*>(overflow_dev.ptr),
+          stream_t,
+          int(threads)),
+      "pairwise_fill_bucketed_u64_launch_stream");
+  if (sync) {
+    throw_on_cuda_error(cudaStreamSynchronize(stream_t), "cudaStreamSynchronize(pairwise_fill_bucketed)");
+  }
+}
+
+void pairwise_sigma_bucketed_u64_inplace_device(
+    const DeviceDRT& drt,
+    uint64_t ncsf_u64,
+    py::object sel_idx_u64_obj,
+    int nsel,
+    py::object h_base_obj,
+    py::object eri4_obj,
+    py::object steps_all_obj,
+    py::object nodes_all_obj,
+    py::object occ_all_obj,
+    py::object b_all_obj,
+    py::object occ_keys_sorted_obj,
+    py::object csf_to_bucket_obj,
+    py::object target_offsets_obj,
+    py::object target_list_obj,
+    py::object target_offsets_1b_obj,
+    py::object target_list_1b_obj,
+    py::object x_obj,
+    py::object y_obj,
+    py::object overflow_obj,
+    int threads,
+    uint64_t stream,
+    bool sync) {
+  if (sel_idx_u64_obj.is_none() || h_base_obj.is_none() || eri4_obj.is_none() ||
+      steps_all_obj.is_none() || nodes_all_obj.is_none() || occ_all_obj.is_none() ||
+      b_all_obj.is_none() || occ_keys_sorted_obj.is_none() || csf_to_bucket_obj.is_none() ||
+      target_offsets_obj.is_none() || target_list_obj.is_none() ||
+      target_offsets_1b_obj.is_none() || target_list_1b_obj.is_none() ||
+      x_obj.is_none() || y_obj.is_none() || overflow_obj.is_none()) {
+    throw std::invalid_argument("required array arguments must not be None");
+  }
+  if (threads <= 0 || threads > 1024) throw std::invalid_argument("threads must be in 1..1024");
+  if (nsel <= 0) return;
+  if (drt.norb <= 0 || drt.norb > 64) throw std::invalid_argument("norb must be in 1..64");
+
+  auto sel_dev = cuda_array_view_from_object(sel_idx_u64_obj, "sel_idx_u64");
+  auto h_base_dev = cuda_array_view_from_object(h_base_obj, "h_base");
+  auto eri4_dev = cuda_array_view_from_object(eri4_obj, "eri4");
+  auto steps_dev = cuda_array_view_from_object(steps_all_obj, "steps_all");
+  auto nodes_dev = cuda_array_view_from_object(nodes_all_obj, "nodes_all");
+  auto occ_dev = cuda_array_view_from_object(occ_all_obj, "occ_all");
+  auto b_dev = cuda_array_view_from_object(b_all_obj, "b_all");
+  auto occ_keys_dev = cuda_array_view_from_object(occ_keys_sorted_obj, "occ_keys_sorted");
+  auto csf_to_bucket_dev = cuda_array_view_from_object(csf_to_bucket_obj, "csf_to_bucket");
+  auto target_offsets_dev = cuda_array_view_from_object(target_offsets_obj, "target_offsets");
+  auto target_list_dev = cuda_array_view_from_object(target_list_obj, "target_list");
+  auto target_offsets_1b_dev = cuda_array_view_from_object(target_offsets_1b_obj, "target_offsets_1b");
+  auto target_list_1b_dev = cuda_array_view_from_object(target_list_1b_obj, "target_list_1b");
+  auto x_dev = cuda_array_view_from_object(x_obj, "x");
+  auto y_dev = cuda_array_view_from_object(y_obj, "y");
+  auto overflow_dev = cuda_array_view_from_object(overflow_obj, "overflow");
+
+  require_typestr(sel_dev, "sel_idx_u64", "<u8");
+  require_typestr(h_base_dev, "h_base", "<f8");
+  require_typestr(eri4_dev, "eri4", "<f8");
+  require_typestr(steps_dev, "steps_all", "|i1");
+  require_typestr(nodes_dev, "nodes_all", "<i4");
+  require_typestr(occ_dev, "occ_all", "|i1");
+  require_typestr(b_dev, "b_all", "<i2");
+  require_typestr(occ_keys_dev, "occ_keys_sorted", "<u8");
+  require_typestr(csf_to_bucket_dev, "csf_to_bucket", "<i4");
+  require_typestr(target_offsets_dev, "target_offsets", "<i4");
+  require_typestr(target_list_dev, "target_list", "<i4");
+  require_typestr(target_offsets_1b_dev, "target_offsets_1b", "<i4");
+  require_typestr(target_list_1b_dev, "target_list_1b", "<i4");
+  require_typestr(x_dev, "x", "<f8");
+  require_typestr(y_dev, "y", "<f8");
+  require_typestr(overflow_dev, "overflow", "<i4");
+
+  if (y_dev.read_only) {
+    throw std::invalid_argument("y must be writable");
+  }
+  if (sel_dev.shape.size() != 1 || sel_dev.shape[0] < (int64_t)nsel) {
+    throw std::invalid_argument("sel_idx_u64 length must be >= nsel");
+  }
+  int64_t nops = (int64_t)drt.norb * (int64_t)drt.norb;
+  if (h_base_dev.shape.size() != 1 || h_base_dev.shape[0] < nops) {
+    throw std::invalid_argument("h_base length must be >= norb*norb");
+  }
+  int64_t eri4_n = nops * nops;
+  if (eri4_dev.shape.size() != 1 || eri4_dev.shape[0] < eri4_n) {
+    throw std::invalid_argument("eri4 length must be >= norb^4");
+  }
+  if (x_dev.shape.size() != 2 || y_dev.shape.size() != 2) {
+    throw std::invalid_argument("x and y must be 2D row-major arrays");
+  }
+  if ((int)x_dev.shape[0] != nsel || (int)y_dev.shape[0] != nsel || x_dev.shape[1] != y_dev.shape[1]) {
+    throw std::invalid_argument("x and y must have matching shape (nsel, nvec)");
+  }
+  int nvec = (int)x_dev.shape[1];
+  if (nvec <= 0) return;
+  if (overflow_dev.shape.size() != 1 || overflow_dev.shape[0] != 1) {
+    throw std::invalid_argument("overflow must have shape (1,)");
+  }
+
+  uint64_t stream_u = stream;
+  if (stream_u == 0) {
+    if (y_dev.stream) stream_u = y_dev.stream;
+    else if (x_dev.stream) stream_u = x_dev.stream;
+    else if (sel_dev.stream) stream_u = sel_dev.stream;
+  }
+  cudaStream_t stream_t = reinterpret_cast<cudaStream_t>(stream_u);
+
+  throw_on_cuda_error(
+      pairwise_sigma_bucketed_u64_launch_stream(
+          reinterpret_cast<const uint64_t*>(sel_dev.ptr),
+          int(nsel),
+          int(drt.norb),
+          ncsf_u64,
+          reinterpret_cast<const double*>(h_base_dev.ptr),
+          reinterpret_cast<const double*>(eri4_dev.ptr),
+          drt.child,
+          drt.node_twos,
+          drt.child_prefix,
+          reinterpret_cast<const int8_t*>(steps_dev.ptr),
+          reinterpret_cast<const int32_t*>(nodes_dev.ptr),
+          reinterpret_cast<const int8_t*>(occ_dev.ptr),
+          reinterpret_cast<const int16_t*>(b_dev.ptr),
+          reinterpret_cast<const uint64_t*>(occ_keys_dev.ptr),
+          reinterpret_cast<const int32_t*>(csf_to_bucket_dev.ptr),
+          reinterpret_cast<const int32_t*>(target_offsets_dev.ptr),
+          reinterpret_cast<const int32_t*>(target_list_dev.ptr),
+          reinterpret_cast<const int32_t*>(target_offsets_1b_dev.ptr),
+          reinterpret_cast<const int32_t*>(target_list_1b_dev.ptr),
+          reinterpret_cast<const double*>(x_dev.ptr),
+          int(nvec),
+          reinterpret_cast<double*>(y_dev.ptr),
+          reinterpret_cast<int*>(overflow_dev.ptr),
+          stream_t,
+          int(threads)),
+      "pairwise_sigma_bucketed_u64_launch_stream");
+  if (sync) {
+    throw_on_cuda_error(cudaStreamSynchronize(stream_t), "cudaStreamSynchronize(pairwise_sigma_bucketed)");
+  }
+}
+
+void pairwise_T_matrix_bucketed_u64_inplace_device(
+    const DeviceDRT& drt,
+    py::object steps_all_obj,
+    py::object nodes_all_obj,
+    py::object occ_all_obj,
+    py::object b_all_obj,
+    py::object csf_to_bucket_obj,
+    py::object target_offsets_1b_obj,
+    py::object target_list_1b_obj,
+    py::object ci_sel_obj,
+    py::object T_out_obj,
+    int nsel,
+    int threads,
+    uint64_t stream,
+    bool sync) {
+  if (steps_all_obj.is_none() || nodes_all_obj.is_none() || occ_all_obj.is_none() ||
+      b_all_obj.is_none() || csf_to_bucket_obj.is_none() || target_offsets_1b_obj.is_none() ||
+      target_list_1b_obj.is_none() || ci_sel_obj.is_none() || T_out_obj.is_none()) {
+    throw std::invalid_argument("required array arguments must not be None");
+  }
+  if (threads <= 0 || threads > 1024) throw std::invalid_argument("threads must be in 1..1024");
+  if (nsel <= 0) return;
+  int norb = (int)drt.norb;
+  if (norb <= 0 || norb > 64) throw std::invalid_argument("norb must be in 1..64");
+
+  auto steps_dev           = cuda_array_view_from_object(steps_all_obj,         "steps_all");
+  auto nodes_dev           = cuda_array_view_from_object(nodes_all_obj,         "nodes_all");
+  auto occ_dev             = cuda_array_view_from_object(occ_all_obj,           "occ_all");
+  auto b_dev               = cuda_array_view_from_object(b_all_obj,             "b_all");
+  auto csf_to_bucket_dev   = cuda_array_view_from_object(csf_to_bucket_obj,     "csf_to_bucket");
+  auto tgt_off_1b_dev      = cuda_array_view_from_object(target_offsets_1b_obj, "target_offsets_1b");
+  auto tgt_lst_1b_dev      = cuda_array_view_from_object(target_list_1b_obj,    "target_list_1b");
+  auto ci_dev              = cuda_array_view_from_object(ci_sel_obj,            "ci_sel");
+  auto T_dev               = cuda_array_view_from_object(T_out_obj,             "T_out");
+
+  require_typestr(steps_dev,         "steps_all",         "|i1");
+  require_typestr(nodes_dev,         "nodes_all",         "<i4");
+  require_typestr(occ_dev,           "occ_all",           "|i1");
+  require_typestr(b_dev,             "b_all",             "<i2");
+  require_typestr(csf_to_bucket_dev, "csf_to_bucket",     "<i4");
+  require_typestr(tgt_off_1b_dev,    "target_offsets_1b", "<i4");
+  require_typestr(tgt_lst_1b_dev,    "target_list_1b",    "<i4");
+  require_typestr(ci_dev,            "ci_sel",            "<f8");
+  require_typestr(T_dev,             "T_out",             "<f8");
+
+  if (T_dev.read_only) throw std::invalid_argument("T_out must be writable");
+  if (ci_dev.shape.size() != 1 || (int)ci_dev.shape[0] < nsel)
+    throw std::invalid_argument("ci_sel must have length >= nsel");
+  int64_t T_required = (int64_t)norb * norb * nsel;
+  if (T_dev.shape.size() != 1 || T_dev.shape[0] < T_required)
+    throw std::invalid_argument("T_out must have length >= norb*norb*nsel");
+
+  uint64_t stream_u = stream;
+  if (stream_u == 0 && T_dev.stream) stream_u = T_dev.stream;
+  cudaStream_t stream_t = reinterpret_cast<cudaStream_t>(stream_u);
+
+  throw_on_cuda_error(
+      pairwise_T_matrix_bucketed_u64_launch_stream(
+          nsel, norb,
+          drt.child, drt.node_twos,
+          reinterpret_cast<const int8_t*>(steps_dev.ptr),
+          reinterpret_cast<const int32_t*>(nodes_dev.ptr),
+          reinterpret_cast<const int8_t*>(occ_dev.ptr),
+          reinterpret_cast<const int16_t*>(b_dev.ptr),
+          reinterpret_cast<const int32_t*>(csf_to_bucket_dev.ptr),
+          reinterpret_cast<const int32_t*>(tgt_off_1b_dev.ptr),
+          reinterpret_cast<const int32_t*>(tgt_lst_1b_dev.ptr),
+          reinterpret_cast<const double*>(ci_dev.ptr),
+          reinterpret_cast<double*>(T_dev.ptr),
+          stream_t, int(threads)),
+      "pairwise_T_matrix_bucketed_u64_launch_stream");
+  if (sync) {
+    throw_on_cuda_error(cudaStreamSynchronize(stream_t),
+                        "cudaStreamSynchronize(pairwise_T_matrix_bucketed)");
+  }
+}
+
+void pairwise_diag_bucketed_u64_inplace_device(
+    const DeviceDRT& drt,
+    uint64_t ncsf_u64,
+    py::object sel_idx_u64_obj,
+    int nsel,
+    py::object h_base_obj,
+    py::object eri4_obj,
+    py::object steps_all_obj,
+    py::object nodes_all_obj,
+    py::object occ_all_obj,
+    py::object b_all_obj,
+    py::object diag_obj,
+    py::object overflow_obj,
+    int threads,
+    uint64_t stream,
+    bool sync) {
+  if (sel_idx_u64_obj.is_none() || h_base_obj.is_none() || eri4_obj.is_none() ||
+      steps_all_obj.is_none() || nodes_all_obj.is_none() || occ_all_obj.is_none() ||
+      b_all_obj.is_none() || diag_obj.is_none() || overflow_obj.is_none()) {
+    throw std::invalid_argument("required array arguments must not be None");
+  }
+  if (threads <= 0 || threads > 1024) throw std::invalid_argument("threads must be in 1..1024");
+  if (nsel <= 0) return;
+  if (drt.norb <= 0 || drt.norb > 64) throw std::invalid_argument("norb must be in 1..64");
+
+  auto sel_dev = cuda_array_view_from_object(sel_idx_u64_obj, "sel_idx_u64");
+  auto h_base_dev = cuda_array_view_from_object(h_base_obj, "h_base");
+  auto eri4_dev = cuda_array_view_from_object(eri4_obj, "eri4");
+  auto steps_dev = cuda_array_view_from_object(steps_all_obj, "steps_all");
+  auto nodes_dev = cuda_array_view_from_object(nodes_all_obj, "nodes_all");
+  auto occ_dev = cuda_array_view_from_object(occ_all_obj, "occ_all");
+  auto b_dev = cuda_array_view_from_object(b_all_obj, "b_all");
+  auto diag_dev = cuda_array_view_from_object(diag_obj, "diag");
+  auto overflow_dev = cuda_array_view_from_object(overflow_obj, "overflow");
+
+  require_typestr(sel_dev, "sel_idx_u64", "<u8");
+  require_typestr(h_base_dev, "h_base", "<f8");
+  require_typestr(eri4_dev, "eri4", "<f8");
+  require_typestr(steps_dev, "steps_all", "|i1");
+  require_typestr(nodes_dev, "nodes_all", "<i4");
+  require_typestr(occ_dev, "occ_all", "|i1");
+  require_typestr(b_dev, "b_all", "<i2");
+  require_typestr(diag_dev, "diag", "<f8");
+  require_typestr(overflow_dev, "overflow", "<i4");
+
+  if (diag_dev.read_only) {
+    throw std::invalid_argument("diag must be writable");
+  }
+  if (sel_dev.shape.size() != 1 || sel_dev.shape[0] < (int64_t)nsel) {
+    throw std::invalid_argument("sel_idx_u64 length must be >= nsel");
+  }
+  int64_t nops = (int64_t)drt.norb * (int64_t)drt.norb;
+  if (h_base_dev.shape.size() != 1 || h_base_dev.shape[0] < nops) {
+    throw std::invalid_argument("h_base length must be >= norb*norb");
+  }
+  int64_t eri4_n = nops * nops;
+  if (eri4_dev.shape.size() != 1 || eri4_dev.shape[0] < eri4_n) {
+    throw std::invalid_argument("eri4 length must be >= norb^4");
+  }
+  if (diag_dev.shape.size() != 1 || diag_dev.shape[0] < (int64_t)nsel) {
+    throw std::invalid_argument("diag must have shape (nsel,)");
+  }
+  if (overflow_dev.shape.size() != 1 || overflow_dev.shape[0] != 1) {
+    throw std::invalid_argument("overflow must have shape (1,)");
+  }
+
+  uint64_t stream_u = stream;
+  if (stream_u == 0) {
+    if (diag_dev.stream) stream_u = diag_dev.stream;
+    else if (sel_dev.stream) stream_u = sel_dev.stream;
+  }
+  cudaStream_t stream_t = reinterpret_cast<cudaStream_t>(stream_u);
+
+  throw_on_cuda_error(
+      pairwise_diag_bucketed_u64_launch_stream(
+          reinterpret_cast<const uint64_t*>(sel_dev.ptr),
+          int(nsel),
+          int(drt.norb),
+          ncsf_u64,
+          reinterpret_cast<const double*>(h_base_dev.ptr),
+          reinterpret_cast<const double*>(eri4_dev.ptr),
+          drt.child,
+          drt.node_twos,
+          drt.child_prefix,
+          reinterpret_cast<const int8_t*>(steps_dev.ptr),
+          reinterpret_cast<const int32_t*>(nodes_dev.ptr),
+          reinterpret_cast<const int8_t*>(occ_dev.ptr),
+          reinterpret_cast<const int16_t*>(b_dev.ptr),
+          reinterpret_cast<double*>(diag_dev.ptr),
+          reinterpret_cast<int*>(overflow_dev.ptr),
+          stream_t,
+          int(threads)),
+      "pairwise_diag_bucketed_u64_launch_stream");
+  if (sync) {
+    throw_on_cuda_error(cudaStreamSynchronize(stream_t), "cudaStreamSynchronize(pairwise_diag_bucketed)");
   }
 }
 
@@ -23132,6 +24580,36 @@ PYBIND11_MODULE(_guga_cuda_ext, m) {
       py::arg("sync") = true);
 
   m.def(
+      "cas36_hb_screen_and_apply_many_roots_u64_inplace_device",
+      &cas36_hb_screen_and_apply_many_roots_u64_inplace_device,
+      py::arg("drt"),
+      py::arg("ncsf"),
+      py::arg("sel_idx_u64"),
+      py::arg("c_sel"),
+      py::arg("nsel"),
+      py::arg("h1_pq"),
+      py::arg("h1_abs"),
+      py::arg("h1_signed"),
+      py::arg("n_h1"),
+      py::arg("pq_ptr"),
+      py::arg("rs_idx"),
+      py::arg("v_abs"),
+      py::arg("v_signed"),
+      py::arg("pq_max_v"),
+      py::arg("eps"),
+      py::arg("hash_keys_u64"),
+      py::arg("hash_vals"),
+      py::arg("label_lo") = 0,
+      py::arg("label_hi") = std::numeric_limits<uint64_t>::max(),
+      py::arg("selected_idx_sorted_u64") = py::none(),
+      py::arg("target_mode") = 0,
+      py::arg("overflow"),
+      py::arg("sym_pq_allowed") = py::none(),
+      py::arg("threads") = 256,
+      py::arg("stream") = 0,
+      py::arg("sync") = true);
+
+  m.def(
       "cas36_hb_emit_tuples_u64_inplace_device",
       &cas36_hb_emit_tuples_u64_inplace_device,
       py::arg("drt"),
@@ -23216,12 +24694,92 @@ PYBIND11_MODULE(_guga_cuda_ext, m) {
       py::arg("sync") = true);
 
   m.def(
+      "cas36_exact_selected_build_rowhash_dense_u64_inplace_device",
+      &cas36_exact_selected_build_rowhash_dense_u64_inplace_device,
+      py::arg("drt"),
+      py::arg("ncsf"),
+      py::arg("sel_idx_u64"),
+      py::arg("c_bound"),
+      py::arg("nsel"),
+      py::arg("h_base"),
+      py::arg("eri4"),
+      py::arg("row_hash_keys"),
+      py::arg("row_hash_vals"),
+      py::arg("row_cap"),
+      py::arg("membership_hash_keys") = py::none(),
+      py::arg("membership_hash_cap") = 0,
+      py::arg("out_diag") = py::none(),
+      py::arg("overflow"),
+      py::arg("threads") = 256,
+      py::arg("stream") = 0,
+      py::arg("sync") = true);
+
+  m.def(
       "cas36_sci_build_membership_hash_u64_inplace_device",
       &cas36_sci_build_membership_hash_u64_inplace_device,
       py::arg("sorted_keys"),
       py::arg("nkeys"),
       py::arg("hash_keys"),
       py::arg("cap"),
+      py::arg("stream") = 0,
+      py::arg("sync") = true);
+
+  m.def(
+      "cas36_exact_external_emit_tuples_dense_u64_inplace_device",
+      &cas36_exact_external_emit_tuples_dense_u64_inplace_device,
+      py::arg("drt"),
+      py::arg("ncsf"),
+      py::arg("sel_idx_u64"),
+      py::arg("c_bound"),
+      py::arg("nsel"),
+      py::arg("h_base"),
+      py::arg("eri4"),
+      py::arg("out_keys_u64"),
+      py::arg("out_src"),
+      py::arg("out_hij"),
+      py::arg("cap"),
+      py::arg("label_lo") = 0,
+      py::arg("label_hi"),
+      py::arg("membership_hash_keys"),
+      py::arg("membership_hash_cap") = 0,
+      py::arg("out_n"),
+      py::arg("overflow"),
+      py::arg("threads") = 256,
+      py::arg("stream") = 0,
+      py::arg("sync") = true);
+
+  m.def(
+      "cas36_exact_external_apply_dense_many_roots_u64_inplace_device",
+      &cas36_exact_external_apply_dense_many_roots_u64_inplace_device,
+      py::arg("drt"),
+      py::arg("ncsf"),
+      py::arg("sel_idx_u64"),
+      py::arg("c_sel"),
+      py::arg("nsel"),
+      py::arg("h_base"),
+      py::arg("eri4"),
+      py::arg("hash_keys_u64"),
+      py::arg("hash_vals"),
+      py::arg("cap"),
+      py::arg("label_lo") = 0,
+      py::arg("label_hi"),
+      py::arg("membership_hash_keys"),
+      py::arg("membership_hash_cap") = 0,
+      py::arg("overflow"),
+      py::arg("threads") = 256,
+      py::arg("stream") = 0,
+      py::arg("sync") = true);
+
+  m.def(
+      "cas36_sym_row_graph_spmm_inplace_device",
+      &cas36_sym_row_graph_spmm_inplace_device,
+      py::arg("row_ptr"),
+      py::arg("col_idx"),
+      py::arg("hij"),
+      py::arg("diag"),
+      py::arg("x"),
+      py::arg("y"),
+      py::arg("threads") = 256,
       py::arg("stream") = 0,
       py::arg("sync") = true);
 
@@ -23273,11 +24831,153 @@ PYBIND11_MODULE(_guga_cuda_ext, m) {
       py::arg("nodes_all"),
       py::arg("occ_all"),
       py::arg("b_all"),
+      py::arg("occ_keys_sorted"),
+      py::arg("bucket_keys"),
+      py::arg("bucket_starts"),
+      py::arg("bucket_sizes"),
+      py::arg("neighbor_offsets"),
+      py::arg("neighbor_list"),
       py::arg("csf_to_bucket"),
       py::arg("target_offsets"),
       py::arg("target_list"),
+      py::arg("target_offsets_1b"),
+      py::arg("target_list_1b"),
+      py::arg("use_bucket_filter_phase2"),
       py::arg("H_out"),
       py::arg("overflow"),
+      py::arg("threads") = 256,
+      py::arg("stream") = 0,
+      py::arg("sync") = true);
+  m.def(
+      "pairwise_diag_bucketed_u64_inplace_device",
+      &pairwise_diag_bucketed_u64_inplace_device,
+      py::arg("drt"),
+      py::arg("ncsf"),
+      py::arg("sel_idx_u64"),
+      py::arg("nsel"),
+      py::arg("h_base"),
+      py::arg("eri4"),
+      py::arg("steps_all"),
+      py::arg("nodes_all"),
+      py::arg("occ_all"),
+      py::arg("b_all"),
+      py::arg("diag"),
+      py::arg("overflow"),
+      py::arg("threads") = 256,
+      py::arg("stream") = 0,
+      py::arg("sync") = true);
+  m.def(
+      "pairwise_count_bucketed_u64_inplace_device",
+      &pairwise_count_bucketed_u64_inplace_device,
+      py::arg("drt"),
+      py::arg("ncsf"),
+      py::arg("sel_idx_u64"),
+      py::arg("nsel"),
+      py::arg("h_base"),
+      py::arg("eri4"),
+      py::arg("steps_all"),
+      py::arg("nodes_all"),
+      py::arg("occ_all"),
+      py::arg("b_all"),
+      py::arg("occ_keys_sorted"),
+      py::arg("bucket_keys"),
+      py::arg("bucket_starts"),
+      py::arg("bucket_sizes"),
+      py::arg("neighbor_offsets"),
+      py::arg("neighbor_list"),
+      py::arg("csf_to_bucket"),
+      py::arg("target_offsets"),
+      py::arg("target_list"),
+      py::arg("target_offsets_1b"),
+      py::arg("target_list_1b"),
+      py::arg("table_cap"),
+      py::arg("workspace_keys"),
+      py::arg("workspace_vals"),
+      py::arg("grid_blocks"),
+      py::arg("row_counts"),
+      py::arg("diag_out"),
+      py::arg("overflow"),
+      py::arg("threads") = 256,
+      py::arg("stream") = 0,
+      py::arg("sync") = true);
+  m.def(
+      "pairwise_fill_bucketed_u64_inplace_device",
+      &pairwise_fill_bucketed_u64_inplace_device,
+      py::arg("drt"),
+      py::arg("ncsf"),
+      py::arg("sel_idx_u64"),
+      py::arg("nsel"),
+      py::arg("h_base"),
+      py::arg("eri4"),
+      py::arg("steps_all"),
+      py::arg("nodes_all"),
+      py::arg("occ_all"),
+      py::arg("b_all"),
+      py::arg("occ_keys_sorted"),
+      py::arg("bucket_keys"),
+      py::arg("bucket_starts"),
+      py::arg("bucket_sizes"),
+      py::arg("neighbor_offsets"),
+      py::arg("neighbor_list"),
+      py::arg("csf_to_bucket"),
+      py::arg("target_offsets"),
+      py::arg("target_list"),
+      py::arg("target_offsets_1b"),
+      py::arg("target_list_1b"),
+      py::arg("table_cap"),
+      py::arg("workspace_keys"),
+      py::arg("workspace_vals"),
+      py::arg("grid_blocks"),
+      py::arg("row_offsets"),
+      py::arg("row_counts"),
+      py::arg("out_target_local"),
+      py::arg("out_src_pos"),
+      py::arg("out_hij"),
+      py::arg("diag_out"),
+      py::arg("overflow"),
+      py::arg("threads") = 256,
+      py::arg("stream") = 0,
+      py::arg("sync") = true);
+  m.def(
+      "pairwise_sigma_bucketed_u64_inplace_device",
+      &pairwise_sigma_bucketed_u64_inplace_device,
+      py::arg("drt"),
+      py::arg("ncsf"),
+      py::arg("sel_idx_u64"),
+      py::arg("nsel"),
+      py::arg("h_base"),
+      py::arg("eri4"),
+      py::arg("steps_all"),
+      py::arg("nodes_all"),
+      py::arg("occ_all"),
+      py::arg("b_all"),
+      py::arg("occ_keys_sorted"),
+      py::arg("csf_to_bucket"),
+      py::arg("target_offsets"),
+      py::arg("target_list"),
+      py::arg("target_offsets_1b"),
+      py::arg("target_list_1b"),
+      py::arg("x"),
+      py::arg("y"),
+      py::arg("overflow"),
+      py::arg("threads") = 256,
+      py::arg("stream") = 0,
+      py::arg("sync") = true);
+
+  m.def(
+      "pairwise_T_matrix_bucketed_u64_inplace_device",
+      &pairwise_T_matrix_bucketed_u64_inplace_device,
+      py::arg("drt"),
+      py::arg("steps_all"),
+      py::arg("nodes_all"),
+      py::arg("occ_all"),
+      py::arg("b_all"),
+      py::arg("csf_to_bucket"),
+      py::arg("target_offsets_1b"),
+      py::arg("target_list_1b"),
+      py::arg("ci_sel"),
+      py::arg("T_out"),
+      py::arg("nsel"),
       py::arg("threads") = 256,
       py::arg("stream") = 0,
       py::arg("sync") = true);

@@ -902,16 +902,35 @@ inline void bind_mixed_precision_eri(
         };
 
         switch (precision_mode) {
-          case 0: call_f64(launch_fp64); break;
-          case 1: call_f32(launch_f32); break;
-          case 2: call_f64(launch_mixed); break;
-          case 3: call_f32(launch_mixed_f32); break;
+          case 0:
+            call_f64(launch_fp64);
+            break;
+          case 1:
+            if (!launch_f32) {
+              throw std::invalid_argument("precision_mode=1 (f32 out) unsupported for this ERI class");
+            }
+            call_f32(launch_f32);
+            break;
+          case 2:
+            call_f64(launch_mixed ? launch_mixed : launch_fp64);
+            break;
+          case 3:
+            if (!(launch_mixed_f32 || launch_f32)) {
+              throw std::invalid_argument("precision_mode=3 (mixed_f32 out) unsupported for this ERI class");
+            }
+            call_f32(launch_mixed_f32 ? launch_mixed_f32 : launch_f32);
+            break;
           case 6:
-            // Fall back to mixed (mode 2) if f32accum not available for this class.
-            call_f64(launch_f32accum ? launch_f32accum : launch_mixed); break;
+            // Fall back in order: f32accum -> mixed -> fp64.
+            call_f64(launch_f32accum ? launch_f32accum : (launch_mixed ? launch_mixed : launch_fp64));
+            break;
           case 7:
-            // Fall back to mixed_f32 (mode 3) if f32accum_f32 not available for this class.
-            call_f32(launch_f32accum_f32 ? launch_f32accum_f32 : launch_mixed_f32); break;
+            // Fall back in order: f32accum_f32 -> mixed_f32 -> f32.
+            if (!(launch_f32accum_f32 || launch_mixed_f32 || launch_f32)) {
+              throw std::invalid_argument("precision_mode=7 (f32accum_f32 out) unsupported for this ERI class");
+            }
+            call_f32(launch_f32accum_f32 ? launch_f32accum_f32 : (launch_mixed_f32 ? launch_mixed_f32 : launch_f32));
+            break;
           default:
             throw std::invalid_argument("precision_mode must be 0-3 or 6-7");
         }

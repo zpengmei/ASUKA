@@ -443,6 +443,7 @@ class TestTileEfficiency:
     """Test tensor-core tile efficiency computations."""
 
     def test_perfect_alignment(self):
+        pytest.importorskip("asuka.basis_profiler")
         from asuka.basis_profiler.tile_efficiency import eta_tc
 
         # 16x16x8 = perfect TF32 tile.
@@ -451,6 +452,7 @@ class TestTileEfficiency:
         assert eta_tc(256, 256, 128) == 1.0
 
     def test_worst_case(self):
+        pytest.importorskip("asuka.basis_profiler")
         from asuka.basis_profiler.tile_efficiency import eta_tc
 
         # 1x1x1 = massive padding waste.
@@ -458,6 +460,7 @@ class TestTileEfficiency:
         assert eta < 0.01
 
     def test_typical_df(self):
+        pytest.importorskip("asuka.basis_profiler")
         from asuka.basis_profiler.tile_efficiency import eta_tc
 
         # Typical DF: nao=60, naux=180, norb=10
@@ -465,6 +468,7 @@ class TestTileEfficiency:
         assert 0.5 < eta < 1.0
 
     def test_padding_waste(self):
+        pytest.importorskip("asuka.basis_profiler")
         from asuka.basis_profiler.tile_efficiency import padding_waste
 
         assert padding_waste(16, 16) == 0

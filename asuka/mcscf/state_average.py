@@ -56,25 +56,43 @@ def normalize_weights(weights: Sequence[float] | None, *, nroots: int) -> np.nda
     return np.asarray(w / s, dtype=np.float64)
 
 
+def _is_dmrg_state(obj: Any) -> bool:
+    """Check if *obj* is a DMRG opaque state (without importing dmrg)."""
+    cls_name = type(obj).__name__
+    return cls_name in ("DMRGState", "DMRGStateBundle")
+
+
 def ci_as_list(ci: Any, *, nroots: int) -> list[Any]:
-    """Canonicalize a multiroot CI container to a list of 1D float64 arrays.
+    """Canonicalize a multiroot CI container to a list of CI objects.
+
+    For GUGA/FCI: returns list of 1D float64 arrays.
+    For DMRG: returns list of DMRGState objects (opaque).
 
     Parameters
     ----------
     ci : Any
-        Input CI vector(s). Can be list, tuple, or array.
+        Input CI vector(s). Can be list, tuple, array, DMRGState, or DMRGStateBundle.
     nroots : int
         Number of roots expected.
 
     Returns
     -------
-    list[np.ndarray]
-        List of 1D CI vectors.
+    list[Any]
+        List of CI vectors (numpy arrays) or DMRGState objects.
     """
 
     nroots = int(nroots)
     if nroots < 1:
         raise ValueError("nroots must be >= 1")
+
+    # DMRG opaque states: pass through without array conversion
+    if _is_dmrg_state(ci):
+        if type(ci).__name__ == "DMRGStateBundle":
+            return list(ci.states)
+        return [ci]
+
+    if isinstance(ci, (list, tuple)) and len(ci) > 0 and _is_dmrg_state(ci[0]):
+        return list(ci)
 
     def _xp_for(obj: Any):
         if cp is not None and isinstance(obj, cp.ndarray):  # type: ignore[attr-defined]
@@ -130,7 +148,10 @@ def match_roots_by_overlap(prev: list[np.ndarray], cur: list[np.ndarray]) -> np.
     for i in range(n):
         pi = prev[i]
         for j in range(n):
-            O[i, j] = abs(float(np.dot(pi, cur[j])))
+            if _is_dmrg_state(pi):
+                O[i, j] = abs(float(pi.overlap(cur[j])))
+            else:
+                O[i, j] = abs(float(np.dot(pi, cur[j])))
 
     try:
         from scipy.optimize import linear_sum_assignment  # type: ignore[import-not-found]  # noqa: PLC0415
@@ -174,9 +195,14 @@ def fix_ci_phases(prev: list[np.ndarray], cur: list[np.ndarray]) -> None:
     if len(prev) != len(cur):
         raise ValueError("prev/cur root count mismatch")
     for i in range(len(prev)):
-        ov = float(np.dot(prev[i], cur[i]))
-        if ov < 0.0:
-            cur[i] *= -1.0
+        if _is_dmrg_state(prev[i]):
+            ov = float(prev[i].overlap(cur[i]))
+            if ov < 0.0:
+                cur[i].flip_global_phase()
+        else:
+            ov = float(np.dot(prev[i], cur[i]))
+            if ov < 0.0:
+                cur[i] *= -1.0
 
 
 def make_state_averaged_rdms(

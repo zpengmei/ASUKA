@@ -440,6 +440,150 @@ def spinfree_rassi_h_s_pair_biorth(
     )
 
 
+def spinfree_rassi_overlap_pair_biorth_csf(
+    bra: SpinFreeCASSCFStateCSF,
+    ket: SpinFreeCASSCFStateCSF,
+    *,
+    s_ao: np.ndarray,
+    biorth_tol: float = 1e-12,
+    ci_transform_tol: float = 1e-14,
+) -> float:
+    """Compute only the RASSI-style overlap S_ij for two CSF/GUGA states (biorth orbitals).
+
+    This is the "S" part of :func:`spinfree_rassi_h_s_pair_biorth_csf`, but avoids
+    requiring one- and two-electron integrals (h1/eri) and avoids building transition RDMs.
+
+    Intended use
+    ------------
+    Cross-geometry wavefunction overlap (e.g. for trajectory/root tracking), where the AO
+    overlap ``s_ao`` is the *cross-geometry* AO overlap matrix S_cross between the two
+    geometries.
+
+    Notes
+    -----
+    - ``s_ao`` must be compatible with the AO bases used to define ``bra.mo_*`` and
+      ``ket.mo_*``. For different geometries this is *not* the within-geometry AO overlap;
+      it must be the cross-geometry overlap ⟨χ(R_bra)|χ(R_ket)⟩.
+    - The returned scalar corresponds to Molcas RASSI-style biorthonormalization plus
+      active CI transformation (CITRA/SSOTRA analogue) in C1 symmetry.
+    - Core and active subspaces are biorthonormalized separately to avoid non-physical
+      CI transforms when there is cross-overlap between core and active orbitals across
+      geometries.
+    """
+
+    if int(bra.twos) != int(ket.twos):
+        return 0.0
+
+    neleca, nelecb = _unpack_nelecas(bra.nelecas, twos=int(bra.twos))
+    if (neleca, nelecb) != _unpack_nelecas(ket.nelecas, twos=int(ket.twos)):
+        return 0.0
+
+    if bra.drt.norb != ket.drt.norb or bra.drt.nelec != ket.drt.nelec or bra.drt.twos_target != ket.drt.twos_target:
+        raise ValueError("bra/ket DRT mismatch")
+
+    ncas = int(bra.drt.norb)
+    if ncas <= 0:
+        raise ValueError("ncas must be positive")
+
+    mo_core_bra = np.asarray(bra.mo_core, dtype=np.float64)
+    mo_core_ket = np.asarray(ket.mo_core, dtype=np.float64)
+    mo_act_bra = np.asarray(bra.mo_act, dtype=np.float64)
+    mo_act_ket = np.asarray(ket.mo_act, dtype=np.float64)
+
+    if mo_core_bra.shape != mo_core_ket.shape:
+        raise ValueError("bra/ket mo_core shapes mismatch")
+    if mo_act_bra.shape != mo_act_ket.shape:
+        raise ValueError("bra/ket mo_act shapes mismatch")
+    if mo_act_bra.shape[1] != ncas:
+        raise ValueError("mo_act must have ncas columns matching drt.norb")
+    if mo_core_bra.shape[0] != mo_act_bra.shape[0]:
+        raise ValueError("mo_core and mo_act must have the same number of rows (AOs)")
+
+    ncore = int(mo_core_bra.shape[1])
+
+    s_ao = np.asarray(s_ao, dtype=np.float64)
+    nao = int(mo_act_bra.shape[0])
+    if s_ao.ndim != 2 or s_ao.shape[0] != s_ao.shape[1] or int(s_ao.shape[0]) != nao:
+        raise ValueError("s_ao must be a square AO overlap matrix compatible with the MO coefficients")
+
+    # Biorthonormalize core and active subspaces separately.
+    # IMPORTANT: do *not* biorthonormalize core+active together and then take sub-blocks.
+    # The occupied-space biorth transform is generally NOT block-diagonal in (core|active)
+    # if there is any cross overlap between core and active orbitals across geometries.
+    # Mixing them can lead to non-physical CI transforms and spuriously low cross-geometry
+    # overlaps. Instead, biorthonormalize separately and combine via determinant scaling.
+
+    def _biorth_x_from_overlap(o: np.ndarray, *, tol: float) -> tuple[np.ndarray, np.ndarray]:
+        """Return (x_bra, x_ket) such that x_bra.T @ o @ x_ket == I."""
+        o = np.asarray(o, dtype=np.float64)
+        n = int(o.shape[0])
+        if n == 0:
+            z = np.zeros((0, 0), dtype=np.float64)
+            return z, z
+        try:
+            l, u = _lu_nopivot(o, tol=float(tol))
+            inv_l = np.linalg.solve(l, np.eye(n, dtype=np.float64))
+            inv_u = np.linalg.solve(u, np.eye(n, dtype=np.float64))
+            return inv_l.T, inv_u
+        except Exception:
+            return _biorth_svd(o, tol=float(tol))
+
+    if ncore:
+        o_core = mo_core_bra.T @ s_ao @ mo_core_ket
+        x_core_bra, x_core_ket = _biorth_x_from_overlap(o_core, tol=float(biorth_tol))
+        det_core_bra = float(np.linalg.det(x_core_bra))
+        det_core_ket = float(np.linalg.det(x_core_ket))
+        core_scale_bra = det_core_bra ** (-2)
+        core_scale_ket = det_core_ket ** (-2)
+    else:
+        core_scale_bra = 1.0
+        core_scale_ket = 1.0
+
+    o_act = mo_act_bra.T @ s_ao @ mo_act_ket
+    x_act_bra, x_act_ket = _biorth_x_from_overlap(o_act, tol=float(biorth_tol))
+
+    tra_act_bra = np.linalg.inv(x_act_bra)
+    tra_act_ket = np.linalg.inv(x_act_ket)
+
+    ci_bra_bi = transform_csf_ci_for_orbital_transform(bra.drt, bra.ci, tra_act_bra, tol=float(ci_transform_tol))
+    ci_ket_bi = transform_csf_ci_for_orbital_transform(ket.drt, ket.ci, tra_act_ket, tol=float(ci_transform_tol))
+    ci_bra_bi = np.asarray(ci_bra_bi, dtype=np.float64, order="C") * float(core_scale_bra)
+    ci_ket_bi = np.asarray(ci_ket_bi, dtype=np.float64, order="C") * float(core_scale_ket)
+
+    return float(np.dot(ci_bra_bi, ci_ket_bi))
+
+
+def build_spinfree_overlap_matrix_biorth_csf(
+    bra_states: list[SpinFreeCASSCFStateCSF],
+    ket_states: list[SpinFreeCASSCFStateCSF],
+    *,
+    s_ao: np.ndarray,
+    biorth_tol: float = 1e-12,
+    ci_transform_tol: float = 1e-14,
+) -> np.ndarray:
+    """Build an overlap matrix S_ij between two state sets using biorthonormal orbitals.
+
+    Returns
+    -------
+    np.ndarray
+        Overlap matrix with shape ``(len(bra_states), len(ket_states))``.
+    """
+
+    nb = int(len(bra_states))
+    nk = int(len(ket_states))
+    s = np.zeros((nb, nk), dtype=np.float64)
+    for i in range(nb):
+        for j in range(nk):
+            s[i, j] = spinfree_rassi_overlap_pair_biorth_csf(
+                bra_states[i],
+                ket_states[j],
+                s_ao=s_ao,
+                biorth_tol=float(biorth_tol),
+                ci_transform_tol=float(ci_transform_tol),
+            )
+    return s
+
+
 def spinfree_rassi_h_s_pair_biorth_csf(
     bra: SpinFreeCASSCFStateCSF,
     ket: SpinFreeCASSCFStateCSF,

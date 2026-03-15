@@ -151,9 +151,8 @@ def _transform_df_for_scf(
     df_layout: str = "mnQ",
 ):
     if bool(mol.cart):
-        return apply_sph_transform(mol, int1e, B, ao_basis, df_B_layout=str(df_layout))
-    int1e_scf, _B_unused, sph_map = apply_sph_transform(mol, int1e, None, ao_basis, df_B_layout=str(df_layout))
-    return int1e_scf, B, sph_map
+        return int1e, B, None
+    return apply_sph_transform(mol, int1e, B, ao_basis, df_B_layout=str(df_layout))
 
 
 def _prepare_df_gpu_problem(

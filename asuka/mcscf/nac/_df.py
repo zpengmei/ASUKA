@@ -14,6 +14,8 @@ Current scope:
 """
 
 from contextlib import contextmanager
+import copy
+import time
 from typing import Any, Callable, Literal, Sequence
 import os
 import warnings
@@ -58,6 +60,26 @@ from asuka.mcscf import newton_casscf as _newton_casscf
 from asuka.mcscf.state_average import ci_as_list, make_state_averaged_rdms, normalize_weights
 from asuka.mcscf.zvector import build_mcscf_hessian_operator, solve_mcscf_zvector, _project_sa_ci_components
 from asuka.solver import GUGAFCISolver
+
+
+_LAST_NACV_TIMING: dict[str, Any] | None = None
+
+
+def _set_last_nacv_timing(payload: dict[str, Any] | None) -> None:
+    global _LAST_NACV_TIMING
+    if payload is None:
+        _LAST_NACV_TIMING = None
+    else:
+        _LAST_NACV_TIMING = copy.deepcopy(payload)
+
+
+def get_last_nacv_timing(*, clear: bool = False) -> dict[str, Any] | None:
+    """Return a deep-copied timing payload from the latest DF NAC call."""
+    global _LAST_NACV_TIMING
+    out = copy.deepcopy(_LAST_NACV_TIMING)
+    if clear:
+        _LAST_NACV_TIMING = None
+    return out
 
 
 def _asnumpy_f64(a: Any) -> np.ndarray:
@@ -1589,6 +1611,15 @@ def sacasscf_nonadiabatic_couplings_df(
         Z-vector linear solve controls.
     """
 
+    t_total_start = time.perf_counter()
+    t_setup_start = t_total_start
+    timing_payload: dict[str, Any] = {
+        "status": "running",
+        "response_term_input": str(response_term),
+        "timings_s": {},
+        "pair_timings_s": [],
+    }
+
     mol = getattr(scf_out, "mol", None)
     if mol is None:
         raise TypeError("scf_out must have a .mol attribute")
@@ -1616,7 +1647,18 @@ def sacasscf_nonadiabatic_couplings_df(
         ci_list = ci_as_list(ci_raw, nroots=nroots)
 
     if nroots <= 1:
-        return np.zeros((nroots, nroots, len(atmlst_use), 3), dtype=np.float64)
+        out = np.zeros((nroots, nroots, len(atmlst_use), 3), dtype=np.float64)
+        timing_payload.update(
+            {
+                "status": "ok",
+                "nroots": int(nroots),
+                "natm": int(natm),
+                "nac_shape": [int(x) for x in out.shape],
+                "timings_s": {"total": float(time.perf_counter() - t_total_start)},
+            }
+        )
+        _set_last_nacv_timing(timing_payload)
+        return out
 
     weights_in = getattr(casscf, "root_weights", None)
     if weights_in is None:
@@ -1705,9 +1747,25 @@ def sacasscf_nonadiabatic_couplings_df(
     fd_delta = float(delta_bohr)
     if fd_delta <= 0.0:
         raise ValueError("delta_bohr must be > 0")
+    timing_payload.update(
+        {
+            "response_term": str(response),
+            "natm": int(natm),
+            "nroots": int(nroots),
+            "ncore": int(ncore),
+            "ncas": int(ncas),
+            "atmlst_len": int(len(atmlst_use)),
+            "df_backend": str(df_backend),
+            "df_threads": int(df_threads),
+            "use_etfs": bool(use_etfs),
+            "mult_ediff": bool(mult_ediff),
+        }
+    )
+    timing_payload["timings_s"]["setup_pre_fd"] = float(time.perf_counter() - t_setup_start)
 
     dg = None
     if response == "fd_jacobian":
+        t_fd_jacobian_start = time.perf_counter()
         # FD Jacobian of SA stationarity conditions w.r.t nuclear coordinates.
         delta = float(fd_delta)
 
@@ -1809,6 +1867,9 @@ def sacasscf_nonadiabatic_couplings_df(
                 g_m2 = _g_at(mol_m2)
 
                 dg[int(ia), int(ax)] = (-g_p2 + 8.0 * g_p1 - 8.0 * g_m1 + g_m2) / (12.0 * delta)
+        timing_payload["timings_s"]["fd_jacobian_build"] = float(time.perf_counter() - t_fd_jacobian_start)
+    else:
+        timing_payload["timings_s"]["fd_jacobian_build"] = 0.0
 
     # Output tensor
     nac = np.zeros((nroots, nroots, len(atmlst_use), 3), dtype=np.float64)
@@ -1826,6 +1887,7 @@ def sacasscf_nonadiabatic_couplings_df(
         pair_list = [(bra, ket) for bra in range(nroots) for ket in range(nroots) if ket != bra]
     else:
         pair_list = [(int(bra), int(ket)) for (bra, ket) in pairs if int(ket) != int(bra)]
+    timing_payload["pair_count"] = int(len(pair_list))
 
     # Cache AO mappings used by the CSF term.
     shell_atom_ref = shell_to_atom_map(ao_basis_ref, atom_coords_bohr=coords)
@@ -1841,10 +1903,17 @@ def sacasscf_nonadiabatic_couplings_df(
             nelecas=nelecas,
         )
 
+    timing_payload["timings_s"]["setup_total"] = float(time.perf_counter() - t_setup_start)
+    t_pair_loop_start = time.perf_counter()
+    pair_timings: list[dict] = []
+
     for bra, ket in pair_list:
         bra, ket = _unpack_state((bra, ket))
         if ket == bra:
             continue
+
+        t_pair_start = time.perf_counter()
+        pair_timing: dict = {"bra": bra, "ket": ket}
 
         ediff = float(e_states[bra] - e_states[ket])
 
@@ -1855,6 +1924,8 @@ def sacasscf_nonadiabatic_couplings_df(
         dm2_t = 0.5 * (
             np.asarray(dm2_t, dtype=np.float64) + np.asarray(dm2_t, dtype=np.float64).transpose(1, 0, 3, 2)
         )
+        pair_timing["trans_rdm"] = float(time.perf_counter() - t_pair_start)
+        t0 = time.perf_counter()
 
         # Hamiltonian response term (<bra|dH/dR|ket> without nuclear term)
         ham = _grad_elec_active_df(
@@ -1870,6 +1941,8 @@ def sacasscf_nonadiabatic_couplings_df(
             df_grad_ctx=df_grad_ctx,
             fd_delta_bohr=float(fd_delta),
         )
+        pair_timing["ham_response"] = float(time.perf_counter() - t0)
+        t0 = time.perf_counter()
 
         # CSF / AO-overlap term (numerator form).
         if not bool(use_etfs):
@@ -1894,6 +1967,8 @@ def sacasscf_nonadiabatic_couplings_df(
                     shell_atom=shell_atom_ref,
                 )
             ham = np.asarray(ham, dtype=np.float64) + np.asarray(nac_csf * ediff, dtype=np.float64)
+        pair_timing["csf_term"] = float(time.perf_counter() - t0)
+        t0 = time.perf_counter()
 
         # Pair-specific Z-vector RHS in SA parameter space.
         fcisolver_fixed = _FixedRDMFcisolver(fcisolver_use, dm1=dm1_t, dm2=dm2_t)
@@ -1962,6 +2037,8 @@ def sacasscf_nonadiabatic_couplings_df(
         Lvec = np.asarray(z.z_packed, dtype=np.float64).ravel()
         if int(Lvec.size) != int(hess_op.n_tot):
             raise RuntimeError("unexpected Z-vector packed length")
+        pair_timing["zvector_solve"] = float(time.perf_counter() - t0)
+        t0 = time.perf_counter()
 
         resp_full = np.zeros((natm, 3), dtype=np.float64)
         if response == "fd_jacobian":
@@ -1970,6 +2047,10 @@ def sacasscf_nonadiabatic_couplings_df(
             for ia in atmlst_use:
                 for ax in range(3):
                     resp_full[int(ia), int(ax)] = float(np.dot(Lvec, dg[int(ia), int(ax)]))
+            pair_timing["response_assemble"] = 0.0
+            pair_timing["response_unpack"] = 0.0
+            pair_timing["response_ci_rdm"] = 0.0
+            pair_timing["response_lorb"] = float(time.perf_counter() - t0)
         else:
             # PySCF-style split response: Lci_dot_dgci + Lorb_dot_dgorb.
             n_orb = int(hess_op.n_orb)
@@ -1998,6 +2079,8 @@ def sacasscf_nonadiabatic_couplings_df(
                 dm2_r = np.asarray(dm2_r, dtype=np.float64)
                 dm1_lci += wr * (dm1_r + dm1_r.T)
                 dm2_lci += wr * (dm2_r + dm2_r.transpose(1, 0, 3, 2))
+            pair_timing["response_ci_rdm"] = float(time.perf_counter() - t0)
+            t0 = time.perf_counter()
 
             de_lci = _grad_elec_active_df(
                 scf_out=scf_out,
@@ -2012,6 +2095,8 @@ def sacasscf_nonadiabatic_couplings_df(
                 df_grad_ctx=df_grad_ctx,
                 fd_delta_bohr=float(fd_delta),
             )
+            pair_timing["response_assemble"] = float(time.perf_counter() - t0)
+            t0 = time.perf_counter()
 
             if dm1_sa is None or dm2_sa is None:  # pragma: no cover
                 raise RuntimeError("internal error: missing SA RDMs for split_orbfd response")
@@ -2033,6 +2118,8 @@ def sacasscf_nonadiabatic_couplings_df(
                 df_grad_ctx=df_grad_ctx,
                 fd_delta_bohr=float(fd_delta),
             )
+            pair_timing["response_lorb"] = float(time.perf_counter() - t0)
+            pair_timing["response_unpack"] = 0.0
 
             resp_full = np.asarray(de_lci, dtype=np.float64) + np.asarray(de_lorb, dtype=np.float64)
 
@@ -2047,8 +2134,26 @@ def sacasscf_nonadiabatic_couplings_df(
             nac_num = nac_num / ediff
 
         nac[bra, ket] = np.asarray(nac_num, dtype=np.float64)
+        pair_timing["total"] = float(time.perf_counter() - t_pair_start)
+        pair_timings.append(copy.copy(pair_timing))
 
+    # Post-loop timing aggregation
+    timing_payload["timings_s"]["pair_loop_total"] = float(time.perf_counter() - t_pair_loop_start)
+    timing_payload["timings_s"]["total"] = float(time.perf_counter() - t_total_start)
+
+    if pair_timings:
+        stage_keys = [k for k in pair_timings[0] if k not in ("bra", "ket")]
+        pair_stage_totals_s = {k: sum(pt.get(k, 0.0) for pt in pair_timings) for k in stage_keys}
+        pair_stage_max_s = {k: max(pt.get(k, 0.0) for pt in pair_timings) for k in stage_keys}
+        slowest_pair = max(pair_timings, key=lambda pt: float(pt.get("total", 0.0)))
+        timing_payload["pair_stage_totals_s"] = pair_stage_totals_s
+        timing_payload["pair_stage_max_s"] = pair_stage_max_s
+        timing_payload["slowest_pair"] = {"bra": slowest_pair["bra"], "ket": slowest_pair["ket"],
+                                           "total_s": float(slowest_pair.get("total", 0.0))}
+    timing_payload["per_pair_timings"] = pair_timings
+
+    _set_last_nacv_timing(timing_payload)
     return nac
 
 
-__all__ = ["sacasscf_nonadiabatic_couplings_df"]
+__all__ = ["sacasscf_nonadiabatic_couplings_df", "get_last_nacv_timing"]

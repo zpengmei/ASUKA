@@ -3915,3 +3915,157 @@ extern "C" cudaError_t pairwise_sigma_bucketed_u64_launch_stream(
 
   return cudaGetLastError();
 }
+
+// ---------------------------------------------------------------------------
+// T-matrix kernel: computes T[pq, i] = sum_j E_pq[i,j] * c[j]
+// for all orbital pairs (p,q) and all selected CSFs i, using the same
+// bucketed occupation-key approach as the sigma kernel (Phase 1 only).
+// No h_base or eri4 needed — raw GUGA coupling coefficients only.
+// ---------------------------------------------------------------------------
+template <int MAX_NORB_T>
+__global__ void pairwise_T_matrix_bucketed_u64_kernel(
+    int nsel,
+    int norb,
+    const int32_t* __restrict__ child_table,
+    const int16_t* __restrict__ node_twos,
+    const int8_t*  __restrict__ steps_all,         // [nsel, norb] sorted by occ key
+    const int32_t* __restrict__ nodes_all,         // [nsel, norb+1] sorted
+    const int8_t*  __restrict__ occ_all,           // [nsel, norb] sorted
+    const int16_t* __restrict__ b_all,             // [nsel, norb] sorted
+    const int32_t* __restrict__ csf_to_bucket,     // [nsel]
+    const int32_t* __restrict__ target_offsets_1b, // [nbuckets+1]
+    const int32_t* __restrict__ target_list_1b,    // [total_targets_1b]
+    const double*  __restrict__ ci_sel,            // [nsel] CI coefficients (sorted)
+    double*        __restrict__ T_out) {            // [norb*norb, nsel] output
+
+  int j_local = blockIdx.x;
+  if (j_local >= nsel || norb > MAX_NORB_T) return;
+
+  int tid = threadIdx.x;
+  int nthreads = blockDim.x;
+
+  // Load source CSF j data into shared memory
+  __shared__ int8_t  steps_j_s[MAX_NORB_T];
+  __shared__ int8_t  occ_j_s[MAX_NORB_T];
+  __shared__ int16_t b_j_s[MAX_NORB_T];
+  __shared__ int32_t nodes_j_s[MAX_NORB_T + 1];
+  __shared__ double  c_j_s;
+
+  for (int k = tid; k < norb; k += nthreads) {
+    steps_j_s[k] = steps_all[(int64_t)j_local * norb + k];
+    occ_j_s[k]   = occ_all[(int64_t)j_local * norb + k];
+    b_j_s[k]     = b_all[(int64_t)j_local * norb + k];
+  }
+  for (int k = tid; k < norb + 1; k += nthreads) {
+    nodes_j_s[k] = nodes_all[(int64_t)j_local * (norb + 1) + k];
+  }
+  if (tid == 0) c_j_s = ci_sel[j_local];
+  __syncthreads();
+
+  double c_j = c_j_s;
+
+  // Diagonal: T[pp, j] += occ_p[j] * c_j for all p
+  for (int p = tid; p < norb; p += nthreads) {
+    int occ_p = (int)occ_j_s[p];
+    if (occ_p != 0) {
+      atomicAdd(&T_out[(int64_t)(p * norb + p) * nsel + j_local], (double)occ_p * c_j);
+    }
+  }
+
+  // Off-diagonal phase 1: 1-body targets (occ_diff == 2 in packed encoding)
+  int j_bucket = csf_to_bucket[j_local];
+  int tgt_start_1b = target_offsets_1b[j_bucket];
+  int tgt_end_1b   = target_offsets_1b[j_bucket + 1];
+
+  for (int t_idx = tgt_start_1b + tid; t_idx < tgt_end_1b; t_idx += nthreads) {
+    int i_local = target_list_1b[t_idx];
+    if (i_local <= j_local) continue;  // process each pair once; apply symmetry below
+
+    const int8_t*  steps_i = steps_all + (int64_t)i_local * norb;
+    const int16_t* b_i     = b_all     + (int64_t)i_local * norb;
+
+    // Identify the loop segment [diff_min, diff_max] where steps differ
+    int diff_min = norb, diff_max = -1;
+    for (int k = 0; k < norb; ++k) {
+      if (steps_i[k] != steps_j_s[k]) {
+        if (diff_min > k) diff_min = k;
+        diff_max = k;
+      }
+    }
+    if (diff_min > diff_max) continue;
+
+    double c_i = ci_sel[i_local];
+    int pm_flat = diff_min * norb + diff_max;
+    int mp_flat = diff_max * norb + diff_min;
+
+    // E_{diff_min, diff_max}[i,j]: creation at diff_min, annihilation at diff_max
+    double coupling_pm = pairwise_compute_epq_coupling<MAX_NORB_T>(
+        norb, diff_min, diff_max,
+        steps_i, b_i, steps_j_s, b_j_s, nodes_j_s, node_twos);
+    if (coupling_pm != 0.0) {
+      // T[pm, i] += E_pm[i,j] * c_j
+      atomicAdd(&T_out[(int64_t)pm_flat * nsel + i_local], coupling_pm * c_j);
+      // T[mp, j] += E_pm[j,i] * c_i  (E_pm[j,i] = E_mp[i,j] for real wfn)
+      atomicAdd(&T_out[(int64_t)mp_flat * nsel + j_local], coupling_pm * c_i);
+    }
+
+    if (diff_min != diff_max) {
+      // E_{diff_max, diff_min}[i,j]: creation at diff_max, annihilation at diff_min
+      double coupling_mp = pairwise_compute_epq_coupling<MAX_NORB_T>(
+          norb, diff_max, diff_min,
+          steps_i, b_i, steps_j_s, b_j_s, nodes_j_s, node_twos);
+      if (coupling_mp != 0.0) {
+        // T[mp, i] += E_mp[i,j] * c_j
+        atomicAdd(&T_out[(int64_t)mp_flat * nsel + i_local], coupling_mp * c_j);
+        // T[pm, j] += E_mp[j,i] * c_i  (E_mp[j,i] = E_pm[i,j] for real wfn)
+        atomicAdd(&T_out[(int64_t)pm_flat * nsel + j_local], coupling_mp * c_i);
+      }
+    }
+  }
+}
+
+extern "C" cudaError_t pairwise_T_matrix_bucketed_u64_launch_stream(
+    int nsel,
+    int norb,
+    const int32_t* child_table,
+    const int16_t* node_twos,
+    const int8_t*  steps_all,
+    const int32_t* nodes_all,
+    const int8_t*  occ_all,
+    const int16_t* b_all,
+    const int32_t* csf_to_bucket,
+    const int32_t* target_offsets_1b,
+    const int32_t* target_list_1b,
+    const double*  ci_sel,
+    double*        T_out,
+    cudaStream_t stream,
+    int threads) {
+  if (!child_table || !node_twos || !steps_all || !nodes_all || !occ_all || !b_all ||
+      !csf_to_bucket || !target_offsets_1b || !target_list_1b || !ci_sel || !T_out) {
+    return cudaErrorInvalidValue;
+  }
+  if (nsel <= 0 || norb <= 0 || norb > 64 || threads <= 0 || threads > 1024) {
+    return cudaErrorInvalidValue;
+  }
+
+  dim3 block((unsigned int)threads);
+  dim3 grid((unsigned int)nsel);
+
+#define LAUNCH_T_MATRIX_(NORB_T) \
+    pairwise_T_matrix_bucketed_u64_kernel<NORB_T><<<grid, block, 0, stream>>>( \
+        nsel, norb, child_table, node_twos, \
+        steps_all, nodes_all, occ_all, b_all, \
+        csf_to_bucket, target_offsets_1b, target_list_1b, \
+        ci_sel, T_out)
+
+  if      (norb <= 8)  { LAUNCH_T_MATRIX_(8);  }
+  else if (norb <= 16) { LAUNCH_T_MATRIX_(16); }
+  else if (norb <= 24) { LAUNCH_T_MATRIX_(24); }
+  else if (norb <= 32) { LAUNCH_T_MATRIX_(32); }
+  else if (norb <= 48) { LAUNCH_T_MATRIX_(48); }
+  else                 { LAUNCH_T_MATRIX_(64); }
+
+#undef LAUNCH_T_MATRIX_
+
+  return cudaGetLastError();
+}

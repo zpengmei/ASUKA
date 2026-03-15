@@ -74,6 +74,23 @@ def _parse_bse_shell(shell: dict[str, Any]) -> list[tuple[int, np.ndarray, np.nd
     return out2
 
 
+def _reorder_shells_like_pyscf(
+    shells: list[tuple[int, np.ndarray, np.ndarray]],
+) -> list[tuple[int, np.ndarray, np.ndarray]]:
+    """Match PySCF-style shell order after splitting mixed-angular shells.
+
+    BSE JSON can encode mixed shells such as SP blocks. After splitting those
+    blocks into separate `(l, exps, coefs)` shells, PySCF-style explicit basis
+    dicts group shells by angular momentum while preserving the original order
+    within each angular-momentum family. Reproducing that order keeps named-basis
+    and explicit-basis AO layouts aligned.
+    """
+
+    if len(shells) <= 1:
+        return list(shells)
+    return [shell for _idx, shell in sorted(enumerate(shells), key=lambda item: (int(item[1][0]), int(item[0])))]
+
+
 def load_element_basis_shells(basis_name: str, *, element: str) -> list[tuple[int, np.ndarray, np.ndarray]]:
     """Load basis shells for one element (as (l, exps, coefs)).
 
@@ -97,7 +114,7 @@ def load_element_basis_shells(basis_name: str, *, element: str) -> list[tuple[in
     out: list[tuple[int, np.ndarray, np.ndarray]] = []
     for sh in shells:
         out.extend(_parse_bse_shell(sh))
-    return out
+    return _reorder_shells_like_pyscf(out)
 
 
 def load_basis_shells(basis_name: str, *, elements: list[str]) -> dict[str, list[tuple[int, np.ndarray, np.ndarray]]]:
@@ -126,7 +143,7 @@ def load_basis_shells(basis_name: str, *, elements: list[str]) -> dict[str, list
         buf: list[tuple[int, np.ndarray, np.ndarray]] = []
         for sh in shells:
             buf.extend(_parse_bse_shell(sh))
-        out[sym] = buf
+        out[sym] = _reorder_shells_like_pyscf(buf)
     return out
 
 
@@ -164,7 +181,7 @@ def load_autoaux_shells(
         buf: list[tuple[int, np.ndarray, np.ndarray]] = []
         for sh in shells:
             buf.extend(_parse_bse_shell(sh))
-        out[sym] = buf
+        out[sym] = _reorder_shells_like_pyscf(buf)
     return aux_name, out
 
 

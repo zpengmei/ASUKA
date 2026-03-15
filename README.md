@@ -191,6 +191,94 @@ out = run_casscf(scf_ddf, **cas_kw, backend="cuda")
 | `cuda` | (direct SCF) | On-the-fly 4-center | CUDA direct | Large basis, low memory |
 | `cuda` | (direct-DF SCF) | Streamed DF | CUDA DF | Large systems, minimal memory |
 
+## Large active spaces: selected-CI (SCI-CASCI)
+
+For active spaces too large for exact diagonalization — CAS(18,18) has ~449 million CSFs,
+CAS(22,22) has ~79.5 billion — ASUKA provides a GPU-accelerated selected-CI (heat-bath CIPSI)
+solver via `GUGASCISolver`. SCI expands a compact set of ~5000 important CSFs iteratively;
+the full CSF space is never stored.
+
+**Recommended two-step workflow**: run an exact CASSCF on a smaller, affordable active space to
+get good orbitals, then run a large-active-space SCI-CASCI in those optimized MOs.
+
+> **Why not run SCI-CASSCF directly?** CASSCF orbital optimization requires a stable CI energy
+> gradient. When the selected-CSF subspace changes discontinuously at each orbital rotation the
+> gradient becomes noisy and CASSCF fails to converge. Use a smaller exact CASSCF for orbitals,
+> then a large SCI-CASCI for variational energy.
+
+```python
+from asuka.frontend import Molecule
+from asuka.frontend.scf import run_hf_df
+from asuka.mcscf import run_casscf
+from asuka.mcscf.casci import run_casci_df
+from asuka.sci.solver import GUGASCISolver
+
+mol = Molecule.from_atoms(
+    "O 0 0 -1.162; C 0 0 0; O 0 0 1.162",
+    unit="Angstrom",
+    basis="6-31g",
+    cart=True,
+    spin=0,
+)
+
+# Step 1: RHF + exact CASSCF on an affordable active space for orbital optimization
+scf_out    = run_hf_df(mol, method="rhf", backend="cuda", df=True, auxbasis="autoaux")
+casscf_ref = run_casscf(
+    scf_out,
+    ncore=7, ncas=10, nelecas=8, nroots=1,
+    backend="cuda", df=True,
+)   # CAS(10,8), ~9.3s on RTX 4090
+
+sci_solver = GUGASCISolver(
+    max_ncsf=5000,               # grow until ~5000 CSFs are selected
+    grow_by=2000,                # add up to 2000 CSFs per CIPSI macro-step
+    selection_mode="heat_bath",  # fast GPU heat-bath screening
+    backend="auto",              # auto-selects CUDA kernel when GPU available
+)
+
+# Step 2a: CAS(18,18) — 449M CSFs, ncore=2 (freeze 2 innermost orbitals)
+casci_18 = run_casci_df(
+    scf_out,
+    ncore=2, ncas=18, nelecas=18,
+    mo_coeff=casscf_ref.mo_coeff,
+    fcisolver=sci_solver,
+)   # ~4.6s on RTX 4090 (10 CIPSI iterations, 256→4884 CSFs, CASSCF MOs)
+print(f"CAS(18,18) SCI: {casci_18.e_tot:.6f} Eh")
+
+# Step 2b: CAS(22,22) — 79.5B CSFs, ncore=0 (full-valence, no frozen electrons)
+casci_22 = run_casci_df(
+    scf_out,
+    ncore=0, ncas=22, nelecas=22,
+    mo_coeff=casscf_ref.mo_coeff,
+    fcisolver=sci_solver,
+)
+print(f"CAS(22,22) SCI: {casci_22.e_tot:.6f} Eh")
+```
+
+**CO₂ / 6-31g benchmark (RTX 4090, 256 → 4884 CSFs selected, 10 CIPSI iterations):**
+
+| Method | MOs | ncsf | E (Eh) | Wall time |
+|---|---|---|---|---|
+| RHF | — | — | −187.512354 | 0.55s |
+| CASSCF(10,8) | — | exact | −187.660573 | 9.3s |
+| CAS(18,18) SCI, nsel = 4884 | HF | 449M | −187.668836 | 4.4s |
+| CAS(18,18) SCI, nsel = 4884 | CASSCF | 449M | −187.715433 | 4.6s |
+| CAS(22,22) SCI, nsel = 4884 | HF | 79.5B | −187.710801 | 7.1s |
+| CAS(22,22) SCI, nsel = 4884 | CASSCF | 79.5B | −187.725327 | 7.9s |
+
+CAS(22,22) is the full-valence active space for CO₂ — all 22 electrons active, ncore=0.
+Its 79.5-billion-CSF space would require **636 GB** to store the dense CI vector; SCI retains
+only ~5000 selected CSFs (~300 KB) regardless of the total space size.
+
+**The CAS(22,22) run is only 1.7× slower than CAS(18,18) despite having 177× more CSFs.**
+Wall time scales with the selected-space size (nsel) and norb, not with ncsf.
+CASSCF-optimized MOs lower the CAS(18,18) energy by 46.6 mEh and CAS(22,22) by 14.5 mEh
+compared to raw HF MOs — demonstrating the value of the two-step workflow.
+
+`GUGASCISolver` accepts the same `fcisolver=` slot as the standard `GUGAFCISolver` and is
+compatible with `run_casci_df`, `run_casscf`, and the `sacasscf_properties` workflow. For
+subsequent CASPT2, pass the `casci_sci` output directly to `run_caspt2`.
+
 ## State-averaged CASSCF
 
 ```python

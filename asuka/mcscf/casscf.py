@@ -1037,23 +1037,32 @@ def run_casscf_df(
             except Exception:
                 pass
 
+    # DMRG / SCI solver: force 1step orbital optimizer (AH requires contract_2e)
+    _is_dmrg = getattr(fcisolver_use, "_is_dmrg", False)
+    _is_sci = getattr(fcisolver_use, "_is_sci", False)
+    _is_external_solver = _is_dmrg or _is_sci
+    if _is_external_solver and orbital_optimizer == "ah":
+        orbital_optimizer = "1step"
+
     # Enable kernel profiling on the solver when CASSCF profiling is active.
     #
     # Default keeps historical behavior (profiling enabled when `profile` is
     # provided) but allows callers to request a lightweight profile (CASSCF
     # iteration timing only) by setting `profile["solver_kernel_profile"]=False`.
-    if profile is not None:
+    if profile is not None and not _is_external_solver:
         solver_kprof = bool(profile.get("solver_kernel_profile", True))
         solver_kprof_sync = bool(profile.get("solver_kernel_profile_cuda_sync", True))
         fcisolver_use.kernel_profile = bool(solver_kprof)
         fcisolver_use.kernel_profile_cuda_sync = bool(solver_kprof_sync)
 
     # Dense CPU eigh fast-path for tiny CI spaces (avoids CUDA Davidson overhead)
-    fcisolver_use.dense_eigh_ncsf_threshold = int(dense_eigh_ncsf_threshold)
+    if not _is_external_solver:
+        fcisolver_use.dense_eigh_ncsf_threshold = int(dense_eigh_ncsf_threshold)
 
     # Propagate GPU backends to the solver so that trans_rdm12 / contract_2e
     # (called directly by the AH orbital optimizer) also run on GPU.
-    if matvec_backend_s in {"cuda_eri_mat", "cuda", "cuda_direct"}:
+    # Skip for external solvers (DMRG/SCI) which handle their own backends.
+    if matvec_backend_s in {"cuda_eri_mat", "cuda", "cuda_direct"} and not _is_external_solver:
         fcisolver_use.matvec_backend = str(matvec_backend_s)
         # rdm_backend="auto" will now pick CUDA because matvec_backend starts
         # with "cuda".  Force it explicitly for clarity.
@@ -2761,8 +2770,6 @@ def run_casscf(
         else (getattr(scf_out, "ao_eri", None) if getattr(scf_out, "ao_eri", None) is not None else (_direct_probe if _direct_probe is not None else C0))
     )
     _, is_gpu = _df_scf._get_xp(_xp_probe, C0)  # noqa: SLF001
-    if backend_s == "cuda" and not bool(is_gpu):
-        raise ValueError("backend='cuda' requires scf_out with GPU arrays (use frontend.run_*_df or run_*_dense with backend='cuda')")
 
     two_e_backend_s = str(getattr(scf_out, "two_e_backend", "") or "").strip().lower()
     if matvec_backend is None:

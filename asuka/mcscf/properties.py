@@ -19,6 +19,25 @@ from typing import Any, Literal, Sequence
 import numpy as np
 
 
+def _maybe_asnumpy(x: Any) -> Any:
+    try:
+        import cupy as cp  # type: ignore[import-not-found]
+    except Exception:
+        cp = None
+
+    if cp is not None and isinstance(x, cp.ndarray):
+        return cp.asnumpy(x)
+    if isinstance(x, list):
+        return [_maybe_asnumpy(v) for v in x]
+    if isinstance(x, tuple):
+        return tuple(_maybe_asnumpy(v) for v in x)
+    return x
+
+
+def _materialize_array(x: Any, *, dtype: Any | None = None) -> np.ndarray:
+    return np.asarray(_maybe_asnumpy(x), dtype=dtype)
+
+
 @dataclass(frozen=True)
 class SACASSCFPropertiesResult:
     """Energies, per-root forces, and non-adiabatic coupling vectors for SA-CASSCF.
@@ -185,13 +204,13 @@ def sacasscf_properties(
         e_raw = getattr(casscf, "e_states", None)
     if e_raw is None:
         raise ValueError("casscf must expose per-root energies as .e_roots or .e_states")
-    e_roots = np.asarray(e_raw, dtype=np.float64).ravel()
+    e_roots = _materialize_array(e_raw, dtype=np.float64).ravel()
     nroots = int(e_roots.size)
 
     weights_raw = getattr(casscf, "root_weights", None)
     if weights_raw is None:
         weights_raw = getattr(casscf, "weights", None)
-    root_weights = normalize_weights(weights_raw, nroots=nroots)
+    root_weights = normalize_weights(_maybe_asnumpy(weights_raw), nroots=nroots)
     e_sa = float(np.dot(root_weights, e_roots))
 
     mol = getattr(scf_out, "mol", None)
@@ -215,8 +234,8 @@ def sacasscf_properties(
             z_maxiter=z_maxiter,
             **grad_kwargs,
         )
-        grads = np.asarray(_grad_result.grads, dtype=np.float64)
-        grad_sa = np.asarray(_grad_result.grad_sa, dtype=np.float64)
+        grads = _materialize_array(_grad_result.grads, dtype=np.float64)
+        grad_sa = _materialize_array(_grad_result.grad_sa, dtype=np.float64)
         e_nuc = float(_grad_result.e_nuc)
 
     # ── NACVs ────────────────────────────────────────────────────────────────
@@ -243,7 +262,7 @@ def sacasscf_properties(
             **nacv_kwargs,
         )
         # sacasscf_nonadiabatic_couplings_df returns (nroots, nroots, natm, 3)
-        nacvs = np.asarray(_nacv_raw, dtype=np.float64)
+        nacvs = _materialize_array(_nacv_raw, dtype=np.float64)
 
         # record which pairs were computed
         natm = int(nacvs.shape[2]) if nacvs.ndim == 4 else 0
@@ -263,13 +282,13 @@ def sacasscf_properties(
     ci_arr: np.ndarray | None = None
     ci_raw = getattr(casscf, "ci", None)
     if ci_raw is not None:
-        _ci = np.asarray(ci_raw, dtype=np.float64)
+        _ci = _materialize_array(ci_raw, dtype=np.float64)
         ci_arr = _ci.reshape(nroots, -1) if _ci.ndim == 1 else _ci
 
     mo_coeff_arr: np.ndarray | None = None
     mo_raw = getattr(casscf, "mo_coeff", None)
     if mo_raw is not None:
-        mo_coeff_arr = np.asarray(mo_raw, dtype=np.float64)
+        mo_coeff_arr = _materialize_array(mo_raw, dtype=np.float64)
 
     return SACASSCFPropertiesResult(
         e_roots=e_roots,
