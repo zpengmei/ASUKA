@@ -13,10 +13,17 @@ from .labels import (
     coalesce_sparse_state,
     normalize_state_rep,
     requires_int64_labels,
+    resolve_label_array,
     resolve_optional_label_index,
 )
 from .estimators import choose_reference_index, projected_energy_ref, rayleigh_energy_ref
-from .sparse import coalesce_coo_auto_f64, coalesce_coo_i32_f64, coalesce_coo_i64_f64, sparse_dot_sorted
+from .sparse import (
+    coalesce_coo_auto_f64,
+    coalesce_coo_i32_f64,
+    coalesce_coo_i64_f64,
+    sparse_abs_l1_on_support,
+    sparse_dot_sorted,
+)
 
 
 @dataclass(frozen=True)
@@ -28,6 +35,8 @@ class FCIFRIRun:
     energies: np.ndarray
     ref_idx: np.ndarray
     energy_estimator: str
+    trial_cosine: np.ndarray | None = None
+    trial_support_l1_frac: np.ndarray | None = None
 
 
 @dataclass(frozen=True)
@@ -319,8 +328,28 @@ def run_fcifri_ground(
     spawner_kwargs: Mapping[str, object] | None = None,
     key64_pair_norm: np.ndarray | None = None,
     key64_pair_sampling_mode: int = 0,
+    trial: object | None = None,
+    trial_idx: np.ndarray | None = None,
+    trial_key: np.ndarray | None = None,
+    trial_val: np.ndarray | None = None,
 ) -> FCIFRIRun:
-    """Single-root FCI-FRI projector iteration (scalable CUDA uint64-label path)."""
+    """Single-root FCI-FRI projector iteration (scalable CUDA uint64-label path).
+
+    The ``trial`` parameter accepts any object with a ``to_qmc_x0(root=0)``
+    method (e.g. :class:`CIPSITrialSpaceResult`).  When provided, it
+    auto-populates ``trial_idx`` and ``trial_val`` (which must be ``None``).
+    Trial diagnostics (``trial_cosine``, ``trial_support_l1_frac``) are
+    computed at each energy checkpoint when a trial is supplied.
+    """
+
+    if trial is not None:
+        if trial_idx is not None or trial_val is not None:
+            raise ValueError("cannot specify both 'trial' and 'trial_idx'/'trial_val'")
+        if not hasattr(trial, "to_qmc_x0"):
+            raise TypeError("trial object must have a to_qmc_x0() method (e.g. CIPSITrialSpaceResult)")
+        _t_idx, _t_val = trial.to_qmc_x0(root=0)
+        trial_idx = np.asarray(_t_idx)
+        trial_val = np.asarray(_t_val, dtype=np.float64)
 
     m = int(m)
     niter = int(niter)
@@ -392,6 +421,26 @@ def run_fcifri_ground(
     )
     state_cache = get_state_cache(drt) if (bool(use_state_cache) and not need_i64_labels) else None
 
+    # --- trial wavefunction setup ---
+    trial_idx_resolved = resolve_label_array(
+        drt, idx=trial_idx, key=trial_key, name="trial",
+    )
+    has_trial = trial_idx_resolved is not None and trial_val is not None
+    if has_trial:
+        if need_i64_labels:
+            trial_idx_u, trial_val_u = coalesce_coo_i64_f64(trial_idx_resolved, trial_val)
+        else:
+            trial_idx_u, trial_val_u = coalesce_coo_i32_f64(trial_idx_resolved, trial_val)
+        if trial_idx_u.size == 0:
+            raise ValueError("trial vector is empty")
+        trial_l2 = float(np.linalg.norm(trial_val_u))
+        if trial_l2 == 0.0:
+            raise ValueError("trial vector has zero norm")
+    else:
+        trial_idx_u = None
+        trial_val_u = None
+        trial_l2 = 0.0
+
     if x_idx_u.size == 0:
         raise ValueError("initial x is empty")
     idx_dtype_out = np.int64 if need_i64_labels else np.int32
@@ -404,6 +453,8 @@ def run_fcifri_ground(
     n_energy = (niter // energy_stride) + 1
     energies = np.empty(n_energy, dtype=np.float64)
     ref_hist = np.empty(n_energy, dtype=np.int64)
+    trial_cosine_hist = np.full(n_energy, np.nan, dtype=np.float64) if has_trial else None
+    trial_support_hist = np.full(n_energy, np.nan, dtype=np.float64) if has_trial else None
     ref0 = choose_reference_index(x_idx_u, x_val_u, preferred=preferred_ref_idx)
     if energy_estimator == "rayleigh":
         e0, _, _ = rayleigh_energy_ref(drt, h1e, eri, x_idx_u, x_val_u, state_cache=state_cache)
@@ -411,6 +462,19 @@ def run_fcifri_ground(
         e0, _, _ = projected_energy_ref(drt, h1e, eri, x_idx_u, x_val_u, ref_idx=ref0, state_cache=state_cache)
     energies[0] = float(e0)
     ref_hist[0] = np.int64(ref0)
+    if has_trial:
+        x_l2 = float(np.linalg.norm(x_val_u))
+        trial_cosine_hist[0] = (
+            sparse_dot_sorted(x_idx_u, x_val_u, trial_idx_u, trial_val_u) / (x_l2 * trial_l2)
+            if x_l2 > 0.0
+            else 0.0
+        )
+        trial_support_hist[0] = (
+            sparse_abs_l1_on_support(x_idx_u, x_val_u, trial_idx_u)
+            / float(np.sum(np.abs(x_val_u)))
+            if float(np.sum(np.abs(x_val_u))) > 0.0
+            else 0.0
+        )
     e_pos = 1
 
     from .cuda_backend import (  # noqa: PLC0415
@@ -449,6 +513,8 @@ def run_fcifri_ground(
             energies=np.asarray(energies, dtype=np.float64, order="C"),
             ref_idx=np.asarray(ref_hist, dtype=np.int64, order="C"),
             energy_estimator=energy_estimator,
+            trial_cosine=trial_cosine_hist,
+            trial_support_l1_frac=trial_support_hist,
         )
 
     try:  # optional
@@ -553,6 +619,19 @@ def run_fcifri_ground(
                     e, _, _ = projected_energy_ref(drt, h1e, eri, x_idx_h, x_val_h, ref_idx=ref, state_cache=state_cache)
                 energies[e_pos] = float(e)
                 ref_hist[e_pos] = np.int64(ref)
+                if has_trial:
+                    x_l2_h = float(np.linalg.norm(x_val_h))
+                    trial_cosine_hist[e_pos] = (
+                        sparse_dot_sorted(x_idx_h, x_val_h, trial_idx_u, trial_val_u) / (x_l2_h * trial_l2)
+                        if x_l2_h > 0.0
+                        else 0.0
+                    )
+                    l1_h = float(np.sum(np.abs(x_val_h)))
+                    trial_support_hist[e_pos] = (
+                        sparse_abs_l1_on_support(x_idx_h, x_val_h, trial_idx_u) / l1_h
+                        if l1_h > 0.0
+                        else 0.0
+                    )
                 e_pos += 1
 
         x_key_u = cp.asnumpy(ctx.x_key[: ctx.nnz]).astype(np.uint64, copy=False)
@@ -573,6 +652,8 @@ def run_fcifri_ground(
         energies=np.asarray(energies, dtype=np.float64, order="C"),
         ref_idx=np.asarray(ref_hist, dtype=np.int64, order="C"),
         energy_estimator=energy_estimator,
+        trial_cosine=trial_cosine_hist,
+        trial_support_l1_frac=trial_support_hist,
     )
 
 

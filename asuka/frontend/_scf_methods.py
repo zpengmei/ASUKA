@@ -88,17 +88,25 @@ def _build_df_factors_gpu(
     cfg: CuERIDFConfig,
     df_layout_s: str,
     df_profile,
-):
+) -> tuple:
+    """Build DF factors on GPU.  Returns ``(B, L_chol, b_already_sph)``.
+
+    ``b_already_sph`` is True when cuERI produced B in the spherical AO basis
+    (``ao_rep="sph"``), so callers must **not** apply the cart→sph transform
+    again.
+    """
+    ao_rep = str(_df_ao_rep(mol))
     try:
-        return build_df_B_from_cueri_packed_bases(
+        B, L = build_df_B_from_cueri_packed_bases(
             ao_basis,
             aux_basis,
             config=cfg,
             layout=str(df_layout_s),
-            ao_rep=str(_df_ao_rep(mol)),
+            ao_rep=ao_rep,
             profile=df_profile,
             return_L=True,
         )
+        return B, L, (ao_rep == "sph")
     except Exception as e:
         msg = str(e).lower()
         can_fallback = isinstance(e, AttributeError) or (
@@ -121,9 +129,9 @@ def _build_df_factors_gpu(
         try:
             import cupy as cp  # noqa: PLC0415
 
-            return cp.asarray(B_cpu, dtype=cp.float64), cp.asarray(L_cpu, dtype=cp.float64)
+            return cp.asarray(B_cpu, dtype=cp.float64), cp.asarray(L_cpu, dtype=cp.float64), False
         except Exception:
-            return B_cpu, L_cpu
+            return B_cpu, L_cpu, False
 
 
 def _build_df_factors_cpu(
@@ -149,10 +157,21 @@ def _transform_df_for_scf(
     B,
     ao_basis,
     df_layout: str = "mnQ",
+    b_already_sph: bool = False,
 ):
     if bool(mol.cart):
         return int1e, B, None
-    return apply_sph_transform(mol, int1e, B, ao_basis, df_B_layout=str(df_layout))
+    # Transform 1e integrals (always Cartesian from int1e_cart builder).
+    # For B: skip transform if cuERI already returned spherical (ao_rep="sph").
+    int1e_sph, _, sph_map = apply_sph_transform(
+        mol, int1e, None, ao_basis, df_B_layout=str(df_layout),
+    )
+    if b_already_sph:
+        return int1e_sph, B, sph_map
+    _, B_sph, _ = apply_sph_transform(
+        mol, int1e, B, ao_basis, df_B_layout=str(df_layout),
+    )
+    return int1e_sph, B_sph, sph_map
 
 
 def _prepare_df_gpu_problem(
@@ -173,7 +192,7 @@ def _prepare_df_gpu_problem(
     )
     df_layout_s = _normalize_df_layout(df_layout)
     df_prof = _profile_section(profile, "df_build")
-    B, L_chol = _build_df_factors_gpu(
+    B, L_chol, b_already_sph = _build_df_factors_gpu(
         mol,
         ao_basis=ao_basis,
         aux_basis=aux_basis,
@@ -187,6 +206,7 @@ def _prepare_df_gpu_problem(
         B=B,
         ao_basis=ao_basis,
         df_layout=str(df_layout),
+        b_already_sph=bool(b_already_sph),
     )
     return (
         ao_basis,
@@ -390,7 +410,7 @@ def run_rhf_df_impl(
         if df_prof is not None:
             df_prof["cache_hit"] = False
 
-        B, L_chol = _build_df_factors_gpu(
+        B, L_chol, b_already_sph = _build_df_factors_gpu(
             mol,
             ao_basis=ao_basis,
             aux_basis=aux_basis,
@@ -401,16 +421,20 @@ def run_rhf_df_impl(
         cache_put(
             rhf_prep_cache,
             prep_key,
-            (ao_basis, str(basis_name), int1e, aux_basis, str(auxbasis_name), B, L_chol),
+            (ao_basis, str(basis_name), int1e, aux_basis, str(auxbasis_name), B, L_chol, bool(b_already_sph)),
             max_size=int(hf_prep_cache_max),
         )
     else:
         _prep_tuple = prep_hit
-        if len(_prep_tuple) == 7:
+        if len(_prep_tuple) == 8:
+            ao_basis, basis_name, int1e, aux_basis, auxbasis_name, B, L_chol, b_already_sph = _prep_tuple
+        elif len(_prep_tuple) == 7:
             ao_basis, basis_name, int1e, aux_basis, auxbasis_name, B, L_chol = _prep_tuple
+            b_already_sph = False
         else:
             ao_basis, basis_name, int1e, aux_basis, auxbasis_name, B = _prep_tuple
             L_chol = None
+            b_already_sph = False
         df_prof = _profile_section(profile, "df_build")
         if df_prof is not None:
             df_prof["cache_hit"] = True
@@ -421,6 +445,7 @@ def run_rhf_df_impl(
         B=B,
         ao_basis=ao_basis,
         df_layout=str(df_layout),
+        b_already_sph=bool(b_already_sph),
     )
 
     try:  # pragma: no cover

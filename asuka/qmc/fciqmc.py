@@ -216,6 +216,7 @@ def _evaluate_checkpoint(
     det_idx_u: np.ndarray,
     compute_rayleigh: bool,
     state_cache,
+    max_out: int = 10_000_000,
 ) -> _CheckpointMetrics:
     dynamic_ref_idx = choose_reference_index(x_idx_u, x_val_u, preferred=preferred_ref_idx)
     e_dynamic, _, _ = projected_energy_ref(
@@ -225,6 +226,7 @@ def _evaluate_checkpoint(
         x_idx_u,
         x_val_u,
         ref_idx=int(dynamic_ref_idx),
+        max_out=int(max_out),
         state_cache=state_cache,
     )
     e_fixed, _, _, fixed_ref_alive = projected_energy_ref_status(
@@ -234,6 +236,7 @@ def _evaluate_checkpoint(
         x_idx_u,
         x_val_u,
         ref_idx=int(fixed_ref_idx),
+        max_out=int(max_out),
         state_cache=state_cache,
     )
     e_rayleigh = np.nan
@@ -413,6 +416,7 @@ def run_fciqmc(
     preferred_ref_idx: int | None = None,
     preferred_ref_key: int | np.integer | None = None,
     reference_policy: str = "dynamic_max_abs",
+    trial: object | None = None,
     trial_idx: np.ndarray | None = None,
     trial_key: np.ndarray | None = None,
     trial_val: np.ndarray | None = None,
@@ -426,7 +430,21 @@ def run_fciqmc(
     key64_pair_norm: np.ndarray | None = None,
     key64_pair_sampling_mode: int = 0,
 ) -> FCIQMCRun:
-    """Single-root CSF-native FCIQMC loop (scalable CUDA uint64-label path)."""
+    """Single-root CSF-native FCIQMC loop (scalable CUDA uint64-label path).
+
+    The ``trial`` parameter accepts any object with a ``to_qmc_x0(root=0)``
+    method (e.g. :class:`CIPSITrialSpaceResult`).  When provided, it
+    auto-populates ``trial_idx`` and ``trial_val`` (which must be ``None``).
+    """
+
+    if trial is not None:
+        if trial_idx is not None or trial_val is not None:
+            raise ValueError("cannot specify both 'trial' and 'trial_idx'/'trial_val'")
+        if not hasattr(trial, "to_qmc_x0"):
+            raise TypeError("trial object must have a to_qmc_x0() method (e.g. CIPSITrialSpaceResult)")
+        _t_idx, _t_val = trial.to_qmc_x0(root=0)
+        trial_idx = np.asarray(_t_idx)
+        trial_val = np.asarray(_t_val, dtype=np.float64)
 
     dt = float(dt)
     niter = int(niter)

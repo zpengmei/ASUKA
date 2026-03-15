@@ -584,6 +584,7 @@ def _build_bar_L_lorb_df(
     qblock: int | None = None,
     act_resp_scale: float | None = None,
     dml_sym_mode: str | None = None,
+    C_L_override: Any | None = None,
 ) -> tuple[Any, Any]:
     """Return (bar_L_lorb, D_L_ao) for the orbital Lagrange DF gradient contribution.
 
@@ -624,6 +625,15 @@ def _build_bar_L_lorb_df(
     C_L = C @ L
     C_L_core = C_L[:, :ncore]
     C_L_act = C_L[:, ncore:nocc]
+    C_L_act_dm2 = C_L_act
+    if C_L_override is not None:
+        C_L_alt = xp.asarray(C_L_override, dtype=_wd)
+        if tuple(map(int, C_L_alt.shape)) != tuple(map(int, C.shape)):
+            raise ValueError(
+                "C_L_override shape mismatch: "
+                f"expected {tuple(map(int, C.shape))}, got {tuple(map(int, C_L_alt.shape))}"
+            )
+        C_L_act_dm2 = C_L_alt[:, ncore:nocc]
 
     if dml_sym_mode is None:
         _dml_sym_mode = str(os.environ.get("ASUKA_CASPT2_LORB_DML_SYM_MODE", "full")).strip().lower()
@@ -758,12 +768,12 @@ def _build_bar_L_lorb_df(
         del M_mat
 
         tmp = xp.einsum("mu,uvQ->mvQ", C_act, M_uvQ, optimize=True)
-        tmp_L = xp.einsum("mu,uvQ->mvQ", C_L_act, M_uvQ, optimize=True)
+        tmp_L = xp.einsum("mu,uvQ->mvQ", C_L_act_dm2, M_uvQ, optimize=True)
         del M_uvQ
 
-        X_L = xp.einsum("mnQ,nv->mvQ", B_ao, C_L_act, optimize=True)
+        X_L = xp.einsum("mnQ,nv->mvQ", B_ao, C_L_act_dm2, optimize=True)
         dL_act = (
-            xp.einsum("mu,mvQ->uvQ", C_L_act, X, optimize=True)
+            xp.einsum("mu,mvQ->uvQ", C_L_act_dm2, X, optimize=True)
             + xp.einsum("mu,mvQ->uvQ", C_act, X_L, optimize=True)
         )
         del X, X_L
@@ -783,7 +793,7 @@ def _build_bar_L_lorb_df(
             _q1 = min(_q0 + _chunk, _naux)
             _blk = xp.einsum("mvQ,nv->Qmn", tmp_L[:, :, _q0:_q1], C_act, optimize=True)
             bar_mean[_q0:_q1] += _blk.astype(_od, copy=False)
-            _blk = xp.einsum("mvQ,nv->Qmn", tmp[:, :, _q0:_q1], C_L_act, optimize=True)
+            _blk = xp.einsum("mvQ,nv->Qmn", tmp[:, :, _q0:_q1], C_L_act_dm2, optimize=True)
             bar_mean[_q0:_q1] += _blk.astype(_od, copy=False)
             _blk = xp.einsum("mvQ,nv->Qmn", tmp_M[:, :, _q0:_q1], C_act, optimize=True)
             bar_mean[_q0:_q1] += _blk.astype(_od, copy=False)
@@ -808,7 +818,7 @@ def _build_bar_L_lorb_df(
                 continue
             BQc = unpack_Qp_to_Qmn_block(B_ao, nao=int(nao), q0=int(_q0), q_count=int(_q))  # (q,nao,nao)
             X_blk = xp.matmul(BQc, C_act)  # (q,nao,ncas)
-            X_L_blk = xp.matmul(BQc, C_L_act)  # (q,nao,ncas)
+            X_L_blk = xp.matmul(BQc, C_L_act_dm2)  # (q,nao,ncas)
             L_blk = xp.matmul(C_act.T[None, :, :], X_blk)  # (q,ncas,ncas)
             X[:, :, int(_q0) : int(_q1)] = X_blk.transpose(1, 2, 0)
             X_L[:, :, int(_q0) : int(_q1)] = X_L_blk.transpose(1, 2, 0)
@@ -823,13 +833,13 @@ def _build_bar_L_lorb_df(
         # tmp = C_act @ M, tmp_L = C_L_act @ M (batch matmul over Q)
         M_batch = M_uvQ.transpose(2, 0, 1)  # (naux,ncas,ncas)
         tmp = xp.matmul(C_act[None, :, :], M_batch).transpose(1, 2, 0)  # (nao,ncas,naux)
-        tmp_L = xp.matmul(C_L_act[None, :, :], M_batch).transpose(1, 2, 0)
+        tmp_L = xp.matmul(C_L_act_dm2[None, :, :], M_batch).transpose(1, 2, 0)
         del M_uvQ, M_batch
 
         # dL_act = C_L_act^T X + C_act^T X_L (batch matmul over Q)
         X_batch = X.transpose(2, 0, 1)  # (naux,nao,ncas)
         X_L_batch = X_L.transpose(2, 0, 1)
-        dL1 = xp.matmul(C_L_act.T[None, :, :], X_batch)  # (naux,ncas,ncas)
+        dL1 = xp.matmul(C_L_act_dm2.T[None, :, :], X_batch)  # (naux,ncas,ncas)
         dL2 = xp.matmul(C_act.T[None, :, :], X_L_batch)
         dL_act = (dL1 + dL2).transpose(1, 2, 0)  # (ncas,ncas,naux)
         del X_batch, X_L_batch, dL1, dL2
@@ -851,7 +861,7 @@ def _build_bar_L_lorb_df(
             _blk = xp.einsum("mvQ,nv->Qmn", tmp_L[:, :, _q0:_q1], C_act, optimize=True)
             _blk = 0.5 * (_blk + _blk.transpose(0, 2, 1))
             bar_mean[_q0:_q1] += _pack_qmn_block_to_qp(xp, _blk.astype(xp.float64, copy=False), nao=int(nao)).astype(_od, copy=False)
-            _blk = xp.einsum("mvQ,nv->Qmn", tmp[:, :, _q0:_q1], C_L_act, optimize=True)
+            _blk = xp.einsum("mvQ,nv->Qmn", tmp[:, :, _q0:_q1], C_L_act_dm2, optimize=True)
             _blk = 0.5 * (_blk + _blk.transpose(0, 2, 1))
             bar_mean[_q0:_q1] += _pack_qmn_block_to_qp(xp, _blk.astype(xp.float64, copy=False), nao=int(nao)).astype(_od, copy=False)
             _blk = xp.einsum("mvQ,nv->Qmn", tmp_M[:, :, _q0:_q1], C_act, optimize=True)
