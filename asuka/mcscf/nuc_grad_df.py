@@ -1226,6 +1226,7 @@ def _build_gfock_casscf_df(
     ncas: int,
     dm1_act: np.ndarray,
     dm2_act: np.ndarray,
+    vhf_cache_in: dict[str, Any] | None = None,
     vhf_cache_out: dict[str, Any] | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """Return (gfock_mo, D_core_ao, D_act_ao, D_tot_ao, C_act) for DF-CASSCF.
@@ -1299,6 +1300,12 @@ def _build_gfock_casscf_df(
     # AO potentials
     # Default to occupied-driven K on GPU only.
     use_cocc_k = (xp is not np) and _normalize_bool_env(_os.environ.get("ASUKA_MCSCF_DF_K_COCC"), default=True)
+    vhf_c_cached = None
+    if vhf_cache_in is not None and "vhf_c" in vhf_cache_in:
+        vhf_c_cached = xp.asarray(vhf_cache_in["vhf_c"], dtype=xp.float64)
+        if vhf_c_cached.shape != (nao, nao):
+            raise ValueError("vhf_cache_in['vhf_c'] shape mismatch")
+
     if use_cocc_k:
         try:
             q_block = int(_os.environ.get("ASUKA_DF_JK_K_QBLOCK", "128"))
@@ -1306,13 +1313,15 @@ def _build_gfock_casscf_df(
             q_block = 128
         q_block = max(1, min(int(naux), int(q_block)))
 
-        if ncore:
+        if vhf_c_cached is not None:
+            vhf_c_ao = vhf_c_cached
+        elif ncore:
             Jc, _ = _df_scf._df_JK(B_ao, D_core_ao, want_J=True, want_K=False)  # noqa: SLF001
             occ_core = xp.full((int(ncore),), 2.0, dtype=xp.float64)
             Kc = _df_jk.df_K_from_BmnQ_Cocc(B_ao, C_core, occ_core, q_block=int(q_block))
+            vhf_c_ao = Jc - 0.5 * Kc
         else:
-            Jc = xp.zeros((nao, nao), dtype=xp.float64)
-            Kc = xp.zeros((nao, nao), dtype=xp.float64)
+            vhf_c_ao = xp.zeros((nao, nao), dtype=xp.float64)
 
         Ja, _ = _df_scf._df_JK(B_ao, D_act_ao, want_J=True, want_K=False)  # noqa: SLF001
         dm1_h = np.asarray(dm1_act if xp is np else xp.asnumpy(dm1_act), dtype=np.float64)
@@ -1326,11 +1335,16 @@ def _build_gfock_casscf_df(
             C_no = C_act @ U
             Ka = _df_jk.df_K_from_BmnQ_Cocc(B_ao, C_no, w, q_block=int(q_block))
     else:
-        Jc, Kc = _df_scf._df_JK(B_ao, D_core_ao, want_J=True, want_K=True)  # noqa: SLF001
+        if vhf_c_cached is not None:
+            vhf_c_ao = vhf_c_cached
+        else:
+            Jc, Kc = _df_scf._df_JK(B_ao, D_core_ao, want_J=True, want_K=True)  # noqa: SLF001
+            vhf_c_ao = Jc - 0.5 * Kc
         Ja, Ka = _df_scf._df_JK(B_ao, D_act_ao, want_J=True, want_K=True)  # noqa: SLF001
-    vhf_c_ao = Jc - 0.5 * Kc
     vhf_a_ao = Ja - 0.5 * Ka
-    vhf_ca_ao = (Jc + Ja) - 0.5 * (Kc + Ka)
+    vhf_ca_ao = vhf_c_ao + vhf_a_ao
+    if vhf_cache_in is not None and "vhf_c" not in vhf_cache_in:
+        vhf_cache_in["vhf_c"] = vhf_c_ao
     if vhf_cache_out is not None:
         vhf_cache_out["vhf_c"] = vhf_c_ao
         vhf_cache_out["vhf_a"] = vhf_a_ao
@@ -1704,6 +1718,9 @@ def _build_dme0_lorb_response(
 
         vhf_c = Jc - 0.5 * Kc
         vhf_a = Ja - 0.5 * Ka
+        if vhf_cache is not None:
+            vhf_cache["vhf_c"] = vhf_c
+            vhf_cache["vhf_a"] = vhf_a
     if ncore:
         JcL, KcL = _df_scf._df_JK(B_x, D_L_core, want_J=True, want_K=True)  # noqa: SLF001
     else:

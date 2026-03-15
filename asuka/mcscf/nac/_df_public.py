@@ -48,6 +48,9 @@ def sacasscf_nonadiabatic_couplings_df(
     ``split_orbfd`` response backend. ``delta_bohr`` controls the finite-
     difference step only if the DF derivative contraction falls back to FD.
     The optional ``pairs`` argument is interpreted as ``(bra, ket)`` indices.
+    Off-diagonal NACVs inherit the arbitrary global phases of the SA states,
+    so cross-code parity checks should align the overall sign before treating
+    a sign flip as a correctness error.
     """
 
     if str(response_term).lower() != "split_orbfd":

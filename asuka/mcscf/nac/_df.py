@@ -942,6 +942,7 @@ def _grad_elec_active_df(
     shell_atom = shell_to_atom_map(ao_basis, atom_coords_bohr=coords)
 
     C = _as_xp_f64(xp, mo_coeff)
+    cache = core_cache if isinstance(core_cache, dict) else None
 
     gfock, D_core_ao, D_act_ao, D_tot_ao, C_act = _build_gfock_casscf_df(
         B_ao,
@@ -951,20 +952,60 @@ def _grad_elec_active_df(
         ncas=int(ncas),
         dm1_act=xp.asarray(dm1_act, dtype=xp.float64),
         dm2_act=xp.asarray(dm2_act, dtype=xp.float64),
+        vhf_cache_in=cache,
     )
 
     # ── Phase 1: Build both bar_L tensors on GPU (cheap, before any contract call) ──
+    barl_L_act = None
+    barl_rho_core = None
+    if cache is not None:
+        barl_L_act = cache.get("barl_L_act")
+        barl_rho_core = cache.get("barl_rho_core")
+    if barl_L_act is None or barl_rho_core is None:
+        if not bool(_is_qp):
+            nao_i = int(C_act.shape[0])
+            naux_i = int(B_ao.shape[2])
+            B2 = B_ao.reshape(nao_i * nao_i, naux_i)
+            barl_rho_core = B2.T @ D_core_ao.reshape(nao_i * nao_i)
+            X_act = xp.einsum("mnQ,nv->mvQ", B_ao, C_act, optimize=True)
+            barl_L_act = xp.einsum("mu,mvQ->uvQ", C_act, X_act, optimize=True)
+            del X_act
+        else:
+            from asuka.integrals.tri_packed import pack_tril, tri_weights  # noqa: PLC0415
+            from asuka.integrals.df_packed_s2 import unpack_Qp_to_Qmn_block  # noqa: PLC0415
+
+            nao_i = int(C_act.shape[0])
+            naux_i = int(B_ao.shape[0])
+            w_tri = tri_weights(xp, int(nao_i), dtype=xp.float64)
+            barl_rho_core = B_ao @ (w_tri * pack_tril(xp, D_core_ao))
+            qblk = int(max(1, int(_barl_qblock) if int(_barl_qblock) > 0 else max(1, int(naux_i) // 4)))
+            qblk = max(1, min(int(naux_i), int(qblk)))
+            barl_L_act = xp.empty((int(ncas), int(ncas), int(naux_i)), dtype=xp.float64)
+            for q0 in range(0, int(naux_i), int(qblk)):
+                q1 = min(int(naux_i), int(q0) + int(qblk))
+                q_count = int(q1 - q0)
+                if q_count <= 0:
+                    continue
+                bq = unpack_Qp_to_Qmn_block(B_ao, nao=int(nao_i), q0=int(q0), q_count=int(q_count))
+                x_blk = xp.matmul(bq, C_act)
+                l_blk = xp.matmul(C_act.T[None, :, :], x_blk)
+                barl_L_act[:, :, int(q0):int(q1)] = l_blk.transpose(1, 2, 0)
+                del bq, x_blk, l_blk
+        if cache is not None:
+            cache["barl_L_act"] = barl_L_act
+            cache["barl_rho_core"] = barl_rho_core
     bar_L_ao = _build_bar_L_casscf_df(
         B_ao,
         D_core_ao=D_core_ao,
         D_act_ao=D_act_ao,
         C_act=C_act,
         dm2_act=xp.asarray(dm2_act, dtype=xp.float64),
+        L_act=barl_L_act,
+        rho_core=barl_rho_core,
         work_dtype=_barl_work_dtype,
         out_dtype=_barl_out_dtype,
         qblock=_barl_qblock,
     )
-    cache = core_cache if isinstance(core_cache, dict) else None
     D_core_only = dme_core = bar_L_core = de_h1_core = None
     if cache is not None:
         D_core_only = cache.get("D_core_only")
