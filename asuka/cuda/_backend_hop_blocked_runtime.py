@@ -20,6 +20,349 @@ from asuka.cuda._backend_hop_runtime import (
 )
 
 
+def _ensure_gdf_workspace(
+    workspace: Any,
+    *,
+    l_full_use: Any,
+    nrows_block_max: int,
+    profile: dict[str, float] | None,
+    Kernel3BuildGDFWorkspace_cls: Any,
+) -> Any:
+    """Initialize or validate the GDF workspace for DF aggregate paths.
+
+    Creates or re-creates ``workspace._gdf_ws`` when naux or max_nrows
+    have changed, configures fp64 emulation or default GEMM backend,
+    and stamps DF profile keys.  Returns the ready-to-use gdf_ws.
+    """
+    import os as _os
+
+    if l_full_use is None:  # pragma: no cover
+        raise RuntimeError("internal error: l_full_use is not set for DF path")
+    naux = int(l_full_use.shape[1])
+    gdf_ws = workspace._gdf_ws
+    if (
+        gdf_ws is None
+        or int(getattr(gdf_ws, "naux", 0)) != naux
+        or int(getattr(gdf_ws, "max_nrows", 0)) < int(nrows_block_max)
+    ):
+        workspace._gdf_ws = Kernel3BuildGDFWorkspace_cls(
+            int(workspace.nops),
+            naux,
+            max_nrows=int(nrows_block_max),
+        )
+        gdf_ws = workspace._gdf_ws
+
+    if gdf_ws is None:  # pragma: no cover
+        raise RuntimeError("internal error: failed to initialize Kernel3BuildGDFWorkspace")
+
+    if workspace.offdiag_enable_fp64_emulation:
+        gdf_ws.set_gemm_backend("gemmex_emulated_fixedpoint")
+        gdf_ws.set_cublas_math_mode("fp64_emulated_fixedpoint")
+        if workspace.offdiag_emulation_strategy:
+            strategy = str(workspace.offdiag_emulation_strategy).strip().lower()
+            if strategy == "eager":
+                allow = str(_os.getenv("CUGUGA_ALLOW_CUBLAS_EAGER", "")).strip().lower()
+                if allow not in ("1", "true", "yes"):
+                    raise RuntimeError(
+                        "offdiag_emulation_strategy='eager' is experimental and may crash for some shapes/GPUs; "
+                        "set CUGUGA_ALLOW_CUBLAS_EAGER=1 to enable anyway"
+                    )
+            gdf_ws.set_cublas_emulation_strategy(strategy)
+        try:
+            gdf_ws.autoset_cublas_workspace_bytes(
+                nrows=int(nrows_block_max),
+                cap_mb=int(workspace.offdiag_cublas_workspace_cap_mb),
+            )
+        except Exception:
+            pass
+    else:
+        gdf_ws.set_gemm_backend(str(workspace.gemm_backend))
+        gdf_ws.set_cublas_math_mode("default")
+
+    if profile is not None:
+        profile["eri_mat_used"] = float(0.0)
+        profile["df_l_full_used"] = float(1.0)
+        profile["df_cublas_workspace_bytes"] = float(int(gdf_ws.cublas_workspace_bytes()))
+
+    return gdf_ws
+
+
+def _build_csr_tile_with_retry(
+    workspace: Any,
+    *,
+    cp: Any,
+    j0: int,
+    j_count: int,
+    stream_build: Any,
+    check_overflow_tile: bool,
+    check_overflow_mode_tile: int,
+    build_from_prefiltered_tasks: bool,
+    pref_task_csf_d: Any,
+    pref_task_p_d: Any,
+    pref_task_q_d: Any,
+    tile_slot: Any,
+    pipeline_nslots: int,
+    tile_idx: int,
+    profile: dict[str, float] | None,
+    kernel25_build_csr_from_tasks_deterministic_inplace_device_fn: Any,
+    kernel25_build_csr_from_jrs_allpairs_deterministic_inplace_device_fn: Any,
+) -> tuple:
+    """Build CSR tile with up to 3 retry attempts on capacity overflow.
+
+    Returns (row_j_d, row_k_d, indptr_d, indices_d, data_d, nrows, nnz).
+    Mutates workspace buffer state on capacity overflow (grows buffers).
+    """
+    # Select initial buffers and capacity.
+    if workspace.cache_csr_tiles and int(workspace.j_tile) < int(workspace.ncsf):
+        cap = int(workspace._tile_csr_capacity) if workspace._tile_csr_capacity > 0 else 0
+        if cap <= 0:
+            n_pairs = int(workspace._rs_n_pairs)
+            cap = int(max(1.0, float(workspace.csr_capacity_mult)) * float(int(j_count) * int(n_pairs)))
+            row_j_buf = cp.empty((cap,), dtype=cp.int32)
+            row_k_buf = cp.empty((cap,), dtype=cp.int32)
+            indptr_buf = cp.empty((cap + 1,), dtype=cp.int64)
+            indices_buf = cp.empty((cap,), dtype=cp.int32)
+            data_buf = cp.empty((cap,), dtype=workspace._csr_data_dtype)
+            overflow_buf = cp.empty((1,), dtype=cp.int32)
+        else:
+            row_j_buf = workspace._tile_csr_row_j
+            row_k_buf = workspace._tile_csr_row_k
+            indptr_buf = workspace._tile_csr_indptr
+            indices_buf = workspace._tile_csr_indices
+            data_buf = workspace._tile_csr_data
+            overflow_buf = workspace._tile_csr_overflow
+    else:
+        if tile_slot is not None:
+            cap = int(tile_slot["cap"])
+            row_j_buf = tile_slot["row_j"]
+            row_k_buf = tile_slot["row_k"]
+            indptr_buf = tile_slot["indptr"]
+            indices_buf = tile_slot["indices"]
+            data_buf = tile_slot["data"]
+            overflow_buf = tile_slot["overflow"]
+        else:
+            cap = int(workspace._csr_capacity)
+            row_j_buf = workspace._csr_row_j
+            row_k_buf = workspace._csr_row_k
+            indptr_buf = workspace._csr_indptr
+            indices_buf = workspace._csr_indices
+            data_buf = workspace._csr_data
+            overflow_buf = workspace._csr_overflow
+
+    # Retry loop: build CSR, double capacity on overflow.
+    last_err = None
+    for _ in range(3):
+        try:
+            t0 = time.perf_counter() if profile is not None else None
+            tile_profile = {} if (profile is not None and (not build_from_prefiltered_tasks)) else None
+            ws = tile_slot.get("ws") if tile_slot is not None else workspace._k25_ws
+            if build_from_prefiltered_tasks:
+                if pref_task_csf_d is None or pref_task_p_d is None or pref_task_q_d is None:
+                    raise RuntimeError("internal error: prefiltered task arrays are not initialized")
+                if ws is not None:
+                    if tile_slot is None and int(getattr(ws, "max_nnz_in", 0)) < int(cap):
+                        workspace._ensure_kernel25_workspace(max_nnz_in=cap)
+                        ws = workspace._k25_ws
+                    if ws is None:
+                        raise RuntimeError("Kernel25Workspace is unavailable")
+                    nrows, nnz, _nnz_in = ws.build_from_tasks_deterministic_inplace_device(
+                        workspace.drt_dev,
+                        workspace.state_dev,
+                        pref_task_csf_d,
+                        pref_task_p_d,
+                        pref_task_q_d,
+                        row_j_buf,
+                        row_k_buf,
+                        indptr_buf,
+                        indices_buf,
+                        data_buf,
+                        overflow_buf,
+                        int(workspace.threads_enum),
+                        bool(workspace.coalesce),
+                        int(stream_build.ptr),
+                        True,
+                        bool(check_overflow_tile),
+                    )
+                    nrows = int(nrows)
+                    nnz = int(nnz)
+                    row_j_d = row_j_buf[:nrows]
+                    row_k_d = row_k_buf[:nrows]
+                    indptr_d = indptr_buf[: nrows + 1]
+                    indices_d = indices_buf[:nnz]
+                    data_d = data_buf[:nnz]
+                else:
+                    (
+                        row_j_d,
+                        row_k_d,
+                        indptr_d,
+                        indices_d,
+                        data_d,
+                        _overflow_csr,
+                        nrows,
+                        nnz,
+                        _nnz_in,
+                    ) = kernel25_build_csr_from_tasks_deterministic_inplace_device_fn(
+                        workspace.drt,
+                        workspace.drt_dev,
+                        workspace.state_dev,
+                        pref_task_csf_d,
+                        pref_task_p_d,
+                        pref_task_q_d,
+                        capacity=cap,
+                        row_j=row_j_buf,
+                        row_k=row_k_buf,
+                        indptr=indptr_buf,
+                        indices=indices_buf,
+                        data=data_buf,
+                        overflow=overflow_buf,
+                        threads=int(workspace.threads_enum),
+                        coalesce=bool(workspace.coalesce),
+                        stream=stream_build,
+                        sync=True,
+                        check_overflow=bool(check_overflow_tile),
+                    )
+            else:
+                if ws is not None:
+                    if tile_slot is None and int(getattr(ws, "max_nnz_in", 0)) < int(cap):
+                        workspace._ensure_kernel25_workspace(max_nnz_in=cap)
+                        ws = workspace._k25_ws
+                    if ws is None:
+                        raise RuntimeError("Kernel25Workspace is unavailable")
+
+                    nrows, nnz, _nnz_in = ws.build_from_jrs_allpairs_deterministic_inplace_device(
+                        workspace.drt_dev,
+                        workspace.state_dev,
+                        int(j0),
+                        int(j_count),
+                        row_j_buf,
+                        row_k_buf,
+                        indptr_buf,
+                        indices_buf,
+                        data_buf,
+                        overflow_buf,
+                        int(workspace.threads_enum),
+                        bool(workspace.coalesce),
+                        int(stream_build.ptr),
+                        True,
+                        bool(check_overflow_tile),
+                        int(check_overflow_mode_tile),
+                        bool(workspace.fuse_count_write),
+                        tile_profile,
+                    )
+                    nrows = int(nrows)
+                    nnz = int(nnz)
+                    row_j_d = row_j_buf[:nrows]
+                    row_k_d = row_k_buf[:nrows]
+                    indptr_d = indptr_buf[: nrows + 1]
+                    indices_d = indices_buf[:nnz]
+                    data_d = data_buf[:nnz]
+                else:
+                    (
+                        row_j_d,
+                        row_k_d,
+                        indptr_d,
+                        indices_d,
+                        data_d,
+                        _overflow_csr,
+                        nrows,
+                        nnz,
+                        _nnz_in,
+                    ) = kernel25_build_csr_from_jrs_allpairs_deterministic_inplace_device_fn(
+                        workspace.drt,
+                        workspace.drt_dev,
+                        workspace.state_dev,
+                        int(j0),
+                        int(j_count),
+                        capacity=cap,
+                        row_j=row_j_buf,
+                        row_k=row_k_buf,
+                        indptr=indptr_buf,
+                        indices=indices_buf,
+                        data=data_buf,
+                        overflow=overflow_buf,
+                        threads=int(workspace.threads_enum),
+                        coalesce=bool(workspace.coalesce),
+                        stream=stream_build,
+                        sync=True,
+                        check_overflow=bool(check_overflow_tile),
+                    )
+            if profile is not None and t0 is not None:
+                profile["csr_build_s"] = profile.get("csr_build_s", 0.0) + (time.perf_counter() - t0)
+                if tile_profile is not None and workspace._k25_ws is not None:
+                    stage_map = (
+                        ("count_ms", "csr_k25_count_s"),
+                        ("prefix_sum_ms", "csr_k25_prefix_sum_s"),
+                        ("write_ms", "csr_k25_write_s"),
+                        ("pack_ms", "csr_k25_pack_s"),
+                        ("sort_ms", "csr_k25_sort_s"),
+                        ("reduce_ms", "csr_k25_reduce_s"),
+                        ("rle_ms", "csr_k25_rle_s"),
+                        ("indptr_ms", "csr_k25_indptr_s"),
+                        ("unpack_ms", "csr_k25_unpack_s"),
+                        ("sync_overhead_ms", "csr_k25_sync_overhead_s"),
+                        ("bucket_ms", "csr_k25_bucket_s"),
+                    )
+                    for src_key, dst_key in stage_map:
+                        ms_val = float(tile_profile.get(src_key, 0.0))
+                        if ms_val != 0.0:
+                            profile[dst_key] = profile.get(dst_key, 0.0) + (ms_val * 1.0e-3)
+                    count_map = (
+                        ("nnz_in", "csr_k25_nnz_in"),
+                        ("nnz_out", "csr_k25_nnz_out"),
+                        ("nrows", "csr_k25_nrows"),
+                    )
+                    for src_key, dst_key in count_map:
+                        v = tile_profile.get(src_key)
+                        if v is not None:
+                            profile[dst_key] = profile.get(dst_key, 0.0) + float(v)
+            return (row_j_d, row_k_d, indptr_d, indices_d, data_d, int(nrows), int(nnz))
+        except RuntimeError as e:
+            last_err = e
+            err_s = str(e).lower()
+            if (
+                "exceeds output buffer capacity" in err_s
+                or "output buffer capacity" in err_s
+                or "capacity exceeds workspace max_nnz_in" in err_s
+            ):
+                cap *= 2
+                if tile_slot is not None:
+                    workspace._grow_csr_pipeline_slot(int(tile_idx) % int(pipeline_nslots), cap)
+                    cap = int(tile_slot["cap"])
+                    row_j_buf = tile_slot["row_j"]
+                    row_k_buf = tile_slot["row_k"]
+                    indptr_buf = tile_slot["indptr"]
+                    indices_buf = tile_slot["indices"]
+                    data_buf = tile_slot["data"]
+                    overflow_buf = tile_slot["overflow"]
+                    continue
+                workspace._ensure_kernel25_workspace(max_nnz_in=cap)
+                if workspace.cache_csr_tiles and int(workspace.j_tile) < int(workspace.ncsf):
+                    workspace._tile_csr_row_j = cp.empty((cap,), dtype=cp.int32)
+                    workspace._tile_csr_row_k = cp.empty((cap,), dtype=cp.int32)
+                    workspace._tile_csr_indptr = cp.empty((cap + 1,), dtype=cp.int64)
+                    workspace._tile_csr_indices = cp.empty((cap,), dtype=cp.int32)
+                    workspace._tile_csr_data = cp.empty((cap,), dtype=workspace._csr_data_dtype)
+                    workspace._tile_csr_overflow = cp.empty((1,), dtype=cp.int32)
+                    workspace._tile_csr_capacity = cap
+                    row_j_buf = workspace._tile_csr_row_j
+                    row_k_buf = workspace._tile_csr_row_k
+                    indptr_buf = workspace._tile_csr_indptr
+                    indices_buf = workspace._tile_csr_indices
+                    data_buf = workspace._tile_csr_data
+                    overflow_buf = workspace._tile_csr_overflow
+                    continue
+                workspace._alloc_csr_buffers(capacity=cap)
+                row_j_buf = workspace._csr_row_j
+                row_k_buf = workspace._csr_row_k
+                indptr_buf = workspace._csr_indptr
+                indices_buf = workspace._csr_indices
+                data_buf = workspace._csr_data
+                overflow_buf = workspace._csr_overflow
+                continue
+            raise
+    raise last_err  # type: ignore[misc]
+
+
 def _prepare_blocked_hop_state(
     workspace: Any,
     *,
@@ -240,8 +583,6 @@ def run_epq_blocked_aggregate_path(
 
     Extracted from GugaMatvecEriMatWorkspace.hop().
     """
-    import os as _os
-
     _one_body_event = one_body_event
 
     nrows_block_max = int(getattr(workspace._g_buf, "shape", (0, 0))[0])
@@ -276,54 +617,13 @@ def run_epq_blocked_aggregate_path(
     # DF (L_full) blocked path uses g_buf as W scratch.
     gdf_ws = None
     if use_df:
-        if l_full_use is None:  # pragma: no cover
-            raise RuntimeError("internal error: l_full_use is not set for DF path")
-        naux = int(l_full_use.shape[1])
-        gdf_ws = workspace._gdf_ws
-        if (
-            gdf_ws is None
-            or int(getattr(gdf_ws, "naux", 0)) != int(naux)
-            or int(getattr(gdf_ws, "max_nrows", 0)) < int(nrows_block_max)
-        ):
-            workspace._gdf_ws = Kernel3BuildGDFWorkspace_cls(
-                int(workspace.nops),
-                int(naux),
-                max_nrows=int(nrows_block_max),
-            )
-            gdf_ws = workspace._gdf_ws
-
-        if gdf_ws is None:  # pragma: no cover
-            raise RuntimeError("internal error: failed to initialize Kernel3BuildGDFWorkspace")
-
-        if workspace.offdiag_enable_fp64_emulation:
-            gdf_ws.set_gemm_backend("gemmex_emulated_fixedpoint")
-            gdf_ws.set_cublas_math_mode("fp64_emulated_fixedpoint")
-            if workspace.offdiag_emulation_strategy:
-                strategy = str(workspace.offdiag_emulation_strategy).strip().lower()
-                if strategy == "eager":
-                    allow = str(_os.getenv("CUGUGA_ALLOW_CUBLAS_EAGER", "")).strip().lower()
-                    if allow not in ("1", "true", "yes"):
-                        raise RuntimeError(
-                            "offdiag_emulation_strategy='eager' is experimental and may crash for some shapes/GPUs; "
-                            "set CUGUGA_ALLOW_CUBLAS_EAGER=1 to enable anyway"
-                        )
-                gdf_ws.set_cublas_emulation_strategy(strategy)
-            # Configure workspace (one-time; capped).
-            try:
-                gdf_ws.autoset_cublas_workspace_bytes(
-                    nrows=int(nrows_block_max),
-                    cap_mb=int(workspace.offdiag_cublas_workspace_cap_mb),
-                )
-            except Exception:
-                pass
-        else:
-            gdf_ws.set_gemm_backend(str(workspace.gemm_backend))
-            gdf_ws.set_cublas_math_mode("default")
-
-        if profile is not None:
-            profile["eri_mat_used"] = float(0.0)
-            profile["df_l_full_used"] = float(1.0)
-            profile["df_cublas_workspace_bytes"] = float(int(gdf_ws.cublas_workspace_bytes()))
+        gdf_ws = _ensure_gdf_workspace(
+            workspace,
+            l_full_use=l_full_use,
+            nrows_block_max=int(nrows_block_max),
+            profile=profile,
+            Kernel3BuildGDFWorkspace_cls=Kernel3BuildGDFWorkspace_cls,
+        )
 
     # Symmetric-pair GEMM setup (Opt 2): compress nops -> npair = norb*(norb+1)/2.
     use_sym_pair = False
@@ -807,59 +1107,20 @@ def run_per_tile_csr_path(
 
     Extracted from GugaMatvecEriMatWorkspace.hop().
     """
-    import os as _os
-
     _one_body_event = one_body_event
 
     gdf_ws = None
     if use_df:
-        if l_full_use is None:  # pragma: no cover
-            raise RuntimeError("internal error: l_full_use is not set for DF path")
-        want_naux = int(l_full_use.shape[1])
         want_max_nrows = int(getattr(workspace._g_buf, "shape", (0, 0))[0])
         if want_max_nrows < 1:
             raise RuntimeError("internal error: invalid g_buf block size for DF path")
-        gdf_ws = workspace._gdf_ws
-        if (
-            gdf_ws is None
-            or int(getattr(gdf_ws, "naux", 0)) != want_naux
-            or int(getattr(gdf_ws, "max_nrows", 0)) < want_max_nrows
-        ):
-            workspace._gdf_ws = Kernel3BuildGDFWorkspace_cls(
-                int(workspace.nops),
-                int(want_naux),
-                max_nrows=int(want_max_nrows),
-            )
-        gdf_ws = workspace._gdf_ws
-        if gdf_ws is None:  # pragma: no cover
-            raise RuntimeError("internal error: failed to initialize Kernel3BuildGDFWorkspace")
-        if workspace.offdiag_enable_fp64_emulation:
-            gdf_ws.set_gemm_backend("gemmex_emulated_fixedpoint")
-            gdf_ws.set_cublas_math_mode("fp64_emulated_fixedpoint")
-            if workspace.offdiag_emulation_strategy:
-                strategy = str(workspace.offdiag_emulation_strategy).strip().lower()
-                if strategy == "eager":
-                    allow = str(_os.getenv("CUGUGA_ALLOW_CUBLAS_EAGER", "")).strip().lower()
-                    if allow not in ("1", "true", "yes"):
-                        raise RuntimeError(
-                            "offdiag_emulation_strategy='eager' is experimental and may crash for some shapes/GPUs; "
-                            "set CUGUGA_ALLOW_CUBLAS_EAGER=1 to enable anyway"
-                        )
-                gdf_ws.set_cublas_emulation_strategy(strategy)
-            try:
-                gdf_ws.autoset_cublas_workspace_bytes(
-                    nrows=int(want_max_nrows),
-                    cap_mb=int(workspace.offdiag_cublas_workspace_cap_mb),
-                )
-            except Exception:
-                pass
-        else:
-            gdf_ws.set_gemm_backend(str(workspace.gemm_backend))
-            gdf_ws.set_cublas_math_mode("default")
-        if profile is not None:
-            profile["eri_mat_used"] = float(0.0)
-            profile["df_l_full_used"] = float(1.0)
-            profile["df_cublas_workspace_bytes"] = float(int(gdf_ws.cublas_workspace_bytes()))
+        gdf_ws = _ensure_gdf_workspace(
+            workspace,
+            l_full_use=l_full_use,
+            nrows_block_max=want_max_nrows,
+            profile=profile,
+            Kernel3BuildGDFWorkspace_cls=Kernel3BuildGDFWorkspace_cls,
+        )
 
     w_offdiag = None
     offdiag_gemm_ws = None
@@ -1237,256 +1498,25 @@ def run_per_tile_csr_path(
                                 delta=1.0,
                             )
 
-                    if workspace.cache_csr_tiles and int(workspace.j_tile) < int(workspace.ncsf):
-                        cap = int(workspace._tile_csr_capacity) if workspace._tile_csr_capacity > 0 else 0
-                        if cap <= 0:
-                            n_pairs = int(workspace._rs_n_pairs)
-                            cap = int(max(1.0, float(workspace.csr_capacity_mult)) * float(int(j_count) * int(n_pairs)))
-                            row_j_buf = cp.empty((cap,), dtype=cp.int32)
-                            row_k_buf = cp.empty((cap,), dtype=cp.int32)
-                            indptr_buf = cp.empty((cap + 1,), dtype=cp.int64)
-                            indices_buf = cp.empty((cap,), dtype=cp.int32)
-                            data_buf = cp.empty((cap,), dtype=workspace._csr_data_dtype)
-                            overflow_buf = cp.empty((1,), dtype=cp.int32)
-                        else:
-                            row_j_buf = workspace._tile_csr_row_j
-                            row_k_buf = workspace._tile_csr_row_k
-                            indptr_buf = workspace._tile_csr_indptr
-                            indices_buf = workspace._tile_csr_indices
-                            data_buf = workspace._tile_csr_data
-                            overflow_buf = workspace._tile_csr_overflow
-                    else:
-                        if tile_slot is not None:
-                            cap = int(tile_slot["cap"])
-                            row_j_buf = tile_slot["row_j"]
-                            row_k_buf = tile_slot["row_k"]
-                            indptr_buf = tile_slot["indptr"]
-                            indices_buf = tile_slot["indices"]
-                            data_buf = tile_slot["data"]
-                            overflow_buf = tile_slot["overflow"]
-                        else:
-                            cap = int(workspace._csr_capacity)
-                            row_j_buf = workspace._csr_row_j
-                            row_k_buf = workspace._csr_row_k
-                            indptr_buf = workspace._csr_indptr
-                            indices_buf = workspace._csr_indices
-                            data_buf = workspace._csr_data
-                            overflow_buf = workspace._csr_overflow
-
-                    last_err = None
-                    for _ in range(3):
-                        try:
-                            t0 = time.perf_counter() if profile is not None else None
-                            tile_profile = {} if (profile is not None and (not build_from_prefiltered_tasks)) else None
-                            ws = tile_slot.get("ws") if tile_slot is not None else workspace._k25_ws
-                            if build_from_prefiltered_tasks:
-                                if pref_task_csf_d is None or pref_task_p_d is None or pref_task_q_d is None:
-                                    raise RuntimeError("internal error: prefiltered task arrays are not initialized")
-                                if ws is not None:
-                                    if tile_slot is None and int(getattr(ws, "max_nnz_in", 0)) < int(cap):
-                                        workspace._ensure_kernel25_workspace(max_nnz_in=cap)
-                                        ws = workspace._k25_ws
-                                    if ws is None:
-                                        raise RuntimeError("Kernel25Workspace is unavailable")
-                                    nrows, nnz, _nnz_in = ws.build_from_tasks_deterministic_inplace_device(
-                                        workspace.drt_dev,
-                                        workspace.state_dev,
-                                        pref_task_csf_d,
-                                        pref_task_p_d,
-                                        pref_task_q_d,
-                                        row_j_buf,
-                                        row_k_buf,
-                                        indptr_buf,
-                                        indices_buf,
-                                        data_buf,
-                                        overflow_buf,
-                                        int(workspace.threads_enum),
-                                        bool(workspace.coalesce),
-                                        int(stream_build.ptr),
-                                        True,
-                                        bool(check_overflow_tile),
-                                    )
-                                    nrows = int(nrows)
-                                    nnz = int(nnz)
-                                    _overflow_csr = overflow_buf
-                                    row_j_d = row_j_buf[:nrows]
-                                    row_k_d = row_k_buf[:nrows]
-                                    indptr_d = indptr_buf[: nrows + 1]
-                                    indices_d = indices_buf[:nnz]
-                                    data_d = data_buf[:nnz]
-                                else:
-                                    (
-                                        row_j_d,
-                                        row_k_d,
-                                        indptr_d,
-                                        indices_d,
-                                        data_d,
-                                        _overflow_csr,
-                                        nrows,
-                                        nnz,
-                                        _nnz_in,
-                                    ) = kernel25_build_csr_from_tasks_deterministic_inplace_device_fn(
-                                        workspace.drt,
-                                        workspace.drt_dev,
-                                        workspace.state_dev,
-                                        pref_task_csf_d,
-                                        pref_task_p_d,
-                                        pref_task_q_d,
-                                        capacity=cap,
-                                        row_j=row_j_buf,
-                                        row_k=row_k_buf,
-                                        indptr=indptr_buf,
-                                        indices=indices_buf,
-                                        data=data_buf,
-                                        overflow=overflow_buf,
-                                        threads=int(workspace.threads_enum),
-                                        coalesce=bool(workspace.coalesce),
-                                        stream=stream_build,
-                                        sync=True,
-                                        check_overflow=bool(check_overflow_tile),
-                                    )
-                            else:
-                                if ws is not None:
-                                    if tile_slot is None and int(getattr(ws, "max_nnz_in", 0)) < int(cap):
-                                        workspace._ensure_kernel25_workspace(max_nnz_in=cap)
-                                        ws = workspace._k25_ws
-                                    if ws is None:
-                                        raise RuntimeError("Kernel25Workspace is unavailable")
-
-                                    nrows, nnz, _nnz_in = ws.build_from_jrs_allpairs_deterministic_inplace_device(
-                                        workspace.drt_dev,
-                                        workspace.state_dev,
-                                        int(j0),
-                                        int(j_count),
-                                        row_j_buf,
-                                        row_k_buf,
-                                        indptr_buf,
-                                        indices_buf,
-                                        data_buf,
-                                        overflow_buf,
-                                        int(workspace.threads_enum),
-                                        bool(workspace.coalesce),
-                                        int(stream_build.ptr),
-                                        True,
-                                        bool(check_overflow_tile),
-                                        int(check_overflow_mode_tile),
-                                        bool(workspace.fuse_count_write),
-                                        tile_profile,
-                                    )
-                                    nrows = int(nrows)
-                                    nnz = int(nnz)
-                                    _overflow_csr = overflow_buf
-                                    row_j_d = row_j_buf[:nrows]
-                                    row_k_d = row_k_buf[:nrows]
-                                    indptr_d = indptr_buf[: nrows + 1]
-                                    indices_d = indices_buf[:nnz]
-                                    data_d = data_buf[:nnz]
-                                else:
-                                    (
-                                        row_j_d,
-                                        row_k_d,
-                                        indptr_d,
-                                        indices_d,
-                                        data_d,
-                                        _overflow_csr,
-                                        nrows,
-                                        nnz,
-                                        _nnz_in,
-                                    ) = kernel25_build_csr_from_jrs_allpairs_deterministic_inplace_device_fn(
-                                        workspace.drt,
-                                        workspace.drt_dev,
-                                        workspace.state_dev,
-                                        int(j0),
-                                        int(j_count),
-                                        capacity=cap,
-                                        row_j=row_j_buf,
-                                        row_k=row_k_buf,
-                                        indptr=indptr_buf,
-                                        indices=indices_buf,
-                                        data=data_buf,
-                                        overflow=overflow_buf,
-                                        threads=int(workspace.threads_enum),
-                                        coalesce=bool(workspace.coalesce),
-                                        stream=stream_build,
-                                        sync=True,
-                                        check_overflow=bool(check_overflow_tile),
-                                    )
-                            if profile is not None and t0 is not None:
-                                profile["csr_build_s"] = profile.get("csr_build_s", 0.0) + (time.perf_counter() - t0)
-                                if tile_profile is not None and workspace._k25_ws is not None:
-                                    stage_map = (
-                                        ("count_ms", "csr_k25_count_s"),
-                                        ("prefix_sum_ms", "csr_k25_prefix_sum_s"),
-                                        ("write_ms", "csr_k25_write_s"),
-                                        ("pack_ms", "csr_k25_pack_s"),
-                                        ("sort_ms", "csr_k25_sort_s"),
-                                        ("reduce_ms", "csr_k25_reduce_s"),
-                                        ("rle_ms", "csr_k25_rle_s"),
-                                        ("indptr_ms", "csr_k25_indptr_s"),
-                                        ("unpack_ms", "csr_k25_unpack_s"),
-                                        ("sync_overhead_ms", "csr_k25_sync_overhead_s"),
-                                        ("bucket_ms", "csr_k25_bucket_s"),
-                                    )
-                                    for src_key, dst_key in stage_map:
-                                        ms_val = float(tile_profile.get(src_key, 0.0))
-                                        if ms_val != 0.0:
-                                            profile[dst_key] = profile.get(dst_key, 0.0) + (ms_val * 1.0e-3)
-                                    count_map = (
-                                        ("nnz_in", "csr_k25_nnz_in"),
-                                        ("nnz_out", "csr_k25_nnz_out"),
-                                        ("nrows", "csr_k25_nrows"),
-                                    )
-                                    for src_key, dst_key in count_map:
-                                        v = tile_profile.get(src_key)
-                                        if v is not None:
-                                            profile[dst_key] = profile.get(dst_key, 0.0) + float(v)
-                            break
-                        except RuntimeError as e:
-                            last_err = e
-                            err_s = str(e).lower()
-                            if (
-                                "exceeds output buffer capacity" in err_s
-                                or "output buffer capacity" in err_s
-                                or "capacity exceeds workspace max_nnz_in" in err_s
-                            ):
-                                cap *= 2
-                                if tile_slot is not None:
-                                    workspace._grow_csr_pipeline_slot(int(tile_idx) % int(pipeline_nslots), cap)
-                                    cap = int(tile_slot["cap"])
-                                    row_j_buf = tile_slot["row_j"]
-                                    row_k_buf = tile_slot["row_k"]
-                                    indptr_buf = tile_slot["indptr"]
-                                    indices_buf = tile_slot["indices"]
-                                    data_buf = tile_slot["data"]
-                                    overflow_buf = tile_slot["overflow"]
-                                    continue
-                                workspace._ensure_kernel25_workspace(max_nnz_in=cap)
-                                if workspace.cache_csr_tiles and int(workspace.j_tile) < int(workspace.ncsf):
-                                    workspace._tile_csr_row_j = cp.empty((cap,), dtype=cp.int32)
-                                    workspace._tile_csr_row_k = cp.empty((cap,), dtype=cp.int32)
-                                    workspace._tile_csr_indptr = cp.empty((cap + 1,), dtype=cp.int64)
-                                    workspace._tile_csr_indices = cp.empty((cap,), dtype=cp.int32)
-                                    workspace._tile_csr_data = cp.empty((cap,), dtype=workspace._csr_data_dtype)
-                                    workspace._tile_csr_overflow = cp.empty((1,), dtype=cp.int32)
-                                    workspace._tile_csr_capacity = cap
-                                    row_j_buf = workspace._tile_csr_row_j
-                                    row_k_buf = workspace._tile_csr_row_k
-                                    indptr_buf = workspace._tile_csr_indptr
-                                    indices_buf = workspace._tile_csr_indices
-                                    data_buf = workspace._tile_csr_data
-                                    overflow_buf = workspace._tile_csr_overflow
-                                    continue
-                                workspace._alloc_csr_buffers(capacity=cap)
-                                row_j_buf = workspace._csr_row_j
-                                row_k_buf = workspace._csr_row_k
-                                indptr_buf = workspace._csr_indptr
-                                indices_buf = workspace._csr_indices
-                                data_buf = workspace._csr_data
-                                overflow_buf = workspace._csr_overflow
-                                continue
-                            raise
-                    else:
-                        raise last_err  # type: ignore[misc]
+                    row_j_d, row_k_d, indptr_d, indices_d, data_d, nrows, nnz = _build_csr_tile_with_retry(
+                        workspace,
+                        cp=cp,
+                        j0=int(j0),
+                        j_count=int(j_count),
+                        stream_build=stream_build,
+                        check_overflow_tile=bool(check_overflow_tile),
+                        check_overflow_mode_tile=int(check_overflow_mode_tile),
+                        build_from_prefiltered_tasks=bool(build_from_prefiltered_tasks),
+                        pref_task_csf_d=pref_task_csf_d,
+                        pref_task_p_d=pref_task_p_d,
+                        pref_task_q_d=pref_task_q_d,
+                        tile_slot=tile_slot,
+                        pipeline_nslots=int(pipeline_nslots),
+                        tile_idx=int(tile_idx),
+                        profile=profile,
+                        kernel25_build_csr_from_tasks_deterministic_inplace_device_fn=kernel25_build_csr_from_tasks_deterministic_inplace_device_fn,
+                        kernel25_build_csr_from_jrs_allpairs_deterministic_inplace_device_fn=kernel25_build_csr_from_jrs_allpairs_deterministic_inplace_device_fn,
+                    )
 
                     if (
                         workspace.cache_csr_tiles
