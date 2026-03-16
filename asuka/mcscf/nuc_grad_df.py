@@ -3897,6 +3897,7 @@ def casscf_nuc_grad_df_per_root(
     solver_kwargs: dict[str, Any] | None = None,
     z_tol: float = 1e-10,
     z_maxiter: int = 200,
+    grad_roots: Sequence[int] | None = None,
 ) -> DFNucGradMultirootResult:
     """Per-root DF-based nuclear gradients for SA-CASSCF with CP-MCSCF response.
 
@@ -3959,6 +3960,13 @@ def casscf_nuc_grad_df_per_root(
         Solve all per-root Z-vectors as a single batched system (faster
         via shared Krylov recycling).  Set to ``0`` to fall back to the
         sequential per-root solve.
+
+    grad_roots : sequence of int or None, default ``None``
+        If given, only compute gradients for the listed root indices.
+        Roots not in the list get a zero gradient in the output array.
+        This saves the Z-vector solve + DF contraction cost for skipped
+        roots, which is useful in dynamics when only the active state
+        gradient is needed.  ``None`` means compute all roots.
     """
     from contextlib import contextmanager, nullcontext  # noqa: PLC0415
     import os  # noqa: PLC0415
@@ -4017,6 +4025,15 @@ def casscf_nuc_grad_df_per_root(
     weights = normalize_weights(getattr(casscf, "root_weights", None), nroots=nroots)
     ci_list = ci_as_list(getattr(casscf, "ci"), nroots=nroots)
     e_roots = np.asarray(getattr(casscf, "e_roots"), dtype=np.float64).ravel()
+
+    # Resolve grad_roots mask: set of root indices that need actual gradient computation.
+    if grad_roots is not None:
+        _grad_roots_set: set[int] = {int(r) for r in grad_roots}
+        for r in _grad_roots_set:
+            if r < 0 or r >= nroots:
+                raise ValueError(f"grad_roots contains invalid root index {r} (nroots={nroots})")
+    else:
+        _grad_roots_set = set(range(nroots))
 
     if nroots > 1:
         w_arr = np.asarray(weights, dtype=np.float64).ravel()
@@ -5268,8 +5285,11 @@ def casscf_nuc_grad_df_per_root(
     if _z_batch_enabled:
         _rhs_orb_all: list[np.ndarray] = []
         _rhs_ci_all: list[list[np.ndarray]] = []
+        _batch_root_indices: list[int] = []  # maps batch index -> root index
         _rhs_ci_zeros = [np.zeros_like(np.asarray(ci_list[r], dtype=np.float64).ravel()) for r in range(int(nroots))]
         for K in range(nroots):
+            if int(K) not in _grad_roots_set:
+                continue
             _flush_gpu_pool()
             _log_vram(f"root {K} rhs start")
             t0 = time.perf_counter()
@@ -5328,10 +5348,11 @@ def casscf_nuc_grad_df_per_root(
             rhs_ci[K] = rhs_ci_K[:ndet_K]
             _rhs_orb_all.append(rhs_orb)
             _rhs_ci_all.append(rhs_ci)
+            _batch_root_indices.append(int(K))
 
         t0 = time.perf_counter()
         _gcrotmk_k = int(_z_recycle_max) if (_z_method == "gcrotmk" and _z_recycle_max > 0) else None
-        _x0_list = [None for _ in range(int(nroots))]
+        _x0_list = [None for _ in range(len(_rhs_orb_all))]
         if _z_use_x0 and _z_prev_x0 is not None:
             _x0_list[0] = np.asarray(_z_prev_x0, dtype=np.float64).ravel()
         z_batch = solve_mcscf_zvector_batch(
@@ -5350,7 +5371,10 @@ def casscf_nuc_grad_df_per_root(
             shared_recycle=True,
             chain_x0=bool(_z_use_x0),
         )
-        _z_results_by_root = list(z_batch.results)
+        # Map batch results back to root indices (None for skipped roots).
+        _z_results_by_root: list[Any] = [None] * int(nroots)
+        for _bi, _ri in enumerate(_batch_root_indices):
+            _z_results_by_root[_ri] = z_batch.results[_bi]
         if _z_recycle_space is not None and _z_recycle_max > 0 and len(_z_recycle_space) > _z_recycle_max:
             del _z_recycle_space[:-int(_z_recycle_max)]
         if _profile_df_per_root:
@@ -5368,6 +5392,8 @@ def casscf_nuc_grad_df_per_root(
         if _mixed_policy_active:
             _gcrotmk_k = int(_z_recycle_max) if (_z_method == "gcrotmk" and _z_recycle_max > 0) else None
             for K in range(int(nroots)):
+                if _z_results_by_root[K] is None:
+                    continue
                 _z_cur = _z_results_by_root[K]
                 _res_rel = float(_z_cur.info.get("residual_rel", np.inf))
                 _needs_fp64_fallback = bool(
@@ -5413,7 +5439,7 @@ def casscf_nuc_grad_df_per_root(
         # only the bad roots with GMRES (fp64, epq_blocked).  Good roots keep their
         # GCROTMK solutions untouched.
         if bool(_z_guard_enabled) and _z_results_by_root is not None:
-            bad_roots = [int(K) for K in range(int(nroots)) if _zvector_guard_bad(_z_results_by_root[int(K)])]
+            bad_roots = [int(K) for K in _grad_roots_set if _zvector_guard_bad(_z_results_by_root[int(K)])]
             if bad_roots:
                 if str(_z_method) != "gcrotmk":
                     raise RuntimeError(
@@ -5470,7 +5496,7 @@ def casscf_nuc_grad_df_per_root(
         if _z_results_by_root is not None:
             _unconverged_roots = [
                 int(K) for K, zr in enumerate(_z_results_by_root)
-                if not bool(getattr(zr, "converged", True))
+                if zr is not None and not bool(getattr(zr, "converged", True))
             ]
             if _unconverged_roots:
                 warnings.warn(
@@ -5482,7 +5508,9 @@ def casscf_nuc_grad_df_per_root(
                 )
 
         if _z_use_x0 and _z_results_by_root:
-            _z_prev_x0 = np.asarray(_z_results_by_root[-1].z_packed, dtype=np.float64).ravel().copy()
+            _last_active = [zr for zr in _z_results_by_root if zr is not None]
+            if _last_active:
+                _z_prev_x0 = np.asarray(_last_active[-1].z_packed, dtype=np.float64).ravel().copy()
 
         # Debug: identify large live CuPy arrays *before* releasing Z-solve caches.
         # This helps track transient VRAM spikes caused by persistent work buffers.
@@ -5862,6 +5890,11 @@ def casscf_nuc_grad_df_per_root(
                     pass
 
     for K in range(nroots):
+        # Skip roots not in the requested grad_roots mask.
+        if int(K) not in _grad_roots_set:
+            grads_out[int(K)] = np.zeros((natm, 3), dtype=np.float64)
+            continue
+
         # Drain free CuPy blocks between roots so pool caching does not inflate
         # driver-visible VRAM and trigger avoidable OOM on small GPUs.
         _flush_gpu_pool()
@@ -6559,8 +6592,9 @@ def casscf_nuc_grad_df_per_root(
             bar_L_terms_contract = None
             de_df_delta_precomputed = None
 
-            # If the batch isn't full yet and we are not on the last root, continue building the next root.
-            if int(len(_batched_pending)) < int(_delta_batch_nbar) and int(K) < int(nroots) - 1:
+            # If the batch isn't full yet and there are still active roots after K, continue accumulating.
+            _last_active_root = max(_grad_roots_set)
+            if int(len(_batched_pending)) < int(_delta_batch_nbar) and int(K) < int(_last_active_root):
                 continue
 
             _pending_batch = list(_batched_pending)

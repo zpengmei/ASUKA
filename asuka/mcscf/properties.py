@@ -99,12 +99,185 @@ class SACASSCFPropertiesResult:
         return -self.grads
 
 
+_VALID_GRAD_BACKENDS = {"auto", "df", "dense", "direct", "direct_df", "thc"}
+
+# Both "dense" (precomputed ao_eri) and "direct" (on-the-fly 4c via
+# direct_jk_ctx) use the same gradient driver (nuc_grad_direct) which
+# always computes ERI derivatives on-the-fly.  We canonicalise both to
+# "_4c" internally so the dispatcher has a single code-path.
+_4C = "_4c"  # internal sentinel — not user-facing
+
+
+def _resolve_grad_backend(
+    grad_backend: str,
+    scf_out: Any,
+) -> str:
+    """Resolve *grad_backend* to a canonical value.
+
+    Returns one of ``"df"``, ``"_4c"``, ``"direct_df"``, ``"thc"``.
+
+    Mapping
+    -------
+    - ``"df"``        → DF 3-centre derivative contractions (needs ``scf_out.df_B``).
+    - ``"dense"``     → 4-centre ERI derivative path (precomputed ``ao_eri``).
+    - ``"direct"``    → 4-centre ERI derivative path (integral-direct ``direct_jk_ctx``).
+    - ``"direct_df"`` → DF gradient with on-the-fly ``df_B`` materialisation
+                         (for ``direct_df`` SCF results that have ``df_L`` but no ``df_B``).
+    - ``"thc"``       → THC gradient (needs ``scf_out.thc_factors``).
+    - ``"auto"``      → Detect from ``scf_out.two_e_backend`` and available tensors.
+    """
+    grad_backend = str(grad_backend).strip().lower()
+
+    if grad_backend in ("dense", "direct"):
+        return _4C
+    if grad_backend in ("df", "direct_df", "thc"):
+        return grad_backend
+    if grad_backend != "auto":
+        raise ValueError(
+            f"grad_backend must be one of {sorted(_VALID_GRAD_BACKENDS)}, got {grad_backend!r}"
+        )
+
+    # ── auto-detect ──────────────────────────────────────────────────────────
+    two_e = str(getattr(scf_out, "two_e_backend", "") or "").strip().lower()
+
+    if two_e == "direct_df":
+        return "direct_df"
+    if two_e in ("direct", "dense") or getattr(scf_out, "direct_jk_ctx", None) is not None:
+        return _4C
+    if getattr(scf_out, "thc_factors", None) is not None and getattr(scf_out, "df_B", None) is None:
+        return "thc"
+    return "df"
+
+
+def _ensure_df_B(scf_out: Any) -> Any:
+    """Return *scf_out* with ``df_B`` materialised if it was ``None``.
+
+    ``direct_df`` SCF results store only the Cholesky factor ``df_L`` to avoid
+    the O(nao^2 * naux) memory footprint during the SCF iterations.  The DF
+    gradient path, however, needs the full ``df_B`` tensor.  This helper builds
+    it on-the-fly and attaches it to ``scf_out`` (mutating in-place for
+    subsequent calls).
+    """
+    if getattr(scf_out, "df_B", None) is not None:
+        return scf_out
+
+    ao_basis = getattr(scf_out, "ao_basis", None)
+    aux_basis = getattr(scf_out, "aux_basis", None)
+    df_L = getattr(scf_out, "df_L", None)
+    if ao_basis is None or aux_basis is None or df_L is None:
+        raise ValueError(
+            "direct_df grad_backend requires scf_out to have ao_basis, aux_basis, and df_L "
+            "(Cholesky factor) so that df_B can be materialised for the DF gradient."
+        )
+
+    mol = getattr(scf_out, "mol", None)
+    is_sph = mol is not None and not bool(getattr(mol, "cart", True))
+    ao_rep = "sph" if is_sph else "cart"
+
+    try:
+        import cupy as cp  # type: ignore[import-not-found]
+        _has_gpu = cp is not None
+    except Exception:
+        _has_gpu = False
+
+    if _has_gpu:
+        from asuka.integrals.cueri_df import build_df_B_from_cueri_packed_bases  # noqa: PLC0415
+
+        B, _L = build_df_B_from_cueri_packed_bases(
+            ao_basis,
+            aux_basis,
+            layout="mnQ",
+            ao_rep=ao_rep,
+            return_L=True,
+        )
+    else:
+        from asuka.integrals.cueri_df_cpu import build_df_B_from_cueri_packed_bases_cpu  # noqa: PLC0415
+
+        B = build_df_B_from_cueri_packed_bases_cpu(
+            ao_basis,
+            aux_basis,
+            layout="mnQ",
+            ao_rep=ao_rep,
+        )
+
+    # Try packed Qp layout for GPU path.
+    try:
+        import cupy as _cp  # type: ignore[import-not-found]
+        from asuka.integrals.df_packed_s2 import ao_packed_s2_enabled, pack_B_to_Qp  # noqa: PLC0415
+
+        if isinstance(B, _cp.ndarray) and B.ndim == 3 and ao_packed_s2_enabled():
+            int1e = getattr(scf_out, "int1e", None)
+            nao = int(int1e.S.shape[0]) if int1e is not None else int(B.shape[0])
+            B = pack_B_to_Qp(B, layout="mnQ", nao=nao)
+    except Exception:
+        pass
+
+    # Attach to scf_out for reuse.
+    try:
+        scf_out.df_B = B
+    except (AttributeError, TypeError):
+        # Frozen dataclass — wrap in a simple namespace.
+        import types  # noqa: PLC0415
+        ns = types.SimpleNamespace(**{k: getattr(scf_out, k) for k in dir(scf_out) if not k.startswith("_")})
+        ns.df_B = B
+        return ns
+
+    return scf_out
+
+
+def _dispatch_per_root_grad(
+    grad_backend: str,
+    scf_out: Any,
+    casscf: Any,
+    *,
+    grad_roots: Sequence[int] | None,
+    z_tol: float,
+    z_maxiter: int,
+    grad_kwargs: dict[str, Any],
+) -> Any:
+    """Call the appropriate per-root gradient function for *grad_backend*."""
+    resolved = _resolve_grad_backend(grad_backend, scf_out)
+
+    common = dict(
+        z_tol=float(z_tol),
+        z_maxiter=int(z_maxiter),
+        grad_roots=grad_roots,
+    )
+
+    if resolved == _4C:
+        from asuka.mcscf.nuc_grad_direct import casscf_nuc_grad_direct_per_root  # noqa: PLC0415
+
+        kw = {**common, **grad_kwargs}
+        for _k in ("df_backend", "int1e_contract_backend", "df_threads"):
+            kw.pop(_k, None)
+        return casscf_nuc_grad_direct_per_root(scf_out, casscf, **kw)
+
+    if resolved == "thc":
+        from asuka.mcscf.nuc_grad_thc import casscf_nuc_grad_thc_per_root  # noqa: PLC0415
+
+        kw = {**common, **grad_kwargs}
+        for _k in ("df_backend", "direct_eri_deriv_backend"):
+            kw.pop(_k, None)
+        return casscf_nuc_grad_thc_per_root(scf_out, casscf, **kw)
+
+    if resolved == "direct_df":
+        scf_out = _ensure_df_B(scf_out)
+
+    # DF path (also handles direct_df after df_B materialisation)
+    from asuka.mcscf.nuc_grad_df import casscf_nuc_grad_df_per_root  # noqa: PLC0415
+
+    kw = {**common, **grad_kwargs}
+    return casscf_nuc_grad_df_per_root(scf_out, casscf, **kw)
+
+
 def sacasscf_properties(
     scf_out: Any,
     casscf: Any,
     *,
     compute_grads: bool = True,
     compute_nacvs: bool = False,
+    grad_roots: Sequence[int] | None = None,
+    grad_backend: Literal["auto", "df", "dense", "direct", "direct_df", "thc"] = "auto",
     nacv_pairs: Sequence[tuple[int, int]] | None = None,
     mult_ediff: bool = False,
     use_etfs: bool = False,
@@ -119,21 +292,38 @@ def sacasscf_properties(
 ) -> SACASSCFPropertiesResult:
     """Compute SA-CASSCF energies, per-root forces, and NACVs in one call.
 
-    This is a convenience wrapper around :func:`casscf_nuc_grad_df_per_root`
-    and :func:`sacasscf_nonadiabatic_couplings_df`.  It collects all
-    quantities needed for non-adiabatic molecular dynamics into a single
-    :class:`SACASSCFPropertiesResult`.
+    This is a convenience wrapper around the per-root gradient and NACV
+    drivers.  It collects all quantities needed for non-adiabatic molecular
+    dynamics into a single :class:`SACASSCFPropertiesResult`.
 
     Parameters
     ----------
     scf_out
-        DF-SCF result (provides DF tensors, ``mol``, etc.).
+        SCF result object (provides DF tensors / direct JK context / THC factors).
     casscf
         SA-CASSCF result (``mo_coeff``, ``ci``, ``e_roots``, etc.).
     compute_grads : bool, default ``True``
         Whether to compute per-root nuclear gradients.
-    compute_nacvs : bool, default ``True``
+    compute_nacvs : bool, default ``False``
         Whether to compute non-adiabatic coupling vectors.
+    grad_roots : sequence of int or None, default ``None``
+        If given, only compute gradients for the listed root indices.
+        Skipped roots get zero gradients.  Useful in dynamics when only
+        the active-state gradient is needed (e.g. ``grad_roots=[1]``
+        for 3 states computes only root 1's gradient).
+    grad_backend : str, default ``"auto"``
+        Two-electron integral backend for per-root gradients.  Mirrors the
+        SCF-level ``two_e_backend`` vocabulary.
+
+        - ``"df"``        — DF 3-centre derivative contractions (requires ``scf_out.df_B``).
+        - ``"direct"``    — On-the-fly 4-centre ERI derivatives (requires
+                            ``scf_out.direct_jk_ctx``).
+        - ``"dense"``     — 4-centre ERI derivatives from precomputed ERIs (requires
+                            ``scf_out.ao_eri`` or ``scf_out.direct_jk_ctx``).
+        - ``"direct_df"`` — DF gradient path with on-the-fly ``df_B`` materialisation
+                            (for ``direct_df`` SCF results that store only ``df_L``).
+        - ``"thc"``       — Tensor hypercontraction (requires ``scf_out.thc_factors``).
+        - ``"auto"``      — Detect from ``scf_out.two_e_backend`` and available tensors.
     nacv_pairs : list of (bra, ket) pairs, optional
         State pairs for NACVs.  ``None`` computes all off-diagonal pairs.
     mult_ediff : bool, default ``False``
@@ -142,9 +332,9 @@ def sacasscf_properties(
     use_etfs : bool, default ``False``
         Include electron-translation-factor corrections to NACVs.
     df_backend : ``"cpu"``, ``"cuda"``, or ``"auto"``, default ``"auto"``
-        Backend for DF 2e derivative contractions.  ``"auto"`` detects from
-        ``scf_out``: uses ``"cuda"`` if the DF tensor is a CuPy array,
-        otherwise ``"cpu"``.
+        Device backend for DF 2e derivative contractions (only used when
+        ``grad_backend="df"``).  ``"auto"`` detects from ``scf_out``:
+        uses ``"cuda"`` if the DF tensor is a CuPy array, otherwise ``"cpu"``.
     int1e_backend : ``"auto"``, ``"cpu"``, or ``"cuda"``, default ``"auto"``
         Backend for 1e AO derivative contractions (hcore, overlap).
         ``"auto"`` picks CUDA fused kernels when available, CPU otherwise.
@@ -157,7 +347,7 @@ def sacasscf_properties(
     nacv_response_term : ``"split_orbfd"`` or ``"fd_jacobian"``, default ``"split_orbfd"``
         Response backend for NACVs.
     grad_kwargs : dict, optional
-        Extra keyword arguments forwarded to :func:`casscf_nuc_grad_df_per_root`.
+        Extra keyword arguments forwarded to the per-root gradient driver.
     nacv_kwargs : dict, optional
         Extra keyword arguments forwarded to :func:`sacasscf_nonadiabatic_couplings_df`.
 
@@ -182,14 +372,13 @@ def sacasscf_properties(
     >>> res.forces         # (3, natm, 3) forces
     >>> res.nacvs          # (3, 3, natm, 3) NACVs
     """
-    from asuka.mcscf.nuc_grad_df import casscf_nuc_grad_df_per_root
     from asuka.mcscf.nac._df import sacasscf_nonadiabatic_couplings_df
     from asuka.mcscf.state_average import normalize_weights
 
-    grad_kwargs = dict(grad_kwargs or {})
+    grad_kwargs_use = dict(grad_kwargs or {})
     nacv_kwargs = dict(nacv_kwargs or {})
 
-    # ── resolve df_backend ───────────────────────────────────────────────────
+    # ── resolve df_backend (device selector for DF path) ─────────────────────
     if str(df_backend) == "auto":
         try:
             import cupy as cp  # type: ignore[import-not-found]
@@ -224,15 +413,21 @@ def sacasscf_properties(
     grads: np.ndarray | None = None
     grad_sa: np.ndarray | None = None
     if compute_grads:
-        _grad_result = casscf_nuc_grad_df_per_root(
-            scf_out,
-            casscf,
-            df_backend=df_backend,
-            int1e_contract_backend=int1e_backend,
-            df_threads=df_threads,
+        # Inject df_backend / int1e_backend / df_threads into grad_kwargs for
+        # the DF path; they are harmlessly stripped for direct/THC paths.
+        _gk = dict(grad_kwargs_use)
+        _gk.setdefault("df_backend", df_backend)
+        _gk.setdefault("int1e_contract_backend", int1e_backend)
+        _gk.setdefault("df_threads", df_threads)
+
+        _grad_result = _dispatch_per_root_grad(
+            grad_backend=str(grad_backend),
+            scf_out=scf_out,
+            casscf=casscf,
+            grad_roots=grad_roots,
             z_tol=z_tol,
             z_maxiter=z_maxiter,
-            **grad_kwargs,
+            grad_kwargs=_gk,
         )
         grads = _materialize_array(_grad_result.grads, dtype=np.float64)
         grad_sa = _materialize_array(_grad_result.grad_sa, dtype=np.float64)

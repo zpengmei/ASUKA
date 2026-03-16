@@ -2411,6 +2411,7 @@ def _casscf_nuc_grad_thc_per_root_impl(
     solver_kwargs: dict[str, Any] | None = None,
     z_tol: float = 1e-10,
     z_maxiter: int = 200,
+    grad_roots: Sequence[int] | None = None,
 ) -> THCNucGradMultirootResult:
     """Per-root analytic gradients for SA-CASSCF with THC / local-THC integrals."""
 
@@ -2566,11 +2567,23 @@ def _casscf_nuc_grad_thc_per_root_impl(
         )
     n_orb = int(hess_op.n_orb)
 
+    # Resolve grad_roots mask.
+    if grad_roots is not None:
+        _grad_roots_set: set[int] = {int(r) for r in grad_roots}
+        for r in _grad_roots_set:
+            if r < 0 or r >= nroots:
+                raise ValueError(f"grad_roots contains invalid root index {r} (nroots={nroots})")
+    else:
+        _grad_roots_set = set(range(int(nroots)))
+
     grads_out: list[np.ndarray] = []
     if int(nroots) == 1:
         grads_out.append(np.asarray(grad_sa_base, dtype=np.float64))
     else:
         for K in range(int(nroots)):
+            if int(K) not in _grad_roots_set:
+                grads_out.append(np.zeros((natm, 3), dtype=np.float64))
+                continue
             dm1_K, dm2_K = per_root_rdms[K]
             gfock_K, D_core_K, D_act_K, D_tot_K, C_act_K = _build_gfock_casscf_thc(
                 scf_out,
@@ -2797,6 +2810,7 @@ def casscf_nuc_grad_thc_per_root(
     solver_kwargs: dict[str, Any] | None = None,
     z_tol: float = 1e-10,
     z_maxiter: int = 200,
+    grad_roots: Sequence[int] | None = None,
 ) -> THCNucGradMultirootResult:
     """Per-root analytic gradients for SA-CASSCF with THC / local-THC integrals."""
 
@@ -2815,6 +2829,7 @@ def casscf_nuc_grad_thc_per_root(
         solver_kwargs=solver_kwargs,
         z_tol=z_tol,
         z_maxiter=z_maxiter,
+        grad_roots=grad_roots,
     )
 
 

@@ -229,29 +229,31 @@ casscf_ref = run_casscf(
     backend="cuda", df=True,
 )   # CAS(10,8), ~9.3s on RTX 4090
 
-sci_solver = GUGASCISolver(
-    max_ncsf=5000,               # grow until ~5000 CSFs are selected
-    grow_by=2000,                # add up to 2000 CSFs per CIPSI macro-step
-    selection_mode="heat_bath",  # fast GPU heat-bath screening
-    backend="auto",              # auto-selects CUDA kernel when GPU available
-)
+def make_sci_solver():
+    return GUGASCISolver(
+        max_ncsf=5000,               # grow until ~5000 CSFs are selected
+        grow_by=2000,                # add up to 2000 CSFs per CIPSI macro-step
+        selection_mode="heat_bath",  # fast GPU heat-bath screening
+        backend="auto",              # auto-selects CUDA kernel when GPU available
+    )
 
 # Step 2a: CAS(18,18) — 449M CSFs, ncore=2 (freeze 2 innermost orbitals)
 casci_18 = run_casci_df(
     scf_out,
     ncore=2, ncas=18, nelecas=18,
     mo_coeff=casscf_ref.mo_coeff,
-    fcisolver=sci_solver,
-)   # ~4.6s on RTX 4090 (10 CIPSI iterations, 256→4884 CSFs, CASSCF MOs)
+    fcisolver=make_sci_solver(),
+)   # ~5.0s on RTX 4090 (10 CIPSI iterations, 256→4884 CSFs, CASSCF MOs)
 print(f"CAS(18,18) SCI: {casci_18.e_tot:.6f} Eh")
 
 # Step 2b: CAS(22,22) — 79.5B CSFs, ncore=0 (full-valence, no frozen electrons)
+# Use a fresh GUGASCISolver — do not reuse the CAS(18,18) solver (solver state is active-space specific)
 casci_22 = run_casci_df(
     scf_out,
     ncore=0, ncas=22, nelecas=22,
     mo_coeff=casscf_ref.mo_coeff,
-    fcisolver=sci_solver,
-)
+    fcisolver=make_sci_solver(),
+)   # ~9.4s on RTX 4090
 print(f"CAS(22,22) SCI: {casci_22.e_tot:.6f} Eh")
 ```
 
@@ -259,20 +261,20 @@ print(f"CAS(22,22) SCI: {casci_22.e_tot:.6f} Eh")
 
 | Method | MOs | ncsf | E (Eh) | Wall time |
 |---|---|---|---|---|
-| RHF | — | — | −187.512354 | 0.55s |
-| CASSCF(10,8) | — | exact | −187.660573 | 9.3s |
-| CAS(18,18) SCI, nsel = 4884 | HF | 449M | −187.668836 | 4.4s |
-| CAS(18,18) SCI, nsel = 4884 | CASSCF | 449M | −187.715433 | 4.6s |
-| CAS(22,22) SCI, nsel = 4884 | HF | 79.5B | −187.710801 | 7.1s |
-| CAS(22,22) SCI, nsel = 4884 | CASSCF | 79.5B | −187.725327 | 7.9s |
+| RHF | — | — | −187.512360 | 0.72s |
+| CASSCF(10,8) | — | exact | −187.637988 | 14.9s |
+| CAS(18,18) SCI, nsel = 4884 | HF | 449M | −187.670281 | 4.7s |
+| CAS(18,18) SCI, nsel = 4884 | CASSCF | 449M | −187.701628 | 5.0s |
+| CAS(22,22) SCI, nsel = 4884 | HF | 79.5B | −187.711750 | 7.4s |
+| CAS(22,22) SCI, nsel = 4884 | CASSCF | 79.5B | −187.722832 | 9.4s |
 
 CAS(22,22) is the full-valence active space for CO₂ — all 22 electrons active, ncore=0.
 Its 79.5-billion-CSF space would require **636 GB** to store the dense CI vector; SCI retains
 only ~5000 selected CSFs (~300 KB) regardless of the total space size.
 
-**The CAS(22,22) run is only 1.7× slower than CAS(18,18) despite having 177× more CSFs.**
+**The CAS(22,22) run is only 1.6× slower than CAS(18,18) despite having 177× more CSFs.**
 Wall time scales with the selected-space size (nsel) and norb, not with ncsf.
-CASSCF-optimized MOs lower the CAS(18,18) energy by 46.6 mEh and CAS(22,22) by 14.5 mEh
+CASSCF-optimized MOs lower the CAS(18,18) energy by 31.3 mEh and CAS(22,22) by 11.1 mEh
 compared to raw HF MOs — demonstrating the value of the two-step workflow.
 
 `GUGASCISolver` accepts the same `fcisolver=` slot as the standard `GUGAFCISolver` and is
@@ -464,6 +466,67 @@ res.grad_sa                  # (natm, 3) SA gradient
 res.ci        # (nroots, ncsf)      CI vectors in CSF basis
 res.mo_coeff  # (nao, nmo)          MO coefficients
 ```
+
+### Gradient backends
+
+`sacasscf_properties` supports multiple two-electron integral backends for per-root gradients via `grad_backend=`.
+This matches the SCF-level `two_e_backend` vocabulary:
+
+```python
+# DF (default) — density-fitted 3-centre derivative contractions
+res = sacasscf_properties(scf, mc, grad_backend="df", df_backend="cuda")
+
+# Direct — on-the-fly 4-centre ERI derivatives (no stored integrals)
+scf_direct = run_hf(mol, backend="cuda", two_e_backend="direct")
+mc_direct  = run_casscf(scf_direct, ..., backend="cuda")
+res = sacasscf_properties(scf_direct, mc_direct, grad_backend="direct")
+
+# Dense — precomputed 4-centre ERI derivatives (small basis only)
+scf_dense = run_hf(mol, backend="cuda", two_e_backend="dense")
+mc_dense  = run_casscf(scf_dense, ..., backend="cuda")
+res = sacasscf_properties(scf_dense, mc_dense, grad_backend="dense")
+
+# Direct-DF — DF gradient with on-the-fly B materialisation (no stored B tensor)
+scf_ddf = run_hf(mol, backend="cuda", two_e_backend="direct_df")
+mc_ddf  = run_casscf(scf_ddf, ..., backend="cuda")
+res = sacasscf_properties(scf_ddf, mc_ddf, grad_backend="direct_df")
+
+# THC — tensor hypercontraction gradients
+scf_thc = run_hf(mol, backend="cuda", two_e_backend="thc")
+mc_thc  = run_casscf(scf_thc, ..., backend="cuda")
+res = sacasscf_properties(scf_thc, mc_thc, grad_backend="thc")
+
+# Auto (default) — detect from scf_out.two_e_backend
+res = sacasscf_properties(scf, mc)
+```
+
+| `grad_backend` | Gradient path | Requires | Notes |
+|---|---|---|---|
+| `"df"` | DF 3-centre derivatives | `scf_out.df_B` | Default for DF-SCF |
+| `"direct"` | On-the-fly 4-centre ERI derivatives | `scf_out.direct_jk_ctx` | No stored integrals |
+| `"dense"` | 4-centre ERI derivatives | `scf_out.ao_eri` or `direct_jk_ctx` | Precomputed ERIs |
+| `"direct_df"` | DF gradient, `df_B` built on-the-fly | `df_L` + `ao_basis` + `aux_basis` | For `direct_df` SCF |
+| `"thc"` | THC derivative contractions | `scf_out.thc_factors` | For THC-SCF |
+| `"auto"` | Detect from `scf_out` | — | Default |
+
+The `df_backend` parameter (`"cpu"` / `"cuda"` / `"auto"`) selects the *device* for DF contractions and is only relevant for the `"df"` and `"direct_df"` gradient paths.
+
+### Selective root gradients
+
+In dynamics only the active-state gradient is typically needed. Use `grad_roots=` to skip the
+Z-vector solve and derivative contractions for unneeded roots:
+
+```python
+# Only compute gradient for root 1 (skips ~2/3 of the work for 3 states)
+res = sacasscf_properties(scf, mc, df_backend="cuda", grad_roots=[1])
+res.forces[1]  # actual gradient for root 1
+res.forces[0]  # zeros (skipped)
+res.forces[2]  # zeros (skipped)
+```
+
+`grad_roots=None` (default) computes all roots. `grad_roots` is supported on all gradient backends.
+
+### NACVs
 
 NACVs are opt-in (`compute_nacvs=False` by default) since they require an additional Z-vector solve per state pair:
 

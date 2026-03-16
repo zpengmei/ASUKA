@@ -2075,6 +2075,8 @@ def sacasscf_nonadiabatic_couplings_df(
                     M=tm1,
                     shell_atom=shell_atom_ref,
                 )
+            # CSF overlap term: (E_bra - E_ket) * nac_csf_raw, added to the
+            # Hamiltonian derivative numerator (matches PySCF convention).
             ham = np.asarray(ham, dtype=np.float64) + np.asarray(nac_csf * ediff, dtype=np.float64)
         pair_timing["csf_term"] = float(time.perf_counter() - t0)
 

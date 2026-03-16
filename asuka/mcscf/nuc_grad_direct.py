@@ -300,6 +300,7 @@ def casscf_nuc_grad_direct_per_root(
     solver_kwargs: dict[str, Any] | None = None,
     z_tol: float = 1e-10,
     z_maxiter: int = 200,
+    grad_roots: Sequence[int] | None = None,
 ) -> DFNucGradMultirootResult:
     """Per-root exact direct-backend SA-CASSCF nuclear gradients."""
 
@@ -433,11 +434,23 @@ def casscf_nuc_grad_direct_per_root(
     )
     n_orb = int(hess_op.n_orb)
 
+    # Resolve grad_roots mask.
+    if grad_roots is not None:
+        _grad_roots_set: set[int] = {int(r) for r in grad_roots}
+        for r in _grad_roots_set:
+            if r < 0 or r >= nroots:
+                raise ValueError(f"grad_roots contains invalid root index {r} (nroots={nroots})")
+    else:
+        _grad_roots_set = set(range(int(nroots)))
+
     grads_out: list[np.ndarray] = []
     if int(nroots) == 1:
         grads_out.append(np.asarray(grad_sa_base, dtype=np.float64))
     else:
         for k in range(int(nroots)):
+            if int(k) not in _grad_roots_set:
+                grads_out.append(np.zeros((natm, 3), dtype=np.float64))
+                continue
             dm1_k, dm2_k = per_root_rdms[k]
             grad_static_k = _compute_unrelaxed_casscf_gradient_dense(
                 ao_basis=getattr(scf_out, "ao_basis"),
