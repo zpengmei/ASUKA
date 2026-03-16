@@ -104,9 +104,9 @@ from asuka.cuda._backend_hop_runtime import (
     resolve_x_tile_skip_policy as _resolve_x_tile_skip_policy_runtime,
     set_matvec_path_profile as _set_matvec_path_profile_runtime,
     try_cuda_graph_fast_path as _try_cuda_graph_fast_path_runtime,
-    run_one_body_phase as _run_one_body_phase_runtime,
-    run_epq_blocked_aggregate_path as _run_epq_blocked_aggregate_path_runtime,
-    run_per_tile_csr_path as _run_per_tile_csr_path_runtime,
+)
+from asuka.cuda._backend_hop_blocked_runtime import (
+    run_blocked_hop_path as _run_blocked_hop_path_runtime,
 )
 from asuka.cuguga.drt import DRT
 from asuka.cuguga.epq.action import epq_apply_g, epq_contribs_one, path_nodes
@@ -10617,72 +10617,7 @@ class GugaMatvecEriMatWorkspace:
                 apply_g_flat_scatter_atomic_epq_table_tile_inplace_device_fn=apply_g_flat_scatter_atomic_epq_table_tile_inplace_device,
             )
 
-        t_total0 = time.perf_counter() if profile is not None else None
-
-        _ob = _run_one_body_phase_runtime(
-            self,
-            cp=cp,
-            x=x,
-            y=y,
-            h_eff_flat=h_eff_flat,
-            stream=stream,
-            sync=bool(sync),
-            check_overflow=bool(check_overflow),
-            profile=profile,
-            use_fused_hop=bool(use_fused_hop),
-            use_aggregate_offdiag=bool(use_aggregate_offdiag),
-            use_epq_streaming=bool(use_epq_streaming),
-            epq_stream_panic_requested=bool(epq_stream_panic_requested),
-            epq_stream_panic_active=bool(epq_stream_panic_active),
-            path_mode=str(path_mode),
-            epq_table=self._epq_table,
-            build_epq_action_table_tile_device_fn=build_epq_action_table_tile_device,
-            apply_g_flat_scatter_atomic_inplace_device_fn=apply_g_flat_scatter_atomic_inplace_device,
-            apply_g_flat_scatter_atomic_epq_table_tile_inplace_device_fn=apply_g_flat_scatter_atomic_epq_table_tile_inplace_device,
-        )
-        _one_body_event = _ob["one_body_event"]
-
-        # EPQ-blocked aggregate guard
-        use_epq_agg_blocked = (
-            bool(use_aggregate_offdiag)
-            and self._epq_table is not None
-            and self._w_offdiag is None
-        )
-        if use_epq_agg_blocked and (not self._should_use_blocked_epq_transpose(self._epq_table, profile=profile)):
-            use_epq_agg_blocked = False
-            if profile is not None:
-                profile["epq_transpose_guard_fallback"] = profile.get("epq_transpose_guard_fallback", 0.0) + 1.0
-
-        if use_epq_agg_blocked:
-            return _run_epq_blocked_aggregate_path_runtime(
-                self,
-                cp=cp,
-                ext=_ext,
-                x=x,
-                y=y,
-                eri_mat_use=eri_mat_use,
-                l_full_use=l_full_use,
-                direct_op_use=direct_op_use,
-                use_df=bool(use_df),
-                use_direct=bool(use_direct),
-                h_eff_flat=h_eff_flat,
-                stream=stream,
-                sync=bool(sync),
-                check_overflow=bool(check_overflow),
-                profile=profile,
-                t_total0=t_total0,
-                one_body_event=_one_body_event,
-                epq_table=self._epq_table,
-                build_epq_action_table_transpose_device_fn=build_epq_action_table_transpose_device,
-                build_w_from_epq_transpose_range_inplace_device_fn=build_w_from_epq_transpose_range_inplace_device,
-                apply_g_flat_gather_epq_transpose_range_inplace_device_fn=apply_g_flat_gather_epq_transpose_range_inplace_device,
-                sym_pair_pack_inplace_device_fn=sym_pair_pack_inplace_device,
-                sym_pair_unpack_inplace_device_fn=sym_pair_unpack_inplace_device,
-                has_sym_pair_fused_kernels_fn=has_sym_pair_fused_kernels,
-                Kernel3BuildGDFWorkspace_cls=Kernel3BuildGDFWorkspace,
-            )
-
-        return _run_per_tile_csr_path_runtime(
+        return _run_blocked_hop_path_runtime(
             self,
             cp=cp,
             ext=_ext,
@@ -10700,16 +10635,25 @@ class GugaMatvecEriMatWorkspace:
             sync=bool(sync),
             check_overflow=bool(check_overflow),
             profile=profile,
-            t_total0=t_total0,
-            one_body_event=_one_body_event,
             use_fused_hop=bool(use_fused_hop),
             use_epq_streaming=bool(use_epq_streaming),
             use_epq_streaming_tiles=bool(use_epq_streaming_tiles),
+            epq_stream_panic_requested=bool(epq_stream_panic_requested),
             epq_stream_panic_active=bool(epq_stream_panic_active),
+            path_mode=str(path_mode),
             epq_table=self._epq_table,
+            # One-body function injections
             build_epq_action_table_tile_device_fn=build_epq_action_table_tile_device,
             apply_g_flat_scatter_atomic_inplace_device_fn=apply_g_flat_scatter_atomic_inplace_device,
             apply_g_flat_scatter_atomic_epq_table_tile_inplace_device_fn=apply_g_flat_scatter_atomic_epq_table_tile_inplace_device,
+            # EPQ-blocked path function injections
+            build_epq_action_table_transpose_device_fn=build_epq_action_table_transpose_device,
+            build_w_from_epq_transpose_range_inplace_device_fn=build_w_from_epq_transpose_range_inplace_device,
+            apply_g_flat_gather_epq_transpose_range_inplace_device_fn=apply_g_flat_gather_epq_transpose_range_inplace_device,
+            sym_pair_pack_inplace_device_fn=sym_pair_pack_inplace_device,
+            sym_pair_unpack_inplace_device_fn=sym_pair_unpack_inplace_device,
+            has_sym_pair_fused_kernels_fn=has_sym_pair_fused_kernels,
+            # Per-tile CSR path function injections
             build_w_from_epq_table_inplace_device_fn=build_w_from_epq_table_inplace_device,
             build_occ_block_from_steps_inplace_device_fn=build_occ_block_from_steps_inplace_device,
             kernel4_build_w_from_csr_unitnnz_inplace_device_fn=kernel4_build_w_from_csr_unitnnz_inplace_device,
@@ -10718,6 +10662,7 @@ class GugaMatvecEriMatWorkspace:
             kernel4_apply_csr_l_full_device_csr_inplace_device_fn=kernel4_apply_csr_l_full_device_csr_inplace_device,
             kernel25_build_csr_from_tasks_deterministic_inplace_device_fn=kernel25_build_csr_from_tasks_deterministic_inplace_device,
             kernel25_build_csr_from_jrs_allpairs_deterministic_inplace_device_fn=kernel25_build_csr_from_jrs_allpairs_deterministic_inplace_device,
+            # Shared
             Kernel3BuildGDFWorkspace_cls=Kernel3BuildGDFWorkspace,
         )
 
