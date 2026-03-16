@@ -1858,7 +1858,7 @@ def run_casscf_df(
             except Exception:
                 _cp_1s = None
             _force_cpu_1s = bool(xp is np)
-            _host_ah_1s = bool(_force_cpu_1s or int(nroots) > 1)
+            _host_ah_1s = bool(_force_cpu_1s)
 
             def _to_host_f64_1s(a: Any) -> np.ndarray:
                 if _cp_1s is not None and isinstance(a, _cp_1s.ndarray):

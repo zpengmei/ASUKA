@@ -151,7 +151,10 @@ def match_roots_by_overlap(prev: list[np.ndarray], cur: list[np.ndarray]) -> np.
             if _is_dmrg_state(pi):
                 O[i, j] = abs(float(pi.overlap(cur[j])))
             else:
-                O[i, j] = abs(float(np.dot(pi, cur[j])))
+                # Ensure both vectors are on the same device / backend.
+                pi_np = np.asarray(pi.get() if hasattr(pi, "get") else pi, dtype=np.float64).ravel()
+                cj_np = np.asarray(cur[j].get() if hasattr(cur[j], "get") else cur[j], dtype=np.float64).ravel()
+                O[i, j] = abs(float(np.dot(pi_np, cj_np)))
 
     try:
         from scipy.optimize import linear_sum_assignment  # type: ignore[import-not-found]  # noqa: PLC0415
@@ -200,7 +203,9 @@ def fix_ci_phases(prev: list[np.ndarray], cur: list[np.ndarray]) -> None:
             if ov < 0.0:
                 cur[i].flip_global_phase()
         else:
-            ov = float(np.dot(prev[i], cur[i]))
+            pi = np.asarray(prev[i].get() if hasattr(prev[i], "get") else prev[i], dtype=np.float64).ravel()
+            ci = np.asarray(cur[i].get() if hasattr(cur[i], "get") else cur[i], dtype=np.float64).ravel()
+            ov = float(np.dot(pi, ci))
             if ov < 0.0:
                 cur[i] *= -1.0
 
