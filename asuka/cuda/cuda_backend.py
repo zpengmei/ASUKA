@@ -10404,6 +10404,61 @@ class GugaMatvecEriMatWorkspace:
             dt = time.perf_counter() - t0
             profile["coo_scatter_s"] = profile.get("coo_scatter_s", 0.0) + dt
 
+    def _hop_via_controller(
+        self,
+        x,
+        *,
+        y=None,
+        stream=None,
+        sync: bool = True,
+        check_overflow: bool = True,
+        profile: dict[str, float] | None = None,
+    ):
+        """Delegate hop() to the GugaMatvecController + CudaGugaExecutor split.
+
+        Lazily creates the controller/executor pair on first call.  This path
+        is the minimal blocked-EPQ trunk — no fused-hop, no CSR tiling, no
+        cache layers.  It is intended as the first runnable backend for ROCm.
+        """
+        ctrl = getattr(self, "_controller", None)
+        # Invalidate if workspace integrals changed since controller was built.
+        if ctrl is not None:
+            _key = (id(self.eri_mat), id(self.l_full), id(self.h_eff_flat))
+            if _key != getattr(self, "_controller_integral_key", None):
+                ctrl = None
+        if ctrl is None:
+            from asuka.cuguga.matvec.controller import GugaMatvecController
+            from asuka.cuguga.matvec.cuda_executor import CudaGugaExecutor
+
+            executor = CudaGugaExecutor(
+                self.drt,
+                drt_dev=self.drt_dev,
+                state_dev=self.state_dev,
+                state_cache=self._state_cache,
+                eri_mat=self.eri_mat,
+                l_full=self.l_full,
+                h_eff=self.h_eff_flat,
+                dtype=self._dtype,
+                max_g_bytes=self.max_g_bytes,
+                threads_w=self.threads_w,
+                threads_apply=self.threads_apply,
+                epq_build_device=False,  # reuse existing table
+                gemm_backend=self.gemm_backend,
+                kahan_compensation=bool(getattr(self, "kahan_compensation", False)),
+            )
+            # Reuse the workspace's pre-built EPQ table instead of rebuilding.
+            executor._epq_table = self._epq_table
+            ctrl = GugaMatvecController(
+                executor, include_diagonal_rs=self.include_diagonal_rs,
+            )
+            self._controller = ctrl
+            self._controller_integral_key = (id(self.eri_mat), id(self.l_full), id(self.h_eff_flat))
+
+        return ctrl.hop(
+            x, y=y, stream=stream, sync=sync,
+            check_overflow=check_overflow, profile=profile,
+        )
+
     def hop(
         self,
         x,
@@ -10450,6 +10505,22 @@ class GugaMatvecEriMatWorkspace:
         use_aggregate_offdiag = bool(_hop_flags["use_aggregate_offdiag"])
 
         x = _normalize_hop_x_runtime(self, cp=cp, x=x)
+
+        # --- Controller delegation (opt-in) ---
+        # When ASUKA_MATVEC_USE_CONTROLLER=1, delegate the blocked-EPQ aggregate
+        # path to the new GugaMatvecController + CudaGugaExecutor split.  This is
+        # the minimal trunk with no fused-hop, no CSR, no cache layers — intended
+        # as the first runnable backend for ROCm / alternative accelerators.
+        if (
+            str(os.getenv("ASUKA_MATVEC_USE_CONTROLLER", "")).strip().lower() in ("1", "true", "yes")
+            and not use_fused_hop
+            and bool(use_aggregate_offdiag)
+            and self._epq_table is not None
+            and eri_mat is None  # no per-call ERI override
+            and h_eff is None   # no per-call h_eff override
+        ):
+            return self._hop_via_controller(x, y=y, stream=stream, sync=sync,
+                                            check_overflow=check_overflow, profile=profile)
 
         _graph = _try_cuda_graph_fast_path_runtime(
             self,
