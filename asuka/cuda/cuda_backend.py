@@ -91,6 +91,7 @@ from asuka.cuda._backend_hop_runtime import (
     increment_profile_counter as _increment_profile_counter_runtime,
     normalize_hop_x as _normalize_hop_x_runtime,
     prepare_hop_runtime_inputs as _prepare_hop_runtime_inputs_runtime,
+    run_fused_hop_path as _run_fused_hop_path_runtime,
     resolve_epq_table_for_tile as _resolve_epq_table_for_tile_runtime,
     resolve_epq_streaming_runtime as _resolve_epq_streaming_runtime,
     resolve_hop_runtime_flags as _resolve_hop_runtime_flags_runtime,
@@ -10598,234 +10599,22 @@ class GugaMatvecEriMatWorkspace:
         t_total0 = time.perf_counter() if profile is not None else None
 
         if use_fused_hop:
-            # Fused kernel computes both one-body and two-body contributions; start
-            # from a zeroed output and launch one tile kernel per j-range.
-            t0 = time.perf_counter() if profile is not None else None
-            cp.cuda.runtime.memsetAsync(
-                int(y.data.ptr),
-                0,
-                int(y.size) * int(y.itemsize),
-                int(stream.ptr),
-            )
-            if profile is not None and t0 is not None:
-                stream.synchronize()
-                profile["one_body_s"] = profile.get("one_body_s", 0.0) + (time.perf_counter() - t0)
-
-            # Check if Phase-1 + COO hybrid path is available.
-            # This path captures connectivity during Phase 1 DFS and uses a
-            # trivial COO scatter for Phase 2 — no EPQ table needed.
-            _panic_mode_str = str(getattr(self, "epq_stream_panic_mode", "off")).strip().lower()
-            _has_phase1_coo = bool(
-                _ext is not None
-                and hasattr(_ext, "fused_hop_phase1_coo_device")
-                and hasattr(_ext, "coo_scatter_device")
-            )
-            if path_mode == "fused_epq_hybrid":
-                _has_phase1_coo = False
-            # Legacy EPQ-based Phase-1 path (requires pre-built EPQ table).
-            _has_phase1 = bool(
-                _ext is not None
-                and hasattr(_ext, "fused_hop_phase1_device")
-                and _panic_mode_str != "on"
-                and self._epq_table is not None
-            ) and (not _has_phase1_coo)
-            if path_mode == "fused_coo":
-                _has_phase1 = False
-            g_tile = self._g_buf if (_has_phase1_coo or _has_phase1) else None
-            _set_matvec_path_profile_runtime(
+            return _run_fused_hop_path_runtime(
+                self,
+                cp=cp,
+                ext=_ext,
+                x=x,
+                y=y,
+                eri_mat_use=eri_mat_use,
+                h_eff_flat=h_eff_flat,
+                stream=stream,
+                sync=bool(sync),
+                check_overflow=bool(check_overflow),
                 profile=profile,
-                path_mode=path_mode,
-                effective_mode=(
-                    "fused_coo" if _has_phase1_coo else ("fused_epq_hybrid" if _has_phase1 else "fused_hop_fallback")
-                ),
-                fallback_reason=(
-                    ""
-                    if (_has_phase1_coo or _has_phase1)
-                    else str(getattr(self, "path_mode_fallback_reason", "fused_phase1_unavailable"))
-                ),
+                path_mode=str(path_mode),
+                build_epq_action_table_tile_device_fn=build_epq_action_table_tile_device,
+                apply_g_flat_scatter_atomic_epq_table_tile_inplace_device_fn=apply_g_flat_scatter_atomic_epq_table_tile_inplace_device,
             )
-
-            # Allocate COO buffers once (lazy) for the COO path.
-            if _has_phase1_coo and g_tile is not None:
-                # Conservative estimate: j_tile * n_offdiag_pairs * avg_connections
-                _n_offdiag = int(self.norb) * (int(self.norb) - 1)
-                _avg_conn = 20  # empirical average for CAS14
-                _max_coo = int(self.j_tile) * _n_offdiag * _avg_conn
-                self._ensure_coo_buffers(_max_coo)
-
-            _coo_overflow = False
-            for j0 in range(0, int(self.ncsf), int(self.j_tile)):
-                j1 = min(int(self.ncsf), int(j0 + int(self.j_tile)))
-                j_count = int(j1 - j0)
-                check_overflow_tile = bool(check_overflow)
-                if check_overflow_tile and bool(self.check_overflow_first_tile_only) and int(j0) != 0:
-                    check_overflow_tile = False
-
-                if _has_phase1_coo and g_tile is not None:
-                    # COO hybrid path: Phase 1 DFS + ERI contraction + COO output,
-                    # then trivial COO scatter for Phase 2.
-                    g_tile_slice = g_tile[:j_count]
-                    nnz = self._fused_hop_phase1_coo_tile(
-                        j_start=int(j0),
-                        j_count=int(j_count),
-                        x=x,
-                        eri_mat=eri_mat_use,
-                        h_eff_flat=h_eff_flat,
-                        y=y,
-                        g_out=g_tile_slice,
-                        stream=stream,
-                        sync=False,
-                        check_overflow=bool(check_overflow_tile),
-                        profile=profile,
-                    )
-                    # Check for COO overflow — fall back to original fused kernel
-                    if nnz > self._coo_max:
-                        import warnings
-                        warnings.warn(
-                            f"COO overflow: nnz={nnz} > max_coo={self._coo_max}, "
-                            f"falling back to fused kernel. Growing buffer 2x.",
-                            stacklevel=2,
-                        )
-                        # Grow buffer and retry the entire matvec with fused kernel.
-                        self._ensure_coo_buffers(self._coo_max * 2)
-                        _coo_overflow = True
-                        break
-                    # Track max nnz across tiles for adaptive calibration
-                    if not getattr(self, "_coo_calibrated", False):
-                        _cal_max_nnz = max(
-                            getattr(self, "_coo_cal_max_nnz", 0), nnz
-                        )
-                        self._coo_cal_max_nnz = _cal_max_nnz
-                    # Phase 2: COO scatter
-                    self._coo_scatter_tile(
-                        g_tile=g_tile_slice,
-                        nops=int(self.nops),
-                        nnz=nnz,
-                        y=y,
-                        stream=stream,
-                        sync=False,
-                        profile=profile,
-                    )
-                elif _has_phase1 and g_tile is not None:
-                    # Hybrid path: Phase 1 DFS + ERI contraction → g_tile,
-                    # then EPQ table scatter for Phase 2.
-                    g_tile_slice = g_tile[:j_count]
-                    self._fused_hop_phase1_tile(
-                        j_start=int(j0),
-                        j_count=int(j_count),
-                        x=x,
-                        eri_mat=eri_mat_use,
-                        h_eff_flat=h_eff_flat,
-                        y=y,
-                        g_out=g_tile_slice,
-                        stream=stream,
-                        sync=False,
-                        check_overflow=bool(check_overflow_tile),
-                        profile=profile,
-                    )
-                    # Build EPQ tile for this j-range
-                    t_build0 = time.perf_counter() if profile is not None else None
-                    epq_tile = build_epq_action_table_tile_device(
-                        self.drt,
-                        self.drt_dev,
-                        self.state_dev,
-                        j_start=int(j0),
-                        j_count=int(j_count),
-                        threads=int(self.threads_enum),
-                        stream=stream,
-                        sync=True,
-                        check_overflow=bool(check_overflow_tile),
-                        use_recompute=self.epq_stream_use_recompute,
-                        recompute_warp_coop=bool(self.epq_recompute_warp_coop),
-                        global_indptr=False,
-                        pq_block=0,
-                        dtype=self._dtype,
-                    )
-                    if profile is not None and t_build0 is not None:
-                        dt = time.perf_counter() - t_build0
-                        profile["fused_epq_build_s"] = profile.get("fused_epq_build_s", 0.0) + dt
-                    # Phase 2: scatter G via EPQ table
-                    t_scatter0 = time.perf_counter() if profile is not None else None
-                    local_indptr, indices, pq_ids, epq_data = epq_tile
-                    apply_g_flat_scatter_atomic_epq_table_tile_inplace_device(
-                        self.drt,
-                        self.drt_dev,
-                        self.state_dev,
-                        local_indptr,
-                        indices,
-                        pq_ids,
-                        epq_data,
-                        g_tile_slice,
-                        j_start=int(j0),
-                        j_count=int(j_count),
-                        y=y,
-                        zero_y=False,
-                        stream=stream,
-                        sync=False,
-                        check_overflow=False,
-                        dtype=self._dtype,
-                    )
-                    if profile is not None and t_scatter0 is not None:
-                        stream.synchronize()
-                        dt = time.perf_counter() - t_scatter0
-                        profile["fused_epq_scatter_s"] = profile.get("fused_epq_scatter_s", 0.0) + dt
-                else:
-                    # Fallback: original fused kernel with Phase 2 DFS
-                    self._fused_hop_tile(
-                        j_start=int(j0),
-                        j_count=int(j_count),
-                        x=x,
-                        eri_mat=eri_mat_use,
-                        h_eff_flat=h_eff_flat,
-                        y=y,
-                        stream=stream,
-                        sync=bool(sync),
-                        check_overflow=bool(check_overflow_tile),
-                        profile=profile,
-                    )
-
-            # Adaptive COO buffer sizing: after the first successful hop()
-            # completes all tiles, use the observed max nnz to right-size the
-            # buffer for subsequent calls.  This avoids shrinking mid-loop
-            # (which could cause overflow on later tiles).
-            if (
-                not _coo_overflow
-                and not getattr(self, "_coo_calibrated", False)
-                and hasattr(self, "_coo_cal_max_nnz")
-            ):
-                _cal_nnz = self._coo_cal_max_nnz
-                _new_max = max(int(_cal_nnz * 2.0), 1024)
-                if _new_max < self._coo_max:
-                    self._ensure_coo_buffers(_new_max, force=True)
-                self._coo_calibrated = True
-                del self._coo_cal_max_nnz
-
-            # If COO overflow occurred, re-zero y and redo with original fused kernel.
-            if _coo_overflow:
-                y.fill(0)
-                for j0 in range(0, int(self.ncsf), int(self.j_tile)):
-                    j1 = min(int(self.ncsf), int(j0 + int(self.j_tile)))
-                    j_count = int(j1 - j0)
-                    check_overflow_tile = bool(check_overflow)
-                    if check_overflow_tile and bool(self.check_overflow_first_tile_only) and int(j0) != 0:
-                        check_overflow_tile = False
-                    self._fused_hop_tile(
-                        j_start=int(j0),
-                        j_count=int(j_count),
-                        x=x,
-                        eri_mat=eri_mat_use,
-                        h_eff_flat=h_eff_flat,
-                        y=y,
-                        stream=stream,
-                        sync=bool(sync),
-                        check_overflow=bool(check_overflow_tile),
-                        profile=profile,
-                    )
-
-            if profile is not None and t_total0 is not None:
-                stream.synchronize()
-                profile["total_s"] = profile.get("total_s", 0.0) + (time.perf_counter() - t_total0)
-            return y
 
         _set_matvec_path_profile_runtime(
             profile=profile,

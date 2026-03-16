@@ -151,6 +151,256 @@ def prepare_hop_runtime_inputs(
     }
 
 
+def run_fused_hop_path(
+    workspace: Any,
+    *,
+    cp: Any,
+    ext: Any,
+    x: Any,
+    y: Any,
+    eri_mat_use: Any,
+    h_eff_flat: Any,
+    stream: Any,
+    sync: bool,
+    check_overflow: bool,
+    profile: dict[str, float] | None,
+    path_mode: str,
+    build_epq_action_table_tile_device_fn: Any,
+    apply_g_flat_scatter_atomic_epq_table_tile_inplace_device_fn: Any,
+):
+    """Run the fused-hop / fused-hybrid controller loop.
+
+    Extracted from GugaMatvecEriMatWorkspace.hop() to keep the workspace
+    class focused on low-level tile kernels while the orchestration for
+    fused Phase-1, COO hybrid, and EPQ-hybrid execution lives here.
+    """
+
+    t_total0 = time.perf_counter() if profile is not None else None
+
+    # Fused kernel computes both one-body and two-body; start from zeroed output.
+    t0 = time.perf_counter() if profile is not None else None
+    cp.cuda.runtime.memsetAsync(
+        int(y.data.ptr),
+        0,
+        int(y.size) * int(y.itemsize),
+        int(stream.ptr),
+    )
+    if profile is not None and t0 is not None:
+        stream.synchronize()
+        profile["one_body_s"] = profile.get("one_body_s", 0.0) + (time.perf_counter() - t0)
+
+    # Detect available phase-1 paths.
+    panic_mode_str = str(getattr(workspace, "epq_stream_panic_mode", "off")).strip().lower()
+    has_phase1_coo = bool(
+        ext is not None
+        and hasattr(ext, "fused_hop_phase1_coo_device")
+        and hasattr(ext, "coo_scatter_device")
+    )
+    if path_mode == "fused_epq_hybrid":
+        has_phase1_coo = False
+
+    has_phase1 = bool(
+        ext is not None
+        and hasattr(ext, "fused_hop_phase1_device")
+        and panic_mode_str != "on"
+        and workspace._epq_table is not None
+    ) and (not has_phase1_coo)
+    if path_mode == "fused_coo":
+        has_phase1 = False
+
+    g_tile = workspace._g_buf if (has_phase1_coo or has_phase1) else None
+    set_matvec_path_profile(
+        profile=profile,
+        path_mode=path_mode,
+        effective_mode=(
+            "fused_coo" if has_phase1_coo else ("fused_epq_hybrid" if has_phase1 else "fused_hop_fallback")
+        ),
+        fallback_reason=(
+            ""
+            if (has_phase1_coo or has_phase1)
+            else str(getattr(workspace, "path_mode_fallback_reason", "fused_phase1_unavailable"))
+        ),
+    )
+
+    # Allocate COO buffers once (lazy) for the COO path.
+    if has_phase1_coo and g_tile is not None:
+        n_offdiag = int(workspace.norb) * (int(workspace.norb) - 1)
+        avg_conn = 20  # empirical average for CAS14
+        max_coo = int(workspace.j_tile) * n_offdiag * avg_conn
+        workspace._ensure_coo_buffers(max_coo)
+
+    coo_overflow = False
+    for j0 in range(0, int(workspace.ncsf), int(workspace.j_tile)):
+        j1 = min(int(workspace.ncsf), j0 + int(workspace.j_tile))
+        j_count = j1 - j0
+        check_overflow_tile = bool(check_overflow)
+        if check_overflow_tile and bool(workspace.check_overflow_first_tile_only) and j0 != 0:
+            check_overflow_tile = False
+
+        if has_phase1_coo and g_tile is not None:
+            # COO hybrid path: Phase 1 DFS + ERI contraction + COO output,
+            # then trivial COO scatter for Phase 2.
+            g_tile_slice = g_tile[:j_count]
+            nnz = workspace._fused_hop_phase1_coo_tile(
+                j_start=j0,
+                j_count=j_count,
+                x=x,
+                eri_mat=eri_mat_use,
+                h_eff_flat=h_eff_flat,
+                y=y,
+                g_out=g_tile_slice,
+                stream=stream,
+                sync=False,
+                check_overflow=check_overflow_tile,
+                profile=profile,
+            )
+            # Check for COO overflow — fall back to original fused kernel
+            if nnz > workspace._coo_max:
+                import warnings
+
+                warnings.warn(
+                    f"COO overflow: nnz={nnz} > max_coo={workspace._coo_max}, "
+                    f"falling back to fused kernel. Growing buffer 2x.",
+                    stacklevel=2,
+                )
+                workspace._ensure_coo_buffers(workspace._coo_max * 2)
+                coo_overflow = True
+                break
+            # Track max nnz across tiles for adaptive calibration
+            if not getattr(workspace, "_coo_calibrated", False):
+                cal_max_nnz = max(getattr(workspace, "_coo_cal_max_nnz", 0), nnz)
+                workspace._coo_cal_max_nnz = cal_max_nnz
+            # Phase 2: COO scatter
+            workspace._coo_scatter_tile(
+                g_tile=g_tile_slice,
+                nops=int(workspace.nops),
+                nnz=nnz,
+                y=y,
+                stream=stream,
+                sync=False,
+                profile=profile,
+            )
+        elif has_phase1 and g_tile is not None:
+            # Hybrid path: Phase 1 DFS + ERI contraction → g_tile,
+            # then EPQ table scatter for Phase 2.
+            g_tile_slice = g_tile[:j_count]
+            workspace._fused_hop_phase1_tile(
+                j_start=j0,
+                j_count=j_count,
+                x=x,
+                eri_mat=eri_mat_use,
+                h_eff_flat=h_eff_flat,
+                y=y,
+                g_out=g_tile_slice,
+                stream=stream,
+                sync=False,
+                check_overflow=check_overflow_tile,
+                profile=profile,
+            )
+            # Build EPQ tile for this j-range
+            t_build0 = time.perf_counter() if profile is not None else None
+            epq_tile = build_epq_action_table_tile_device_fn(
+                workspace.drt,
+                workspace.drt_dev,
+                workspace.state_dev,
+                j_start=j0,
+                j_count=j_count,
+                threads=int(workspace.threads_enum),
+                stream=stream,
+                sync=True,
+                check_overflow=check_overflow_tile,
+                use_recompute=workspace.epq_stream_use_recompute,
+                recompute_warp_coop=bool(workspace.epq_recompute_warp_coop),
+                global_indptr=False,
+                pq_block=0,
+                dtype=workspace._dtype,
+            )
+            if profile is not None and t_build0 is not None:
+                dt = time.perf_counter() - t_build0
+                profile["fused_epq_build_s"] = profile.get("fused_epq_build_s", 0.0) + dt
+            # Phase 2: scatter G via EPQ table
+            t_scatter0 = time.perf_counter() if profile is not None else None
+            local_indptr, indices, pq_ids, epq_data = epq_tile
+            apply_g_flat_scatter_atomic_epq_table_tile_inplace_device_fn(
+                workspace.drt,
+                workspace.drt_dev,
+                workspace.state_dev,
+                local_indptr,
+                indices,
+                pq_ids,
+                epq_data,
+                g_tile_slice,
+                j_start=j0,
+                j_count=j_count,
+                y=y,
+                zero_y=False,
+                stream=stream,
+                sync=False,
+                check_overflow=False,
+                dtype=workspace._dtype,
+            )
+            if profile is not None and t_scatter0 is not None:
+                stream.synchronize()
+                dt = time.perf_counter() - t_scatter0
+                profile["fused_epq_scatter_s"] = profile.get("fused_epq_scatter_s", 0.0) + dt
+        else:
+            # Fallback: original fused kernel with Phase 2 DFS
+            workspace._fused_hop_tile(
+                j_start=j0,
+                j_count=j_count,
+                x=x,
+                eri_mat=eri_mat_use,
+                h_eff_flat=h_eff_flat,
+                y=y,
+                stream=stream,
+                sync=bool(sync),
+                check_overflow=check_overflow_tile,
+                profile=profile,
+            )
+
+    # Adaptive COO buffer sizing: after the first successful hop() completes
+    # all tiles, use the observed max nnz to right-size the buffer.
+    if (
+        not coo_overflow
+        and not getattr(workspace, "_coo_calibrated", False)
+        and hasattr(workspace, "_coo_cal_max_nnz")
+    ):
+        cal_nnz = workspace._coo_cal_max_nnz
+        new_max = max(int(cal_nnz * 2.0), 1024)
+        if new_max < workspace._coo_max:
+            workspace._ensure_coo_buffers(new_max, force=True)
+        workspace._coo_calibrated = True
+        del workspace._coo_cal_max_nnz
+
+    # If COO overflow occurred, re-zero y and redo with original fused kernel.
+    if coo_overflow:
+        y.fill(0)
+        for j0 in range(0, int(workspace.ncsf), int(workspace.j_tile)):
+            j1 = min(int(workspace.ncsf), j0 + int(workspace.j_tile))
+            j_count = j1 - j0
+            check_overflow_tile = bool(check_overflow)
+            if check_overflow_tile and bool(workspace.check_overflow_first_tile_only) and j0 != 0:
+                check_overflow_tile = False
+            workspace._fused_hop_tile(
+                j_start=j0,
+                j_count=j_count,
+                x=x,
+                eri_mat=eri_mat_use,
+                h_eff_flat=h_eff_flat,
+                y=y,
+                stream=stream,
+                sync=bool(sync),
+                check_overflow=check_overflow_tile,
+                profile=profile,
+            )
+
+    if profile is not None and t_total0 is not None:
+        stream.synchronize()
+        profile["total_s"] = profile.get("total_s", 0.0) + (time.perf_counter() - t_total0)
+
+    return y
+
+
 def build_epq_stream_tile(
     workspace: Any,
     *,
