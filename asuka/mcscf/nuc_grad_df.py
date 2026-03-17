@@ -2306,6 +2306,7 @@ def _build_bar_L_casscf_df_qp(
     from asuka.integrals.df_packed_s2 import (  # noqa: PLC0415
         fused_qp_l_act_f64,
         fused_qp_exchange_sym_f64,
+        unpack_Qp_to_Qmn_block,
     )
 
     # Mean-field interaction with the core potential:
@@ -2335,23 +2336,33 @@ def _build_bar_L_casscf_df_qp(
     )
     _log_vram("    casscf_df_qp: after bar_mean J")
 
-    # Tier B-2 exchange: fused kernel reads Qp and writes Qp, no (q,nao,nao) intermediate.
-    # Computes -0.5 * (D_core @ B_q @ D_w + D_w @ B_q @ D_core) in packed Qp format.
-    _chunk = int(max(1, qblock if qblock is not None else (naux // 4)))
+    # Exchange: -0.5 * (D_core @ B_q @ D_w + D_w @ B_q @ D_core) in packed Qp.
+    # Use batched GEMM via unpack → matmul → pack (much faster than per-element kernel).
+    _chunk = int(max(1, qblock if qblock is not None else min(128, naux)))
     D_core_f64 = xp.asarray(D_core_ao, dtype=xp.float64)
     D_w_f64 = xp.asarray(D_w, dtype=xp.float64)
     B_Qp_f64 = xp.asarray(B_Qp, dtype=xp.float64)
-    # Accumulate exchange into a float64 working buffer, then cast back.
     _exch_f64 = xp.zeros((naux, ntri), dtype=xp.float64)
+    _tri_i = None
+    _tri_j = None
     for _q0 in range(0, naux, _chunk):
         _q1 = min(_q0 + _chunk, naux)
         _q = int(_q1 - _q0)
         if _q <= 0:
             continue
-        fused_qp_exchange_sym_f64(
-            B_Qp_f64, D_core_f64, D_w_f64, _exch_f64,
-            nao=int(nao), q0=int(_q0), q_count=int(_q), alpha=-0.5,
-        )
+        _bq = unpack_Qp_to_Qmn_block(B_Qp_f64, nao=int(nao), q0=int(_q0), q_count=int(_q))
+        _t1 = xp.matmul(D_core_f64[None, :, :], _bq)
+        _t2 = xp.matmul(_t1, D_w_f64[None, :, :])
+        _t3 = xp.matmul(D_w_f64[None, :, :], _bq)
+        _t4 = xp.matmul(_t3, D_core_f64[None, :, :])
+        _res = -0.5 * (_t2 + _t4)
+        if _tri_i is None:
+            import numpy as _np_tri
+            _tri_i_np, _tri_j_np = _np_tri.tril_indices(int(nao))
+            _tri_i = xp.asarray(_tri_i_np, dtype=xp.int64)
+            _tri_j = xp.asarray(_tri_j_np, dtype=xp.int64)
+        _exch_f64[_q0:_q1] = _res[:, _tri_i, _tri_j]
+        del _bq, _t1, _t2, _t3, _t4, _res
     bar_mean += _exch_f64.astype(_od, copy=False)
     del _exch_f64
     _log_vram("    casscf_df_qp: after exchange")
