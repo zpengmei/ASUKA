@@ -1245,7 +1245,13 @@ def contract_dhcore_sph(
     shell_ao_start_sph: np.ndarray | None = None,
     include_operator_deriv: bool = True,
 ) -> np.ndarray:
-    """Contract d(hcore)/dR with a spherical AO matrix without forming cart-sized AO matrices."""
+    """Contract d(hcore)/dR with a spherical AO matrix.
+
+    Default path: build prebuilt dT/dV tensors (numba-accelerated) then
+    contract via GPU einsum when CuPy is available, or CPU einsum otherwise.
+    Falls back to the legacy per-shell-pair Python loop only when the
+    prebuilt path is unavailable.
+    """
     atom_coords_bohr = np.asarray(atom_coords_bohr, dtype=np.float64)
     if atom_coords_bohr.ndim != 2 or atom_coords_bohr.shape[1] != 3:
         raise ValueError("atom_coords_bohr must have shape (natm, 3)")
@@ -1272,6 +1278,38 @@ def contract_dhcore_sph(
 
     M_sph_np = _validate_sph_matrix(M_sph, nao_sph=int(nao_sph))
 
+    # Fast path: prebuilt dT/dV tensors (numba) + GPU contraction.
+    try:
+        dT = build_dT_sph(
+            basis_cart,
+            atom_coords_bohr=atom_coords_bohr,
+            shell_atom=shell_atom,
+            shell_ao_start_sph=shell_ao_start_sph,
+        )
+        dV = build_dV_sph(
+            basis_cart,
+            atom_coords_bohr=atom_coords_bohr,
+            atom_charges=atom_charges,
+            shell_atom=shell_atom,
+            shell_ao_start_sph=shell_ao_start_sph,
+            include_operator_deriv=bool(include_operator_deriv),
+        )
+        # Try GPU contraction first.
+        try:
+            import cupy as cp  # noqa: PLC0415
+            dH = cp.asarray(dT + dV, dtype=cp.float64)
+            M_d = cp.asarray(M_sph_np, dtype=cp.float64)
+            out = cp.einsum("axij,ij->ax", dH, M_d, optimize=True)
+            return np.asarray(cp.asnumpy(out), dtype=np.float64)
+        except Exception:
+            pass
+        # CPU einsum fallback.
+        dH = np.asarray(dT + dV, dtype=np.float64)
+        return np.einsum("axij,ij->ax", dH, M_sph_np, optimize=True).astype(np.float64)
+    except Exception:
+        pass
+
+    # Legacy fallback: per-shell-pair Python loop (slow for large molecules).
     gT = _contract_dT_sph(
         basis_cart,
         atom_coords_bohr=atom_coords_bohr,
@@ -1301,8 +1339,8 @@ def contract_dS_ip_sph(
 ) -> np.ndarray:
     """Contract bra-side overlap derivative with a spherical-space matrix.
 
-    Uses per-shell-pair Cartesian↔spherical block transforms to avoid
-    materializing a full ``(nao_cart, nao_cart)`` back-transformed matrix.
+    Default path: build prebuilt dS tensor (numba) then contract via GPU
+    einsum when CuPy is available, or CPU einsum otherwise.
 
     Returns
     -------
@@ -1332,6 +1370,27 @@ def contract_dS_ip_sph(
 
     M_sph_np = _validate_sph_matrix(M_sph, nao_sph=int(nao_sph))
 
+    # Fast path: prebuilt dS tensor + GPU/CPU einsum.
+    try:
+        dS = build_dS_sph(
+            basis_cart,
+            atom_coords_bohr=atom_coords_bohr,
+            shell_atom=shell_atom,
+            shell_ao_start_sph=shell_ao_start_sph,
+        )
+        try:
+            import cupy as cp  # noqa: PLC0415
+            dS_d = cp.asarray(dS, dtype=cp.float64)
+            M_d = cp.asarray(M_sph_np, dtype=cp.float64)
+            out = cp.einsum("axij,ij->ax", dS_d, M_d, optimize=True)
+            return np.asarray(cp.asnumpy(out), dtype=np.float64)
+        except Exception:
+            pass
+        return np.einsum("axij,ij->ax", dS, M_sph_np, optimize=True).astype(np.float64)
+    except Exception:
+        pass
+
+    # Legacy fallback: per-shell-pair Python loop.
     out = np.zeros((natm, 3), dtype=np.float64)
     nshell = int(np.asarray(basis_cart.shell_l).shape[0])
     for shA in range(nshell):

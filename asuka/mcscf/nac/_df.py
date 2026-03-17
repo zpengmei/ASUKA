@@ -2147,6 +2147,10 @@ def sacasscf_nonadiabatic_couplings_df(
         rhs_orb_all.append(np.asarray(g_orb, dtype=np.float64))
         rhs_ci_all.append(rhs_ci_list)
 
+    # Use GMRES when GPU mode is active — the GPU GCROTMK implementation
+    # can stall on large orbital spaces (n_orb > 1000).
+    _z_method = "gmres" if bool(getattr(hess_op, "gpu_mode", False)) else "gcrotmk"
+
     z_results: list[Any] = []
     if pair_records:
         t_z_solve_start = time.perf_counter()
@@ -2159,6 +2163,7 @@ def sacasscf_nonadiabatic_couplings_df(
                 tol=float(z_tol),
                 maxiter=int(z_maxiter),
                 recycle_space=z_recycle_space,
+                method=_z_method,
             )
             z_results = [z_single]
             z_total_time = float(time.perf_counter() - t_z_solve_start)
@@ -2183,6 +2188,7 @@ def sacasscf_nonadiabatic_couplings_df(
                 reorder="input",
                 shared_recycle=True,
                 chain_x0=True,
+                method=_z_method,
             )
             z_results = list(z_batch.results)
             z_total_time = float(time.perf_counter() - t_z_solve_start)
