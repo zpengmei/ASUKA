@@ -564,8 +564,11 @@ def _extract_h_diag(h_diag: Any, n_orb: int, ci_template: Any) -> np.ndarray | N
     n_ci = int(ci_flat.size)
     n_tot = int(n_orb + n_ci)
 
-    if isinstance(h_diag, np.ndarray):
-        d = np.asarray(h_diag, dtype=np.float64).ravel()
+    _hd = h_diag
+    if hasattr(_hd, "get"):
+        _hd = _hd.get()  # CuPy → NumPy
+    if isinstance(_hd, np.ndarray):
+        d = np.asarray(_hd, dtype=np.float64).ravel()
         if d.size == n_tot:
             return d
         # Some PySCF paths return only the orbital diagonal.
@@ -578,8 +581,14 @@ def _extract_h_diag(h_diag: Any, n_orb: int, ci_template: Any) -> np.ndarray | N
     if isinstance(h_diag, (list, tuple)):
         # Common: (diag_orb, diag_ci)
         if len(h_diag) == 2:
-            d_orb = np.asarray(h_diag[0], dtype=np.float64).ravel()
-            d_ci = np.asarray(_flatten_ci(h_diag[1])[0], dtype=np.float64).ravel()
+            _d0 = h_diag[0].get() if hasattr(h_diag[0], "get") else h_diag[0]
+            _d1 = h_diag[1]
+            if isinstance(_d1, (list, tuple)):
+                _d1 = [di.get() if hasattr(di, "get") else di for di in _d1]
+            elif hasattr(_d1, "get"):
+                _d1 = _d1.get()
+            d_orb = np.asarray(_d0, dtype=np.float64).ravel()
+            d_ci = np.asarray(_flatten_ci(_d1)[0], dtype=np.float64).ravel()
             if d_orb.size != n_orb or d_ci.size != n_ci:
                 raise ValueError("Unexpected h_diag tuple shapes")
             return np.concatenate([d_orb, d_ci])
