@@ -223,6 +223,8 @@ def casscf_nuc_grad_direct(
     nroots = int(getattr(casscf, "nroots", 1))
     weights = normalize_weights(getattr(casscf, "root_weights", None), nroots=nroots)
     ci_list = ci_as_list(getattr(casscf, "ci"), nroots=nroots)
+    # Ensure CI vectors are NumPy (may be CuPy from direct-SCF CASSCF).
+    ci_list = [_asnumpy_f64(c) for c in ci_list]
 
     if fcisolver is None:
         if twos is None:
@@ -324,6 +326,8 @@ def casscf_nuc_grad_direct_per_root(
     nroots = int(getattr(casscf, "nroots", 1))
     weights = normalize_weights(getattr(casscf, "root_weights", None), nroots=nroots)
     ci_list = ci_as_list(getattr(casscf, "ci"), nroots=nroots)
+    # Ensure CI vectors are NumPy (may be CuPy from direct-SCF CASSCF).
+    ci_list = [_asnumpy_f64(c) for c in ci_list]
     e_roots = np.asarray(getattr(casscf, "e_roots", np.asarray([float(getattr(casscf, "e_tot", 0.0))])), dtype=np.float64).ravel()
 
     if int(nroots) > 1:
