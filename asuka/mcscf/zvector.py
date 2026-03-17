@@ -1193,6 +1193,8 @@ def _build_sa_lagrange_precond(
     diag: np.ndarray,
     ci_ref_list: list[np.ndarray],
     level_shift: float = 1e-8,
+    e_roots: np.ndarray | None = None,
+    weights: list[float] | None = None,
 ) -> Callable[[Any], Any]:
     """Build a CSF-compatible SA-CASSCF Lagrange preconditioner.
 
@@ -1251,18 +1253,41 @@ def _build_sa_lagrange_precond(
     d_ci_mat[np.abs(d_ci_mat) < 1e-8] = 1e-8
     r_ci_mat = 1.0 / d_ci_mat
 
-    # For each root i, precompute sci_inv_i where sci_i = C^T (diag^{-1}_i * C).
-    # Store as (nroots,nroots,nroots): sci_inv_stack[i,:,:].
+    # For each root i, precompute the coupling matrix.
+    # When e_roots is available, use the Fancy matrix (Molcas convention)
+    # which includes energy-weighted inter-root coupling.
+    # Without e_roots, fall back to the pure overlap inverse (sci_inv).
     sci_inv_stack = np.empty((nroots, nroots, nroots), dtype=np.float64)
-    for i in range(nroots):
-        r_i = np.asarray(r_ci_mat[:, i], dtype=np.float64)
-        rci_c = r_i[:, None] * cmat  # (nci,nroots)
-        sci = cmat.T @ rci_c  # (nroots,nroots)
-        try:
-            sci_inv = np.linalg.inv(sci)
-        except np.linalg.LinAlgError:  # pragma: no cover
-            sci_inv = np.linalg.pinv(sci)
-        sci_inv_stack[i] = np.asarray(sci_inv, dtype=np.float64)
+    if e_roots is not None:
+        # Compute Fancy matrix following Molcas CIDia_SA:
+        # Fancy[I,J,K] = w_K * delta(I,K) * (E_K - E_precond_J)
+        # where E_precond_J = E_root_J (the root energy used in diag preconditioner)
+        _e = np.asarray(e_roots, dtype=np.float64).ravel()
+        _w = np.asarray(weights if weights is not None else [1.0 / nroots] * nroots, dtype=np.float64)
+        for i in range(nroots):
+            r_i = np.asarray(r_ci_mat[:, i], dtype=np.float64)
+            rci_c = r_i[:, None] * cmat
+            sci = cmat.T @ rci_c  # (nroots, nroots)
+            # Modify sci with Fancy: sci_modified[J,K] = sci[J,K] + Fancy_correction
+            # Fancy[J,K,i] = w_i * delta(J,i) * (E_i - E_J) for diagonal contribution
+            # For the full Fancy, see Molcas CIDia_SA
+            sci_fancy = sci.copy()
+            for k in range(nroots):
+                sci_fancy[k, k] += _w[i] * (_e[i] - _e[k]) if i != k else 0.0
+            try:
+                sci_inv_stack[i] = np.linalg.inv(sci_fancy)
+            except np.linalg.LinAlgError:
+                sci_inv_stack[i] = np.linalg.pinv(sci_fancy)
+    else:
+        for i in range(nroots):
+            r_i = np.asarray(r_ci_mat[:, i], dtype=np.float64)
+            rci_c = r_i[:, None] * cmat
+            sci = cmat.T @ rci_c
+            try:
+                sci_inv = np.linalg.inv(sci)
+            except np.linalg.LinAlgError:
+                sci_inv = np.linalg.pinv(sci)
+            sci_inv_stack[i] = np.asarray(sci_inv, dtype=np.float64)
 
     # Lazy GPU cache (allocated on first CuPy call).
     try:
@@ -1377,7 +1402,7 @@ def build_mcscf_hessian_operator(
     ci_ref_list: list[np.ndarray] | None = None
     sa_gram_inv: np.ndarray | None = None
     if is_sa:
-        ci_ref_list = [np.asarray(c, dtype=np.float64).ravel() for c in ci]
+        ci_ref_list = [np.asarray(c.get() if hasattr(c, "get") else c, dtype=np.float64).ravel() for c in ci]
         sizes = {int(c.size) for c in ci_ref_list}
         if len(sizes) == 1:
             nroots = int(len(ci_ref_list))
@@ -1800,14 +1825,25 @@ def solve_mcscf_zvector(
                     int(op.n_orb),
                     int(op.n_ci),
                     _sizes,
+                    int(id(getattr(mc, "e_roots", None))),
                 )
                 precond_use = _sa_precond_cache_get(_cache_key)
                 if precond_use is None:
+                    # Pass SA root energies for the Fancy matrix (inter-root coupling)
+                    _mc_e_roots = None
+                    _mc_weights = None
+                    try:
+                        _mc_e_roots = np.asarray(getattr(mc, "e_roots", None), dtype=np.float64)
+                        _mc_weights = getattr(mc, "weights", None)
+                    except Exception:
+                        pass
                     try:
                         precond_use = _build_sa_lagrange_precond(
                             n_orb=int(op.n_orb),
                             diag=np.asarray(op.diag, dtype=np.float64),
                             ci_ref_list=op.ci_ref_list,
+                            e_roots=_mc_e_roots,
+                            weights=_mc_weights,
                         )
                         _sa_precond_cache_put(_cache_key, precond_use)
                     except Exception:

@@ -86,7 +86,7 @@ def _make_rdm12_safe(
         dm1, dm2 = fcisolver.make_rdm12(ci, int(ncas), nelecas, **kw)
     except TypeError:
         dm1, dm2 = fcisolver.make_rdm12(ci, int(ncas), nelecas)
-    return np.asarray(dm1, dtype=np.float64), np.asarray(dm2, dtype=np.float64)
+    return _asnumpy_f64(dm1), _asnumpy_f64(dm2)
 
 
 def _trans_rdm12_safe(
@@ -103,7 +103,7 @@ def _trans_rdm12_safe(
         dm1, dm2 = fcisolver.trans_rdm12(bra, ket, int(ncas), nelecas, **kw)
     except TypeError:
         dm1, dm2 = fcisolver.trans_rdm12(bra, ket, int(ncas), nelecas)
-    return np.asarray(dm1, dtype=np.float64), np.asarray(dm2, dtype=np.float64)
+    return _asnumpy_f64(dm1), _asnumpy_f64(dm2)
 
 
 def _sa_energy(casscf: Any, *, weights: Sequence[float], nroots: int) -> float:
@@ -137,8 +137,8 @@ def _compute_unrelaxed_casscf_gradient_dense(
         atom_coords_bohr=np.asarray(atom_coords_bohr, dtype=np.float64),
         h_ao=np.asarray(h_ao, dtype=np.float64),
         mo_coeff=np.asarray(mo_coeff, dtype=np.float64),
-        dm1_act=np.asarray(dm1_act, dtype=np.float64),
-        dm2_act=np.asarray(dm2_act, dtype=np.float64),
+        dm1_act=_asnumpy_f64(dm1_act),
+        dm2_act=_asnumpy_f64(dm2_act),
         ncore=int(ncore),
         ncas=int(ncas),
         cache_cpu=cache_cpu,
@@ -160,8 +160,8 @@ def _compute_unrelaxed_casscf_gradient_dense(
         ao_basis=ao_basis,
         atom_coords_bohr=np.asarray(atom_coords_bohr, dtype=np.float64),
         mo_coeff=np.asarray(mo_coeff, dtype=np.float64),
-        dm1_act=np.asarray(dm1_act, dtype=np.float64),
-        dm2_act=np.asarray(dm2_act, dtype=np.float64),
+        dm1_act=_asnumpy_f64(dm1_act),
+        dm2_act=_asnumpy_f64(dm2_act),
         ncore=int(ncore),
         ncas=int(ncas),
         backend=str(dense_deriv_backend),
@@ -262,8 +262,8 @@ def casscf_nuc_grad_direct(
         atom_charges=np.asarray(atom_charges, dtype=np.float64),
         h_ao=np.asarray(h_ao, dtype=np.float64),
         mo_coeff=np.asarray(mo_coeff, dtype=np.float64),
-        dm1_act=np.asarray(dm1_sa, dtype=np.float64),
-        dm2_act=np.asarray(dm2_sa, dtype=np.float64),
+        dm1_act=_asnumpy_f64(dm1_sa),
+        dm2_act=_asnumpy_f64(dm2_sa),
         ncore=int(ncore),
         ncas=int(ncas),
         de_nuc=np.asarray(de_nuc, dtype=np.float64),
@@ -396,8 +396,8 @@ def casscf_nuc_grad_direct_per_root(
         atom_charges=np.asarray(atom_charges, dtype=np.float64),
         h_ao=np.asarray(h_ao, dtype=np.float64),
         mo_coeff=np.asarray(mo_coeff_np, dtype=np.float64),
-        dm1_act=np.asarray(dm1_sa, dtype=np.float64),
-        dm2_act=np.asarray(dm2_sa, dtype=np.float64),
+        dm1_act=_asnumpy_f64(dm1_sa),
+        dm2_act=_asnumpy_f64(dm2_sa),
         ncore=int(ncore),
         ncas=int(ncas),
         de_nuc=np.asarray(de_nuc, dtype=np.float64),
@@ -458,8 +458,8 @@ def casscf_nuc_grad_direct_per_root(
                 atom_charges=np.asarray(atom_charges, dtype=np.float64),
                 h_ao=np.asarray(h_ao, dtype=np.float64),
                 mo_coeff=np.asarray(mo_coeff_np, dtype=np.float64),
-                dm1_act=np.asarray(dm1_k, dtype=np.float64),
-                dm2_act=np.asarray(dm2_k, dtype=np.float64),
+                dm1_act=_asnumpy_f64(dm1_k),
+                dm2_act=_asnumpy_f64(dm2_k),
                 ncore=int(ncore),
                 ncas=int(ncas),
                 de_nuc=np.asarray(de_nuc, dtype=np.float64),
@@ -471,7 +471,7 @@ def casscf_nuc_grad_direct_per_root(
                 threads=int(threads),
             )
 
-            fcisolver_fixed = _FixedRDMFcisolver(fcisolver_use, dm1=np.asarray(dm1_k, dtype=np.float64), dm2=np.asarray(dm2_k, dtype=np.float64))
+            fcisolver_fixed = _FixedRDMFcisolver(fcisolver_use, dm1=_asnumpy_f64(dm1_k), dm2=_asnumpy_f64(dm2_k))
             mc_k = DFNewtonCASSCFAdapter(
                 df_B=None,
                 hcore_ao=getattr(getattr(scf_out, "int1e"), "hcore"),
@@ -498,8 +498,8 @@ def casscf_nuc_grad_direct_per_root(
             g_k = np.asarray(g_k, dtype=np.float64).ravel()
             rhs_orb = g_k[:n_orb]
             rhs_ci_k = g_k[n_orb:]
-            rhs_ci = [np.zeros_like(np.asarray(ci_list[r], dtype=np.float64).ravel()) for r in range(int(nroots))]
-            ndet_k = int(np.asarray(ci_list[k]).size)
+            rhs_ci = [np.zeros_like(_asnumpy_f64(ci_list[r]).ravel()) for r in range(int(nroots))]
+            ndet_k = int(_asnumpy_f64(ci_list[k]).size)
             rhs_ci[k] = rhs_ci_k[:ndet_k]
 
             z_k = solve_mcscf_zvector(
@@ -540,8 +540,8 @@ def casscf_nuc_grad_direct_per_root(
                     continue
                 dm1_r, dm2_r = _trans_rdm12_safe(
                     fcisolver_use,
-                    np.asarray(Lci_list[r], dtype=np.float64).ravel(),
-                    np.asarray(ci_list[r], dtype=np.float64).ravel(),
+                    _asnumpy_f64(Lci_list[r]).ravel(),
+                    _asnumpy_f64(ci_list[r]).ravel(),
                     int(ncas),
                     nelecas,
                     solver_kwargs=solver_kwargs,
@@ -555,8 +555,8 @@ def casscf_nuc_grad_direct_per_root(
                 atom_charges=np.asarray(atom_charges, dtype=np.float64),
                 h_ao=np.asarray(h_ao, dtype=np.float64),
                 mo_coeff=np.asarray(mo_coeff_np, dtype=np.float64),
-                dm1_act=np.asarray(dm1_lci, dtype=np.float64),
-                dm2_act=np.asarray(dm2_lci, dtype=np.float64),
+                dm1_act=_asnumpy_f64(dm1_lci),
+                dm2_act=_asnumpy_f64(dm2_lci),
                 ncore=int(ncore),
                 ncas=int(ncas),
                 backend=str(dense_deriv_backend),
@@ -571,8 +571,8 @@ def casscf_nuc_grad_direct_per_root(
                 atom_charges=np.asarray(atom_charges, dtype=np.float64),
                 h_ao=np.asarray(h_ao, dtype=np.float64),
                 mo_coeff=np.asarray(mo_coeff_np, dtype=np.float64),
-                dm1_act=np.asarray(dm1_sa, dtype=np.float64),
-                dm2_act=np.asarray(dm2_sa, dtype=np.float64),
+                dm1_act=_asnumpy_f64(dm1_sa),
+                dm2_act=_asnumpy_f64(dm2_sa),
                 Lorb=np.asarray(Lorb_mat, dtype=np.float64),
                 ncore=int(ncore),
                 ncas=int(ncas),

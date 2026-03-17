@@ -1279,6 +1279,10 @@ def _compute_ci_grad_and_diag_blocks(
     # Build active-space Hamiltonian pieces at the reference.
     ham = _build_ci_active_hamiltonian(casscf, mo, eris)
 
+    # Ensure ci_list items are NumPy for the CPU-side gradient/diagonal math below.
+    _to_np = lambda a: a.get() if hasattr(a, "get") else np.asarray(a, dtype=np.float64)
+    ci_list = [_to_np(c) for c in ci_list]
+
     with ctx_absorb:
         linkstrl = _maybe_gen_linkstr(fcisolver, ncas, nelecas, True)
         hci0 = _ci_h_op(
@@ -1290,6 +1294,7 @@ def _compute_ci_grad_and_diag_blocks(
             ci_list=ci_list,
             link_index=linkstrl,
         )
+        hci0 = [_to_np(h) for h in hci0]
         eci0 = np.asarray([float(np.dot(c, hc)) for c, hc in zip(ci_list, hci0)], dtype=np.float64)
         gci_resid = [hc - c * float(e) for hc, c, e in zip(hci0, ci_list, eci0)]
 
@@ -1302,7 +1307,7 @@ def _compute_ci_grad_and_diag_blocks(
         g_ci = pack_ci_list(gci_w) * 2.0
 
         # PySCF's CI diagonal includes an intermediate-normalization correction.
-        hd0 = _ci_h_diag(fcisolver, h1cas=ham.h1cas, eri_cas=ham.eri_cas, ncas=ncas, nelecas=nelecas)
+        hd0 = _to_np(_ci_h_diag(fcisolver, h1cas=ham.h1cas, eri_cas=ham.eri_cas, ncas=ncas, nelecas=nelecas))
         hci_diag = [hd0 - float(e) - g * c * 2.0 for hd0, e, g, c in zip([hd0] * nroots, eci0, gci_resid, ci_list)]
         hci_diag = [h * float(w) for h, w in zip(hci_diag, w_info.weights)]
         hdiag_ci = pack_ci_list(hci_diag) * 2.0

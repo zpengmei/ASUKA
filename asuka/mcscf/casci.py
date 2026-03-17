@@ -1980,7 +1980,10 @@ def run_casci_direct_exact(
     if int(nroots) == 1:
         e_tot_val = float(e_tot)
     else:
-        e_tot_val = np.asarray(e_tot, dtype=np.float64).ravel()
+        _e = e_tot
+        if hasattr(_e, "get"):
+            _e = _e.get()  # CuPy → NumPy
+        e_tot_val = np.asarray(_e, dtype=np.float64).ravel()
 
     return CASCIResult(
         mol=scf_out.mol,

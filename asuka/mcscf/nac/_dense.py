@@ -1173,6 +1173,8 @@ def sacasscf_nonadiabatic_couplings_dense(
     ci_raw = getattr(casscf, "ci", None)
     nroots = int(getattr(casscf, "nroots", len(ci_raw) if isinstance(ci_raw, (list, tuple)) else 1))
     ci_list = ci_as_list(ci_raw, nroots=nroots)
+    # Ensure CI vectors are NumPy (may be CuPy from direct-SCF CASSCF).
+    ci_list = [c.get() if hasattr(c, "get") else np.asarray(c, dtype=np.float64) for c in ci_list]
     if nroots <= 1:
         return np.zeros((nroots, nroots, len(atmlst_use), 3), dtype=np.float64)
 
@@ -1181,7 +1183,10 @@ def sacasscf_nonadiabatic_couplings_dense(
         e_raw = getattr(casscf, "e_roots", None)
     if e_raw is None:
         raise ValueError("casscf must provide per-root energies as e_states or e_roots")
-    e_states = np.asarray(e_raw, dtype=np.float64).ravel()
+    _e = e_raw
+    if hasattr(_e, "get"):
+        _e = _e.get()
+    e_states = np.asarray(_e, dtype=np.float64).ravel()
     if int(e_states.size) != nroots:
         raise ValueError("energy array length mismatch")
 
