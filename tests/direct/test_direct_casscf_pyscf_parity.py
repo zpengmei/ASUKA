@@ -192,18 +192,12 @@ def test_sa_gradient_matches(asuka_results, pyscf_results):
 
 
 @pytest.mark.cuda
-@pytest.mark.xfail(
-    reason="Direct-backend per-root Z-vector has CuPy/NumPy device-mixing bug "
-           "causing non-deterministic results (pre-existing, not from this PR)",
-    strict=False,
-)
 def test_per_root_gradient_matches(asuka_results, pyscf_results):
     """Per-root SA-CASSCF gradients should match to ~1e-4.
 
-    Known issue: the direct-backend ``casscf_nuc_grad_direct_per_root`` passes
-    CuPy mo_coeff into the CPU-side Newton-CASSCF Hessian operator, causing
-    mixed-device operations that produce non-deterministic Z-vector solutions.
-    The DF backend does not have this problem (weighted-sum residual ~7e-8).
+    Looser than SA gradient because PySCF's per-root scanner re-runs CASSCF
+    for each state, while ASUKA uses the analytic Z-vector approach on the
+    SA solution directly.
     """
     g_a = asuka_results["grads_per_root"]
     g_p = pyscf_results["grads_per_root"]
