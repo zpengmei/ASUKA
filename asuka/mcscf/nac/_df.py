@@ -2150,6 +2150,13 @@ def sacasscf_nonadiabatic_couplings_df(
     # Use GMRES when GPU mode is active — the GPU GCROTMK implementation
     # can stall on large orbital spaces (n_orb > 1000).
     _z_method = "gmres" if bool(getattr(hess_op, "gpu_mode", False)) else "gcrotmk"
+    # For small active spaces (CI dimension << orbital dimension), the SA Fancy
+    # preconditioner can be counterproductive.  Use diagonal preconditioner instead.
+    _z_precond_override: Any = None
+    if hess_op.diag is not None and int(hess_op.n_ci) <= 20:
+        _diag_np = np.asarray(hess_op.diag, dtype=np.float64).ravel()
+        _diag_safe = np.where(np.abs(_diag_np) > 1e-10, _diag_np, 1.0)
+        _z_precond_override = lambda x: np.asarray(x, dtype=np.float64) / _diag_safe
 
     z_results: list[Any] = []
     if pair_records:
@@ -2164,6 +2171,7 @@ def sacasscf_nonadiabatic_couplings_df(
                 maxiter=int(z_maxiter),
                 recycle_space=z_recycle_space,
                 method=_z_method,
+                precond_override=_z_precond_override,
             )
             z_results = [z_single]
             z_total_time = float(time.perf_counter() - t_z_solve_start)
