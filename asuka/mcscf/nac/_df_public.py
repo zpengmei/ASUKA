@@ -39,7 +39,7 @@ def sacasscf_nonadiabatic_couplings_df(
     df_threads: int = 0,
     response_term: _ResponseTerm = "split_orbfd",
     z_tol: float = 1e-10,
-    z_maxiter: int = 200,
+    z_maxiter: int = 100,
     delta_bohr: float = 1e-4,
 ) -> np.ndarray:
     """Compute SA-CASSCF NACVs (<bra|d/dR|ket>) using ASUKA DF integrals.

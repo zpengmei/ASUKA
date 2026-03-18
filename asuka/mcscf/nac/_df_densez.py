@@ -240,15 +240,19 @@ def sacasscf_nonadiabatic_couplings_df_densez(
         g_ci_bra = 0.5 * g_ket[n_orb:].copy()
         g_ci_ket = 0.5 * g_bra[n_orb:].copy()
 
-        ndet_ket = int(np.asarray(ci_list[ket]).size)
-        ndet_bra = int(np.asarray(ci_list[bra]).size)
+        def _to_np(x):
+            return np.asarray(x.get() if hasattr(x, "get") else x, dtype=np.float64)
+        ndet_ket = int(_to_np(ci_list[ket]).size)
+        ndet_bra = int(_to_np(ci_list[bra]).size)
         if ndet_ket == ndet_bra:
-            ket2bra = float(np.dot(np.asarray(ci_list[bra], dtype=np.float64).ravel(), g_ci_ket))
-            bra2ket = float(np.dot(np.asarray(ci_list[ket], dtype=np.float64).ravel(), g_ci_bra))
-            g_ci_ket = g_ci_ket - ket2bra * np.asarray(ci_list[bra], dtype=np.float64).ravel()
-            g_ci_bra = g_ci_bra - bra2ket * np.asarray(ci_list[ket], dtype=np.float64).ravel()
+            _ci_bra_np = _to_np(ci_list[bra]).ravel()
+            _ci_ket_np = _to_np(ci_list[ket]).ravel()
+            ket2bra = float(np.dot(_ci_bra_np, g_ci_ket))
+            bra2ket = float(np.dot(_ci_ket_np, g_ci_bra))
+            g_ci_ket = g_ci_ket - ket2bra * _ci_bra_np
+            g_ci_bra = g_ci_bra - bra2ket * _ci_ket_np
 
-        rhs_ci_list = [np.zeros_like(np.asarray(ci_list[r], dtype=np.float64).ravel()) for r in range(nroots)]
+        rhs_ci_list = [np.zeros(int(_to_np(ci_list[r]).size), dtype=np.float64) for r in range(nroots)]
         rhs_ci_list[ket] = g_ci_ket[:ndet_ket]
         rhs_ci_list[bra] = g_ci_bra[:ndet_bra]
 
@@ -272,7 +276,7 @@ def sacasscf_nonadiabatic_couplings_df_densez(
             dm1_r, dm2_r = trans_rdm12(
                 fcisolver_use,
                 np.asarray(Lci_list[r], dtype=np.float64).ravel(),
-                np.asarray(ci_list[r], dtype=np.float64).ravel(),
+                _to_np(ci_list[r]).ravel(),
                 int(ncas),
                 nelecas,
             )

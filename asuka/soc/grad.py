@@ -1016,7 +1016,7 @@ def soc_si_nuclear_gradients_all_roots(
     imag_tol: float = 1e-10,
     project_normalized: bool = True,
     z_tol: float = 1e-10,
-    z_maxiter: int = 200,
+    z_maxiter: int = 100,
     z_method: Literal["gmres", "gcrotmk"] | None = None,
     z_restart: int | None = None,
     z_gcrotmk_k: int | None = None,
@@ -1113,7 +1113,7 @@ def soc_si_nuclear_gradients_all_roots(
             raise ValueError("so_roots contains duplicates")
 
     if z_method is None:
-        method_z = "gcrotmk" if int(len(roots)) > 1 else "gmres"
+        method_z = "gmres"
     else:
         method_z = str(z_method).strip().lower()
     if method_z not in ("gmres", "gcrotmk"):
@@ -1301,7 +1301,7 @@ def soc_si_nuclear_gradient(
     imag_tol: float = 1e-10,
     project_normalized: bool = True,
     z_tol: float = 1e-10,
-    z_maxiter: int = 200,
+    z_maxiter: int = 100,
     use_newton_hessian: bool | None = True,
     soc_backend: Literal["cpu", "cuda", "auto"] = "auto",
     soc_cuda_threads: int = 128,
@@ -1465,7 +1465,7 @@ def soc_si_nuclear_gradient_multi_spin(
     imag_tol: float = 1e-10,
     project_normalized: bool = True,
     z_tol: float = 1e-10,
-    z_maxiter: int = 200,
+    z_maxiter: int = 100,
     use_newton_hessian: bool | None = True,
     soc_backend: Literal["cpu", "cuda", "auto"] = "auto",
     soc_cuda_threads: int = 128,
@@ -1747,7 +1747,7 @@ def solve_soc_ci_zvector_response(
     imag_tol: float = 1e-10,
     project_normalized: bool = True,
     z_tol: float = 1e-10,
-    z_maxiter: int = 200,
+    z_maxiter: int = 100,
     use_newton_hessian: bool | None = True,
     rdm_weights: Sequence[float] | None = None,
 ) -> SOCCIZVectorResponse:
@@ -1841,7 +1841,7 @@ def solve_soc_ci_zvector_response_multi_spin(
     imag_tol: float = 1e-10,
     project_normalized: bool = True,
     z_tol: float = 1e-10,
-    z_maxiter: int = 200,
+    z_maxiter: int = 100,
     use_newton_hessian: bool | None = True,
 ) -> SOCMultiSpinZVectorResponse:
     """General (multi-spin) SOC-SI adjoint → per-manifold MCSCF Z-vector responses.

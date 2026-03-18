@@ -1036,7 +1036,7 @@ def make_df_casscf_hvec_df(
     df_config: Any | None = None,
     df_threads: int = 0,
     z_tol: float = 1e-10,
-    z_maxiter: int = 200,
+    z_maxiter: int = 100,
     delta_bohr: float = 1e-4,
 ) -> HVecFn:
     """Build an h-vector callback for SA-CASSCF from ASUKA's DF NAC driver.

@@ -130,7 +130,7 @@ def mrci_grad_states_from_ref(
     df_config: Any | None = None,
     df_threads: int = 0,
     z_tol: float = 1e-10,
-    z_maxiter: int = 200,
+    z_maxiter: int = 100,
     mrci_backend: str | None = None,
     # Forwarded to mrci_states_from_ref
     **mrci_kwargs: Any,

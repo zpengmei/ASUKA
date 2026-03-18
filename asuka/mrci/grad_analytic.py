@@ -1002,7 +1002,7 @@ def mrci_grad_states_from_ref_analytic(
     df_config: Any | None = None,
     df_threads: int = 0,
     z_tol: float = 1e-10,
-    z_maxiter: int = 200,
+    z_maxiter: int = 100,
 ) -> list[np.ndarray]:
     """Compute analytic MRCISD gradients for the requested reference states.
 

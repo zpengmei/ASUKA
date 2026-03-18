@@ -3907,7 +3907,7 @@ def casscf_nuc_grad_df_per_root(
     delta_bohr: float = 1e-4,
     solver_kwargs: dict[str, Any] | None = None,
     z_tol: float = 1e-10,
-    z_maxiter: int = 200,
+    z_maxiter: int = 100,
     grad_roots: Sequence[int] | None = None,
 ) -> DFNucGradMultirootResult:
     """Per-root DF-based nuclear gradients for SA-CASSCF with CP-MCSCF response.
@@ -4539,11 +4539,12 @@ def casscf_nuc_grad_df_per_root(
     _z_use_x0_env = str(os.environ.get("ASUKA_ZVECTOR_USE_X0", "1")).strip().lower()
     _z_use_x0 = _z_use_x0_env not in ("0", "false", "no", "off", "disable", "disabled")
 
-    # Default to GCROTMK unless explicitly overridden.
+    # Default to GMRES. GCROTMK does m inner iterations per outer cycle,
+    # leading to ~20x more matvecs for ill-conditioned SA-CASSCF Hessians.
     if _z_method_env in ("gmres", "gcrotmk"):
         _z_method = _z_method_env
     else:
-        _z_method = "gcrotmk"
+        _z_method = "gmres"
     _z_recycle_space: list[tuple[np.ndarray | None, np.ndarray]] | None = [] if _z_method == "gcrotmk" else None
     _z_recycle_max = 0
     if _gpu_runtime_cfg.krylov_recycle_max_vectors is not None:
@@ -5284,7 +5285,7 @@ def casscf_nuc_grad_df_per_root(
         link_index=_linkstrl_rhs,
     )
     _eci0_all = np.array(
-        [float(np.dot(np.asarray(c).ravel(), np.asarray(hc).ravel())) for c, hc in zip(ci_list, _hci0_all)],
+        [float(np.dot(_asnumpy_f64(c).ravel(), _asnumpy_f64(hc).ravel())) for c, hc in zip(ci_list, _hci0_all)],
         dtype=np.float64,
     )
     _ppaa_2d = ppaa_sa_np.reshape(nmo * nmo, ncas * ncas)
@@ -5297,7 +5298,7 @@ def casscf_nuc_grad_df_per_root(
         _rhs_orb_all: list[np.ndarray] = []
         _rhs_ci_all: list[list[np.ndarray]] = []
         _batch_root_indices: list[int] = []  # maps batch index -> root index
-        _rhs_ci_zeros = [np.zeros_like(np.asarray(ci_list[r], dtype=np.float64).ravel()) for r in range(int(nroots))]
+        _rhs_ci_zeros = [np.zeros_like(_asnumpy_f64(ci_list[r]).ravel()) for r in range(int(nroots))]
         for K in range(nroots):
             if int(K) not in _grad_roots_set:
                 continue
@@ -5355,7 +5356,7 @@ def casscf_nuc_grad_df_per_root(
             rhs_orb = np.asarray(g_K[:n_orb], dtype=np.float64)
             rhs_ci_K = np.asarray(g_K[n_orb:], dtype=np.float64)
             rhs_ci = [arr.copy() for arr in _rhs_ci_zeros]
-            ndet_K = int(np.asarray(ci_list[K]).size)
+            ndet_K = int(_asnumpy_f64(ci_list[K]).size)
             rhs_ci[K] = rhs_ci_K[:ndet_K]
             _rhs_orb_all.append(rhs_orb)
             _rhs_ci_all.append(rhs_ci)
@@ -5997,8 +5998,8 @@ def casscf_nuc_grad_df_per_root(
             rhs_ci_K = g_K[n_orb:]
             rhs_ci = []
             for r in range(nroots):
-                rhs_ci.append(np.zeros_like(np.asarray(ci_list[r], dtype=np.float64).ravel()))
-            ndet_K = int(np.asarray(ci_list[K]).size)
+                rhs_ci.append(np.zeros_like(_asnumpy_f64(ci_list[r]).ravel()))
+            ndet_K = int(_asnumpy_f64(ci_list[K]).size)
             rhs_ci[K] = rhs_ci_K[:ndet_K]
 
             if _profile_df_per_root:
@@ -6181,7 +6182,7 @@ def casscf_nuc_grad_df_per_root(
                     _rdm_kw["rdm_backend"] = "cuda"
                 dm1_r, dm2_r = fcisolver_use.trans_rdm12(
                     np.asarray(Lci_list[r], dtype=np.float64).ravel(),
-                    np.asarray(ci_list[r], dtype=np.float64).ravel(),
+                    _asnumpy_f64(ci_list[r]).ravel(),
                     int(ncas),
                     nelecas,
                     **_rdm_kw,

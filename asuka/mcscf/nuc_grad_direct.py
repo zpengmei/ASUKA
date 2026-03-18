@@ -301,7 +301,7 @@ def casscf_nuc_grad_direct_per_root(
     threads: int = 0,
     solver_kwargs: dict[str, Any] | None = None,
     z_tol: float = 1e-10,
-    z_maxiter: int = 200,
+    z_maxiter: int = 100,
     grad_roots: Sequence[int] | None = None,
 ) -> DFNucGradMultirootResult:
     """Per-root exact direct-backend SA-CASSCF nuclear gradients."""

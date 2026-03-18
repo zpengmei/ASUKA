@@ -1659,7 +1659,7 @@ def sacasscf_nonadiabatic_couplings_df(
     delta_bohr: float = 1e-4,
     fd_integrals_builder: Callable[[Any], tuple[Any, Any, Any]] | None = None,
     z_tol: float = 1e-10,
-    z_maxiter: int = 200,
+    z_maxiter: int = 100,
 ) -> np.ndarray:
     """Compute SA-CASSCF NACVs (<bra|d/dR|ket>) using ASUKA DF integrals.
 
@@ -2120,17 +2120,19 @@ def sacasscf_nonadiabatic_couplings_df(
         g_ci_bra = 0.5 * g_ket[n_orb:].copy()
         g_ci_ket = 0.5 * g_bra[n_orb:].copy()
 
-        ndet_ket = int(np.asarray(ci_list[ket]).size)
-        ndet_bra = int(np.asarray(ci_list[bra]).size)
+        ndet_ket = int(_asnumpy_f64(ci_list[ket]).size)
+        ndet_bra = int(_asnumpy_f64(ci_list[bra]).size)
         if ndet_ket == ndet_bra:
-            ket2bra = float(np.dot(np.asarray(ci_list[bra], dtype=np.float64).ravel(), g_ci_ket))
-            bra2ket = float(np.dot(np.asarray(ci_list[ket], dtype=np.float64).ravel(), g_ci_bra))
-            g_ci_ket = g_ci_ket - ket2bra * np.asarray(ci_list[bra], dtype=np.float64).ravel()
-            g_ci_bra = g_ci_bra - bra2ket * np.asarray(ci_list[ket], dtype=np.float64).ravel()
+            _ci_bra_np = _asnumpy_f64(ci_list[bra]).ravel()
+            _ci_ket_np = _asnumpy_f64(ci_list[ket]).ravel()
+            ket2bra = float(np.dot(_ci_bra_np, g_ci_ket))
+            bra2ket = float(np.dot(_ci_ket_np, g_ci_bra))
+            g_ci_ket = g_ci_ket - ket2bra * _ci_bra_np
+            g_ci_bra = g_ci_bra - bra2ket * _ci_ket_np
 
         rhs_ci_list: list[np.ndarray] = []
         for r in range(nroots):
-            rhs_ci_list.append(np.zeros_like(np.asarray(ci_list[r], dtype=np.float64).ravel()))
+            rhs_ci_list.append(np.zeros_like(_asnumpy_f64(ci_list[r]).ravel()))
         rhs_ci_list[ket] = g_ci_ket[:ndet_ket]
         rhs_ci_list[bra] = g_ci_bra[:ndet_bra]
         pair_timing["zvector_rhs_build"] = float(time.perf_counter() - t0)
@@ -2147,9 +2149,9 @@ def sacasscf_nonadiabatic_couplings_df(
         rhs_orb_all.append(np.asarray(g_orb, dtype=np.float64))
         rhs_ci_all.append(rhs_ci_list)
 
-    # Use GMRES when GPU mode is active — the GPU GCROTMK implementation
-    # can stall on large orbital spaces (n_orb > 1000).
-    _z_method = "gmres" if bool(getattr(hess_op, "gpu_mode", False)) else "gcrotmk"
+    # Default to GMRES — GCROTMK does ~20x more matvecs per maxiter due to
+    # inner iteration cycles, which is catastrophic for ill-conditioned systems.
+    _z_method = "gmres"
     # For small active spaces (CI dimension << orbital dimension), the SA Fancy
     # preconditioner can be counterproductive.  Use diagonal preconditioner instead.
     _z_precond_override: Any = None
@@ -2262,7 +2264,7 @@ def sacasscf_nonadiabatic_couplings_df(
                 dm1_r, dm2_r = trans_rdm12(
                     fcisolver_use,
                     np.asarray(Lci_list[r], dtype=np.float64).ravel(),
-                    np.asarray(ci_list[r], dtype=np.float64).ravel(),
+                    _asnumpy_f64(ci_list[r]).ravel(),
                     int(ncas),
                     nelecas,
                 )

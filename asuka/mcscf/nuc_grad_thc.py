@@ -2410,7 +2410,7 @@ def _casscf_nuc_grad_thc_per_root_impl(
     int1e_contract_backend: Literal["auto", "cpu", "cuda"] = "cpu",
     solver_kwargs: dict[str, Any] | None = None,
     z_tol: float = 1e-10,
-    z_maxiter: int = 200,
+    z_maxiter: int = 100,
     grad_roots: Sequence[int] | None = None,
 ) -> THCNucGradMultirootResult:
     """Per-root analytic gradients for SA-CASSCF with THC / local-THC integrals."""
@@ -2632,8 +2632,8 @@ def _casscf_nuc_grad_thc_per_root_impl(
             g_K = np.asarray(g_K, dtype=np.float64).ravel()
             rhs_orb = g_K[:n_orb]
             rhs_ci_K = g_K[n_orb:]
-            rhs_ci = [np.zeros_like(np.asarray(ci_list[r], dtype=np.float64).ravel()) for r in range(int(nroots))]
-            rhs_ci[K] = rhs_ci_K[: int(np.asarray(ci_list[K]).size)]
+            rhs_ci = [np.zeros_like(_asnumpy_f64(ci_list[r]).ravel()) for r in range(int(nroots))]
+            rhs_ci[K] = rhs_ci_K[: int(_asnumpy_f64(ci_list[K]).size)]
 
             def _z_bad(z_res: Any) -> bool:
                 z_vec = np.asarray(getattr(z_res, "z_packed", np.array([], dtype=np.float64)), dtype=np.float64).ravel()
@@ -2683,7 +2683,7 @@ def _casscf_nuc_grad_thc_per_root_impl(
                     hessian_op=hess_op,
                     tol=float(z_tol),
                     maxiter=max(int(z_maxiter), 400),
-                    method="gcrotmk",
+                    method="gmres",
                     x0=None,
                 )
             if _z_bad(z_K):
@@ -2709,7 +2709,7 @@ def _casscf_nuc_grad_thc_per_root_impl(
                     continue
                 dm1_r, dm2_r = fcisolver_use.trans_rdm12(
                     np.asarray(Lci_list[r], dtype=np.float64).ravel(),
-                    np.asarray(ci_list[r], dtype=np.float64).ravel(),
+                    _asnumpy_f64(ci_list[r]).ravel(),
                     int(ncas),
                     nelecas,
                     rdm_backend="cuda",
@@ -2809,7 +2809,7 @@ def casscf_nuc_grad_thc_per_root(
     int1e_contract_backend: Literal["auto", "cpu", "cuda"] = "cpu",
     solver_kwargs: dict[str, Any] | None = None,
     z_tol: float = 1e-10,
-    z_maxiter: int = 200,
+    z_maxiter: int = 100,
     grad_roots: Sequence[int] | None = None,
 ) -> THCNucGradMultirootResult:
     """Per-root analytic gradients for SA-CASSCF with THC / local-THC integrals."""

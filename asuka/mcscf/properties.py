@@ -285,7 +285,7 @@ def sacasscf_properties(
     int1e_backend: Literal["auto", "cpu", "cuda"] = "auto",
     df_threads: int = 0,
     z_tol: float = 1e-10,
-    z_maxiter: int = 200,
+    z_maxiter: int = 100,
     nacv_response_term: Literal["split_orbfd", "fd_jacobian"] = "split_orbfd",
     grad_kwargs: dict[str, Any] | None = None,
     nacv_kwargs: dict[str, Any] | None = None,
