@@ -188,6 +188,16 @@ def casscf_nuc_grad_per_root(*args: Any, **kwargs: Any) -> DFNucGradMultirootRes
 
         if use_direct:
             return casscf_nuc_grad_direct_per_root(scf_out, casscf, **kwargs)
+
+        import warnings
+        warnings.warn(
+            "casscf_nuc_grad_per_root: using the DF gradient backend. "
+            "The DF per-root gradient path has a known CUDA numerical issue "
+            "for systems with virtual orbitals. For production use (e.g. SHARC "
+            "dynamics), use two_e_backend='direct' in run_hf_df to enable the "
+            "exact 4c gradient path, which is validated against PySCF to ~5e-5.",
+            stacklevel=2,
+        )
         if use_thc:
             return casscf_nuc_grad_thc_per_root(scf_out, casscf, **kwargs)
         return casscf_nuc_grad_df_per_root(scf_out, casscf, **kwargs)
@@ -201,4 +211,60 @@ def casscf_nuc_grad_per_root(*args: Any, **kwargs: Any) -> DFNucGradMultirootRes
     raise TypeError("casscf_nuc_grad_per_root expects (scf_out, casscf, ...)")
 
 
-__all__ = ["NucGradResult", "casci_nuc_grad", "casscf_nuc_grad", "casscf_nuc_grad_per_root"]
+def sacasscf_nonadiabatic_couplings(*args: Any, **kwargs: Any) -> np.ndarray:
+    """Compute SA-CASSCF nonadiabatic coupling vectors.
+
+    Call pattern
+    ------------
+    ``sacasscf_nonadiabatic_couplings(scf_out, casscf, *, backend='auto', **kwargs)``
+
+    When ``backend='auto'``, selects 'direct' (exact 4c) if
+    ``scf_out.two_e_backend == 'direct'``, else 'df'.
+
+    Returns
+    -------
+    np.ndarray
+        NACV array indexed as ``result[i, j]`` → ``(natm, 3)``.
+    """
+
+    if len(args) != 2:
+        raise TypeError("sacasscf_nonadiabatic_couplings expects (scf_out, casscf, ...)")
+
+    scf_out, casscf = args
+    backend = str(kwargs.pop("backend", "auto")).strip().lower()
+    if backend not in {"auto", "df", "direct"}:
+        raise ValueError("backend must be one of: 'auto', 'df', 'direct'")
+
+    use_direct = bool(backend == "direct")
+    if backend == "auto":
+        use_direct = bool(
+            getattr(scf_out, "direct_jk_ctx", None) is not None
+            or str(getattr(scf_out, "two_e_backend", "") or "").strip().lower() == "direct"
+        )
+
+    if use_direct:
+        from .nac._dense import sacasscf_nonadiabatic_couplings_dense  # noqa: PLC0415
+
+        return sacasscf_nonadiabatic_couplings_dense(scf_out, casscf, **kwargs)
+
+    import warnings
+    warnings.warn(
+        "sacasscf_nonadiabatic_couplings: using the DF backend. "
+        "The DF NACV path has a known CUDA numerical issue for systems "
+        "with virtual orbitals. For production use (e.g. SHARC dynamics), "
+        "use two_e_backend='direct' in run_hf_df to enable the exact 4c "
+        "NACV path, which is validated against PySCF to ~1e-5.",
+        stacklevel=2,
+    )
+    from .nac._df import sacasscf_nonadiabatic_couplings_df  # noqa: PLC0415
+
+    return sacasscf_nonadiabatic_couplings_df(scf_out, casscf, **kwargs)
+
+
+__all__ = [
+    "NucGradResult",
+    "casci_nuc_grad",
+    "casscf_nuc_grad",
+    "casscf_nuc_grad_per_root",
+    "sacasscf_nonadiabatic_couplings",
+]

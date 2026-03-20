@@ -889,6 +889,258 @@ def _gmres_solve(
     return x, out
 
 
+def _cg_solve(
+    mv: Callable[[np.ndarray], np.ndarray],
+    b: np.ndarray,
+    *,
+    diag_precond: np.ndarray | None = None,
+    precond: Callable[[np.ndarray], np.ndarray] | None = None,
+    tol: float = 1e-7,
+    atol: float = 1e-12,
+    maxiter: int = 50,
+    x0: np.ndarray | None = None,
+) -> tuple[np.ndarray, dict[str, Any]]:
+    """Solve A x = b with preconditioned conjugate gradient (CG).
+
+    This mirrors PySCF's ``lagrange.Gradients.solve_lagrange`` which uses
+    ``scipy.sparse.linalg.cg`` for SA-CASSCF per-root gradient Z-vectors.
+    CG is appropriate when the projected SA-CASSCF Hessian is symmetric
+    positive semi-definite (which it is after SA-CI projection).
+
+    Parameters
+    ----------
+    mv : Callable
+        Matrix-vector product function (must be symmetric).
+    b : np.ndarray
+        RHS vector.
+    diag_precond : np.ndarray | None
+        Diagonal preconditioner array.
+    precond : Callable | None
+        Preconditioner function (left preconditioner).
+    tol : float
+        Relative convergence tolerance (default 1e-7, matching PySCF).
+    atol : float
+        Absolute convergence tolerance (default 1e-12).
+    maxiter : int
+        Max iterations (default 50, matching PySCF).
+    x0 : np.ndarray | None
+        Initial guess.
+    """
+
+    from scipy.sparse.linalg import LinearOperator, cg
+
+    b = np.asarray(b, dtype=np.float64).ravel()
+    n = int(b.size)
+    bnorm = float(np.linalg.norm(b))
+    if n == 0:
+        return b.copy(), {
+            "info": 0, "niter": 0, "matvec_calls": 0,
+            "matvec_time_total": 0.0, "matvec_time_avg": 0.0,
+            "solve_time_total": 0.0, "rhs_norm": 0.0,
+            "residual_norm": 0.0, "residual_rel": 0.0, "solver": "cg",
+        }
+
+    matvec_calls = 0
+    matvec_time = 0.0
+
+    def _mv_counted(x: np.ndarray) -> np.ndarray:
+        nonlocal matvec_calls, matvec_time
+        matvec_calls += 1
+        t0 = time.perf_counter()
+        y = mv(x)
+        matvec_time += time.perf_counter() - t0
+        return y
+
+    A = LinearOperator((n, n), matvec=_mv_counted, dtype=np.float64)
+
+    M = None
+    if precond is not None:
+        def _m_mv(x: np.ndarray) -> np.ndarray:
+            return np.asarray(precond(np.asarray(x, dtype=np.float64).ravel()), dtype=np.float64).ravel()
+        M = LinearOperator((n, n), matvec=_m_mv, dtype=np.float64)
+    elif diag_precond is not None:
+        d = np.asarray(diag_precond, dtype=np.float64).ravel()
+        if d.size != n:
+            raise ValueError("diag_precond length mismatch")
+        d_safe = np.where(np.abs(d) > 1e-14, d, 1.0)
+        def _m_mv(x: np.ndarray) -> np.ndarray:
+            return np.asarray(x, dtype=np.float64).ravel() / d_safe
+        M = LinearOperator((n, n), matvec=_m_mv, dtype=np.float64)
+
+    niter = 0
+    def _cb(_rk=None):
+        nonlocal niter
+        niter += 1
+
+    x0_use = None if x0 is None else np.asarray(x0, dtype=np.float64).ravel()
+    if x0_use is not None and int(x0_use.size) != n:
+        raise ValueError("x0 length mismatch")
+
+    kwargs: dict[str, Any] = {
+        "M": M,
+        "maxiter": int(maxiter),
+        "callback": _cb,
+    }
+    # SciPy CG tol/atol API changed in 1.14
+    import scipy  # noqa: PLC0415
+    if hasattr(scipy, "__version__") and tuple(int(x) for x in scipy.__version__.split(".")[:2]) >= (1, 14):
+        kwargs["rtol"] = float(tol)
+        kwargs["atol"] = float(atol)
+    else:
+        kwargs["tol"] = float(tol)
+        kwargs["atol"] = float(atol)
+    if x0_use is not None:
+        kwargs["x0"] = x0_use
+
+    t_solve0 = time.perf_counter()
+    x, info = cg(A, b, **kwargs)
+    solve_time = time.perf_counter() - t_solve0
+    x = np.asarray(x, dtype=np.float64).ravel()
+    r = mv(x) - b
+    resid = float(np.linalg.norm(r))
+    rel = resid / bnorm if bnorm > 0.0 else resid
+
+    out: dict[str, Any] = {
+        "info": int(info),
+        "niter": int(niter),
+        "matvec_calls": int(matvec_calls),
+        "matvec_time_total": float(matvec_time),
+        "matvec_time_avg": float(matvec_time) / float(matvec_calls) if matvec_calls else 0.0,
+        "solve_time_total": float(solve_time),
+        "rhs_norm": float(bnorm),
+        "residual_norm": resid,
+        "residual_rel": float(rel),
+        "solver": "cg",
+    }
+    return x, out
+
+
+def _cg_solve_gpu(
+    mv: Callable,
+    b: np.ndarray,
+    *,
+    diag_precond: np.ndarray | None = None,
+    precond: Callable | None = None,
+    tol: float = 1e-7,
+    atol: float = 1e-12,
+    maxiter: int = 50,
+    x0: np.ndarray | None = None,
+) -> tuple[np.ndarray, dict[str, Any]]:
+    """GPU-native CG solve using CuPy — zero GPU↔CPU sync during iteration.
+
+    Mirrors :func:`_cg_solve` but keeps all iteration vectors on device.
+    """
+
+    import cupy as cp  # type: ignore[import-not-found]
+    from cupyx.scipy.sparse.linalg import LinearOperator as CuLinearOperator
+    from cupyx.scipy.sparse.linalg import cg as cu_cg
+
+    b_np = np.asarray(b, dtype=np.float64).ravel()
+    n = int(b_np.size)
+    bnorm = float(np.linalg.norm(b_np))
+    if n == 0:
+        return b_np.copy(), {
+            "info": 0, "niter": 0, "matvec_calls": 0,
+            "matvec_time_total": 0.0, "matvec_time_avg": 0.0,
+            "solve_time_total": 0.0, "rhs_norm": 0.0,
+            "residual_norm": 0.0, "residual_rel": 0.0, "solver": "cg_gpu",
+        }
+
+    b_d = cp.asarray(b_np, dtype=cp.float64)
+
+    matvec_calls = 0
+    matvec_time = 0.0
+
+    def _mv_gpu(x_d):
+        nonlocal matvec_calls, matvec_time
+        matvec_calls += 1
+        t0 = time.perf_counter()
+        y_d = mv(x_d)
+        y_d = cp.asarray(y_d, dtype=cp.float64).ravel()
+        matvec_time += time.perf_counter() - t0
+        return y_d
+
+    A = CuLinearOperator((n, n), matvec=_mv_gpu, dtype=cp.float64)
+
+    # Preconditioner on GPU.
+    M = None
+    if precond is not None:
+        _gpu_precond_ok = False
+        try:
+            _probe = precond(cp.zeros_like(b_d))
+            _gpu_precond_ok = isinstance(_probe, cp.ndarray)
+        except Exception:
+            _gpu_precond_ok = False
+
+        if _gpu_precond_ok:
+            def _m_mv_gpu(x_d):
+                return cp.asarray(precond(x_d), dtype=cp.float64).ravel()
+            M = CuLinearOperator((n, n), matvec=_m_mv_gpu, dtype=cp.float64)
+        else:
+            def _m_mv_gpu(x_d):
+                x_np = cp.asnumpy(x_d).astype(np.float64)
+                y_np = np.asarray(precond(x_np), dtype=np.float64).ravel()
+                return cp.asarray(y_np, dtype=cp.float64)
+            M = CuLinearOperator((n, n), matvec=_m_mv_gpu, dtype=cp.float64)
+    elif diag_precond is not None:
+        d = cp.asarray(diag_precond, dtype=cp.float64).ravel()
+        if d.size != n:
+            raise ValueError("diag_precond length mismatch")
+        d_safe = cp.where(cp.abs(d) > 1e-14, d, 1.0)
+        def _m_mv_gpu(x_d):
+            return x_d / d_safe
+        M = CuLinearOperator((n, n), matvec=_m_mv_gpu, dtype=cp.float64)
+
+    x0_d = None
+    if x0 is not None:
+        x0_d = cp.asarray(x0, dtype=cp.float64).ravel()
+        if x0_d.size != n:
+            raise ValueError("x0 length mismatch")
+
+    t_solve0 = time.perf_counter()
+    cg_kwargs: dict[str, Any] = {
+        "x0": x0_d,
+        "maxiter": int(maxiter),
+        "M": M,
+    }
+    try:
+        import inspect as _insp
+        _cg_params = _insp.signature(cu_cg).parameters
+    except Exception:
+        _cg_params = {}
+    if "rtol" in _cg_params:
+        cg_kwargs["rtol"] = float(tol)
+        cg_kwargs["atol"] = float(atol)
+    else:
+        cg_kwargs["tol"] = float(tol)
+        if "atol" in _cg_params:
+            cg_kwargs["atol"] = float(atol)
+
+    x_d, info = cu_cg(A, b_d, **cg_kwargs)
+    solve_time = time.perf_counter() - t_solve0
+
+    # Single sync at end.
+    x_np = cp.asnumpy(x_d).astype(np.float64)
+
+    r = mv(x_np) - b_np
+    resid = float(np.linalg.norm(r))
+    rel = resid / bnorm if bnorm > 0.0 else resid
+
+    out: dict[str, Any] = {
+        "info": int(info),
+        "niter": int(matvec_calls),
+        "matvec_calls": int(matvec_calls),
+        "matvec_time_total": float(matvec_time),
+        "matvec_time_avg": float(matvec_time) / float(matvec_calls) if matvec_calls else 0.0,
+        "solve_time_total": float(solve_time),
+        "rhs_norm": float(bnorm),
+        "residual_norm": resid,
+        "residual_rel": float(rel),
+        "solver": "cg_gpu",
+    }
+    return x_np, out
+
+
 def _gcrotmk_solve(
     mv: Callable[[np.ndarray], np.ndarray],
     b: np.ndarray,
@@ -1262,41 +1514,20 @@ def _build_sa_lagrange_precond(
     d_ci_mat[np.abs(d_ci_mat) < 1e-8] = 1e-8
     r_ci_mat = 1.0 / d_ci_mat
 
-    # For each root i, precompute the coupling matrix.
-    # When e_roots is available, use the Fancy matrix (Molcas convention)
-    # which includes energy-weighted inter-root coupling.
-    # Without e_roots, fall back to the pure overlap inverse (sci_inv).
+    # Match PySCF's SACASLagPrec exactly here: the SA CI preconditioner uses
+    # only the R_I|J> overlap matrix S(I)_JK = <J|R_I|K>. Injecting extra
+    # root-energy coupling changes the Krylov surface and breaks parity with
+    # PySCF's SA-CASSCF Lagrange solve.
     sci_inv_stack = np.empty((nroots, nroots, nroots), dtype=np.float64)
-    if e_roots is not None:
-        # Compute Fancy matrix following Molcas CIDia_SA:
-        # Fancy[I,J,K] = w_K * delta(I,K) * (E_K - E_precond_J)
-        # where E_precond_J = E_root_J (the root energy used in diag preconditioner)
-        _e = np.asarray(e_roots, dtype=np.float64).ravel()
-        _w = np.asarray(weights if weights is not None else [1.0 / nroots] * nroots, dtype=np.float64)
-        for i in range(nroots):
-            r_i = np.asarray(r_ci_mat[:, i], dtype=np.float64)
-            rci_c = r_i[:, None] * cmat
-            sci = cmat.T @ rci_c  # (nroots, nroots)
-            # Modify sci with Fancy: sci_modified[J,K] = sci[J,K] + Fancy_correction
-            # Fancy[J,K,i] = w_i * delta(J,i) * (E_i - E_J) for diagonal contribution
-            # For the full Fancy, see Molcas CIDia_SA
-            sci_fancy = sci.copy()
-            for k in range(nroots):
-                sci_fancy[k, k] += _w[i] * (_e[i] - _e[k]) if i != k else 0.0
-            try:
-                sci_inv_stack[i] = np.linalg.inv(sci_fancy)
-            except np.linalg.LinAlgError:
-                sci_inv_stack[i] = np.linalg.pinv(sci_fancy)
-    else:
-        for i in range(nroots):
-            r_i = np.asarray(r_ci_mat[:, i], dtype=np.float64)
-            rci_c = r_i[:, None] * cmat
-            sci = cmat.T @ rci_c
-            try:
-                sci_inv = np.linalg.inv(sci)
-            except np.linalg.LinAlgError:
-                sci_inv = np.linalg.pinv(sci)
-            sci_inv_stack[i] = np.asarray(sci_inv, dtype=np.float64)
+    for i in range(nroots):
+        r_i = np.asarray(r_ci_mat[:, i], dtype=np.float64)
+        rci_c = r_i[:, None] * cmat
+        sci = cmat.T @ rci_c
+        try:
+            sci_inv = np.linalg.inv(sci)
+        except np.linalg.LinAlgError:
+            sci_inv = np.linalg.pinv(sci)
+        sci_inv_stack[i] = np.asarray(sci_inv, dtype=np.float64)
 
     # Lazy GPU cache (allocated on first CuPy call).
     try:
@@ -1518,14 +1749,10 @@ def build_mcscf_hessian_operator(
                     raise ValueError("h_op input length mismatch")
 
                 if is_sa:
-                    x_orb = x[:n_orb]
-                    x_ci_list = _ci_unflatten_xp(xp, x[n_orb:])
                     if ci_ref_list is None:
                         raise RuntimeError("internal error: expected ci_ref_list for SA-CASSCF")
                     _refs = _ci_ref_dev if _is_gpu else ci_ref_list
                     _ginv = _sa_gram_inv_dev if (_is_gpu and _mv_gpu_mode) else sa_gram_inv
-                    x_ci_list = _project_sa_ci_components(_refs, x_ci_list, gram_inv=_ginv)
-                    x = xp.concatenate([x_orb, xp.concatenate([xp.asarray(v, dtype=xp.float64).ravel() for v in x_ci_list])])
 
                 y = h_op(x)
                 y = xp.asarray(y, dtype=xp.float64).ravel()
@@ -1792,8 +2019,8 @@ def solve_mcscf_zvector(
             ctx_rdm = nullcontext(False)
 
         method_l = str(method).strip().lower()
-        if method_l not in ("gmres", "gcrotmk"):
-            raise ValueError("method must be 'gmres' or 'gcrotmk'")
+        if method_l not in ("gmres", "gcrotmk", "cg"):
+            raise ValueError("method must be 'gmres', 'gcrotmk', or 'cg'")
 
         # Orbital RHS
         if rhs_orb is None:
@@ -1810,13 +2037,6 @@ def solve_mcscf_zvector(
             rhs_ci_flat, _ = _flatten_ci(rhs_ci)
             if int(rhs_ci_flat.size) != int(op.n_ci):
                 raise ValueError("rhs_ci size mismatch")
-
-        if op.is_sa and bool(project_sa_rhs):
-            rhs_ci_list = op.ci_unflatten(rhs_ci_flat)
-            if not isinstance(rhs_ci_list, list) or op.ci_ref_list is None:
-                raise RuntimeError("internal error: expected list CI unpacking for SA-CASSCF")
-            rhs_ci_list = _project_sa_ci_components(op.ci_ref_list, rhs_ci_list, gram_inv=op.sa_gram_inv)
-            rhs_ci_flat = np.concatenate([np.asarray(v, dtype=np.float64).ravel() for v in rhs_ci_list])
 
         diag_use: np.ndarray | None = op.diag
         precond_use: Callable[[np.ndarray], np.ndarray] | None = None
@@ -1909,6 +2129,18 @@ def solve_mcscf_zvector(
                 info_cpu["backend"] = "cpu"
                 return x_cpu, info_cpu
 
+        def _build_init_guess(b_vec: np.ndarray) -> np.ndarray | None:
+            b_arr = np.asarray(b_vec, dtype=np.float64).ravel()
+            if precond_use is not None:
+                return np.asarray(precond_use(b_arr), dtype=np.float64).ravel()
+            if diag_use is not None:
+                d = np.asarray(diag_use, dtype=np.float64).ravel()
+                if int(d.size) != int(b_arr.size):
+                    raise ValueError("diag length mismatch for init guess")
+                d_safe = np.where(np.abs(d) > 1e-14, d, 1.0)
+                return b_arr / d_safe
+            return None
+
         info: dict[str, Any]
         z: np.ndarray
         z_orb: np.ndarray
@@ -1939,9 +2171,23 @@ def solve_mcscf_zvector(
                         raise ValueError("x0 length mismatch")
 
                 b_orb = -rhs_orb_flat
+                if x0_orb is None:
+                    x0_orb = _build_init_guess(b_orb)
                 if method_l == "gcrotmk":
                     with ctx_rdm:
                         z_orb, info = _solve_gcrotmk_dispatch(b_orb, x0_orb)
+                elif method_l == "cg":
+                    cg_kwargs_orb: dict[str, Any] = {
+                        "diag_precond": diag_use,
+                        "precond": precond_use,
+                        "tol": float(tol),
+                        "atol": 1e-12,
+                        "maxiter": int(maxiter),
+                    }
+                    if x0_orb is not None:
+                        cg_kwargs_orb["x0"] = np.asarray(x0_orb, dtype=np.float64).ravel()
+                    with ctx_rdm:
+                        z_orb, info = _cg_solve(op.mv, b_orb, **cg_kwargs_orb)
                 else:
                     gmres_kwargs: dict[str, Any] = {
                         "diag_precond": diag_use,
@@ -1967,20 +2213,34 @@ def solve_mcscf_zvector(
                 x0_use = np.asarray(x0, dtype=np.float64).ravel()
                 if int(x0_use.size) != int(op.n_tot):
                     raise ValueError("x0 length mismatch")
-                if op.is_sa:
-                    x0_orb = x0_use[: int(op.n_orb)]
-                    x0_ci_list = op.ci_unflatten(x0_use[int(op.n_orb) :])
-                    if not isinstance(x0_ci_list, list) or op.ci_ref_list is None:
-                        raise RuntimeError("internal error: expected list CI unpacking for SA-CASSCF")
-                    x0_ci_list = _project_sa_ci_components(op.ci_ref_list, x0_ci_list, gram_inv=op.sa_gram_inv)
-                    x0_use = np.concatenate(
-                        [x0_orb, np.concatenate([np.asarray(v, dtype=np.float64).ravel() for v in x0_ci_list])]
-                    )
-
             b = -rhs
+            if x0_use is None:
+                x0_use = _build_init_guess(b)
             if method_l == "gcrotmk":
                 with ctx_rdm:
                     z, info = _solve_gcrotmk_dispatch(b, x0_use)
+            elif method_l == "cg":
+                cg_kwargs: dict[str, Any] = {
+                    "diag_precond": diag_use,
+                    "precond": precond_use,
+                    "tol": float(tol),
+                    "atol": 1e-12,
+                    "maxiter": int(maxiter),
+                }
+                if x0_use is not None:
+                    cg_kwargs["x0"] = np.asarray(x0_use, dtype=np.float64).ravel()
+                _use_gpu_cg = bool(op.gpu_mode)
+                if _use_gpu_cg:
+                    try:
+                        import cupy as _cp_cg  # noqa: PLC0415
+                        _ = _cp_cg.zeros(1)
+                    except Exception:
+                        _use_gpu_cg = False
+                with ctx_rdm:
+                    if _use_gpu_cg:
+                        z, info = _cg_solve_gpu(op.mv, b, **cg_kwargs)
+                    else:
+                        z, info = _cg_solve(op.mv, b, **cg_kwargs)
             else:
                 gmres_kwargs = {
                     "diag_precond": diag_use,
@@ -1998,17 +2258,6 @@ def solve_mcscf_zvector(
             z = np.asarray(z, dtype=np.float64).ravel()
             z_orb = z[: int(op.n_orb)].copy()
             z_ci = op.ci_unflatten(z[int(op.n_orb) :])
-            if op.is_sa and bool(project_sa_rhs) and op.ci_ref_list is not None:
-                if not isinstance(z_ci, list):
-                    raise RuntimeError("internal error: expected list CI unpacking for SA-CASSCF")
-                z_ci = _project_sa_ci_components(op.ci_ref_list, z_ci, gram_inv=op.sa_gram_inv)
-                if int(op.n_ci) > 0:
-                    z_ci_flat = np.concatenate(
-                        [np.asarray(v, dtype=np.float64).ravel() for v in z_ci]
-                    )
-                else:
-                    z_ci_flat = np.zeros(0, dtype=np.float64)
-                z = np.concatenate([z_orb, z_ci_flat])
 
         resid = float(info.get("residual_norm", np.nan))
         rel = float(info.get("residual_rel", np.nan))
@@ -2017,6 +2266,53 @@ def solve_mcscf_zvector(
             converged = bool(rel <= float(tol))
         else:  # pragma: no cover
             converged = bool(solver_info == 0)
+
+        # Safety check: if the absolute residual is unreasonably large
+        # compared to the RHS, override convergence to trigger the dense
+        # fallback.  GPU GMRES can report misleading convergence info
+        # for ill-conditioned SA Hessians.
+        _rhs_norm = float(info.get("rhs_norm", 0.0))
+        if bool(converged) and np.isfinite(resid) and resid > max(1e-4, 0.01 * _rhs_norm):
+            converged = False
+
+        _dense_fallback_dim = 256
+        try:
+            import os as _os_dense  # noqa: PLC0415
+            _dense_fallback_dim = int(_os_dense.environ.get("ASUKA_ZVECTOR_DENSE_FALLBACK_DIM", "256"))
+        except Exception:
+            _dense_fallback_dim = 256
+        _want_dense_fallback = (
+            (not bool(converged))
+            and (not bool(op.orb_only))
+            and bool(op.is_sa)
+            and int(getattr(op, "n_tot", 0)) > 0
+            and int(getattr(op, "n_tot", 0)) <= int(max(0, _dense_fallback_dim))
+        )
+        if _want_dense_fallback:
+            try:
+                from .zvector_dense import DenseSVDLinearSolver  # noqa: PLC0415
+                _dense = DenseSVDLinearSolver.from_hessian_op(op)
+                z_dense = _dense.solve_vec(b)
+                z_dense = np.asarray(z_dense, dtype=np.float64).ravel()
+                r_dense = op.mv(z_dense) - b
+                resid_dense = float(np.linalg.norm(r_dense))
+                rel_dense = resid_dense / float(np.linalg.norm(b)) if float(np.linalg.norm(b)) > 0.0 else resid_dense
+                z = z_dense
+                z_orb = z[: int(op.n_orb)].copy()
+                z_ci = op.ci_unflatten(z[int(op.n_orb) :])
+                info = dict(info)
+                info["dense_fallback"] = True
+                info["dense_fallback_rcond"] = float(_dense.rcond)
+                info["dense_fallback_residual_norm"] = float(resid_dense)
+                info["dense_fallback_residual_rel"] = float(rel_dense)
+                info["solver"] = f'{info.get("solver", method_l)}+dense_svd'
+                resid = float(resid_dense)
+                rel = float(rel_dense)
+                converged = bool(np.isfinite(rel_dense))
+                solver_info = 0 if bool(converged) else solver_info
+            except Exception as _dense_exc:
+                info = dict(info)
+                info["dense_fallback_error"] = f'{type(_dense_exc).__name__}: {_dense_exc}'
 
         niter = int(info.get("niter", 0))
         if niter <= 0 and solver_info > 0:

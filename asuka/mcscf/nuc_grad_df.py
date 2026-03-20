@@ -354,6 +354,63 @@ def _flush_gpu_pool() -> None:
         pass
 
 
+
+def _sanitize_cuda_after_hf_dfjk(*, clear_cueri_df_caches: bool = False) -> None:
+    """Fence and tear down HF DF-JK CUDA state before DF derivative kernels.
+
+    The occupied-driven HF DF-JK CUDA extension launches asynchronously and
+    retains device-side workspaces outside the CuPy pool. In the SA per-root
+    gradient path, entering DF derivative contractions immediately afterward can
+    produce wrong answers on some virtual-containing CUDA cases.
+
+    This helper provides a narrow barrier:
+    1. synchronize the active CUDA stream/device before any DF derivative kernel starts
+    2. release HF DF-JK extension workspaces/BQ caches
+    3. optionally clear cuERI DF plan caches if a caller wants a colder reset
+    """
+    try:
+        import cupy as cp  # noqa: PLC0415
+    except Exception:
+        return
+
+    if not _normalize_bool_env(
+        _os.environ.get("ASUKA_SANITIZE_CUDA_AFTER_HF_DFJK"),
+        default=False,
+    ):
+        return
+
+    try:
+        cp.cuda.get_current_stream().synchronize()
+    except Exception:
+        try:
+            cp.cuda.Device().synchronize()
+        except Exception:
+            pass
+
+    if _normalize_bool_env(
+        _os.environ.get("ASUKA_RELEASE_HF_DFJK_WS_BEFORE_CONTRACT"),
+        default=False,
+    ):
+        try:
+            _df_jk.release_cuda_ext_workspace_cache()
+        except Exception:
+            pass
+
+    if bool(clear_cueri_df_caches) and _normalize_bool_env(
+        _os.environ.get("ASUKA_CLEAR_CUERI_DF_CACHES_AFTER_HF_DFJK"),
+        default=False,
+    ):
+        try:
+            from asuka.cueri import df as _cueri_df  # noqa: PLC0415
+
+            if hasattr(_cueri_df, "clear_df_caches"):
+                _cueri_df.clear_df_caches()
+        except Exception:
+            pass
+
+    _flush_gpu_pool()
+
+
 def _dump_cupy_arrays(label: str, *, min_mb: float = 64.0, max_items: int = 24) -> None:
     """Debug helper: list the largest live CuPy arrays.
 
@@ -3074,16 +3131,42 @@ def casscf_nuc_grad_df(
     B_ao = _as_xp_f64(xp, getattr(scf_out, "df_B"))
     h_ao = _as_xp_f64(xp, getattr(getattr(scf_out, "int1e"), "hcore"))
     _restore_pool = _apply_df_pool_policy(B_ao, label="casscf_nuc_grad_df")
-
-    gfock, D_core_ao, D_act_ao, D_tot_ao, C_act = _build_gfock_casscf_df(
-        B_ao,
-        h_ao,
-        C,
-        ncore=int(ncore),
-        ncas=int(ncas),
-        dm1_act=dm1_act,
-        dm2_act=dm2_act,
+    _safe_grad_dfjk = (
+        xp is not np
+        and _normalize_bool_env(
+            _os.environ.get("ASUKA_GRAD_SAFE_DFJK"),
+            default=True,
+        )
     )
+    _old_cocc = _os.environ.get("ASUKA_MCSCF_DF_K_COCC")
+    _old_hf_k_impl = _os.environ.get("ASUKA_HF_K_IMPL")
+    try:
+        if bool(_safe_grad_dfjk):
+            _os.environ["ASUKA_MCSCF_DF_K_COCC"] = "0"
+            if _normalize_bool_env(
+                _os.environ.get("ASUKA_GRAD_SAFE_DFJK_FORCE_CUPY"),
+                default=False,
+            ):
+                _os.environ["ASUKA_HF_K_IMPL"] = "cupy"
+
+        gfock, D_core_ao, D_act_ao, D_tot_ao, C_act = _build_gfock_casscf_df(
+            B_ao,
+            h_ao,
+            C,
+            ncore=int(ncore),
+            ncas=int(ncas),
+            dm1_act=dm1_act,
+            dm2_act=dm2_act,
+        )
+    finally:
+        if _old_cocc is None:
+            _os.environ.pop("ASUKA_MCSCF_DF_K_COCC", None)
+        else:
+            _os.environ["ASUKA_MCSCF_DF_K_COCC"] = _old_cocc
+        if _old_hf_k_impl is None:
+            _os.environ.pop("ASUKA_HF_K_IMPL", None)
+        else:
+            _os.environ["ASUKA_HF_K_IMPL"] = _old_hf_k_impl
     t_gfock = time.perf_counter() if profile is not None else 0.0
 
     # ── GPU phase: bar_L build + DF 2e contraction (before 1e to keep GPU busy) ──
@@ -3150,9 +3233,20 @@ def casscf_nuc_grad_df(
     # ── CPU phase: 1e AO derivative contractions ──
     ao_basis = getattr(scf_out, "ao_basis")
     shell_atom = shell_to_atom_map(ao_basis, atom_coords_bohr=coords)
+    _safe_cart_int1e_cuda = (
+        (not bool(is_spherical))
+        and bool(_is_gpu)
+        and _normalize_bool_env(
+            _os.environ.get("ASUKA_GRAD_SAFE_CART_INT1E"),
+            default=True,
+        )
+    )
     _dS_sph_pre = None
     _dT_sph_pre = None
     _dV_sph_pre = None
+    _dS_cart_pre = None
+    _dT_cart_pre = None
+    _dV_cart_pre = None
     if bool(is_spherical) and str(_sph_int1e_backend) == "cuda":
         _dS_sph_pre, _dT_sph_pre, _dV_sph_pre = _build_sph_int1e_prebuilt(
             ao_basis,
@@ -3162,6 +3256,27 @@ def casscf_nuc_grad_df(
             need_overlap=True,
             need_hcore=True,
             to_gpu=True,
+        )
+    elif bool(_safe_cart_int1e_cuda):
+        from asuka.integrals.int1e_cart import build_dS_cart, build_dT_cart, build_dV_cart  # noqa: PLC0415
+
+        _dS_cart_pre = xp.asarray(
+            build_dS_cart(ao_basis, atom_coords_bohr=coords, shell_atom=shell_atom),
+            dtype=xp.float64,
+        )
+        _dT_cart_pre = xp.asarray(
+            build_dT_cart(ao_basis, atom_coords_bohr=coords, shell_atom=shell_atom),
+            dtype=xp.float64,
+        )
+        _dV_cart_pre = xp.asarray(
+            build_dV_cart(
+                ao_basis,
+                atom_coords_bohr=coords,
+                atom_charges=charges,
+                shell_atom=shell_atom,
+                include_operator_deriv=True,
+            ),
+            dtype=xp.float64,
         )
 
     if is_spherical:
@@ -3184,14 +3299,24 @@ def casscf_nuc_grad_df(
                 shell_atom=shell_atom,
             )
     else:
-        de_h1 = contract_dhcore_cart(
-            ao_basis,
-            atom_coords_bohr=coords,
-            atom_charges=charges,
-            M=_asnumpy_f64(D_tot_ao),
-            shell_atom=shell_atom,
-            contract_backend=str(int1e_contract_backend),
-        )
+        if _dT_cart_pre is not None and _dV_cart_pre is not None:
+            D_tot_cart = xp.asarray(D_tot_ao, dtype=xp.float64)
+            de_h1 = np.asarray(
+                _asnumpy_f64(
+                    xp.einsum("axij,ij->ax", _dT_cart_pre, D_tot_cart, optimize=True)
+                    + xp.einsum("axij,ij->ax", _dV_cart_pre, D_tot_cart, optimize=True)
+                ),
+                dtype=np.float64,
+            )
+        else:
+            de_h1 = contract_dhcore_cart(
+                ao_basis,
+                atom_coords_bohr=coords,
+                atom_charges=charges,
+                M=_asnumpy_f64(D_tot_ao),
+                shell_atom=shell_atom,
+                contract_backend=str(int1e_contract_backend),
+            )
 
     t_1e = time.perf_counter() if profile is not None else 0.0
 
@@ -3220,20 +3345,30 @@ def casscf_nuc_grad_df(
                 shell_atom=shell_atom,
             )
     else:
-        de_pulay = -1.0 * contract_dS_cart(
-            ao_basis,
-            atom_coords_bohr=coords,
-            M=np.asarray(W, dtype=np.float64),
-            shell_atom=shell_atom,
-            contract_backend=str(int1e_contract_backend),
-        )
+        if _dS_cart_pre is not None:
+            W_cart = xp.asarray(W, dtype=xp.float64)
+            W_cart = 0.5 * (W_cart + W_cart.T)
+            de_pulay = -np.asarray(
+                _asnumpy_f64(
+                    xp.einsum("axij,ij->ax", _dS_cart_pre, W_cart, optimize=True)
+                ),
+                dtype=np.float64,
+            )
+        else:
+            de_pulay = -1.0 * contract_dS_cart(
+                ao_basis,
+                atom_coords_bohr=coords,
+                M=np.asarray(W, dtype=np.float64),
+                shell_atom=shell_atom,
+                contract_backend=str(int1e_contract_backend),
+            )
     t_pulay = time.perf_counter() if profile is not None else 0.0
 
     _de_h1_np = np.asarray(de_h1, dtype=np.float64)
     _de_df_np = _asnumpy_f64(de_df)
     _de_nuc_np = np.asarray(de_nuc, dtype=np.float64)
-    import os as _os
-    if _os.environ.get("ASUKA_GRAD_DEBUG"):
+    import os as _os_grad_debug
+    if _os_grad_debug.environ.get("ASUKA_GRAD_DEBUG"):
         print(f"[grad_debug] atom0 x: de_h1={_de_h1_np[0,0]:+.8f}  de_df={_de_df_np[0,0]:+.8f}"
               f"  de_nuc={_de_nuc_np[0,0]:+.8f}  de_pulay={de_pulay[0,0]:+.8f}"
               f"  pre_pulay={(_de_h1_np+_de_df_np+_de_nuc_np)[0,0]:+.8f}"
@@ -3988,6 +4123,7 @@ def casscf_nuc_grad_df_per_root(
     from .nac._df import (  # noqa: PLC0415
         _FixedRDMFcisolver,
         _grad_elec_active_df,
+        _grad_elec_casscf_df,
         _Lorb_dot_dgorb_dx_df,
         _build_bar_L_net_active_df,
         _build_bar_L_lorb_df,
@@ -4068,6 +4204,29 @@ def casscf_nuc_grad_df_per_root(
             except Exception:
                 pass
     _gpu_runtime_cfg = _resolve_gpu_runtime_config()
+
+    # When the literal response path is active, pre-compute the SA gradient
+    # BEFORE any GPU operations. The per-root function's GPU computations
+    # (gfock/bar_L builds) can leave CUDA state that causes subtle numerical
+    # mismatches in subsequent DF contraction contexts.
+    _literal_pyscf_response_early = _normalize_bool_env(
+        os.environ.get("ASUKA_SA_LITERAL_RESPONSE"),
+        default=False,
+    )
+    _precomputed_grad_sa: np.ndarray | None = None
+    if bool(_literal_pyscf_response_early):
+        try:
+            _sa_pre = casscf_nuc_grad_df(
+                scf_out, casscf, fcisolver=fcisolver_use, twos=twos,
+                df_backend=str(df_backend),
+                int1e_contract_backend=str(int1e_contract_backend),
+                df_config=df_config, df_threads=int(df_threads),
+                delta_bohr=float(delta_bohr), solver_kwargs=solver_kwargs,
+            )
+            _precomputed_grad_sa = np.asarray(_sa_pre.grad, dtype=np.float64)
+            del _sa_pre
+        except Exception:
+            _precomputed_grad_sa = None
 
     xp, _is_gpu = _resolve_xp(df_backend)
     C = _as_xp_f64(xp, getattr(casscf, "mo_coeff"))
@@ -4383,6 +4542,10 @@ def casscf_nuc_grad_df_per_root(
     # Profiling + CUDA stream configuration
     # ------------------------------------------------------------------
     _prof_env = str(os.environ.get("ASUKA_PROFILE_DF_PER_ROOT", "")).strip().lower()
+    _literal_pyscf_response = _normalize_bool_env(
+        os.environ.get("ASUKA_SA_LITERAL_RESPONSE"),
+        default=False,
+    )
     _profile_df_per_root = _prof_env not in ("", "0", "false", "no", "off")
     _df_grad_path_log = _normalize_bool_env(os.environ.get("ASUKA_DF_GRAD_PATH_LOG"), default=False)
     _t_bar_L_sa = 0.0
@@ -4539,12 +4702,14 @@ def casscf_nuc_grad_df_per_root(
     _z_use_x0_env = str(os.environ.get("ASUKA_ZVECTOR_USE_X0", "1")).strip().lower()
     _z_use_x0 = _z_use_x0_env not in ("0", "false", "no", "off", "disable", "disabled")
 
-    # Default to GMRES. GCROTMK does m inner iterations per outer cycle,
-    # leading to ~20x more matvecs for ill-conditioned SA-CASSCF Hessians.
-    if _z_method_env in ("gmres", "gcrotmk"):
+    # Default to CG for SA-CASSCF per-root gradients, matching PySCF's
+    # lagrange.Gradients.solve_lagrange (scipy CG + SACASLagPrec).  CG with
+    # the SA Lagrange preconditioner converges robustly in ~20-40 iterations
+    # and avoids the restart-stalling issues of restarted GMRES on GPU.
+    if _z_method_env in ("gmres", "gcrotmk", "cg"):
         _z_method = _z_method_env
     else:
-        _z_method = "gmres"
+        _z_method = "cg"
     _z_recycle_space: list[tuple[np.ndarray | None, np.ndarray]] | None = [] if _z_method == "gcrotmk" else None
     _z_recycle_max = 0
     if _gpu_runtime_cfg.krylov_recycle_max_vectors is not None:
@@ -4611,6 +4776,51 @@ def casscf_nuc_grad_df_per_root(
                 else:
                     setattr(obj, key, old)
 
+    @contextmanager
+    def _temporary_env(updates: dict[str, str]):
+        prev: dict[str, Any] = {}
+        for key, val in updates.items():
+            prev[key] = _os.environ.get(key, _MISSING)
+            _os.environ[str(key)] = str(val)
+        try:
+            yield
+        finally:
+            for key, old in prev.items():
+                if old is _MISSING:
+                    _os.environ.pop(str(key), None)
+                else:
+                    _os.environ[str(key)] = str(old)
+
+    _safe_per_root_dfjk = (
+        xp is not np
+        and _normalize_bool_env(
+            _os.environ.get("ASUKA_PER_ROOT_SAFE_DFJK"),
+            default=True,
+        )
+    )
+
+    @contextmanager
+    def _safe_per_root_dfjk_ctx():
+        if not bool(_safe_per_root_dfjk):
+            yield
+            return
+        updates = {"ASUKA_MCSCF_DF_K_COCC": "0"}
+        if _normalize_bool_env(
+            _os.environ.get("ASUKA_PER_ROOT_SAFE_DFJK_FORCE_CUPY"),
+            default=False,
+        ):
+            updates["ASUKA_HF_K_IMPL"] = "cupy"
+        with _temporary_env(updates):
+            yield
+
+    def _build_gfock_casscf_df_per_root_safe(*args: Any, **kwargs: Any):
+        with _safe_per_root_dfjk_ctx():
+            return _build_gfock_casscf_df(*args, **kwargs)
+
+    def _build_dme0_lorb_response_per_root_safe(*args: Any, **kwargs: Any):
+        with _safe_per_root_dfjk_ctx():
+            return _build_dme0_lorb_response(*args, **kwargs)
+
     # These are initialized later (after the SA DF contraction) once we have
     # built the Newton Hessian operator + ERI container. Keeping them out of
     # scope during the SA contraction avoids overlapping `eris_sa.L_pi` with
@@ -4651,7 +4861,7 @@ def casscf_nuc_grad_df_per_root(
     with _main_stream_cm:
         _vhf_cache: dict[str, Any] = {}
         C_np = _asnumpy_f64(C)
-        gfock_sa, D_core_sa, D_act_sa, D_tot_sa, C_act_sa = _build_gfock_casscf_df(
+        gfock_sa, D_core_sa, D_act_sa, D_tot_sa, C_act_sa = _build_gfock_casscf_df_per_root_safe(
             B_ao, h_ao, C, ncore=int(ncore), ncas=int(ncas), dm1_act=dm1_sa, dm2_act=dm2_sa,
             vhf_cache_out=_vhf_cache,
         )
@@ -4718,18 +4928,8 @@ def casscf_nuc_grad_df_per_root(
             # contraction kernels. These are `cudaMalloc`-backed and do not
             # participate in the CuPy pool, but can inflate peak VRAM when
             # bar_L and B are simultaneously live.
-            if (
-                xp is not np
-                and _normalize_bool_env(
-                    _os.environ.get("ASUKA_RELEASE_HF_DFJK_WS_BEFORE_CONTRACT"),
-                    default=True,
-                )
-            ):
-                try:
-                    _df_jk.release_cuda_ext_workspace_cache()
-                except Exception:
-                    pass
-                _flush_gpu_pool()
+            if xp is not np:
+                _sanitize_cuda_after_hf_dfjk()
             if bool(_vram_debug_fine):
                 _log_vram("sa contract start")
             _fuse_sa_df = (
@@ -4759,31 +4959,15 @@ def casscf_nuc_grad_df_per_root(
                     _fuse_sa_df = False
 
             if not bool(_fuse_sa_df):
-                if bool(is_spherical):
-                    if df_grad_ctx is not None:
-                        de_df_sa = df_grad_ctx.contract_sph(B_sph=B_ao, bar_L_sph=bar_L_sa, T_c2s=None)
-                    else:
-                        de_df_sa = compute_df_gradient_contributions_analytic_sph(
-                            ao_basis,
-                            aux_basis,
-                            atom_coords_bohr=coords,
-                            B_sph=B_ao,
-                            bar_L_sph=bar_L_sa,
-                            T_c2s=None,
-                            L_chol=getattr(scf_out, "df_L", None),
-                            backend=str(df_backend),
-                            df_threads=int(df_threads),
-                            profile=None,
-                        )
-                else:
-                    if df_grad_ctx is not None:
-                        de_df_sa = df_grad_ctx.contract(B_ao=B_ao, bar_L_ao=bar_L_sa)
-                    else:
-                        de_df_sa = compute_df_gradient_contributions_analytic_packed_bases(
-                            ao_basis, aux_basis, atom_coords_bohr=coords, B_ao=B_ao, bar_L_ao=bar_L_sa,
-                            L_chol=getattr(scf_out, "df_L", None),
-                            backend=str(df_backend), df_threads=int(df_threads), profile=None,
-                        )
+                de_df_sa = _contract_df_gradient_2e(
+                    scf_out,
+                    is_spherical=bool(is_spherical),
+                    B_ao=B_ao,
+                    bar_L_ao=bar_L_sa,
+                    coords=coords,
+                    df_backend=str(df_backend),
+                    df_threads=int(df_threads),
+                )
             if bool(_vram_debug_fine):
                 _log_vram("sa contract done")
                 if _os.environ.get("ASUKA_VRAM_ACCOUNTING"):
@@ -4905,11 +5089,14 @@ def casscf_nuc_grad_df_per_root(
         W_sa = 0.5 * (_tmp_sa @ C_occ_np.T + C_occ_np @ _tmp_sa.T)
         de_pulay_sa = _contract_pulay_fast(W_sa)
 
-    # SA base gradient: de_h1_sa + de_df_sa + de_nuc + de_pulay_sa.
-    # If we fused SA DF contraction with the first delta batch, de_df_sa_np will be filled later.
-    grad_sa_base = np.asarray(de_h1_sa + de_nuc + de_pulay_sa, dtype=np.float64)
-    if de_df_sa_np is not None:
-        grad_sa_base += de_df_sa_np
+    # SA base gradient.
+    if _precomputed_grad_sa is not None:
+        grad_sa_base = np.asarray(_precomputed_grad_sa, dtype=np.float64)
+    else:
+        # Fused path or fallback: build SA base from components.
+        grad_sa_base = np.asarray(de_h1_sa + de_nuc + de_pulay_sa, dtype=np.float64)
+        if de_df_sa_np is not None:
+            grad_sa_base += de_df_sa_np
     _log_vram("after SA base gradient")
     _flush_gpu_pool()
 
@@ -4934,6 +5121,7 @@ def casscf_nuc_grad_df_per_root(
     # Per-root gradient loop
     # ------------------------------------------------------------------
     grads_out: list[np.ndarray | None] = [None] * int(nroots)
+    _active_core_cache: dict[str, Any] | None = {} if bool(_literal_pyscf_response) else None
     _in_flight: list[dict[str, Any]] = []
 
     # Root-invariant mean-field potentials (vhf_c/vhf_a) are computed during the
@@ -4944,7 +5132,7 @@ def casscf_nuc_grad_df_per_root(
     if not (isinstance(_vhf_cache, dict) and ("vhf_c" in _vhf_cache) and ("vhf_a" in _vhf_cache)):
         t0 = time.perf_counter()
         with _main_stream_cm:
-            use_cocc_k = (xp is not np) and _normalize_bool_env(_os.environ.get("ASUKA_MCSCF_DF_K_COCC"), default=True)
+            use_cocc_k = (not bool(_safe_per_root_dfjk)) and (xp is not np) and _normalize_bool_env(_os.environ.get("ASUKA_MCSCF_DF_K_COCC"), default=True)
             try:
                 q_block = int(_os.environ.get("ASUKA_DF_JK_K_QBLOCK", "128"))
             except Exception:
@@ -5048,7 +5236,7 @@ def casscf_nuc_grad_df_per_root(
         Lorb_mat: Any,
         debug_root: int | None = None,
     ) -> np.ndarray:
-        _gfock_lci_raw, _, _, _, _ = _build_gfock_casscf_df(
+        _gfock_lci_raw, _, _, _, _ = _build_gfock_casscf_df_per_root_safe(
             B_ao,
             h_ao,
             C,
@@ -5067,7 +5255,7 @@ def casscf_nuc_grad_df_per_root(
                 W_K_xp = 0.5 * (_tmp_K @ C_occ_xp.T + C_occ_xp @ _tmp_K.T)
                 _dgfock_lci = xp.asarray(_gfock_lci_raw, dtype=xp.float64) - xp.asarray(_gfock_zero_xp, dtype=xp.float64)
                 _dme0_lci = C @ (0.5 * (_dgfock_lci + _dgfock_lci.T)) @ C.T
-                _dme0_lorb = _build_dme0_lorb_response(
+                _dme0_lorb = _build_dme0_lorb_response_per_root_safe(
                     B_ao,
                     h_ao,
                     C,
@@ -5092,7 +5280,7 @@ def casscf_nuc_grad_df_per_root(
             _dgfock_lci = _asnumpy_f64(_gfock_lci_raw) - _ensure_gfock_zero_host()
             dm1_sa_np_h, dm2_sa_np_h = _ensure_sa_rdm_host()
             _dme0_lci = C_np @ (0.5 * (_dgfock_lci + _dgfock_lci.T)) @ C_np.T
-            _dme0_lorb = _build_dme0_lorb_response(
+            _dme0_lorb = _build_dme0_lorb_response_per_root_safe(
                 B_ao,
                 h_ao,
                 C_np,
@@ -5592,7 +5780,7 @@ def casscf_nuc_grad_df_per_root(
         # gradient loop can inflate peak VRAM by ~O(sizeof(eris/Lpq)).  Strip the
         # operator down to the lightweight metadata we still need (CI unflatten,
         # sizes, gpu_mode flag).
-        if _normalize_bool_env(_os.environ.get("ASUKA_ZVECTOR_STRIP_HESS_OP"), default=True):
+        if (not bool(_literal_pyscf_response)) and _normalize_bool_env(_os.environ.get("ASUKA_ZVECTOR_STRIP_HESS_OP"), default=True):
             try:
                 from asuka.mcscf.zvector import MCSCFHessianOp as _MCSCFHessianOp  # noqa: PLC0415
 
@@ -5666,6 +5854,7 @@ def casscf_nuc_grad_df_per_root(
             dm1_lci=dm1_lci,
             dm2_lci=dm2_lci,
             Lorb_mat=Lorb_mat,
+            debug_root=int(K),
         )
         if _profile_df_per_root:
             _t_response_pulay += time.perf_counter() - t0
@@ -5679,22 +5868,10 @@ def casscf_nuc_grad_df_per_root(
         _flush_gpu_pool()
 
     def _maybe_release_hf_dfjk_ws_before_contract() -> None:
-        """Release HF DF-JK cached CUDA work buffers before launching DF contraction kernels.
-
-        The HF DF-JK CUDA extension keeps some workspaces backed by raw
-        ``cudaMalloc`` (not the CuPy pool). Dropping them right before the DF
-        derivative contraction reduces peak driver-visible VRAM without
-        affecting numerical results.
-        """
+        """Fence and clear HF DF-JK CUDA state before DF derivative kernels."""
         if xp is np:
             return
-        if not _normalize_bool_env(_os.environ.get("ASUKA_RELEASE_HF_DFJK_WS_BEFORE_CONTRACT"), default=True):
-            return
-        try:
-            _df_jk.release_cuda_ext_workspace_cache()
-        except Exception:
-            return
-        _flush_gpu_pool()
+        _sanitize_cuda_after_hf_dfjk()
 
     def _contract_df_delta_batch_from_pending(pending_batch: list[dict[str, Any]]) -> np.ndarray:
         """Contract a pending delta batch from (preferred) adjoints or (fallback) bar_L.
@@ -5925,7 +6102,7 @@ def casscf_nuc_grad_df_per_root(
         # Step A: Build per-root densities (GPU) and cache RDM deltas (CPU).
         t0 = time.perf_counter()
         with _main_stream_cm:
-            gfock_K, _D_core_K, _D_act_K, D_tot_K, _C_act_K = _build_gfock_casscf_df(
+            gfock_K, _D_core_K, _D_act_K, D_tot_K, _C_act_K = _build_gfock_casscf_df_per_root_safe(
                 B_ao, h_ao, C, ncore=int(ncore), ncas=int(ncas), dm1_act=dm1_K, dm2_act=dm2_K,
             )
             dm1_delta = dm1_K - dm1_sa
@@ -6193,6 +6370,58 @@ def casscf_nuc_grad_df_per_root(
                 dm2_lci += wr * (dm2_r + dm2_r.transpose(1, 0, 3, 2))
         if _profile_df_per_root:
             _t_trans_rdm_lci += time.perf_counter() - t0
+
+        if bool(_literal_pyscf_response):
+            de_ham_root = _grad_elec_casscf_df(
+                scf_out=scf_out,
+                mo_coeff=C,
+                dm1_act=dm1_K,
+                dm2_act=dm2_K,
+                ncore=int(ncore),
+                ncas=int(ncas),
+                df_backend=str(df_backend),
+                df_config=df_config,
+                df_threads=int(df_threads),
+                df_grad_ctx=df_grad_ctx,
+                fd_delta_bohr=float(delta_bohr),
+                include_pulay=True,
+            )
+            de_lci = _grad_elec_active_df(
+                scf_out=scf_out,
+                mo_coeff=C,
+                dm1_act=dm1_lci,
+                dm2_act=dm2_lci,
+                ncore=int(ncore),
+                ncas=int(ncas),
+                df_backend=str(df_backend),
+                df_config=df_config,
+                df_threads=int(df_threads),
+                df_grad_ctx=df_grad_ctx,
+                fd_delta_bohr=float(delta_bohr),
+                core_cache=_active_core_cache,
+            )
+            de_lorb = _Lorb_dot_dgorb_dx_df(
+                scf_out=scf_out,
+                mo_coeff=C,
+                dm1_act=dm1_sa,
+                dm2_act=dm2_sa,
+                Lorb=np.asarray(Lorb_mat, dtype=np.float64),
+                ncore=int(ncore),
+                ncas=int(ncas),
+                eris=eris_sa,
+                df_backend=str(df_backend),
+                df_config=df_config,
+                df_threads=int(df_threads),
+                df_grad_ctx=df_grad_ctx,
+                fd_delta_bohr=float(delta_bohr),
+            )
+            grads_out[int(K)] = np.asarray(
+                de_nuc + np.asarray(de_ham_root, dtype=np.float64) + np.asarray(de_lci, dtype=np.float64) + np.asarray(de_lorb, dtype=np.float64),
+                dtype=np.float64,
+            )
+            _log_vram(f"root {K} done")
+            _flush_gpu_pool()
+            continue
 
         # ── Single fused contract(): HF delta + lci response + lorb response ──
         _flush_gpu_pool()

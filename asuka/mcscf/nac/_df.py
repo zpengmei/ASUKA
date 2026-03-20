@@ -1245,8 +1245,14 @@ def _grad_elec_casscf_df(
     df_threads: int,
     df_grad_ctx: DFGradContractionContext | None = None,
     fd_delta_bohr: float = 1e-4,
+    include_pulay: bool = False,
 ) -> np.ndarray:
-    """Return electronic SA-CASSCF/CASSCF gradient (no nuclear term), DF-only."""
+    """Return electronic SA-CASSCF/CASSCF gradient (no nuclear term), DF-only.
+
+    When *include_pulay* is True the Pulay overlap-derivative term
+    ``-2 Tr(W · dS/dR)`` is included, making the result a self-contained
+    Hellmann–Feynman + Pulay gradient (analogous to PySCF ``casscf_grad.kernel``).
+    """
 
     xp, _is_gpu = _resolve_xp(df_backend)
 
@@ -1348,8 +1354,35 @@ def _grad_elec_casscf_df(
             M=_asnumpy_f64(D_tot_ao), shell_atom=shell_atom,
         )
 
+    # ── Optional Pulay term: -2 Tr(W · dS/dR) ──
+    if bool(include_pulay):
+        _nocc_p = int(ncore) + int(ncas)
+        _C_np = _asnumpy_f64(C)
+        _gfock_np = _asnumpy_f64(gfock)
+        _C_occ = _C_np[:, :_nocc_p]
+        _tmp_w = _C_np @ _gfock_np[:, :_nocc_p]  # (nao, nocc)
+        W_ao = 0.5 * (_tmp_w @ _C_occ.T + _C_occ @ _tmp_w.T)
+        if _is_sph_c:
+            from asuka.integrals.int1e_sph import contract_dS_ip_sph  # noqa: PLC0415
+
+            de_pulay = -2.0 * contract_dS_ip_sph(
+                ao_basis,
+                atom_coords_bohr=coords,
+                M_sph=W_ao,
+                shell_atom=shell_atom,
+            )
+        else:
+            de_pulay = -2.0 * contract_dS_ip_cart(
+                ao_basis,
+                atom_coords_bohr=coords,
+                M=W_ao,
+                shell_atom=shell_atom,
+            )
+    else:
+        de_pulay = 0.0
+
     _restore_pool()
-    return np.asarray(de_h1 + _asnumpy_f64(de_df), dtype=np.float64)
+    return np.asarray(de_h1 + _asnumpy_f64(de_df) + np.asarray(de_pulay, dtype=np.float64), dtype=np.float64)
 
 
 def _Lorb_dot_dgorb_dx_df(
