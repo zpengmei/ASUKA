@@ -188,16 +188,6 @@ def casscf_nuc_grad_per_root(*args: Any, **kwargs: Any) -> DFNucGradMultirootRes
 
         if use_direct:
             return casscf_nuc_grad_direct_per_root(scf_out, casscf, **kwargs)
-
-        import warnings
-        warnings.warn(
-            "casscf_nuc_grad_per_root: using the DF gradient backend. "
-            "The DF per-root gradient path has a known CUDA numerical issue "
-            "for systems with virtual orbitals. For production use (e.g. SHARC "
-            "dynamics), use two_e_backend='direct' in run_hf_df to enable the "
-            "exact 4c gradient path, which is validated against PySCF to ~5e-5.",
-            stacklevel=2,
-        )
         if use_thc:
             return casscf_nuc_grad_thc_per_root(scf_out, casscf, **kwargs)
         return casscf_nuc_grad_df_per_root(scf_out, casscf, **kwargs)
@@ -246,16 +236,6 @@ def sacasscf_nonadiabatic_couplings(*args: Any, **kwargs: Any) -> np.ndarray:
         from .nac._dense import sacasscf_nonadiabatic_couplings_dense  # noqa: PLC0415
 
         return sacasscf_nonadiabatic_couplings_dense(scf_out, casscf, **kwargs)
-
-    import warnings
-    warnings.warn(
-        "sacasscf_nonadiabatic_couplings: using the DF backend. "
-        "The DF NACV path has a known CUDA numerical issue for systems "
-        "with virtual orbitals. For production use (e.g. SHARC dynamics), "
-        "use two_e_backend='direct' in run_hf_df to enable the exact 4c "
-        "NACV path, which is validated against PySCF to ~1e-5.",
-        stacklevel=2,
-    )
     from .nac._df import sacasscf_nonadiabatic_couplings_df  # noqa: PLC0415
 
     return sacasscf_nonadiabatic_couplings_df(scf_out, casscf, **kwargs)

@@ -2066,53 +2066,6 @@ def sacasscf_nonadiabatic_couplings_df(
         )
         pair_timing["trans_rdm"] = float(time.perf_counter() - t0)
 
-        # Hamiltonian response term (<bra|dH/dR|ket> without nuclear term)
-        t0 = time.perf_counter()
-        ham = _grad_elec_active_df(
-            scf_out=scf_out,
-            mo_coeff=C_ref,
-            dm1_act=dm1_t,
-            dm2_act=dm2_t,
-            ncore=int(ncore),
-            ncas=int(ncas),
-            df_backend=str(df_backend),
-            df_config=df_config,
-            df_threads=int(df_threads),
-            df_grad_ctx=df_grad_ctx,
-            fd_delta_bohr=float(fd_delta),
-            core_cache=active_core_cache,
-        )
-        pair_timing["ham_response"] = float(time.perf_counter() - t0)
-
-        # CSF / AO-overlap term (numerator form).
-        t0 = time.perf_counter()
-        if not bool(use_etfs):
-            if trans_rdm1 is None:  # pragma: no cover
-                raise RuntimeError("internal error: missing trans_rdm1 builder")
-            dm1 = trans_rdm1(fcisolver_use, ci_list[bra], ci_list[ket], int(ncas), nelecas)
-            castm1 = np.asarray(dm1, dtype=np.float64).T - np.asarray(dm1, dtype=np.float64)
-            tm1 = mo_cas @ castm1 @ mo_cas.T
-            if _is_sph_nac:
-                from asuka.integrals.int1e_sph import contract_dS_ip_sph  # noqa: PLC0415
-
-                nac_csf = 0.5 * contract_dS_ip_sph(
-                    ao_basis_ref,
-                    atom_coords_bohr=coords,
-                    M_sph=tm1,
-                    shell_atom=shell_atom_ref,
-                )
-            else:
-                nac_csf = 0.5 * contract_dS_ip_cart(
-                    ao_basis_ref,
-                    atom_coords_bohr=coords,
-                    M=tm1,
-                    shell_atom=shell_atom_ref,
-                )
-            # CSF overlap term: (E_bra - E_ket) * nac_csf_raw, added to the
-            # Hamiltonian derivative numerator (matches PySCF convention).
-            ham = np.asarray(ham, dtype=np.float64) + np.asarray(nac_csf * ediff, dtype=np.float64)
-        pair_timing["csf_term"] = float(time.perf_counter() - t0)
-
         # Pair-specific Z-vector RHS in SA parameter space.
         t0 = time.perf_counter()
         fcisolver_fixed = _FixedRDMFcisolver(fcisolver_use, dm1=dm1_t, dm2=dm2_t)
@@ -2175,7 +2128,8 @@ def sacasscf_nonadiabatic_couplings_df(
                 "bra": bra,
                 "ket": ket,
                 "ediff": ediff,
-                "ham": np.asarray(ham, dtype=np.float64),
+                "dm1_t": np.asarray(dm1_t, dtype=np.float64),
+                "dm2_t": np.asarray(dm2_t, dtype=np.float64),
                 "pair_timing": pair_timing,
             }
         )
@@ -2259,7 +2213,8 @@ def sacasscf_nonadiabatic_couplings_df(
         bra = int(rec["bra"])
         ket = int(rec["ket"])
         ediff = float(rec["ediff"])
-        ham = np.asarray(rec["ham"], dtype=np.float64)
+        dm1_t = np.asarray(rec["dm1_t"], dtype=np.float64)
+        dm2_t = np.asarray(rec["dm2_t"], dtype=np.float64)
         pair_timing = rec["pair_timing"]
 
         Lvec = np.asarray(z.z_packed, dtype=np.float64).ravel()
@@ -2349,6 +2304,55 @@ def sacasscf_nonadiabatic_couplings_df(
             pair_timing["response_unpack"] = 0.0
 
             resp_full = np.asarray(de_lci, dtype=np.float64) + np.asarray(de_lorb, dtype=np.float64)
+
+        # Hamiltonian response term (<bra|dH/dR|ket> without nuclear term).
+        # Keep this after the pair solve/response build: on CUDA, the DF gradient
+        # helper can perturb later AO2MO/Newton work if it runs first.
+        t0 = time.perf_counter()
+        ham = _grad_elec_active_df(
+            scf_out=scf_out,
+            mo_coeff=C_ref,
+            dm1_act=dm1_t,
+            dm2_act=dm2_t,
+            ncore=int(ncore),
+            ncas=int(ncas),
+            df_backend=str(df_backend),
+            df_config=df_config,
+            df_threads=int(df_threads),
+            df_grad_ctx=df_grad_ctx,
+            fd_delta_bohr=float(fd_delta),
+            core_cache=active_core_cache,
+        )
+        pair_timing["ham_response"] = float(time.perf_counter() - t0)
+
+        # CSF / AO-overlap term (numerator form).
+        t0 = time.perf_counter()
+        if not bool(use_etfs):
+            if trans_rdm1 is None:  # pragma: no cover
+                raise RuntimeError("internal error: missing trans_rdm1 builder")
+            dm1 = trans_rdm1(fcisolver_use, ci_list[bra], ci_list[ket], int(ncas), nelecas)
+            castm1 = np.asarray(dm1, dtype=np.float64).T - np.asarray(dm1, dtype=np.float64)
+            tm1 = mo_cas @ castm1 @ mo_cas.T
+            if _is_sph_nac:
+                from asuka.integrals.int1e_sph import contract_dS_ip_sph  # noqa: PLC0415
+
+                nac_csf = 0.5 * contract_dS_ip_sph(
+                    ao_basis_ref,
+                    atom_coords_bohr=coords,
+                    M_sph=tm1,
+                    shell_atom=shell_atom_ref,
+                )
+            else:
+                nac_csf = 0.5 * contract_dS_ip_cart(
+                    ao_basis_ref,
+                    atom_coords_bohr=coords,
+                    M=tm1,
+                    shell_atom=shell_atom_ref,
+                )
+            # CSF overlap term: (E_bra - E_ket) * nac_csf_raw, added to the
+            # Hamiltonian derivative numerator (matches PySCF convention).
+            ham = np.asarray(ham, dtype=np.float64) + np.asarray(nac_csf * ediff, dtype=np.float64)
+        pair_timing["csf_term"] = float(time.perf_counter() - t0)
 
         nac_num = (
             np.asarray(ham, dtype=np.float64)[atmlst_idx]

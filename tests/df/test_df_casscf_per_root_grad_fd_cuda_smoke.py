@@ -1,12 +1,44 @@
 from __future__ import annotations
 
+import importlib
+import sys
+from pathlib import Path
+
 import numpy as np
 import pytest
 
 
+def _import_cupy_for_pytest():
+    try:
+        return importlib.import_module("cupy")
+    except ModuleNotFoundError as err:
+        # Under pytest's prepend import mode, the local tests/cuda namespace can
+        # shadow NVIDIA's site-packages `cuda` package that CuPy imports.
+        if err.name != "cuda.pathfinder":
+            pytest.skip(f"could not import cupy: {err}")
+        repo_root = Path(__file__).resolve().parents[2]
+        tests_dir = str(repo_root / "tests")
+        old_path = list(sys.path)
+        old_cuda = sys.modules.pop("cuda", None)
+        old_cuda_pathfinder = sys.modules.pop("cuda.pathfinder", None)
+        try:
+            sys.path = [p for p in sys.path if Path(p or ".").resolve() != Path(tests_dir).resolve()]
+            return importlib.import_module("cupy")
+        except Exception as retry_err:
+            pytest.skip(f"could not import cupy: {retry_err}")
+        finally:
+            sys.path = old_path
+            if old_cuda is not None:
+                sys.modules["cuda"] = old_cuda
+            if old_cuda_pathfinder is not None:
+                sys.modules["cuda.pathfinder"] = old_cuda_pathfinder
+    except Exception as err:
+        pytest.skip(f"could not import cupy: {err}")
+
+
 @pytest.mark.cuda
 def test_df_casscf_per_root_grad_matches_fd_component():
-    cp = pytest.importorskip("cupy")
+    cp = _import_cupy_for_pytest()
     try:
         _ = cp.zeros((1,), dtype=cp.float64)
         _ = int(cp.cuda.runtime.getDeviceCount())

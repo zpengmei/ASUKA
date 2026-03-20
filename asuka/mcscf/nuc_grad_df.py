@@ -643,10 +643,13 @@ def _apply_df_grad_optimal_defaults() -> dict[str, Any]:
         _os.environ[name] = str(value)
         applied[name] = str(value)
 
-    # Single production preset: fused fp64 contraction + scheduler-guided 3c launches.
+    # Keep the fused fp64 contraction fast path, but do not force the
+    # scheduler-guided 3c launch planner on by default. The current scheduler
+    # merge path can duplicate shell pairs for some cases, which corrupts the
+    # DF derivative contraction. `off` is the correct-by-construction setting.
     _setdefault_env("ASUKA_DF_FUSED_CONTRACT", "1")
     _setdefault_env("ASUKA_DF_FUSED_CONTRACT_PRECISION", "fp64")
-    _setdefault_env("ASUKA_DF_3C_SCHED_MODE", "on")
+    _setdefault_env("ASUKA_DF_3C_SCHED_MODE", "off")
     _setdefault_env("ASUKA_DF_3C_AB_TILE", "8")
 
     if _normalize_bool_env(_os.environ.get("ASUKA_VRAM_DEBUG"), default=False) or _normalize_bool_env(
@@ -1189,6 +1192,10 @@ def _resolve_gpu_runtime_config() -> GpuRuntimeConfig:
     memory_cap = _parse_env_float("ASUKA_GPU_MEM_CAP_GB")
     ws_cache_frac = _normalize_ws_cache_fraction_local(_parse_env_float("ASUKA_GPU_WS_CACHE_FRAC"))
     precision_policy = _normalize_precision_policy(_os.environ.get("ASUKA_GPU_PRECISION_POLICY"))
+    if precision_policy is None:
+        # SA-CASSCF per-root response is sensitive to mixed-precision drift.
+        # Default to fp64 unless the user explicitly overrides it.
+        precision_policy = "fp64"
 
     fused_df = None
     if _os.environ.get("ASUKA_GPU_FUSED_DF") is not None:
@@ -4117,6 +4124,8 @@ def casscf_nuc_grad_df_per_root(
     from contextlib import contextmanager, nullcontext  # noqa: PLC0415
     import os  # noqa: PLC0415
 
+    _t_profile_wall_clock0 = time.perf_counter()
+
     from .newton_df import DFNewtonCASSCFAdapter  # noqa: PLC0415
     from . import newton_casscf as _newton_casscf  # noqa: PLC0415
     from .zvector import build_mcscf_hessian_operator, solve_mcscf_zvector, solve_mcscf_zvector_batch  # noqa: PLC0415
@@ -4204,29 +4213,6 @@ def casscf_nuc_grad_df_per_root(
             except Exception:
                 pass
     _gpu_runtime_cfg = _resolve_gpu_runtime_config()
-
-    # When the literal response path is active, pre-compute the SA gradient
-    # BEFORE any GPU operations. The per-root function's GPU computations
-    # (gfock/bar_L builds) can leave CUDA state that causes subtle numerical
-    # mismatches in subsequent DF contraction contexts.
-    _literal_pyscf_response_early = _normalize_bool_env(
-        os.environ.get("ASUKA_SA_LITERAL_RESPONSE"),
-        default=False,
-    )
-    _precomputed_grad_sa: np.ndarray | None = None
-    if bool(_literal_pyscf_response_early):
-        try:
-            _sa_pre = casscf_nuc_grad_df(
-                scf_out, casscf, fcisolver=fcisolver_use, twos=twos,
-                df_backend=str(df_backend),
-                int1e_contract_backend=str(int1e_contract_backend),
-                df_config=df_config, df_threads=int(df_threads),
-                delta_bohr=float(delta_bohr), solver_kwargs=solver_kwargs,
-            )
-            _precomputed_grad_sa = np.asarray(_sa_pre.grad, dtype=np.float64)
-            del _sa_pre
-        except Exception:
-            _precomputed_grad_sa = None
 
     xp, _is_gpu = _resolve_xp(df_backend)
     C = _as_xp_f64(xp, getattr(casscf, "mo_coeff"))
@@ -4542,11 +4528,8 @@ def casscf_nuc_grad_df_per_root(
     # Profiling + CUDA stream configuration
     # ------------------------------------------------------------------
     _prof_env = str(os.environ.get("ASUKA_PROFILE_DF_PER_ROOT", "")).strip().lower()
-    _literal_pyscf_response = _normalize_bool_env(
-        os.environ.get("ASUKA_SA_LITERAL_RESPONSE"),
-        default=False,
-    )
     _profile_df_per_root = _prof_env not in ("", "0", "false", "no", "off")
+    _t_profile_preamble = float(time.perf_counter() - _t_profile_wall_clock0)
     _df_grad_path_log = _normalize_bool_env(os.environ.get("ASUKA_DF_GRAD_PATH_LOG"), default=False)
     _t_bar_L_sa = 0.0
     _t_contract_sa = 0.0
@@ -4556,8 +4539,9 @@ def casscf_nuc_grad_df_per_root(
     _t_trans_rdm_lci = 0.0
     _t_gen_g_hop = 0.0
     _t_gfock = 0.0
-    _t_1e_pulay = 0.0
+    _t_h1_delta = 0.0
     _t_response_pulay = 0.0
+    _t_sa_base = 0.0
     _t_vhf_cache = 0.0
     _t_gfock_zero = 0.0
     _t_newton_ao2mo = 0.0
@@ -4694,6 +4678,24 @@ def casscf_nuc_grad_df_per_root(
             f"delta_batch_reason={delta_reason}",
             file=sys.stderr,
         )
+
+    def _profile_cuda_sync() -> None:
+        if not _profile_df_per_root or xp is np:
+            return
+        try:
+            import cupy as _cp_prof  # noqa: PLC0415
+        except Exception:
+            return
+        try:
+            if _main_stream is not None:
+                _main_stream.synchronize()
+            else:
+                _cp_prof.cuda.get_current_stream().synchronize()
+        except Exception:
+            try:
+                _cp_prof.cuda.Device().synchronize()
+            except Exception:
+                pass
 
     # ------------------------------------------------------------------
     # Z-vector + CI-response CUDA configuration
@@ -4921,6 +4923,7 @@ def casscf_nuc_grad_df_per_root(
             qblock=_qblk_sa,
         )
         if _profile_df_per_root:
+            _profile_cuda_sync()
             _t_bar_L_sa += time.perf_counter() - t0
 
         try:
@@ -5037,6 +5040,7 @@ def casscf_nuc_grad_df_per_root(
                         pass
                 _dump_cupy_arrays("sa contract done", min_mb=32.0, max_items=24)
             if _profile_df_per_root:
+                _profile_cuda_sync()
                 _t_contract_sa += time.perf_counter() - t0
         except (NotImplementedError, RuntimeError) as e:
             if bool(is_spherical):
@@ -5056,6 +5060,7 @@ def casscf_nuc_grad_df_per_root(
             )
 
     # ── 1e and Pulay contractions ──
+    t0 = time.perf_counter()
     if de_df_sa is not None:
         de_df_sa_np = np.asarray(_asnumpy_f64(de_df_sa), dtype=np.float64)
         del de_df_sa
@@ -5089,14 +5094,15 @@ def casscf_nuc_grad_df_per_root(
         W_sa = 0.5 * (_tmp_sa @ C_occ_np.T + C_occ_np @ _tmp_sa.T)
         de_pulay_sa = _contract_pulay_fast(W_sa)
 
+    if _profile_df_per_root:
+        _profile_cuda_sync()
+        _t_sa_base += time.perf_counter() - t0
+
     # SA base gradient.
-    if _precomputed_grad_sa is not None:
-        grad_sa_base = np.asarray(_precomputed_grad_sa, dtype=np.float64)
-    else:
-        # Fused path or fallback: build SA base from components.
-        grad_sa_base = np.asarray(de_h1_sa + de_nuc + de_pulay_sa, dtype=np.float64)
-        if de_df_sa_np is not None:
-            grad_sa_base += de_df_sa_np
+    # Fused path or fallback: build SA base from components.
+    grad_sa_base = np.asarray(de_h1_sa + de_nuc + de_pulay_sa, dtype=np.float64)
+    if de_df_sa_np is not None:
+        grad_sa_base += de_df_sa_np
     _log_vram("after SA base gradient")
     _flush_gpu_pool()
 
@@ -5121,7 +5127,6 @@ def casscf_nuc_grad_df_per_root(
     # Per-root gradient loop
     # ------------------------------------------------------------------
     grads_out: list[np.ndarray | None] = [None] * int(nroots)
-    _active_core_cache: dict[str, Any] | None = {} if bool(_literal_pyscf_response) else None
     _in_flight: list[dict[str, Any]] = []
 
     # Root-invariant mean-field potentials (vhf_c/vhf_a) are computed during the
@@ -5383,6 +5388,7 @@ def casscf_nuc_grad_df_per_root(
     t0 = time.perf_counter()
     eris_sa = mc_sa.ao2mo(C)
     if _profile_df_per_root:
+        _profile_cuda_sync()
         _t_newton_ao2mo += time.perf_counter() - t0
     if bool(_is_gpu):
         _flush_gpu_pool()
@@ -5393,6 +5399,7 @@ def casscf_nuc_grad_df_per_root(
             mc_sa, mo_coeff=C, ci=ci_list, eris=eris_sa, use_newton_hessian=True,
         )
     if _profile_df_per_root:
+        _profile_cuda_sync()
         _t_newton_hess += time.perf_counter() - t0
     n_orb = int(hess_op.n_orb)
 
@@ -5537,6 +5544,7 @@ def casscf_nuc_grad_df_per_root(
                 del _gupd, _hop, _hdiag
             del mc_K, fcisolver_fixed
             if _profile_df_per_root:
+                _profile_cuda_sync()
                 _t_gen_g_hop += time.perf_counter() - t0
             _flush_gpu_pool()
             _log_vram(f"root {K} after rhs build")
@@ -5578,6 +5586,7 @@ def casscf_nuc_grad_df_per_root(
         if _z_recycle_space is not None and _z_recycle_max > 0 and len(_z_recycle_space) > _z_recycle_max:
             del _z_recycle_space[:-int(_z_recycle_max)]
         if _profile_df_per_root:
+            _profile_cuda_sync()
             _t_z_solve += time.perf_counter() - t0
             _z_solver = str(z_batch.info.get("solver", _z_solver or "")).strip() or _z_solver
             _z_backend = str(z_batch.info.get("backend", _z_backend or "")).strip() or _z_backend
@@ -5780,7 +5789,7 @@ def casscf_nuc_grad_df_per_root(
         # gradient loop can inflate peak VRAM by ~O(sizeof(eris/Lpq)).  Strip the
         # operator down to the lightweight metadata we still need (CI unflatten,
         # sizes, gpu_mode flag).
-        if (not bool(_literal_pyscf_response)) and _normalize_bool_env(_os.environ.get("ASUKA_ZVECTOR_STRIP_HESS_OP"), default=True):
+        if _normalize_bool_env(_os.environ.get("ASUKA_ZVECTOR_STRIP_HESS_OP"), default=True):
             try:
                 from asuka.mcscf.zvector import MCSCFHessianOp as _MCSCFHessianOp  # noqa: PLC0415
 
@@ -5836,9 +5845,10 @@ def casscf_nuc_grad_df_per_root(
         dm2_lci: Any,
     ) -> None:
         """Finish per-root gradient once DF 2e delta (de_df_delta_np) is available."""
-        nonlocal _t_1e_pulay, _t_response_pulay
+        nonlocal _t_h1_delta, _t_response_pulay
 
         # ── Single fused 1e call: delta from SA + lci + lorb ──
+        t0 = time.perf_counter()
         if _gpu_1e_tensor_path:
             with _main_stream_cm:
                 D_1e_delta = xp.asarray(D_tot_K - D_tot_sa + D_act_lci + D_L_lorb, dtype=xp.float64)
@@ -5846,6 +5856,9 @@ def casscf_nuc_grad_df_per_root(
             with _main_stream_cm:
                 D_1e_delta = _asnumpy_f64(D_tot_K - D_tot_sa + D_act_lci + D_L_lorb)
         de_h1_delta = _contract_hcore_fast(D_1e_delta)
+        if _profile_df_per_root:
+            _profile_cuda_sync()
+            _t_h1_delta += time.perf_counter() - t0
 
         # ── Per-root Pulay delta: -Tr((W_K - W_sa) · dS/dR) ──
         t0 = time.perf_counter()
@@ -6109,8 +6122,8 @@ def casscf_nuc_grad_df_per_root(
             dm2_delta = dm2_K - dm2_sa
             _flush_gpu_pool()
         if _profile_df_per_root:
+            _profile_cuda_sync()
             _t_gfock += time.perf_counter() - t0
-
         t_rhs_start = time.perf_counter()
 
         # Step B/C: Z-vector RHS + solve (legacy) or batched pre-solved path.
@@ -6167,6 +6180,7 @@ def casscf_nuc_grad_df_per_root(
                 del _gupd, _hop, _hdiag
             del mc_K, fcisolver_fixed
             if _profile_df_per_root:
+                _profile_cuda_sync()
                 _t_gen_g_hop += time.perf_counter() - t0
             _flush_gpu_pool()
             _log_vram(f"root {K} after gen_g_hop cleanup")
@@ -6295,6 +6309,7 @@ def casscf_nuc_grad_df_per_root(
                 )
 
             if _profile_df_per_root:
+                _profile_cuda_sync()
                 _t_z_solve += time.perf_counter() - t0
                 try:
                     _z_solver = str(z_K.info.get("solver", _z_solver or "")).strip() or _z_solver
@@ -6309,7 +6324,6 @@ def casscf_nuc_grad_df_per_root(
 
         Lvec = np.asarray(z_K.z_packed, dtype=np.float64).ravel()
         Lorb_mat = mc_sa.unpack_uniq_var(Lvec[:n_orb])
-
         # Step D: CI response — accumulate transition RDMs, then build bar_L without contract().
         Lci_list = hess_op.ci_unflatten(Lvec[n_orb:])
         del z_K
@@ -6369,60 +6383,8 @@ def casscf_nuc_grad_df_per_root(
                 dm1_lci += wr * (dm1_r + dm1_r.T)
                 dm2_lci += wr * (dm2_r + dm2_r.transpose(1, 0, 3, 2))
         if _profile_df_per_root:
+            _profile_cuda_sync()
             _t_trans_rdm_lci += time.perf_counter() - t0
-
-        if bool(_literal_pyscf_response):
-            de_ham_root = _grad_elec_casscf_df(
-                scf_out=scf_out,
-                mo_coeff=C,
-                dm1_act=dm1_K,
-                dm2_act=dm2_K,
-                ncore=int(ncore),
-                ncas=int(ncas),
-                df_backend=str(df_backend),
-                df_config=df_config,
-                df_threads=int(df_threads),
-                df_grad_ctx=df_grad_ctx,
-                fd_delta_bohr=float(delta_bohr),
-                include_pulay=True,
-            )
-            de_lci = _grad_elec_active_df(
-                scf_out=scf_out,
-                mo_coeff=C,
-                dm1_act=dm1_lci,
-                dm2_act=dm2_lci,
-                ncore=int(ncore),
-                ncas=int(ncas),
-                df_backend=str(df_backend),
-                df_config=df_config,
-                df_threads=int(df_threads),
-                df_grad_ctx=df_grad_ctx,
-                fd_delta_bohr=float(delta_bohr),
-                core_cache=_active_core_cache,
-            )
-            de_lorb = _Lorb_dot_dgorb_dx_df(
-                scf_out=scf_out,
-                mo_coeff=C,
-                dm1_act=dm1_sa,
-                dm2_act=dm2_sa,
-                Lorb=np.asarray(Lorb_mat, dtype=np.float64),
-                ncore=int(ncore),
-                ncas=int(ncas),
-                eris=eris_sa,
-                df_backend=str(df_backend),
-                df_config=df_config,
-                df_threads=int(df_threads),
-                df_grad_ctx=df_grad_ctx,
-                fd_delta_bohr=float(delta_bohr),
-            )
-            grads_out[int(K)] = np.asarray(
-                de_nuc + np.asarray(de_ham_root, dtype=np.float64) + np.asarray(de_lci, dtype=np.float64) + np.asarray(de_lorb, dtype=np.float64),
-                dtype=np.float64,
-            )
-            _log_vram(f"root {K} done")
-            _flush_gpu_pool()
-            continue
-
         # ── Single fused contract(): HF delta + lci response + lorb response ──
         _flush_gpu_pool()
         _log_vram(f"root {K} pre-barL flush")
@@ -6456,83 +6418,79 @@ def casscf_nuc_grad_df_per_root(
             # Always use a single accumulation buffer for bar_L construction.
             # The old per-term path (3 separate buffers) wastes 2xsizeof(B) VRAM
             # with no benefit: contraction now sums terms before the kernel anyway.
-            if False:  # kept for reference; the 3-buffer path is strictly dominated
-                pass
-            else:
-                # Default path: allocate one accumulation buffer and build all terms into it.
-                bar_L_delta_total = (
-                    xp.zeros((naux, ntri), dtype=_barl_out_dtype)
-                    if bool(is_qp)
-                    else xp.zeros((naux, nao, nao), dtype=_barl_out_dtype)
-                )
+            # Default path: allocate one accumulation buffer and build all terms into it.
+            bar_L_delta_total = (
+                xp.zeros((naux, ntri), dtype=_barl_out_dtype)
+                if bool(is_qp)
+                else xp.zeros((naux, nao, nao), dtype=_barl_out_dtype)
+            )
 
-                _build_bar_L_delta_casscf_df(
-                    B_ao,
-                    D_core_ao=D_core_sa,
-                    C_act=C_act_sa,
-                    dm1_delta=dm1_delta,
-                    dm2_delta=dm2_delta,
-                    rho_core=rho_core,
-                    L2=L2,
-                    out=bar_L_delta_total,
-                    symmetrize=False,
-                    work_dtype=_barl_work_dtype,
-                    out_dtype=_barl_out_dtype,
-                    qblock=qblock_eff,
-                )
-                _log_vram(f"root {K} after delta_hf")
-                _flush_gpu_pool()
-                _log_vram(f"root {K} after delta_hf flush")
+            _build_bar_L_delta_casscf_df(
+                B_ao,
+                D_core_ao=D_core_sa,
+                C_act=C_act_sa,
+                dm1_delta=dm1_delta,
+                dm2_delta=dm2_delta,
+                rho_core=rho_core,
+                L2=L2,
+                out=bar_L_delta_total,
+                symmetrize=False,
+                work_dtype=_barl_work_dtype,
+                out_dtype=_barl_out_dtype,
+                qblock=qblock_eff,
+            )
+            _log_vram(f"root {K} after delta_hf")
+            _flush_gpu_pool()
+            _log_vram(f"root {K} after delta_hf flush")
 
-                # CI response term: use linearized bar_L (cross-terms with
-                # core only, no quadratic self-interaction of D_lci) so that
-                # the weighted sum over roots cancels exactly.
-                _build_bar_L_delta_casscf_df(
-                    B_ao,
-                    D_core_ao=D_core_sa,
-                    C_act=C_act_sa,
-                    dm1_delta=dm1_lci,
-                    dm2_delta=dm2_lci,
-                    rho_core=rho_core,
-                    L2=L2,
-                    out=bar_L_delta_total,
-                    symmetrize=False,
-                    work_dtype=_barl_work_dtype,
-                    out_dtype=_barl_out_dtype,
-                    qblock=qblock_eff,
-                )
-                D_act_lci = xp.asarray(
-                    C_act_sa @ xp.asarray(dm1_lci, dtype=xp.float64) @ C_act_sa.T,
-                    dtype=xp.float64,
-                )
-                _log_vram(f"root {K} after lci_net")
-                _flush_gpu_pool()
-                _log_vram(f"root {K} after lci_net flush")
+            # CI response term: use linearized bar_L (cross-terms with
+            # core only, no quadratic self-interaction of D_lci) so that
+            # the weighted sum over roots cancels exactly.
+            _build_bar_L_delta_casscf_df(
+                B_ao,
+                D_core_ao=D_core_sa,
+                C_act=C_act_sa,
+                dm1_delta=dm1_lci,
+                dm2_delta=dm2_lci,
+                rho_core=rho_core,
+                L2=L2,
+                out=bar_L_delta_total,
+                symmetrize=False,
+                work_dtype=_barl_work_dtype,
+                out_dtype=_barl_out_dtype,
+                qblock=qblock_eff,
+            )
+            D_act_lci = xp.asarray(
+                C_act_sa @ xp.asarray(dm1_lci, dtype=xp.float64) @ C_act_sa.T,
+                dtype=xp.float64,
+            )
+            _log_vram(f"root {K} after lci_net")
+            _flush_gpu_pool()
+            _log_vram(f"root {K} after lci_net flush")
+            # Orbital response term: accumulate directly into bar_L_delta_total.
+            _, D_L_lorb = _build_bar_L_lorb_df(
+                B_ao,
+                C,
+                np.asarray(Lorb_mat, dtype=np.float64),
+                dm1_sa,
+                dm2_sa,
+                ncore=int(ncore),
+                ncas=int(ncas),
+                xp=xp,
+                out=bar_L_delta_total,
+                symmetrize=False,
+                work_dtype=_barl_work_dtype,
+                out_dtype=_barl_out_dtype,
+                qblock=qblock_eff,
+            )
+            _log_vram(f"root {K} after lorb")
 
-                # Orbital response term: accumulate directly into bar_L_delta_total.
-                _, D_L_lorb = _build_bar_L_lorb_df(
-                    B_ao,
-                    C,
-                    np.asarray(Lorb_mat, dtype=np.float64),
-                    dm1_sa,
-                    dm2_sa,
-                    ncore=int(ncore),
-                    ncas=int(ncas),
-                    xp=xp,
-                    out=bar_L_delta_total,
-                    symmetrize=False,
-                    work_dtype=_barl_work_dtype,
-                    out_dtype=_barl_out_dtype,
-                    qblock=qblock_eff,
-                )
-                _log_vram(f"root {K} after lorb")
-
-
-                if not bool(is_qp):
-                    _symmetrize_bar_L_inplace(bar_L_delta_total, xp)
-                _log_vram(f"root {K} bar_L fused")
-                if _profile_df_per_root:
-                    _t_bar_L_delta += time.perf_counter() - t0
+            if not bool(is_qp):
+                _symmetrize_bar_L_inplace(bar_L_delta_total, xp)
+            _log_vram(f"root {K} bar_L fused")
+            if _profile_df_per_root:
+                _profile_cuda_sync()
+                _t_bar_L_delta += time.perf_counter() - t0
 
         if bool(_fused_contract_enabled):
             if bar_L_terms_contract is None:
@@ -6717,6 +6675,7 @@ def casscf_nuc_grad_df_per_root(
 
             if grad_dev is not None:
                 # ── Single fused 1e call: delta from SA + lci + lorb ──
+                t0 = time.perf_counter()
                 if _gpu_1e_tensor_path:
                     with _main_stream_cm:
                         D_1e_delta = xp.asarray(D_tot_K - D_tot_sa + D_act_lci + D_L_lorb, dtype=xp.float64)
@@ -6724,6 +6683,9 @@ def casscf_nuc_grad_df_per_root(
                     with _main_stream_cm:
                         D_1e_delta = _asnumpy_f64(D_tot_K - D_tot_sa + D_act_lci + D_L_lorb)
                 de_h1_delta = _contract_hcore_fast(D_1e_delta)
+                if _profile_df_per_root:
+                    _profile_cuda_sync()
+                    _t_h1_delta += time.perf_counter() - t0
 
                 # ── Per-root Pulay delta: -Tr((W_K - W_sa) · dS/dR) ──
                 # ── Response Pulay (multi-stream path) ──
@@ -6787,6 +6749,7 @@ def casscf_nuc_grad_df_per_root(
                         de_df_delta = _asnumpy_f64(de_df_delta)
 
                     if _profile_df_per_root:
+                        _profile_cuda_sync()
                         _t_contract_delta += time.perf_counter() - t0
 
                     grad_done = np.asarray(
@@ -6845,6 +6808,7 @@ def casscf_nuc_grad_df_per_root(
                 t0 = time.perf_counter()
                 de_df_delta_multi = _contract_df_delta_batch_from_pending(_pending_batch)
                 if _profile_df_per_root:
+                    _profile_cuda_sync()
                     _t_contract_delta += time.perf_counter() - t0
             except Exception:
                 _finalize_pending_batch_sequential(_pending_batch)
@@ -6898,6 +6862,7 @@ def casscf_nuc_grad_df_per_root(
                     _log_vram(f"root {K} delta2e contract done")
                     _dump_cupy_arrays(f"root {K} delta2e contract done", min_mb=32.0, max_items=24)
                 if _profile_df_per_root:
+                    _profile_cuda_sync()
                     _t_contract_delta += time.perf_counter() - t0
             except (NotImplementedError, RuntimeError, ValueError) as e:
                 if bool(is_spherical):
@@ -6946,6 +6911,7 @@ def casscf_nuc_grad_df_per_root(
             _log_vram(f"root {K} after delta2e + release barL")
 
         # ── Single fused 1e call: delta from SA + lci + lorb ──
+        t0 = time.perf_counter()
         if _gpu_1e_tensor_path:
             with _main_stream_cm:
                 D_1e_delta = xp.asarray(D_tot_K - D_tot_sa + D_act_lci + D_L_lorb, dtype=xp.float64)
@@ -6953,6 +6919,9 @@ def casscf_nuc_grad_df_per_root(
             with _main_stream_cm:
                 D_1e_delta = _asnumpy_f64(D_tot_K - D_tot_sa + D_act_lci + D_L_lorb)
         de_h1_delta = _contract_hcore_fast(D_1e_delta)
+        if _profile_df_per_root:
+            _profile_cuda_sync()
+            _t_h1_delta += time.perf_counter() - t0
         if bool(_vram_debug_fine):
             _log_vram(f"root {K} after delta h1")
 
@@ -7010,6 +6979,7 @@ def casscf_nuc_grad_df_per_root(
                 de_df_delta = _asnumpy_f64(de_df_delta)
 
             if _profile_df_per_root:
+                _profile_cuda_sync()
                 _t_contract_delta += time.perf_counter() - t0
 
             grad_done = np.asarray(
@@ -7038,6 +7008,14 @@ def casscf_nuc_grad_df_per_root(
         import sys  # noqa: PLC0415
 
         nstreams = int(_n_streams) if bool(_use_multistream_contract) else 1
+        _profile_total_wall = float(time.perf_counter() - _t_profile_wall_clock0)
+        _profile_accounted = float(
+            _t_bar_L_sa + _t_contract_sa + _t_bar_L_delta + _t_contract_delta + _t_z_solve
+            + _t_trans_rdm_lci + _t_gen_g_hop + _t_gfock + _t_h1_delta + _t_response_pulay
+            + _t_vhf_cache + _t_gfock_zero + _t_newton_ao2mo + _t_newton_hess
+            + _t_sa_prep + _t_rhs_build + _t_sa_base + _t_profile_preamble
+        )
+        _profile_unaccounted = max(0.0, float(_profile_total_wall - _profile_accounted))
         print(
             "[ASUKA_PROFILE_DF_PER_ROOT] "
             f"nroots={int(nroots)} streams={nstreams} "
@@ -7048,7 +7026,7 @@ def casscf_nuc_grad_df_per_root(
             f"delta_batch_prec={str(_delta_batch_precision)} "
             f"sa_df_deferred={int(bool(_sa_df_deferred))} "
             f"sa_df_fused={int(bool(_sa_df_fused))} "
-            f"t_vhf_cache={_t_vhf_cache:.3f}s t_gfock_zero={_t_gfock_zero:.3f}s "
+            f"t_preamble={_t_profile_preamble:.3f}s t_vhf_cache={_t_vhf_cache:.3f}s t_gfock_zero={_t_gfock_zero:.3f}s "
             f"t_newton_ao2mo={_t_newton_ao2mo:.3f}s t_newton_hess={_t_newton_hess:.3f}s "
             f"t_sa_prep={_t_sa_prep:.3f}s t_rhs_build={_t_rhs_build:.3f}s "
             f"barL_hybrid={int(bool(_barl_hybrid_enabled))} "
@@ -7065,7 +7043,9 @@ def casscf_nuc_grad_df_per_root(
             f"z_niter={int(_z_niter)} z_matvec_calls={int(_z_matvec_calls)} "
             f"t_trans_rdm_lci={_t_trans_rdm_lci:.3f}s "
             f"t_gen_g_hop={_t_gen_g_hop:.3f}s t_gfock={_t_gfock:.3f}s "
-            f"t_response_pulay={_t_response_pulay:.3f}s",
+            f"t_h1_delta={_t_h1_delta:.3f}s t_response_pulay={_t_response_pulay:.3f}s "
+            f"t_sa_base={_t_sa_base:.3f}s total_wall={_profile_total_wall:.3f}s "
+            f"accounted={_profile_accounted:.3f}s unaccounted={_profile_unaccounted:.3f}s",
             file=sys.stderr,
         )
 
