@@ -140,9 +140,25 @@ __global__ void KernelMako_gemm_eri(
     int* cart_dy = smem_ints + ioff; ioff += nd;
     int* cart_dz = smem_ints + ioff; ioff += nd;
 
-    // TF32TC staging (placed after int lookup tables)
-    // NOTE: staging is only valid when UseTF32TC=true and smem is large enough
+    // FP32-native intermediates for TF32TC: reinterpret double arrays as float
+    // (float is 4 bytes, double is 8 bytes → float array fits in first half)
+    [[maybe_unused]] float* fE    = reinterpret_cast<float*>(smem_E);
+    [[maybe_unused]] float* fR    = reinterpret_cast<float*>(smem_R);
+    [[maybe_unused]] float* fM    = reinterpret_cast<float*>(smem_M);
+    [[maybe_unused]] float* fRtuv = reinterpret_cast<float*>(smem_Rtuv);
+    [[maybe_unused]] float* fRt   = reinterpret_cast<float*>(smem_Rt);
+    [[maybe_unused]] float* f1d_bra = reinterpret_cast<float*>(smem_1d_bra);
+    [[maybe_unused]] float* f1d_ket = reinterpret_cast<float*>(smem_1d_ket);
+    // Per-warp MMA output tile (reuse Fm area which has L+1 doubles ≥ 128 floats for L≥15)
+    // For smaller L: use smem after int tables
     [[maybe_unused]] float* smem_tf32_staging = nullptr;
+    if constexpr (UseTF32TC) {
+        // Per-warp output tiles: 4 warps × 128 floats = 512 floats = 2048 bytes
+        // Place after int tables, 16-byte aligned
+        uintptr_t p = reinterpret_cast<uintptr_t>(smem_ints + ioff);
+        p = (p + 15u) & ~uintptr_t(15u);
+        smem_tf32_staging = reinterpret_cast<float*>(p);
+    }
 
     // One-time setup: lookup tables
     // Set staging pointer after int tables (16-byte aligned for CuTe vectorized loads)
@@ -202,7 +218,11 @@ __global__ void KernelMako_gemm_eri(
         const double XQD = Qx - Dx, YQD = Qy - Dy, ZQD = Qz - Dz;
 
         // Zero the (ab|q] intermediate — accumulates over K_AB
-        mako::smem_zero(smem_M, M_size, tid, nthreads);
+        if constexpr (UseTF32TC) {
+            mako::smem_zero(fM, M_size, tid, nthreads);
+        } else {
+            mako::smem_zero(smem_M, M_size, tid, nthreads);
+        }
         __syncthreads();
 
         // ===== Inner loop over bra primitives (K_AB) =====
@@ -223,7 +243,53 @@ __global__ void KernelMako_gemm_eri(
                                    * cKi * cKj;
 
             // ----- Phase 1: r-integrals + [p|q] assembly -----
-            // Bra E-coefficients (threads 0-2)
+            if constexpr (UseTF32TC) {
+                // FP32-native path: compute directly in float
+                float* fE_bra_x = f1d_bra;
+                float* fE_bra_y = f1d_bra + bra_1d_size;
+                float* fE_bra_z = f1d_bra + 2 * bra_1d_size;
+                float fXPA = __double2float_rn(XPA), fYPA = __double2float_rn(YPA), fZPA = __double2float_rn(ZPA);
+                float fXPB = __double2float_rn(XPB), fYPB = __double2float_rn(YPB), fZPB = __double2float_rn(ZPB);
+                float finv_2p = __double2float_rn(inv_2p);
+                if (tid == 0) mako::compute_E_1d_t<float>(la, lb, fXPA, fXPB, finv_2p, fE_bra_x, e_bra_stride_i, e_bra_stride_j);
+                if (tid == 1) mako::compute_E_1d_t<float>(la, lb, fYPA, fYPB, finv_2p, fE_bra_y, e_bra_stride_i, e_bra_stride_j);
+                if (tid == 2) mako::compute_E_1d_t<float>(la, lb, fZPA, fZPB, finv_2p, fE_bra_z, e_bra_stride_i, e_bra_stride_j);
+                __syncthreads();
+
+                mako::cooperative_compute_R_integrals_t<float>(
+                    XPQ, YPQ, ZPQ, rho, prefactor, L,
+                    smem_Fm, fRtuv, fRt, Lp1, tid, nthreads);
+
+                // [p|q] assembly in float
+                for (int row = tid; row < nhab; row += nthreads) {
+                    const int tb = herm_t_bra[row], ub = herm_u_bra[row], vb = herm_v_bra[row];
+                    for (int q_h = 0; q_h < nhcd; ++q_h) {
+                        const int T_idx = tb + herm_t_ket[q_h];
+                        const int U_idx = ub + herm_u_ket[q_h];
+                        const int V_idx = vb + herm_v_ket[q_h];
+                        const int lq = herm_t_ket[q_h] + herm_u_ket[q_h] + herm_v_ket[q_h];
+                        const float sign = (lq & 1) ? -1.0f : 1.0f;
+                        fR[row * R_stride + q_h] = sign *
+                            fRtuv[(T_idx * Lp1 + U_idx) * Lp1 + V_idx];
+                    }
+                }
+
+                // E_AB assembly in float
+                for (int row = tid; row < nab; row += nthreads) {
+                    const int ia = row / nb, ib = row % nb;
+                    const int axi = cart_ax[ia], ayi = cart_ay[ia], azi = cart_az[ia];
+                    const int bxi = cart_bx[ib], byi = cart_by[ib], bzi = cart_bz[ib];
+                    for (int p_h = 0; p_h < nhab; ++p_h) {
+                        const int t = herm_t_bra[p_h], u = herm_u_bra[p_h], v = herm_v_bra[p_h];
+                        fE[row * nhab + p_h] =
+                            fE_bra_x[axi * e_bra_stride_i + bxi * e_bra_stride_j + t] *
+                            fE_bra_y[ayi * e_bra_stride_i + byi * e_bra_stride_j + u] *
+                            fE_bra_z[azi * e_bra_stride_i + bzi * e_bra_stride_j + v];
+                    }
+                }
+                __syncthreads();
+            } else {
+            // FP64 path (original)
             double* E_bra_x = smem_1d_bra;
             double* E_bra_y = smem_1d_bra + bra_1d_size;
             double* E_bra_z = smem_1d_bra + 2 * bra_1d_size;
@@ -233,23 +299,16 @@ __global__ void KernelMako_gemm_eri(
             if (tid == 2) mako::compute_E_1d(la, lb, ZPA, ZPB, inv_2p, E_bra_z, e_bra_stride_i, e_bra_stride_j);
             __syncthreads();
 
-            // Cooperative R-integrals (all threads, Eq. 4-5)
             mako::cooperative_compute_R_integrals(
                 XPQ, YPQ, ZPQ, rho, prefactor, L,
                 smem_Fm, smem_Rtuv, smem_Rt, Lp1, tid, nthreads);
 
-            // ----- [p|q] assembly with ILP (Eq. 6, 8) -----
-            // [p|q] = (-1)^l_q * [p+q]^(0)
-            // Each thread computes multiple (p,q) elements — the inner
-            // q-loop is the ILP dimension (independent iterations that the
-            // compiler can schedule concurrently, Eq. 8).
             for (int row = tid; row < nhab; row += nthreads) {
                 const int tb = herm_t_bra[row], ub = herm_u_bra[row], vb = herm_v_bra[row];
                 for (int q_h = 0; q_h < nhcd; ++q_h) {
                     const int T_idx = tb + herm_t_ket[q_h];
                     const int U_idx = ub + herm_u_ket[q_h];
                     const int V_idx = vb + herm_v_ket[q_h];
-                    // Eq. 6: sign = (-1)^{l_q} where l_q = tau+ups+phi
                     const int lq = herm_t_ket[q_h] + herm_u_ket[q_h] + herm_v_ket[q_h];
                     const double sign = (lq & 1) ? -1.0 : 1.0;
                     smem_R[row * R_stride + q_h] = sign *
@@ -257,7 +316,6 @@ __global__ void KernelMako_gemm_eri(
                 }
             }
 
-            // ----- Phase 2: E_AB assembly -----
             for (int row = tid; row < nab; row += nthreads) {
                 const int ia = row / nb, ib = row % nb;
                 const int axi = cart_ax[ia], ayi = cart_ay[ia], azi = cart_az[ia];
@@ -271,6 +329,7 @@ __global__ void KernelMako_gemm_eri(
                 }
             }
             __syncthreads();
+            } // end FP64 path
 
             // ----- Phase 3: GEMM1 — (ab|q] += E_AB ⊗ [p|q] (Eq. 7) -----
             // Output accumulates into smem_M across K_AB iterations.
@@ -279,9 +338,11 @@ __global__ void KernelMako_gemm_eri(
 #ifdef MAKO_HAS_CUTLASS
             if constexpr (UseTF32TC) {
                 if (mako::cutlass_gemm_eligible(nab, nhcd, nhab))
-                    mako::smem_gemm_AB_accum_tf32(smem_M, smem_E, smem_R, nab, nhcd, nhab, tid, nthreads, smem_tf32_staging, R_stride);
+                    // FP32-native MMA: read float arrays directly
+                    mako::smem_gemm_AB_accum_tf32_native<float>(fM, fE, fR, nab, nhcd, nhab, tid, nthreads, smem_tf32_staging, R_stride);
                 else
-                    mako::smem_gemm_AB_accum_v2(smem_M, smem_E, smem_R, nab, nhcd, nhab, tid, nthreads, R_stride);
+                    // FP32-native scalar fallback (data is float, not double!)
+                    mako::smem_gemm_AB_accum_v2<float>(fM, fE, fR, nab, nhcd, nhab, tid, nthreads, R_stride);
             } else
 #endif
             mako::smem_gemm_AB_accum_v2(smem_M, smem_E, smem_R, nab, nhcd, nhab, tid, nthreads, R_stride);
@@ -290,7 +351,57 @@ __global__ void KernelMako_gemm_eri(
         // ===== End K_AB loop =====
 
         // ----- Phase 4: E_CD assembly + GEMM2 -----
-        // Ket E-coefficients (computed once per jp)
+#ifdef MAKO_HAS_CUTLASS
+        if constexpr (UseTF32TC) {
+            // FP32-native ket E-coefficients
+            float* fE_ket_x = f1d_ket;
+            float* fE_ket_y = f1d_ket + ket_1d_size;
+            float* fE_ket_z = f1d_ket + 2 * ket_1d_size;
+            float fXQC = __double2float_rn(XQC), fYQC = __double2float_rn(YQC), fZQC = __double2float_rn(ZQC);
+            float fXQD = __double2float_rn(XQD), fYQD = __double2float_rn(YQD), fZQD = __double2float_rn(ZQD);
+            float finv_2q = __double2float_rn(inv_2q);
+            if (tid == 0) mako::compute_E_1d_t<float>(lc, ld, fXQC, fXQD, finv_2q, fE_ket_x, e_ket_stride_i, e_ket_stride_j);
+            if (tid == 1) mako::compute_E_1d_t<float>(lc, ld, fYQC, fYQD, finv_2q, fE_ket_y, e_ket_stride_i, e_ket_stride_j);
+            if (tid == 2) mako::compute_E_1d_t<float>(lc, ld, fZQC, fZQD, finv_2q, fE_ket_z, e_ket_stride_i, e_ket_stride_j);
+            __syncthreads();
+
+            // E_CD assembly in float (reuses fE)
+            for (int row = tid; row < ncd; row += nthreads) {
+                const int ic = row / nd, id_c = row % nd;
+                const int cxi = cart_cx[ic], cyi = cart_cy[ic], czi = cart_cz[ic];
+                const int dxi = cart_dx[id_c], dyi = cart_dy[id_c], dzi = cart_dz[id_c];
+                for (int q_h = 0; q_h < nhcd; ++q_h) {
+                    const int tau = herm_t_ket[q_h], ups = herm_u_ket[q_h], phi = herm_v_ket[q_h];
+                    fE[row * nhcd + q_h] =
+                        fE_ket_x[cxi * e_ket_stride_i + dxi * e_ket_stride_j + tau] *
+                        fE_ket_y[cyi * e_ket_stride_i + dyi * e_ket_stride_j + ups] *
+                        fE_ket_z[czi * e_ket_stride_i + dzi * e_ket_stride_j + phi];
+                }
+            }
+            __syncthreads();
+
+            // GEMM2: Acc (double) += fM × fE^T — float→double accumulation
+            if (mako::cutlass_gemm_eligible(nab, ncd, nhcd))
+                mako::smem_gemm_ABt_accum_tf32_native<double>(smem_Acc, fM, fE,
+                    nab, ncd, nhcd, tid, nthreads, smem_tf32_staging);
+            else {
+                // Scalar float fallback for GEMM2 (fM and fE are float)
+                // Accumulate into double output manually
+                for (int row = tid; row < nab; row += nthreads) {
+                    for (int j = 0; j < ncd; ++j) {
+                        double sum = 0.0;
+                        for (int k = 0; k < nhcd; ++k)
+                            sum += static_cast<double>(fM[row * nhcd + k]) *
+                                   static_cast<double>(fE[j * nhcd + k]);
+                        smem_Acc[row * ncd + j] += sum;
+                    }
+                }
+            }
+            __syncthreads();
+        } else
+#endif
+        {
+        // FP64 path (original)
         double* E_ket_x = smem_1d_ket;
         double* E_ket_y = smem_1d_ket + ket_1d_size;
         double* E_ket_z = smem_1d_ket + 2 * ket_1d_size;
@@ -300,7 +411,6 @@ __global__ void KernelMako_gemm_eri(
         if (tid == 2) mako::compute_E_1d(lc, ld, ZQC, ZQD, inv_2q, E_ket_z, e_ket_stride_i, e_ket_stride_j);
         __syncthreads();
 
-        // Assemble E_CD (reuse smem_E; sign already absorbed into [p|q])
         for (int row = tid; row < ncd; row += nthreads) {
             const int ic = row / nd, id_c = row % nd;
             const int cxi = cart_cx[ic], cyi = cart_cy[ic], czi = cart_cz[ic];
@@ -315,19 +425,9 @@ __global__ void KernelMako_gemm_eri(
         }
         __syncthreads();
 
-        // GEMM2: (ab|cd) += (ab|q] ⊗ E_CD^T (Eq. 7, second MatMul)
-        // GEMM coalescing: reads (ab|q] from smem_M (no global memory).
-#ifdef MAKO_HAS_CUTLASS
-        if constexpr (UseTF32TC) {
-            if (mako::cutlass_gemm_eligible(nab, ncd, nhcd))
-                mako::smem_gemm_ABt_accum_tf32(smem_Acc, smem_M, smem_E,
-                    nab, ncd, nhcd, tid, nthreads, smem_tf32_staging);
-            else
-                mako::smem_gemm_ABt_accum(smem_Acc, smem_M, smem_E, nab, ncd, nhcd, tid, nthreads);
-        } else
-#endif
         mako::smem_gemm_ABt_accum(smem_Acc, smem_M, smem_E, nab, ncd, nhcd, tid, nthreads);
         __syncthreads();
+        } // end FP64 path
     }
     // ===== End K_CD loop =====
 
@@ -422,15 +522,9 @@ extern "C" void mako_gemm_eri_tf32tc_launch(
 {
     if (ntasks <= 0) return;
     const int block_size = (threads > 0 && threads <= 1024) ? threads : 128;
-    // Add FP32 staging for TF32 tensor core path
-    const int na = mako::ncart(la), nb = mako::ncart(lb);
-    const int nc = mako::ncart(lc), nd = mako::ncart(ld);
-    const int nab = na*nb, ncd = nc*nd;
-    const int nhab = mako::n_hermite_count(la+lb), nhcd = mako::n_hermite_count(lc+ld);
-    const int stg1 = mako::tf32_staging_bytes(nab, nhcd, nhab);
-    const int stg2 = mako::tf32_staging_bytes(nab, ncd, nhcd);
+    // FP32-native: only per-warp output tiles needed (no global staging)
     const int smem_bytes = _gemm_smem_bytes(la, lb, lc, ld)
-                         + ((stg1 > stg2) ? stg1 : stg2);
+                         + mako::tf32_native_staging_bytes();
     cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
 
     if (smem_bytes > 48 * 1024) {
