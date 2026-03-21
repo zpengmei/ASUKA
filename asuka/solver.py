@@ -3870,27 +3870,63 @@ class GUGAFCISolver(_StreamObject):
                         keep_keys=(ws_key,),
                     )
                 else:
-                    cuda_ws.eri_mat = eri_mat_d
-                    cuda_ws.l_full = l_full_d
-                    cuda_ws.direct_op = direct_op_d
-                    h_eff_flat_new = cuda_ws._as_h_eff_flat(h_eff_d)
-                    if getattr(cuda_ws, "h_eff_flat", None) is None or tuple(getattr(cuda_ws.h_eff_flat, "shape", ())) != tuple(
-                        getattr(h_eff_flat_new, "shape", ())
-                    ):
-                        cuda_ws.h_eff_flat = h_eff_flat_new
-                        if getattr(cuda_ws, "_cuda_graph", None) is not None:
-                            cuda_ws._cuda_graph = None
-                            cuda_ws._cuda_graph_x = None
-                            cuda_ws._cuda_graph_y = None
-                    else:
-                        cp.copyto(cuda_ws.h_eff_flat, h_eff_flat_new)
-                    cuda_ws._eri_diag_t = None
-                    if eri_mat_d is not None and getattr(cuda_ws, "_eri_mat_t", None) is not None:
-                        cp.copyto(cuda_ws._eri_mat_t, cuda_ws.eri_mat.T)
-                    elif getattr(cuda_ws, "_cuda_graph", None) is not None:
-                        cuda_ws._cuda_graph = None
-                        cuda_ws._cuda_graph_x = None
-                        cuda_ws._cuda_graph_y = None
+                    # Full rebuild: drop the old workspace and create fresh.
+                    # The in-place update path has a subtle stale-state bug that
+                    # causes intermittent CI-element drift when the workspace
+                    # alternates between two different integral sets (e.g., CI
+                    # Hessian vs CI coupling in Newton-CASSCF h_op).  Rebuilding
+                    # is slightly more expensive but eliminates the bug.
+                    cuda_ws = GugaMatvecEriMatWorkspace(
+                        drt,
+                        drt_dev=drt_dev,
+                        state_dev=state_dev,
+                        eri_mat=eri_mat_d,
+                        l_full=l_full_d,
+                        direct_op=direct_op_d,
+                        h_eff=h_eff_d,
+                        j_tile=int(getattr(self, "matvec_cuda_j_tile", 1024)) if int(getattr(self, "matvec_cuda_j_tile", 0)) > 0 else 1024,
+                        csr_capacity_mult=float(getattr(self, "matvec_cuda_csr_capacity_mult", 2.0)),
+                        cache_csr_tiles=bool(getattr(self, "matvec_cuda_cache_csr_tiles", False)),
+                        csr_host_cache=_normalize_csr_host_cache_mode(getattr(self, "matvec_cuda_csr_host_cache", "auto")),
+                        csr_host_cache_budget_gib=max(0.0, float(getattr(self, "matvec_cuda_csr_host_cache_budget_gib", 4.0))),
+                        csr_host_cache_min_ncsf=max(1, int(getattr(self, "matvec_cuda_csr_host_cache_min_ncsf", 1_000_000))),
+                        csr_pipeline_streams=getattr(self, "matvec_cuda_csr_pipeline_streams", "auto"),
+                        csr_pipeline_min_ncsf=max(1, int(getattr(self, "matvec_cuda_csr_pipeline_min_ncsf", 1_000_000))),
+                        prefilter_trivial_tasks=_normalize_prefilter_trivial_tasks_mode(
+                            getattr(self, "matvec_cuda_prefilter_trivial_tasks", "auto")
+                        ),
+                        prefilter_trivial_tasks_min_ncsf=max(
+                            1, int(getattr(self, "matvec_cuda_prefilter_trivial_tasks_min_ncsf", 1_000_000))
+                        ),
+                        threads_enum=int(getattr(self, "matvec_cuda_threads_enum", 128)),
+                        threads_g=int(getattr(self, "matvec_cuda_threads_g", 256)),
+                        threads_w=int(getattr(self, "matvec_cuda_threads_w", 0)) if int(getattr(self, "matvec_cuda_threads_w", 0)) > 0 else int(getattr(self, "matvec_cuda_threads_g", 256)),
+                        threads_apply=int(getattr(self, "matvec_cuda_threads_apply", 32)) if int(getattr(self, "matvec_cuda_threads_apply", 0)) > 0 else 32,
+                        max_g_bytes=int(float(getattr(self, "matvec_cuda_max_g_mib", 256.0)) * 1024 * 1024),
+                        coalesce=bool(getattr(self, "matvec_cuda_coalesce", True)),
+                        include_diagonal_rs=bool(getattr(self, "matvec_cuda_include_diagonal_rs", True)),
+                        fuse_count_write=bool(getattr(self, "matvec_cuda_fuse_count_write", True)),
+                        path_mode=str(_path_mode_req),
+                        use_fused_hop=bool(getattr(self, "matvec_cuda_use_fused_hop", True)),
+                        fp32_coeff_data=bool(getattr(self, "matvec_cuda_fp32_coeff_data", False)),
+                        use_epq_table=use_epq_table,
+                        aggregate_offdiag_k=bool(use_aggregate_offdiag),
+                        offdiag_enable_fp64_emulation=bool(getattr(self, "matvec_cuda_enable_fp64_emulation", False)),
+                        offdiag_emulation_strategy=str(getattr(self, "matvec_cuda_emulation_strategy", "performant")),
+                        offdiag_cublas_workspace_cap_mb=int(getattr(self, "matvec_cuda_cublas_workspace_cap_mb", 2048)),
+                        gemm_backend=str(getattr(self, "matvec_cuda_gemm_backend", "gemmex_fp64")),
+                        dtype=_ws_dtype,
+                        apply_mode=str(getattr(self, "matvec_cuda_apply_mode", "auto")),
+                        epq_build_nthreads=int(getattr(self, "matvec_cuda_epq_build_nthreads", 0)),
+                        epq_build_device=bool(getattr(self, "matvec_cuda_epq_build_device", False)),
+                        epq_build_j_tile=int(getattr(self, "matvec_cuda_epq_build_j_tile", 0)),
+                        use_cuda_graph=bool(getattr(self, "matvec_cuda_use_graph", False)),
+                    )
+                    self._matvec_cuda_ws_cache_put(
+                        ws_key,
+                        cuda_ws,
+                        keep_keys=(ws_key,),
+                    )
 
                 cuda_ws._contract_2e_integral_key = integral_key
 

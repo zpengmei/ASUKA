@@ -464,6 +464,15 @@ def make_rdm12_cuda(
 
                 # Make the default stream wait for the pipeline to finish.
                 stream.wait_event(event_contracted[(ntiles - 1) % 2])
+                # Synchronize the non-blocking pipeline streams before they go
+                # out of scope.  Without this, cudaStreamDestroy (triggered by
+                # Python GC of the local stream objects) races with in-flight
+                # kernels, and the cuBLAS handle inside gram_ws retains a
+                # pointer to the destroyed stream — subsequent calls that reuse
+                # gram_ws can then issue GEMMs on a stale stream handle,
+                # corrupting results that share the device memory pool.
+                stream_build.synchronize()
+                stream_contract.synchronize()
             else:
                 # Single tile: no pipeline needed.
                 k_count = min(tile_csf, ncsf)
@@ -839,6 +848,15 @@ def trans_rdm12_cuda(
 
                 # Make the default stream wait for the pipeline to finish.
                 stream.wait_event(event_contracted[(ntiles - 1) % 2])
+                # Synchronize the non-blocking pipeline streams before they go
+                # out of scope.  Without this, cudaStreamDestroy (triggered by
+                # Python GC of the local stream objects) races with in-flight
+                # kernels, and the cuBLAS handle inside gram_ws retains a
+                # pointer to the destroyed stream — subsequent calls that reuse
+                # gram_ws can then issue GEMMs on a stale stream handle,
+                # corrupting results that share the device memory pool.
+                stream_build.synchronize()
+                stream_contract.synchronize()
             else:
                 # Single tile: no pipeline needed.
                 k_count = min(tile_csf, ncsf)
