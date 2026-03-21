@@ -413,63 +413,26 @@ def casscf_nuc_grad_direct_per_root(
         threads=int(threads),
     )
 
-    # Build eris using the GPU provider, then construct a CPU-only adapter for
-    # the Z-vector solve to avoid GPU non-determinism in the Hessian matvec.
-    _mc_eri_builder = DFNewtonCASSCFAdapter(
-        df_B=None,
+    # Build the Z-vector Hessian operator using DF factors from the SCF for
+    # J/K contractions.  This avoids materializing a dense AO-ERI tensor
+    # (nao^4 * 8 bytes — OOM at ~200 AOs) and runs the CUDA matvec path.
+    _df_B = getattr(scf_out, "df_B", None)
+    mc_sa = DFNewtonCASSCFAdapter(
+        df_B=_df_B,
         hcore_ao=getattr(getattr(scf_out, "int1e"), "hcore"),
         ncore=int(ncore),
         ncas=int(ncas),
         nelecas=nelecas,
         mo_coeff=mo_coeff,
         fcisolver=fcisolver_use,
-        jk_provider=provider,
-        eri_provider=provider,
+        jk_provider=provider if _df_B is None else None,
+        eri_provider=provider if _df_B is None else None,
         weights=[float(w) for w in np.asarray(weights, dtype=np.float64).ravel().tolist()],
         frozen=getattr(casscf, "frozen", None),
         internal_rotation=bool(getattr(casscf, "internal_rotation", False)),
         extrasym=getattr(casscf, "extrasym", None),
     )
-    eris_sa = _mc_eri_builder.ao2mo(mo_coeff)
-    # Force all eris fields to NumPy and strip GPU provider so the Hessian
-    # matvec stays CPU-deterministic during the Z-vector solve.
-    for _attr in ("ppaa", "papa", "vhf_c", "vhf_ca", "j_pc", "k_pc", "paaa", "mo_coeff"):
-        _v = getattr(eris_sa, _attr, None)
-        if _v is not None and hasattr(_v, "get"):
-            object.__setattr__(eris_sa, _attr, _v.get())
-    if getattr(eris_sa, "eri_provider", None) is not None:
-        object.__setattr__(eris_sa, "eri_provider", None)
-    if getattr(eris_sa, "C_act", None) is not None:
-        object.__setattr__(eris_sa, "C_act", None)
-    # Build a dense AO-ERI tensor (CPU) for the Z-vector J/K contractions.
-    # This avoids the GPU DirectHybridProvider in the Hessian matvec.
-    nao = int(mo_coeff_np.shape[0])
-    _ao_eri_np = None
-    if hasattr(provider, "_builder") and provider._builder is not None:
-        try:
-            _ao_eri_np = _asnumpy_f64(provider._builder.build_ao_eri(nao=nao))
-        except Exception:
-            pass
-    if _ao_eri_np is None:
-        # Fallback: build from scratch via cuERI
-        from asuka.hf.dense_eri import build_ao_eri_dense  # noqa: PLC0415
-        _ao_eri_result = build_ao_eri_dense(getattr(scf_out, "ao_basis"))
-        _ao_eri_np = _asnumpy_f64(_ao_eri_result.eri_mat)
-    # CPU-only adapter for Hessian/gradient — uses dense AO-ERI for J/K.
-    mc_sa = DFNewtonCASSCFAdapter(
-        df_B=None,
-        hcore_ao=getattr(getattr(scf_out, "int1e"), "hcore"),
-        ncore=int(ncore),
-        ncas=int(ncas),
-        nelecas=nelecas,
-        mo_coeff=mo_coeff_np,
-        fcisolver=fcisolver_use,
-        ao_eri=_ao_eri_np,
-        weights=[float(w) for w in np.asarray(weights, dtype=np.float64).ravel().tolist()],
-        frozen=getattr(casscf, "frozen", None),
-        internal_rotation=bool(getattr(casscf, "internal_rotation", False)),
-        extrasym=getattr(casscf, "extrasym", None),
-    )
+    eris_sa = mc_sa.ao2mo(mo_coeff)
     hess_op = build_mcscf_hessian_operator(
         mc_sa,
         mo_coeff=mo_coeff_np,
