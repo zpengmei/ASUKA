@@ -415,7 +415,8 @@ def casscf_nuc_grad_direct_per_root(
 
     # Build the Z-vector Hessian operator using DF factors from the SCF for
     # J/K contractions.  This avoids materializing a dense AO-ERI tensor
-    # (nao^4 * 8 bytes — OOM at ~200 AOs) and runs the CUDA matvec path.
+    # (nao^4 * 8 bytes — OOM at ~200 AOs) and runs the GPU CUDA matvec path
+    # (the CUDA matvec drift was fixed in 084c263).
     _df_B = getattr(scf_out, "df_B", None)
     mc_sa = DFNewtonCASSCFAdapter(
         df_B=_df_B,
@@ -435,7 +436,7 @@ def casscf_nuc_grad_direct_per_root(
     eris_sa = mc_sa.ao2mo(mo_coeff)
     hess_op = build_mcscf_hessian_operator(
         mc_sa,
-        mo_coeff=mo_coeff_np,
+        mo_coeff=mo_coeff_np,  # numpy for CI-vector unpacking; eris.ppaa on GPU triggers GPU h_op
         ci=ci_list,
         eris=eris_sa,
         use_newton_hessian=True,
@@ -481,12 +482,12 @@ def casscf_nuc_grad_direct_per_root(
 
             fcisolver_fixed = _FixedRDMFcisolver(fcisolver_use, dm1=_asnumpy_f64(dm1_k), dm2=_asnumpy_f64(dm2_k))
             mc_k = DFNewtonCASSCFAdapter(
-                df_B=None,
+                df_B=_df_B,
                 hcore_ao=getattr(getattr(scf_out, "int1e"), "hcore"),
                 ncore=int(ncore),
                 ncas=int(ncas),
                 nelecas=nelecas,
-                mo_coeff=mo_coeff_np,
+                mo_coeff=mo_coeff,
                 fcisolver=fcisolver_fixed,
                 frozen=getattr(casscf, "frozen", None),
                 internal_rotation=bool(getattr(casscf, "internal_rotation", False)),
@@ -515,7 +516,7 @@ def casscf_nuc_grad_direct_per_root(
                 hessian_op=hess_op,
                 tol=float(z_tol),
                 maxiter=int(z_maxiter),
-                method="gmres",
+                method="cg",
             )
             if not np.all(np.isfinite(np.asarray(z_k.z_packed, dtype=np.float64))):
                 z_k = solve_mcscf_zvector(
@@ -525,7 +526,7 @@ def casscf_nuc_grad_direct_per_root(
                     hessian_op=hess_op,
                     tol=float(z_tol),
                     maxiter=int(z_maxiter),
-                    method="gmres",
+                    method="cg",
                     x0=None,
                 )
             if not np.all(np.isfinite(np.asarray(z_k.z_packed, dtype=np.float64))):
