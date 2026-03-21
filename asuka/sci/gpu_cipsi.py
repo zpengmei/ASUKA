@@ -16,8 +16,8 @@ from asuka.cuguga.oracle import _restore_eri_4d
 from asuka.cuguga.state_cache import get_state_cache
 from asuka.integrals.df_integrals import DFMOIntegrals, DeviceDFMOIntegrals
 from asuka.mcscf.casci import CASCIResult, _build_casci_df_integrals
-from asuka.qmc.labels import normalize_state_rep
-from asuka.qmc.sparse import SparseVector
+from asuka.sci._key64 import normalize_state_rep
+from asuka.sci._sparse_vector import SparseVector
 from asuka.sci.frontier_hash import SparseFrontierSelector
 from asuka.sci.hb_integrals import (
     build_hb_index,
@@ -3293,7 +3293,7 @@ def run_cipsi_trials(
         sel_key_u64 = None
         label_kind = "csf_idx"
         if state_rep_s == "key64":
-            from asuka.qmc.cuda_backend import csf_idx_to_key64_host  # noqa: PLC0415
+            from asuka.sci._key64 import csf_idx_to_key64_host  # noqa: PLC0415
 
             sel_key_u64 = np.asarray(csf_idx_to_key64_host(drt, sel_idx, state_cache=None), dtype=np.uint64, order="C")
             label_kind = "key64"
@@ -3713,7 +3713,7 @@ def run_cipsi_trials(
     sel_key_u64 = None
     label_kind = "csf_idx"
     if state_rep_s == "key64":
-        from asuka.qmc.cuda_backend import csf_idx_to_key64_host  # noqa: PLC0415
+        from asuka.sci._key64 import csf_idx_to_key64_host  # noqa: PLC0415
 
         sel_key_u64 = np.asarray(csf_idx_to_key64_host(drt, sel_idx, state_cache=None), dtype=np.uint64, order="C")
         label_kind = "key64"

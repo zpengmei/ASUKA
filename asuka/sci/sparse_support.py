@@ -21,7 +21,7 @@ from asuka.cuguga.screening import RowScreening
 from asuka.cuguga.state_cache import DRTStateCache
 from asuka.integrals.df_diag import diagonal_element_det_guess_df
 from asuka.integrals.df_integrals import DFMOIntegrals, DeviceDFMOIntegrals
-from asuka.qmc.sparse import SparseVector
+from asuka.sci._sparse_vector import SparseVector
 
 ConnectedRowCache = dict[int, tuple[np.ndarray, np.ndarray]]
 SELECTOR_BUCKET_EDGE_THRESHOLD = 1_000_000
