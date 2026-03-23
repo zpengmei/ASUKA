@@ -2229,18 +2229,15 @@ def solve_mcscf_zvector(
                 }
                 if x0_use is not None:
                     cg_kwargs["x0"] = np.asarray(x0_use, dtype=np.float64).ravel()
-                _use_gpu_cg = bool(op.gpu_mode)
-                if _use_gpu_cg:
-                    try:
-                        import cupy as _cp_cg  # noqa: PLC0415
-                        _ = _cp_cg.zeros(1)
-                    except Exception:
-                        _use_gpu_cg = False
+                # Always use scipy CPU CG (matching PySCF).  CuPy's CG
+                # diverges for the indefinite SA-CASSCF Hessian that arises
+                # in systems with virtual orbitals, while scipy CG converges
+                # reliably with the SA Lagrange preconditioner.  The GPU
+                # matvec dominates cost; CPU CG orchestration is negligible.
+                # TODO: replace CG with MINRES or GMRES for the indefinite
+                # case so the full solve can stay on GPU end-to-end.
                 with ctx_rdm:
-                    if _use_gpu_cg:
-                        z, info = _cg_solve_gpu(op.mv, b, **cg_kwargs)
-                    else:
-                        z, info = _cg_solve(op.mv, b, **cg_kwargs)
+                    z, info = _cg_solve(op.mv, b, **cg_kwargs)
             else:
                 gmres_kwargs = {
                     "diag_precond": diag_use,

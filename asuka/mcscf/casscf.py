@@ -2707,6 +2707,7 @@ def run_casscf(
     mo_coeff_init: Any | None = None,
     ci_init: Any | None = None,
     matvec_backend: str | None = None,
+    optimizer: str | None = None,
     **kwargs,
 ) -> CASSCFResult:
     """Unified CASSCF driver over (backend, df) switches.
@@ -2725,6 +2726,23 @@ def run_casscf(
     """
 
     from dataclasses import replace as _dc_replace  # noqa: PLC0415
+
+    # ---- CASSecond optimizer (default, second-order) ----
+    _opt = str(optimizer).strip().lower() if optimizer is not None else str(os.environ.get("ASUKA_CASSCF_OPTIMIZER", "cassecond")).strip().lower()
+    if _opt in {"cassecond", "second", "bagel", ""}:
+        from asuka.mcscf.cassecond import CASSecond  # noqa: PLC0415
+
+        _nelecas = int(nelecas) if isinstance(nelecas, (int, np.integer)) else int(nelecas[0]) + int(nelecas[1])
+        _cs_kwargs = {}
+        for k in ("max_iter", "thresh", "max_micro_iter", "thresh_micro", "nroots", "root_weights", "verbose"):
+            if k in kwargs:
+                _cs_kwargs[k] = kwargs.pop(k)
+        if mo_coeff_init is not None:
+            _cs_kwargs["mo_coeff"] = mo_coeff_init
+        elif guess is not None and hasattr(guess, "mo_coeff"):
+            _cs_kwargs["mo_coeff"] = getattr(guess, "mo_coeff")
+        cs = CASSecond(scf_out, ncore=int(ncore), ncas=int(ncas), nelecas=_nelecas, **_cs_kwargs)
+        return cs.compute()
 
     backend_s = str(backend).strip().lower()
     if backend_s not in {"cpu", "cuda"}:

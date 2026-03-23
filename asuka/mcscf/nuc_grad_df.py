@@ -1476,6 +1476,7 @@ def _build_dme0_lorb_response(
     *,
     ncore: int,
     ncas: int,
+    reco: float = 1.0,
     vhf_cache: dict | None = None,
     lorb_cache: dict | None = None,
     return_xp: bool = False,
@@ -1624,6 +1625,28 @@ def _build_dme0_lorb_response(
         D_core = xp.zeros((nao, nao), dtype=xp.float64)
         D_L_core = xp.zeros((nao, nao), dtype=xp.float64)
 
+    # Molcas reco parameter: Rint_generic (Make_Conn) uses reco=-1 which
+    # negates the inactive orbital-rotated density (DLT) in J/K builds and
+    # in the FIMO/FAMO @ kappa uncontracted terms.  ASUKA's default (reco=+1)
+    # corresponds to the PySCF Lorb_dot_dgorb_dx convention.
+    #
+    # IMPORTANT: reco must NOT scale D_L_core itself because D_L = D_L_core
+    # + D_L_act is used for g_h1 = h @ D_L (1e term, reco-independent).
+    # Instead, reco is applied downstream:
+    #   1. JcL, KcL (J/K from D_L_core) are scaled by reco after computation
+    #   2. D_L_core_vmix variants (for g_vmix = vhf @ D_L_core) are scaled
+    #      by reco, since g_vmix represents the FIMO@kappa / FAMO@kappa terms
+    #      which get factor Reco*Fact in Molcas Rint_generic
+    # The env var is kept for backward compatibility but the function parameter
+    # takes precedence when != 1.0.
+    _reco_eff = float(reco)
+    try:
+        _reco_env = float(_os.environ.get("ASUKA_CASPT2_LORB_RECO", "1.0"))
+    except Exception:
+        _reco_env = 1.0
+    if abs(_reco_eff - 1.0) < 1e-15 and abs(float(_reco_env) - 1.0) > 1e-15:
+        _reco_eff = float(_reco_env)
+
     D_act = C_act @ dm1 @ C_act.T
     D_L_act_raw = C_L_act @ dm1 @ C_act.T
     D_L_act_asym = D_L_act_raw - D_L_act_raw.T
@@ -1701,6 +1724,18 @@ def _build_dme0_lorb_response(
         D_L_core_vmix_k_act = xp.zeros_like(D_L_core)
     else:
         D_L_core_vmix_k_act = D_L_core_vmix
+
+    # reco scaling for the FIMO/FAMO @ kappa direction (g_vmix terms).
+    # In Molcas Rint_generic, the FIMO@kappa and FAMO@kappa terms get factor
+    # Reco*Fact, while kappa@FIMO gets factor Fact only (no Reco).
+    # g_vmix = vhf @ D_L_core_vmix corresponds to the FIMO@kappa direction,
+    # so all D_L_core_vmix variants must be scaled by reco.
+    if abs(float(_reco_eff) - 1.0) > 1e-15 and ncore > 0:
+        D_L_core_vmix = float(_reco_eff) * D_L_core_vmix
+        D_L_core_vmix_j = float(_reco_eff) * D_L_core_vmix_j
+        D_L_core_vmix_k = float(_reco_eff) * D_L_core_vmix_k
+        D_L_core_vmix_j_act = float(_reco_eff) * D_L_core_vmix_j_act
+        D_L_core_vmix_k_act = float(_reco_eff) * D_L_core_vmix_k_act
 
     def _normalize_vmix_mm_mode(value: str | None) -> str:
         mode = str(value or "left").strip().lower()
@@ -1792,6 +1827,13 @@ def _build_dme0_lorb_response(
         KcL = xp.zeros((nao, nao), dtype=xp.float64)
     JaL, KaL = _df_scf._df_JK(B_x, D_L_act, want_J=True, want_K=True)  # noqa: SLF001
 
+    # reco scaling: J/K from the core orbital-rotated density are
+    # reco-dependent (Molcas Rint_generic negates DLT for reco=-1).
+    # Active J/K (JaL, KaL) are NOT reco-dependent.
+    if abs(float(_reco_eff) - 1.0) > 1e-15 and ncore > 0:
+        JcL = float(_reco_eff) * JcL
+        KcL = float(_reco_eff) * KcL
+
     vhfL_c = JcL - 0.5 * KcL
     vhfL_a = JaL - 0.5 * KaL
 
@@ -1847,14 +1889,25 @@ def _build_dme0_lorb_response(
         g_vc_L_j = Jc @ D_L_act
         g_vc_L_k = (-0.5 * Kc) @ D_L_act
 
-    g_h1 = h_ao_x @ D_L
+    # The 1e part: h @ D_L = h @ D_L_core + h @ D_L_act.
+    # With reco != 1: h @ D_L_core is part of the FIMO@kappa term and gets
+    # factor Reco*Fact (reco-dependent), while h @ D_L_act is reco-independent.
+    if abs(float(_reco_eff) - 1.0) > 1e-15 and ncore > 0:
+        g_h1 = h_ao_x @ (float(_reco_eff) * D_L_core + D_L_act)
+    else:
+        g_h1 = h_ao_x @ D_L
     if g_vmix_j is not None and g_vmix_k is not None:
         g_vmix = g_vmix_j + g_vmix_k
         g_vLmix = g_vLmix_j + g_vLmix_k  # type: ignore[operator]
         g_vL_c = g_vL_c_j + g_vL_c_k  # type: ignore[operator]
         g_vc_L = g_vc_L_j + g_vc_L_k  # type: ignore[operator]
     else:
-        g_vmix = _vhf_mix @ D_L_core
+        # In the fallback path (individual J/K not available), apply reco
+        # to the D_L_core used in g_vmix (FIMO@kappa direction).
+        _D_L_core_vmix_fb = D_L_core
+        if abs(float(_reco_eff) - 1.0) > 1e-15 and ncore > 0:
+            _D_L_core_vmix_fb = float(_reco_eff) * D_L_core
+        g_vmix = _vhf_mix @ _D_L_core_vmix_fb
         g_vLmix = _vhfL_mix @ D_core
         g_vL_c = vhfL_c @ D_act
         g_vc_L = vhf_c @ D_L_act

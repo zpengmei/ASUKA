@@ -604,7 +604,17 @@ def build_dense_newton_eris(
     # j_pc[p,i] = (pp|ii), k_pc[p,i] = (pi|pi)  where i is a CORE orbital
     if ncore:
         if B_ao_for_vhf is not None:
-            # DF path: compute from L[p,q,Q]
+            # DF path: build L[p,q,Q] from B_ao and MO coefficients
+            B = cp.asarray(B_ao_for_vhf, dtype=cp.float64)
+            if B.ndim == 3:
+                # B is (nao, nao, naux) → L[p,q,Q] = C[:,p]^T B[:,:,Q] C[:,q]
+                L = cp.einsum("mp,mnQ,nq->pqQ", mo, B, mo)
+            else:
+                # B is packed (naux, ntri) or (ntri, naux) — unpack first
+                from asuka.integrals.df_packed_s2 import unpack_Qp_to_mnQ
+                B_3d = cp.asarray(unpack_Qp_to_mnQ(
+                    cp.asnumpy(B), nao=nao), dtype=cp.float64)
+                L = cp.einsum("mp,mnQ,nq->pqQ", mo, B_3d, mo)
             L_pp = cp.ascontiguousarray(L[cp.arange(nmo), cp.arange(nmo)])  # (nmo,naux)
             L_ii = cp.ascontiguousarray(L_pp[:ncore])  # (ncore,naux)
             j_pc = cp.ascontiguousarray(L_pp @ L_ii.T)  # (nmo,ncore)
